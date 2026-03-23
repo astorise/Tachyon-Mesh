@@ -1,0 +1,10 @@
+[package]
+name = "core-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+wasmtime = "42.0.1"
+wasmtime-wasi = { version = "42.0.1", features = ["p1"] }

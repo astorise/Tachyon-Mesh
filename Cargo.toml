@@ -1,0 +1,7 @@
+[workspace]
+members = ["core-host", "guest-example"]
+resolver = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
