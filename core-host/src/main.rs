@@ -7,7 +7,9 @@ use axum::{
     routing::post,
     Router,
 };
-use std::{fmt, path::PathBuf};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+use std::{fmt, path::PathBuf, sync::Once};
 use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, Trap, TypedFunc};
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
@@ -17,7 +19,7 @@ use wasmtime_wasi::{
 
 const HOST_ADDRESS: &str = "0.0.0.0:8080";
 const MAX_STDOUT_BYTES: usize = 64 * 1024;
-const GUEST_FUEL_BUDGET: u64 = 100_000;
+const GUEST_FUEL_BUDGET: u64 = 250_000;
 const GUEST_MEMORY_LIMIT_BYTES: usize = 50 * 1024 * 1024;
 const RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
 
@@ -53,6 +55,13 @@ struct GuestModuleNotFound {
     candidate_paths: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GuestLogRecord {
+    level: String,
+    target: Option<String>,
+    fields: Map<String, Value>,
+}
+
 #[derive(Debug)]
 enum ExecutionError {
     GuestModuleNotFound(GuestModuleNotFound),
@@ -69,6 +78,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    init_host_tracing();
+
     let app = build_app(AppState {
         engine: build_engine()?,
     });
@@ -155,7 +166,7 @@ fn execute_guest(
         guest_execution_error(error, "guest function `faas_entry` trapped")
     })?;
 
-    Ok(stdout.contents())
+    Ok(split_guest_stdout(function_name, stdout.contents()))
 }
 
 fn build_linker(engine: &Engine) -> std::result::Result<Linker<HostState>, ExecutionError> {
@@ -212,6 +223,18 @@ fn build_engine() -> Result<Engine> {
         .map_err(|error| anyhow!("failed to create Wasmtime engine with fuel metering enabled: {error}"))
 }
 
+fn init_host_tracing() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .try_init();
+    });
+}
+
 fn guest_execution_error(error: wasmtime::Error, context: impl Into<String>) -> ExecutionError {
     let error = error.context(context.into());
 
@@ -235,6 +258,78 @@ fn classify_resource_limit(error: &wasmtime::Error) -> Option<ResourceLimitKind>
         Trap::AllocationTooLarge => Some(ResourceLimitKind::Memory),
         _ => None,
     })
+}
+
+fn split_guest_stdout(function_name: &str, stdout: Bytes) -> Bytes {
+    let output = String::from_utf8_lossy(&stdout);
+    let mut response = String::new();
+
+    for segment in output.split_inclusive('\n') {
+        let line = trim_line_endings(segment);
+
+        if let Some(record) = parse_guest_log_line(line) {
+            forward_guest_log(function_name, record);
+            continue;
+        }
+
+        response.push_str(segment);
+    }
+
+    Bytes::from(response)
+}
+
+fn trim_line_endings(segment: &str) -> &str {
+    let trimmed = segment.strip_suffix('\n').unwrap_or(segment);
+    trimmed.strip_suffix('\r').unwrap_or(trimmed)
+}
+
+fn parse_guest_log_line(line: &str) -> Option<GuestLogRecord> {
+    serde_json::from_str::<GuestLogRecord>(line).ok()
+}
+
+fn forward_guest_log(function_name: &str, record: GuestLogRecord) {
+    let level = record.level.to_ascii_uppercase();
+    let target = record.target.unwrap_or_else(|| "guest".to_owned());
+    let message = record
+        .fields
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("guest emitted a structured log")
+        .to_owned();
+    let fields = Value::Object(record.fields).to_string();
+
+    match level.as_str() {
+        "TRACE" => tracing::trace!(
+            guest_function = function_name,
+            guest_target = %target,
+            guest_fields = %fields,
+            "{message}"
+        ),
+        "DEBUG" => tracing::debug!(
+            guest_function = function_name,
+            guest_target = %target,
+            guest_fields = %fields,
+            "{message}"
+        ),
+        "WARN" => tracing::warn!(
+            guest_function = function_name,
+            guest_target = %target,
+            guest_fields = %fields,
+            "{message}"
+        ),
+        "ERROR" => tracing::error!(
+            guest_function = function_name,
+            guest_target = %target,
+            guest_fields = %fields,
+            "{message}"
+        ),
+        _ => tracing::info!(
+            guest_function = function_name,
+            guest_target = %target,
+            guest_fields = %fields,
+            "{message}"
+        ),
+    }
 }
 
 impl HostState {
@@ -344,6 +439,20 @@ mod tests {
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn split_guest_stdout_removes_json_log_lines() {
+        let stdout = Bytes::from(
+            "{\"level\":\"INFO\",\"target\":\"guest_example\",\"fields\":{\"message\":\"guest-example received a request payload\"}}\nFaaS received: Hello Lean FaaS!\n",
+        );
+
+        let response = split_guest_stdout("guest-example", stdout);
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "FaaS received: Hello Lean FaaS!\n"
+        );
+    }
 
     #[test]
     fn execute_guest_returns_stdout_payload() {
