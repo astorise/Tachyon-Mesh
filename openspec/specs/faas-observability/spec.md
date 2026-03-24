@@ -1,5 +1,9 @@
-## ADDED Requirements
+# faas-observability Specification
 
+## Purpose
+Define the guest-side structured logging contract and the host-side forwarding behavior for FaaS observability without requiring guest network exporters.
+
+## Requirements
 ### Requirement: FaaS SDK macro initializes lightweight JSON logging
 The workspace SHALL provide a `faas-sdk` proc-macro crate exposing `#[faas_handler]`, and that macro SHALL inject a `tracing_subscriber` configured to emit JSON logs to `stdout` at the start of the annotated guest handler.
 

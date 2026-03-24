@@ -1,5 +1,9 @@
-## ADDED Requirements
+# cryptographic-integrity Specification
 
+## Purpose
+Define how the workspace seals an integrity manifest and how `core-host` verifies that embedded configuration before serving traffic.
+
+## Requirements
 ### Requirement: Signer CLI produces a sealed integrity manifest
 The workspace SHALL provide a `cli-signer` binary that generates an Ed25519 key pair, hashes the canonical configuration payload, signs that hash, and writes an `integrity.lock` file at the workspace root containing `config_payload`, `public_key`, and `signature`.
 
