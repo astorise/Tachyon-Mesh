@@ -1,5 +1,5 @@
 [workspace]
-members = ["core-host", "guest-example"]
+members = ["core-host", "guest-example", "guest-malicious"]
 resolver = "2"
 
 [profile.release]

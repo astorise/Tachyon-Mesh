@@ -785,6 +785,10 @@ name = "guest-example"
 version = "0.1.0"
 
 [[package]]
+name = "guest-malicious"
+version = "0.1.0"
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
