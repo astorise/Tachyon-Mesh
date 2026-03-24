@@ -7,9 +7,12 @@ use axum::{
     routing::post,
     Router,
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::{fmt, path::PathBuf, sync::Once};
+use sha2::{Digest, Sha256};
 use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, Trap, TypedFunc};
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
@@ -22,6 +25,9 @@ const MAX_STDOUT_BYTES: usize = 64 * 1024;
 const GUEST_FUEL_BUDGET: u64 = 250_000;
 const GUEST_MEMORY_LIMIT_BYTES: usize = 50 * 1024 * 1024;
 const RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
+const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
+const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
+const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
 
 #[derive(Clone)]
 struct AppState {
@@ -62,6 +68,15 @@ struct GuestLogRecord {
     fields: Map<String, Value>,
 }
 
+#[derive(Serialize)]
+struct IntegrityConfig<'a> {
+    host_address: &'a str,
+    max_stdout_bytes: usize,
+    guest_fuel_budget: u64,
+    guest_memory_limit_bytes: usize,
+    resource_limit_response: &'a str,
+}
+
 #[derive(Debug)]
 enum ExecutionError {
     GuestModuleNotFound(GuestModuleNotFound),
@@ -79,6 +94,7 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     init_host_tracing();
+    verify_integrity()?;
 
     let app = build_app(AppState {
         engine: build_engine()?,
@@ -233,6 +249,53 @@ fn init_host_tracing() {
             .with_target(true)
             .try_init();
     });
+}
+
+fn verify_integrity() -> Result<()> {
+    let runtime_config = canonical_runtime_config_payload()?;
+
+    if runtime_config != EMBEDDED_CONFIG_PAYLOAD {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration does not match runtime configuration"
+        ));
+    }
+
+    verify_integrity_signature(EMBEDDED_CONFIG_PAYLOAD, EMBEDDED_PUBLIC_KEY, EMBEDDED_SIGNATURE)?;
+    tracing::info!("integrity verification passed");
+    Ok(())
+}
+
+fn canonical_runtime_config_payload() -> Result<String> {
+    serde_json::to_string(&IntegrityConfig {
+        host_address: HOST_ADDRESS,
+        max_stdout_bytes: MAX_STDOUT_BYTES,
+        guest_fuel_budget: GUEST_FUEL_BUDGET,
+        guest_memory_limit_bytes: GUEST_MEMORY_LIMIT_BYTES,
+        resource_limit_response: RESOURCE_LIMIT_RESPONSE,
+    })
+    .context("failed to serialize runtime integrity configuration")
+}
+
+fn verify_integrity_signature(payload: &str, public_key_hex: &str, signature_hex: &str) -> Result<()> {
+    let payload_hash = Sha256::digest(payload.as_bytes());
+    let public_key_bytes = decode_hex_array::<32>(public_key_hex, "public key")?;
+    let signature_bytes = decode_hex_array::<64>(signature_hex, "signature")?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&public_key_bytes).context("invalid embedded Ed25519 public key")?;
+    let signature = Signature::from_bytes(&signature_bytes);
+
+    verifying_key
+        .verify(&payload_hash, &signature)
+        .map_err(|error| anyhow!("Integrity Validation Failed: signature verification failed: {error}"))
+}
+
+fn decode_hex_array<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+    let decoded = hex::decode(value)
+        .with_context(|| format!("failed to decode embedded {label} as hex"))?;
+
+    decoded
+        .try_into()
+        .map_err(|_| anyhow!("embedded {label} has an unexpected byte length"))
 }
 
 fn guest_execution_error(error: wasmtime::Error, context: impl Into<String>) -> ExecutionError {
@@ -437,6 +500,7 @@ impl ExecutionError {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use ed25519_dalek::{Signer, SigningKey};
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
 
@@ -451,6 +515,41 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&response),
             "FaaS received: Hello Lean FaaS!\n"
+        );
+    }
+
+    #[test]
+    fn verify_integrity_signature_accepts_valid_material() {
+        let payload = canonical_runtime_config_payload().expect("payload should serialize");
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let signature = signing_key.sign(&Sha256::digest(payload.as_bytes()));
+
+        verify_integrity_signature(
+            &payload,
+            &hex::encode(signing_key.verifying_key().to_bytes()),
+            &hex::encode(signature.to_bytes()),
+        )
+        .expect("signature should verify");
+    }
+
+    #[test]
+    fn verify_integrity_signature_rejects_tampered_payload() {
+        let payload = canonical_runtime_config_payload().expect("payload should serialize");
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let signature = signing_key.sign(&Sha256::digest(payload.as_bytes()));
+
+        let error = verify_integrity_signature(
+            "{\"tampered\":true}",
+            &hex::encode(signing_key.verifying_key().to_bytes()),
+            &hex::encode(signature.to_bytes()),
+        )
+        .expect_err("tampered payload should fail verification");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Integrity Validation Failed"),
+            "unexpected error: {error}"
         );
     }
 
