@@ -5,6 +5,12 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+axum = "0.7"
+bytes = "1.5"
 tokio = { version = "1", features = ["full"] }
 wasmtime = "42.0.1"
 wasmtime-wasi = { version = "42.0.1", features = ["p1"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
