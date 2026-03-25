@@ -11,8 +11,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::{fmt, path::PathBuf, sync::Once};
 use sha2::{Digest, Sha256};
+use std::{fmt, path::PathBuf, sync::Once};
 use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, Trap, TypedFunc};
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
@@ -110,7 +110,9 @@ async fn run() -> Result<()> {
 }
 
 fn build_app(state: AppState) -> Router {
-    Router::new().route("/*path", post(faas_handler)).with_state(state)
+    Router::new()
+        .route("/*path", post(faas_handler))
+        .with_state(state)
 }
 
 async fn faas_handler(
@@ -167,20 +169,22 @@ fn execute_guest(
         .build_p1();
     let mut store = Store::new(engine, HostState::new(wasi));
     store.limiter(|state| &mut state.limits);
-    store.set_fuel(GUEST_FUEL_BUDGET).map_err(|error| {
-        guest_execution_error(error, "failed to inject guest fuel budget")
-    })?;
+    store
+        .set_fuel(GUEST_FUEL_BUDGET)
+        .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
     let instance = linker
         .instantiate(&mut store, &module)
         .map_err(|error| guest_execution_error(error, "failed to instantiate guest module"))?;
     let faas_entry: TypedFunc<(), ()> =
-        instance.get_typed_func(&mut store, "faas_entry").map_err(|error| {
-            guest_execution_error(error, "failed to resolve exported function `faas_entry`")
-        })?;
+        instance
+            .get_typed_func(&mut store, "faas_entry")
+            .map_err(|error| {
+                guest_execution_error(error, "failed to resolve exported function `faas_entry`")
+            })?;
 
-    faas_entry.call(&mut store, ()).map_err(|error| {
-        guest_execution_error(error, "guest function `faas_entry` trapped")
-    })?;
+    faas_entry
+        .call(&mut store, ())
+        .map_err(|error| guest_execution_error(error, "guest function `faas_entry` trapped"))?;
 
     Ok(split_guest_stdout(function_name, stdout.contents()))
 }
@@ -200,7 +204,9 @@ fn resolve_function_name(path: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn resolve_guest_module_path(function_name: &str) -> std::result::Result<PathBuf, GuestModuleNotFound> {
+fn resolve_guest_module_path(
+    function_name: &str,
+) -> std::result::Result<PathBuf, GuestModuleNotFound> {
     let wasm_file = format!("{}.wasm", function_name.replace('-', "_"));
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidate_strings = [
@@ -220,7 +226,9 @@ fn resolve_guest_module_path(function_name: &str) -> std::result::Result<PathBuf
         .into_iter()
         .find(|path| path.exists())
         .map(normalize_path)
-        .ok_or_else(|| GuestModuleNotFound::new(function_name, format_candidate_list(&candidate_strings)))
+        .ok_or_else(|| {
+            GuestModuleNotFound::new(function_name, format_candidate_list(&candidate_strings))
+        })
 }
 
 fn normalize_path(path: PathBuf) -> PathBuf {
@@ -235,8 +243,9 @@ fn build_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.consume_fuel(true);
 
-    Engine::new(&config)
-        .map_err(|error| anyhow!("failed to create Wasmtime engine with fuel metering enabled: {error}"))
+    Engine::new(&config).map_err(|error| {
+        anyhow!("failed to create Wasmtime engine with fuel metering enabled: {error}")
+    })
 }
 
 fn init_host_tracing() {
@@ -260,7 +269,11 @@ fn verify_integrity() -> Result<()> {
         ));
     }
 
-    verify_integrity_signature(EMBEDDED_CONFIG_PAYLOAD, EMBEDDED_PUBLIC_KEY, EMBEDDED_SIGNATURE)?;
+    verify_integrity_signature(
+        EMBEDDED_CONFIG_PAYLOAD,
+        EMBEDDED_PUBLIC_KEY,
+        EMBEDDED_SIGNATURE,
+    )?;
     tracing::info!("integrity verification passed");
     Ok(())
 }
@@ -276,22 +289,28 @@ fn canonical_runtime_config_payload() -> Result<String> {
     .context("failed to serialize runtime integrity configuration")
 }
 
-fn verify_integrity_signature(payload: &str, public_key_hex: &str, signature_hex: &str) -> Result<()> {
+fn verify_integrity_signature(
+    payload: &str,
+    public_key_hex: &str,
+    signature_hex: &str,
+) -> Result<()> {
     let payload_hash = Sha256::digest(payload.as_bytes());
     let public_key_bytes = decode_hex_array::<32>(public_key_hex, "public key")?;
     let signature_bytes = decode_hex_array::<64>(signature_hex, "signature")?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&public_key_bytes).context("invalid embedded Ed25519 public key")?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
+        .context("invalid embedded Ed25519 public key")?;
     let signature = Signature::from_bytes(&signature_bytes);
 
     verifying_key
         .verify(&payload_hash, &signature)
-        .map_err(|error| anyhow!("Integrity Validation Failed: signature verification failed: {error}"))
+        .map_err(|error| {
+            anyhow!("Integrity Validation Failed: signature verification failed: {error}")
+        })
 }
 
 fn decode_hex_array<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
-    let decoded = hex::decode(value)
-        .with_context(|| format!("failed to decode embedded {label} as hex"))?;
+    let decoded =
+        hex::decode(value).with_context(|| format!("failed to decode embedded {label} as hex"))?;
 
     decoded
         .try_into()
@@ -424,7 +443,7 @@ impl ResourceLimiter for GuestResourceLimiter {
             .into());
         }
 
-        Ok(maximum.map_or(true, |max| desired <= max))
+        Ok(maximum.is_none_or(|max| desired <= max))
     }
 
     fn table_growing(
@@ -433,7 +452,7 @@ impl ResourceLimiter for GuestResourceLimiter {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(maximum.map_or(true, |max| desired <= max))
+        Ok(maximum.is_none_or(|max| desired <= max))
     }
 }
 
@@ -489,9 +508,7 @@ impl ExecutionError {
 
     fn log_if_needed(&self, function_name: &str) {
         if let Self::ResourceLimitExceeded { kind, detail } = self {
-            eprintln!(
-                "warning: guest `{function_name}` exceeded its {kind} quota: {detail}"
-            );
+            eprintln!("warning: guest `{function_name}` exceeded its {kind} quota: {detail}");
         }
     }
 }
@@ -546,9 +563,7 @@ mod tests {
         .expect_err("tampered payload should fail verification");
 
         assert!(
-            error
-                .to_string()
-                .contains("Integrity Validation Failed"),
+            error.to_string().contains("Integrity Validation Failed"),
             "unexpected error: {error}"
         );
     }
@@ -556,9 +571,8 @@ mod tests {
     #[test]
     fn execute_guest_returns_stdout_payload() {
         let engine = build_engine().expect("engine should be created");
-        let response =
-            execute_guest(&engine, "guest-example", Bytes::from("Hello Lean FaaS!"))
-                .expect("guest execution should succeed");
+        let response = execute_guest(&engine, "guest-example", Bytes::from("Hello Lean FaaS!"))
+            .expect("guest execution should succeed");
 
         assert_eq!(
             String::from_utf8_lossy(&response).trim(),
@@ -607,7 +621,9 @@ mod tests {
             .expect_err("growth past the quota should fail");
 
         assert_eq!(
-            error.downcast_ref::<ResourceLimitTrap>().map(|error| error.kind),
+            error
+                .downcast_ref::<ResourceLimitTrap>()
+                .map(|error| error.kind),
             Some(ResourceLimitKind::Memory)
         );
     }
