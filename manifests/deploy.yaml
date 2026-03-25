@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tachyon-host
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tachyon-host
+  template:
+    metadata:
+      labels:
+        app: tachyon-host
+    spec:
+      containers:
+        - name: core-host
+          image: tachyon-mesh:test
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tachyon-service
+spec:
+  selector:
+    app: tachyon-host
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: 8080

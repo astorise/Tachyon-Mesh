@@ -253,20 +253,11 @@ fn normalize_route_path(path: &str) -> String {
 fn resolve_guest_module_path(
     function_name: &str,
 ) -> std::result::Result<PathBuf, GuestModuleNotFound> {
-    let wasm_file = format!("{}.wasm", function_name.replace('-', "_"));
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidate_strings = [
-        format!("../target/wasm32-wasip1/debug/{wasm_file}"),
-        format!("../target/wasm32-wasi/debug/{wasm_file}"),
-        format!("target/wasm32-wasip1/debug/{wasm_file}"),
-        format!("target/wasm32-wasi/debug/{wasm_file}"),
-    ];
-    let candidates = [
-        manifest_dir.join(&candidate_strings[0]),
-        manifest_dir.join(&candidate_strings[1]),
-        PathBuf::from(&candidate_strings[2]),
-        PathBuf::from(&candidate_strings[3]),
-    ];
+    let candidates = guest_module_candidate_paths(function_name);
+    let candidate_strings = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
 
     candidates
         .into_iter()
@@ -275,6 +266,33 @@ fn resolve_guest_module_path(
         .ok_or_else(|| {
             GuestModuleNotFound::new(function_name, format_candidate_list(&candidate_strings))
         })
+}
+
+fn guest_module_candidate_paths(function_name: &str) -> Vec<PathBuf> {
+    let wasm_file = format!("{}.wasm", function_name.replace('-', "_"));
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_relative_candidates = [
+        format!("../target/wasm32-wasip1/debug/{wasm_file}"),
+        format!("../target/wasm32-wasip1/release/{wasm_file}"),
+        format!("../target/wasm32-wasi/debug/{wasm_file}"),
+        format!("../target/wasm32-wasi/release/{wasm_file}"),
+    ];
+    let workspace_relative_candidates = [
+        format!("target/wasm32-wasip1/debug/{wasm_file}"),
+        format!("target/wasm32-wasip1/release/{wasm_file}"),
+        format!("target/wasm32-wasi/debug/{wasm_file}"),
+        format!("target/wasm32-wasi/release/{wasm_file}"),
+        format!("guest-modules/{wasm_file}"),
+    ];
+
+    manifest_relative_candidates
+        .into_iter()
+        .map(|path| manifest_dir.join(path))
+        .chain(workspace_relative_candidates.into_iter().map(PathBuf::from))
+        .chain(std::iter::once(PathBuf::from(format!(
+            "/app/guest-modules/{wasm_file}"
+        ))))
+        .collect()
 }
 
 fn normalize_path(path: PathBuf) -> PathBuf {
@@ -819,6 +837,22 @@ mod tests {
         let config = validate_integrity_config(config).expect("embedded config should validate");
 
         assert!(config.allows_route("/api/guest-example"));
+    }
+
+    #[test]
+    fn guest_module_candidates_cover_release_and_container_paths() {
+        let candidates = guest_module_candidate_paths("guest-example")
+            .into_iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+
+        assert!(candidates.iter().any(|path| {
+            path.ends_with("/target/wasm32-wasip1/release/guest_example.wasm")
+                || path == "target/wasm32-wasip1/release/guest_example.wasm"
+        }));
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with("guest-modules/guest_example.wasm")));
     }
 
     #[test]

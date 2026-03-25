@@ -1,5 +1,5 @@
 {
   "config_payload": "{\"host_address\":\"0.0.0.0:8080\",\"max_stdout_bytes\":65536,\"guest_fuel_budget\":250000,\"guest_memory_limit_bytes\":67108864,\"resource_limit_response\":\"Execution trapped: Resource limit exceeded\",\"routes\":[\"/api/guest-example\"]}",
-  "public_key": "c3799f4101b9646099fb7d124634df588616049db3396f2e8c0fc86cf62f2725",
-  "signature": "9878188f5428244e34fc7e127bb7c95352875763d2b69a6418747727ea3b2e3c5c1d6cbf6eb173ac56bd9c94eb4db285169743eb2fe44dd29bd682c7f081cc03"
+  "public_key": "4282890d3fcad94b59ad4548e5260927ea4303c3c879917454b2d9e6cf23f7a4",
+  "signature": "6b781abbf1a51b8406d3cf5a7194beceab5941268a50d627de41597449840a7b36df528e9a1648b0ee6681dd6e536658d2ef35efbb70cc6a94bea6fea7848407"
 }

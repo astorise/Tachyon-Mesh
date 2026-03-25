@@ -1,0 +1,78 @@
+name: k3d-integration
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  k3d-integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build container image
+        run: docker build -t tachyon-mesh:test .
+
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+          curl -L -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Create cluster and import local image
+        run: |
+          k3d cluster create tachyon-mesh --wait
+          k3d image import tachyon-mesh:test -c tachyon-mesh
+          kubectl cluster-info
+
+      - name: Deploy workload
+        run: |
+          kubectl apply -f manifests/deploy.yaml
+          kubectl wait --for=condition=available --timeout=180s deployment/tachyon-host
+
+      - name: Verify guest endpoint
+        run: |
+          kubectl port-forward service/tachyon-service 8080:8080 >/tmp/tachyon-port-forward.log 2>&1 &
+          PORT_FORWARD_PID=$!
+
+          cleanup() {
+            kill "${PORT_FORWARD_PID}" || true
+          }
+
+          trap cleanup EXIT
+
+          success=0
+          for attempt in $(seq 1 20); do
+            if curl --fail --show-error --silent --request POST --data 'Hello Lean FaaS!' \
+              http://127.0.0.1:8080/api/guest-example >/tmp/tachyon-response.txt; then
+              success=1
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ "${success}" -ne 1 ]; then
+            cat /tmp/tachyon-port-forward.log || true
+            exit 1
+          fi
+
+          grep -F "FaaS received: Hello Lean FaaS!" /tmp/tachyon-response.txt
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide || true
+          kubectl describe deployment/tachyon-host || true
+          kubectl describe pod -l app=tachyon-host || true
+          kubectl logs deployment/tachyon-host || true
+          cat /tmp/tachyon-port-forward.log || true
