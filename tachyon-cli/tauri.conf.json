@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "tachyon-cli",
+  "version": "0.1.0",
+  "identifier": "com.tachyonmesh.cli",
+  "build": {
+    "frontendDist": "dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  },
+  "plugins": {
+    "cli": {
+      "description": "Generate signed Tachyon Mesh integrity manifests.",
+      "subcommands": {
+        "generate": {
+          "description": "Generate integrity.lock for the current Tachyon Mesh workspace.",
+          "args": [
+            {
+              "name": "route",
+              "short": "r",
+              "description": "HTTP route to seal into the manifest.",
+              "takesValue": true,
+              "multiple": true,
+              "required": true
+            },
+            {
+              "name": "memory",
+              "short": "m",
+              "description": "Guest memory limit in MiB.",
+              "takesValue": true,
+              "required": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}

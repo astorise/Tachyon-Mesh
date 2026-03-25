@@ -74,8 +74,14 @@ Compile it to WASI:
 cargo build -p guest-example --target wasm32-wasip1 --release
 ```
 
-### 3. Run the Host
-The host validates the `integrity.lock` signature and binds to your local port, ready to serve requests directly to the WASM modules.
+### 3. Seal the Runtime Configuration
+Generate the signed `integrity.lock` manifest that `core-host` embeds and validates at startup:
+```bash
+cargo run -p tachyon-cli -- generate --route /api/guest-example --memory 64
+```
+
+### 4. Run the Host
+The host validates the sealed `integrity.lock` manifest and binds to your local port, ready to serve requests directly to the WASM modules.
 ```bash
 cargo run -p core-host --release
 ```
@@ -84,9 +90,9 @@ cargo run -p core-host --release
 
 - [ ] **Phase 1:** Core Wasmtime Orchestrator & Axum HTTP Routing (In-memory pipes).
 - [ ] **Phase 2:** FaaS-Native Observability via `#[faas_handler]` macro.
-- [ ] **Phase 3:** Ed25519 Build-Time Cryptographic Validation (`cli-signer`).
+- [ ] **Phase 3:** Ed25519 Build-Time Cryptographic Validation (`tachyon-cli`).
 - [ ] **Phase 4:** Compile-Time Service Mesh (Traffic shifting & autonomous A/B testing).
-- [ ] **Phase 5:** Tauri GitOps Desktop Client for visual configuration generation.
+- [ ] **Phase 5:** Rich Tauri GitOps Desktop Client for visual configuration generation.
 - [ ] **Phase 6:** Hybrid Mesh: Ultra-light Rust sidecar for external OCI containers.
 
 ## 🤝 Contributing

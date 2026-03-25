@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli-signer", "core-host", "faas-sdk", "guest-example", "guest-malicious"]
+members = ["core-host", "faas-sdk", "guest-example", "guest-malicious", "tachyon-cli"]
 resolver = "2"
 
 [profile.release]

@@ -20,11 +20,18 @@ use wasmtime_wasi::{
     WasiCtxBuilder,
 };
 
-const HOST_ADDRESS: &str = "0.0.0.0:8080";
-const MAX_STDOUT_BYTES: usize = 64 * 1024;
-const GUEST_FUEL_BUDGET: u64 = 250_000;
-const GUEST_MEMORY_LIMIT_BYTES: usize = 50 * 1024 * 1024;
-const RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
+#[cfg(test)]
+const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
+#[cfg(test)]
+const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
+#[cfg(test)]
+const DEFAULT_GUEST_FUEL_BUDGET: u64 = 250_000;
+#[cfg(test)]
+const DEFAULT_GUEST_MEMORY_LIMIT_BYTES: usize = 50 * 1024 * 1024;
+#[cfg(test)]
+const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
+#[cfg(test)]
+const DEFAULT_ROUTE: &str = "/api/guest-example";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
@@ -32,6 +39,7 @@ const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
+    config: IntegrityConfig,
 }
 
 struct HostState {
@@ -68,13 +76,14 @@ struct GuestLogRecord {
     fields: Map<String, Value>,
 }
 
-#[derive(Serialize)]
-struct IntegrityConfig<'a> {
-    host_address: &'a str,
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct IntegrityConfig {
+    host_address: String,
     max_stdout_bytes: usize,
     guest_fuel_budget: u64,
     guest_memory_limit_bytes: usize,
-    resource_limit_response: &'a str,
+    resource_limit_response: String,
+    routes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -94,15 +103,21 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     init_host_tracing();
-    verify_integrity()?;
+    let config = verify_integrity()?;
 
     let app = build_app(AppState {
         engine: build_engine()?,
+        config: config.clone(),
     });
 
-    let listener = tokio::net::TcpListener::bind(HOST_ADDRESS)
+    let listener = tokio::net::TcpListener::bind(&config.host_address)
         .await
-        .with_context(|| format!("failed to bind HTTP listener on {HOST_ADDRESS}"))?;
+        .with_context(|| {
+            format!(
+                "failed to bind HTTP listener on {}",
+                config.host_address.as_str()
+            )
+        })?;
 
     axum::serve(listener, app)
         .await
@@ -120,25 +135,36 @@ async fn faas_handler(
     Path(path): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let Some(function_name) = resolve_function_name(&path) else {
+    let normalized_path = normalize_route_path(&path);
+    if !state.config.allows_route(&normalized_path) {
         return (
             StatusCode::NOT_FOUND,
-            format!("no guest function could be resolved from `{path}`"),
+            format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
+        )
+            .into_response();
+    }
+
+    let Some(function_name) = resolve_function_name(&normalized_path) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no guest function could be resolved from `{normalized_path}`"),
         )
             .into_response();
     };
 
     let engine = state.engine.clone();
+    let config = state.config.clone();
     let task_function_name = function_name.clone();
-    let result =
-        tokio::task::spawn_blocking(move || execute_guest(&engine, &task_function_name, body))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        execute_guest(&engine, &task_function_name, body, &config)
+    })
+    .await;
 
     match result {
         Ok(Ok(stdout)) => (StatusCode::OK, stdout).into_response(),
         Ok(Err(error)) => {
             error.log_if_needed(&function_name);
-            error.into_response().into_response()
+            error.into_response(&state.config).into_response()
         }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -152,6 +178,7 @@ fn execute_guest(
     engine: &Engine,
     function_name: &str,
     body: Bytes,
+    config: &IntegrityConfig,
 ) -> std::result::Result<Bytes, ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
@@ -162,15 +189,18 @@ fn execute_guest(
         )
     })?;
     let linker = build_linker(engine)?;
-    let stdout = MemoryOutputPipe::new(MAX_STDOUT_BYTES);
+    let stdout = MemoryOutputPipe::new(config.max_stdout_bytes);
     let wasi = WasiCtxBuilder::new()
         .stdin(MemoryInputPipe::new(body))
         .stdout(stdout.clone())
         .build_p1();
-    let mut store = Store::new(engine, HostState::new(wasi));
+    let mut store = Store::new(
+        engine,
+        HostState::new(wasi, config.guest_memory_limit_bytes),
+    );
     store.limiter(|state| &mut state.limits);
     store
-        .set_fuel(GUEST_FUEL_BUDGET)
+        .set_fuel(config.guest_fuel_budget)
         .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
     let instance = linker
         .instantiate(&mut store, &module)
@@ -202,6 +232,22 @@ fn resolve_function_name(path: &str) -> Option<String> {
         .rev()
         .find(|segment| !segment.is_empty() && *segment != "api")
         .map(ToOwned::to_owned)
+}
+
+fn normalize_route_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let with_leading_slash = if trimmed.starts_with('/') {
+        trimmed.to_owned()
+    } else {
+        format!("/{trimmed}")
+    };
+    let normalized = with_leading_slash.trim_end_matches('/');
+
+    if normalized.is_empty() {
+        "/".to_owned()
+    } else {
+        normalized.to_owned()
+    }
 }
 
 fn resolve_guest_module_path(
@@ -260,33 +306,86 @@ fn init_host_tracing() {
     });
 }
 
-fn verify_integrity() -> Result<()> {
-    let runtime_config = canonical_runtime_config_payload()?;
-
-    if runtime_config != EMBEDDED_CONFIG_PAYLOAD {
-        return Err(anyhow!(
-            "Integrity Validation Failed: embedded sealed configuration does not match runtime configuration"
-        ));
-    }
-
+fn verify_integrity() -> Result<IntegrityConfig> {
     verify_integrity_signature(
         EMBEDDED_CONFIG_PAYLOAD,
         EMBEDDED_PUBLIC_KEY,
         EMBEDDED_SIGNATURE,
     )?;
+    let config = serde_json::from_str::<IntegrityConfig>(EMBEDDED_CONFIG_PAYLOAD)
+        .context("failed to parse embedded sealed configuration")?;
+    let config = validate_integrity_config(config)?;
     tracing::info!("integrity verification passed");
-    Ok(())
+    Ok(config)
 }
 
-fn canonical_runtime_config_payload() -> Result<String> {
-    serde_json::to_string(&IntegrityConfig {
-        host_address: HOST_ADDRESS,
-        max_stdout_bytes: MAX_STDOUT_BYTES,
-        guest_fuel_budget: GUEST_FUEL_BUDGET,
-        guest_memory_limit_bytes: GUEST_MEMORY_LIMIT_BYTES,
-        resource_limit_response: RESOURCE_LIMIT_RESPONSE,
-    })
-    .context("failed to serialize runtime integrity configuration")
+fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityConfig> {
+    if config.host_address.trim().is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration is missing `host_address`"
+        ));
+    }
+
+    if config.max_stdout_bytes == 0 {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration is missing `max_stdout_bytes`"
+        ));
+    }
+
+    if config.guest_fuel_budget == 0 {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration is missing `guest_fuel_budget`"
+        ));
+    }
+
+    if config.guest_memory_limit_bytes == 0 {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration is missing `guest_memory_limit_bytes`"
+        ));
+    }
+
+    if config.resource_limit_response.trim().is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration is missing `resource_limit_response`"
+        ));
+    }
+
+    config.routes = normalize_config_routes(config.routes)?;
+    Ok(config)
+}
+
+fn normalize_config_routes(routes: Vec<String>) -> Result<Vec<String>> {
+    if routes.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration must define at least one route"
+        ));
+    }
+
+    let mut normalized = routes
+        .into_iter()
+        .map(|route| validate_route_path(&route))
+        .collect::<Result<Vec<_>>>()?;
+
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn validate_route_path(path: &str) -> Result<String> {
+    let normalized = normalize_route_path(path);
+
+    if normalized == "/" || resolve_function_name(&normalized).is_none() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{normalized}` does not resolve to a guest function"
+        ));
+    }
+
+    Ok(normalized)
+}
+
+#[cfg(test)]
+fn canonical_config_payload(config: &IntegrityConfig) -> Result<String> {
+    serde_json::to_string(config).context("failed to serialize runtime integrity configuration")
 }
 
 fn verify_integrity_signature(
@@ -415,11 +514,30 @@ fn forward_guest_log(function_name: &str, record: GuestLogRecord) {
 }
 
 impl HostState {
-    fn new(wasi: WasiP1Ctx) -> Self {
+    fn new(wasi: WasiP1Ctx, max_memory_bytes: usize) -> Self {
         Self {
             wasi,
-            limits: GuestResourceLimiter::new(GUEST_MEMORY_LIMIT_BYTES),
+            limits: GuestResourceLimiter::new(max_memory_bytes),
         }
+    }
+}
+
+impl IntegrityConfig {
+    #[cfg(test)]
+    fn default_sealed() -> Self {
+        Self {
+            host_address: DEFAULT_HOST_ADDRESS.to_owned(),
+            max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
+            guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
+            guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
+            resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            routes: vec![DEFAULT_ROUTE.to_owned()],
+        }
+    }
+
+    fn allows_route(&self, path: &str) -> bool {
+        let normalized = normalize_route_path(path);
+        self.routes.iter().any(|route| route == &normalized)
     }
 }
 
@@ -495,12 +613,12 @@ impl fmt::Display for GuestModuleNotFound {
 impl std::error::Error for GuestModuleNotFound {}
 
 impl ExecutionError {
-    fn into_response(self) -> (StatusCode, String) {
+    fn into_response(self, config: &IntegrityConfig) -> (StatusCode, String) {
         match self {
             Self::GuestModuleNotFound(error) => (StatusCode::NOT_FOUND, error.to_string()),
             Self::ResourceLimitExceeded { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                RESOURCE_LIMIT_RESPONSE.to_string(),
+                config.resource_limit_response.clone(),
             ),
             Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
         }
@@ -537,7 +655,8 @@ mod tests {
 
     #[test]
     fn verify_integrity_signature_accepts_valid_material() {
-        let payload = canonical_runtime_config_payload().expect("payload should serialize");
+        let payload = canonical_config_payload(&IntegrityConfig::default_sealed())
+            .expect("payload should serialize");
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let signature = signing_key.sign(&Sha256::digest(payload.as_bytes()));
 
@@ -551,7 +670,8 @@ mod tests {
 
     #[test]
     fn verify_integrity_signature_rejects_tampered_payload() {
-        let payload = canonical_runtime_config_payload().expect("payload should serialize");
+        let payload = canonical_config_payload(&IntegrityConfig::default_sealed())
+            .expect("payload should serialize");
         let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
         let signature = signing_key.sign(&Sha256::digest(payload.as_bytes()));
 
@@ -571,8 +691,14 @@ mod tests {
     #[test]
     fn execute_guest_returns_stdout_payload() {
         let engine = build_engine().expect("engine should be created");
-        let response = execute_guest(&engine, "guest-example", Bytes::from("Hello Lean FaaS!"))
-            .expect("guest execution should succeed");
+        let config = IntegrityConfig::default_sealed();
+        let response = execute_guest(
+            &engine,
+            "guest-example",
+            Bytes::from("Hello Lean FaaS!"),
+            &config,
+        )
+        .expect("guest execution should succeed");
 
         assert_eq!(
             String::from_utf8_lossy(&response).trim(),
@@ -584,6 +710,7 @@ mod tests {
     async fn router_returns_guest_stdout_for_post_request() {
         let app = build_app(AppState {
             engine: build_engine().expect("engine should be created"),
+            config: IntegrityConfig::default_sealed(),
         });
         let response = app
             .oneshot(
@@ -609,13 +736,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn router_rejects_unsealed_routes() {
+        let app = build_app(AppState {
+            engine: build_engine().expect("engine should be created"),
+            config: IntegrityConfig::default_sealed(),
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/guest-malicious")
+                    .body(Body::from("blocked"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn guest_resource_limiter_rejects_memory_growth_past_ceiling() {
-        let mut limiter = GuestResourceLimiter::new(GUEST_MEMORY_LIMIT_BYTES);
+        let config = IntegrityConfig::default_sealed();
+        let mut limiter = GuestResourceLimiter::new(config.guest_memory_limit_bytes);
         let error = limiter
             .memory_growing(
-                GUEST_MEMORY_LIMIT_BYTES,
-                GUEST_MEMORY_LIMIT_BYTES + 64 * 1024,
+                config.guest_memory_limit_bytes,
+                config.guest_memory_limit_bytes + 64 * 1024,
                 None,
             )
             .expect_err("growth past the quota should fail");
@@ -630,19 +776,49 @@ mod tests {
 
     #[test]
     fn error_response_normalizes_resource_limit_failures() {
+        let config = IntegrityConfig::default_sealed();
         let response = ExecutionError::ResourceLimitExceeded {
             kind: ResourceLimitKind::Memory,
             detail: "guest exceeded its memory quota".to_string(),
         }
-        .into_response();
+        .into_response(&config);
 
         assert_eq!(
             response,
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                RESOURCE_LIMIT_RESPONSE.to_string(),
+                config.resource_limit_response,
             )
         );
+    }
+
+    #[test]
+    fn validate_integrity_config_normalizes_routes() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![
+            "api/guest-example".to_owned(),
+            "/api/guest-example/".to_owned(),
+            "/api/guest-malicious".to_owned(),
+        ];
+
+        let config = validate_integrity_config(config).expect("config should validate");
+
+        assert_eq!(
+            config.routes,
+            vec![
+                "/api/guest-example".to_owned(),
+                "/api/guest-malicious".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn embedded_integrity_payload_is_a_valid_runtime_config() {
+        let config = serde_json::from_str::<IntegrityConfig>(EMBEDDED_CONFIG_PAYLOAD)
+            .expect("embedded payload should deserialize into an integrity config");
+        let config = validate_integrity_config(config).expect("embedded config should validate");
+
+        assert!(config.allows_route("/api/guest-example"));
     }
 
     #[test]
