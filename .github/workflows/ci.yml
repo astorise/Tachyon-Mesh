@@ -49,11 +49,11 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Run tests
-        run: cargo test --workspace
-
       - name: Build guest-example for WASI
         run: cargo build -p guest-example --target wasm32-wasip1 --release
+
+      - name: Run tests
+        run: cargo test --workspace
 
       - name: Build core-host in release mode
         run: cargo build -p core-host --release
