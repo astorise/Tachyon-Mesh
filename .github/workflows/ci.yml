@@ -20,6 +20,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+
       - name: Install Linux system dependencies for Tauri
         run: |
           sudo apt-get update
@@ -57,3 +62,17 @@ jobs:
 
       - name: Build core-host in release mode
         run: cargo build -p core-host --release
+
+      - name: Build tachyon-cli in release mode
+        run: cargo build -p tachyon-cli --release
+
+      - name: Upload CI build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tachyon-mesh-build-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            integrity.lock
+            target/release/core-host
+            target/release/tachyon-cli
+            target/wasm32-wasip1/release/guest_example.wasm
