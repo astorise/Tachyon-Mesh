@@ -41,7 +41,7 @@ COPY . .
 RUN mkdir -p guest-modules
 RUN cargo build -p guest-example --target wasm32-wasip1 --release
 RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
-RUN tinygo build -o /workspace/guest-modules/guest_go.wasm -target=wasip1 ./guest-go
+RUN cd /workspace/guest-go && tinygo build -o /workspace/guest-modules/guest_go.wasm -target=wasip1 .
 RUN javy build /workspace/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-cli --release
