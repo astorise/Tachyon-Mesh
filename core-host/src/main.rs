@@ -4,10 +4,11 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::post,
+    routing::any,
     Router,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use reqwest::Client;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -40,6 +41,7 @@ const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
 struct AppState {
     engine: Engine,
     config: IntegrityConfig,
+    http_client: Client,
 }
 
 struct HostState {
@@ -108,6 +110,7 @@ async fn run() -> Result<()> {
     let app = build_app(AppState {
         engine: build_engine()?,
         config: config.clone(),
+        http_client: Client::new(),
     });
 
     let listener = tokio::net::TcpListener::bind(&config.host_address)
@@ -126,7 +129,7 @@ async fn run() -> Result<()> {
 
 fn build_app(state: AppState) -> Router {
     Router::new()
-        .route("/*path", post(faas_handler))
+        .route("/*path", any(faas_handler))
         .with_state(state)
 }
 
@@ -161,7 +164,10 @@ async fn faas_handler(
     .await;
 
     match result {
-        Ok(Ok(stdout)) => (StatusCode::OK, stdout).into_response(),
+        Ok(Ok(stdout)) => match resolve_mesh_response(&state.http_client, stdout).await {
+            Ok(response_body) => (StatusCode::OK, response_body).into_response(),
+            Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+        },
         Ok(Err(error)) => {
             error.log_if_needed(&function_name);
             error.into_response(&state.config).into_response()
@@ -172,6 +178,37 @@ async fn faas_handler(
         )
             .into_response(),
     }
+}
+
+async fn resolve_mesh_response(
+    http_client: &Client,
+    stdout: Bytes,
+) -> std::result::Result<Bytes, String> {
+    let Some(url) = extract_mesh_fetch_url(&stdout) else {
+        return Ok(stdout);
+    };
+
+    let response = http_client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("mesh fetch to `{url}` failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("mesh fetch to `{url}` returned an error status: {error}"))?;
+
+    response
+        .bytes()
+        .await
+        .map_err(|error| format!("failed to read mesh fetch response body from `{url}`: {error}"))
+}
+
+fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
+    std::str::from_utf8(stdout)
+        .ok()?
+        .trim()
+        .strip_prefix("MESH_FETCH:")
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
 }
 
 fn execute_guest(
@@ -729,6 +766,7 @@ mod tests {
         let app = build_app(AppState {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
+            http_client: Client::new(),
         });
         let response = app
             .oneshot(
@@ -755,10 +793,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_accepts_get_requests() {
+        let app = build_app(AppState {
+            engine: build_engine().expect("engine should be created"),
+            config: IntegrityConfig::default_sealed(),
+            http_client: Client::new(),
+        });
+        let response = app
+            .oneshot(
+                Request::get("/api/guest-example")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+
+        assert_eq!(
+            String::from_utf8_lossy(&body).trim(),
+            "FaaS received an empty payload"
+        );
+    }
+
+    #[tokio::test]
     async fn router_rejects_unsealed_routes() {
         let app = build_app(AppState {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
+            http_client: Client::new(),
         });
         let response = app
             .oneshot(
@@ -790,6 +860,23 @@ mod tests {
                 .map(|error| error.kind),
             Some(ResourceLimitKind::Memory)
         );
+    }
+
+    #[test]
+    fn extract_mesh_fetch_url_recognizes_bridge_command() {
+        let stdout = Bytes::from("MESH_FETCH:http://legacy-service:8081/ping\n");
+
+        assert_eq!(
+            extract_mesh_fetch_url(&stdout),
+            Some("http://legacy-service:8081/ping")
+        );
+    }
+
+    #[test]
+    fn extract_mesh_fetch_url_ignores_regular_guest_output() {
+        let stdout = Bytes::from("FaaS received: Hello Lean FaaS!\n");
+
+        assert_eq!(extract_mesh_fetch_url(&stdout), None);
     }
 
     #[test]

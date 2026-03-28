@@ -12,8 +12,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Build container image
-        run: docker build -t tachyon-mesh:test .
+      - name: Build container images
+        run: |
+          docker build -t tachyon-mesh:test .
+          docker build --target legacy-runtime -t legacy-mock:test .
 
       - name: Install kubectl
         run: |
@@ -28,51 +30,84 @@ jobs:
           curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
           k3d version
 
-      - name: Create cluster and import local image
+      - name: Create cluster and import local images
         run: |
           k3d cluster create tachyon-mesh --wait
-          k3d image import tachyon-mesh:test -c tachyon-mesh
+          k3d image import tachyon-mesh:test legacy-mock:test -c tachyon-mesh
           kubectl cluster-info
 
       - name: Deploy workload
         run: |
           kubectl apply -f manifests/deploy.yaml
           kubectl wait --for=condition=available --timeout=180s deployment/tachyon-host
+          kubectl wait --for=condition=available --timeout=180s deployment/legacy-deployment
 
-      - name: Verify guest endpoint
+      - name: Verify hybrid mesh traffic matrix
         run: |
           kubectl port-forward service/tachyon-service 8080:8080 >/tmp/tachyon-port-forward.log 2>&1 &
-          PORT_FORWARD_PID=$!
+          TACHYON_PORT_FORWARD_PID=$!
+          kubectl port-forward service/legacy-service 8081:8081 >/tmp/legacy-port-forward.log 2>&1 &
+          LEGACY_PORT_FORWARD_PID=$!
 
           cleanup() {
-            kill "${PORT_FORWARD_PID}" || true
+            kill "${TACHYON_PORT_FORWARD_PID}" "${LEGACY_PORT_FORWARD_PID}" || true
           }
 
           trap cleanup EXIT
 
-          success=0
-          for attempt in $(seq 1 20); do
-            if curl --fail --show-error --silent --request POST --data 'Hello Lean FaaS!' \
-              http://127.0.0.1:8080/api/guest-example >/tmp/tachyon-response.txt; then
-              success=1
-              break
+          retry_curl() {
+            local output_file="$1"
+            shift
+            local success=0
+
+            for attempt in $(seq 1 20); do
+              if curl --fail --show-error --silent "$@" >"${output_file}"; then
+                success=1
+                break
+              fi
+
+              sleep 2
+            done
+
+            if [ "${success}" -ne 1 ]; then
+              cat /tmp/tachyon-port-forward.log || true
+              cat /tmp/legacy-port-forward.log || true
+              return 1
             fi
+          }
 
-            sleep 2
-          done
+          assert_contains() {
+            local expected="$1"
+            local file="$2"
 
-          if [ "${success}" -ne 1 ]; then
-            cat /tmp/tachyon-port-forward.log || true
-            exit 1
-          fi
+            if ! grep -F "${expected}" "${file}" >/dev/null; then
+              echo "Expected response to contain: ${expected}"
+              cat "${file}" || true
+              exit 1
+            fi
+          }
 
-          grep -F "FaaS received: Hello Lean FaaS!" /tmp/tachyon-response.txt
+          retry_curl /tmp/legacy-direct.txt http://127.0.0.1:8081/ping
+          assert_contains "legacy_ok" /tmp/legacy-direct.txt
+
+          retry_curl /tmp/faas-direct.txt --request POST --data 'Hello Lean FaaS!' http://127.0.0.1:8080/api/guest-example
+          assert_contains "FaaS received: Hello Lean FaaS!" /tmp/faas-direct.txt
+
+          retry_curl /tmp/legacy-to-faas.txt --request POST http://127.0.0.1:8081/call-faas
+          assert_contains "FaaS received an empty payload" /tmp/legacy-to-faas.txt
+
+          retry_curl /tmp/faas-to-legacy.txt http://127.0.0.1:8080/api/guest-call-legacy
+          assert_contains "legacy_ok" /tmp/faas-to-legacy.txt
 
       - name: Show diagnostics on failure
         if: failure()
         run: |
           kubectl get pods -o wide || true
           kubectl describe deployment/tachyon-host || true
+          kubectl describe deployment/legacy-deployment || true
           kubectl describe pod -l app=tachyon-host || true
+          kubectl describe pod -l app=legacy-mock || true
           kubectl logs deployment/tachyon-host || true
+          kubectl logs deployment/legacy-deployment || true
           cat /tmp/tachyon-port-forward.log || true
+          cat /tmp/legacy-port-forward.log || true

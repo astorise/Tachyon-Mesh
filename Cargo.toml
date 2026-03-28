@@ -1,5 +1,13 @@
 [workspace]
-members = ["core-host", "faas-sdk", "guest-example", "guest-malicious", "tachyon-cli"]
+members = [
+    "core-host",
+    "faas-sdk",
+    "guest-call-legacy",
+    "guest-example",
+    "guest-malicious",
+    "legacy-mock",
+    "tachyon-cli",
+]
 resolver = "2"
 
 [profile.release]

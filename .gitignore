@@ -1,3 +1,4 @@
 **/target/*
 *.log
 .codex-tmp/*
+.vscode/*

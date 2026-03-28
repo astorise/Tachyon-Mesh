@@ -1,5 +1,5 @@
 {
-  "config_payload": "{\"host_address\":\"0.0.0.0:8080\",\"max_stdout_bytes\":65536,\"guest_fuel_budget\":250000,\"guest_memory_limit_bytes\":67108864,\"resource_limit_response\":\"Execution trapped: Resource limit exceeded\",\"routes\":[\"/api/guest-example\"]}",
-  "public_key": "4282890d3fcad94b59ad4548e5260927ea4303c3c879917454b2d9e6cf23f7a4",
-  "signature": "6b781abbf1a51b8406d3cf5a7194beceab5941268a50d627de41597449840a7b36df528e9a1648b0ee6681dd6e536658d2ef35efbb70cc6a94bea6fea7848407"
+  "config_payload": "{\"host_address\":\"0.0.0.0:8080\",\"max_stdout_bytes\":65536,\"guest_fuel_budget\":250000,\"guest_memory_limit_bytes\":67108864,\"resource_limit_response\":\"Execution trapped: Resource limit exceeded\",\"routes\":[\"/api/guest-call-legacy\",\"/api/guest-example\"]}",
+  "public_key": "9c342cfb76aa54b89568c5ccb9fceb112f5db0460cd878567ee78a787ee7cc44",
+  "signature": "cd0d734302464f9fee00e6f2f868dfa5622d3420108f04416e101c3e06ead41b7e886b91df1d6d393962905a870bb50711e799f021fbfa3d304967364421b201"
 }

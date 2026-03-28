@@ -36,3 +36,46 @@ spec:
       port: 8080
       protocol: TCP
       targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: legacy-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: legacy-mock
+  template:
+    metadata:
+      labels:
+        app: legacy-mock
+    spec:
+      containers:
+        - name: legacy-mock
+          image: legacy-mock:test
+          imagePullPolicy: Never
+          env:
+            - name: FAAS_URL
+              value: http://tachyon-service:8080/api/guest-example
+          ports:
+            - containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8081
+            periodSeconds: 2
+            failureThreshold: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-service
+spec:
+  selector:
+    app: legacy-mock
+  ports:
+    - name: http
+      port: 8081
+      protocol: TCP
+      targetPort: 8081
