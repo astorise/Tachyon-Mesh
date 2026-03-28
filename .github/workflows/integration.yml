@@ -93,6 +93,12 @@ jobs:
           retry_curl /tmp/faas-direct.txt --request POST --data 'Hello Lean FaaS!' http://127.0.0.1:8080/api/guest-example
           assert_contains "FaaS received: Hello Lean FaaS!" /tmp/faas-direct.txt
 
+          retry_curl /tmp/faas-go.txt http://127.0.0.1:8080/api/guest-go
+          assert_contains "Hello from TinyGo FaaS!" /tmp/faas-go.txt
+
+          retry_curl /tmp/faas-js.txt http://127.0.0.1:8080/api/guest-js
+          assert_contains "Hello from JavaScript FaaS!" /tmp/faas-js.txt
+
           retry_curl /tmp/legacy-to-faas.txt --request POST http://127.0.0.1:8081/call-faas
           assert_contains "FaaS received an empty payload" /tmp/legacy-to-faas.txt
 

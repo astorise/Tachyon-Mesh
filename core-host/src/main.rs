@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{fmt, path::PathBuf, sync::Once};
-use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, Trap, TypedFunc};
+use wasmtime::{Config, Engine, Instance, Linker, Module, ResourceLimiter, Store, Trap, TypedFunc};
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
@@ -242,18 +242,31 @@ fn execute_guest(
     let instance = linker
         .instantiate(&mut store, &module)
         .map_err(|error| guest_execution_error(error, "failed to instantiate guest module"))?;
-    let faas_entry: TypedFunc<(), ()> =
-        instance
-            .get_typed_func(&mut store, "faas_entry")
-            .map_err(|error| {
-                guest_execution_error(error, "failed to resolve exported function `faas_entry`")
-            })?;
+    let (entrypoint_name, entrypoint) =
+        resolve_guest_entrypoint(&mut store, &instance).map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to resolve exported function `faas_entry` or `_start`",
+            )
+        })?;
 
-    faas_entry
-        .call(&mut store, ())
-        .map_err(|error| guest_execution_error(error, "guest function `faas_entry` trapped"))?;
+    entrypoint.call(&mut store, ()).map_err(|error| {
+        guest_execution_error(error, format!("guest function `{entrypoint_name}` trapped"))
+    })?;
 
     Ok(split_guest_stdout(function_name, stdout.contents()))
+}
+
+fn resolve_guest_entrypoint(
+    store: &mut Store<HostState>,
+    instance: &Instance,
+) -> std::result::Result<(&'static str, TypedFunc<(), ()>), wasmtime::Error> {
+    match instance.get_typed_func(&mut *store, "faas_entry") {
+        Ok(entrypoint) => Ok(("faas_entry", entrypoint)),
+        Err(_) => instance
+            .get_typed_func(&mut *store, "_start")
+            .map(|entrypoint| ("_start", entrypoint)),
+    }
 }
 
 fn build_linker(engine: &Engine) -> std::result::Result<Linker<HostState>, ExecutionError> {
