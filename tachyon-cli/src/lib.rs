@@ -43,6 +43,12 @@ pub fn run() {
 }
 
 fn run_inner() -> Result<()> {
+    if let Some(request) = parse_generate_request_from_args(std::env::args().skip(1))? {
+        let manifest_path = generate_manifest(request)?;
+        println!("wrote integrity manifest to {}", manifest_path.display());
+        return Ok(());
+    }
+
     #[cfg(desktop)]
     {
         tauri::Builder::default()
@@ -93,6 +99,56 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
     let manifest_path = generate_manifest(request)?;
     println!("wrote integrity manifest to {}", manifest_path.display());
     Ok(())
+}
+
+fn parse_generate_request_from_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<Option<GenerateRequest>> {
+    let mut args = args.into_iter();
+    let Some(subcommand) = args.next() else {
+        return Ok(None);
+    };
+
+    if subcommand != "generate" {
+        bail!("unsupported subcommand `{subcommand}`; expected `generate`");
+    }
+
+    let mut routes = Vec::new();
+    let mut memory_mib = None;
+
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--route=") {
+            routes.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--route" {
+            let route = args
+                .next()
+                .context("missing value for `--route`; expected `--route /api/guest-example`")?;
+            routes.push(route);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--memory=") {
+            memory_mib = Some(parse_memory_value(value)?);
+            continue;
+        }
+
+        if arg == "--memory" {
+            let value = args
+                .next()
+                .context("missing value for `--memory`; expected `--memory 64`")?;
+            memory_mib = Some(parse_memory_value(&value)?);
+            continue;
+        }
+
+        bail!("unexpected argument `{arg}`");
+    }
+
+    let memory_mib = memory_mib.context("missing required `--memory` argument")?;
+
+    Ok(Some(GenerateRequest { routes, memory_mib }))
 }
 
 fn generate_manifest(request: GenerateRequest) -> Result<PathBuf> {
@@ -182,6 +238,10 @@ fn parse_memory_arg(
         _ => bail!("`--memory` must be provided as a number in MiB"),
     };
 
+    parse_memory_value(&value)
+}
+
+fn parse_memory_value(value: &str) -> Result<u32> {
     let memory_mib = value
         .parse::<u32>()
         .with_context(|| format!("failed to parse `--memory {value}` as an unsigned integer"))?;
@@ -287,5 +347,42 @@ mod tests {
             .canonical_payload()
             .expect("payload should serialize deterministically");
         assert!(payload.contains("\"routes\":[\"/api/guest-example\"]"));
+    }
+
+    #[test]
+    fn parse_generate_request_supports_headless_cli_arguments() {
+        let request = parse_generate_request_from_args(
+            [
+                "generate",
+                "--route",
+                "/api/guest-example",
+                "--route=/api/guest-malicious",
+                "--memory",
+                "64",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("arguments should parse")
+        .expect("subcommand should be detected");
+
+        assert_eq!(
+            request,
+            GenerateRequest {
+                routes: vec![
+                    "/api/guest-example".to_owned(),
+                    "/api/guest-malicious".to_owned()
+                ],
+                memory_mib: 64,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_generate_request_returns_none_without_arguments() {
+        let request = parse_generate_request_from_args(std::iter::empty::<String>())
+            .expect("empty arguments should be accepted");
+
+        assert!(request.is_none());
     }
 }

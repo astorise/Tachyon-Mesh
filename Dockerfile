@@ -28,7 +28,8 @@ WORKDIR /workspace
 COPY . .
 
 RUN cargo build -p guest-example --target wasm32-wasip1 --release
-RUN cargo run -p tachyon-cli -- generate --route /api/guest-example --memory 64
+RUN cargo build -p tachyon-cli --release
+RUN ./target/release/tachyon-cli generate --route /api/guest-example --memory 64
 RUN cargo build -p core-host --target x86_64-unknown-linux-musl --release
 
 FROM scratch AS runtime
