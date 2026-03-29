@@ -1002,8 +1002,14 @@ impl ExecutionError {
     }
 
     fn log_if_needed(&self, function_name: &str) {
-        if let Self::ResourceLimitExceeded { kind, detail } = self {
-            eprintln!("warning: guest `{function_name}` exceeded its {kind} quota: {detail}");
+        match self {
+            Self::ResourceLimitExceeded { kind, detail } => {
+                eprintln!("warning: guest `{function_name}` exceeded its {kind} quota: {detail}");
+            }
+            Self::Internal(message) => {
+                eprintln!("error: guest `{function_name}` failed: {message}");
+            }
+            Self::GuestModuleNotFound(_) => {}
         }
     }
 }
