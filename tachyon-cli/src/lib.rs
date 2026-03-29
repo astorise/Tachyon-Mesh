@@ -96,7 +96,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         .context("failed to parse Tauri CLI arguments")?;
     let subcommand = matches
         .subcommand
-        .context("expected `generate` subcommand, for example `tachyon-cli generate --route /api/guest-example --memory 64`")?;
+        .context("expected `generate` subcommand, for example `tachyon-cli generate --route /api/guest-example --system-route /metrics --memory 64`")?;
 
     if subcommand.name != "generate" {
         bail!(
