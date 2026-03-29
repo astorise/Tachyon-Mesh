@@ -1,8 +1,5 @@
-# polyglot-faas Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change polyglot-faas. Update Purpose after archive.
-## Requirements
 ### Requirement: Repository packages polyglot WASI guest modules
 The repository SHALL include Go, JavaScript, C#, and Java guest examples that compile into standalone WASI modules and ship in the host runtime image alongside the Rust guest modules.
 
@@ -26,4 +23,3 @@ The repository SHALL verify that the deployed host can serve Go, JavaScript, C#,
 - **AND** `GET /api/guest-csharp` returns `Hello from C# FaaS!`
 - **AND** `GET /api/guest-java` returns `Hello from Java FaaS!`
 - **AND** the same host execution pipeline continues to serve the existing Rust guest routes
-

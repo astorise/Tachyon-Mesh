@@ -1,4 +1,6 @@
 **/target/*
+**/bin/*
+**/obj/*
 *.log
 .codex-tmp/*
 .vscode/*

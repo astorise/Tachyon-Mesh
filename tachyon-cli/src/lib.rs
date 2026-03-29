@@ -8,7 +8,7 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
-const DEFAULT_GUEST_FUEL_BUDGET: u64 = 250_000;
+const DEFAULT_GUEST_FUEL_BUDGET: u64 = 50_000_000;
 const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

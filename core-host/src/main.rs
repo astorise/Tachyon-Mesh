@@ -26,7 +26,7 @@ const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
 #[cfg(test)]
 const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
 #[cfg(test)]
-const DEFAULT_GUEST_FUEL_BUDGET: u64 = 250_000;
+const DEFAULT_GUEST_FUEL_BUDGET: u64 = 50_000_000;
 #[cfg(test)]
 const DEFAULT_GUEST_MEMORY_LIMIT_BYTES: usize = 50 * 1024 * 1024;
 #[cfg(test)]
@@ -937,6 +937,8 @@ mod tests {
         let config = validate_integrity_config(config).expect("embedded config should validate");
 
         assert!(config.allows_route("/api/guest-example"));
+        assert!(config.allows_route("/api/guest-csharp"));
+        assert!(config.allows_route("/api/guest-java"));
     }
 
     #[test]
@@ -953,6 +955,26 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|path| path.ends_with("guest-modules/guest_example.wasm")));
+    }
+
+    #[test]
+    fn guest_module_candidates_normalize_hyphenated_names_to_underscores() {
+        let candidates = guest_module_candidate_paths("guest-csharp")
+            .into_iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with("guest-modules/guest_csharp.wasm")));
+    }
+
+    #[test]
+    fn resolve_function_name_supports_hyphenated_guest_routes() {
+        assert_eq!(
+            resolve_function_name("/api/guest-java"),
+            Some("guest-java".to_owned())
+        );
     }
 
     #[test]
