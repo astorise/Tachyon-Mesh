@@ -59,7 +59,7 @@ RUN cd /workspace/guest-go && tinygo build -o /workspace/guest-modules/guest_go.
 RUN javy build /workspace/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
 RUN dotnet publish /workspace/guest-csharp/guest-csharp.csproj -c Release \
     && cp /workspace/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/guest_csharp.wasm /workspace/guest-modules/guest_csharp.wasm
-RUN mvn -q -f /workspace/guest-java/pom.xml package \
+RUN mvn -B --no-transfer-progress -e -f /workspace/guest-java/pom.xml clean package \
     && cp /workspace/guest-java/target/teavm-wasi/guest_java.wasm /workspace/guest-modules/guest_java.wasm
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-cli --release

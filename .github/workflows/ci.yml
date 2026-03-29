@@ -82,6 +82,8 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: rust-ci
     runs-on: ubuntu-latest
+    env:
+      BUILDKIT_PROGRESS: plain
     permissions:
       contents: read
       packages: write
