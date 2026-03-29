@@ -593,13 +593,22 @@ fn handle_guest_entrypoint_result(
 ) -> std::result::Result<(), ExecutionError> {
     match result {
         Ok(()) => Ok(()),
-        Err(error)
-            if error
-                .downcast_ref::<I32Exit>()
-                .is_some_and(|exit| exit.0 == 0) =>
-        {
-            Ok(())
-        }
+        Err(error) if entrypoint_name == "_start" => match error.downcast_ref::<I32Exit>() {
+            Some(exit) => {
+                if exit.0 != 0 {
+                    tracing::warn!(
+                        guest_entrypoint = entrypoint_name,
+                        exit_status = exit.0,
+                        "command-style WASI guest exited non-zero; preserving stdout response"
+                    );
+                }
+                Ok(())
+            }
+            None => Err(guest_execution_error(
+                error,
+                format!("guest function `{entrypoint_name}` trapped"),
+            )),
+        },
         Err(error) => Err(guest_execution_error(
             error,
             format!("guest function `{entrypoint_name}` trapped"),
@@ -1373,9 +1382,16 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_exit_status_from_command_guest_remains_an_error() {
-        let error = handle_guest_entrypoint_result("_start", Err(I32Exit(1).into()))
-            .expect_err("non-zero command exit should fail");
+    fn nonzero_exit_status_from_start_guest_is_preserved_as_success() {
+        let result = handle_guest_entrypoint_result("_start", Err(I32Exit(1).into()));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn nonzero_exit_status_from_faas_entry_remains_an_error() {
+        let error = handle_guest_entrypoint_result("faas_entry", Err(I32Exit(1).into()))
+            .expect_err("non-zero faas_entry exit should fail");
 
         match error {
             ExecutionError::Internal(message) => {
