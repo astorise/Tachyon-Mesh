@@ -15,6 +15,27 @@ interface handler {
     handle-request: func(req: request) -> response;
 }
 
+interface telemetry-reader {
+    record metrics-snapshot {
+        total-requests: u64,
+        completed-requests: u64,
+        error-requests: u64,
+        active-requests: u32,
+        dropped-events: u64,
+        last-status: u16,
+        total-duration-us: u64,
+        total-wasm-duration-us: u64,
+        total-host-overhead-us: u64,
+    }
+
+    get-metrics: func() -> metrics-snapshot;
+}
+
 world faas-guest {
+    export handler;
+}
+
+world system-faas-guest {
+    import telemetry-reader;
     export handler;
 }

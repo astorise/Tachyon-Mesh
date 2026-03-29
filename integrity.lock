@@ -1,5 +1,5 @@
 {
-  "config_payload": "{\"host_address\":\"0.0.0.0:8080\",\"max_stdout_bytes\":65536,\"guest_fuel_budget\":500000000,\"guest_memory_limit_bytes\":67108864,\"resource_limit_response\":\"Execution trapped: Resource limit exceeded\",\"routes\":[\"/api/guest-call-legacy\",\"/api/guest-csharp\",\"/api/guest-example\",\"/api/guest-go\",\"/api/guest-java\",\"/api/guest-js\"]}",
-  "public_key": "7e3b7a4b89e39de20fe4fb1fdd042f78daa66b0dc7f47ec00f63a065b0cdc9d5",
-  "signature": "74b23fd3b641d0ecf04aa5b6ddc6264d8b45901110033bf13e54825a1eeb9bcc7f47bfa2dba790bb264f03b548e22acb4e9a71b069a467fe08a8e268c0019504"
+  "config_payload": "{\"host_address\":\"0.0.0.0:8080\",\"max_stdout_bytes\":65536,\"guest_fuel_budget\":500000000,\"guest_memory_limit_bytes\":67108864,\"resource_limit_response\":\"Execution trapped: Resource limit exceeded\",\"routes\":[{\"path\":\"/api/guest-call-legacy\",\"role\":\"user\"},{\"path\":\"/api/guest-csharp\",\"role\":\"user\"},{\"path\":\"/api/guest-example\",\"role\":\"user\"},{\"path\":\"/api/guest-go\",\"role\":\"user\"},{\"path\":\"/api/guest-java\",\"role\":\"user\"},{\"path\":\"/api/guest-js\",\"role\":\"user\"},{\"path\":\"/metrics\",\"role\":\"system\"}]}",
+  "public_key": "83110ee8683874da4069e04fe7b2264b28eb907c3b274869792174a3b32db534",
+  "signature": "1ba23486db09fd8cc46df259e726b6cf62fdf19bec22e1f935d3665fe3b12f6288ab7ffae738e1b1c838079eacdef3d39fc5de6d96c7e7fc8a2edd2e891eb30f"
 }

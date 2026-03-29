@@ -19,7 +19,7 @@ use std::{
     sync::Once,
     time::Instant,
 };
-use telemetry::{TelemetryEvent, TelemetrySender};
+use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
@@ -41,6 +41,13 @@ mod component_bindings {
     });
 }
 
+mod system_component_bindings {
+    wasmtime::component::bindgen!({
+        path: "../wit",
+        world: "system-faas-guest",
+    });
+}
+
 #[cfg(test)]
 const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
 #[cfg(test)]
@@ -53,16 +60,19 @@ const DEFAULT_GUEST_MEMORY_LIMIT_BYTES: usize = 50 * 1024 * 1024;
 const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
 #[cfg(test)]
 const DEFAULT_ROUTE: &str = "/api/guest-example";
+#[cfg(test)]
+const DEFAULT_SYSTEM_ROUTE: &str = "/metrics";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
+const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
     config: IntegrityConfig,
     http_client: Client,
-    telemetry: TelemetrySender,
+    telemetry: TelemetryHandle,
 }
 
 struct LegacyHostState {
@@ -74,11 +84,12 @@ struct ComponentHostState {
     ctx: WasiCtx,
     table: ResourceTable,
     limits: GuestResourceLimiter,
+    telemetry: TelemetryHandle,
 }
 
 #[derive(Clone)]
 struct GuestTelemetryContext {
-    sender: TelemetrySender,
+    handle: TelemetryHandle,
     trace_id: String,
 }
 
@@ -106,6 +117,13 @@ enum GuestExecutionOutput {
     LegacyStdout(Bytes),
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RouteRole {
+    User,
+    System,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResourceLimitKind {
     Fuel,
@@ -131,13 +149,19 @@ struct GuestLogRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct IntegrityRoute {
+    path: String,
+    role: RouteRole,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct IntegrityConfig {
     host_address: String,
     max_stdout_bytes: usize,
     guest_fuel_budget: u64,
     guest_memory_limit_bytes: usize,
     resource_limit_response: String,
-    routes: Vec<String>,
+    routes: Vec<IntegrityRoute>,
 }
 
 #[derive(Debug)]
@@ -193,6 +217,7 @@ async fn faas_handler(
     uri: Uri,
     body: Bytes,
 ) -> impl IntoResponse {
+    let _active_request = telemetry::begin_request(&state.telemetry);
     let normalized_path = normalize_route_path(uri.path());
     let trace_id = Uuid::new_v4().to_string();
     telemetry::record_event(
@@ -204,68 +229,82 @@ async fn faas_handler(
         },
     );
 
-    let response: Response = if !state.config.allows_route(&normalized_path) {
-        (
+    let response: Response = match state.config.sealed_route(&normalized_path).cloned() {
+        None => (
             StatusCode::NOT_FOUND,
             format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
         )
-            .into_response()
-    } else {
-        match resolve_function_name(&normalized_path) {
-            Some(function_name) => {
-                let engine = state.engine.clone();
-                let config = state.config.clone();
-                let telemetry_context = GuestTelemetryContext {
-                    sender: state.telemetry.clone(),
-                    trace_id: trace_id.clone(),
-                };
-                let task_function_name = function_name.clone();
-                let guest_request = GuestRequest {
-                    method: method.to_string(),
-                    uri: uri.to_string(),
-                    body,
-                };
-                let result = tokio::task::spawn_blocking(move || {
-                    execute_guest(
-                        &engine,
-                        &task_function_name,
-                        guest_request,
-                        &config,
-                        Some(telemetry_context),
-                    )
-                })
-                .await;
-
-                match result {
-                    Ok(Ok(output)) => {
-                        let (status, body) = match output {
-                            GuestExecutionOutput::Http(response) => {
-                                (response.status, response.body)
-                            }
-                            GuestExecutionOutput::LegacyStdout(stdout) => (StatusCode::OK, stdout),
+            .into_response(),
+        Some(route) => {
+            if route.role == RouteRole::System && should_shed_system_route(&state.telemetry) {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("system route `{normalized_path}` shed under load"),
+                )
+                    .into_response()
+            } else {
+                match resolve_function_name(&normalized_path) {
+                    Some(function_name) => {
+                        let engine = state.engine.clone();
+                        let config = state.config.clone();
+                        let telemetry_context = GuestTelemetryContext {
+                            handle: state.telemetry.clone(),
+                            trace_id: trace_id.clone(),
                         };
+                        let runtime_telemetry = state.telemetry.clone();
+                        let task_function_name = function_name.clone();
+                        let guest_request = GuestRequest {
+                            method: method.to_string(),
+                            uri: uri.to_string(),
+                            body,
+                        };
+                        let result = tokio::task::spawn_blocking(move || {
+                            execute_guest(
+                                &engine,
+                                &task_function_name,
+                                guest_request,
+                                &config,
+                                route.role,
+                                runtime_telemetry,
+                                Some(telemetry_context),
+                            )
+                        })
+                        .await;
 
-                        match resolve_mesh_response(&state.http_client, body).await {
-                            Ok(response_body) => (status, response_body).into_response(),
-                            Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+                        match result {
+                            Ok(Ok(output)) => {
+                                let (status, body) = match output {
+                                    GuestExecutionOutput::Http(response) => {
+                                        (response.status, response.body)
+                                    }
+                                    GuestExecutionOutput::LegacyStdout(stdout) => {
+                                        (StatusCode::OK, stdout)
+                                    }
+                                };
+
+                                match resolve_mesh_response(&state.http_client, body).await {
+                                    Ok(response_body) => (status, response_body).into_response(),
+                                    Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                error.log_if_needed(&function_name);
+                                error.into_response(&state.config).into_response()
+                            }
+                            Err(error) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("guest execution task failed: {error}"),
+                            )
+                                .into_response(),
                         }
                     }
-                    Ok(Err(error)) => {
-                        error.log_if_needed(&function_name);
-                        error.into_response(&state.config).into_response()
-                    }
-                    Err(error) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("guest execution task failed: {error}"),
+                    None => (
+                        StatusCode::NOT_FOUND,
+                        format!("no guest function could be resolved from `{normalized_path}`"),
                     )
                         .into_response(),
                 }
             }
-            None => (
-                StatusCode::NOT_FOUND,
-                format!("no guest function could be resolved from `{normalized_path}`"),
-            )
-                .into_response(),
         }
     };
 
@@ -317,20 +356,34 @@ fn execute_guest(
     function_name: &str,
     request: GuestRequest,
     config: &IntegrityConfig,
+    role: RouteRole,
+    runtime_telemetry: TelemetryHandle,
     telemetry: Option<GuestTelemetryContext>,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
 
     if let Ok(component) = Component::from_file(engine, &module_path) {
-        return execute_component_guest(
-            engine,
-            request,
-            config,
-            &module_path,
-            &component,
-            telemetry.as_ref(),
-        );
+        return match role {
+            RouteRole::User => execute_component_guest(
+                engine,
+                request,
+                config,
+                &module_path,
+                &component,
+                runtime_telemetry,
+                telemetry.as_ref(),
+            ),
+            RouteRole::System => execute_system_component_guest(
+                engine,
+                request,
+                config,
+                &module_path,
+                &component,
+                runtime_telemetry,
+                telemetry.as_ref(),
+            ),
+        };
     }
 
     let module = Module::from_file(engine, &module_path).map_err(|error| {
@@ -360,6 +413,7 @@ fn execute_component_guest(
     config: &IntegrityConfig,
     component_path: &Path,
     component: &Component,
+    runtime_telemetry: TelemetryHandle,
     telemetry: Option<&GuestTelemetryContext>,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
@@ -371,7 +425,7 @@ fn execute_component_guest(
     })?;
     let mut store = Store::new(
         engine,
-        ComponentHostState::new(config.guest_memory_limit_bytes),
+        ComponentHostState::new(config.guest_memory_limit_bytes, runtime_telemetry),
     );
     store.limiter(|state| &mut state.limits);
     store
@@ -404,6 +458,79 @@ fn execute_component_guest(
     let status = StatusCode::from_u16(response.status).map_err(|error| {
         ExecutionError::Internal(format!(
             "guest component returned an invalid HTTP status code `{}`: {error}",
+            response.status
+        ))
+    })?;
+
+    Ok(GuestExecutionOutput::Http(GuestHttpResponse {
+        status,
+        body: Bytes::from(response.body),
+    }))
+}
+
+fn execute_system_component_guest(
+    engine: &Engine,
+    request: GuestRequest,
+    config: &IntegrityConfig,
+    component_path: &Path,
+    component: &Component,
+    runtime_telemetry: TelemetryHandle,
+    telemetry: Option<&GuestTelemetryContext>,
+) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
+    let mut linker = ComponentLinker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add WASI preview2 functions to system component linker",
+        )
+    })?;
+    system_component_bindings::tachyon::mesh::telemetry_reader::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add telemetry reader functions to system component linker",
+        )
+    })?;
+
+    let mut store = Store::new(
+        engine,
+        ComponentHostState::new(config.guest_memory_limit_bytes, runtime_telemetry),
+    );
+    store.limiter(|state| &mut state.limits);
+    store
+        .set_fuel(config.guest_fuel_budget)
+        .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
+
+    let bindings =
+        system_component_bindings::SystemFaasGuest::instantiate(&mut store, component, &linker)
+            .map_err(|error| {
+                guest_execution_error(
+                    error,
+                    format!(
+                        "failed to instantiate system guest component from {}",
+                        component_path.display()
+                    ),
+                )
+            })?;
+    record_wasm_start(telemetry);
+    let response = bindings.tachyon_mesh_handler().call_handle_request(
+        &mut store,
+        &system_component_bindings::exports::tachyon::mesh::handler::Request {
+            method: request.method,
+            uri: request.uri,
+            body: request.body.to_vec(),
+        },
+    );
+    record_wasm_end(telemetry);
+    let response = response.map_err(|error| {
+        guest_execution_error(error, "system guest component `handle-request` trapped")
+    })?;
+    let status = StatusCode::from_u16(response.status).map_err(|error| {
+        ExecutionError::Internal(format!(
+            "system guest component returned an invalid HTTP status code `{}`: {error}",
             response.status
         ))
     })?;
@@ -609,7 +736,15 @@ fn record_wasm_event(telemetry: Option<&GuestTelemetryContext>, is_start: bool) 
         }
     };
 
-    telemetry::record_event(&telemetry.sender, event);
+    telemetry::record_event(&telemetry.handle, event);
+}
+
+fn should_shed_system_route(telemetry: &TelemetryHandle) -> bool {
+    is_system_route_saturated(telemetry::active_requests(telemetry))
+}
+
+fn is_system_route_saturated(active_requests: usize) -> bool {
+    active_requests > SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD
 }
 
 fn handle_guest_entrypoint_result(
@@ -711,7 +846,7 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
     Ok(config)
 }
 
-fn normalize_config_routes(routes: Vec<String>) -> Result<Vec<String>> {
+fn normalize_config_routes(routes: Vec<IntegrityRoute>) -> Result<Vec<IntegrityRoute>> {
     if routes.is_empty() {
         return Err(anyhow!(
             "Integrity Validation Failed: embedded sealed configuration must define at least one route"
@@ -720,16 +855,23 @@ fn normalize_config_routes(routes: Vec<String>) -> Result<Vec<String>> {
 
     let mut normalized = routes
         .into_iter()
-        .map(|route| validate_route_path(&route))
+        .map(validate_integrity_route)
         .collect::<Result<Vec<_>>>()?;
 
-    normalized.sort();
-    normalized.dedup();
+    normalized.sort_by(|left, right| left.path.cmp(&right.path));
+    for pair in normalized.windows(2) {
+        if pair[0].path == pair[1].path {
+            return Err(anyhow!(
+                "Integrity Validation Failed: route `{}` is defined more than once",
+                pair[0].path
+            ));
+        }
+    }
     Ok(normalized)
 }
 
-fn validate_route_path(path: &str) -> Result<String> {
-    let normalized = normalize_route_path(path);
+fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
+    let normalized = normalize_route_path(&route.path);
 
     if normalized == "/" || resolve_function_name(&normalized).is_none() {
         return Err(anyhow!(
@@ -737,7 +879,10 @@ fn validate_route_path(path: &str) -> Result<String> {
         ));
     }
 
-    Ok(normalized)
+    Ok(IntegrityRoute {
+        path: normalized,
+        role: route.role,
+    })
 }
 
 #[cfg(test)]
@@ -880,12 +1025,13 @@ impl LegacyHostState {
 }
 
 impl ComponentHostState {
-    fn new(max_memory_bytes: usize) -> Self {
+    fn new(max_memory_bytes: usize, telemetry: TelemetryHandle) -> Self {
         let mut wasi = WasiCtxBuilder::new();
         Self {
             ctx: wasi.build(),
             table: ResourceTable::new(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
+            telemetry,
         }
     }
 }
@@ -899,6 +1045,40 @@ impl WasiView for ComponentHostState {
     }
 }
 
+impl wasmtime::component::HasData for ComponentHostState {
+    type Data<'a> = &'a mut Self;
+}
+
+impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for ComponentHostState {
+    fn get_metrics(
+        &mut self,
+    ) -> system_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
+        let TelemetrySnapshot {
+            total_requests,
+            completed_requests,
+            error_requests,
+            active_requests,
+            dropped_events,
+            last_status,
+            total_duration_us,
+            total_wasm_duration_us,
+            total_host_overhead_us,
+        } = telemetry::snapshot(&self.telemetry);
+
+        system_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
+            total_requests,
+            completed_requests,
+            error_requests,
+            active_requests,
+            dropped_events,
+            last_status,
+            total_duration_us,
+            total_wasm_duration_us,
+            total_host_overhead_us,
+        }
+    }
+}
+
 impl IntegrityConfig {
     #[cfg(test)]
     fn default_sealed() -> Self {
@@ -908,13 +1088,34 @@ impl IntegrityConfig {
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
-            routes: vec![DEFAULT_ROUTE.to_owned()],
+            routes: vec![
+                IntegrityRoute::user(DEFAULT_ROUTE),
+                IntegrityRoute::system(DEFAULT_SYSTEM_ROUTE),
+            ],
         }
     }
 
-    fn allows_route(&self, path: &str) -> bool {
+    fn sealed_route(&self, path: &str) -> Option<&IntegrityRoute> {
         let normalized = normalize_route_path(path);
-        self.routes.iter().any(|route| route == &normalized)
+        self.routes.iter().find(|route| route.path == normalized)
+    }
+}
+
+impl IntegrityRoute {
+    #[cfg(test)]
+    fn user(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            role: RouteRole::User,
+        }
+    }
+
+    #[cfg(test)]
+    fn system(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            role: RouteRole::System,
+        }
     }
 }
 
@@ -1084,6 +1285,8 @@ mod tests {
                 body: Bytes::from("Hello Lean FaaS!"),
             },
             &config,
+            RouteRole::User,
+            telemetry::init_test_telemetry(),
             None,
         )
         .expect("guest execution should succeed");
@@ -1110,6 +1313,8 @@ mod tests {
                 body: Bytes::new(),
             },
             &config,
+            RouteRole::User,
+            telemetry::init_test_telemetry(),
             None,
         )
         .expect("legacy guest execution should succeed");
@@ -1204,6 +1409,96 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn system_guest_requires_system_route_role() {
+        let engine = build_engine().expect("engine should be created");
+        let config = IntegrityConfig::default_sealed();
+        let error = execute_guest(
+            &engine,
+            "metrics",
+            GuestRequest {
+                method: "GET".to_owned(),
+                uri: "/metrics".to_owned(),
+                body: Bytes::new(),
+            },
+            &config,
+            RouteRole::User,
+            telemetry::init_test_telemetry(),
+            None,
+        )
+        .expect_err("privileged metrics guest should fail as a user route");
+
+        match error {
+            ExecutionError::Internal(message) => {
+                assert!(
+                    message.contains("telemetry-reader") || message.contains("telemetry_reader")
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn router_returns_system_metrics_for_privileged_route() {
+        let app = build_app(AppState {
+            engine: build_engine().expect("engine should be created"),
+            config: IntegrityConfig::default_sealed(),
+            http_client: Client::new(),
+            telemetry: telemetry::init_test_telemetry(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+
+        assert!(text.contains("tachyon_requests_total"));
+        assert!(text.contains("tachyon_active_requests"));
+    }
+
+    #[tokio::test]
+    async fn router_sheds_system_routes_when_host_is_saturated() {
+        let telemetry = telemetry::init_test_telemetry();
+        let mut active_guards = Vec::new();
+        for _ in 0..=SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD {
+            active_guards.push(telemetry::begin_request(&telemetry));
+        }
+
+        let app = build_app(AppState {
+            engine: build_engine().expect("engine should be created"),
+            config: IntegrityConfig::default_sealed(),
+            http_client: Client::new(),
+            telemetry,
+        });
+
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(active_guards);
     }
 
     #[tokio::test]
@@ -1328,9 +1623,9 @@ mod tests {
     fn validate_integrity_config_normalizes_routes() {
         let mut config = IntegrityConfig::default_sealed();
         config.routes = vec![
-            "api/guest-example".to_owned(),
-            "/api/guest-example/".to_owned(),
-            "/api/guest-malicious".to_owned(),
+            IntegrityRoute::user("api/guest-example"),
+            IntegrityRoute::user("/api/guest-malicious"),
+            IntegrityRoute::system("/metrics/"),
         ];
 
         let config = validate_integrity_config(config).expect("config should validate");
@@ -1338,10 +1633,25 @@ mod tests {
         assert_eq!(
             config.routes,
             vec![
-                "/api/guest-example".to_owned(),
-                "/api/guest-malicious".to_owned(),
+                IntegrityRoute::user("/api/guest-example"),
+                IntegrityRoute::user("/api/guest-malicious"),
+                IntegrityRoute::system("/metrics"),
             ]
         );
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_duplicate_routes() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![
+            IntegrityRoute::user("/metrics"),
+            IntegrityRoute::system("/metrics/"),
+        ];
+
+        let error = validate_integrity_config(config)
+            .expect_err("duplicate normalized routes should fail validation");
+
+        assert!(error.to_string().contains("defined more than once"));
     }
 
     #[test]
@@ -1351,9 +1661,16 @@ mod tests {
         let config = validate_integrity_config(config).expect("embedded config should validate");
 
         assert_eq!(config.guest_fuel_budget, DEFAULT_GUEST_FUEL_BUDGET);
-        assert!(config.allows_route("/api/guest-example"));
-        assert!(config.allows_route("/api/guest-csharp"));
-        assert!(config.allows_route("/api/guest-java"));
+        assert_eq!(
+            config
+                .sealed_route("/metrics")
+                .expect("embedded config should seal the system metrics route")
+                .role,
+            RouteRole::System
+        );
+        assert!(config.sealed_route("/api/guest-example").is_some());
+        assert!(config.sealed_route("/api/guest-csharp").is_some());
+        assert!(config.sealed_route("/api/guest-java").is_some());
     }
 
     #[test]

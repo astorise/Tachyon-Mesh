@@ -11,6 +11,19 @@ const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
 const DEFAULT_GUEST_FUEL_BUDGET: u64 = 500_000_000;
 const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteRole {
+    User,
+    System,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct SealedRoute {
+    pub path: String,
+    pub role: RouteRole,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SealedConfig {
     pub host_address: String,
@@ -18,7 +31,7 @@ pub struct SealedConfig {
     pub guest_fuel_budget: u64,
     pub guest_memory_limit_bytes: usize,
     pub resource_limit_response: String,
-    pub routes: Vec<String>,
+    pub routes: Vec<SealedRoute>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -30,7 +43,8 @@ struct IntegrityManifest {
 
 #[derive(Debug, PartialEq, Eq)]
 struct GenerateRequest {
-    routes: Vec<String>,
+    user_routes: Vec<String>,
+    system_routes: Vec<String>,
     memory_mib: u32,
 }
 
@@ -92,7 +106,8 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
     }
 
     let request = GenerateRequest {
-        routes: parse_routes_arg(&subcommand.matches.args)?,
+        user_routes: parse_required_routes_arg(&subcommand.matches.args, "route")?,
+        system_routes: parse_optional_routes_arg(&subcommand.matches.args, "system-route")?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
     };
 
@@ -113,12 +128,13 @@ fn parse_generate_request_from_args(
         bail!("unsupported subcommand `{subcommand}`; expected `generate`");
     }
 
-    let mut routes = Vec::new();
+    let mut user_routes = Vec::new();
+    let mut system_routes = Vec::new();
     let mut memory_mib = None;
 
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--route=") {
-            routes.push(value.to_owned());
+            user_routes.push(value.to_owned());
             continue;
         }
 
@@ -126,7 +142,20 @@ fn parse_generate_request_from_args(
             let route = args
                 .next()
                 .context("missing value for `--route`; expected `--route /api/guest-example`")?;
-            routes.push(route);
+            user_routes.push(route);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--system-route=") {
+            system_routes.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--system-route" {
+            let route = args.next().context(
+                "missing value for `--system-route`; expected `--system-route /metrics`",
+            )?;
+            system_routes.push(route);
             continue;
         }
 
@@ -147,8 +176,15 @@ fn parse_generate_request_from_args(
     }
 
     let memory_mib = memory_mib.context("missing required `--memory` argument")?;
+    if user_routes.is_empty() {
+        bail!("missing required `--route` argument");
+    }
 
-    Ok(Some(GenerateRequest { routes, memory_mib }))
+    Ok(Some(GenerateRequest {
+        user_routes,
+        system_routes,
+        memory_mib,
+    }))
 }
 
 fn generate_manifest(request: GenerateRequest) -> Result<PathBuf> {
@@ -179,7 +215,7 @@ fn generate_manifest(request: GenerateRequest) -> Result<PathBuf> {
 
 impl SealedConfig {
     fn from_request(request: GenerateRequest) -> Result<Self> {
-        let routes = normalize_routes(request.routes)?;
+        let routes = normalize_routes(request.user_routes, request.system_routes)?;
         let memory_mib = usize::try_from(request.memory_mib)
             .context("memory limit is too large for this platform")?;
         let guest_memory_limit_bytes = memory_mib
@@ -202,12 +238,26 @@ impl SealedConfig {
 }
 
 #[cfg(desktop)]
-fn parse_routes_arg(
+fn parse_required_routes_arg(
     args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
+    name: &str,
 ) -> Result<Vec<String>> {
-    let arg = args
-        .get("route")
-        .context("missing required `--route` argument")?;
+    let routes = parse_optional_routes_arg(args, name)?;
+    if routes.is_empty() {
+        bail!("missing required `--{name}` argument");
+    }
+
+    Ok(routes)
+}
+
+#[cfg(desktop)]
+fn parse_optional_routes_arg(
+    args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
+    name: &str,
+) -> Result<Vec<String>> {
+    let Some(arg) = args.get(name) else {
+        return Ok(Vec::new());
+    };
 
     match &arg.value {
         Value::String(route) => Ok(vec![route.clone()]),
@@ -220,7 +270,7 @@ fn parse_routes_arg(
                     .ok_or_else(|| anyhow!("route values must be strings"))
             })
             .collect(),
-        _ => bail!("`--route` must be provided as one or more strings"),
+        _ => bail!("`--{name}` must be provided as one or more strings"),
     }
 }
 
@@ -253,18 +303,60 @@ fn parse_memory_value(value: &str) -> Result<u32> {
     Ok(memory_mib)
 }
 
-fn normalize_routes(routes: Vec<String>) -> Result<Vec<String>> {
-    if routes.is_empty() {
+fn normalize_routes(
+    user_routes: Vec<String>,
+    system_routes: Vec<String>,
+) -> Result<Vec<SealedRoute>> {
+    if user_routes.is_empty() {
         bail!("at least one `--route` value must be provided");
     }
 
     let mut normalized = BTreeSet::new();
 
-    for route in routes {
-        normalized.insert(normalize_route(&route)?);
+    for route in user_routes {
+        normalized.insert(SealedRoute {
+            path: normalize_route(&route)?,
+            role: RouteRole::User,
+        });
     }
 
-    Ok(normalized.into_iter().collect())
+    for route in system_routes {
+        let path = normalize_route(&route)?;
+        let sealed_route = SealedRoute {
+            path,
+            role: RouteRole::System,
+        };
+
+        if !normalized.insert(sealed_route.clone()) {
+            bail!(
+                "route `{}` is declared more than once with the same role",
+                sealed_route.path
+            );
+        }
+    }
+
+    let mut deduped_by_path = std::collections::BTreeMap::new();
+    for route in normalized {
+        if let Some(existing_role) = deduped_by_path.insert(route.path.clone(), route.role) {
+            bail!(
+                "route `{}` cannot be declared as both `{}` and `{}`",
+                route.path,
+                match existing_role {
+                    RouteRole::User => "user",
+                    RouteRole::System => "system",
+                },
+                match route.role {
+                    RouteRole::User => "user",
+                    RouteRole::System => "system",
+                }
+            );
+        }
+    }
+
+    Ok(deduped_by_path
+        .into_iter()
+        .map(|(path, role)| SealedRoute { path, role })
+        .collect())
 }
 
 fn normalize_route(route: &str) -> Result<String> {
@@ -316,18 +408,31 @@ mod tests {
 
     #[test]
     fn normalize_routes_deduplicates_and_sorts() {
-        let routes = normalize_routes(vec![
-            "/api/guest-example/".to_owned(),
-            "api/guest-example".to_owned(),
-            "/api/guest-malicious".to_owned(),
-        ])
+        let routes = normalize_routes(
+            vec![
+                "/api/guest-example/".to_owned(),
+                "api/guest-example".to_owned(),
+                "/api/guest-malicious".to_owned(),
+            ],
+            vec!["/metrics/".to_owned()],
+        )
         .expect("routes should normalize");
 
         assert_eq!(
             routes,
             vec![
-                "/api/guest-example".to_owned(),
-                "/api/guest-malicious".to_owned()
+                SealedRoute {
+                    path: "/api/guest-example".to_owned(),
+                    role: RouteRole::User,
+                },
+                SealedRoute {
+                    path: "/api/guest-malicious".to_owned(),
+                    role: RouteRole::User,
+                },
+                SealedRoute {
+                    path: "/metrics".to_owned(),
+                    role: RouteRole::System,
+                }
             ]
         );
     }
@@ -335,19 +440,33 @@ mod tests {
     #[test]
     fn sealed_config_payload_includes_routes_and_memory_limit() {
         let config = SealedConfig::from_request(GenerateRequest {
-            routes: vec!["/api/guest-example".to_owned()],
+            user_routes: vec!["/api/guest-example".to_owned()],
+            system_routes: vec!["/metrics".to_owned()],
             memory_mib: 64,
         })
         .expect("request should produce a sealed config");
 
         assert_eq!(config.guest_fuel_budget, DEFAULT_GUEST_FUEL_BUDGET);
         assert_eq!(config.guest_memory_limit_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.routes, vec!["/api/guest-example".to_owned()]);
+        assert_eq!(
+            config.routes,
+            vec![
+                SealedRoute {
+                    path: "/api/guest-example".to_owned(),
+                    role: RouteRole::User,
+                },
+                SealedRoute {
+                    path: "/metrics".to_owned(),
+                    role: RouteRole::System,
+                }
+            ]
+        );
 
         let payload = config
             .canonical_payload()
             .expect("payload should serialize deterministically");
-        assert!(payload.contains("\"routes\":[\"/api/guest-example\"]"));
+        assert!(payload.contains("\"path\":\"/api/guest-example\""));
+        assert!(payload.contains("\"role\":\"system\""));
     }
 
     #[test]
@@ -358,6 +477,8 @@ mod tests {
                 "--route",
                 "/api/guest-example",
                 "--route=/api/guest-malicious",
+                "--system-route",
+                "/metrics",
                 "--memory",
                 "64",
             ]
@@ -370,13 +491,24 @@ mod tests {
         assert_eq!(
             request,
             GenerateRequest {
-                routes: vec![
+                user_routes: vec![
                     "/api/guest-example".to_owned(),
                     "/api/guest-malicious".to_owned()
                 ],
+                system_routes: vec!["/metrics".to_owned()],
                 memory_mib: 64,
             }
         );
+    }
+
+    #[test]
+    fn normalize_routes_rejects_conflicting_roles_for_same_path() {
+        let error = normalize_routes(vec!["/metrics".to_owned()], vec!["/metrics/".to_owned()])
+            .expect_err("same path with different roles should fail");
+
+        assert!(error
+            .to_string()
+            .contains("cannot be declared as both `user` and `system`"));
     }
 
     #[test]

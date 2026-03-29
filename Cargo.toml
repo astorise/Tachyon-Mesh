@@ -6,6 +6,7 @@ members = [
     "guest-example",
     "guest-malicious",
     "legacy-mock",
+    "system-faas-prom",
     "tachyon-cli",
 ]
 resolver = "2"

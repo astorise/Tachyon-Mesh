@@ -28,10 +28,11 @@ WORKDIR /workspace
 COPY . .
 
 RUN cargo build -p guest-example --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
 RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-cli --release
-RUN ./target/release/tachyon-cli generate --route /api/guest-example --route /api/guest-call-legacy --route /api/guest-go --route /api/guest-js --route /api/guest-csharp --route /api/guest-java --memory 64
+RUN ./target/release/tachyon-cli generate --route /api/guest-example --route /api/guest-call-legacy --route /api/guest-go --route /api/guest-js --route /api/guest-csharp --route /api/guest-java --system-route /metrics --memory 64
 RUN cargo build -p core-host --target x86_64-unknown-linux-musl --release
 
 FROM ubuntu:24.04 AS tinygo-builder
@@ -135,6 +136,7 @@ WORKDIR /app
 
 COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /app/guest-modules/metrics.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
 COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-modules/guest_go.wasm
 COPY --from=javy-builder /workspace/guest-modules/guest_js.wasm /app/guest-modules/guest_js.wasm

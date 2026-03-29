@@ -77,7 +77,7 @@ cargo build -p guest-example --target wasm32-wasip2 --release
 ### 3. Seal the Runtime Configuration
 Generate the signed `integrity.lock` manifest that `core-host` embeds and validates at startup:
 ```bash
-cargo run -p tachyon-cli -- generate --route /api/guest-example --memory 64
+cargo run -p tachyon-cli -- generate --route /api/guest-example --system-route /metrics --memory 64
 ```
 
 ### 4. Run the Host
