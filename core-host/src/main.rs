@@ -29,7 +29,7 @@ use wasmtime::{
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
-    ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+    I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 
 mod telemetry;
@@ -449,9 +449,7 @@ fn execute_legacy_guest(
     record_wasm_start(telemetry);
     let call_result = entrypoint.call(&mut store, ());
     record_wasm_end(telemetry);
-    call_result.map_err(|error| {
-        guest_execution_error(error, format!("guest function `{entrypoint_name}` trapped"))
-    })?;
+    handle_guest_entrypoint_result(entrypoint_name, call_result)?;
 
     Ok(GuestExecutionOutput::LegacyStdout(split_guest_stdout(
         function_name,
@@ -587,6 +585,26 @@ fn record_wasm_event(telemetry: Option<&GuestTelemetryContext>, is_start: bool) 
     };
 
     telemetry::record_event(&telemetry.sender, event);
+}
+
+fn handle_guest_entrypoint_result(
+    entrypoint_name: &str,
+    result: std::result::Result<(), wasmtime::Error>,
+) -> std::result::Result<(), ExecutionError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .downcast_ref::<I32Exit>()
+                .is_some_and(|exit| exit.0 == 0) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(guest_execution_error(
+            error,
+            format!("guest function `{entrypoint_name}` trapped"),
+        )),
+    }
 }
 
 fn build_engine() -> Result<Engine> {
@@ -1345,5 +1363,25 @@ mod tests {
             classify_resource_limit(&error),
             Some(ResourceLimitKind::Fuel)
         );
+    }
+
+    #[test]
+    fn zero_exit_status_from_command_guest_is_treated_as_success() {
+        let result = handle_guest_entrypoint_result("_start", Err(I32Exit(0).into()));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn nonzero_exit_status_from_command_guest_remains_an_error() {
+        let error = handle_guest_entrypoint_result("_start", Err(I32Exit(1).into()))
+            .expect_err("non-zero command exit should fail");
+
+        match error {
+            ExecutionError::Internal(message) => {
+                assert!(message.contains("Exited with i32 exit status 1"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }
