@@ -34,6 +34,8 @@ use wasmtime_wasi::{
     DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 
+#[cfg(feature = "rate-limit")]
+mod rate_limit;
 mod telemetry;
 
 mod component_bindings {
@@ -207,16 +209,26 @@ async fn run() -> Result<()> {
             )
         })?;
 
-    axum::serve(listener, app)
-        .await
-        .context("axum server exited unexpectedly")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("axum server exited unexpectedly")
 }
 
 fn build_app(state: AppState) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/*path", any(faas_handler))
-        .layer(from_fn(hop_limit_middleware))
-        .with_state(state)
+        .layer(from_fn(hop_limit_middleware));
+
+    #[cfg(feature = "rate-limit")]
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        rate_limit::new_rate_limiter(),
+        rate_limit::rate_limit_middleware,
+    ));
+
+    app.with_state(state)
 }
 
 async fn hop_limit_middleware(
@@ -1817,12 +1829,15 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .expect("test host should stay healthy");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("test host should stay healthy");
         });
 
         let response = Client::new()
