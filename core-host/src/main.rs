@@ -2,10 +2,11 @@ use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Bytes,
     extract::State,
-    http::{Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    middleware::from_fn,
     response::{IntoResponse, Response},
     routing::any,
-    Router,
+    Extension, Router,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use reqwest::Client;
@@ -15,6 +16,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Once,
     time::Instant,
@@ -65,6 +67,8 @@ const DEFAULT_SYSTEM_ROUTE: &str = "/metrics";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
+const DEFAULT_HOP_LIMIT: u32 = 10;
+const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 
 #[derive(Clone)]
@@ -74,6 +78,9 @@ struct AppState {
     http_client: Client,
     telemetry: TelemetryHandle,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HopLimit(u32);
 
 struct LegacyHostState {
     wasi: WasiP1Ctx,
@@ -208,11 +215,29 @@ async fn run() -> Result<()> {
 fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/*path", any(faas_handler))
+        .layer(from_fn(hop_limit_middleware))
         .with_state(state)
+}
+
+async fn hop_limit_middleware(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let hop_limit = match resolve_incoming_hop_limit(req.headers()) {
+        Ok(hop_limit) => hop_limit,
+        Err(()) => return loop_detected_response(),
+    };
+
+    req.extensions_mut().insert(hop_limit);
+    req.headers_mut()
+        .insert(HOP_LIMIT_HEADER, hop_limit.as_header_value());
+
+    next.run(req).await
 }
 
 async fn faas_handler(
     State(state): State<AppState>,
+    Extension(hop_limit): Extension<HopLimit>,
     method: Method,
     uri: Uri,
     body: Bytes,
@@ -273,17 +298,27 @@ async fn faas_handler(
 
                         match result {
                             Ok(Ok(output)) => {
-                                let (status, body) = match output {
-                                    GuestExecutionOutput::Http(response) => {
-                                        (response.status, response.body)
-                                    }
+                                let response = match output {
+                                    GuestExecutionOutput::Http(response) => response,
                                     GuestExecutionOutput::LegacyStdout(stdout) => {
-                                        (StatusCode::OK, stdout)
+                                        GuestHttpResponse {
+                                            status: StatusCode::OK,
+                                            body: stdout,
+                                        }
                                     }
                                 };
 
-                                match resolve_mesh_response(&state.http_client, body).await {
-                                    Ok(response_body) => (status, response_body).into_response(),
+                                match resolve_mesh_response(
+                                    &state.http_client,
+                                    &state.config,
+                                    hop_limit,
+                                    response,
+                                )
+                                .await
+                                {
+                                    Ok(response) => {
+                                        (response.status, response.body).into_response()
+                                    }
                                     Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
                                 }
                             }
@@ -322,24 +357,34 @@ async fn faas_handler(
 
 async fn resolve_mesh_response(
     http_client: &Client,
-    body: Bytes,
-) -> std::result::Result<Bytes, String> {
-    let Some(url) = extract_mesh_fetch_url(&body) else {
-        return Ok(body);
+    config: &IntegrityConfig,
+    hop_limit: HopLimit,
+    response: GuestHttpResponse,
+) -> std::result::Result<GuestHttpResponse, String> {
+    let Some(target) = extract_mesh_fetch_url(&response.body) else {
+        return Ok(response);
     };
+    let url = resolve_mesh_fetch_target(config, target)?;
 
     let response = http_client
-        .get(url)
+        .get(&url)
+        .header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string())
         .send()
         .await
-        .map_err(|error| format!("mesh fetch to `{url}` failed: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("mesh fetch to `{url}` returned an error status: {error}"))?;
+        .map_err(|error| format!("mesh fetch to `{url}` failed: {error}"))?;
 
-    response
-        .bytes()
-        .await
-        .map_err(|error| format!("failed to read mesh fetch response body from `{url}`: {error}"))
+    let status = response.status();
+    let body = response.bytes().await.map_err(|error| {
+        format!("failed to read mesh fetch response body from `{url}`: {error}")
+    })?;
+
+    if status == StatusCode::LOOP_DETECTED || status.is_success() {
+        Ok(GuestHttpResponse { status, body })
+    } else {
+        Err(format!(
+            "mesh fetch to `{url}` returned an error status: {status}"
+        ))
+    }
 }
 
 fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
@@ -349,6 +394,85 @@ fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
         .strip_prefix("MESH_FETCH:")
         .map(str::trim)
         .filter(|url| !url.is_empty())
+}
+
+fn resolve_incoming_hop_limit(headers: &HeaderMap) -> std::result::Result<HopLimit, ()> {
+    let hop_limit = headers
+        .get(HOP_LIMIT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_HOP_LIMIT);
+
+    if hop_limit == 0 {
+        Err(())
+    } else {
+        Ok(HopLimit(hop_limit))
+    }
+}
+
+fn resolve_mesh_fetch_target(
+    config: &IntegrityConfig,
+    target: &str,
+) -> std::result::Result<String, String> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Ok(target.to_owned());
+    }
+
+    if target.starts_with('/') {
+        return Ok(format!("{}{}", internal_mesh_base_url(config)?, target));
+    }
+
+    Err(format!(
+        "mesh fetch target `{target}` must be an absolute URL or an absolute route path"
+    ))
+}
+
+fn internal_mesh_base_url(config: &IntegrityConfig) -> std::result::Result<String, String> {
+    let host_address = config.host_address.trim();
+    if host_address.is_empty() {
+        return Err(
+            "mesh fetch cannot resolve a relative route without a configured host address"
+                .to_owned(),
+        );
+    }
+
+    if let Ok(socket_addr) = host_address.parse::<SocketAddr>() {
+        return Ok(format!(
+            "http://{}:{}",
+            client_connect_host(socket_addr.ip()),
+            socket_addr.port()
+        ));
+    }
+
+    Ok(format!("http://{}", host_address.trim_end_matches('/')))
+}
+
+fn client_connect_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) if ip.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) if ip.is_unspecified() => format!("[{}]", Ipv6Addr::LOCALHOST),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+fn loop_detected_response() -> Response {
+    (
+        StatusCode::LOOP_DETECTED,
+        "Tachyon Mesh: Routing loop detected (Hop limit exceeded)",
+    )
+        .into_response()
+}
+
+impl HopLimit {
+    fn as_header_value(self) -> HeaderValue {
+        HeaderValue::from_str(&self.0.to_string())
+            .expect("hop limit should always produce a valid header value")
+    }
+
+    fn decremented(self) -> u32 {
+        self.0.saturating_sub(1)
+    }
 }
 
 fn execute_guest(
@@ -1392,6 +1516,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_rejects_exhausted_hop_limit_header() {
+        let app = build_app(AppState {
+            engine: build_engine().expect("engine should be created"),
+            config: IntegrityConfig::default_sealed(),
+            http_client: Client::new(),
+            telemetry: telemetry::init_test_telemetry(),
+        });
+        let response = app
+            .oneshot(
+                Request::get("/api/guest-example")
+                    .header(HOP_LIMIT_HEADER, "0")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::LOOP_DETECTED);
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+
+        assert!(
+            String::from_utf8_lossy(&body).contains("Routing loop detected"),
+            "unexpected loop-detected response body: {:?}",
+            body
+        );
+    }
+
+    #[tokio::test]
     async fn router_rejects_unsealed_routes() {
         let app = build_app(AppState {
             engine: build_engine().expect("engine should be created"),
@@ -1602,6 +1760,94 @@ mod tests {
     }
 
     #[test]
+    fn resolve_incoming_hop_limit_defaults_missing_or_invalid_values() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            resolve_incoming_hop_limit(&headers),
+            Ok(HopLimit(DEFAULT_HOP_LIMIT))
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HOP_LIMIT_HEADER, HeaderValue::from_static("not-a-number"));
+        assert_eq!(
+            resolve_incoming_hop_limit(&headers),
+            Ok(HopLimit(DEFAULT_HOP_LIMIT))
+        );
+    }
+
+    #[test]
+    fn resolve_incoming_hop_limit_rejects_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOP_LIMIT_HEADER, HeaderValue::from_static("0"));
+
+        assert_eq!(resolve_incoming_hop_limit(&headers), Err(()));
+    }
+
+    #[test]
+    fn resolve_mesh_fetch_target_supports_relative_mesh_routes() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = "0.0.0.0:8080".to_owned();
+
+        assert_eq!(
+            resolve_mesh_fetch_target(&config, "/api/guest-loop")
+                .expect("relative mesh route should resolve"),
+            "http://127.0.0.1:8080/api/guest-loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_breaks_guest_self_loop_with_http_508() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should expose an address");
+
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = address.to_string();
+        config.routes.push(IntegrityRoute::user("/api/guest-loop"));
+
+        let app = build_app(AppState {
+            engine: build_engine().expect("engine should be created"),
+            config,
+            http_client: Client::new(),
+            telemetry: telemetry::init_test_telemetry(),
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("test host should stay healthy");
+        });
+
+        let response = Client::new()
+            .get(format!("http://{address}/api/guest-loop"))
+            .send()
+            .await
+            .expect("guest-loop request should complete");
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .expect("guest-loop response body should be readable");
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("server should shut down cleanly");
+
+        assert_eq!(status, StatusCode::LOOP_DETECTED);
+        assert!(
+            body.contains("Routing loop detected"),
+            "unexpected loop-detected response body: {body}"
+        );
+    }
+
+    #[test]
     fn error_response_normalizes_resource_limit_failures() {
         let config = IntegrityConfig::default_sealed();
         let response = ExecutionError::ResourceLimitExceeded {
@@ -1669,6 +1915,7 @@ mod tests {
             RouteRole::System
         );
         assert!(config.sealed_route("/api/guest-example").is_some());
+        assert!(config.sealed_route("/api/guest-loop").is_some());
         assert!(config.sealed_route("/api/guest-csharp").is_some());
         assert!(config.sealed_route("/api/guest-java").is_some());
     }

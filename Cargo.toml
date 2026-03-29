@@ -4,6 +4,7 @@ members = [
     "faas-sdk",
     "guest-call-legacy",
     "guest-example",
+    "guest-loop",
     "guest-malicious",
     "legacy-mock",
     "system-faas-prom",

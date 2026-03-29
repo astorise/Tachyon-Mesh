@@ -1921,6 +1921,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-loop"
+version = "0.1.0"
+
+[[package]]
 name = "guest-malicious"
 version = "0.1.0"
 
