@@ -13,7 +13,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::{fmt, path::PathBuf, sync::Once};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Once,
+};
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
     Config, Engine, Instance, Linker as ModuleLinker, Module, ResourceLimiter, Store, Trap,
@@ -290,7 +294,7 @@ fn execute_component_guest(
     engine: &Engine,
     request: GuestRequest,
     config: &IntegrityConfig,
-    component_path: &PathBuf,
+    component_path: &Path,
     component: &Component,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
