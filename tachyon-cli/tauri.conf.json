@@ -38,6 +38,13 @@
               "required": false
             },
             {
+              "name": "secret-route",
+              "description": "Grant named secrets to a sealed user route using /path=NAME[,NAME].",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
               "name": "memory",
               "short": "m",
               "description": "Guest memory limit in MiB.",

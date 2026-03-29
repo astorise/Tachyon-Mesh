@@ -4,7 +4,11 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+};
 
 const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
@@ -22,6 +26,8 @@ pub enum RouteRole {
 pub struct SealedRoute {
     pub path: String,
     pub role: RouteRole,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_secrets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -45,6 +51,7 @@ struct IntegrityManifest {
 struct GenerateRequest {
     user_routes: Vec<String>,
     system_routes: Vec<String>,
+    secret_routes: Vec<String>,
     memory_mib: u32,
 }
 
@@ -108,6 +115,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
     let request = GenerateRequest {
         user_routes: parse_required_routes_arg(&subcommand.matches.args, "route")?,
         system_routes: parse_optional_routes_arg(&subcommand.matches.args, "system-route")?,
+        secret_routes: parse_optional_routes_arg(&subcommand.matches.args, "secret-route")?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
     };
 
@@ -130,6 +138,7 @@ fn parse_generate_request_from_args(
 
     let mut user_routes = Vec::new();
     let mut system_routes = Vec::new();
+    let mut secret_routes = Vec::new();
     let mut memory_mib = None;
 
     while let Some(arg) = args.next() {
@@ -159,6 +168,19 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--secret-route=") {
+            secret_routes.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--secret-route" {
+            let route = args.next().context(
+                "missing value for `--secret-route`; expected `--secret-route /api/guest-example=DB_PASS`",
+            )?;
+            secret_routes.push(route);
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix("--memory=") {
             memory_mib = Some(parse_memory_value(value)?);
             continue;
@@ -183,6 +205,7 @@ fn parse_generate_request_from_args(
     Ok(Some(GenerateRequest {
         user_routes,
         system_routes,
+        secret_routes,
         memory_mib,
     }))
 }
@@ -215,7 +238,11 @@ fn generate_manifest(request: GenerateRequest) -> Result<PathBuf> {
 
 impl SealedConfig {
     fn from_request(request: GenerateRequest) -> Result<Self> {
-        let routes = normalize_routes(request.user_routes, request.system_routes)?;
+        let routes = normalize_routes(
+            request.user_routes,
+            request.system_routes,
+            request.secret_routes,
+        )?;
         let memory_mib = usize::try_from(request.memory_mib)
             .context("memory limit is too large for this platform")?;
         let guest_memory_limit_bytes = memory_mib
@@ -306,57 +333,112 @@ fn parse_memory_value(value: &str) -> Result<u32> {
 fn normalize_routes(
     user_routes: Vec<String>,
     system_routes: Vec<String>,
+    secret_routes: Vec<String>,
 ) -> Result<Vec<SealedRoute>> {
     if user_routes.is_empty() {
         bail!("at least one `--route` value must be provided");
     }
 
-    let mut normalized = BTreeSet::new();
+    let mut normalized: BTreeMap<String, SealedRoute> = BTreeMap::new();
 
     for route in user_routes {
-        normalized.insert(SealedRoute {
-            path: normalize_route(&route)?,
-            role: RouteRole::User,
-        });
+        let path = normalize_route(&route)?;
+        if let Some(existing) = normalized.get(&path) {
+            match existing.role {
+                RouteRole::User => continue,
+                RouteRole::System => {
+                    bail!("route `{path}` cannot be declared as both `user` and `system`");
+                }
+            }
+        }
+
+        normalized.insert(
+            path.clone(),
+            SealedRoute {
+                path,
+                role: RouteRole::User,
+                allowed_secrets: Vec::new(),
+            },
+        );
     }
 
     for route in system_routes {
         let path = normalize_route(&route)?;
         let sealed_route = SealedRoute {
-            path,
+            path: path.clone(),
             role: RouteRole::System,
+            allowed_secrets: Vec::new(),
         };
 
-        if !normalized.insert(sealed_route.clone()) {
-            bail!(
-                "route `{}` is declared more than once with the same role",
-                sealed_route.path
-            );
-        }
-    }
-
-    let mut deduped_by_path = std::collections::BTreeMap::new();
-    for route in normalized {
-        if let Some(existing_role) = deduped_by_path.insert(route.path.clone(), route.role) {
+        if let Some(existing) = normalized.get(&path) {
             bail!(
                 "route `{}` cannot be declared as both `{}` and `{}`",
-                route.path,
-                match existing_role {
+                sealed_route.path,
+                match existing.role {
                     RouteRole::User => "user",
                     RouteRole::System => "system",
                 },
-                match route.role {
+                match sealed_route.role {
                     RouteRole::User => "user",
                     RouteRole::System => "system",
                 }
             );
         }
+
+        normalized.insert(path, sealed_route);
     }
 
-    Ok(deduped_by_path
+    for secret_route in secret_routes {
+        let (path, allowed_secrets) = parse_secret_route(&secret_route)?;
+        let normalized_path = normalize_route(&path)?;
+        let sealed_route = normalized.get_mut(&normalized_path).ok_or_else(|| {
+            anyhow!("secret route `{normalized_path}` must also be declared with `--route`")
+        })?;
+
+        if sealed_route.role != RouteRole::User {
+            bail!("secret route `{normalized_path}` must be declared as a user route");
+        }
+
+        sealed_route.allowed_secrets = merge_allowed_secrets(
+            std::mem::take(&mut sealed_route.allowed_secrets),
+            allowed_secrets,
+        );
+    }
+
+    Ok(normalized.into_values().collect())
+}
+
+fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
+    let (path, secrets) = value.split_once('=').context(
+        "secret routes must use the `/path=NAME[,NAME]` syntax, for example `/api/guest-example=DB_PASS`",
+    )?;
+
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("secret routes must include a non-empty path before `=`");
+    }
+
+    let secrets = secrets
+        .split(',')
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if secrets.is_empty() {
+        bail!("secret routes must grant at least one named secret");
+    }
+
+    Ok((path.to_owned(), merge_allowed_secrets(Vec::new(), secrets)))
+}
+
+fn merge_allowed_secrets(existing: Vec<String>, added: Vec<String>) -> Vec<String> {
+    existing
         .into_iter()
-        .map(|(path, role)| SealedRoute { path, role })
-        .collect())
+        .chain(added)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn normalize_route(route: &str) -> Result<String> {
@@ -415,6 +497,7 @@ mod tests {
                 "/api/guest-malicious".to_owned(),
             ],
             vec!["/metrics/".to_owned()],
+            Vec::new(),
         )
         .expect("routes should normalize");
 
@@ -424,14 +507,17 @@ mod tests {
                 SealedRoute {
                     path: "/api/guest-example".to_owned(),
                     role: RouteRole::User,
+                    allowed_secrets: Vec::new(),
                 },
                 SealedRoute {
                     path: "/api/guest-malicious".to_owned(),
                     role: RouteRole::User,
+                    allowed_secrets: Vec::new(),
                 },
                 SealedRoute {
                     path: "/metrics".to_owned(),
                     role: RouteRole::System,
+                    allowed_secrets: Vec::new(),
                 }
             ]
         );
@@ -442,6 +528,7 @@ mod tests {
         let config = SealedConfig::from_request(GenerateRequest {
             user_routes: vec!["/api/guest-example".to_owned()],
             system_routes: vec!["/metrics".to_owned()],
+            secret_routes: vec!["/api/guest-example=DB_PASS".to_owned()],
             memory_mib: 64,
         })
         .expect("request should produce a sealed config");
@@ -454,10 +541,12 @@ mod tests {
                 SealedRoute {
                     path: "/api/guest-example".to_owned(),
                     role: RouteRole::User,
+                    allowed_secrets: vec!["DB_PASS".to_owned()],
                 },
                 SealedRoute {
                     path: "/metrics".to_owned(),
                     role: RouteRole::System,
+                    allowed_secrets: Vec::new(),
                 }
             ]
         );
@@ -467,6 +556,7 @@ mod tests {
             .expect("payload should serialize deterministically");
         assert!(payload.contains("\"path\":\"/api/guest-example\""));
         assert!(payload.contains("\"role\":\"system\""));
+        assert!(payload.contains("\"allowed_secrets\":[\"DB_PASS\"]"));
     }
 
     #[test]
@@ -479,6 +569,8 @@ mod tests {
                 "--route=/api/guest-malicious",
                 "--system-route",
                 "/metrics",
+                "--secret-route",
+                "/api/guest-example=DB_PASS,API_KEY",
                 "--memory",
                 "64",
             ]
@@ -496,6 +588,7 @@ mod tests {
                     "/api/guest-malicious".to_owned()
                 ],
                 system_routes: vec!["/metrics".to_owned()],
+                secret_routes: vec!["/api/guest-example=DB_PASS,API_KEY".to_owned()],
                 memory_mib: 64,
             }
         );
@@ -503,12 +596,30 @@ mod tests {
 
     #[test]
     fn normalize_routes_rejects_conflicting_roles_for_same_path() {
-        let error = normalize_routes(vec!["/metrics".to_owned()], vec!["/metrics/".to_owned()])
-            .expect_err("same path with different roles should fail");
+        let error = normalize_routes(
+            vec!["/metrics".to_owned()],
+            vec!["/metrics/".to_owned()],
+            Vec::new(),
+        )
+        .expect_err("same path with different roles should fail");
 
         assert!(error
             .to_string()
             .contains("cannot be declared as both `user` and `system`"));
+    }
+
+    #[test]
+    fn normalize_routes_rejects_secret_grants_for_unknown_routes() {
+        let error = normalize_routes(
+            vec!["/api/guest-example".to_owned()],
+            Vec::new(),
+            vec!["/api/missing=DB_PASS".to_owned()],
+        )
+        .expect_err("secret route must target a declared user route");
+
+        assert!(error
+            .to_string()
+            .contains("must also be declared with `--route`"));
     }
 
     #[test]

@@ -15,12 +15,15 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Once,
     time::Instant,
 };
+#[cfg(feature = "secrets-vault")]
+use std::{collections::HashMap, sync::Arc};
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 use uuid::Uuid;
 use wasmtime::{
@@ -78,6 +81,7 @@ struct AppState {
     engine: Engine,
     config: IntegrityConfig,
     http_client: Client,
+    secrets_vault: SecretsVault,
     telemetry: TelemetryHandle,
 }
 
@@ -93,6 +97,7 @@ struct ComponentHostState {
     ctx: WasiCtx,
     table: ResourceTable,
     limits: GuestResourceLimiter,
+    secrets: SecretAccess,
     telemetry: TelemetryHandle,
 }
 
@@ -100,6 +105,27 @@ struct ComponentHostState {
 struct GuestTelemetryContext {
     handle: TelemetryHandle,
     trace_id: String,
+}
+
+struct GuestExecutionContext {
+    config: IntegrityConfig,
+    runtime_telemetry: TelemetryHandle,
+    secret_access: SecretAccess,
+    telemetry: Option<GuestTelemetryContext>,
+}
+
+#[derive(Clone, Default)]
+struct SecretsVault {
+    #[cfg(feature = "secrets-vault")]
+    entries: Arc<HashMap<String, String>>,
+}
+
+#[cfg_attr(not(feature = "secrets-vault"), allow(dead_code))]
+#[derive(Clone, Debug, Default)]
+struct SecretAccess {
+    allowed_secrets: BTreeSet<String>,
+    #[cfg(feature = "secrets-vault")]
+    entries: Arc<HashMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -139,6 +165,15 @@ enum ResourceLimitKind {
     Memory,
 }
 
+#[cfg_attr(not(feature = "secrets-vault"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretAccessErrorKind {
+    NotFound,
+    PermissionDenied,
+    #[cfg(not(feature = "secrets-vault"))]
+    VaultDisabled,
+}
+
 #[derive(Debug)]
 struct ResourceLimitTrap {
     kind: ResourceLimitKind,
@@ -161,6 +196,8 @@ struct GuestLogRecord {
 struct IntegrityRoute {
     path: String,
     role: RouteRole,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_secrets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -197,6 +234,7 @@ async fn run() -> Result<()> {
         engine: build_engine()?,
         config: config.clone(),
         http_client: Client::new(),
+        secrets_vault: SecretsVault::load(),
         telemetry,
     });
 
@@ -289,6 +327,7 @@ async fn faas_handler(
                             trace_id: trace_id.clone(),
                         };
                         let runtime_telemetry = state.telemetry.clone();
+                        let secret_access = SecretAccess::from_route(&route, &state.secrets_vault);
                         let task_function_name = function_name.clone();
                         let guest_request = GuestRequest {
                             method: method.to_string(),
@@ -300,10 +339,13 @@ async fn faas_handler(
                                 &engine,
                                 &task_function_name,
                                 guest_request,
-                                &config,
                                 route.role,
-                                runtime_telemetry,
-                                Some(telemetry_context),
+                                GuestExecutionContext {
+                                    config,
+                                    runtime_telemetry,
+                                    secret_access,
+                                    telemetry: Some(telemetry_context),
+                                },
                             )
                         })
                         .await;
@@ -491,33 +533,23 @@ fn execute_guest(
     engine: &Engine,
     function_name: &str,
     request: GuestRequest,
-    config: &IntegrityConfig,
     role: RouteRole,
-    runtime_telemetry: TelemetryHandle,
-    telemetry: Option<GuestTelemetryContext>,
+    execution: GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
 
     if let Ok(component) = Component::from_file(engine, &module_path) {
         return match role {
-            RouteRole::User => execute_component_guest(
-                engine,
-                request,
-                config,
-                &module_path,
-                &component,
-                runtime_telemetry,
-                telemetry.as_ref(),
-            ),
+            RouteRole::User => {
+                execute_component_guest(engine, request, &module_path, &component, &execution)
+            }
             RouteRole::System => execute_system_component_guest(
                 engine,
                 request,
-                config,
                 &module_path,
                 &component,
-                runtime_telemetry,
-                telemetry.as_ref(),
+                &execution,
             ),
         };
     }
@@ -536,21 +568,18 @@ fn execute_guest(
         engine,
         function_name,
         request.body,
-        config,
         &module_path,
         module,
-        telemetry.as_ref(),
+        &execution,
     )
 }
 
 fn execute_component_guest(
     engine: &Engine,
     request: GuestRequest,
-    config: &IntegrityConfig,
     component_path: &Path,
     component: &Component,
-    runtime_telemetry: TelemetryHandle,
-    telemetry: Option<&GuestTelemetryContext>,
+    execution: &GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
@@ -559,13 +588,27 @@ fn execute_component_guest(
             "failed to add WASI preview2 functions to component linker",
         )
     })?;
+    component_bindings::tachyon::mesh::secrets_vault::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add secrets vault functions to component linker",
+        )
+    })?;
     let mut store = Store::new(
         engine,
-        ComponentHostState::new(config.guest_memory_limit_bytes, runtime_telemetry),
+        ComponentHostState::new(
+            execution.config.guest_memory_limit_bytes,
+            execution.runtime_telemetry.clone(),
+            execution.secret_access.clone(),
+        ),
     );
     store.limiter(|state| &mut state.limits);
     store
-        .set_fuel(config.guest_fuel_budget)
+        .set_fuel(execution.config.guest_fuel_budget)
         .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
 
     let bindings = component_bindings::FaasGuest::instantiate(&mut store, component, &linker)
@@ -578,7 +621,7 @@ fn execute_component_guest(
                 ),
             )
         })?;
-    record_wasm_start(telemetry);
+    record_wasm_start(execution.telemetry.as_ref());
     let response = bindings.tachyon_mesh_handler().call_handle_request(
         &mut store,
         &component_bindings::exports::tachyon::mesh::handler::Request {
@@ -587,7 +630,7 @@ fn execute_component_guest(
             body: request.body.to_vec(),
         },
     );
-    record_wasm_end(telemetry);
+    record_wasm_end(execution.telemetry.as_ref());
     let response = response.map_err(|error| {
         guest_execution_error(error, "guest component `handle-request` trapped")
     })?;
@@ -607,11 +650,9 @@ fn execute_component_guest(
 fn execute_system_component_guest(
     engine: &Engine,
     request: GuestRequest,
-    config: &IntegrityConfig,
     component_path: &Path,
     component: &Component,
-    runtime_telemetry: TelemetryHandle,
-    telemetry: Option<&GuestTelemetryContext>,
+    execution: &GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
@@ -633,11 +674,15 @@ fn execute_system_component_guest(
 
     let mut store = Store::new(
         engine,
-        ComponentHostState::new(config.guest_memory_limit_bytes, runtime_telemetry),
+        ComponentHostState::new(
+            execution.config.guest_memory_limit_bytes,
+            execution.runtime_telemetry.clone(),
+            execution.secret_access.clone(),
+        ),
     );
     store.limiter(|state| &mut state.limits);
     store
-        .set_fuel(config.guest_fuel_budget)
+        .set_fuel(execution.config.guest_fuel_budget)
         .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
 
     let bindings =
@@ -651,7 +696,7 @@ fn execute_system_component_guest(
                     ),
                 )
             })?;
-    record_wasm_start(telemetry);
+    record_wasm_start(execution.telemetry.as_ref());
     let response = bindings.tachyon_mesh_handler().call_handle_request(
         &mut store,
         &system_component_bindings::exports::tachyon::mesh::handler::Request {
@@ -660,7 +705,7 @@ fn execute_system_component_guest(
             body: request.body.to_vec(),
         },
     );
-    record_wasm_end(telemetry);
+    record_wasm_end(execution.telemetry.as_ref());
     let response = response.map_err(|error| {
         guest_execution_error(error, "system guest component `handle-request` trapped")
     })?;
@@ -681,13 +726,12 @@ fn execute_legacy_guest(
     engine: &Engine,
     function_name: &str,
     body: Bytes,
-    config: &IntegrityConfig,
     module_path: &Path,
     module: Module,
-    telemetry: Option<&GuestTelemetryContext>,
+    execution: &GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let linker = build_linker(engine)?;
-    let stdout = MemoryOutputPipe::new(config.max_stdout_bytes);
+    let stdout = MemoryOutputPipe::new(execution.config.max_stdout_bytes);
     let mut wasi = WasiCtxBuilder::new();
     wasi.arg(legacy_guest_program_name(module_path))
         .stdin(MemoryInputPipe::new(body))
@@ -709,11 +753,11 @@ fn execute_legacy_guest(
     let wasi = wasi.build_p1();
     let mut store = Store::new(
         engine,
-        LegacyHostState::new(wasi, config.guest_memory_limit_bytes),
+        LegacyHostState::new(wasi, execution.config.guest_memory_limit_bytes),
     );
     store.limiter(|state| &mut state.limits);
     store
-        .set_fuel(config.guest_fuel_budget)
+        .set_fuel(execution.config.guest_fuel_budget)
         .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
     let instance = linker
         .instantiate(&mut store, &module)
@@ -726,9 +770,9 @@ fn execute_legacy_guest(
             )
         })?;
 
-    record_wasm_start(telemetry);
+    record_wasm_start(execution.telemetry.as_ref());
     let call_result = entrypoint.call(&mut store, ());
-    record_wasm_end(telemetry);
+    record_wasm_end(execution.telemetry.as_ref());
     handle_guest_entrypoint_result(entrypoint_name, call_result)?;
 
     Ok(GuestExecutionOutput::LegacyStdout(split_guest_stdout(
@@ -1018,7 +1062,25 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
     Ok(IntegrityRoute {
         path: normalized,
         role: route.role,
+        allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
     })
+}
+
+fn normalize_allowed_secrets(allowed_secrets: Vec<String>) -> Result<Vec<String>> {
+    allowed_secrets
+        .into_iter()
+        .map(|secret| {
+            let trimmed = secret.trim();
+            if trimmed.is_empty() {
+                Err(anyhow!(
+                    "Integrity Validation Failed: allowed secret names cannot be empty"
+                ))
+            } else {
+                Ok(trimmed.to_owned())
+            }
+        })
+        .collect::<Result<BTreeSet<_>>>()
+        .map(|allowed_secrets| allowed_secrets.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -1160,16 +1222,69 @@ impl LegacyHostState {
     }
 }
 
-impl ComponentHostState {
-    fn new(max_memory_bytes: usize, telemetry: TelemetryHandle) -> Self {
-        let mut wasi = WasiCtxBuilder::new();
+impl SecretsVault {
+    fn load() -> Self {
+        #[cfg(feature = "secrets-vault")]
+        {
+            let entries = HashMap::from([("DB_PASS".to_owned(), "super_secret_123".to_owned())]);
+            Self {
+                entries: Arc::new(entries),
+            }
+        }
+
+        #[cfg(not(feature = "secrets-vault"))]
+        {
+            Self::default()
+        }
+    }
+}
+
+impl SecretAccess {
+    fn from_route(route: &IntegrityRoute, _vault: &SecretsVault) -> Self {
         Self {
-            ctx: wasi.build(),
+            allowed_secrets: route.allowed_secrets.iter().cloned().collect(),
+            #[cfg(feature = "secrets-vault")]
+            entries: Arc::clone(&_vault.entries),
+        }
+    }
+
+    fn get_secret(&self, name: &str) -> std::result::Result<String, SecretAccessErrorKind> {
+        #[cfg(not(feature = "secrets-vault"))]
+        {
+            let _ = name;
+            return Err(SecretAccessErrorKind::VaultDisabled);
+        }
+
+        #[cfg(feature = "secrets-vault")]
+        {
+            if !self.allowed_secrets.contains(name) {
+                return Err(SecretAccessErrorKind::PermissionDenied);
+            }
+
+            self.entries
+                .get(name)
+                .cloned()
+                .ok_or(SecretAccessErrorKind::NotFound)
+        }
+    }
+}
+
+impl ComponentHostState {
+    fn new(max_memory_bytes: usize, telemetry: TelemetryHandle, secrets: SecretAccess) -> Self {
+        Self {
+            ctx: build_component_wasi_ctx(),
             table: ResourceTable::new(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
+            secrets,
             telemetry,
         }
     }
+}
+
+fn build_component_wasi_ctx() -> WasiCtx {
+    // Intentionally do not inherit the host environment. Secrets stay in host memory
+    // and are only reachable through the typed vault import.
+    WasiCtxBuilder::new().build()
 }
 
 impl WasiView for ComponentHostState {
@@ -1183,6 +1298,26 @@ impl WasiView for ComponentHostState {
 
 impl wasmtime::component::HasData for ComponentHostState {
     type Data<'a> = &'a mut Self;
+}
+
+impl component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHostState {
+    fn get_secret(
+        &mut self,
+        name: String,
+    ) -> std::result::Result<String, component_bindings::tachyon::mesh::secrets_vault::Error> {
+        self.secrets.get_secret(&name).map_err(|error| match error {
+            SecretAccessErrorKind::NotFound => {
+                component_bindings::tachyon::mesh::secrets_vault::Error::NotFound
+            }
+            SecretAccessErrorKind::PermissionDenied => {
+                component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied
+            }
+            #[cfg(not(feature = "secrets-vault"))]
+            SecretAccessErrorKind::VaultDisabled => {
+                component_bindings::tachyon::mesh::secrets_vault::Error::VaultDisabled
+            }
+        })
+    }
 }
 
 impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for ComponentHostState {
@@ -1225,7 +1360,7 @@ impl IntegrityConfig {
             guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
             routes: vec![
-                IntegrityRoute::user(DEFAULT_ROUTE),
+                IntegrityRoute::user_with_secrets(DEFAULT_ROUTE, &["DB_PASS"]),
                 IntegrityRoute::system(DEFAULT_SYSTEM_ROUTE),
             ],
         }
@@ -1243,6 +1378,7 @@ impl IntegrityRoute {
         Self {
             path: path.to_owned(),
             role: RouteRole::User,
+            allowed_secrets: Vec::new(),
         }
     }
 
@@ -1251,6 +1387,19 @@ impl IntegrityRoute {
         Self {
             path: path.to_owned(),
             role: RouteRole::System,
+            allowed_secrets: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn user_with_secrets(path: &str, allowed_secrets: &[&str]) -> Self {
+        Self {
+            path: path.to_owned(),
+            role: RouteRole::User,
+            allowed_secrets: allowed_secrets
+                .iter()
+                .map(|secret| (*secret).to_owned())
+                .collect(),
         }
     }
 }
@@ -1359,6 +1508,21 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
 
+    fn expected_secret_status() -> &'static str {
+        if cfg!(feature = "secrets-vault") {
+            "super_secret_123"
+        } else {
+            "vault-disabled"
+        }
+    }
+
+    fn expected_guest_example_body(payload: &str) -> String {
+        format!(
+            "{payload} | env: missing | secret: {}",
+            expected_secret_status()
+        )
+    }
+
     #[test]
     fn split_guest_stdout_removes_json_log_lines() {
         let stdout = Bytes::from(
@@ -1420,10 +1584,18 @@ mod tests {
                 uri: "/api/guest-example".to_owned(),
                 body: Bytes::from("Hello Lean FaaS!"),
             },
-            &config,
             RouteRole::User,
-            telemetry::init_test_telemetry(),
-            None,
+            GuestExecutionContext {
+                secret_access: SecretAccess::from_route(
+                    config
+                        .sealed_route("/api/guest-example")
+                        .expect("sealed route should exist"),
+                    &SecretsVault::load(),
+                ),
+                config,
+                runtime_telemetry: telemetry::init_test_telemetry(),
+                telemetry: None,
+            },
         )
         .expect("guest execution should succeed");
 
@@ -1431,7 +1603,9 @@ mod tests {
             response,
             GuestExecutionOutput::Http(GuestHttpResponse {
                 status: StatusCode::OK,
-                body: Bytes::from("FaaS received: Hello Lean FaaS!"),
+                body: Bytes::from(expected_guest_example_body(
+                    "FaaS received: Hello Lean FaaS!"
+                )),
             })
         );
     }
@@ -1448,10 +1622,13 @@ mod tests {
                 uri: "/api/guest-call-legacy".to_owned(),
                 body: Bytes::new(),
             },
-            &config,
             RouteRole::User,
-            telemetry::init_test_telemetry(),
-            None,
+            GuestExecutionContext {
+                config,
+                runtime_telemetry: telemetry::init_test_telemetry(),
+                secret_access: SecretAccess::default(),
+                telemetry: None,
+            },
         )
         .expect("legacy guest execution should succeed");
 
@@ -1469,6 +1646,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
             telemetry: telemetry::init_test_telemetry(),
         });
         let response = app
@@ -1491,7 +1669,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8_lossy(&body).trim(),
-            "FaaS received: Hello Lean FaaS!"
+            expected_guest_example_body("FaaS received: Hello Lean FaaS!")
         );
     }
 
@@ -1501,6 +1679,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
             telemetry: telemetry::init_test_telemetry(),
         });
         let response = app
@@ -1523,7 +1702,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8_lossy(&body).trim(),
-            "FaaS received an empty payload"
+            expected_guest_example_body("FaaS received an empty payload")
         );
     }
 
@@ -1533,6 +1712,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
             telemetry: telemetry::init_test_telemetry(),
         });
         let response = app
@@ -1567,6 +1747,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
             telemetry: telemetry::init_test_telemetry(),
         });
         let response = app
@@ -1593,10 +1774,13 @@ mod tests {
                 uri: "/metrics".to_owned(),
                 body: Bytes::new(),
             },
-            &config,
             RouteRole::User,
-            telemetry::init_test_telemetry(),
-            None,
+            GuestExecutionContext {
+                config,
+                runtime_telemetry: telemetry::init_test_telemetry(),
+                secret_access: SecretAccess::default(),
+                telemetry: None,
+            },
         )
         .expect_err("privileged metrics guest should fail as a user route");
 
@@ -1616,6 +1800,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
             telemetry: telemetry::init_test_telemetry(),
         });
 
@@ -1654,6 +1839,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
             telemetry,
         });
 
@@ -1693,6 +1879,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
             telemetry,
         });
 
@@ -1732,6 +1919,43 @@ mod tests {
         assert!(record["total_duration_us"].as_u64().is_some());
         assert!(record["wasm_duration_us"].as_u64().is_some());
         assert!(record["host_overhead_us"].as_u64().is_some());
+    }
+
+    #[cfg(feature = "secrets-vault")]
+    #[tokio::test]
+    async fn router_denies_secret_lookup_without_sealed_grant() {
+        let app = build_app(AppState {
+            engine: build_engine().expect("engine should be created"),
+            config: IntegrityConfig {
+                routes: vec![IntegrityRoute::user("/api/guest-example")],
+                ..IntegrityConfig::default_sealed()
+            },
+            http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
+            telemetry: telemetry::init_test_telemetry(),
+        });
+        let response = app
+            .oneshot(
+                Request::get("/api/guest-example")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+
+        assert_eq!(
+            String::from_utf8_lossy(&body).trim(),
+            "FaaS received an empty payload | env: missing | secret: permission-denied"
+        );
     }
 
     #[test]
@@ -1824,6 +2048,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config,
             http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
             telemetry: telemetry::init_test_telemetry(),
         });
 
@@ -1928,6 +2153,13 @@ mod tests {
                 .expect("embedded config should seal the system metrics route")
                 .role,
             RouteRole::System
+        );
+        assert_eq!(
+            config
+                .sealed_route("/api/guest-example")
+                .expect("embedded config should seal the example route")
+                .allowed_secrets,
+            vec!["DB_PASS".to_owned()]
         );
         assert!(config.sealed_route("/api/guest-example").is_some());
         assert!(config.sealed_route("/api/guest-loop").is_some());

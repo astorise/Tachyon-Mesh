@@ -31,7 +31,18 @@ interface telemetry-reader {
     get-metrics: func() -> metrics-snapshot;
 }
 
+interface secrets-vault {
+    enum error {
+        not-found,
+        permission-denied,
+        vault-disabled,
+    }
+
+    get-secret: func(name: string) -> result<string, error>;
+}
+
 world faas-guest {
+    import secrets-vault;
     export handler;
 }
 

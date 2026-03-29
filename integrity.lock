@@ -1,5 +1,5 @@
 {
-  "config_payload": "{\"host_address\":\"0.0.0.0:8080\",\"max_stdout_bytes\":65536,\"guest_fuel_budget\":500000000,\"guest_memory_limit_bytes\":67108864,\"resource_limit_response\":\"Execution trapped: Resource limit exceeded\",\"routes\":[{\"path\":\"/api/guest-call-legacy\",\"role\":\"user\"},{\"path\":\"/api/guest-csharp\",\"role\":\"user\"},{\"path\":\"/api/guest-example\",\"role\":\"user\"},{\"path\":\"/api/guest-go\",\"role\":\"user\"},{\"path\":\"/api/guest-java\",\"role\":\"user\"},{\"path\":\"/api/guest-js\",\"role\":\"user\"},{\"path\":\"/api/guest-loop\",\"role\":\"user\"},{\"path\":\"/metrics\",\"role\":\"system\"}]}",
-  "public_key": "550ec56615d9dd18513e57c43abd0ae84ac6a018ef65d06ffe0ef3ce075f2a36",
-  "signature": "ef72d60979c37c094fa1b29203459540e5dddf5aebf071600da5f47f2cbf0cd070c5330c5b2de5e9ac88d3fc911b970df4aa6af7b2f7ede29754fe3ffcb7e304"
+  "config_payload": "{\"host_address\":\"0.0.0.0:8080\",\"max_stdout_bytes\":65536,\"guest_fuel_budget\":500000000,\"guest_memory_limit_bytes\":67108864,\"resource_limit_response\":\"Execution trapped: Resource limit exceeded\",\"routes\":[{\"path\":\"/api/guest-call-legacy\",\"role\":\"user\"},{\"path\":\"/api/guest-csharp\",\"role\":\"user\"},{\"path\":\"/api/guest-example\",\"role\":\"user\",\"allowed_secrets\":[\"DB_PASS\"]},{\"path\":\"/api/guest-go\",\"role\":\"user\"},{\"path\":\"/api/guest-java\",\"role\":\"user\"},{\"path\":\"/api/guest-js\",\"role\":\"user\"},{\"path\":\"/api/guest-loop\",\"role\":\"user\"},{\"path\":\"/metrics\",\"role\":\"system\"}]}",
+  "public_key": "75e4736d6dab94fd7a6068d1b92d9ad6831564878ae338d1575ff2ed26a024f4",
+  "signature": "479a7d7ab724369fe94930bac711da5298d413e95358c949f8072b94abc4b4b1810fb2c880674bd1e629af555fc4f2697c6b0b32c71ad2c7edd8a8a293efdd01"
 }

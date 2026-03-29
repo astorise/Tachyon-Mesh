@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
+secrets-vault = []
 
 [dependencies]
 anyhow = "1"
