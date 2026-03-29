@@ -36,19 +36,21 @@ At startup, `core-host` SHALL hash the embedded configuration payload, reconstru
 - **AND** the process surfaces an integrity validation failure before binding the HTTP server
 
 ### Requirement: Integrity manifest seals route execution roles
-The workspace SHALL seal each configured route in `integrity.lock` as a structured entry containing the normalized route path, an execution role of `user` or `system`, and an optional `allowed_secrets` list when a user route is permitted to read named secrets from the host vault.
+The workspace SHALL seal each configured route in `integrity.lock` as a structured entry
+containing the normalized route path, an execution role of `user` or `system`, optional
+`allowed_secrets`, and route-scaling fields `min_instances` plus `max_concurrency`.
 
-#### Scenario: Generating a manifest with both user and system routes
-- **WHEN** a developer runs `tachyon-cli generate` with regular routes and at least one privileged telemetry route
-- **THEN** the canonical configuration payload includes every route as an object with `path` and `role`
-- **AND** regular guest routes are sealed with role `user`
-- **AND** privileged telemetry routes are sealed with role `system`
+#### Scenario: Generating a manifest with explicit route scaling
+- **WHEN** a developer runs `tachyon-cli generate --route /api/guest-example --route-scale /api/guest-example=2:16 --memory 64`
+- **THEN** the canonical configuration payload includes `/api/guest-example` with `min_instances = 2`
+- **AND** the same route entry includes `max_concurrency = 16`
+- **AND** the route remains normalized before it is signed
 
-#### Scenario: Generating a manifest with a secret-enabled user route
-- **WHEN** a developer runs `tachyon-cli generate --route /api/guest-example --secret-route /api/guest-example=DB_PASS --memory 64`
-- **THEN** the canonical configuration payload includes `/api/guest-example` with role `user`
-- **AND** that route entry includes `allowed_secrets` containing `DB_PASS`
-- **AND** routes without secret grants omit or leave empty `allowed_secrets`
+#### Scenario: Loading an older manifest without scaling fields
+- **WHEN** `core-host` starts with a sealed manifest whose route entries omit `min_instances` and `max_concurrency`
+- **THEN** integrity validation still succeeds
+- **AND** the host defaults `min_instances` to `0`
+- **AND** the host defaults `max_concurrency` to `100`
 
 ### Requirement: Host rejects ambiguous or invalid sealed route metadata
 `core-host` SHALL normalize sealed route paths, reject duplicates, and refuse to start if any sealed route metadata is invalid.

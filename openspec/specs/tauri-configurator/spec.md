@@ -4,22 +4,19 @@
 TBD - created by archiving change tauri-configurator. Update Purpose after archive.
 ## Requirements
 ### Requirement: Tauri configurator supports headless manifest generation from the CLI
-The `tachyon-cli` application SHALL expose a `generate` subcommand that accepts regular route, privileged system route, secret grant, and memory inputs, invokes the Rust manifest-generation backend, and exits without opening a desktop window when run from the terminal.
+The `tachyon-cli` application SHALL expose a `generate` subcommand that accepts regular route,
+privileged system route, secret grant, memory, and optional per-route scaling inputs, invokes the
+Rust manifest-generation backend, and exits without opening a desktop window when run from the
+terminal.
 
-#### Scenario: CLI mode exits before launching a webview
-- **WHEN** a developer invokes `tachyon-cli generate --route /api/guest-example --memory 64`
-- **THEN** the application parses the CLI arguments before any desktop window is created
-- **AND** the manifest-generation backend runs to completion using those arguments
-- **AND** the process exits with a success or failure status code without opening a webview
+#### Scenario: CLI mode seals route scaling overrides
+- **WHEN** a developer invokes `tachyon-cli generate --route /api/guest-example --route-scale /api/guest-example=1:8 --memory 64`
+- **THEN** the generated canonical configuration payload includes `/api/guest-example` with `min_instances = 1`
+- **AND** the generated canonical configuration payload includes `/api/guest-example` with `max_concurrency = 8`
+- **AND** the command succeeds without opening a webview
 
-#### Scenario: CLI mode seals privileged system routes distinctly from user routes
-- **WHEN** a developer invokes `tachyon-cli generate --route /api/guest-example --system-route /metrics --memory 64`
-- **THEN** the generated canonical configuration payload includes `/api/guest-example` with role `user`
-- **AND** the generated canonical configuration payload includes `/metrics` with role `system`
-- **AND** route normalization still applies before `integrity.lock` is written
-
-#### Scenario: CLI mode seals named secret grants for a user route
-- **WHEN** a developer invokes `tachyon-cli generate --route /api/guest-example --secret-route /api/guest-example=DB_PASS --memory 64`
-- **THEN** the generated canonical configuration payload includes `/api/guest-example` with `allowed_secrets` containing `DB_PASS`
-- **AND** secret grants targeting undeclared routes are rejected
+#### Scenario: CLI mode rejects scaling overrides for unknown routes
+- **WHEN** a developer invokes `tachyon-cli generate --route /api/guest-example --route-scale /api/missing=1:8 --memory 64`
+- **THEN** the command exits with a failure status
+- **AND** the error explains that the scaling override must target a declared sealed route
 

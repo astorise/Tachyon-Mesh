@@ -19,6 +19,6 @@
 
 ## 4. Delivery
 
-- [ ] 4.1 Commit and push the scoped change on the active branch.
-- [ ] 4.2 Iterate on GitHub Actions failures until the branch is green.
-- [ ] 4.3 Archive `instance-pooling-concurrency` with spec sync once the branch head is green.
+- [x] 4.1 Commit and push the scoped change on the active branch.
+- [x] 4.2 Iterate on GitHub Actions failures until the branch is green.
+- [x] 4.3 Archive `instance-pooling-concurrency` with spec sync once the branch head is green.
