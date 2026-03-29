@@ -46,7 +46,7 @@ const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
 #[cfg(test)]
 const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
 #[cfg(test)]
-const DEFAULT_GUEST_FUEL_BUDGET: u64 = 50_000_000;
+const DEFAULT_GUEST_FUEL_BUDGET: u64 = 500_000_000;
 #[cfg(test)]
 const DEFAULT_GUEST_MEMORY_LIMIT_BYTES: usize = 50 * 1024 * 1024;
 #[cfg(test)]
@@ -1344,6 +1344,7 @@ mod tests {
             .expect("embedded payload should deserialize into an integrity config");
         let config = validate_integrity_config(config).expect("embedded config should validate");
 
+        assert_eq!(config.guest_fuel_budget, DEFAULT_GUEST_FUEL_BUDGET);
         assert!(config.allows_route("/api/guest-example"));
         assert!(config.allows_route("/api/guest-csharp"));
         assert!(config.allows_route("/api/guest-java"));
