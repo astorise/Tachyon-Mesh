@@ -14,6 +14,11 @@ const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
 const DEFAULT_GUEST_FUEL_BUDGET: u64 = 500_000_000;
 const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
+const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
+
+fn default_max_concurrency() -> u32 {
+    DEFAULT_ROUTE_MAX_CONCURRENCY
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,6 +33,10 @@ pub struct SealedRoute {
     pub role: RouteRole,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_secrets: Vec<String>,
+    #[serde(default)]
+    pub min_instances: u32,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -52,7 +61,14 @@ struct GenerateRequest {
     user_routes: Vec<String>,
     system_routes: Vec<String>,
     secret_routes: Vec<String>,
+    route_scales: Vec<String>,
     memory_mib: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RouteScaling {
+    min_instances: u32,
+    max_concurrency: u32,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -116,6 +132,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         user_routes: parse_required_routes_arg(&subcommand.matches.args, "route")?,
         system_routes: parse_optional_routes_arg(&subcommand.matches.args, "system-route")?,
         secret_routes: parse_optional_routes_arg(&subcommand.matches.args, "secret-route")?,
+        route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
     };
 
@@ -139,6 +156,7 @@ fn parse_generate_request_from_args(
     let mut user_routes = Vec::new();
     let mut system_routes = Vec::new();
     let mut secret_routes = Vec::new();
+    let mut route_scales = Vec::new();
     let mut memory_mib = None;
 
     while let Some(arg) = args.next() {
@@ -186,6 +204,19 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--route-scale=") {
+            route_scales.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--route-scale" {
+            let route_scale = args.next().context(
+                "missing value for `--route-scale`; expected `--route-scale /api/guest-example=1:8`",
+            )?;
+            route_scales.push(route_scale);
+            continue;
+        }
+
         if arg == "--memory" {
             let value = args
                 .next()
@@ -206,6 +237,7 @@ fn parse_generate_request_from_args(
         user_routes,
         system_routes,
         secret_routes,
+        route_scales,
         memory_mib,
     }))
 }
@@ -242,6 +274,7 @@ impl SealedConfig {
             request.user_routes,
             request.system_routes,
             request.secret_routes,
+            request.route_scales,
         )?;
         let memory_mib = usize::try_from(request.memory_mib)
             .context("memory limit is too large for this platform")?;
@@ -334,6 +367,7 @@ fn normalize_routes(
     user_routes: Vec<String>,
     system_routes: Vec<String>,
     secret_routes: Vec<String>,
+    route_scales: Vec<String>,
 ) -> Result<Vec<SealedRoute>> {
     if user_routes.is_empty() {
         bail!("at least one `--route` value must be provided");
@@ -358,6 +392,8 @@ fn normalize_routes(
                 path,
                 role: RouteRole::User,
                 allowed_secrets: Vec::new(),
+                min_instances: 0,
+                max_concurrency: default_max_concurrency(),
             },
         );
     }
@@ -368,6 +404,8 @@ fn normalize_routes(
             path: path.clone(),
             role: RouteRole::System,
             allowed_secrets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: default_max_concurrency(),
         };
 
         if let Some(existing) = normalized.get(&path) {
@@ -405,6 +443,17 @@ fn normalize_routes(
         );
     }
 
+    for route_scale in route_scales {
+        let (path, scaling) = parse_route_scale(&route_scale)?;
+        let normalized_path = normalize_route(&path)?;
+        let sealed_route = normalized.get_mut(&normalized_path).ok_or_else(|| {
+            anyhow!("route scale `{normalized_path}` must target a declared sealed route")
+        })?;
+
+        sealed_route.min_instances = scaling.min_instances;
+        sealed_route.max_concurrency = scaling.max_concurrency;
+    }
+
     Ok(normalized.into_values().collect())
 }
 
@@ -430,6 +479,45 @@ fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
     }
 
     Ok((path.to_owned(), merge_allowed_secrets(Vec::new(), secrets)))
+}
+
+fn parse_route_scale(value: &str) -> Result<(String, RouteScaling)> {
+    let (path, scaling) = value.split_once('=').context(
+        "route scaling must use the `/path=min:max` syntax, for example `/api/guest-example=1:8`",
+    )?;
+    let (min_instances, max_concurrency) = scaling.split_once(':').context(
+        "route scaling must include both `min_instances` and `max_concurrency`, for example `/api/guest-example=1:8`",
+    )?;
+
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("route scaling must include a non-empty path before `=`");
+    }
+
+    let min_instances = min_instances.trim().parse::<u32>().with_context(|| {
+        format!(
+            "failed to parse `{}` as `min_instances` in route scaling override `{value}`",
+            min_instances.trim()
+        )
+    })?;
+    let max_concurrency = max_concurrency.trim().parse::<u32>().with_context(|| {
+        format!(
+            "failed to parse `{}` as `max_concurrency` in route scaling override `{value}`",
+            max_concurrency.trim()
+        )
+    })?;
+
+    if max_concurrency == 0 {
+        bail!("route scaling override `{value}` must set `max_concurrency` above zero");
+    }
+
+    Ok((
+        path.to_owned(),
+        RouteScaling {
+            min_instances,
+            max_concurrency,
+        },
+    ))
 }
 
 fn merge_allowed_secrets(existing: Vec<String>, added: Vec<String>) -> Vec<String> {
@@ -498,6 +586,7 @@ mod tests {
             ],
             vec!["/metrics/".to_owned()],
             Vec::new(),
+            Vec::new(),
         )
         .expect("routes should normalize");
 
@@ -508,16 +597,22 @@ mod tests {
                     path: "/api/guest-example".to_owned(),
                     role: RouteRole::User,
                     allowed_secrets: Vec::new(),
+                    min_instances: 0,
+                    max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                 },
                 SealedRoute {
                     path: "/api/guest-malicious".to_owned(),
                     role: RouteRole::User,
                     allowed_secrets: Vec::new(),
+                    min_instances: 0,
+                    max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                 },
                 SealedRoute {
                     path: "/metrics".to_owned(),
                     role: RouteRole::System,
                     allowed_secrets: Vec::new(),
+                    min_instances: 0,
+                    max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                 }
             ]
         );
@@ -529,6 +624,7 @@ mod tests {
             user_routes: vec!["/api/guest-example".to_owned()],
             system_routes: vec!["/metrics".to_owned()],
             secret_routes: vec!["/api/guest-example=DB_PASS".to_owned()],
+            route_scales: vec!["/api/guest-example=2:16".to_owned()],
             memory_mib: 64,
         })
         .expect("request should produce a sealed config");
@@ -542,11 +638,15 @@ mod tests {
                     path: "/api/guest-example".to_owned(),
                     role: RouteRole::User,
                     allowed_secrets: vec!["DB_PASS".to_owned()],
+                    min_instances: 2,
+                    max_concurrency: 16,
                 },
                 SealedRoute {
                     path: "/metrics".to_owned(),
                     role: RouteRole::System,
                     allowed_secrets: Vec::new(),
+                    min_instances: 0,
+                    max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                 }
             ]
         );
@@ -557,6 +657,8 @@ mod tests {
         assert!(payload.contains("\"path\":\"/api/guest-example\""));
         assert!(payload.contains("\"role\":\"system\""));
         assert!(payload.contains("\"allowed_secrets\":[\"DB_PASS\"]"));
+        assert!(payload.contains("\"min_instances\":2"));
+        assert!(payload.contains("\"max_concurrency\":16"));
     }
 
     #[test]
@@ -571,6 +673,8 @@ mod tests {
                 "/metrics",
                 "--secret-route",
                 "/api/guest-example=DB_PASS,API_KEY",
+                "--route-scale",
+                "/api/guest-example=1:8",
                 "--memory",
                 "64",
             ]
@@ -589,8 +693,31 @@ mod tests {
                 ],
                 system_routes: vec!["/metrics".to_owned()],
                 secret_routes: vec!["/api/guest-example=DB_PASS,API_KEY".to_owned()],
+                route_scales: vec!["/api/guest-example=1:8".to_owned()],
                 memory_mib: 64,
             }
+        );
+    }
+
+    #[test]
+    fn normalize_routes_applies_scaling_overrides() {
+        let routes = normalize_routes(
+            vec!["/api/guest-example".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            vec!["/api/guest-example=3:7".to_owned()],
+        )
+        .expect("route scaling should normalize");
+
+        assert_eq!(
+            routes,
+            vec![SealedRoute {
+                path: "/api/guest-example".to_owned(),
+                role: RouteRole::User,
+                allowed_secrets: Vec::new(),
+                min_instances: 3,
+                max_concurrency: 7,
+            }]
         );
     }
 
@@ -599,6 +726,7 @@ mod tests {
         let error = normalize_routes(
             vec!["/metrics".to_owned()],
             vec!["/metrics/".to_owned()],
+            Vec::new(),
             Vec::new(),
         )
         .expect_err("same path with different roles should fail");
@@ -614,12 +742,43 @@ mod tests {
             vec!["/api/guest-example".to_owned()],
             Vec::new(),
             vec!["/api/missing=DB_PASS".to_owned()],
+            Vec::new(),
         )
         .expect_err("secret route must target a declared user route");
 
         assert!(error
             .to_string()
             .contains("must also be declared with `--route`"));
+    }
+
+    #[test]
+    fn normalize_routes_rejects_scaling_overrides_for_unknown_routes() {
+        let error = normalize_routes(
+            vec!["/api/guest-example".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            vec!["/api/missing=1:8".to_owned()],
+        )
+        .expect_err("route scaling must target a declared route");
+
+        assert!(error
+            .to_string()
+            .contains("must target a declared sealed route"));
+    }
+
+    #[test]
+    fn normalize_routes_rejects_zero_max_concurrency() {
+        let error = normalize_routes(
+            vec!["/api/guest-example".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            vec!["/api/guest-example=1:0".to_owned()],
+        )
+        .expect_err("zero max_concurrency should fail");
+
+        assert!(error
+            .to_string()
+            .contains("must set `max_concurrency` above zero"));
     }
 
     #[test]

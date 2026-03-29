@@ -45,6 +45,13 @@
               "required": false
             },
             {
+              "name": "route-scale",
+              "description": "Apply per-route scaling using /path=min:max.",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
               "name": "memory",
               "short": "m",
               "description": "Guest memory limit in MiB.",

@@ -15,21 +15,20 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Once,
-    time::Instant,
+    sync::{Arc, Once},
+    time::{Duration, Instant},
 };
-#[cfg(feature = "secrets-vault")]
-use std::{collections::HashMap, sync::Arc};
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
-    Config, Engine, Instance, Linker as ModuleLinker, Module, ResourceLimiter, Store, Trap,
-    TypedFunc,
+    Config, Engine, Instance, Linker as ModuleLinker, Module, PoolingAllocationConfig,
+    ResourceLimiter, Store, Trap, TypedFunc,
 };
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
@@ -75,11 +74,28 @@ const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
 const DEFAULT_HOP_LIMIT: u32 = 10;
 const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
+const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
+#[cfg(not(test))]
+const ROUTE_CONCURRENCY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const ROUTE_CONCURRENCY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+const POOLING_CORE_INSTANCES_MULTIPLIER: u32 = 8;
+const POOLING_MEMORIES_MULTIPLIER: u32 = 2;
+const POOLING_TABLES_MULTIPLIER: u32 = 2;
+const POOLING_INSTANCE_METADATA_BYTES: usize = 1 << 20;
+const POOLING_MAX_CORE_INSTANCES_PER_COMPONENT: u32 = 50;
+const POOLING_MAX_MEMORIES_PER_COMPONENT: u32 = 8;
+const POOLING_MAX_TABLES_PER_COMPONENT: u32 = 8;
+
+fn default_max_concurrency() -> u32 {
+    DEFAULT_ROUTE_MAX_CONCURRENCY
+}
 
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
     config: IntegrityConfig,
+    concurrency_limits: Arc<HashMap<String, Arc<Semaphore>>>,
     http_client: Client,
     secrets_vault: SecretsVault,
     telemetry: TelemetryHandle,
@@ -198,6 +214,10 @@ struct IntegrityRoute {
     role: RouteRole,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_secrets: Vec<String>,
+    #[serde(default)]
+    min_instances: u32,
+    #[serde(default = "default_max_concurrency")]
+    max_concurrency: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -229,10 +249,13 @@ async fn run() -> Result<()> {
     init_host_tracing();
     let config = verify_integrity()?;
     let telemetry = telemetry::init_telemetry();
+    let engine = build_engine(&config)?;
+    let concurrency_limits = build_concurrency_limits(&config);
 
     let app = build_app(AppState {
-        engine: build_engine()?,
+        engine,
         config: config.clone(),
+        concurrency_limits,
         http_client: Client::new(),
         secrets_vault: SecretsVault::load(),
         telemetry,
@@ -318,80 +341,117 @@ async fn faas_handler(
                 )
                     .into_response()
             } else {
-                match resolve_function_name(&normalized_path) {
-                    Some(function_name) => {
-                        let engine = state.engine.clone();
-                        let config = state.config.clone();
-                        let telemetry_context = GuestTelemetryContext {
-                            handle: state.telemetry.clone(),
-                            trace_id: trace_id.clone(),
-                        };
-                        let runtime_telemetry = state.telemetry.clone();
-                        let secret_access = SecretAccess::from_route(&route, &state.secrets_vault);
-                        let task_function_name = function_name.clone();
-                        let guest_request = GuestRequest {
-                            method: method.to_string(),
-                            uri: uri.to_string(),
-                            body,
-                        };
-                        let result = tokio::task::spawn_blocking(move || {
-                            execute_guest(
-                                &engine,
-                                &task_function_name,
-                                guest_request,
-                                route.role,
-                                GuestExecutionContext {
-                                    config,
-                                    runtime_telemetry,
-                                    secret_access,
-                                    telemetry: Some(telemetry_context),
-                                },
-                            )
-                        })
-                        .await;
+                match state.concurrency_limits.get(&normalized_path).cloned() {
+                    None => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("route `{normalized_path}` is missing a concurrency limiter"),
+                    )
+                        .into_response(),
+                    Some(semaphore) => {
+                        match tokio::time::timeout(
+                            ROUTE_CONCURRENCY_WAIT_TIMEOUT,
+                            semaphore.acquire_owned(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(permit)) => {
+                                let _permit = permit;
 
-                        match result {
-                            Ok(Ok(output)) => {
-                                let response = match output {
-                                    GuestExecutionOutput::Http(response) => response,
-                                    GuestExecutionOutput::LegacyStdout(stdout) => {
-                                        GuestHttpResponse {
-                                            status: StatusCode::OK,
-                                            body: stdout,
+                                match resolve_function_name(&normalized_path) {
+                                    Some(function_name) => {
+                                        let engine = state.engine.clone();
+                                        let config = state.config.clone();
+                                        let telemetry_context = GuestTelemetryContext {
+                                            handle: state.telemetry.clone(),
+                                            trace_id: trace_id.clone(),
+                                        };
+                                        let runtime_telemetry = state.telemetry.clone();
+                                        let secret_access =
+                                            SecretAccess::from_route(&route, &state.secrets_vault);
+                                        let task_function_name = function_name.clone();
+                                        let guest_request = GuestRequest {
+                                            method: method.to_string(),
+                                            uri: uri.to_string(),
+                                            body,
+                                        };
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            execute_guest(
+                                                &engine,
+                                                &task_function_name,
+                                                guest_request,
+                                                route.role,
+                                                GuestExecutionContext {
+                                                    config,
+                                                    runtime_telemetry,
+                                                    secret_access,
+                                                    telemetry: Some(telemetry_context),
+                                                },
+                                            )
+                                        })
+                                        .await;
+
+                                        match result {
+                                            Ok(Ok(output)) => {
+                                                let response = match output {
+                                                    GuestExecutionOutput::Http(response) => response,
+                                                    GuestExecutionOutput::LegacyStdout(stdout) => {
+                                                        GuestHttpResponse {
+                                                            status: StatusCode::OK,
+                                                            body: stdout,
+                                                        }
+                                                    }
+                                                };
+
+                                                match resolve_mesh_response(
+                                                    &state.http_client,
+                                                    &state.config,
+                                                    hop_limit,
+                                                    response,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(response) => {
+                                                        (response.status, response.body)
+                                                            .into_response()
+                                                    }
+                                                    Err(error) => {
+                                                        (StatusCode::BAD_GATEWAY, error)
+                                                            .into_response()
+                                                    }
+                                                }
+                                            }
+                                            Ok(Err(error)) => {
+                                                error.log_if_needed(&function_name);
+                                                error.into_response(&state.config).into_response()
+                                            }
+                                            Err(error) => (
+                                                StatusCode::INTERNAL_SERVER_ERROR,
+                                                format!("guest execution task failed: {error}"),
+                                            )
+                                                .into_response(),
                                         }
                                     }
-                                };
-
-                                match resolve_mesh_response(
-                                    &state.http_client,
-                                    &state.config,
-                                    hop_limit,
-                                    response,
-                                )
-                                .await
-                                {
-                                    Ok(response) => {
-                                        (response.status, response.body).into_response()
-                                    }
-                                    Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+                                    None => (
+                                        StatusCode::NOT_FOUND,
+                                        format!(
+                                            "no guest function could be resolved from `{normalized_path}`"
+                                        ),
+                                    )
+                                        .into_response(),
                                 }
                             }
-                            Ok(Err(error)) => {
-                                error.log_if_needed(&function_name);
-                                error.into_response(&state.config).into_response()
-                            }
-                            Err(error) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("guest execution task failed: {error}"),
+                            Ok(Err(_)) => (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("route `{normalized_path}` is currently unavailable"),
+                            )
+                                .into_response(),
+                            Err(_) => (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("route `{normalized_path}` is saturated"),
                             )
                                 .into_response(),
                         }
                     }
-                    None => (
-                        StatusCode::NOT_FOUND,
-                        format!("no guest function could be resolved from `{normalized_path}`"),
-                    )
-                        .into_response(),
                 }
             }
         }
@@ -956,14 +1016,74 @@ fn handle_guest_entrypoint_result(
     }
 }
 
-fn build_engine() -> Result<Engine> {
+fn build_engine(integrity_config: &IntegrityConfig) -> Result<Engine> {
     let mut config = Config::new();
     config.consume_fuel(true);
     config.wasm_component_model(true);
+    config.allocation_strategy(build_pooling_config(integrity_config)?);
 
-    Engine::new(&config).map_err(|error| {
-        anyhow!("failed to create Wasmtime engine with fuel metering enabled: {error}")
-    })
+    Engine::new(&config)
+        .map_err(|error| anyhow!("failed to create Wasmtime engine with pooling enabled: {error}"))
+}
+
+fn build_pooling_config(config: &IntegrityConfig) -> Result<PoolingAllocationConfig> {
+    let total_route_concurrency = total_route_concurrency(&config.routes)?;
+    let total_min_instances = total_min_instances(&config.routes)?;
+    let mut pooling = PoolingAllocationConfig::new();
+
+    pooling.total_component_instances(total_route_concurrency);
+    pooling.total_core_instances(
+        total_route_concurrency.saturating_mul(POOLING_CORE_INSTANCES_MULTIPLIER),
+    );
+    pooling.total_memories(total_route_concurrency.saturating_mul(POOLING_MEMORIES_MULTIPLIER));
+    pooling.total_tables(total_route_concurrency.saturating_mul(POOLING_TABLES_MULTIPLIER));
+    pooling.max_component_instance_size(POOLING_INSTANCE_METADATA_BYTES);
+    pooling.max_core_instance_size(POOLING_INSTANCE_METADATA_BYTES);
+    pooling.max_core_instances_per_component(POOLING_MAX_CORE_INSTANCES_PER_COMPONENT);
+    pooling.max_memories_per_component(POOLING_MAX_MEMORIES_PER_COMPONENT);
+    pooling.max_tables_per_component(POOLING_MAX_TABLES_PER_COMPONENT);
+    pooling.max_memory_size(config.guest_memory_limit_bytes);
+    pooling.max_unused_warm_slots(total_min_instances);
+
+    Ok(pooling)
+}
+
+fn build_concurrency_limits(config: &IntegrityConfig) -> Arc<HashMap<String, Arc<Semaphore>>> {
+    Arc::new(
+        config
+            .routes
+            .iter()
+            .map(|route| {
+                (
+                    route.path.clone(),
+                    Arc::new(Semaphore::new(
+                        usize::try_from(route.max_concurrency)
+                            .expect("route max_concurrency should fit in usize"),
+                    )),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn total_route_concurrency(routes: &[IntegrityRoute]) -> Result<u32> {
+    u32::try_from(
+        routes
+            .iter()
+            .map(|route| u64::from(route.max_concurrency))
+            .sum::<u64>(),
+    )
+    .context("embedded sealed configuration declares more route concurrency than Wasmtime can pool")
+}
+
+fn total_min_instances(routes: &[IntegrityRoute]) -> Result<u32> {
+    u32::try_from(
+        routes
+            .iter()
+            .map(|route| u64::from(route.min_instances))
+            .sum::<u64>(),
+    )
+    .context("embedded sealed configuration declares more warm instances than Wasmtime can track")
 }
 
 fn init_host_tracing() {
@@ -1059,10 +1179,24 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         ));
     }
 
+    if route.max_concurrency == 0 {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{normalized}` must set `max_concurrency` above zero"
+        ));
+    }
+
+    if route.min_instances > route.max_concurrency {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{normalized}` cannot set `min_instances` above `max_concurrency`"
+        ));
+    }
+
     Ok(IntegrityRoute {
         path: normalized,
         role: route.role,
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
+        min_instances: route.min_instances,
+        max_concurrency: route.max_concurrency,
     })
 }
 
@@ -1379,6 +1513,8 @@ impl IntegrityRoute {
             path: path.to_owned(),
             role: RouteRole::User,
             allowed_secrets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
         }
     }
 
@@ -1388,6 +1524,8 @@ impl IntegrityRoute {
             path: path.to_owned(),
             role: RouteRole::System,
             allowed_secrets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
         }
     }
 
@@ -1400,6 +1538,8 @@ impl IntegrityRoute {
                 .iter()
                 .map(|secret| (*secret).to_owned())
                 .collect(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
         }
     }
 }
@@ -1523,6 +1663,24 @@ mod tests {
         )
     }
 
+    fn build_test_engine(config: &IntegrityConfig) -> Engine {
+        build_engine(config).expect("engine should be created")
+    }
+
+    fn build_test_state(config: IntegrityConfig, telemetry: TelemetryHandle) -> AppState {
+        let engine = build_test_engine(&config);
+        let concurrency_limits = build_concurrency_limits(&config);
+
+        AppState {
+            engine,
+            config,
+            concurrency_limits,
+            http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
+            telemetry,
+        }
+    }
+
     #[test]
     fn split_guest_stdout_removes_json_log_lines() {
         let stdout = Bytes::from(
@@ -1574,8 +1732,8 @@ mod tests {
 
     #[test]
     fn execute_guest_returns_component_response_payload() {
-        let engine = build_engine().expect("engine should be created");
         let config = IntegrityConfig::default_sealed();
+        let engine = build_test_engine(&config);
         let response = execute_guest(
             &engine,
             "guest-example",
@@ -1612,8 +1770,8 @@ mod tests {
 
     #[test]
     fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
-        let engine = build_engine().expect("engine should be created");
         let config = IntegrityConfig::default_sealed();
+        let engine = build_test_engine(&config);
         let response = execute_guest(
             &engine,
             "guest-call-legacy",
@@ -1642,13 +1800,10 @@ mod tests {
 
     #[tokio::test]
     async fn router_returns_guest_stdout_for_post_request() {
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config: IntegrityConfig::default_sealed(),
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
-            telemetry: telemetry::init_test_telemetry(),
-        });
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
+            telemetry::init_test_telemetry(),
+        ));
         let response = app
             .oneshot(
                 Request::post("/api/guest-example")
@@ -1675,13 +1830,10 @@ mod tests {
 
     #[tokio::test]
     async fn router_accepts_get_requests() {
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config: IntegrityConfig::default_sealed(),
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
-            telemetry: telemetry::init_test_telemetry(),
-        });
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
+            telemetry::init_test_telemetry(),
+        ));
         let response = app
             .oneshot(
                 Request::get("/api/guest-example")
@@ -1708,13 +1860,10 @@ mod tests {
 
     #[tokio::test]
     async fn router_rejects_exhausted_hop_limit_header() {
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config: IntegrityConfig::default_sealed(),
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
-            telemetry: telemetry::init_test_telemetry(),
-        });
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
+            telemetry::init_test_telemetry(),
+        ));
         let response = app
             .oneshot(
                 Request::get("/api/guest-example")
@@ -1743,13 +1892,10 @@ mod tests {
 
     #[tokio::test]
     async fn router_rejects_unsealed_routes() {
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config: IntegrityConfig::default_sealed(),
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
-            telemetry: telemetry::init_test_telemetry(),
-        });
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
+            telemetry::init_test_telemetry(),
+        ));
         let response = app
             .oneshot(
                 Request::post("/api/guest-malicious")
@@ -1762,10 +1908,46 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn router_returns_service_unavailable_when_route_concurrency_is_exhausted() {
+        let config = IntegrityConfig::default_sealed();
+        let app = build_app(AppState {
+            engine: build_test_engine(&config),
+            config,
+            concurrency_limits: Arc::new(HashMap::from([(
+                DEFAULT_ROUTE.to_owned(),
+                Arc::new(Semaphore::new(0)),
+            )])),
+            http_client: Client::new(),
+            secrets_vault: SecretsVault::load(),
+            telemetry: telemetry::init_test_telemetry(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::post("/api/guest-example")
+                    .body(Body::from("blocked"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+
+        assert!(String::from_utf8_lossy(&body).contains("saturated"));
+    }
+
     #[test]
     fn system_guest_requires_system_route_role() {
-        let engine = build_engine().expect("engine should be created");
         let config = IntegrityConfig::default_sealed();
+        let engine = build_test_engine(&config);
         let error = execute_guest(
             &engine,
             "metrics",
@@ -1796,13 +1978,10 @@ mod tests {
 
     #[tokio::test]
     async fn router_returns_system_metrics_for_privileged_route() {
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config: IntegrityConfig::default_sealed(),
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
-            telemetry: telemetry::init_test_telemetry(),
-        });
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
+            telemetry::init_test_telemetry(),
+        ));
 
         let response = app
             .oneshot(
@@ -1835,13 +2014,10 @@ mod tests {
             active_guards.push(telemetry::begin_request(&telemetry));
         }
 
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config: IntegrityConfig::default_sealed(),
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
             telemetry,
-        });
+        ));
 
         let response = app
             .oneshot(
@@ -1875,13 +2051,10 @@ mod tests {
                     .push(line);
             }
         });
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config: IntegrityConfig::default_sealed(),
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
             telemetry,
-        });
+        ));
 
         let response = app
             .oneshot(
@@ -1924,16 +2097,13 @@ mod tests {
     #[cfg(feature = "secrets-vault")]
     #[tokio::test]
     async fn router_denies_secret_lookup_without_sealed_grant() {
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config: IntegrityConfig {
+        let app = build_app(build_test_state(
+            IntegrityConfig {
                 routes: vec![IntegrityRoute::user("/api/guest-example")],
                 ..IntegrityConfig::default_sealed()
             },
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
-            telemetry: telemetry::init_test_telemetry(),
-        });
+            telemetry::init_test_telemetry(),
+        ));
         let response = app
             .oneshot(
                 Request::get("/api/guest-example")
@@ -2044,13 +2214,7 @@ mod tests {
         config.host_address = address.to_string();
         config.routes.push(IntegrityRoute::user("/api/guest-loop"));
 
-        let app = build_app(AppState {
-            engine: build_engine().expect("engine should be created"),
-            config,
-            http_client: Client::new(),
-            secrets_vault: SecretsVault::load(),
-            telemetry: telemetry::init_test_telemetry(),
-        });
+        let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -2141,6 +2305,47 @@ mod tests {
     }
 
     #[test]
+    fn validate_integrity_config_defaults_route_scaling_for_older_payloads() {
+        let config = serde_json::from_str::<IntegrityConfig>(
+            r#"{
+                "host_address":"0.0.0.0:8080",
+                "max_stdout_bytes":65536,
+                "guest_fuel_budget":500000000,
+                "guest_memory_limit_bytes":52428800,
+                "resource_limit_response":"Execution trapped: Resource limit exceeded",
+                "routes":[{"path":"/api/guest-example","role":"user"}]
+            }"#,
+        )
+        .expect("legacy payload should deserialize");
+        let config = validate_integrity_config(config).expect("legacy payload should validate");
+        let route = config
+            .sealed_route("/api/guest-example")
+            .expect("route should remain sealed");
+
+        assert_eq!(route.min_instances, 0);
+        assert_eq!(route.max_concurrency, DEFAULT_ROUTE_MAX_CONCURRENCY);
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_zero_max_concurrency() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![IntegrityRoute {
+            path: "/api/guest-example".to_owned(),
+            role: RouteRole::User,
+            allowed_secrets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: 0,
+        }];
+
+        let error = validate_integrity_config(config)
+            .expect_err("zero max_concurrency should fail validation");
+
+        assert!(error
+            .to_string()
+            .contains("must set `max_concurrency` above zero"));
+    }
+
+    #[test]
     fn embedded_integrity_payload_is_a_valid_runtime_config() {
         let config = serde_json::from_str::<IntegrityConfig>(EMBEDDED_CONFIG_PAYLOAD)
             .expect("embedded payload should deserialize into an integrity config");
@@ -2160,6 +2365,20 @@ mod tests {
                 .expect("embedded config should seal the example route")
                 .allowed_secrets,
             vec!["DB_PASS".to_owned()]
+        );
+        assert_eq!(
+            config
+                .sealed_route("/api/guest-example")
+                .expect("embedded config should seal the example route")
+                .min_instances,
+            0
+        );
+        assert_eq!(
+            config
+                .sealed_route("/api/guest-example")
+                .expect("embedded config should seal the example route")
+                .max_concurrency,
+            DEFAULT_ROUTE_MAX_CONCURRENCY
         );
         assert!(config.sealed_route("/api/guest-example").is_some());
         assert!(config.sealed_route("/api/guest-loop").is_some());
