@@ -10,6 +10,6 @@
 
 ## 3. Delivery
 
-- [ ] 3.1 Commit and push the repaired change on the active PR branch.
-- [ ] 3.2 Wait for the GitHub Actions checks on the PR to return green, fixing any regression before archive.
-- [ ] 3.3 Archive `tauri-roles-update` with spec sync once the branch is green.
+- [x] 3.1 Commit and push the repaired change on the active PR branch.
+- [x] 3.2 Wait for the GitHub Actions checks on the PR to return green, fixing any regression before archive.
+- [x] 3.3 Archive `tauri-roles-update` with spec sync once the branch is green.
