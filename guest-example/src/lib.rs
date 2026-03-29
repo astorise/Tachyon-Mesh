@@ -1,20 +1,26 @@
-use faas_sdk::faas_handler;
-use std::io::{self, Read};
+mod bindings {
+    use super::Component;
 
-#[faas_handler]
-#[no_mangle]
-pub extern "C" fn faas_entry() {
-    let mut payload = String::new();
+    wit_bindgen::generate!({
+        path: "../wit",
+        world: "faas-guest",
+    });
 
-    match io::stdin().read_to_string(&mut payload) {
-        Ok(_) if payload.is_empty() => {
-            tracing::info!("guest-example received an empty payload");
-            println!("FaaS received an empty payload");
-        }
-        Ok(_) => {
-            tracing::info!("guest-example received a request payload");
-            println!("FaaS received: {payload}");
-        }
-        Err(error) => println!("FaaS failed to read request payload: {error}"),
+    export!(Component);
+}
+
+struct Component;
+
+impl bindings::exports::tachyon::mesh::handler::Guest for Component {
+    fn handle_request(
+        req: bindings::exports::tachyon::mesh::handler::Request,
+    ) -> bindings::exports::tachyon::mesh::handler::Response {
+        let body = if req.body.is_empty() {
+            b"FaaS received an empty payload".to_vec()
+        } else {
+            format!("FaaS received: {}", String::from_utf8_lossy(&req.body)).into_bytes()
+        };
+
+        bindings::exports::tachyon::mesh::handler::Response { status: 200, body }
     }
 }

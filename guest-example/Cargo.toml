@@ -7,6 +7,4 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-faas-sdk = { path = "../faas-sdk" }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
+wit-bindgen = "0.46"

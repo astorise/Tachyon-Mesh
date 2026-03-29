@@ -16,7 +16,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
-wasmtime = "42.0.1"
+wasmtime = { version = "42.0.1", features = ["component-model"] }
 wasmtime-wasi = { version = "42.0.1", features = ["p1"] }
 
 [build-dependencies]

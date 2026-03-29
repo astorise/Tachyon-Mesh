@@ -4,7 +4,7 @@
 ![WebAssembly](https://img.shields.io/badge/WebAssembly-WASI-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
-**Tachyon Mesh** is an ultra-lightweight, sidecar-less Serverless/FaaS platform and Service Mesh, built entirely in Rust and WebAssembly. 
+**Tachyon Mesh** is an ultra-lightweight, sidecar-less Serverless/FaaS platform and Service Mesh, built entirely in Rust and WebAssembly.
 
 It completely rethinks the Cloud Native stack by replacing the massive CPU and memory overhead of Kubernetes, Knative, and Istio/Envoy with **in-process WASM sandboxing**, **cryptographic build-time validation**, and a **compile-time service mesh**. It is designed to run ultra-dense WASM FaaS workloads today, with a clear path to supporting legacy containers via an ultra-light Rust sidecar tomorrow.
 
@@ -17,10 +17,10 @@ Modern architectures (like Knative + Linkerd/Istio) suffer from the **"Sidecar T
 
 ## 🚀 The Tachyon Solution
 
-Tachyon Mesh drops the heavy containers and bloated network proxies. It runs a single highly-optimized Rust Host that orchestrates multiple FaaS functions compiled as WebAssembly (`wasm32-wasip1`, formerly `wasm32-wasi`) modules within the same OS process. 
+Tachyon Mesh drops the heavy containers and bloated network proxies. It runs a single highly-optimized Rust Host that orchestrates multiple FaaS functions compiled as WebAssembly components (`wasm32-wasip2`) or legacy WASI modules (`wasm32-wasip1`) within the same OS process.
 
 ### Key Innovations
-- 🪶 **Zero-Overhead FaaS:** Network routing and observability are handled natively by the Rust Host. Guest functions communicate via in-memory WASI pipes (Zero network latency).
+- 🪶 **Zero-Overhead FaaS:** Network routing and observability are handled natively by the Rust Host. Component guests use a typed WIT boundary, while legacy guests still run through the existing WASI pipeline.
 - 🔒 **Cryptographic Integrity:** Configuration is signed locally via an Ed25519 key pair. The Rust Host validates its own runtime configuration signature at startup. If tampered with, it panics.
 - 🧬 **Compile-Time Service Mesh:** Features like Chaos Testing and A/B Canary releases are injected via Rust `features` at compile-time. If you don't need them, they add *zero bytes* and *zero CPU cycles* to your binary.
 - 🔭 **Macro-Based Observability:** A simple `#[faas_handler]` macro instruments your WASM functions. Logs are intercepted and exported by the Host. No heavy OpenTelemetry SDKs in your FaaS binaries.
@@ -40,7 +40,7 @@ Tachyon Mesh drops the heavy containers and bloated network proxies. It runs a s
 │  │                                                     │
 │  └── Wasmtime Engine (Strict Memory & Fuel Quotas)     │
 │         │                                              │
-│         ▼ (WASI Memory Pipes)                          │
+│         ▼ (Typed WIT / Legacy WASI Fallback)          │
 │      ┌─────────────────────┐   ┌─────────────────────┐ │
 │      │ guest_payment.wasm  │   │ guest_auth.wasm     │ │
 │      └─────────────────────┘   └─────────────────────┘ │
@@ -56,7 +56,7 @@ Tachyon Mesh drops the heavy containers and bloated network proxies. It runs a s
 
 ### 1. Prerequisites
 - Rust toolchain (`cargo`, `rustup`)
-- WebAssembly target: `rustup target add wasm32-wasip1`
+- WebAssembly targets: `rustup target add wasm32-wasip2 wasm32-wasip1`
 
 ### 2. Build the Guest Function
 Write your FaaS logic using our lightweight SDK:
@@ -69,9 +69,9 @@ pub fn process_data() {
     println!("Hello from Tachyon Mesh");
 }
 ```
-Compile it to WASI:
+Compile the Rust reference guest as a WebAssembly component:
 ```bash
-cargo build -p guest-example --target wasm32-wasip1 --release
+cargo build -p guest-example --target wasm32-wasip2 --release
 ```
 
 ### 3. Seal the Runtime Configuration

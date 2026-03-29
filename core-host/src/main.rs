@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Bytes,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::State,
+    http::{Method, StatusCode, Uri},
     response::IntoResponse,
     routing::any,
     Router,
@@ -14,12 +14,23 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{fmt, path::PathBuf, sync::Once};
-use wasmtime::{Config, Engine, Instance, Linker, Module, ResourceLimiter, Store, Trap, TypedFunc};
+use wasmtime::{
+    component::{Component, Linker as ComponentLinker},
+    Config, Engine, Instance, Linker as ModuleLinker, Module, ResourceLimiter, Store, Trap,
+    TypedFunc,
+};
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
-    WasiCtxBuilder,
+    ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
+
+mod component_bindings {
+    wasmtime::component::bindgen!({
+        path: "../wit",
+        world: "faas-guest",
+    });
+}
 
 #[cfg(test)]
 const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
@@ -44,14 +55,39 @@ struct AppState {
     http_client: Client,
 }
 
-struct HostState {
+struct LegacyHostState {
     wasi: WasiP1Ctx,
+    limits: GuestResourceLimiter,
+}
+
+struct ComponentHostState {
+    ctx: WasiCtx,
+    table: ResourceTable,
     limits: GuestResourceLimiter,
 }
 
 #[derive(Debug)]
 struct GuestResourceLimiter {
     max_memory_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GuestRequest {
+    method: String,
+    uri: String,
+    body: Bytes,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GuestHttpResponse {
+    status: StatusCode,
+    body: Bytes,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GuestExecutionOutput {
+    Http(GuestHttpResponse),
+    LegacyStdout(Bytes),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,10 +171,11 @@ fn build_app(state: AppState) -> Router {
 
 async fn faas_handler(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    method: Method,
+    uri: Uri,
     body: Bytes,
 ) -> impl IntoResponse {
-    let normalized_path = normalize_route_path(&path);
+    let normalized_path = normalize_route_path(uri.path());
     if !state.config.allows_route(&normalized_path) {
         return (
             StatusCode::NOT_FOUND,
@@ -158,16 +195,28 @@ async fn faas_handler(
     let engine = state.engine.clone();
     let config = state.config.clone();
     let task_function_name = function_name.clone();
+    let guest_request = GuestRequest {
+        method: method.to_string(),
+        uri: uri.to_string(),
+        body,
+    };
     let result = tokio::task::spawn_blocking(move || {
-        execute_guest(&engine, &task_function_name, body, &config)
+        execute_guest(&engine, &task_function_name, guest_request, &config)
     })
     .await;
 
     match result {
-        Ok(Ok(stdout)) => match resolve_mesh_response(&state.http_client, stdout).await {
-            Ok(response_body) => (StatusCode::OK, response_body).into_response(),
-            Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
-        },
+        Ok(Ok(output)) => {
+            let (status, body) = match output {
+                GuestExecutionOutput::Http(response) => (response.status, response.body),
+                GuestExecutionOutput::LegacyStdout(stdout) => (StatusCode::OK, stdout),
+            };
+
+            match resolve_mesh_response(&state.http_client, body).await {
+                Ok(response_body) => (status, response_body).into_response(),
+                Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+            }
+        }
         Ok(Err(error)) => {
             error.log_if_needed(&function_name);
             error.into_response(&state.config).into_response()
@@ -182,10 +231,10 @@ async fn faas_handler(
 
 async fn resolve_mesh_response(
     http_client: &Client,
-    stdout: Bytes,
+    body: Bytes,
 ) -> std::result::Result<Bytes, String> {
-    let Some(url) = extract_mesh_fetch_url(&stdout) else {
-        return Ok(stdout);
+    let Some(url) = extract_mesh_fetch_url(&body) else {
+        return Ok(body);
     };
 
     let response = http_client
@@ -214,17 +263,95 @@ fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
 fn execute_guest(
     engine: &Engine,
     function_name: &str,
-    body: Bytes,
+    request: GuestRequest,
     config: &IntegrityConfig,
-) -> std::result::Result<Bytes, ExecutionError> {
+) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
+
+    if let Ok(component) = Component::from_file(engine, &module_path) {
+        return execute_component_guest(engine, request, config, &module_path, &component);
+    }
+
     let module = Module::from_file(engine, &module_path).map_err(|error| {
         guest_execution_error(
             error,
-            format!("failed to load guest module from {}", module_path.display()),
+            format!(
+                "failed to load guest artifact from {}",
+                module_path.display()
+            ),
         )
     })?;
+
+    execute_legacy_guest(engine, function_name, request.body, config, module)
+}
+
+fn execute_component_guest(
+    engine: &Engine,
+    request: GuestRequest,
+    config: &IntegrityConfig,
+    component_path: &PathBuf,
+    component: &Component,
+) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
+    let mut linker = ComponentLinker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add WASI preview2 functions to component linker",
+        )
+    })?;
+    let mut store = Store::new(
+        engine,
+        ComponentHostState::new(config.guest_memory_limit_bytes),
+    );
+    store.limiter(|state| &mut state.limits);
+    store
+        .set_fuel(config.guest_fuel_budget)
+        .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
+
+    let bindings = component_bindings::FaasGuest::instantiate(&mut store, component, &linker)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                format!(
+                    "failed to instantiate guest component from {}",
+                    component_path.display()
+                ),
+            )
+        })?;
+    let response = bindings
+        .tachyon_mesh_handler()
+        .call_handle_request(
+            &mut store,
+            &component_bindings::exports::tachyon::mesh::handler::Request {
+                method: request.method,
+                uri: request.uri,
+                body: request.body.to_vec(),
+            },
+        )
+        .map_err(|error| {
+            guest_execution_error(error, "guest component `handle-request` trapped")
+        })?;
+    let status = StatusCode::from_u16(response.status).map_err(|error| {
+        ExecutionError::Internal(format!(
+            "guest component returned an invalid HTTP status code `{}`: {error}",
+            response.status
+        ))
+    })?;
+
+    Ok(GuestExecutionOutput::Http(GuestHttpResponse {
+        status,
+        body: Bytes::from(response.body),
+    }))
+}
+
+fn execute_legacy_guest(
+    engine: &Engine,
+    function_name: &str,
+    body: Bytes,
+    config: &IntegrityConfig,
+    module: Module,
+) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let linker = build_linker(engine)?;
     let stdout = MemoryOutputPipe::new(config.max_stdout_bytes);
     let wasi = WasiCtxBuilder::new()
@@ -233,7 +360,7 @@ fn execute_guest(
         .build_p1();
     let mut store = Store::new(
         engine,
-        HostState::new(wasi, config.guest_memory_limit_bytes),
+        LegacyHostState::new(wasi, config.guest_memory_limit_bytes),
     );
     store.limiter(|state| &mut state.limits);
     store
@@ -254,11 +381,14 @@ fn execute_guest(
         guest_execution_error(error, format!("guest function `{entrypoint_name}` trapped"))
     })?;
 
-    Ok(split_guest_stdout(function_name, stdout.contents()))
+    Ok(GuestExecutionOutput::LegacyStdout(split_guest_stdout(
+        function_name,
+        stdout.contents(),
+    )))
 }
 
 fn resolve_guest_entrypoint(
-    store: &mut Store<HostState>,
+    store: &mut Store<LegacyHostState>,
     instance: &Instance,
 ) -> std::result::Result<(&'static str, TypedFunc<(), ()>), wasmtime::Error> {
     match instance.get_typed_func(&mut *store, "faas_entry") {
@@ -269,9 +399,11 @@ fn resolve_guest_entrypoint(
     }
 }
 
-fn build_linker(engine: &Engine) -> std::result::Result<Linker<HostState>, ExecutionError> {
-    let mut linker = Linker::new(engine);
-    p1::add_to_linker_sync(&mut linker, |state: &mut HostState| &mut state.wasi).map_err(
+fn build_linker(
+    engine: &Engine,
+) -> std::result::Result<ModuleLinker<LegacyHostState>, ExecutionError> {
+    let mut linker = ModuleLinker::new(engine);
+    p1::add_to_linker_sync(&mut linker, |state: &mut LegacyHostState| &mut state.wasi).map_err(
         |error| guest_execution_error(error, "failed to add WASI preview1 functions to linker"),
     )?;
     Ok(linker)
@@ -322,12 +454,16 @@ fn guest_module_candidate_paths(function_name: &str) -> Vec<PathBuf> {
     let wasm_file = format!("{}.wasm", function_name.replace('-', "_"));
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let manifest_relative_candidates = [
+        format!("../target/wasm32-wasip2/debug/{wasm_file}"),
+        format!("../target/wasm32-wasip2/release/{wasm_file}"),
         format!("../target/wasm32-wasip1/debug/{wasm_file}"),
         format!("../target/wasm32-wasip1/release/{wasm_file}"),
         format!("../target/wasm32-wasi/debug/{wasm_file}"),
         format!("../target/wasm32-wasi/release/{wasm_file}"),
     ];
     let workspace_relative_candidates = [
+        format!("target/wasm32-wasip2/debug/{wasm_file}"),
+        format!("target/wasm32-wasip2/release/{wasm_file}"),
         format!("target/wasm32-wasip1/debug/{wasm_file}"),
         format!("target/wasm32-wasip1/release/{wasm_file}"),
         format!("target/wasm32-wasi/debug/{wasm_file}"),
@@ -356,6 +492,7 @@ fn format_candidate_list(paths: &[String]) -> String {
 fn build_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.consume_fuel(true);
+    config.wasm_component_model(true);
 
     Engine::new(&config).map_err(|error| {
         anyhow!("failed to create Wasmtime engine with fuel metering enabled: {error}")
@@ -581,11 +718,31 @@ fn forward_guest_log(function_name: &str, record: GuestLogRecord) {
     }
 }
 
-impl HostState {
+impl LegacyHostState {
     fn new(wasi: WasiP1Ctx, max_memory_bytes: usize) -> Self {
         Self {
             wasi,
             limits: GuestResourceLimiter::new(max_memory_bytes),
+        }
+    }
+}
+
+impl ComponentHostState {
+    fn new(max_memory_bytes: usize) -> Self {
+        let mut wasi = WasiCtxBuilder::new();
+        Self {
+            ctx: wasi.build(),
+            table: ResourceTable::new(),
+            limits: GuestResourceLimiter::new(max_memory_bytes),
+        }
+    }
+}
+
+impl WasiView for ComponentHostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
         }
     }
 }
@@ -672,7 +829,7 @@ impl fmt::Display for GuestModuleNotFound {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "guest module not found for `{}`; expected one of: {}",
+            "guest artifact not found for `{}`; expected one of: {}",
             self.function_name, self.candidate_paths
         )
     }
@@ -757,20 +914,51 @@ mod tests {
     }
 
     #[test]
-    fn execute_guest_returns_stdout_payload() {
+    fn execute_guest_returns_component_response_payload() {
         let engine = build_engine().expect("engine should be created");
         let config = IntegrityConfig::default_sealed();
         let response = execute_guest(
             &engine,
             "guest-example",
-            Bytes::from("Hello Lean FaaS!"),
+            GuestRequest {
+                method: "POST".to_owned(),
+                uri: "/api/guest-example".to_owned(),
+                body: Bytes::from("Hello Lean FaaS!"),
+            },
             &config,
         )
         .expect("guest execution should succeed");
 
         assert_eq!(
-            String::from_utf8_lossy(&response).trim(),
-            "FaaS received: Hello Lean FaaS!"
+            response,
+            GuestExecutionOutput::Http(GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from("FaaS received: Hello Lean FaaS!"),
+            })
+        );
+    }
+
+    #[test]
+    fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
+        let engine = build_engine().expect("engine should be created");
+        let config = IntegrityConfig::default_sealed();
+        let response = execute_guest(
+            &engine,
+            "guest-call-legacy",
+            GuestRequest {
+                method: "GET".to_owned(),
+                uri: "/api/guest-call-legacy".to_owned(),
+                body: Bytes::new(),
+            },
+            &config,
+        )
+        .expect("legacy guest execution should succeed");
+
+        assert_eq!(
+            response,
+            GuestExecutionOutput::LegacyStdout(Bytes::from(
+                "MESH_FETCH:http://legacy-service:8081/ping\n"
+            ))
         );
     }
 
@@ -948,6 +1136,10 @@ mod tests {
             .map(|path| path.to_string_lossy().replace('\\', "/"))
             .collect::<Vec<_>>();
 
+        assert!(candidates.iter().any(|path| {
+            path.ends_with("/target/wasm32-wasip2/release/guest_example.wasm")
+                || path == "target/wasm32-wasip2/release/guest_example.wasm"
+        }));
         assert!(candidates.iter().any(|path| {
             path.ends_with("/target/wasm32-wasip1/release/guest_example.wasm")
                 || path == "target/wasm32-wasip1/release/guest_example.wasm"

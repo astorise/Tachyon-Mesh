@@ -44,7 +44,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: wasm32-wasip1
+          targets: wasm32-wasip1,wasm32-wasip2
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -55,8 +55,10 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Build guest-example for WASI
-        run: cargo build -p guest-example --target wasm32-wasip1 --release
+      - name: Build guest artifacts
+        run: |
+          cargo build -p guest-example --target wasm32-wasip2 --release
+          cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 
       - name: Run tests
         run: cargo test --workspace
@@ -76,7 +78,7 @@ jobs:
             integrity.lock
             target/release/core-host
             target/release/tachyon-cli
-            target/wasm32-wasip1/release/guest_example.wasm
+            target/wasm32-wasip2/release/guest_example.wasm
 
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

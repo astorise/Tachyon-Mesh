@@ -21,13 +21,13 @@ ENV PATH="${CARGO_HOME}/bin:${PATH}"
 ENV RUSTUP_HOME=/usr/local/rustup
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-RUN rustup target add wasm32-wasip1 x86_64-unknown-linux-musl
+RUN rustup target add wasm32-wasip1 wasm32-wasip2 x86_64-unknown-linux-musl
 
 WORKDIR /workspace
 
 COPY . .
 
-RUN cargo build -p guest-example --target wasm32-wasip1 --release
+RUN cargo build -p guest-example --target wasm32-wasip2 --release
 RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-cli --release
@@ -134,7 +134,7 @@ FROM scratch AS runtime
 WORKDIR /app
 
 COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
-COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_example.wasm /app/guest-modules/guest_example.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
 COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-modules/guest_go.wasm
 COPY --from=javy-builder /workspace/guest-modules/guest_js.wasm /app/guest-modules/guest_js.wasm

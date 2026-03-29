@@ -1,0 +1,20 @@
+package tachyon:mesh;
+
+interface handler {
+    record request {
+        method: string,
+        uri: string,
+        body: list<u8>,
+    }
+
+    record response {
+        status: u16,
+        body: list<u8>,
+    }
+
+    handle-request: func(req: request) -> response;
+}
+
+world faas-guest {
+    export handler;
+}
