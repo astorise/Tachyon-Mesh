@@ -15,4 +15,4 @@
 
 - [x] 3.1 Rebuild the guest artifacts and verify `core-host` without and with `--features secrets-vault`.
 - [x] 3.2 Run workspace-level validation (`cargo test --workspace`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `openspec validate --all`).
-- [ ] 3.3 Archive `secrets-management` with spec sync once the branch head is green.
+- [x] 3.3 Archive `secrets-management` with spec sync once the branch head is green.
