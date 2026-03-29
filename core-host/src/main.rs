@@ -3,7 +3,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{Method, StatusCode, Uri},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::any,
     Router,
 };
@@ -17,7 +17,10 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::Once,
+    time::Instant,
 };
+use telemetry::{TelemetryEvent, TelemetrySender};
+use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
     Config, Engine, Instance, Linker as ModuleLinker, Module, ResourceLimiter, Store, Trap,
@@ -28,6 +31,8 @@ use wasmtime_wasi::{
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
     ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
+
+mod telemetry;
 
 mod component_bindings {
     wasmtime::component::bindgen!({
@@ -57,6 +62,7 @@ struct AppState {
     engine: Engine,
     config: IntegrityConfig,
     http_client: Client,
+    telemetry: TelemetrySender,
 }
 
 struct LegacyHostState {
@@ -68,6 +74,12 @@ struct ComponentHostState {
     ctx: WasiCtx,
     table: ResourceTable,
     limits: GuestResourceLimiter,
+}
+
+#[derive(Clone)]
+struct GuestTelemetryContext {
+    sender: TelemetrySender,
+    trace_id: String,
 }
 
 #[derive(Debug)]
@@ -146,11 +158,13 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     init_host_tracing();
     let config = verify_integrity()?;
+    let telemetry = telemetry::init_telemetry();
 
     let app = build_app(AppState {
         engine: build_engine()?,
         config: config.clone(),
         http_client: Client::new(),
+        telemetry,
     });
 
     let listener = tokio::net::TcpListener::bind(&config.host_address)
@@ -180,57 +194,91 @@ async fn faas_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let normalized_path = normalize_route_path(uri.path());
-    if !state.config.allows_route(&normalized_path) {
-        return (
+    let trace_id = Uuid::new_v4().to_string();
+    telemetry::record_event(
+        &state.telemetry,
+        TelemetryEvent::RequestStart {
+            trace_id: trace_id.clone(),
+            path: normalized_path.clone(),
+            timestamp: Instant::now(),
+        },
+    );
+
+    let response: Response = if !state.config.allows_route(&normalized_path) {
+        (
             StatusCode::NOT_FOUND,
             format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
         )
-            .into_response();
-    }
+            .into_response()
+    } else {
+        match resolve_function_name(&normalized_path) {
+            Some(function_name) => {
+                let engine = state.engine.clone();
+                let config = state.config.clone();
+                let telemetry_context = GuestTelemetryContext {
+                    sender: state.telemetry.clone(),
+                    trace_id: trace_id.clone(),
+                };
+                let task_function_name = function_name.clone();
+                let guest_request = GuestRequest {
+                    method: method.to_string(),
+                    uri: uri.to_string(),
+                    body,
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    execute_guest(
+                        &engine,
+                        &task_function_name,
+                        guest_request,
+                        &config,
+                        Some(telemetry_context),
+                    )
+                })
+                .await;
 
-    let Some(function_name) = resolve_function_name(&normalized_path) else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("no guest function could be resolved from `{normalized_path}`"),
-        )
-            .into_response();
-    };
+                match result {
+                    Ok(Ok(output)) => {
+                        let (status, body) = match output {
+                            GuestExecutionOutput::Http(response) => {
+                                (response.status, response.body)
+                            }
+                            GuestExecutionOutput::LegacyStdout(stdout) => (StatusCode::OK, stdout),
+                        };
 
-    let engine = state.engine.clone();
-    let config = state.config.clone();
-    let task_function_name = function_name.clone();
-    let guest_request = GuestRequest {
-        method: method.to_string(),
-        uri: uri.to_string(),
-        body,
-    };
-    let result = tokio::task::spawn_blocking(move || {
-        execute_guest(&engine, &task_function_name, guest_request, &config)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(output)) => {
-            let (status, body) = match output {
-                GuestExecutionOutput::Http(response) => (response.status, response.body),
-                GuestExecutionOutput::LegacyStdout(stdout) => (StatusCode::OK, stdout),
-            };
-
-            match resolve_mesh_response(&state.http_client, body).await {
-                Ok(response_body) => (status, response_body).into_response(),
-                Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+                        match resolve_mesh_response(&state.http_client, body).await {
+                            Ok(response_body) => (status, response_body).into_response(),
+                            Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        error.log_if_needed(&function_name);
+                        error.into_response(&state.config).into_response()
+                    }
+                    Err(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("guest execution task failed: {error}"),
+                    )
+                        .into_response(),
+                }
             }
+            None => (
+                StatusCode::NOT_FOUND,
+                format!("no guest function could be resolved from `{normalized_path}`"),
+            )
+                .into_response(),
         }
-        Ok(Err(error)) => {
-            error.log_if_needed(&function_name);
-            error.into_response(&state.config).into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("guest execution task failed: {error}"),
-        )
-            .into_response(),
-    }
+    };
+
+    telemetry::record_event(
+        &state.telemetry,
+        TelemetryEvent::RequestEnd {
+            trace_id,
+            status: response.status().as_u16(),
+            timestamp: Instant::now(),
+        },
+    );
+
+    response
 }
 
 async fn resolve_mesh_response(
@@ -269,12 +317,20 @@ fn execute_guest(
     function_name: &str,
     request: GuestRequest,
     config: &IntegrityConfig,
+    telemetry: Option<GuestTelemetryContext>,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
 
     if let Ok(component) = Component::from_file(engine, &module_path) {
-        return execute_component_guest(engine, request, config, &module_path, &component);
+        return execute_component_guest(
+            engine,
+            request,
+            config,
+            &module_path,
+            &component,
+            telemetry.as_ref(),
+        );
     }
 
     let module = Module::from_file(engine, &module_path).map_err(|error| {
@@ -287,7 +343,14 @@ fn execute_guest(
         )
     })?;
 
-    execute_legacy_guest(engine, function_name, request.body, config, module)
+    execute_legacy_guest(
+        engine,
+        function_name,
+        request.body,
+        config,
+        module,
+        telemetry.as_ref(),
+    )
 }
 
 fn execute_component_guest(
@@ -296,6 +359,7 @@ fn execute_component_guest(
     config: &IntegrityConfig,
     component_path: &Path,
     component: &Component,
+    telemetry: Option<&GuestTelemetryContext>,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
@@ -323,19 +387,19 @@ fn execute_component_guest(
                 ),
             )
         })?;
-    let response = bindings
-        .tachyon_mesh_handler()
-        .call_handle_request(
-            &mut store,
-            &component_bindings::exports::tachyon::mesh::handler::Request {
-                method: request.method,
-                uri: request.uri,
-                body: request.body.to_vec(),
-            },
-        )
-        .map_err(|error| {
-            guest_execution_error(error, "guest component `handle-request` trapped")
-        })?;
+    record_wasm_start(telemetry);
+    let response = bindings.tachyon_mesh_handler().call_handle_request(
+        &mut store,
+        &component_bindings::exports::tachyon::mesh::handler::Request {
+            method: request.method,
+            uri: request.uri,
+            body: request.body.to_vec(),
+        },
+    );
+    record_wasm_end(telemetry);
+    let response = response.map_err(|error| {
+        guest_execution_error(error, "guest component `handle-request` trapped")
+    })?;
     let status = StatusCode::from_u16(response.status).map_err(|error| {
         ExecutionError::Internal(format!(
             "guest component returned an invalid HTTP status code `{}`: {error}",
@@ -355,6 +419,7 @@ fn execute_legacy_guest(
     body: Bytes,
     config: &IntegrityConfig,
     module: Module,
+    telemetry: Option<&GuestTelemetryContext>,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let linker = build_linker(engine)?;
     let stdout = MemoryOutputPipe::new(config.max_stdout_bytes);
@@ -381,7 +446,10 @@ fn execute_legacy_guest(
             )
         })?;
 
-    entrypoint.call(&mut store, ()).map_err(|error| {
+    record_wasm_start(telemetry);
+    let call_result = entrypoint.call(&mut store, ());
+    record_wasm_end(telemetry);
+    call_result.map_err(|error| {
         guest_execution_error(error, format!("guest function `{entrypoint_name}` trapped"))
     })?;
 
@@ -491,6 +559,34 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 
 fn format_candidate_list(paths: &[String]) -> String {
     paths.join(", ")
+}
+
+fn record_wasm_start(telemetry: Option<&GuestTelemetryContext>) {
+    record_wasm_event(telemetry, true);
+}
+
+fn record_wasm_end(telemetry: Option<&GuestTelemetryContext>) {
+    record_wasm_event(telemetry, false);
+}
+
+fn record_wasm_event(telemetry: Option<&GuestTelemetryContext>, is_start: bool) {
+    let Some(telemetry) = telemetry else {
+        return;
+    };
+
+    let event = if is_start {
+        TelemetryEvent::WasmStart {
+            trace_id: telemetry.trace_id.clone(),
+            timestamp: Instant::now(),
+        }
+    } else {
+        TelemetryEvent::WasmEnd {
+            trace_id: telemetry.trace_id.clone(),
+            timestamp: Instant::now(),
+        }
+    };
+
+    telemetry::record_event(&telemetry.sender, event);
 }
 
 fn build_engine() -> Result<Engine> {
@@ -930,6 +1026,7 @@ mod tests {
                 body: Bytes::from("Hello Lean FaaS!"),
             },
             &config,
+            None,
         )
         .expect("guest execution should succeed");
 
@@ -955,6 +1052,7 @@ mod tests {
                 body: Bytes::new(),
             },
             &config,
+            None,
         )
         .expect("legacy guest execution should succeed");
 
@@ -972,6 +1070,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            telemetry: telemetry::init_test_telemetry(),
         });
         let response = app
             .oneshot(
@@ -1003,6 +1102,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            telemetry: telemetry::init_test_telemetry(),
         });
         let response = app
             .oneshot(
@@ -1034,6 +1134,7 @@ mod tests {
             engine: build_engine().expect("engine should be created"),
             config: IntegrityConfig::default_sealed(),
             http_client: Client::new(),
+            telemetry: telemetry::init_test_telemetry(),
         });
         let response = app
             .oneshot(
@@ -1045,6 +1146,69 @@ mod tests {
             .expect("request should complete");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_emits_async_telemetry_metrics() {
+        use serde_json::Value;
+        use std::{
+            sync::{Arc, Mutex},
+            time::Duration,
+        };
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let telemetry = telemetry::init_test_telemetry_with_emitter({
+            let captured = Arc::clone(&captured);
+            move |line| {
+                captured
+                    .lock()
+                    .expect("captured telemetry should not be poisoned")
+                    .push(line);
+            }
+        });
+        let app = build_app(AppState {
+            engine: build_engine().expect("engine should be created"),
+            config: IntegrityConfig::default_sealed(),
+            http_client: Client::new(),
+            telemetry,
+        });
+
+        let response = app
+            .oneshot(
+                Request::post("/api/guest-example")
+                    .body(Body::from("Hello Lean FaaS!"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let line = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(line) = captured
+                    .lock()
+                    .expect("captured telemetry should not be poisoned")
+                    .first()
+                    .cloned()
+                {
+                    break line;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("telemetry line should be emitted");
+        let record: Value =
+            serde_json::from_str(&line).expect("telemetry output should be valid JSON");
+
+        assert_eq!(record["path"], "/api/guest-example");
+        assert_eq!(record["status"], 200);
+        assert!(record["trace_id"].as_str().is_some());
+        assert!(record["total_duration_us"].as_u64().is_some());
+        assert!(record["wasm_duration_us"].as_u64().is_some());
+        assert!(record["host_overhead_us"].as_u64().is_some());
     }
 
     #[test]
