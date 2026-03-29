@@ -106,7 +106,7 @@ COPY guest-csharp/Program.cs ./
 
 RUN mkdir -p /workspace/guest-modules \
     && dotnet publish guest-csharp.csproj -c Release \
-    && cp /workspace/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/guest_csharp.wasm /workspace/guest-modules/guest_csharp.wasm
+    && cp -r /workspace/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/. /workspace/guest-modules/
 
 FROM maven:3.9.11-eclipse-temurin-17 AS java-builder
 
@@ -138,7 +138,7 @@ COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.w
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
 COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-modules/guest_go.wasm
 COPY --from=javy-builder /workspace/guest-modules/guest_js.wasm /app/guest-modules/guest_js.wasm
-COPY --from=dotnet-builder /workspace/guest-modules/guest_csharp.wasm /app/guest-modules/guest_csharp.wasm
+COPY --from=dotnet-builder /workspace/guest-modules/. /app/guest-modules/
 COPY --from=java-builder /workspace/guest-modules/guest_java.wasm /app/guest-modules/guest_java.wasm
 
 EXPOSE 8080

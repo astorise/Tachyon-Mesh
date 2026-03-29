@@ -29,7 +29,7 @@ use wasmtime::{
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
-    I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+    DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 
 mod telemetry;
@@ -348,6 +348,7 @@ fn execute_guest(
         function_name,
         request.body,
         config,
+        &module_path,
         module,
         telemetry.as_ref(),
     )
@@ -418,15 +419,31 @@ fn execute_legacy_guest(
     function_name: &str,
     body: Bytes,
     config: &IntegrityConfig,
+    module_path: &Path,
     module: Module,
     telemetry: Option<&GuestTelemetryContext>,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let linker = build_linker(engine)?;
     let stdout = MemoryOutputPipe::new(config.max_stdout_bytes);
-    let wasi = WasiCtxBuilder::new()
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.arg(legacy_guest_program_name(module_path))
         .stdin(MemoryInputPipe::new(body))
-        .stdout(stdout.clone())
-        .build_p1();
+        .stdout(stdout.clone());
+
+    if let Some(module_dir) = module_path.parent() {
+        wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
+            .map_err(|error| {
+                guest_execution_error(
+                    error,
+                    format!(
+                        "failed to preopen guest module directory {}",
+                        module_dir.display()
+                    ),
+                )
+            })?;
+    }
+
+    let wasi = wasi.build_p1();
     let mut store = Store::new(
         engine,
         LegacyHostState::new(wasi, config.guest_memory_limit_bytes),
@@ -455,6 +472,14 @@ fn execute_legacy_guest(
         function_name,
         stdout.contents(),
     )))
+}
+
+fn legacy_guest_program_name(module_path: &Path) -> String {
+    module_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("./{name}"))
+        .unwrap_or_else(|| "./guest.wasm".to_owned())
 }
 
 fn resolve_guest_entrypoint(
@@ -1354,6 +1379,14 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|path| path.ends_with("guest-modules/guest_csharp.wasm")));
+    }
+
+    #[test]
+    fn legacy_guest_program_name_is_a_guest_visible_relative_path() {
+        let program_name =
+            legacy_guest_program_name(Path::new("/app/guest-modules/guest_csharp.wasm"));
+
+        assert_eq!(program_name, "./guest_csharp.wasm");
     }
 
     #[test]
