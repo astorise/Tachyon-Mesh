@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+.codex
+.codex-tmp
+.vscode
+openspec
+target
+**/target
+**/bin
+**/obj
+*.log
