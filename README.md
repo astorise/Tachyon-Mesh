@@ -77,7 +77,7 @@ cargo build -p guest-example --target wasm32-wasip2 --release
 ### 3. Seal the Runtime Configuration
 Generate the signed `integrity.lock` manifest that `core-host` embeds and validates at startup:
 ```bash
-cargo run -p tachyon-cli -- generate --route /api/guest-example --memory 64
+cargo run -p tachyon-cli -- generate --route /api/guest-example --system-route /metrics --memory 64
 ```
 
 ### 4. Run the Host
@@ -85,6 +85,49 @@ The host validates the sealed `integrity.lock` manifest and binds to your local 
 ```bash
 cargo run -p core-host --release
 ```
+
+### 5. Optional Autoscaling System FaaS
+Build the autoscaling guests when you want queue-depth metrics or autonomous legacy scaling:
+```bash
+cargo build -p system-faas-keda --target wasm32-wasip2 --release
+cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
+```
+
+Seal `/metrics/scaling` to expose Prometheus queue depth for `/api/guest-call-legacy`:
+```bash
+cargo run -p tachyon-cli -- generate --route /api/guest-example --route /api/guest-call-legacy --system-route /metrics --system-route /metrics/scaling --memory 64
+```
+
+Seal `/system/k8s-scaler` to enable the five-second background autoscaler. For local validation against a mock API server, point the host at the mock base URL before starting it:
+```bash
+$env:TACHYON_MOCK_K8S_URL="http://127.0.0.1:18080"
+cargo run -p core-host --release
+```
+
+### 6. Optional WASI-NN Inference Guest
+Build the legacy `guest-ai` module when you want ONNX inference through WASI-NN:
+```bash
+cargo build -p guest-ai --target wasm32-wasip1 --release
+```
+
+Seal the AI route and mount a read-only model directory into the guest. The guest expects ONNX files under `/models` and defaults to `/models/model.onnx`:
+```bash
+cargo run -p tachyon-cli -- generate --route /api/guest-ai --volume /api/guest-ai=/absolute/path/to/models:/models:ro --memory 64
+```
+
+Run the host with the optional feature so it exposes the `wasi_ephemeral_nn` imports:
+```bash
+cargo run -p core-host --features ai-inference --release
+```
+
+Send a JSON request with the input tensor shape, input values, and an output buffer size:
+```bash
+curl --request POST http://127.0.0.1:8080/api/guest-ai \
+  --header "content-type: application/json" \
+  --data "{\"model\":\"model.onnx\",\"shape\":[1,4],\"values\":[1.0,2.0,3.0,4.0],\"output_len\":4}"
+```
+
+`ai-inference` is intentionally optional because the host machine must provide ONNX Runtime dynamic libraries for the selected execution provider.
 
 ## 🗺️ Roadmap
 

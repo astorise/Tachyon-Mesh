@@ -1,0 +1,11 @@
+[package]
+name = "system-faas-prom"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "metrics"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"

@@ -28,10 +28,16 @@ WORKDIR /workspace
 COPY . .
 
 RUN cargo build -p guest-example --target wasm32-wasip2 --release
+RUN cargo build -p guest-volume --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
+RUN cargo build -p guest-ai --target wasm32-wasip1 --release
 RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
+RUN cargo build -p guest-loop --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-cli --release
-RUN ./target/release/tachyon-cli generate --route /api/guest-example --route /api/guest-call-legacy --route /api/guest-go --route /api/guest-js --route /api/guest-csharp --route /api/guest-java --memory 64
+RUN ./target/release/tachyon-cli generate --route /api/guest-call-legacy --route /api/guest-csharp --route /api/guest-example --route /api/guest-go --route /api/guest-java --route /api/guest-js --route /api/guest-loop --system-route /metrics --memory 64
 RUN cargo build -p core-host --target x86_64-unknown-linux-musl --release
 
 FROM ubuntu:24.04 AS tinygo-builder
@@ -106,7 +112,7 @@ COPY guest-csharp/Program.cs ./
 
 RUN mkdir -p /workspace/guest-modules \
     && dotnet publish guest-csharp.csproj -c Release \
-    && cp /workspace/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/guest_csharp.wasm /workspace/guest-modules/guest_csharp.wasm
+    && cp -r /workspace/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/. /workspace/guest-modules/
 
 FROM maven:3.9.11-eclipse-temurin-17 AS java-builder
 
@@ -135,10 +141,16 @@ WORKDIR /app
 
 COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_volume.wasm /app/guest-modules/guest_volume.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/k8s_scaler.wasm /app/guest-modules/k8s_scaler.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /app/guest-modules/metrics.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_ai.wasm /app/guest-modules/guest_ai.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_loop.wasm /app/guest-modules/guest_loop.wasm
 COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-modules/guest_go.wasm
 COPY --from=javy-builder /workspace/guest-modules/guest_js.wasm /app/guest-modules/guest_js.wasm
-COPY --from=dotnet-builder /workspace/guest-modules/guest_csharp.wasm /app/guest-modules/guest_csharp.wasm
+COPY --from=dotnet-builder /workspace/guest-modules/. /app/guest-modules/
 COPY --from=java-builder /workspace/guest-modules/guest_java.wasm /app/guest-modules/guest_java.wasm
 
 EXPOSE 8080

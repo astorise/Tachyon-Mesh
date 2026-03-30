@@ -57,11 +57,20 @@ jobs:
 
       - name: Build guest artifacts
         run: |
+          cargo build -p guest-ai --target wasm32-wasip1 --release
           cargo build -p guest-example --target wasm32-wasip2 --release
+          cargo build -p guest-volume --target wasm32-wasip2 --release
+          cargo build -p system-faas-keda --target wasm32-wasip2 --release
+          cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
+          cargo build -p system-faas-prom --target wasm32-wasip2 --release
           cargo build -p guest-call-legacy --target wasm32-wasip1 --release
+          cargo build -p guest-loop --target wasm32-wasip1 --release
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Check ai-inference host build
+        run: cargo check -p core-host --features ai-inference
 
       - name: Build core-host in release mode
         run: cargo build -p core-host --release
@@ -78,7 +87,13 @@ jobs:
             integrity.lock
             target/release/core-host
             target/release/tachyon-cli
+            target/wasm32-wasip1/release/guest_ai.wasm
             target/wasm32-wasip2/release/guest_example.wasm
+            target/wasm32-wasip2/release/guest_volume.wasm
+            target/wasm32-wasip2/release/k8s_scaler.wasm
+            target/wasm32-wasip2/release/metrics.wasm
+            target/wasm32-wasip2/release/scaling.wasm
+            target/wasm32-wasip1/release/guest_loop.wasm
 
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

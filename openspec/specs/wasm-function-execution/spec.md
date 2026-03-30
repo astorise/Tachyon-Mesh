@@ -58,3 +58,41 @@ The `core-host` runtime SHALL resolve guest artifacts from the workspace or pack
 - **AND** the guest still receives the HTTP request body through WASI stdin
 - **AND** the host still returns the captured stdout as the HTTP response body
 
+### Requirement: Component guests retrieve secrets through a typed host vault import
+The workspace SHALL define a `secrets-vault` WIT interface in `wit/tachyon.wit`, and `core-host` SHALL implement that import for `faas-guest` components without exposing the same secrets through the guest environment block.
+
+#### Scenario: Vault is disabled at compile time
+- **WHEN** `core-host` runs without `--features secrets-vault`
+- **THEN** a `faas-guest` component can still call `get-secret("DB_PASS")`
+- **AND** the host returns `vault-disabled`
+- **AND** `std::env::var("DB_PASS")` inside the guest remains unset
+
+#### Scenario: Authorized guest receives a sealed secret
+- **WHEN** `core-host` is built with `--features secrets-vault`
+- **AND** `/api/guest-example` is sealed with `allowed_secrets: ["DB_PASS"]`
+- **THEN** the guest receives `super_secret_123` from `get-secret("DB_PASS")`
+- **AND** the guest still cannot read `DB_PASS` from its environment block
+
+#### Scenario: Unauthorized guest is denied
+- **WHEN** a component guest requests a secret that is not granted by its sealed route metadata
+- **THEN** the host returns `permission-denied`
+- **AND** the secret value is not disclosed
+
+### Requirement: Host mounts sealed route volumes into the guest filesystem
+The `core-host` runtime SHALL preopen every sealed route volume into the request-scoped WASI
+context for both legacy WASI guests and Component Model guests, while honoring the sealed
+read-only flag.
+
+#### Scenario: Stateful guest persists data through a mounted directory
+- **WHEN** `/api/guest-volume` is sealed with a host directory mounted at `/app/data`
+- **AND** a client sends `POST Hello Stateful World` to `/api/guest-volume`
+- **AND** the client later sends `GET /api/guest-volume`
+- **THEN** the guest writes `state.txt` under `/app/data`
+- **AND** the subsequent `GET` returns `Hello Stateful World`
+- **AND** the host filesystem contains the persisted file in the mounted host directory
+
+#### Scenario: Read-only guest volume denies writes
+- **WHEN** a sealed route volume is mounted with `readonly = true`
+- **AND** the guest attempts to write under the configured `guest_path`
+- **THEN** the guest receives a WASI permission error
+- **AND** the host volume contents are not modified
