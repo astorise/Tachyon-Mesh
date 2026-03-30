@@ -45,6 +45,13 @@
               "required": false
             },
             {
+              "name": "route-target",
+              "description": "Attach a guest target using /path=MODULE[,weight=80][,header=X-Cohort=beta].",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
               "name": "route-scale",
               "description": "Apply per-route scaling using /path=min:max.",
               "takesValue": true,

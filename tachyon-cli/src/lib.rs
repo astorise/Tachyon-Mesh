@@ -28,11 +28,28 @@ pub enum RouteRole {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct HeaderMatch {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct RouteTarget {
+    pub module: String,
+    #[serde(default)]
+    pub weight: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_header: Option<HeaderMatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct SealedRoute {
     pub path: String,
     pub role: RouteRole,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_secrets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<RouteTarget>,
     #[serde(default)]
     pub min_instances: u32,
     #[serde(default = "default_max_concurrency")]
@@ -71,6 +88,7 @@ struct GenerateRequest {
     user_routes: Vec<String>,
     system_routes: Vec<String>,
     secret_routes: Vec<String>,
+    route_targets: Vec<String>,
     route_scales: Vec<String>,
     volumes: Vec<String>,
     memory_mib: u32,
@@ -143,6 +161,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         user_routes: parse_required_routes_arg(&subcommand.matches.args, "route")?,
         system_routes: parse_optional_routes_arg(&subcommand.matches.args, "system-route")?,
         secret_routes: parse_optional_routes_arg(&subcommand.matches.args, "secret-route")?,
+        route_targets: parse_optional_routes_arg(&subcommand.matches.args, "route-target")?,
         route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
         volumes: parse_optional_string_args(&subcommand.matches.args, "volume", "volume")?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
@@ -168,6 +187,7 @@ fn parse_generate_request_from_args(
     let mut user_routes = Vec::new();
     let mut system_routes = Vec::new();
     let mut secret_routes = Vec::new();
+    let mut route_targets = Vec::new();
     let mut route_scales = Vec::new();
     let mut volumes = Vec::new();
     let mut memory_mib = None;
@@ -209,6 +229,19 @@ fn parse_generate_request_from_args(
                 "missing value for `--secret-route`; expected `--secret-route /api/guest-example=DB_PASS`",
             )?;
             secret_routes.push(route);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--route-target=") {
+            route_targets.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--route-target" {
+            let route_target = args.next().context(
+                "missing value for `--route-target`; expected `--route-target /api/checkout=checkout-v2,weight=10`",
+            )?;
+            route_targets.push(route_target);
             continue;
         }
 
@@ -263,6 +296,7 @@ fn parse_generate_request_from_args(
         user_routes,
         system_routes,
         secret_routes,
+        route_targets,
         route_scales,
         volumes,
         memory_mib,
@@ -303,6 +337,7 @@ impl SealedConfig {
             request.secret_routes,
             request.route_scales,
             request.volumes,
+            request.route_targets,
         )?;
         let memory_mib = usize::try_from(request.memory_mib)
             .context("memory limit is too large for this platform")?;
@@ -406,6 +441,7 @@ fn normalize_routes(
     secret_routes: Vec<String>,
     route_scales: Vec<String>,
     route_volumes: Vec<String>,
+    route_targets: Vec<String>,
 ) -> Result<Vec<SealedRoute>> {
     if user_routes.is_empty() {
         bail!("at least one `--route` value must be provided");
@@ -430,6 +466,7 @@ fn normalize_routes(
                 path,
                 role: RouteRole::User,
                 allowed_secrets: Vec::new(),
+                targets: Vec::new(),
                 min_instances: 0,
                 max_concurrency: default_max_concurrency(),
                 volumes: Vec::new(),
@@ -443,6 +480,7 @@ fn normalize_routes(
             path: path.clone(),
             role: RouteRole::System,
             allowed_secrets: Vec::new(),
+            targets: Vec::new(),
             min_instances: 0,
             max_concurrency: default_max_concurrency(),
             volumes: Vec::new(),
@@ -483,6 +521,15 @@ fn normalize_routes(
         );
     }
 
+    for route_target in route_targets {
+        let (path, target) = parse_route_target(&route_target)?;
+        let normalized_path = normalize_route(&path)?;
+        let sealed_route = normalized.get_mut(&normalized_path).ok_or_else(|| {
+            anyhow!("route target `{normalized_path}` must target a declared sealed route")
+        })?;
+        insert_route_target(sealed_route, target);
+    }
+
     for route_scale in route_scales {
         let (path, scaling) = parse_route_scale(&route_scale)?;
         let normalized_path = normalize_route(&path)?;
@@ -511,7 +558,10 @@ fn normalize_routes(
         insert_route_volume(sealed_route, volume)?;
     }
 
-    Ok(normalized.into_values().collect())
+    normalized
+        .into_values()
+        .map(finalize_route)
+        .collect::<Result<Vec<_>>>()
 }
 
 fn parse_route_volume(
@@ -631,6 +681,21 @@ fn insert_route_volume(route: &mut SealedRoute, volume: SealedVolume) -> Result<
     Ok(())
 }
 
+fn insert_route_target(route: &mut SealedRoute, target: RouteTarget) {
+    route.targets.push(target);
+}
+
+fn finalize_route(route: SealedRoute) -> Result<SealedRoute> {
+    if route.targets.is_empty() && resolve_function_name(&route.path).is_none() {
+        bail!(
+            "route `{}` does not resolve to a guest function name and must define at least one `--route-target`",
+            route.path
+        );
+    }
+
+    Ok(route)
+}
+
 fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
     let (path, secrets) = value.split_once('=').context(
         "secret routes must use the `/path=NAME[,NAME]` syntax, for example `/api/guest-example=DB_PASS`",
@@ -653,6 +718,106 @@ fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
     }
 
     Ok((path.to_owned(), merge_allowed_secrets(Vec::new(), secrets)))
+}
+
+fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
+    let (path, target) = value.split_once('=').context(
+        "route targets must use the `/path=MODULE[,weight=80][,header=X-Cohort=beta]` syntax",
+    )?;
+
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("route targets must include a non-empty path before `=`");
+    }
+
+    let mut segments = target.split(',').map(str::trim);
+    let module = normalize_target_module(
+        segments
+            .next()
+            .context("route targets must include a module name after `=`")?,
+    )?;
+    let mut weight = None;
+    let mut match_header = None;
+
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+
+        if let Some(raw_weight) = segment.strip_prefix("weight=") {
+            if weight.is_some() {
+                bail!("route target `{value}` defines `weight` more than once");
+            }
+
+            let parsed_weight = raw_weight.trim().parse::<u32>().with_context(|| {
+                format!(
+                    "failed to parse route target weight `{}` in `{value}`",
+                    raw_weight.trim()
+                )
+            })?;
+            if parsed_weight > 100 {
+                bail!("route target `{value}` must keep `weight` between 0 and 100");
+            }
+            weight = Some(parsed_weight);
+            continue;
+        }
+
+        if let Some(raw_header) = segment.strip_prefix("header=") {
+            if match_header.is_some() {
+                bail!("route target `{value}` defines `header` more than once");
+            }
+            match_header = Some(parse_header_match(raw_header)?);
+            continue;
+        }
+
+        bail!("unsupported route target option `{segment}`; expected `weight=` or `header=`");
+    }
+
+    Ok((
+        path.to_owned(),
+        RouteTarget {
+            module,
+            weight: weight.unwrap_or_else(|| u32::from(match_header.is_none()) * 100),
+            match_header,
+        },
+    ))
+}
+
+fn normalize_target_module(module: &str) -> Result<String> {
+    let trimmed = module.trim();
+    if trimmed.is_empty() {
+        bail!("route targets must include a non-empty module name");
+    }
+
+    let normalized = trimmed.strip_suffix(".wasm").unwrap_or(trimmed).trim();
+    if normalized.is_empty() {
+        bail!("route targets must include a non-empty module name");
+    }
+    if normalized.contains('/') || normalized.contains('\\') {
+        bail!("route targets must use module names, not filesystem paths");
+    }
+
+    Ok(normalized.to_owned())
+}
+
+fn parse_header_match(value: &str) -> Result<HeaderMatch> {
+    let (name, header_value) = value.split_once('=').context(
+        "route target headers must use the `header=NAME=VALUE` syntax, for example `header=X-Cohort=beta`",
+    )?;
+    let name = name.trim();
+    let header_value = header_value.trim();
+
+    if name.is_empty() {
+        bail!("route target headers must include a non-empty header name");
+    }
+    if header_value.is_empty() {
+        bail!("route target headers must include a non-empty header value");
+    }
+
+    Ok(HeaderMatch {
+        name: name.to_ascii_lowercase(),
+        value: header_value.to_owned(),
+    })
 }
 
 fn parse_route_scale(value: &str) -> Result<(String, RouteScaling)> {
@@ -723,11 +888,7 @@ fn normalize_route(route: &str) -> Result<String> {
     };
 
     if normalized == "/" {
-        bail!("route `/` does not resolve to a guest function");
-    }
-
-    if resolve_function_name(&normalized).is_none() {
-        bail!("route `{normalized}` does not resolve to a guest function name");
+        bail!("route `/` is not allowed");
     }
 
     Ok(normalized)
@@ -762,6 +923,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .expect("routes should normalize");
 
@@ -772,6 +934,7 @@ mod tests {
                     path: "/api/guest-example".to_owned(),
                     role: RouteRole::User,
                     allowed_secrets: Vec::new(),
+                    targets: Vec::new(),
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                     volumes: Vec::new(),
@@ -780,6 +943,7 @@ mod tests {
                     path: "/api/guest-malicious".to_owned(),
                     role: RouteRole::User,
                     allowed_secrets: Vec::new(),
+                    targets: Vec::new(),
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                     volumes: Vec::new(),
@@ -788,6 +952,7 @@ mod tests {
                     path: "/metrics".to_owned(),
                     role: RouteRole::System,
                     allowed_secrets: Vec::new(),
+                    targets: Vec::new(),
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                     volumes: Vec::new(),
@@ -802,6 +967,7 @@ mod tests {
             user_routes: vec!["/api/guest-example".to_owned()],
             system_routes: vec!["/metrics".to_owned()],
             secret_routes: vec!["/api/guest-example=DB_PASS".to_owned()],
+            route_targets: Vec::new(),
             route_scales: vec!["/api/guest-example=2:16".to_owned()],
             volumes: vec!["/api/guest-example=/tmp/tachyon_data:/app/data:ro".to_owned()],
             memory_mib: 64,
@@ -817,6 +983,7 @@ mod tests {
                     path: "/api/guest-example".to_owned(),
                     role: RouteRole::User,
                     allowed_secrets: vec!["DB_PASS".to_owned()],
+                    targets: Vec::new(),
                     min_instances: 2,
                     max_concurrency: 16,
                     volumes: vec![SealedVolume {
@@ -829,6 +996,7 @@ mod tests {
                     path: "/metrics".to_owned(),
                     role: RouteRole::System,
                     allowed_secrets: Vec::new(),
+                    targets: Vec::new(),
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                     volumes: Vec::new(),
@@ -860,6 +1028,8 @@ mod tests {
                 "/metrics",
                 "--secret-route",
                 "/api/guest-example=DB_PASS,API_KEY",
+                "--route-target",
+                "/api/guest-example=guest-example,weight=70",
                 "--route-scale",
                 "/api/guest-example=1:8",
                 "--volume",
@@ -882,6 +1052,7 @@ mod tests {
                 ],
                 system_routes: vec!["/metrics".to_owned()],
                 secret_routes: vec!["/api/guest-example=DB_PASS,API_KEY".to_owned()],
+                route_targets: vec!["/api/guest-example=guest-example,weight=70".to_owned()],
                 route_scales: vec!["/api/guest-example=1:8".to_owned()],
                 volumes: vec!["/api/guest-example=C:\\\\tachyon_data:/app/data:rw".to_owned()],
                 memory_mib: 64,
@@ -897,6 +1068,7 @@ mod tests {
             Vec::new(),
             vec!["/api/guest-example=3:7".to_owned()],
             Vec::new(),
+            Vec::new(),
         )
         .expect("route scaling should normalize");
 
@@ -906,6 +1078,7 @@ mod tests {
                 path: "/api/guest-example".to_owned(),
                 role: RouteRole::User,
                 allowed_secrets: Vec::new(),
+                targets: Vec::new(),
                 min_instances: 3,
                 max_concurrency: 7,
                 volumes: Vec::new(),
@@ -918,6 +1091,7 @@ mod tests {
         let error = normalize_routes(
             vec!["/metrics".to_owned()],
             vec!["/metrics/".to_owned()],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -937,6 +1111,7 @@ mod tests {
             vec!["/api/missing=DB_PASS".to_owned()],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .expect_err("secret route must target a declared user route");
 
@@ -953,6 +1128,7 @@ mod tests {
             Vec::new(),
             vec!["/api/missing=1:8".to_owned()],
             Vec::new(),
+            Vec::new(),
         )
         .expect_err("route scaling must target a declared route");
 
@@ -968,6 +1144,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["/api/guest-example=1:0".to_owned()],
+            Vec::new(),
             Vec::new(),
         )
         .expect_err("zero max_concurrency should fail");
@@ -993,6 +1170,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["C:\\\\tachyon_data:/app/data:rw".to_owned()],
+            Vec::new(),
         )
         .expect("single route volume should normalize");
 
@@ -1017,8 +1195,75 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["/tmp/tachyon_data:/app/data:rw".to_owned()],
+            Vec::new(),
         )
         .expect_err("implicit volume should be rejected when more than one route exists");
+
+        assert!(error
+            .to_string()
+            .contains("must target a declared sealed route"));
+    }
+
+    #[test]
+    fn normalize_routes_applies_explicit_targets_in_order() {
+        let routes = normalize_routes(
+            vec!["/api/checkout".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                "/api/checkout=checkout-v1,weight=90".to_owned(),
+                "/api/checkout=checkout-v2,weight=10".to_owned(),
+                "/api/checkout=checkout-beta,header=X-Cohort=beta".to_owned(),
+            ],
+        )
+        .expect("route targets should normalize");
+
+        assert_eq!(
+            routes,
+            vec![SealedRoute {
+                path: "/api/checkout".to_owned(),
+                role: RouteRole::User,
+                allowed_secrets: Vec::new(),
+                targets: vec![
+                    RouteTarget {
+                        module: "checkout-v1".to_owned(),
+                        weight: 90,
+                        match_header: None,
+                    },
+                    RouteTarget {
+                        module: "checkout-v2".to_owned(),
+                        weight: 10,
+                        match_header: None,
+                    },
+                    RouteTarget {
+                        module: "checkout-beta".to_owned(),
+                        weight: 0,
+                        match_header: Some(HeaderMatch {
+                            name: "x-cohort".to_owned(),
+                            value: "beta".to_owned(),
+                        }),
+                    },
+                ],
+                min_instances: 0,
+                max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+                volumes: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_routes_rejects_targets_for_unknown_routes() {
+        let error = normalize_routes(
+            vec!["/api/guest-example".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["/api/unknown=guest-loop,weight=100".to_owned()],
+        )
+        .expect_err("route target should require a declared route");
 
         assert!(error
             .to_string()

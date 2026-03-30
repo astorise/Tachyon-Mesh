@@ -9,6 +9,7 @@ use axum::{
     Extension, Router,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use rand::Rng;
 use reqwest::Client;
 use serde::Deserialize;
 use serde::Serialize;
@@ -85,6 +86,8 @@ const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
 const DEFAULT_HOP_LIMIT: u32 = 10;
 const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
+const COHORT_HEADER: &str = "x-cohort";
+const TACHYON_COHORT_HEADER: &str = "x-tachyon-cohort";
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
@@ -133,6 +136,7 @@ struct ComponentHostState {
     secrets: SecretAccess,
     telemetry: TelemetryHandle,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    propagated_headers: Vec<PropagatedHeader>,
     outbound_http_client: reqwest::blocking::Client,
 }
 
@@ -148,6 +152,7 @@ struct GuestExecutionContext {
     secret_access: SecretAccess,
     telemetry: Option<GuestTelemetryContext>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    propagated_headers: Vec<PropagatedHeader>,
 }
 
 struct BackgroundTickRunner {
@@ -202,6 +207,27 @@ enum RouteRole {
     System,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct HeaderMatch {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct RouteTarget {
+    module: String,
+    #[serde(default)]
+    weight: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    match_header: Option<HeaderMatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PropagatedHeader {
+    name: String,
+    value: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResourceLimitKind {
     Fuel,
@@ -252,6 +278,8 @@ struct IntegrityRoute {
     role: RouteRole,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_secrets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    targets: Vec<RouteTarget>,
     #[serde(default)]
     min_instances: u32,
     #[serde(default = "default_max_concurrency")]
@@ -336,7 +364,7 @@ fn start_background_tick_workers(state: &AppState) {
             continue;
         }
 
-        let Some(function_name) = resolve_function_name(&route.path) else {
+        let Some(function_name) = background_route_module(route) else {
             continue;
         };
 
@@ -459,6 +487,7 @@ async fn hop_limit_middleware(
 async fn faas_handler(
     State(state): State<AppState>,
     Extension(hop_limit): Extension<HopLimit>,
+    headers: HeaderMap,
     method: Method,
     uri: Uri,
     body: Bytes,
@@ -498,93 +527,90 @@ async fn faas_handler(
                     Some(semaphore) => match acquire_route_permit(semaphore).await {
                         Ok(permit) => {
                             let _permit = permit;
+                            match select_route_module(&route, &headers) {
+                                Ok(selected_module) => {
+                                    let propagated_headers = extract_propagated_headers(&headers);
+                                    let engine = state.engine.clone();
+                                    let config = state.config.clone();
+                                    let telemetry_context = GuestTelemetryContext {
+                                        handle: state.telemetry.clone(),
+                                        trace_id: trace_id.clone(),
+                                    };
+                                    let runtime_telemetry = state.telemetry.clone();
+                                    let secret_access =
+                                        SecretAccess::from_route(&route, &state.secrets_vault);
+                                    let task_route = route.clone();
+                                    let task_function_name = selected_module.clone();
+                                    let task_propagated_headers = propagated_headers.clone();
+                                    let guest_request = GuestRequest {
+                                        method: method.to_string(),
+                                        uri: uri.to_string(),
+                                        body,
+                                    };
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        execute_guest(
+                                            &engine,
+                                            &task_function_name,
+                                            guest_request,
+                                            &task_route,
+                                            GuestExecutionContext {
+                                                config,
+                                                runtime_telemetry,
+                                                secret_access,
+                                                telemetry: Some(telemetry_context),
+                                                concurrency_limits: Arc::clone(
+                                                    &state.concurrency_limits,
+                                                ),
+                                                propagated_headers: task_propagated_headers,
+                                            },
+                                        )
+                                    })
+                                    .await;
 
-                            match resolve_function_name(&normalized_path) {
-                                    Some(function_name) => {
-                                        let engine = state.engine.clone();
-                                        let config = state.config.clone();
-                                        let telemetry_context = GuestTelemetryContext {
-                                            handle: state.telemetry.clone(),
-                                            trace_id: trace_id.clone(),
-                                        };
-                                        let runtime_telemetry = state.telemetry.clone();
-                                        let secret_access =
-                                            SecretAccess::from_route(&route, &state.secrets_vault);
-                                        let task_route = route.clone();
-                                        let task_function_name = function_name.clone();
-                                        let guest_request = GuestRequest {
-                                            method: method.to_string(),
-                                            uri: uri.to_string(),
-                                            body,
-                                        };
-                                        let result = tokio::task::spawn_blocking(move || {
-                                            execute_guest(
-                                                &engine,
-                                                &task_function_name,
-                                                guest_request,
-                                                &task_route,
-                                                GuestExecutionContext {
-                                                    config,
-                                                    runtime_telemetry,
-                                                    secret_access,
-                                                    telemetry: Some(telemetry_context),
-                                                    concurrency_limits: Arc::clone(
-                                                        &state.concurrency_limits,
-                                                    ),
-                                                },
-                                            )
-                                        })
-                                        .await;
-
-                                        match result {
-                                            Ok(Ok(output)) => {
-                                                let response = match output {
-                                                    GuestExecutionOutput::Http(response) => response,
-                                                    GuestExecutionOutput::LegacyStdout(stdout) => {
-                                                        GuestHttpResponse {
-                                                            status: StatusCode::OK,
-                                                            body: stdout,
-                                                        }
-                                                    }
-                                                };
-
-                                                match resolve_mesh_response(
-                                                    &state.http_client,
-                                                    &state.config,
-                                                    hop_limit,
-                                                    response,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(response) => {
-                                                        (response.status, response.body)
-                                                            .into_response()
-                                                    }
-                                                    Err(error) => {
-                                                        (StatusCode::BAD_GATEWAY, error)
-                                                            .into_response()
+                                    match result {
+                                        Ok(Ok(output)) => {
+                                            let response = match output {
+                                                GuestExecutionOutput::Http(response) => response,
+                                                GuestExecutionOutput::LegacyStdout(stdout) => {
+                                                    GuestHttpResponse {
+                                                        status: StatusCode::OK,
+                                                        body: stdout,
                                                     }
                                                 }
-                                            }
-                                            Ok(Err(error)) => {
-                                                error.log_if_needed(&function_name);
-                                                error.into_response(&state.config).into_response()
-                                            }
-                                            Err(error) => (
-                                                StatusCode::INTERNAL_SERVER_ERROR,
-                                                format!("guest execution task failed: {error}"),
+                                            };
+
+                                            match resolve_mesh_response(
+                                                &state.http_client,
+                                                &state.config,
+                                                hop_limit,
+                                                &propagated_headers,
+                                                response,
                                             )
-                                                .into_response(),
+                                            .await
+                                            {
+                                                Ok(response) => {
+                                                    (response.status, response.body).into_response()
+                                                }
+                                                Err(error) => {
+                                                    (StatusCode::BAD_GATEWAY, error).into_response()
+                                                }
+                                            }
                                         }
+                                        Ok(Err(error)) => {
+                                            error.log_if_needed(&selected_module);
+                                            error.into_response(&state.config).into_response()
+                                        }
+                                        Err(error) => (
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            format!("guest execution task failed: {error}"),
+                                        )
+                                            .into_response(),
                                     }
-                                    None => (
-                                        StatusCode::NOT_FOUND,
-                                        format!(
-                                            "no guest function could be resolved from `{normalized_path}`"
-                                        ),
-                                    )
-                                        .into_response(),
                                 }
+                                Err(error) => {
+                                    (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+                                }
+                            }
                         }
                         Err(RoutePermitError::Closed) => (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -642,6 +668,7 @@ async fn resolve_mesh_response(
     http_client: &Client,
     config: &IntegrityConfig,
     hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
     response: GuestHttpResponse,
 ) -> std::result::Result<GuestHttpResponse, String> {
     let Some(target) = extract_mesh_fetch_url(&response.body) else {
@@ -649,9 +676,13 @@ async fn resolve_mesh_response(
     };
     let url = resolve_mesh_fetch_target(config, target)?;
 
-    let response = http_client
+    let mut request = http_client
         .get(&url)
-        .header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string())
+        .header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
+    for header in propagated_headers {
+        request = request.header(&header.name, &header.value);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("mesh fetch to `{url}` failed: {error}"))?;
@@ -677,6 +708,89 @@ fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
         .strip_prefix("MESH_FETCH:")
         .map(str::trim)
         .filter(|url| !url.is_empty())
+}
+
+fn select_route_module(
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+) -> std::result::Result<String, String> {
+    select_route_module_with_roll(route, headers, None)
+}
+
+fn select_route_module_with_roll(
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+    random_roll: Option<u64>,
+) -> std::result::Result<String, String> {
+    for target in &route.targets {
+        if target
+            .match_header
+            .as_ref()
+            .is_some_and(|matcher| request_header_matches(headers, matcher))
+        {
+            return Ok(target.module.clone());
+        }
+    }
+
+    let total_weight = route
+        .targets
+        .iter()
+        .map(|target| u64::from(target.weight))
+        .sum::<u64>();
+    if total_weight > 0 {
+        let draw = match random_roll {
+            Some(roll) => roll % total_weight,
+            None => rand::thread_rng().gen_range(0..total_weight),
+        };
+        let mut cumulative_weight = 0_u64;
+        for target in &route.targets {
+            if target.weight == 0 {
+                continue;
+            }
+            cumulative_weight = cumulative_weight.saturating_add(u64::from(target.weight));
+            if draw < cumulative_weight {
+                return Ok(target.module.clone());
+            }
+        }
+    }
+
+    resolve_function_name(&route.path).ok_or_else(|| {
+        format!(
+            "route `{}` does not define a routable guest target",
+            route.path
+        )
+    })
+}
+
+fn request_header_matches(headers: &HeaderMap, matcher: &HeaderMatch) -> bool {
+    headers
+        .get(matcher.name.as_str())
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|value| value == matcher.value)
+}
+
+fn extract_propagated_headers(headers: &HeaderMap) -> Vec<PropagatedHeader> {
+    let Some(value) = headers
+        .get(TACHYON_COHORT_HEADER)
+        .or_else(|| headers.get(COHORT_HEADER))
+        .and_then(|header| header.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    vec![
+        PropagatedHeader {
+            name: COHORT_HEADER.to_owned(),
+            value: value.to_owned(),
+        },
+        PropagatedHeader {
+            name: TACHYON_COHORT_HEADER.to_owned(),
+            value: value.to_owned(),
+        },
+    ]
 }
 
 fn resolve_incoming_hop_limit(headers: &HeaderMap) -> std::result::Result<HopLimit, ()> {
@@ -850,6 +964,7 @@ fn execute_component_guest(
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
             Arc::clone(&execution.concurrency_limits),
+            execution.propagated_headers.clone(),
         )?,
     );
     store.limiter(|state| &mut state.limits);
@@ -937,6 +1052,7 @@ fn execute_system_component_guest(
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
             Arc::clone(&execution.concurrency_limits),
+            execution.propagated_headers.clone(),
         )?,
     );
     store.limiter(|state| &mut state.limits);
@@ -1038,6 +1154,7 @@ impl BackgroundTickRunner {
                 telemetry,
                 SecretAccess::default(),
                 concurrency_limits,
+                Vec::new(),
             )?,
         );
         store.limiter(|state| &mut state.limits);
@@ -1174,7 +1291,7 @@ fn build_linker(
 
 #[cfg_attr(feature = "ai-inference", allow(dead_code))]
 fn requires_ai_inference_feature(function_name: &str) -> bool {
-    function_name == "guest-ai"
+    normalize_target_module_name(function_name) == "guest-ai"
 }
 
 fn resolve_function_name(path: &str) -> Option<String> {
@@ -1182,6 +1299,14 @@ fn resolve_function_name(path: &str) -> Option<String> {
         .rev()
         .find(|segment| !segment.is_empty() && *segment != "api")
         .map(ToOwned::to_owned)
+}
+
+fn background_route_module(route: &IntegrityRoute) -> Option<String> {
+    route
+        .targets
+        .first()
+        .map(|target| target.module.clone())
+        .or_else(|| resolve_function_name(&route.path))
 }
 
 fn normalize_route_path(path: &str) -> String {
@@ -1219,7 +1344,10 @@ fn resolve_guest_module_path(
 }
 
 fn guest_module_candidate_paths(function_name: &str) -> Vec<PathBuf> {
-    let wasm_file = format!("{}.wasm", function_name.replace('-', "_"));
+    let wasm_file = format!(
+        "{}.wasm",
+        normalize_target_module_name(function_name).replace('-', "_")
+    );
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let manifest_relative_candidates = [
         format!("../target/wasm32-wasip2/debug/{wasm_file}"),
@@ -1247,6 +1375,15 @@ fn guest_module_candidate_paths(function_name: &str) -> Vec<PathBuf> {
             "/app/guest-modules/{wasm_file}"
         ))))
         .collect()
+}
+
+fn normalize_target_module_name(module_name: &str) -> String {
+    module_name
+        .trim()
+        .strip_suffix(".wasm")
+        .unwrap_or(module_name.trim())
+        .trim()
+        .to_owned()
 }
 
 fn normalize_path(path: PathBuf) -> PathBuf {
@@ -1518,10 +1655,64 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         path: normalized.clone(),
         role: route.role,
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
+        targets: normalize_route_targets(route.targets)?,
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
         volumes: normalize_route_volumes(route.volumes, &normalized)?,
     })
+}
+
+fn normalize_route_targets(targets: Vec<RouteTarget>) -> Result<Vec<RouteTarget>> {
+    targets
+        .into_iter()
+        .map(normalize_route_target)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
+    let module = normalize_target_module_name(&target.module);
+    if module.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route targets must include a non-empty `module`"
+        ));
+    }
+    if module.contains('/') || module.contains('\\') {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route targets must use module names, not filesystem paths"
+        ));
+    }
+    if target.weight > 100 {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route target `{module}` must keep `weight` between 0 and 100"
+        ));
+    }
+
+    Ok(RouteTarget {
+        module,
+        weight: target.weight,
+        match_header: target
+            .match_header
+            .map(normalize_header_match)
+            .transpose()?,
+    })
+}
+
+fn normalize_header_match(header_match: HeaderMatch) -> Result<HeaderMatch> {
+    let name = header_match.name.trim().to_ascii_lowercase();
+    let value = header_match.value.trim().to_owned();
+
+    if name.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route target header matches must include a non-empty `name`"
+        ));
+    }
+    if value.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route target header matches must include a non-empty `value`"
+        ));
+    }
+
+    Ok(HeaderMatch { name, value })
 }
 
 fn normalize_route_volumes(
@@ -1835,6 +2026,7 @@ impl ComponentHostState {
         telemetry: TelemetryHandle,
         secrets: SecretAccess,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+        propagated_headers: Vec<PropagatedHeader>,
     ) -> std::result::Result<Self, ExecutionError> {
         Ok(Self {
             ctx: build_component_wasi_ctx(route)?,
@@ -1843,6 +2035,7 @@ impl ComponentHostState {
             secrets,
             telemetry,
             concurrency_limits,
+            propagated_headers,
             outbound_http_client: reqwest::blocking::Client::new(),
         })
     }
@@ -1996,10 +2189,14 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             "autoscaling guest sending outbound HTTP request"
         );
 
-        let response = self
+        let mut request = self
             .outbound_http_client
             .request(method, &url)
-            .header("content-type", "application/merge-patch+json")
+            .header("content-type", "application/merge-patch+json");
+        for header in &self.propagated_headers {
+            request = request.header(&header.name, &header.value);
+        }
+        let response = request
             .body(body)
             .send()
             .map_err(|error| format!("failed to send outbound HTTP request to `{url}`: {error}"))?;
@@ -2053,6 +2250,7 @@ impl IntegrityRoute {
             path: path.to_owned(),
             role: RouteRole::User,
             allowed_secrets: Vec::new(),
+            targets: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -2065,6 +2263,7 @@ impl IntegrityRoute {
             path: path.to_owned(),
             role: RouteRole::System,
             allowed_secrets: Vec::new(),
+            targets: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -2080,6 +2279,7 @@ impl IntegrityRoute {
                 .iter()
                 .map(|secret| (*secret).to_owned())
                 .collect(),
+            targets: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -2192,6 +2392,8 @@ mod tests {
     use std::{fs, path::PathBuf};
     use tower::util::ServiceExt;
 
+    type CapturedForwardedHeaders = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
     fn expected_secret_status() -> &'static str {
         if cfg!(feature = "secrets-vault") {
             "super_secret_123"
@@ -2249,6 +2451,7 @@ mod tests {
             path: "/api/guest-volume".to_owned(),
             role: RouteRole::User,
             allowed_secrets: Vec::new(),
+            targets: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -2256,6 +2459,31 @@ mod tests {
                 guest_path: "/app/data".to_owned(),
                 readonly,
             }],
+        }
+    }
+
+    fn targeted_route(path: &str, targets: Vec<RouteTarget>) -> IntegrityRoute {
+        let mut route = IntegrityRoute::user(path);
+        route.targets = targets;
+        route
+    }
+
+    fn weighted_target(module: &str, weight: u32) -> RouteTarget {
+        RouteTarget {
+            module: module.to_owned(),
+            weight,
+            match_header: None,
+        }
+    }
+
+    fn header_target(module: &str, header_name: &str, header_value: &str) -> RouteTarget {
+        RouteTarget {
+            module: module.to_owned(),
+            weight: 0,
+            match_header: Some(HeaderMatch {
+                name: header_name.to_owned(),
+                value: header_value.to_owned(),
+            }),
         }
     }
 
@@ -2337,6 +2565,7 @@ mod tests {
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
+                propagated_headers: Vec::new(),
             },
         )
         .expect("guest execution should succeed");
@@ -2372,6 +2601,7 @@ mod tests {
                 secret_access: SecretAccess::default(),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
+                propagated_headers: Vec::new(),
             },
         )
         .expect("legacy guest execution should succeed");
@@ -2409,6 +2639,7 @@ mod tests {
                 secret_access: SecretAccess::default(),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
+                propagated_headers: Vec::new(),
             },
         )
         .expect("volume guest should write successfully");
@@ -2436,6 +2667,7 @@ mod tests {
                 secret_access: SecretAccess::default(),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
+                propagated_headers: Vec::new(),
             },
         )
         .expect("volume guest should read successfully");
@@ -2622,6 +2854,7 @@ mod tests {
                 secret_access: SecretAccess::default(),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
+                propagated_headers: Vec::new(),
             },
         )
         .expect_err("privileged metrics guest should fail as a user route");
@@ -2937,6 +3170,86 @@ mod tests {
     }
 
     #[test]
+    fn select_route_module_prefers_matching_header_targets() {
+        let route = targeted_route(
+            "/api/checkout",
+            vec![
+                header_target("guest-loop", COHORT_HEADER, "beta"),
+                weighted_target("guest-example", 100),
+            ],
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(COHORT_HEADER, HeaderValue::from_static("beta"));
+
+        assert_eq!(
+            select_route_module_with_roll(&route, &headers, Some(42))
+                .expect("header-target route should resolve"),
+            "guest-loop"
+        );
+    }
+
+    #[test]
+    fn select_route_module_uses_weighted_rollout_without_matching_headers() {
+        let route = targeted_route(
+            "/api/checkout",
+            vec![
+                weighted_target("guest-example", 90),
+                weighted_target("guest-loop", 10),
+            ],
+        );
+
+        assert_eq!(
+            select_route_module_with_roll(&route, &HeaderMap::new(), Some(0))
+                .expect("weighted route should resolve"),
+            "guest-example"
+        );
+        assert_eq!(
+            select_route_module_with_roll(&route, &HeaderMap::new(), Some(89))
+                .expect("weighted route should resolve"),
+            "guest-example"
+        );
+        assert_eq!(
+            select_route_module_with_roll(&route, &HeaderMap::new(), Some(90))
+                .expect("weighted route should resolve"),
+            "guest-loop"
+        );
+    }
+
+    #[test]
+    fn select_route_module_falls_back_to_path_module_when_targets_are_header_only() {
+        let route = targeted_route(
+            "/api/guest-example",
+            vec![header_target("guest-loop", COHORT_HEADER, "beta")],
+        );
+
+        assert_eq!(
+            select_route_module_with_roll(&route, &HeaderMap::new(), Some(0))
+                .expect("route should fall back to the path module"),
+            "guest-example"
+        );
+    }
+
+    #[test]
+    fn extract_propagated_headers_copies_legacy_and_canonical_cohort_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COHORT_HEADER, HeaderValue::from_static("beta"));
+
+        assert_eq!(
+            extract_propagated_headers(&headers),
+            vec![
+                PropagatedHeader {
+                    name: COHORT_HEADER.to_owned(),
+                    value: "beta".to_owned(),
+                },
+                PropagatedHeader {
+                    name: TACHYON_COHORT_HEADER.to_owned(),
+                    value: "beta".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn resolve_incoming_hop_limit_defaults_missing_or_invalid_values() {
         let headers = HeaderMap::new();
         assert_eq!(
@@ -2969,6 +3282,86 @@ mod tests {
             resolve_mesh_fetch_target(&config, "/api/guest-loop")
                 .expect("relative mesh route should resolve"),
             "http://127.0.0.1:8080/api/guest-loop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_mesh_response_forwards_propagated_cohort_headers() {
+        use axum::{extract::State, routing::get, Router};
+
+        async fn capture_headers(
+            State(captured): State<CapturedForwardedHeaders>,
+            headers: HeaderMap,
+        ) -> &'static str {
+            captured
+                .lock()
+                .expect("captured headers should not be poisoned")
+                .push((
+                    headers
+                        .get(HOP_LIMIT_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    headers
+                        .get(COHORT_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    headers
+                        .get(TACHYON_COHORT_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned(),
+                ));
+            "ok"
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/ping", get(capture_headers))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should expose an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should stay healthy");
+        });
+
+        let mut inbound_headers = HeaderMap::new();
+        inbound_headers.insert(COHORT_HEADER, HeaderValue::from_static("beta"));
+        let propagated_headers = extract_propagated_headers(&inbound_headers);
+        let response = resolve_mesh_response(
+            &Client::new(),
+            &IntegrityConfig::default_sealed(),
+            HopLimit(DEFAULT_HOP_LIMIT),
+            &propagated_headers,
+            GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from(format!("MESH_FETCH:http://{address}/ping")),
+            },
+        )
+        .await
+        .expect("mesh fetch should succeed");
+
+        server.abort();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from("ok"));
+        assert_eq!(
+            captured
+                .lock()
+                .expect("captured headers should not be poisoned")
+                .as_slice(),
+            &[(
+                (DEFAULT_HOP_LIMIT - 1).to_string(),
+                "beta".to_owned(),
+                "beta".to_owned()
+            )]
         );
     }
 
@@ -3105,6 +3498,7 @@ mod tests {
             path: "/api/guest-volume".to_owned(),
             role: RouteRole::User,
             allowed_secrets: Vec::new(),
+            targets: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -3136,6 +3530,7 @@ mod tests {
             path: "/api/guest-example".to_owned(),
             role: RouteRole::User,
             allowed_secrets: Vec::new(),
+            targets: Vec::new(),
             min_instances: 0,
             max_concurrency: 0,
             volumes: Vec::new(),
