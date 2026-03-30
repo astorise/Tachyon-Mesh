@@ -3,21 +3,32 @@ name = "core-host"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+ai-inference = ["dep:wasmtime-wasi-nn"]
+rate-limit = ["dep:governor", "dep:forwarded-header-value"]
+secrets-vault = []
+
 [dependencies]
 anyhow = "1"
 axum = "0.7"
 bytes = "1.5"
 ed25519-dalek = "2"
+forwarded-header-value = { version = "0.1", optional = true }
+governor = { version = "0.6", optional = true }
 hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+uuid = { version = "1", features = ["v4"] }
 wasmtime = { version = "42.0.1", features = ["component-model"] }
 wasmtime-wasi = { version = "42.0.1", features = ["p1"] }
+wasmtime-wasi-nn = { version = "42.0.1", optional = true, default-features = false, features = ["onnx-download"] }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

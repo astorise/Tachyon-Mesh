@@ -2,7 +2,6 @@
 
 ## Purpose
 Define deterministic CPU and memory limits for guest execution so `core-host` can contain malicious or runaway workloads without crashing.
-
 ## Requirements
 ### Requirement: Wasmtime engine enables deterministic fuel accounting
 The `core-host` runtime SHALL initialize Wasmtime with fuel consumption enabled so every guest execution can be bounded by instruction count.
@@ -38,3 +37,16 @@ The workspace SHALL include a `guest-malicious` WASI crate that intentionally ex
 - **WHEN** a developer inspects the workspace members for the quota change
 - **THEN** a `guest-malicious` crate is present as a WASI guest module
 - **AND** its exported behavior is designed to trigger the configured fuel or memory limits during host execution
+
+### Requirement: Shared Wasmtime engine uses pooled instance allocation
+The `core-host` runtime SHALL configure the shared Wasmtime engine with the pooling allocator so
+guest execution reuses reserved instance capacity instead of relying solely on on-demand
+allocation.
+
+#### Scenario: Engine is configured for pooled guest allocation
+- **WHEN** the host builds the shared Wasmtime engine during startup
+- **THEN** fuel metering remains enabled
+- **AND** component-model support remains enabled
+- **AND** the engine uses `PoolingAllocationConfig` sized from the sealed route concurrency plus
+  the existing guest memory ceiling
+

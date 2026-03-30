@@ -2,10 +2,16 @@
 members = [
     "core-host",
     "faas-sdk",
+    "guest-ai",
     "guest-call-legacy",
     "guest-example",
+    "guest-loop",
     "guest-malicious",
+    "guest-volume",
     "legacy-mock",
+    "system-faas-k8s-scaler",
+    "system-faas-keda",
+    "system-faas-prom",
     "tachyon-cli",
 ]
 resolver = "2"

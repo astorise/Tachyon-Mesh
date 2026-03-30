@@ -15,6 +15,53 @@ interface handler {
     handle-request: func(req: request) -> response;
 }
 
+interface telemetry-reader {
+    record metrics-snapshot {
+        total-requests: u64,
+        completed-requests: u64,
+        error-requests: u64,
+        active-requests: u32,
+        dropped-events: u64,
+        last-status: u16,
+        total-duration-us: u64,
+        total-wasm-duration-us: u64,
+        total-host-overhead-us: u64,
+    }
+
+    get-metrics: func() -> metrics-snapshot;
+}
+
+interface scaling-metrics {
+    get-pending-queue-size: func(route-path: string) -> u32;
+}
+
+interface outbound-http {
+    send-request: func(method: string, url: string, body: list<u8>) -> result<u16, string>;
+}
+
+interface secrets-vault {
+    enum error {
+        not-found,
+        permission-denied,
+        vault-disabled,
+    }
+
+    get-secret: func(name: string) -> result<string, error>;
+}
+
 world faas-guest {
+    import secrets-vault;
     export handler;
+}
+
+world system-faas-guest {
+    import telemetry-reader;
+    import scaling-metrics;
+    export handler;
+}
+
+world background-system-faas {
+    import scaling-metrics;
+    import outbound-http;
+    export on-tick: func();
 }

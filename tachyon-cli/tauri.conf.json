@@ -31,6 +31,41 @@
               "required": true
             },
             {
+              "name": "system-route",
+              "description": "Privileged system route to seal into the manifest.",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
+              "name": "secret-route",
+              "description": "Grant named secrets to a sealed user route using /path=NAME[,NAME].",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
+              "name": "route-target",
+              "description": "Attach a guest target using /path=MODULE[,weight=80][,header=X-Cohort=beta].",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
+              "name": "route-scale",
+              "description": "Apply per-route scaling using /path=min:max.",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
+              "name": "volume",
+              "description": "Attach a host directory using [/route=]HOST:GUEST[:ro|rw].",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
               "name": "memory",
               "short": "m",
               "description": "Guest memory limit in MiB.",
