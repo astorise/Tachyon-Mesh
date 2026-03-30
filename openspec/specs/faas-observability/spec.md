@@ -55,18 +55,16 @@ A background telemetry worker SHALL aggregate request lifecycle events by `trace
 - **AND** the record reports `host_overhead_us` equal to `total_duration_us`
 
 ### Requirement: System FaaS can read host telemetry snapshots through a privileged world
-The workspace SHALL provide a `system-faas-guest` component world that imports `tachyon:telemetry/reader`, and `core-host` SHALL only satisfy that import for routes sealed as role `system`.
+The workspace SHALL provide a `system-faas-guest` component world that imports
+`tachyon:telemetry/reader` and `tachyon:mesh/scaling-metrics`, and `core-host`
+SHALL only satisfy those imports for routes sealed as role `system`.
 
-#### Scenario: System route exposes telemetry metrics successfully
-- **WHEN** a request targets a sealed route whose role is `system`
-- **AND** the corresponding guest component imports `tachyon:telemetry/reader`
+#### Scenario: System autoscaling metrics route exposes pending queue depth
+- **WHEN** a request targets the sealed system route `/metrics/scaling`
+- **AND** the corresponding guest component imports `tachyon:mesh/scaling-metrics`
 - **THEN** `core-host` instantiates the component with the privileged linker
-- **AND** the guest can read host telemetry counters and return a metrics response
-
-#### Scenario: User route cannot instantiate the privileged telemetry guest
-- **WHEN** the same telemetry guest component is executed through a sealed route whose role is `user`
-- **THEN** `core-host` does not provide the privileged telemetry import
-- **AND** component instantiation fails before guest code runs
+- **AND** the guest can read the pending queue size for `/api/guest-call-legacy`
+- **AND** the guest returns Prometheus text containing that queue depth
 
 ### Requirement: Host sheds privileged telemetry routes under heavy business load
 `core-host` SHALL track active requests and reject sealed `system` routes once active load passes the configured threshold, so normal guest traffic keeps priority over telemetry exports.
