@@ -38,6 +38,8 @@ use wasmtime_wasi::{
     p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
     DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
+#[cfg(feature = "ai-inference")]
+use wasmtime_wasi_nn::{backend, witx::WasiNnCtx, Backend as WasiNnBackend, InMemoryRegistry};
 
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
@@ -119,6 +121,8 @@ struct HopLimit(u32);
 
 struct LegacyHostState {
     wasi: WasiP1Ctx,
+    #[cfg(feature = "ai-inference")]
+    wasi_nn: WasiNnCtx,
     limits: GuestResourceLimiter,
 }
 
@@ -761,6 +765,13 @@ fn execute_guest(
     route: &IntegrityRoute,
     execution: GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
+    #[cfg(not(feature = "ai-inference"))]
+    if requires_ai_inference_feature(function_name) {
+        return Err(ExecutionError::Internal(format!(
+            "guest `{function_name}` requires `core-host` to be built with `--features ai-inference`"
+        )));
+    }
+
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
 
@@ -1153,7 +1164,17 @@ fn build_linker(
     p1::add_to_linker_sync(&mut linker, |state: &mut LegacyHostState| &mut state.wasi).map_err(
         |error| guest_execution_error(error, "failed to add WASI preview1 functions to linker"),
     )?;
+    #[cfg(feature = "ai-inference")]
+    wasmtime_wasi_nn::witx::add_to_linker(&mut linker, |state: &mut LegacyHostState| {
+        &mut state.wasi_nn
+    })
+    .map_err(|error| guest_execution_error(error, "failed to add WASI-NN functions to linker"))?;
     Ok(linker)
+}
+
+#[cfg_attr(feature = "ai-inference", allow(dead_code))]
+fn requires_ai_inference_feature(function_name: &str) -> bool {
+    function_name == "guest-ai"
 }
 
 fn resolve_function_name(path: &str) -> Option<String> {
@@ -1746,9 +1767,18 @@ impl LegacyHostState {
     fn new(wasi: WasiP1Ctx, max_memory_bytes: usize) -> Self {
         Self {
             wasi,
+            #[cfg(feature = "ai-inference")]
+            wasi_nn: build_wasi_nn_ctx(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
         }
     }
+}
+
+#[cfg(feature = "ai-inference")]
+fn build_wasi_nn_ctx() -> WasiNnCtx {
+    let registry = InMemoryRegistry::new();
+    let backends = [WasiNnBackend::from(backend::onnx::OnnxBackend::default())];
+    WasiNnCtx::new(backends, registry.into())
 }
 
 impl SecretsVault {
@@ -3190,6 +3220,12 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|path| path.ends_with("guest-modules/guest_csharp.wasm")));
+    }
+
+    #[test]
+    fn guest_ai_is_gated_behind_ai_inference_feature() {
+        assert!(requires_ai_inference_feature("guest-ai"));
+        assert!(!requires_ai_inference_feature("guest-example"));
     }
 
     #[test]

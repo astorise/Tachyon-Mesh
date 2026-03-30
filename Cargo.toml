@@ -2,6 +2,7 @@
 members = [
     "core-host",
     "faas-sdk",
+    "guest-ai",
     "guest-call-legacy",
     "guest-example",
     "guest-loop",

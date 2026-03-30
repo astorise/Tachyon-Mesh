@@ -104,6 +104,31 @@ $env:TACHYON_MOCK_K8S_URL="http://127.0.0.1:18080"
 cargo run -p core-host --release
 ```
 
+### 6. Optional WASI-NN Inference Guest
+Build the legacy `guest-ai` module when you want ONNX inference through WASI-NN:
+```bash
+cargo build -p guest-ai --target wasm32-wasip1 --release
+```
+
+Seal the AI route and mount a read-only model directory into the guest. The guest expects ONNX files under `/models` and defaults to `/models/model.onnx`:
+```bash
+cargo run -p tachyon-cli -- generate --route /api/guest-ai --volume /api/guest-ai=/absolute/path/to/models:/models:ro --memory 64
+```
+
+Run the host with the optional feature so it exposes the `wasi_ephemeral_nn` imports:
+```bash
+cargo run -p core-host --features ai-inference --release
+```
+
+Send a JSON request with the input tensor shape, input values, and an output buffer size:
+```bash
+curl --request POST http://127.0.0.1:8080/api/guest-ai \
+  --header "content-type: application/json" \
+  --data "{\"model\":\"model.onnx\",\"shape\":[1,4],\"values\":[1.0,2.0,3.0,4.0],\"output_len\":4}"
+```
+
+`ai-inference` is intentionally optional because the host machine must provide ONNX Runtime dynamic libraries for the selected execution provider.
+
 ## 🗺️ Roadmap
 
 - [ ] **Phase 1:** Core Wasmtime Orchestrator & Axum HTTP Routing (In-memory pipes).
