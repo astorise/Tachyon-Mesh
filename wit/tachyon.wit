@@ -31,6 +31,14 @@ interface telemetry-reader {
     get-metrics: func() -> metrics-snapshot;
 }
 
+interface scaling-metrics {
+    get-pending-queue-size: func(route-path: string) -> u32;
+}
+
+interface outbound-http {
+    send-request: func(method: string, url: string, body: list<u8>) -> result<u16, string>;
+}
+
 interface secrets-vault {
     enum error {
         not-found,
@@ -48,5 +56,12 @@ world faas-guest {
 
 world system-faas-guest {
     import telemetry-reader;
+    import scaling-metrics;
     export handler;
+}
+
+world background-system-faas {
+    import scaling-metrics;
+    import outbound-http;
+    export on-tick: func();
 }

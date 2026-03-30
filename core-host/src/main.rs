@@ -19,11 +19,14 @@ use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Once},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Once,
+    },
     time::{Duration, Instant},
 };
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
@@ -54,6 +57,13 @@ mod system_component_bindings {
     });
 }
 
+mod background_component_bindings {
+    wasmtime::component::bindgen!({
+        path: "../wit",
+        world: "background-system-faas",
+    });
+}
+
 #[cfg(test)]
 const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
 #[cfg(test)]
@@ -75,6 +85,9 @@ const DEFAULT_HOP_LIMIT: u32 = 10;
 const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
+const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
+const KUBERNETES_SERVICE_BASE_URL: &str = "https://kubernetes.default.svc";
+const MOCK_K8S_URL_ENV: &str = "TACHYON_MOCK_K8S_URL";
 #[cfg(not(test))]
 const ROUTE_CONCURRENCY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -95,7 +108,7 @@ fn default_max_concurrency() -> u32 {
 struct AppState {
     engine: Engine,
     config: IntegrityConfig,
-    concurrency_limits: Arc<HashMap<String, Arc<Semaphore>>>,
+    concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     http_client: Client,
     secrets_vault: SecretsVault,
     telemetry: TelemetryHandle,
@@ -115,6 +128,8 @@ struct ComponentHostState {
     limits: GuestResourceLimiter,
     secrets: SecretAccess,
     telemetry: TelemetryHandle,
+    concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    outbound_http_client: reqwest::blocking::Client,
 }
 
 #[derive(Clone)]
@@ -128,6 +143,14 @@ struct GuestExecutionContext {
     runtime_telemetry: TelemetryHandle,
     secret_access: SecretAccess,
     telemetry: Option<GuestTelemetryContext>,
+    concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+}
+
+struct BackgroundTickRunner {
+    function_name: String,
+    route_path: String,
+    store: Store<ComponentHostState>,
+    bindings: background_component_bindings::BackgroundSystemFaas,
 }
 
 #[derive(Clone, Default)]
@@ -181,6 +204,12 @@ enum ResourceLimitKind {
     Memory,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoutePermitError {
+    Closed,
+    TimedOut,
+}
+
 #[cfg_attr(not(feature = "secrets-vault"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SecretAccessErrorKind {
@@ -199,6 +228,11 @@ struct ResourceLimitTrap {
 struct GuestModuleNotFound {
     function_name: String,
     candidate_paths: String,
+}
+
+struct RouteExecutionControl {
+    semaphore: Arc<Semaphore>,
+    pending_waiters: AtomicUsize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,14 +286,16 @@ async fn run() -> Result<()> {
     let engine = build_engine(&config)?;
     let concurrency_limits = build_concurrency_limits(&config);
 
-    let app = build_app(AppState {
+    let state = AppState {
         engine,
         config: config.clone(),
         concurrency_limits,
         http_client: Client::new(),
         secrets_vault: SecretsVault::load(),
         telemetry,
-    });
+    };
+    start_background_tick_workers(&state);
+    let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(&config.host_address)
         .await
@@ -276,6 +312,104 @@ async fn run() -> Result<()> {
     )
     .await
     .context("axum server exited unexpectedly")
+}
+
+fn start_background_tick_workers(state: &AppState) {
+    let mut started_workers = 0_u32;
+
+    for route in &state.config.routes {
+        if route.role != RouteRole::System {
+            continue;
+        }
+
+        let Some(function_name) = resolve_function_name(&route.path) else {
+            continue;
+        };
+
+        if resolve_guest_module_path(&function_name).is_err() {
+            tracing::warn!(
+                route = %route.path,
+                function = function_name,
+                "sealed system route is missing its guest artifact"
+            );
+            continue;
+        }
+
+        if BackgroundTickRunner::new(
+            &state.engine,
+            &state.config,
+            &function_name,
+            &route.path,
+            state.telemetry.clone(),
+            Arc::clone(&state.concurrency_limits),
+        )
+        .is_err()
+        {
+            continue;
+        }
+
+        let engine = state.engine.clone();
+        let config = state.config.clone();
+        let telemetry = state.telemetry.clone();
+        let concurrency_limits = Arc::clone(&state.concurrency_limits);
+        let route_path = route.path.clone();
+        let function_name = function_name.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            run_background_tick_loop(
+                engine,
+                config,
+                telemetry,
+                concurrency_limits,
+                route_path,
+                function_name,
+            )
+        });
+        started_workers = started_workers.saturating_add(1);
+    }
+
+    if started_workers > 0 {
+        tracing::info!(
+            workers = started_workers,
+            "started autoscaling background workers"
+        );
+    }
+}
+
+fn run_background_tick_loop(
+    engine: Engine,
+    config: IntegrityConfig,
+    telemetry: TelemetryHandle,
+    concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    route_path: String,
+    function_name: String,
+) {
+    let mut runner = match BackgroundTickRunner::new(
+        &engine,
+        &config,
+        &function_name,
+        &route_path,
+        telemetry,
+        concurrency_limits,
+    ) {
+        Ok(runner) => runner,
+        Err(error) => {
+            error.log_if_needed(&function_name);
+            return;
+        }
+    };
+
+    loop {
+        std::thread::sleep(AUTOSCALING_TICK_INTERVAL);
+        tracing::info!(
+            route = %runner.route_path,
+            function = %runner.function_name,
+            "invoking autoscaling background tick"
+        );
+        if let Err(error) = runner.tick() {
+            error.log_if_needed(&runner.function_name);
+        }
+    }
 }
 
 fn build_app(state: AppState) -> Router {
@@ -347,17 +481,11 @@ async fn faas_handler(
                         format!("route `{normalized_path}` is missing a concurrency limiter"),
                     )
                         .into_response(),
-                    Some(semaphore) => {
-                        match tokio::time::timeout(
-                            ROUTE_CONCURRENCY_WAIT_TIMEOUT,
-                            semaphore.acquire_owned(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(permit)) => {
-                                let _permit = permit;
+                    Some(semaphore) => match acquire_route_permit(semaphore).await {
+                        Ok(permit) => {
+                            let _permit = permit;
 
-                                match resolve_function_name(&normalized_path) {
+                            match resolve_function_name(&normalized_path) {
                                     Some(function_name) => {
                                         let engine = state.engine.clone();
                                         let config = state.config.clone();
@@ -385,6 +513,9 @@ async fn faas_handler(
                                                     runtime_telemetry,
                                                     secret_access,
                                                     telemetry: Some(telemetry_context),
+                                                    concurrency_limits: Arc::clone(
+                                                        &state.concurrency_limits,
+                                                    ),
                                                 },
                                             )
                                         })
@@ -439,19 +570,18 @@ async fn faas_handler(
                                     )
                                         .into_response(),
                                 }
-                            }
-                            Ok(Err(_)) => (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                format!("route `{normalized_path}` is currently unavailable"),
-                            )
-                                .into_response(),
-                            Err(_) => (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                format!("route `{normalized_path}` is saturated"),
-                            )
-                                .into_response(),
                         }
-                    }
+                        Err(RoutePermitError::Closed) => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("route `{normalized_path}` is currently unavailable"),
+                        )
+                            .into_response(),
+                        Err(RoutePermitError::TimedOut) => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("route `{normalized_path}` is saturated"),
+                        )
+                            .into_response(),
+                    },
                 }
             }
         }
@@ -467,6 +597,30 @@ async fn faas_handler(
     );
 
     response
+}
+
+async fn acquire_route_permit(
+    control: Arc<RouteExecutionControl>,
+) -> std::result::Result<OwnedSemaphorePermit, RoutePermitError> {
+    match Arc::clone(&control.semaphore).try_acquire_owned() {
+        Ok(permit) => Ok(permit),
+        Err(TryAcquireError::Closed) => Err(RoutePermitError::Closed),
+        Err(TryAcquireError::NoPermits) => {
+            control.pending_waiters.fetch_add(1, Ordering::SeqCst);
+            let result = tokio::time::timeout(
+                ROUTE_CONCURRENCY_WAIT_TIMEOUT,
+                Arc::clone(&control.semaphore).acquire_owned(),
+            )
+            .await;
+            control.pending_waiters.fetch_sub(1, Ordering::SeqCst);
+
+            match result {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(_)) => Err(RoutePermitError::Closed),
+                Err(_) => Err(RoutePermitError::TimedOut),
+            }
+        }
+    }
 }
 
 async fn resolve_mesh_response(
@@ -664,6 +818,7 @@ fn execute_component_guest(
             execution.config.guest_memory_limit_bytes,
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
+            Arc::clone(&execution.concurrency_limits),
         ),
     );
     store.limiter(|state| &mut state.limits);
@@ -731,6 +886,16 @@ fn execute_system_component_guest(
             "failed to add telemetry reader functions to system component linker",
         )
     })?;
+    system_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add scaling metrics functions to system component linker",
+        )
+    })?;
 
     let mut store = Store::new(
         engine,
@@ -738,6 +903,7 @@ fn execute_system_component_guest(
             execution.config.guest_memory_limit_bytes,
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
+            Arc::clone(&execution.concurrency_limits),
         ),
     );
     store.limiter(|state| &mut state.limits);
@@ -780,6 +946,99 @@ fn execute_system_component_guest(
         status,
         body: Bytes::from(response.body),
     }))
+}
+
+impl BackgroundTickRunner {
+    fn new(
+        engine: &Engine,
+        config: &IntegrityConfig,
+        function_name: &str,
+        route_path: &str,
+        telemetry: TelemetryHandle,
+        concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    ) -> std::result::Result<Self, ExecutionError> {
+        let module_path = resolve_guest_module_path(function_name)
+            .map_err(ExecutionError::GuestModuleNotFound)?;
+        let component = Component::from_file(engine, &module_path).map_err(|error| {
+            guest_execution_error(
+                error,
+                format!(
+                    "failed to load background system component from {}",
+                    module_path.display()
+                ),
+            )
+        })?;
+
+        let mut linker = ComponentLinker::new(engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to add WASI preview2 functions to background component linker",
+            )
+        })?;
+        background_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(&mut linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to add scaling metrics functions to background component linker",
+            )
+        })?;
+        background_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(&mut linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to add outbound HTTP functions to background component linker",
+            )
+        })?;
+
+        let mut store = Store::new(
+            engine,
+            ComponentHostState::new(
+                config.guest_memory_limit_bytes,
+                telemetry,
+                SecretAccess::default(),
+                concurrency_limits,
+            ),
+        );
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(config.guest_fuel_budget)
+            .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
+
+        let bindings = background_component_bindings::BackgroundSystemFaas::instantiate(
+            &mut store, &component, &linker,
+        )
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                format!(
+                    "failed to instantiate background system component from {}",
+                    module_path.display()
+                ),
+            )
+        })?;
+
+        Ok(Self {
+            function_name: function_name.to_owned(),
+            route_path: route_path.to_owned(),
+            store,
+            bindings,
+        })
+    }
+
+    fn tick(&mut self) -> std::result::Result<(), ExecutionError> {
+        self.bindings
+            .call_on_tick(&mut self.store)
+            .map_err(|error| {
+                guest_execution_error(error, "background system guest `on-tick` trapped")
+            })
+    }
 }
 
 fn execute_legacy_guest(
@@ -1048,7 +1307,9 @@ fn build_pooling_config(config: &IntegrityConfig) -> Result<PoolingAllocationCon
     Ok(pooling)
 }
 
-fn build_concurrency_limits(config: &IntegrityConfig) -> Arc<HashMap<String, Arc<Semaphore>>> {
+fn build_concurrency_limits(
+    config: &IntegrityConfig,
+) -> Arc<HashMap<String, Arc<RouteExecutionControl>>> {
     Arc::new(
         config
             .routes
@@ -1056,10 +1317,7 @@ fn build_concurrency_limits(config: &IntegrityConfig) -> Arc<HashMap<String, Arc
             .map(|route| {
                 (
                     route.path.clone(),
-                    Arc::new(Semaphore::new(
-                        usize::try_from(route.max_concurrency)
-                            .expect("route max_concurrency should fit in usize"),
-                    )),
+                    Arc::new(RouteExecutionControl::new(route.max_concurrency)),
                 )
             })
             .collect(),
@@ -1084,6 +1342,24 @@ fn total_min_instances(routes: &[IntegrityRoute]) -> Result<u32> {
             .sum::<u64>(),
     )
     .context("embedded sealed configuration declares more warm instances than Wasmtime can track")
+}
+
+impl RouteExecutionControl {
+    fn new(max_concurrency: u32) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(
+                usize::try_from(max_concurrency)
+                    .expect("route max_concurrency should fit in usize"),
+            )),
+            pending_waiters: AtomicUsize::new(0),
+        }
+    }
+
+    fn pending_queue_size(&self) -> u32 {
+        self.pending_waiters
+            .load(Ordering::Relaxed)
+            .min(u32::MAX as usize) as u32
+    }
 }
 
 fn init_host_tracing() {
@@ -1404,14 +1680,28 @@ impl SecretAccess {
 }
 
 impl ComponentHostState {
-    fn new(max_memory_bytes: usize, telemetry: TelemetryHandle, secrets: SecretAccess) -> Self {
+    fn new(
+        max_memory_bytes: usize,
+        telemetry: TelemetryHandle,
+        secrets: SecretAccess,
+        concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    ) -> Self {
         Self {
             ctx: build_component_wasi_ctx(),
             table: ResourceTable::new(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
             secrets,
             telemetry,
+            concurrency_limits,
+            outbound_http_client: reqwest::blocking::Client::new(),
         }
+    }
+
+    fn pending_queue_size(&self, route_path: &str) -> u32 {
+        self.concurrency_limits
+            .get(&normalize_route_path(route_path))
+            .map(|control| control.pending_queue_size())
+            .unwrap_or_default()
     }
 }
 
@@ -1481,6 +1771,64 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             total_wasm_duration_us,
             total_host_overhead_us,
         }
+    }
+}
+
+impl system_component_bindings::tachyon::mesh::scaling_metrics::Host for ComponentHostState {
+    fn get_pending_queue_size(&mut self, route_path: String) -> u32 {
+        self.pending_queue_size(&route_path)
+    }
+}
+
+impl background_component_bindings::tachyon::mesh::scaling_metrics::Host for ComponentHostState {
+    fn get_pending_queue_size(&mut self, route_path: String) -> u32 {
+        self.pending_queue_size(&route_path)
+    }
+}
+
+impl background_component_bindings::tachyon::mesh::outbound_http::Host for ComponentHostState {
+    fn send_request(
+        &mut self,
+        method: String,
+        url: String,
+        body: Vec<u8>,
+    ) -> std::result::Result<u16, String> {
+        let method = reqwest::Method::from_bytes(method.trim().as_bytes())
+            .map_err(|error| format!("invalid outbound HTTP method `{method}`: {error}"))?;
+        let url = rewrite_outbound_http_url(&url);
+
+        tracing::info!(
+            method = %method,
+            url = %url,
+            bytes = body.len(),
+            "autoscaling guest sending outbound HTTP request"
+        );
+
+        let response = self
+            .outbound_http_client
+            .request(method, &url)
+            .header("content-type", "application/merge-patch+json")
+            .body(body)
+            .send()
+            .map_err(|error| format!("failed to send outbound HTTP request to `{url}`: {error}"))?;
+
+        Ok(response.status().as_u16())
+    }
+}
+
+fn rewrite_outbound_http_url(url: &str) -> String {
+    let Some(mock_base_url) = std::env::var(MOCK_K8S_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return url.to_owned();
+    };
+
+    if let Some(suffix) = url.strip_prefix(KUBERNETES_SERVICE_BASE_URL) {
+        format!("{mock_base_url}{suffix}")
+    } else {
+        url.to_owned()
     }
 }
 
@@ -1667,6 +2015,25 @@ mod tests {
         build_engine(config).expect("engine should be created")
     }
 
+    fn autoscaling_test_config(include_background_route: bool) -> IntegrityConfig {
+        let mut routes = vec![
+            IntegrityRoute::user("/api/guest-call-legacy"),
+            IntegrityRoute::system("/metrics/scaling"),
+        ];
+        if include_background_route {
+            routes.push(IntegrityRoute::system("/system/k8s-scaler"));
+        }
+
+        IntegrityConfig {
+            host_address: DEFAULT_HOST_ADDRESS.to_owned(),
+            max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
+            guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
+            guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
+            resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            routes,
+        }
+    }
+
     fn build_test_state(config: IntegrityConfig, telemetry: TelemetryHandle) -> AppState {
         let engine = build_test_engine(&config);
         let concurrency_limits = build_concurrency_limits(&config);
@@ -1753,6 +2120,7 @@ mod tests {
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 telemetry: None,
+                concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
             },
         )
         .expect("guest execution should succeed");
@@ -1786,6 +2154,7 @@ mod tests {
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
                 telemetry: None,
+                concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
             },
         )
         .expect("legacy guest execution should succeed");
@@ -1916,7 +2285,7 @@ mod tests {
             config,
             concurrency_limits: Arc::new(HashMap::from([(
                 DEFAULT_ROUTE.to_owned(),
-                Arc::new(Semaphore::new(0)),
+                Arc::new(RouteExecutionControl::new(0)),
             )])),
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
@@ -1962,6 +2331,7 @@ mod tests {
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
                 telemetry: None,
+                concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
             },
         )
         .expect_err("privileged metrics guest should fail as a user route");
@@ -2004,6 +2374,115 @@ mod tests {
 
         assert!(text.contains("tachyon_requests_total"));
         assert!(text.contains("tachyon_active_requests"));
+    }
+
+    #[tokio::test]
+    async fn router_returns_scaling_metrics_for_privileged_route() {
+        let config = autoscaling_test_config(false);
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        state
+            .concurrency_limits
+            .get("/api/guest-call-legacy")
+            .expect("legacy route should have a limiter")
+            .pending_waiters
+            .store(7, Ordering::SeqCst);
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::get("/metrics/scaling")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+
+        assert!(text.contains("tachyon_pending_requests"));
+        assert!(text.contains("route=\"/api/guest-call-legacy\""));
+        assert!(text.contains(" 7"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_scaler_tick_respects_cooldown() {
+        use axum::{extract::State, routing::patch, Router};
+        use std::sync::Mutex;
+
+        async fn capture_patch(
+            State(captured): State<Arc<Mutex<Vec<String>>>>,
+            body: Bytes,
+        ) -> StatusCode {
+            captured
+                .lock()
+                .expect("captured requests should not be poisoned")
+                .push(String::from_utf8_lossy(&body).into_owned());
+            StatusCode::OK
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mock_app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/default/deployments/legacy-app",
+                patch(capture_patch),
+            )
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should expose a local address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, mock_app)
+                .await
+                .expect("mock server should stay up");
+        });
+
+        std::env::set_var(MOCK_K8S_URL_ENV, format!("http://{address}"));
+
+        let config = autoscaling_test_config(true);
+        let concurrency_limits = build_concurrency_limits(&config);
+        concurrency_limits
+            .get("/api/guest-call-legacy")
+            .expect("legacy route should have a limiter")
+            .pending_waiters
+            .store(75, Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || {
+            let engine = build_test_engine(&config);
+            let mut runner = BackgroundTickRunner::new(
+                &engine,
+                &config,
+                "k8s-scaler",
+                "/system/k8s-scaler",
+                telemetry::init_test_telemetry(),
+                concurrency_limits,
+            )
+            .expect("background scaler should instantiate");
+
+            for _ in 0..7 {
+                runner.tick().expect("background tick should succeed");
+            }
+        })
+        .await
+        .expect("background runner task should complete");
+
+        std::env::remove_var(MOCK_K8S_URL_ENV);
+        server.abort();
+
+        let requests = captured
+            .lock()
+            .expect("captured requests should not be poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|body| body.contains("\"replicas\":2")));
     }
 
     #[tokio::test]

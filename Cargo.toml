@@ -7,6 +7,8 @@ members = [
     "guest-loop",
     "guest-malicious",
     "legacy-mock",
+    "system-faas-k8s-scaler",
+    "system-faas-keda",
     "system-faas-prom",
     "tachyon-cli",
 ]

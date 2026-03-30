@@ -58,6 +58,8 @@ jobs:
       - name: Build guest artifacts
         run: |
           cargo build -p guest-example --target wasm32-wasip2 --release
+          cargo build -p system-faas-keda --target wasm32-wasip2 --release
+          cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
           cargo build -p system-faas-prom --target wasm32-wasip2 --release
           cargo build -p guest-call-legacy --target wasm32-wasip1 --release
           cargo build -p guest-loop --target wasm32-wasip1 --release
@@ -81,7 +83,9 @@ jobs:
             target/release/core-host
             target/release/tachyon-cli
             target/wasm32-wasip2/release/guest_example.wasm
+            target/wasm32-wasip2/release/k8s_scaler.wasm
             target/wasm32-wasip2/release/metrics.wasm
+            target/wasm32-wasip2/release/scaling.wasm
             target/wasm32-wasip1/release/guest_loop.wasm
 
   publish-docker-images:

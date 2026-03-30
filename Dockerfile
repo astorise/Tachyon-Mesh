@@ -28,6 +28,8 @@ WORKDIR /workspace
 COPY . .
 
 RUN cargo build -p guest-example --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
 RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p guest-loop --target wasm32-wasip1 --release
@@ -137,7 +139,9 @@ WORKDIR /app
 
 COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/k8s_scaler.wasm /app/guest-modules/k8s_scaler.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /app/guest-modules/metrics.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_loop.wasm /app/guest-modules/guest_loop.wasm
 COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-modules/guest_go.wasm

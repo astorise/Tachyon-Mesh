@@ -86,6 +86,24 @@ The host validates the sealed `integrity.lock` manifest and binds to your local 
 cargo run -p core-host --release
 ```
 
+### 5. Optional Autoscaling System FaaS
+Build the autoscaling guests when you want queue-depth metrics or autonomous legacy scaling:
+```bash
+cargo build -p system-faas-keda --target wasm32-wasip2 --release
+cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
+```
+
+Seal `/metrics/scaling` to expose Prometheus queue depth for `/api/guest-call-legacy`:
+```bash
+cargo run -p tachyon-cli -- generate --route /api/guest-example --route /api/guest-call-legacy --system-route /metrics --system-route /metrics/scaling --memory 64
+```
+
+Seal `/system/k8s-scaler` to enable the five-second background autoscaler. For local validation against a mock API server, point the host at the mock base URL before starting it:
+```bash
+$env:TACHYON_MOCK_K8S_URL="http://127.0.0.1:18080"
+cargo run -p core-host --release
+```
+
 ## 🗺️ Roadmap
 
 - [ ] **Phase 1:** Core Wasmtime Orchestrator & Axum HTTP Routing (In-memory pipes).
