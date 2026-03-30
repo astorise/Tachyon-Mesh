@@ -52,6 +52,13 @@
               "required": false
             },
             {
+              "name": "volume",
+              "description": "Attach a host directory using [/route=]HOST:GUEST[:ro|rw].",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
               "name": "memory",
               "short": "m",
               "description": "Guest memory limit in MiB.",

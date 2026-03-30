@@ -6,6 +6,7 @@ members = [
     "guest-example",
     "guest-loop",
     "guest-malicious",
+    "guest-volume",
     "legacy-mock",
     "system-faas-k8s-scaler",
     "system-faas-keda",

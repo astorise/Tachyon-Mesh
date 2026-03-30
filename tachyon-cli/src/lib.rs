@@ -37,6 +37,16 @@ pub struct SealedRoute {
     pub min_instances: u32,
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<SealedVolume>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct SealedVolume {
+    pub host_path: String,
+    pub guest_path: String,
+    #[serde(default)]
+    pub readonly: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -62,6 +72,7 @@ struct GenerateRequest {
     system_routes: Vec<String>,
     secret_routes: Vec<String>,
     route_scales: Vec<String>,
+    volumes: Vec<String>,
     memory_mib: u32,
 }
 
@@ -133,6 +144,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         system_routes: parse_optional_routes_arg(&subcommand.matches.args, "system-route")?,
         secret_routes: parse_optional_routes_arg(&subcommand.matches.args, "secret-route")?,
         route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
+        volumes: parse_optional_string_args(&subcommand.matches.args, "volume", "volume")?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
     };
 
@@ -157,6 +169,7 @@ fn parse_generate_request_from_args(
     let mut system_routes = Vec::new();
     let mut secret_routes = Vec::new();
     let mut route_scales = Vec::new();
+    let mut volumes = Vec::new();
     let mut memory_mib = None;
 
     while let Some(arg) = args.next() {
@@ -217,6 +230,19 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--volume=") {
+            volumes.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--volume" {
+            let volume = args.next().context(
+                "missing value for `--volume`; expected `--volume /api/guest-volume=/tmp/tachyon_data:/app/data:rw`",
+            )?;
+            volumes.push(volume);
+            continue;
+        }
+
         if arg == "--memory" {
             let value = args
                 .next()
@@ -238,6 +264,7 @@ fn parse_generate_request_from_args(
         system_routes,
         secret_routes,
         route_scales,
+        volumes,
         memory_mib,
     }))
 }
@@ -275,6 +302,7 @@ impl SealedConfig {
             request.system_routes,
             request.secret_routes,
             request.route_scales,
+            request.volumes,
         )?;
         let memory_mib = usize::try_from(request.memory_mib)
             .context("memory limit is too large for this platform")?;
@@ -302,7 +330,7 @@ fn parse_required_routes_arg(
     args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
     name: &str,
 ) -> Result<Vec<String>> {
-    let routes = parse_optional_routes_arg(args, name)?;
+    let routes = parse_optional_string_args(args, name, "route")?;
     if routes.is_empty() {
         bail!("missing required `--{name}` argument");
     }
@@ -314,6 +342,15 @@ fn parse_required_routes_arg(
 fn parse_optional_routes_arg(
     args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
     name: &str,
+) -> Result<Vec<String>> {
+    parse_optional_string_args(args, name, "route")
+}
+
+#[cfg(desktop)]
+fn parse_optional_string_args(
+    args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
+    name: &str,
+    label: &str,
 ) -> Result<Vec<String>> {
     let Some(arg) = args.get(name) else {
         return Ok(Vec::new());
@@ -327,7 +364,7 @@ fn parse_optional_routes_arg(
                 route
                     .as_str()
                     .map(ToOwned::to_owned)
-                    .ok_or_else(|| anyhow!("route values must be strings"))
+                    .ok_or_else(|| anyhow!("{label} values must be strings"))
             })
             .collect(),
         _ => bail!("`--{name}` must be provided as one or more strings"),
@@ -368,6 +405,7 @@ fn normalize_routes(
     system_routes: Vec<String>,
     secret_routes: Vec<String>,
     route_scales: Vec<String>,
+    route_volumes: Vec<String>,
 ) -> Result<Vec<SealedRoute>> {
     if user_routes.is_empty() {
         bail!("at least one `--route` value must be provided");
@@ -394,6 +432,7 @@ fn normalize_routes(
                 allowed_secrets: Vec::new(),
                 min_instances: 0,
                 max_concurrency: default_max_concurrency(),
+                volumes: Vec::new(),
             },
         );
     }
@@ -406,6 +445,7 @@ fn normalize_routes(
             allowed_secrets: Vec::new(),
             min_instances: 0,
             max_concurrency: default_max_concurrency(),
+            volumes: Vec::new(),
         };
 
         if let Some(existing) = normalized.get(&path) {
@@ -454,7 +494,141 @@ fn normalize_routes(
         sealed_route.max_concurrency = scaling.max_concurrency;
     }
 
+    let sealed_route_count = normalized.len();
+    for route_volume in route_volumes {
+        let (path, volume) = parse_route_volume(&route_volume, sealed_route_count)?;
+        let normalized_path = match path {
+            Some(path) => normalize_route(&path)?,
+            None => normalized
+                .keys()
+                .next()
+                .cloned()
+                .context("volume mounts require at least one sealed route")?,
+        };
+        let sealed_route = normalized.get_mut(&normalized_path).ok_or_else(|| {
+            anyhow!("volume route `{normalized_path}` must target a declared sealed route")
+        })?;
+        insert_route_volume(sealed_route, volume)?;
+    }
+
     Ok(normalized.into_values().collect())
+}
+
+fn parse_route_volume(
+    value: &str,
+    sealed_route_count: usize,
+) -> Result<(Option<String>, SealedVolume)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("volume values cannot be empty");
+    }
+
+    let (route_path, volume_spec) = match trimmed.split_once('=') {
+        Some((path, volume_spec)) => {
+            let path = path.trim();
+            if path.is_empty() {
+                bail!("volume values must include a non-empty route before `=`");
+            }
+            (Some(path.to_owned()), volume_spec.trim())
+        }
+        None => {
+            if sealed_route_count != 1 {
+                bail!(
+                    "volume `{trimmed}` must target a declared sealed route using `/path=HOST:GUEST[:ro|rw]` when more than one route is configured"
+                );
+            }
+            (None, trimmed)
+        }
+    };
+
+    Ok((route_path, parse_volume_spec(volume_spec)?))
+}
+
+fn parse_volume_spec(value: &str) -> Result<SealedVolume> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("volume definitions cannot be empty");
+    }
+
+    let (mapping, readonly) = match trimmed.rsplit_once(':') {
+        Some((mapping, mode))
+            if matches!(mode.trim().to_ascii_lowercase().as_str(), "ro" | "rw") =>
+        {
+            (mapping.trim(), mode.trim().eq_ignore_ascii_case("ro"))
+        }
+        _ => (trimmed, false),
+    };
+
+    let separator = mapping.rfind(":/").context(
+        "volumes must use the `HOST:GUEST[:ro|rw]` syntax, for example `/tmp/tachyon_data:/app/data:rw`",
+    )?;
+    let host_path = mapping[..separator].trim();
+    if host_path.is_empty() {
+        bail!("volume definitions must include a non-empty host path");
+    }
+
+    Ok(SealedVolume {
+        host_path: host_path.to_owned(),
+        guest_path: normalize_guest_volume_path(&mapping[separator + 1..])?,
+        readonly,
+    })
+}
+
+fn normalize_guest_volume_path(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!("volume definitions must include a non-empty guest path");
+    }
+    if !trimmed.starts_with('/') {
+        bail!("guest volume paths must be absolute, for example `/app/data`");
+    }
+    if trimmed.contains('\\') {
+        bail!("guest volume paths must use `/` separators");
+    }
+
+    let normalized = trimmed.trim_end_matches('/');
+    let normalized = if normalized.is_empty() {
+        "/".to_owned()
+    } else {
+        normalized.to_owned()
+    };
+
+    if normalized == "/" {
+        bail!("guest volume path `/` is not allowed");
+    }
+    if normalized
+        .split('/')
+        .skip(1)
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        bail!("guest volume paths cannot contain empty, `.` or `..` segments");
+    }
+
+    Ok(normalized)
+}
+
+fn insert_route_volume(route: &mut SealedRoute, volume: SealedVolume) -> Result<()> {
+    if let Some(existing) = route
+        .volumes
+        .iter()
+        .find(|existing| existing.guest_path == volume.guest_path)
+    {
+        if existing == &volume {
+            return Ok(());
+        }
+
+        bail!(
+            "route `{}` defines guest volume path `{}` more than once",
+            route.path,
+            volume.guest_path
+        );
+    }
+
+    route.volumes.push(volume);
+    route
+        .volumes
+        .sort_by(|left, right| left.guest_path.cmp(&right.guest_path));
+    Ok(())
 }
 
 fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
@@ -587,6 +761,7 @@ mod tests {
             vec!["/metrics/".to_owned()],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .expect("routes should normalize");
 
@@ -599,6 +774,7 @@ mod tests {
                     allowed_secrets: Vec::new(),
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+                    volumes: Vec::new(),
                 },
                 SealedRoute {
                     path: "/api/guest-malicious".to_owned(),
@@ -606,6 +782,7 @@ mod tests {
                     allowed_secrets: Vec::new(),
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+                    volumes: Vec::new(),
                 },
                 SealedRoute {
                     path: "/metrics".to_owned(),
@@ -613,6 +790,7 @@ mod tests {
                     allowed_secrets: Vec::new(),
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+                    volumes: Vec::new(),
                 }
             ]
         );
@@ -625,6 +803,7 @@ mod tests {
             system_routes: vec!["/metrics".to_owned()],
             secret_routes: vec!["/api/guest-example=DB_PASS".to_owned()],
             route_scales: vec!["/api/guest-example=2:16".to_owned()],
+            volumes: vec!["/api/guest-example=/tmp/tachyon_data:/app/data:ro".to_owned()],
             memory_mib: 64,
         })
         .expect("request should produce a sealed config");
@@ -640,6 +819,11 @@ mod tests {
                     allowed_secrets: vec!["DB_PASS".to_owned()],
                     min_instances: 2,
                     max_concurrency: 16,
+                    volumes: vec![SealedVolume {
+                        host_path: "/tmp/tachyon_data".to_owned(),
+                        guest_path: "/app/data".to_owned(),
+                        readonly: true,
+                    }],
                 },
                 SealedRoute {
                     path: "/metrics".to_owned(),
@@ -647,6 +831,7 @@ mod tests {
                     allowed_secrets: Vec::new(),
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+                    volumes: Vec::new(),
                 }
             ]
         );
@@ -659,6 +844,8 @@ mod tests {
         assert!(payload.contains("\"allowed_secrets\":[\"DB_PASS\"]"));
         assert!(payload.contains("\"min_instances\":2"));
         assert!(payload.contains("\"max_concurrency\":16"));
+        assert!(payload.contains("\"guest_path\":\"/app/data\""));
+        assert!(payload.contains("\"readonly\":true"));
     }
 
     #[test]
@@ -675,6 +862,8 @@ mod tests {
                 "/api/guest-example=DB_PASS,API_KEY",
                 "--route-scale",
                 "/api/guest-example=1:8",
+                "--volume",
+                "/api/guest-example=C:\\\\tachyon_data:/app/data:rw",
                 "--memory",
                 "64",
             ]
@@ -694,6 +883,7 @@ mod tests {
                 system_routes: vec!["/metrics".to_owned()],
                 secret_routes: vec!["/api/guest-example=DB_PASS,API_KEY".to_owned()],
                 route_scales: vec!["/api/guest-example=1:8".to_owned()],
+                volumes: vec!["/api/guest-example=C:\\\\tachyon_data:/app/data:rw".to_owned()],
                 memory_mib: 64,
             }
         );
@@ -706,6 +896,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["/api/guest-example=3:7".to_owned()],
+            Vec::new(),
         )
         .expect("route scaling should normalize");
 
@@ -717,6 +908,7 @@ mod tests {
                 allowed_secrets: Vec::new(),
                 min_instances: 3,
                 max_concurrency: 7,
+                volumes: Vec::new(),
             }]
         );
     }
@@ -726,6 +918,7 @@ mod tests {
         let error = normalize_routes(
             vec!["/metrics".to_owned()],
             vec!["/metrics/".to_owned()],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )
@@ -743,6 +936,7 @@ mod tests {
             Vec::new(),
             vec!["/api/missing=DB_PASS".to_owned()],
             Vec::new(),
+            Vec::new(),
         )
         .expect_err("secret route must target a declared user route");
 
@@ -758,6 +952,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["/api/missing=1:8".to_owned()],
+            Vec::new(),
         )
         .expect_err("route scaling must target a declared route");
 
@@ -773,6 +968,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["/api/guest-example=1:0".to_owned()],
+            Vec::new(),
         )
         .expect_err("zero max_concurrency should fail");
 
@@ -787,5 +983,45 @@ mod tests {
             .expect("empty arguments should be accepted");
 
         assert!(request.is_none());
+    }
+
+    #[test]
+    fn normalize_routes_assigns_implicit_volume_to_the_only_route() {
+        let routes = normalize_routes(
+            vec!["/api/guest-volume".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["C:\\\\tachyon_data:/app/data:rw".to_owned()],
+        )
+        .expect("single route volume should normalize");
+
+        assert_eq!(
+            routes[0].volumes,
+            vec![SealedVolume {
+                host_path: "C:\\\\tachyon_data".to_owned(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_routes_rejects_implicit_volume_when_multiple_routes_exist() {
+        let error = normalize_routes(
+            vec![
+                "/api/guest-example".to_owned(),
+                "/api/guest-volume".to_owned(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["/tmp/tachyon_data:/app/data:rw".to_owned()],
+        )
+        .expect_err("implicit volume should be rejected when more than one route exists");
+
+        assert!(error
+            .to_string()
+            .contains("must target a declared sealed route"));
     }
 }

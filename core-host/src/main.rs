@@ -252,6 +252,16 @@ struct IntegrityRoute {
     min_instances: u32,
     #[serde(default = "default_max_concurrency")]
     max_concurrency: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    volumes: Vec<IntegrityVolume>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct IntegrityVolume {
+    host_path: String,
+    guest_path: String,
+    #[serde(default)]
+    readonly: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -338,8 +348,8 @@ fn start_background_tick_workers(state: &AppState) {
         if BackgroundTickRunner::new(
             &state.engine,
             &state.config,
+            route,
             &function_name,
-            &route.path,
             state.telemetry.clone(),
             Arc::clone(&state.concurrency_limits),
         )
@@ -352,7 +362,7 @@ fn start_background_tick_workers(state: &AppState) {
         let config = state.config.clone();
         let telemetry = state.telemetry.clone();
         let concurrency_limits = Arc::clone(&state.concurrency_limits);
-        let route_path = route.path.clone();
+        let route = route.clone();
         let function_name = function_name.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -361,7 +371,7 @@ fn start_background_tick_workers(state: &AppState) {
                 config,
                 telemetry,
                 concurrency_limits,
-                route_path,
+                route,
                 function_name,
             )
         });
@@ -381,14 +391,14 @@ fn run_background_tick_loop(
     config: IntegrityConfig,
     telemetry: TelemetryHandle,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
-    route_path: String,
+    route: IntegrityRoute,
     function_name: String,
 ) {
     let mut runner = match BackgroundTickRunner::new(
         &engine,
         &config,
+        &route,
         &function_name,
-        &route_path,
         telemetry,
         concurrency_limits,
     ) {
@@ -496,6 +506,7 @@ async fn faas_handler(
                                         let runtime_telemetry = state.telemetry.clone();
                                         let secret_access =
                                             SecretAccess::from_route(&route, &state.secrets_vault);
+                                        let task_route = route.clone();
                                         let task_function_name = function_name.clone();
                                         let guest_request = GuestRequest {
                                             method: method.to_string(),
@@ -507,7 +518,7 @@ async fn faas_handler(
                                                 &engine,
                                                 &task_function_name,
                                                 guest_request,
-                                                route.role,
+                                                &task_route,
                                                 GuestExecutionContext {
                                                     config,
                                                     runtime_telemetry,
@@ -747,20 +758,26 @@ fn execute_guest(
     engine: &Engine,
     function_name: &str,
     request: GuestRequest,
-    role: RouteRole,
+    route: &IntegrityRoute,
     execution: GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
 
     if let Ok(component) = Component::from_file(engine, &module_path) {
-        return match role {
-            RouteRole::User => {
-                execute_component_guest(engine, request, &module_path, &component, &execution)
-            }
+        return match route.role {
+            RouteRole::User => execute_component_guest(
+                engine,
+                request,
+                route,
+                &module_path,
+                &component,
+                &execution,
+            ),
             RouteRole::System => execute_system_component_guest(
                 engine,
                 request,
+                route,
                 &module_path,
                 &component,
                 &execution,
@@ -782,6 +799,7 @@ fn execute_guest(
         engine,
         function_name,
         request.body,
+        route,
         &module_path,
         module,
         &execution,
@@ -791,6 +809,7 @@ fn execute_guest(
 fn execute_component_guest(
     engine: &Engine,
     request: GuestRequest,
+    route: &IntegrityRoute,
     component_path: &Path,
     component: &Component,
     execution: &GuestExecutionContext,
@@ -815,11 +834,12 @@ fn execute_component_guest(
     let mut store = Store::new(
         engine,
         ComponentHostState::new(
+            route,
             execution.config.guest_memory_limit_bytes,
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
             Arc::clone(&execution.concurrency_limits),
-        ),
+        )?,
     );
     store.limiter(|state| &mut state.limits);
     store
@@ -865,6 +885,7 @@ fn execute_component_guest(
 fn execute_system_component_guest(
     engine: &Engine,
     request: GuestRequest,
+    route: &IntegrityRoute,
     component_path: &Path,
     component: &Component,
     execution: &GuestExecutionContext,
@@ -900,11 +921,12 @@ fn execute_system_component_guest(
     let mut store = Store::new(
         engine,
         ComponentHostState::new(
+            route,
             execution.config.guest_memory_limit_bytes,
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
             Arc::clone(&execution.concurrency_limits),
-        ),
+        )?,
     );
     store.limiter(|state| &mut state.limits);
     store
@@ -952,8 +974,8 @@ impl BackgroundTickRunner {
     fn new(
         engine: &Engine,
         config: &IntegrityConfig,
+        route: &IntegrityRoute,
         function_name: &str,
-        route_path: &str,
         telemetry: TelemetryHandle,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     ) -> std::result::Result<Self, ExecutionError> {
@@ -1000,11 +1022,12 @@ impl BackgroundTickRunner {
         let mut store = Store::new(
             engine,
             ComponentHostState::new(
+                route,
                 config.guest_memory_limit_bytes,
                 telemetry,
                 SecretAccess::default(),
                 concurrency_limits,
-            ),
+            )?,
         );
         store.limiter(|state| &mut state.limits);
         store
@@ -1026,7 +1049,7 @@ impl BackgroundTickRunner {
 
         Ok(Self {
             function_name: function_name.to_owned(),
-            route_path: route_path.to_owned(),
+            route_path: route.path.clone(),
             store,
             bindings,
         })
@@ -1045,6 +1068,7 @@ fn execute_legacy_guest(
     engine: &Engine,
     function_name: &str,
     body: Bytes,
+    route: &IntegrityRoute,
     module_path: &Path,
     module: Module,
     execution: &GuestExecutionContext,
@@ -1068,6 +1092,8 @@ fn execute_legacy_guest(
                 )
             })?;
     }
+
+    preopen_route_volumes(&mut wasi, route)?;
 
     let wasi = wasi.build_p1();
     let mut store = Store::new(
@@ -1468,12 +1494,105 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
     }
 
     Ok(IntegrityRoute {
-        path: normalized,
+        path: normalized.clone(),
         role: route.role,
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
+        volumes: normalize_route_volumes(route.volumes, &normalized)?,
     })
+}
+
+fn normalize_route_volumes(
+    volumes: Vec<IntegrityVolume>,
+    route_path: &str,
+) -> Result<Vec<IntegrityVolume>> {
+    let mut normalized = BTreeSet::new();
+    let mut deduped = Vec::new();
+
+    for volume in volumes {
+        let volume = validate_route_volume(volume)?;
+        if !normalized.insert((
+            volume.guest_path.clone(),
+            volume.host_path.clone(),
+            volume.readonly,
+        )) {
+            continue;
+        }
+
+        if deduped
+            .iter()
+            .any(|existing: &IntegrityVolume| existing.guest_path == volume.guest_path)
+        {
+            return Err(anyhow!(
+                "Integrity Validation Failed: route `{route_path}` defines guest volume path `{}` more than once",
+                volume.guest_path
+            ));
+        }
+
+        deduped.push(volume);
+    }
+
+    deduped.sort_by(|left, right| left.guest_path.cmp(&right.guest_path));
+    Ok(deduped)
+}
+
+fn validate_route_volume(volume: IntegrityVolume) -> Result<IntegrityVolume> {
+    let host_path = volume.host_path.trim();
+    if host_path.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route volumes must include a non-empty `host_path`"
+        ));
+    }
+
+    Ok(IntegrityVolume {
+        host_path: host_path.to_owned(),
+        guest_path: normalize_guest_volume_path(&volume.guest_path)?,
+        readonly: volume.readonly,
+    })
+}
+
+fn normalize_guest_volume_path(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route volumes must include a non-empty `guest_path`"
+        ));
+    }
+    if !trimmed.starts_with('/') {
+        return Err(anyhow!(
+            "Integrity Validation Failed: guest volume paths must be absolute, for example `/app/data`"
+        ));
+    }
+    if trimmed.contains('\\') {
+        return Err(anyhow!(
+            "Integrity Validation Failed: guest volume paths must use `/` separators"
+        ));
+    }
+
+    let normalized = trimmed.trim_end_matches('/');
+    let normalized = if normalized.is_empty() {
+        "/".to_owned()
+    } else {
+        normalized.to_owned()
+    };
+
+    if normalized == "/" {
+        return Err(anyhow!(
+            "Integrity Validation Failed: guest volume path `/` is not allowed"
+        ));
+    }
+    if normalized
+        .split('/')
+        .skip(1)
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(anyhow!(
+            "Integrity Validation Failed: guest volume paths cannot contain empty, `.` or `..` segments"
+        ));
+    }
+
+    Ok(normalized)
 }
 
 fn normalize_allowed_secrets(allowed_secrets: Vec<String>) -> Result<Vec<String>> {
@@ -1681,20 +1800,21 @@ impl SecretAccess {
 
 impl ComponentHostState {
     fn new(
+        route: &IntegrityRoute,
         max_memory_bytes: usize,
         telemetry: TelemetryHandle,
         secrets: SecretAccess,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
-    ) -> Self {
-        Self {
-            ctx: build_component_wasi_ctx(),
+    ) -> std::result::Result<Self, ExecutionError> {
+        Ok(Self {
+            ctx: build_component_wasi_ctx(route)?,
             table: ResourceTable::new(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
             secrets,
             telemetry,
             concurrency_limits,
             outbound_http_client: reqwest::blocking::Client::new(),
-        }
+        })
     }
 
     fn pending_queue_size(&self, route_path: &str) -> u32 {
@@ -1705,10 +1825,52 @@ impl ComponentHostState {
     }
 }
 
-fn build_component_wasi_ctx() -> WasiCtx {
+fn build_component_wasi_ctx(
+    route: &IntegrityRoute,
+) -> std::result::Result<WasiCtx, ExecutionError> {
     // Intentionally do not inherit the host environment. Secrets stay in host memory
     // and are only reachable through the typed vault import.
-    WasiCtxBuilder::new().build()
+    let mut wasi = WasiCtxBuilder::new();
+    preopen_route_volumes(&mut wasi, route)?;
+    Ok(wasi.build())
+}
+
+fn preopen_route_volumes(
+    wasi: &mut WasiCtxBuilder,
+    route: &IntegrityRoute,
+) -> std::result::Result<(), ExecutionError> {
+    for volume in &route.volumes {
+        wasi.preopened_dir(
+            &volume.host_path,
+            &volume.guest_path,
+            volume_dir_perms(volume.readonly),
+            volume_file_perms(volume.readonly),
+        )
+        .map_err(|error| {
+            ExecutionError::Internal(format!(
+                "failed to preopen volume `{}` for route `{}` at guest path `{}`: {error}",
+                volume.host_path, route.path, volume.guest_path
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+fn volume_dir_perms(readonly: bool) -> DirPerms {
+    if readonly {
+        DirPerms::READ
+    } else {
+        DirPerms::READ | DirPerms::MUTATE
+    }
+}
+
+fn volume_file_perms(readonly: bool) -> FilePerms {
+    if readonly {
+        FilePerms::READ
+    } else {
+        FilePerms::READ | FilePerms::WRITE
+    }
 }
 
 impl WasiView for ComponentHostState {
@@ -1863,6 +2025,7 @@ impl IntegrityRoute {
             allowed_secrets: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: Vec::new(),
         }
     }
 
@@ -1874,6 +2037,7 @@ impl IntegrityRoute {
             allowed_secrets: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: Vec::new(),
         }
     }
 
@@ -1888,6 +2052,7 @@ impl IntegrityRoute {
                 .collect(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: Vec::new(),
         }
     }
 }
@@ -1994,6 +2159,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use ed25519_dalek::{Signer, SigningKey};
     use http_body_util::BodyExt;
+    use std::{fs, path::PathBuf};
     use tower::util::ServiceExt;
 
     fn expected_secret_status() -> &'static str {
@@ -2046,6 +2212,27 @@ mod tests {
             secrets_vault: SecretsVault::load(),
             telemetry,
         }
+    }
+
+    fn volume_test_route(host_path: &std::path::Path, readonly: bool) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/api/guest-volume".to_owned(),
+            role: RouteRole::User,
+            allowed_secrets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                host_path: host_path.display().to_string(),
+                guest_path: "/app/data".to_owned(),
+                readonly,
+            }],
+        }
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("temporary directory should be created");
+        path
     }
 
     #[test]
@@ -2101,6 +2288,10 @@ mod tests {
     fn execute_guest_returns_component_response_payload() {
         let config = IntegrityConfig::default_sealed();
         let engine = build_test_engine(&config);
+        let route = config
+            .sealed_route("/api/guest-example")
+            .expect("sealed route should exist")
+            .clone();
         let response = execute_guest(
             &engine,
             "guest-example",
@@ -2109,14 +2300,9 @@ mod tests {
                 uri: "/api/guest-example".to_owned(),
                 body: Bytes::from("Hello Lean FaaS!"),
             },
-            RouteRole::User,
+            &route,
             GuestExecutionContext {
-                secret_access: SecretAccess::from_route(
-                    config
-                        .sealed_route("/api/guest-example")
-                        .expect("sealed route should exist"),
-                    &SecretsVault::load(),
-                ),
+                secret_access: SecretAccess::from_route(&route, &SecretsVault::load()),
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 telemetry: None,
@@ -2140,6 +2326,7 @@ mod tests {
     fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
         let config = IntegrityConfig::default_sealed();
         let engine = build_test_engine(&config);
+        let route = IntegrityRoute::user("/api/guest-call-legacy");
         let response = execute_guest(
             &engine,
             "guest-call-legacy",
@@ -2148,7 +2335,7 @@ mod tests {
                 uri: "/api/guest-call-legacy".to_owned(),
                 body: Bytes::new(),
             },
-            RouteRole::User,
+            &route,
             GuestExecutionContext {
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
@@ -2165,6 +2352,78 @@ mod tests {
                 "MESH_FETCH:http://legacy-service:8081/ping\n"
             ))
         );
+    }
+
+    #[test]
+    fn execute_guest_persists_volume_data_for_component_guest() {
+        let volume_dir = unique_test_dir("tachyon-volume-test");
+        let route = volume_test_route(&volume_dir, false);
+        let config = IntegrityConfig {
+            routes: vec![route.clone()],
+            ..IntegrityConfig::default_sealed()
+        };
+        let engine = build_test_engine(&config);
+
+        let save_response = execute_guest(
+            &engine,
+            "guest-volume",
+            GuestRequest {
+                method: "POST".to_owned(),
+                uri: "/api/guest-volume".to_owned(),
+                body: Bytes::from("Hello Stateful World"),
+            },
+            &route,
+            GuestExecutionContext {
+                config: config.clone(),
+                runtime_telemetry: telemetry::init_test_telemetry(),
+                secret_access: SecretAccess::default(),
+                telemetry: None,
+                concurrency_limits: build_concurrency_limits(&config),
+            },
+        )
+        .expect("volume guest should write successfully");
+
+        assert_eq!(
+            save_response,
+            GuestExecutionOutput::Http(GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from("Saved"),
+            })
+        );
+
+        let read_response = execute_guest(
+            &engine,
+            "guest-volume",
+            GuestRequest {
+                method: "GET".to_owned(),
+                uri: "/api/guest-volume".to_owned(),
+                body: Bytes::new(),
+            },
+            &route,
+            GuestExecutionContext {
+                config: config.clone(),
+                runtime_telemetry: telemetry::init_test_telemetry(),
+                secret_access: SecretAccess::default(),
+                telemetry: None,
+                concurrency_limits: build_concurrency_limits(&config),
+            },
+        )
+        .expect("volume guest should read successfully");
+
+        assert_eq!(
+            read_response,
+            GuestExecutionOutput::Http(GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from("Hello Stateful World"),
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(volume_dir.join("state.txt"))
+                .expect("host volume file should exist"),
+            "Hello Stateful World"
+        );
+
+        let _ = fs::remove_dir_all(volume_dir);
     }
 
     #[tokio::test]
@@ -2317,6 +2576,7 @@ mod tests {
     fn system_guest_requires_system_route_role() {
         let config = IntegrityConfig::default_sealed();
         let engine = build_test_engine(&config);
+        let route = IntegrityRoute::user("/metrics");
         let error = execute_guest(
             &engine,
             "metrics",
@@ -2325,7 +2585,7 @@ mod tests {
                 uri: "/metrics".to_owned(),
                 body: Bytes::new(),
             },
-            RouteRole::User,
+            &route,
             GuestExecutionContext {
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
@@ -2461,8 +2721,10 @@ mod tests {
             let mut runner = BackgroundTickRunner::new(
                 &engine,
                 &config,
+                config
+                    .sealed_route("/system/k8s-scaler")
+                    .expect("background route should be sealed"),
                 "k8s-scaler",
-                "/system/k8s-scaler",
                 telemetry::init_test_telemetry(),
                 concurrency_limits,
             )
@@ -2803,6 +3065,38 @@ mod tests {
 
         assert_eq!(route.min_instances, 0);
         assert_eq!(route.max_concurrency, DEFAULT_ROUTE_MAX_CONCURRENCY);
+        assert!(route.volumes.is_empty());
+    }
+
+    #[test]
+    fn validate_integrity_config_normalizes_route_volumes() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![IntegrityRoute {
+            path: "/api/guest-volume".to_owned(),
+            role: RouteRole::User,
+            allowed_secrets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                host_path: "  /tmp/tachyon_data  ".to_owned(),
+                guest_path: "/app/data/".to_owned(),
+                readonly: false,
+            }],
+        }];
+
+        let config = validate_integrity_config(config).expect("volume config should validate");
+        let route = config
+            .sealed_route("/api/guest-volume")
+            .expect("route should remain sealed");
+
+        assert_eq!(
+            route.volumes,
+            vec![IntegrityVolume {
+                host_path: "/tmp/tachyon_data".to_owned(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
+            }]
+        );
     }
 
     #[test]
@@ -2814,6 +3108,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             min_instances: 0,
             max_concurrency: 0,
+            volumes: Vec::new(),
         }];
 
         let error = validate_integrity_config(config)

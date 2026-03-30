@@ -1980,6 +1980,13 @@ name = "guest-malicious"
 version = "0.1.0"
 
 [[package]]
+name = "guest-volume"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
