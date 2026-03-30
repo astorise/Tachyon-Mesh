@@ -38,7 +38,8 @@ At startup, `core-host` SHALL hash the embedded configuration payload, reconstru
 ### Requirement: Integrity manifest seals route execution roles
 The workspace SHALL seal each configured route in `integrity.lock` as a structured entry
 containing the normalized route path, an execution role of `user` or `system`, optional
-`allowed_secrets`, and route-scaling fields `min_instances` plus `max_concurrency`.
+`allowed_secrets`, route-scaling fields `min_instances` plus `max_concurrency`, and
+optional route volume mounts containing `host_path`, `guest_path`, and `readonly`.
 
 #### Scenario: Generating a manifest with explicit route scaling
 - **WHEN** a developer runs `tachyon-cli generate --route /api/guest-example --route-scale /api/guest-example=2:16 --memory 64`
@@ -52,6 +53,18 @@ containing the normalized route path, an execution role of `user` or `system`, o
 - **AND** the host defaults `min_instances` to `0`
 - **AND** the host defaults `max_concurrency` to `100`
 
+#### Scenario: Generating a manifest with explicit route volumes
+- **WHEN** a developer runs `tachyon-cli generate --route /api/guest-volume --volume /api/guest-volume=/tmp/tachyon_data:/app/data:rw --memory 64`
+- **THEN** the canonical configuration payload includes `/api/guest-volume`
+- **AND** the same route entry includes a volume with `host_path = /tmp/tachyon_data`
+- **AND** the volume includes `guest_path = /app/data` and `readonly = false`
+- **AND** the route remains normalized before it is signed
+
+#### Scenario: Loading an older manifest without volume fields
+- **WHEN** `core-host` starts with a sealed manifest whose route entries omit `volumes`
+- **THEN** integrity validation still succeeds
+- **AND** the host defaults the route volume list to empty
+
 ### Requirement: Host rejects ambiguous or invalid sealed route metadata
 `core-host` SHALL normalize sealed route paths, reject duplicates, and refuse to start if any sealed route metadata is invalid.
 
@@ -59,4 +72,3 @@ containing the normalized route path, an execution role of `user` or `system`, o
 - **WHEN** the embedded configuration payload contains the same normalized route more than once
 - **THEN** `core-host` fails integrity validation before serving traffic
 - **AND** the error reports that the sealed route metadata is ambiguous
-
