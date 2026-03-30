@@ -11,12 +11,13 @@ use axum::{
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::Rng;
 use reqwest::Client;
+use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -90,6 +91,7 @@ const COHORT_HEADER: &str = "x-cohort";
 const TACHYON_COHORT_HEADER: &str = "x-tachyon-cohort";
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
+const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const KUBERNETES_SERVICE_BASE_URL: &str = "https://kubernetes.default.svc";
 const MOCK_K8S_URL_ENV: &str = "TACHYON_MOCK_K8S_URL";
@@ -109,10 +111,19 @@ fn default_max_concurrency() -> u32 {
     DEFAULT_ROUTE_MAX_CONCURRENCY
 }
 
+fn default_route_version() -> String {
+    DEFAULT_ROUTE_VERSION.to_owned()
+}
+
+fn is_default_route_version(version: &String) -> bool {
+    version == DEFAULT_ROUTE_VERSION
+}
+
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
     config: IntegrityConfig,
+    route_registry: Arc<RouteRegistry>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     http_client: Client,
     secrets_vault: SecretsVault,
@@ -276,6 +287,15 @@ struct GuestLogRecord {
 struct IntegrityRoute {
     path: String,
     role: RouteRole,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    name: String,
+    #[serde(
+        default = "default_route_version",
+        skip_serializing_if = "is_default_route_version"
+    )]
+    version: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dependencies: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -306,6 +326,20 @@ struct IntegrityConfig {
     routes: Vec<IntegrityRoute>,
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedRoute {
+    path: String,
+    name: String,
+    version: Version,
+    dependencies: HashMap<String, VersionReq>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouteRegistry {
+    by_name: HashMap<String, Vec<ResolvedRoute>>,
+    by_path: HashMap<String, ResolvedRoute>,
+}
+
 #[derive(Debug)]
 enum ExecutionError {
     GuestModuleNotFound(GuestModuleNotFound),
@@ -324,6 +358,7 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     init_host_tracing();
     let config = verify_integrity()?;
+    let route_registry = Arc::new(RouteRegistry::build(&config)?);
     let telemetry = telemetry::init_telemetry();
     let engine = build_engine(&config)?;
     let concurrency_limits = build_concurrency_limits(&config);
@@ -331,6 +366,7 @@ async fn run() -> Result<()> {
     let state = AppState {
         engine,
         config: config.clone(),
+        route_registry,
         concurrency_limits,
         http_client: Client::new(),
         secrets_vault: SecretsVault::load(),
@@ -582,6 +618,8 @@ async fn faas_handler(
                                             match resolve_mesh_response(
                                                 &state.http_client,
                                                 &state.config,
+                                                &state.route_registry,
+                                                &route,
                                                 hop_limit,
                                                 &propagated_headers,
                                                 response,
@@ -667,6 +705,8 @@ async fn acquire_route_permit(
 async fn resolve_mesh_response(
     http_client: &Client,
     config: &IntegrityConfig,
+    route_registry: &RouteRegistry,
+    caller_route: &IntegrityRoute,
     hop_limit: HopLimit,
     propagated_headers: &[PropagatedHeader],
     response: GuestHttpResponse,
@@ -674,7 +714,7 @@ async fn resolve_mesh_response(
     let Some(target) = extract_mesh_fetch_url(&response.body) else {
         return Ok(response);
     };
-    let url = resolve_mesh_fetch_target(config, target)?;
+    let url = resolve_mesh_fetch_target(config, route_registry, caller_route, target)?;
 
     let mut request = http_client
         .get(&url)
@@ -809,19 +849,65 @@ fn resolve_incoming_hop_limit(headers: &HeaderMap) -> std::result::Result<HopLim
 
 fn resolve_mesh_fetch_target(
     config: &IntegrityConfig,
+    route_registry: &RouteRegistry,
+    caller_route: &IntegrityRoute,
     target: &str,
 ) -> std::result::Result<String, String> {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return Ok(target.to_owned());
-    }
-
     if target.starts_with('/') {
         return Ok(format!("{}{}", internal_mesh_base_url(config)?, target));
+    }
+
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let url = reqwest::Url::parse(target)
+            .map_err(|error| format!("mesh fetch target `{target}` is not a valid URL: {error}"))?;
+
+        if !url.host_str().is_some_and(is_internal_mesh_host) {
+            return Ok(target.to_owned());
+        }
+
+        let normalized_path = normalize_route_path(url.path());
+        let base_url = internal_mesh_base_url(config)?;
+        if route_registry.by_path.contains_key(&normalized_path) {
+            return Ok(format!(
+                "{base_url}{}",
+                append_query(&normalized_path, url.query())
+            ));
+        }
+
+        let dependency_segments = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if dependency_segments.len() != 1 {
+            return Err(format!(
+                "internal mesh target `{target}` must identify a sealed route path or a single dependency name"
+            ));
+        }
+        let dependency_name = dependency_segments[0];
+        let resolved_route =
+            route_registry.resolve_dependency_route(&caller_route.path, dependency_name)?;
+        return Ok(format!(
+            "{base_url}{}",
+            append_query(&resolved_route.path, url.query())
+        ));
     }
 
     Err(format!(
         "mesh fetch target `{target}` must be an absolute URL or an absolute route path"
     ))
+}
+
+fn is_internal_mesh_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("tachyon") || host.eq_ignore_ascii_case("mesh")
+}
+
+fn append_query(path: &str, query: Option<&str>) -> String {
+    match query {
+        Some(query) if !query.is_empty() => format!("{path}?{query}"),
+        _ => path.to_owned(),
+    }
 }
 
 fn internal_mesh_base_url(config: &IntegrityConfig) -> std::result::Result<String, String> {
@@ -842,6 +928,145 @@ fn internal_mesh_base_url(config: &IntegrityConfig) -> std::result::Result<Strin
     }
 
     Ok(format!("http://{}", host_address.trim_end_matches('/')))
+}
+
+impl RouteRegistry {
+    fn build(config: &IntegrityConfig) -> Result<Self> {
+        let mut registry = Self::default();
+        let mut seen_versions = HashMap::<(String, String), String>::new();
+
+        for route in &config.routes {
+            let version = Version::parse(route.version.trim()).with_context(|| {
+                format!(
+                    "Integrity Validation Failed: route `{}` has invalid semantic version `{}`",
+                    route.path, route.version
+                )
+            })?;
+            let dependencies = route
+                .dependencies
+                .iter()
+                .map(|(name, requirement)| {
+                    VersionReq::parse(requirement.trim())
+                        .map(|parsed| (name.clone(), parsed))
+                        .map_err(|error| {
+                            anyhow!(
+                                "Integrity Validation Failed: route `{}` has invalid dependency requirement `{}` for `{}`: {}",
+                                route.path,
+                                requirement,
+                                name,
+                                error
+                            )
+                        })
+                })
+                .collect::<Result<HashMap<_, _>>>()?;
+
+            let resolved = ResolvedRoute {
+                path: route.path.clone(),
+                name: route.name.clone(),
+                version,
+                dependencies,
+            };
+            let version_text = resolved.version.to_string();
+            if let Some(existing_path) = seen_versions.insert(
+                (resolved.name.clone(), version_text.clone()),
+                resolved.path.clone(),
+            ) {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: routes `{}` and `{}` both declare `{}` version `{}`",
+                    existing_path,
+                    resolved.path,
+                    resolved.name,
+                    version_text
+                ));
+            }
+
+            registry
+                .by_name
+                .entry(resolved.name.clone())
+                .or_default()
+                .push(resolved.clone());
+            registry.by_path.insert(resolved.path.clone(), resolved);
+        }
+
+        for routes in registry.by_name.values_mut() {
+            routes.sort_by(|left, right| {
+                right
+                    .version
+                    .cmp(&left.version)
+                    .then_with(|| left.path.cmp(&right.path))
+            });
+        }
+
+        for route in registry.by_path.values() {
+            registry
+                .ensure_dependencies_satisfied(route)
+                .map_err(anyhow::Error::msg)?;
+        }
+
+        Ok(registry)
+    }
+
+    fn ensure_dependencies_satisfied(
+        &self,
+        route: &ResolvedRoute,
+    ) -> std::result::Result<(), String> {
+        for (dependency_name, requirement) in &route.dependencies {
+            if self
+                .by_name
+                .get(dependency_name)
+                .into_iter()
+                .flatten()
+                .any(|candidate| requirement.matches(&candidate.version))
+            {
+                continue;
+            }
+
+            return Err(format!(
+                "Dependency resolution failed: route {} ({}@{}) requires {} matching {}, but no compatible version was loaded",
+                route.path,
+                route.name,
+                route.version,
+                dependency_name,
+                requirement
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn resolve_dependency_route(
+        &self,
+        caller_path: &str,
+        dependency_name: &str,
+    ) -> std::result::Result<&ResolvedRoute, String> {
+        let caller = self.by_path.get(caller_path).ok_or_else(|| {
+            format!(
+                "mesh fetch caller route `{caller_path}` is missing from the sealed dependency registry"
+            )
+        })?;
+        let requirement = caller.dependencies.get(dependency_name).ok_or_else(|| {
+            format!(
+                "route {} ({}@{}) does not declare `{}` in its sealed dependencies",
+                caller.path, caller.name, caller.version, dependency_name
+            )
+        })?;
+
+        self.by_name
+            .get(dependency_name)
+            .into_iter()
+            .flatten()
+            .find(|candidate| requirement.matches(&candidate.version))
+            .ok_or_else(|| {
+                format!(
+                    "Dependency resolution failed: route {} ({}@{}) requires {} matching {}, but no compatible version was loaded",
+                    caller.path,
+                    caller.name,
+                    caller.version,
+                    dependency_name,
+                    requirement
+                )
+            })
+    }
 }
 
 fn client_connect_host(ip: IpAddr) -> String {
@@ -1301,6 +1526,10 @@ fn resolve_function_name(path: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn default_route_name(path: &str) -> String {
+    resolve_function_name(path).unwrap_or_else(|| path.trim_matches('/').to_owned())
+}
+
 fn background_route_module(route: &IntegrityRoute) -> Option<String> {
     route
         .targets
@@ -1603,6 +1832,7 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
     }
 
     config.routes = normalize_config_routes(config.routes)?;
+    RouteRegistry::build(&config)?;
     Ok(config)
 }
 
@@ -1654,6 +1884,9 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
     Ok(IntegrityRoute {
         path: normalized.clone(),
         role: route.role,
+        name: normalize_route_name(&route.name, &normalized)?,
+        version: normalize_route_version(&route.version, &normalized)?,
+        dependencies: normalize_route_dependencies(route.dependencies, &normalized)?,
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
         targets: normalize_route_targets(route.targets)?,
         min_instances: route.min_instances,
@@ -1667,6 +1900,62 @@ fn normalize_route_targets(targets: Vec<RouteTarget>) -> Result<Vec<RouteTarget>
         .into_iter()
         .map(normalize_route_target)
         .collect::<Result<Vec<_>>>()
+}
+
+fn normalize_route_name(name: &str, path: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Ok(default_route_name(path));
+    }
+    normalize_service_name(trimmed).map_err(|error| {
+        anyhow!("Integrity Validation Failed: route `{path}` has an invalid `name`: {error}")
+    })
+}
+
+fn normalize_service_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("service names cannot be empty"));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(anyhow!("service names must not contain path separators"));
+    }
+
+    Ok(trimmed.to_owned())
+}
+
+fn normalize_route_version(version: &str, path: &str) -> Result<String> {
+    Version::parse(version.trim())
+        .with_context(|| {
+            format!(
+                "Integrity Validation Failed: route `{path}` must use a valid semantic `version`"
+            )
+        })
+        .map(|parsed| parsed.to_string())
+}
+
+fn normalize_route_dependencies(
+    dependencies: BTreeMap<String, String>,
+    path: &str,
+) -> Result<BTreeMap<String, String>> {
+    dependencies
+        .into_iter()
+        .map(|(name, requirement)| {
+            let normalized_name = normalize_service_name(&name).map_err(|error| {
+                anyhow!(
+                    "Integrity Validation Failed: route `{path}` has an invalid dependency name `{}`: {}",
+                    name,
+                    error
+                )
+            })?;
+            let parsed = VersionReq::parse(requirement.trim()).with_context(|| {
+                format!(
+                    "Integrity Validation Failed: route `{path}` has an invalid dependency requirement for `{normalized_name}`"
+                )
+            })?;
+            Ok((normalized_name, parsed.to_string()))
+        })
+        .collect()
 }
 
 fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
@@ -2249,6 +2538,9 @@ impl IntegrityRoute {
         Self {
             path: path.to_owned(),
             role: RouteRole::User,
+            name: default_route_name(path),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -2262,6 +2554,9 @@ impl IntegrityRoute {
         Self {
             path: path.to_owned(),
             role: RouteRole::System,
+            name: default_route_name(path),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -2275,6 +2570,9 @@ impl IntegrityRoute {
         Self {
             path: path.to_owned(),
             role: RouteRole::User,
+            name: default_route_name(path),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
             allowed_secrets: allowed_secrets
                 .iter()
                 .map(|secret| (*secret).to_owned())
@@ -2434,11 +2732,14 @@ mod tests {
 
     fn build_test_state(config: IntegrityConfig, telemetry: TelemetryHandle) -> AppState {
         let engine = build_test_engine(&config);
+        let route_registry =
+            Arc::new(RouteRegistry::build(&config).expect("route registry should build"));
         let concurrency_limits = build_concurrency_limits(&config);
 
         AppState {
             engine,
             config,
+            route_registry,
             concurrency_limits,
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
@@ -2450,6 +2751,9 @@ mod tests {
         IntegrityRoute {
             path: "/api/guest-volume".to_owned(),
             role: RouteRole::User,
+            name: "guest-volume".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -2465,6 +2769,27 @@ mod tests {
     fn targeted_route(path: &str, targets: Vec<RouteTarget>) -> IntegrityRoute {
         let mut route = IntegrityRoute::user(path);
         route.targets = targets;
+        route
+    }
+
+    fn versioned_route(path: &str, name: &str, version: &str) -> IntegrityRoute {
+        let mut route = IntegrityRoute::user(path);
+        route.name = name.to_owned();
+        route.version = version.to_owned();
+        route
+    }
+
+    fn dependency_route(
+        path: &str,
+        name: &str,
+        version: &str,
+        dependencies: &[(&str, &str)],
+    ) -> IntegrityRoute {
+        let mut route = versioned_route(path, name, version);
+        route.dependencies = dependencies
+            .iter()
+            .map(|(dependency, requirement)| ((*dependency).to_owned(), (*requirement).to_owned()))
+            .collect();
         route
     }
 
@@ -2801,9 +3126,12 @@ mod tests {
     #[tokio::test]
     async fn router_returns_service_unavailable_when_route_concurrency_is_exhausted() {
         let config = IntegrityConfig::default_sealed();
+        let route_registry =
+            Arc::new(RouteRegistry::build(&config).expect("route registry should build"));
         let app = build_app(AppState {
             engine: build_test_engine(&config),
             config,
+            route_registry,
             concurrency_limits: Arc::new(HashMap::from([(
                 DEFAULT_ROUTE.to_owned(),
                 Arc::new(RouteExecutionControl::new(0)),
@@ -3277,11 +3605,42 @@ mod tests {
     fn resolve_mesh_fetch_target_supports_relative_mesh_routes() {
         let mut config = IntegrityConfig::default_sealed();
         config.host_address = "0.0.0.0:8080".to_owned();
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route(DEFAULT_ROUTE)
+            .expect("default route should stay sealed");
 
         assert_eq!(
-            resolve_mesh_fetch_target(&config, "/api/guest-loop")
+            resolve_mesh_fetch_target(&config, &route_registry, caller_route, "/api/guest-loop",)
                 .expect("relative mesh route should resolve"),
             "http://127.0.0.1:8080/api/guest-loop"
+        );
+    }
+
+    #[test]
+    fn resolve_mesh_fetch_target_uses_highest_compatible_dependency_version() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = "0.0.0.0:8080".to_owned();
+        config.routes = vec![
+            dependency_route("/api/faas-a", "faas-a", "2.0.0", &[("faas-b", "^2.0")]),
+            versioned_route("/api/faas-b-v2", "faas-b", "2.1.0"),
+            versioned_route("/api/faas-b-v3", "faas-b", "3.0.0"),
+        ];
+        let config = validate_integrity_config(config).expect("config should validate");
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route("/api/faas-a")
+            .expect("caller route should remain sealed");
+
+        assert_eq!(
+            resolve_mesh_fetch_target(
+                &config,
+                &route_registry,
+                caller_route,
+                "http://tachyon/faas-b",
+            )
+            .expect("dependency route should resolve"),
+            "http://127.0.0.1:8080/api/faas-b-v2"
         );
     }
 
@@ -3335,9 +3694,16 @@ mod tests {
         let mut inbound_headers = HeaderMap::new();
         inbound_headers.insert(COHORT_HEADER, HeaderValue::from_static("beta"));
         let propagated_headers = extract_propagated_headers(&inbound_headers);
+        let config = IntegrityConfig::default_sealed();
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route(DEFAULT_ROUTE)
+            .expect("default route should remain sealed");
         let response = resolve_mesh_response(
             &Client::new(),
-            &IntegrityConfig::default_sealed(),
+            &config,
+            &route_registry,
+            caller_route,
             HopLimit(DEFAULT_HOP_LIMIT),
             &propagated_headers,
             GuestHttpResponse {
@@ -3486,9 +3852,26 @@ mod tests {
             .sealed_route("/api/guest-example")
             .expect("route should remain sealed");
 
+        assert_eq!(route.name, "guest-example");
+        assert_eq!(route.version, DEFAULT_ROUTE_VERSION);
+        assert!(route.dependencies.is_empty());
         assert_eq!(route.min_instances, 0);
         assert_eq!(route.max_concurrency, DEFAULT_ROUTE_MAX_CONCURRENCY);
         assert!(route.volumes.is_empty());
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_unsatisfied_semver_dependencies() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![
+            dependency_route("/api/faas-a", "faas-a", "2.0.0", &[("faas-b", "^2.0")]),
+            versioned_route("/api/faas-b-v1", "faas-b", "1.5.0"),
+        ];
+
+        let error = validate_integrity_config(config)
+            .expect_err("unsatisfied dependency graph should fail validation");
+
+        assert!(error.to_string().contains("requires faas-b matching ^2.0"));
     }
 
     #[test]
@@ -3497,6 +3880,9 @@ mod tests {
         config.routes = vec![IntegrityRoute {
             path: "/api/guest-volume".to_owned(),
             role: RouteRole::User,
+            name: "guest-volume".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -3529,6 +3915,9 @@ mod tests {
         config.routes = vec![IntegrityRoute {
             path: "/api/guest-example".to_owned(),
             role: RouteRole::User,
+            name: "guest-example".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
