@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Context, Result};
+use arc_swap::ArcSwap;
 use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::from_fn,
     response::{IntoResponse, Response},
-    routing::any,
     Extension, Router,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -18,12 +18,12 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fmt,
+    fmt, fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Once,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, Once,
     },
     time::{Duration, Instant},
 };
@@ -85,6 +85,7 @@ const DEFAULT_SYSTEM_ROUTE: &str = "/metrics";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
+const INTEGRITY_MANIFEST_PATH_ENV: &str = "TACHYON_INTEGRITY_MANIFEST";
 const DEFAULT_HOP_LIMIT: u32 = 10;
 const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
 const COHORT_HEADER: &str = "x-cohort";
@@ -121,13 +122,22 @@ fn is_default_route_version(version: &String) -> bool {
 
 #[derive(Clone)]
 struct AppState {
+    runtime: Arc<ArcSwap<RuntimeState>>,
+    http_client: Client,
+    secrets_vault: SecretsVault,
+    telemetry: TelemetryHandle,
+    #[cfg_attr(not(any(unix, test)), allow(dead_code))]
+    manifest_path: PathBuf,
+    #[cfg_attr(not(any(unix, test)), allow(dead_code))]
+    background_workers: Arc<BackgroundWorkerManager>,
+}
+
+#[derive(Clone)]
+struct RuntimeState {
     engine: Engine,
     config: IntegrityConfig,
     route_registry: Arc<RouteRegistry>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
-    http_client: Client,
-    secrets_vault: SecretsVault,
-    telemetry: TelemetryHandle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +286,25 @@ struct RouteExecutionControl {
     pending_waiters: AtomicUsize,
 }
 
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+#[derive(Debug, Deserialize, Serialize)]
+struct IntegrityManifest {
+    config_payload: String,
+    public_key: String,
+    signature: String,
+}
+
+#[derive(Default)]
+struct BackgroundWorkerManager {
+    workers: Mutex<Vec<BackgroundWorkerHandle>>,
+}
+
+struct BackgroundWorkerHandle {
+    route_path: String,
+    stop_requested: Arc<AtomicBool>,
+    join_handle: tokio::task::JoinHandle<()>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GuestLogRecord {
     level: String,
@@ -357,30 +386,28 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     init_host_tracing();
-    let config = verify_integrity()?;
-    let route_registry = Arc::new(RouteRegistry::build(&config)?);
     let telemetry = telemetry::init_telemetry();
-    let engine = build_engine(&config)?;
-    let concurrency_limits = build_concurrency_limits(&config);
+    let runtime = build_runtime_state(verify_integrity()?)?;
+    let background_workers = Arc::new(BackgroundWorkerManager::default());
+    background_workers.start_for_runtime(&runtime, telemetry.clone());
 
     let state = AppState {
-        engine,
-        config: config.clone(),
-        route_registry,
-        concurrency_limits,
+        runtime: Arc::new(ArcSwap::from_pointee(runtime.clone())),
         http_client: Client::new(),
         secrets_vault: SecretsVault::load(),
         telemetry,
+        manifest_path: integrity_manifest_path(),
+        background_workers: Arc::clone(&background_workers),
     };
-    start_background_tick_workers(&state);
+    spawn_reload_watcher(state.clone());
     let app = build_app(state);
 
-    let listener = tokio::net::TcpListener::bind(&config.host_address)
+    let listener = tokio::net::TcpListener::bind(&runtime.config.host_address)
         .await
         .with_context(|| {
             format!(
                 "failed to bind HTTP listener on {}",
-                config.host_address.as_str()
+                runtime.config.host_address.as_str()
             )
         })?;
 
@@ -388,69 +415,119 @@ async fn run() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
-    .context("axum server exited unexpectedly")
+    .context("axum server exited unexpectedly")?;
+
+    background_workers.stop_all().await;
+    Ok(())
 }
 
-fn start_background_tick_workers(state: &AppState) {
-    let mut started_workers = 0_u32;
+impl BackgroundWorkerManager {
+    fn start_for_runtime(&self, runtime: &RuntimeState, telemetry: TelemetryHandle) {
+        let mut new_workers = Vec::new();
+        let mut started_workers = 0_u32;
 
-    for route in &state.config.routes {
-        if route.role != RouteRole::System {
-            continue;
-        }
+        for route in &runtime.config.routes {
+            if route.role != RouteRole::System {
+                continue;
+            }
 
-        let Some(function_name) = background_route_module(route) else {
-            continue;
-        };
+            let Some(function_name) = background_route_module(route) else {
+                continue;
+            };
 
-        if resolve_guest_module_path(&function_name).is_err() {
-            tracing::warn!(
-                route = %route.path,
-                function = function_name,
-                "sealed system route is missing its guest artifact"
-            );
-            continue;
-        }
+            if resolve_guest_module_path(&function_name).is_err() {
+                tracing::warn!(
+                    route = %route.path,
+                    function = function_name,
+                    "sealed system route is missing its guest artifact"
+                );
+                continue;
+            }
 
-        if BackgroundTickRunner::new(
-            &state.engine,
-            &state.config,
-            route,
-            &function_name,
-            state.telemetry.clone(),
-            Arc::clone(&state.concurrency_limits),
-        )
-        .is_err()
-        {
-            continue;
-        }
-
-        let engine = state.engine.clone();
-        let config = state.config.clone();
-        let telemetry = state.telemetry.clone();
-        let concurrency_limits = Arc::clone(&state.concurrency_limits);
-        let route = route.clone();
-        let function_name = function_name.to_owned();
-
-        tokio::task::spawn_blocking(move || {
-            run_background_tick_loop(
-                engine,
-                config,
-                telemetry,
-                concurrency_limits,
+            if BackgroundTickRunner::new(
+                &runtime.engine,
+                &runtime.config,
                 route,
-                function_name,
+                &function_name,
+                telemetry.clone(),
+                Arc::clone(&runtime.concurrency_limits),
             )
-        });
-        started_workers = started_workers.saturating_add(1);
+            .is_err()
+            {
+                continue;
+            }
+
+            let stop_requested = Arc::new(AtomicBool::new(false));
+            let worker_route = route.clone();
+            let worker_path = worker_route.path.clone();
+            let worker_function_name = function_name.to_owned();
+            let worker_engine = runtime.engine.clone();
+            let worker_config = runtime.config.clone();
+            let worker_telemetry = telemetry.clone();
+            let worker_limits = Arc::clone(&runtime.concurrency_limits);
+            let worker_stop = Arc::clone(&stop_requested);
+            let join_handle = tokio::task::spawn_blocking(move || {
+                run_background_tick_loop(
+                    worker_engine,
+                    worker_config,
+                    worker_telemetry,
+                    worker_limits,
+                    worker_route,
+                    worker_function_name,
+                    worker_stop,
+                )
+            });
+
+            new_workers.push(BackgroundWorkerHandle {
+                route_path: worker_path,
+                stop_requested,
+                join_handle,
+            });
+            started_workers = started_workers.saturating_add(1);
+        }
+
+        if started_workers > 0 {
+            tracing::info!(
+                workers = started_workers,
+                "started autoscaling background workers"
+            );
+        }
+
+        self.workers
+            .lock()
+            .expect("background worker list should not be poisoned")
+            .extend(new_workers);
     }
 
-    if started_workers > 0 {
-        tracing::info!(
-            workers = started_workers,
-            "started autoscaling background workers"
-        );
+    #[cfg_attr(not(any(unix, test)), allow(dead_code))]
+    async fn replace_with(&self, runtime: &RuntimeState, telemetry: TelemetryHandle) {
+        self.stop_all().await;
+        self.start_for_runtime(runtime, telemetry);
+    }
+
+    async fn stop_all(&self) {
+        let workers = {
+            let mut guard = self
+                .workers
+                .lock()
+                .expect("background worker list should not be poisoned");
+            std::mem::take(&mut *guard)
+        };
+
+        for worker in &workers {
+            worker.stop_requested.store(true, Ordering::Release);
+        }
+
+        for worker in workers {
+            if let Err(error) = worker.join_handle.await {
+                tracing::warn!(
+                    route = %worker.route_path,
+                    "background worker task exited unexpectedly: {error}"
+                );
+            }
+        }
     }
 }
 
@@ -461,6 +538,7 @@ fn run_background_tick_loop(
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     route: IntegrityRoute,
     function_name: String,
+    stop_requested: Arc<AtomicBool>,
 ) {
     let mut runner = match BackgroundTickRunner::new(
         &engine,
@@ -478,7 +556,10 @@ fn run_background_tick_loop(
     };
 
     loop {
-        std::thread::sleep(AUTOSCALING_TICK_INTERVAL);
+        if !wait_for_background_tick(&stop_requested) {
+            break;
+        }
+
         tracing::info!(
             route = %runner.route_path,
             function = %runner.function_name,
@@ -490,9 +571,115 @@ fn run_background_tick_loop(
     }
 }
 
+fn wait_for_background_tick(stop_requested: &AtomicBool) -> bool {
+    let deadline = Instant::now() + AUTOSCALING_TICK_INTERVAL;
+
+    loop {
+        if stop_requested.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+#[cfg(unix)]
+fn spawn_reload_watcher(state: AppState) {
+    tokio::spawn(async move {
+        let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(signal) => signal,
+            Err(error) => {
+                tracing::warn!("failed to install SIGHUP watcher: {error}");
+                return;
+            }
+        };
+
+        while hangup.recv().await.is_some() {
+            if let Err(error) = reload_runtime_from_disk(&state).await {
+                tracing::error!(
+                    manifest = %state.manifest_path.display(),
+                    "hot reload failed: {error:#}"
+                );
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_watcher(_state: AppState) {}
+
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
+    let manifest_path = state.manifest_path.clone();
+    let runtime = tokio::task::spawn_blocking(move || {
+        let config = load_integrity_config_from_manifest_path(&manifest_path)?;
+        build_runtime_state(config)
+    })
+    .await
+    .context("hot reload task failed")??;
+
+    state
+        .background_workers
+        .replace_with(&runtime, state.telemetry.clone())
+        .await;
+    state.runtime.store(Arc::new(runtime));
+    tracing::info!(
+        manifest = %state.manifest_path.display(),
+        "Hot reload successful"
+    );
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!("failed to install SIGTERM watcher: {error}");
+                let _ = ctrl_c.await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    tracing::info!("shutdown signal received");
+}
+
+fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeState> {
+    Ok(RuntimeState {
+        engine: build_engine(&config)?,
+        route_registry: Arc::new(RouteRegistry::build(&config)?),
+        concurrency_limits: build_concurrency_limits(&config),
+        config,
+    })
+}
+
+fn integrity_manifest_path() -> PathBuf {
+    std::env::var_os(INTEGRITY_MANIFEST_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("integrity.lock"))
+}
+
 fn build_app(state: AppState) -> Router {
     let app = Router::new()
-        .route("/*path", any(faas_handler))
+        .fallback(faas_handler)
         .layer(from_fn(hop_limit_middleware));
 
     #[cfg(feature = "rate-limit")]
@@ -529,6 +716,7 @@ async fn faas_handler(
     body: Bytes,
 ) -> impl IntoResponse {
     let _active_request = telemetry::begin_request(&state.telemetry);
+    let runtime = state.runtime.load_full();
     let normalized_path = normalize_route_path(uri.path());
     let trace_id = Uuid::new_v4().to_string();
     telemetry::record_event(
@@ -540,7 +728,7 @@ async fn faas_handler(
         },
     );
 
-    let response: Response = match state.config.sealed_route(&normalized_path).cloned() {
+    let response: Response = match runtime.config.sealed_route(&normalized_path).cloned() {
         None => (
             StatusCode::NOT_FOUND,
             format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
@@ -554,7 +742,7 @@ async fn faas_handler(
                 )
                     .into_response()
             } else {
-                match state.concurrency_limits.get(&normalized_path).cloned() {
+                match runtime.concurrency_limits.get(&normalized_path).cloned() {
                     None => (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("route `{normalized_path}` is missing a concurrency limiter"),
@@ -566,8 +754,12 @@ async fn faas_handler(
                             match select_route_module(&route, &headers) {
                                 Ok(selected_module) => {
                                     let propagated_headers = extract_propagated_headers(&headers);
-                                    let engine = state.engine.clone();
-                                    let config = state.config.clone();
+                                    let engine = runtime.engine.clone();
+                                    let request_config = runtime.config.clone();
+                                    let response_config = runtime.config.clone();
+                                    let route_registry = Arc::clone(&runtime.route_registry);
+                                    let concurrency_limits =
+                                        Arc::clone(&runtime.concurrency_limits);
                                     let telemetry_context = GuestTelemetryContext {
                                         handle: state.telemetry.clone(),
                                         trace_id: trace_id.clone(),
@@ -590,13 +782,11 @@ async fn faas_handler(
                                             guest_request,
                                             &task_route,
                                             GuestExecutionContext {
-                                                config,
+                                                config: request_config,
                                                 runtime_telemetry,
                                                 secret_access,
                                                 telemetry: Some(telemetry_context),
-                                                concurrency_limits: Arc::clone(
-                                                    &state.concurrency_limits,
-                                                ),
+                                                concurrency_limits,
                                                 propagated_headers: task_propagated_headers,
                                             },
                                         )
@@ -617,8 +807,8 @@ async fn faas_handler(
 
                                             match resolve_mesh_response(
                                                 &state.http_client,
-                                                &state.config,
-                                                &state.route_registry,
+                                                &response_config,
+                                                &route_registry,
                                                 &route,
                                                 hop_limit,
                                                 &propagated_headers,
@@ -636,7 +826,7 @@ async fn faas_handler(
                                         }
                                         Ok(Err(error)) => {
                                             error.log_if_needed(&selected_module);
-                                            error.into_response(&state.config).into_response()
+                                            error.into_response(&response_config).into_response()
                                         }
                                         Err(error) => (
                                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1788,16 +1978,46 @@ fn init_host_tracing() {
 }
 
 fn verify_integrity() -> Result<IntegrityConfig> {
-    verify_integrity_signature(
+    let config = verify_integrity_payload(
         EMBEDDED_CONFIG_PAYLOAD,
         EMBEDDED_PUBLIC_KEY,
         EMBEDDED_SIGNATURE,
+        "embedded sealed configuration",
     )?;
-    let config = serde_json::from_str::<IntegrityConfig>(EMBEDDED_CONFIG_PAYLOAD)
-        .context("failed to parse embedded sealed configuration")?;
-    let config = validate_integrity_config(config)?;
     tracing::info!("integrity verification passed");
     Ok(config)
+}
+
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+fn load_integrity_config_from_manifest_path(path: &Path) -> Result<IntegrityConfig> {
+    let manifest = read_integrity_manifest(path)?;
+    verify_integrity_payload(
+        &manifest.config_payload,
+        &manifest.public_key,
+        &manifest.signature,
+        &format!("integrity manifest at {}", path.display()),
+    )
+}
+
+#[cfg_attr(not(any(unix, test)), allow(dead_code))]
+fn read_integrity_manifest(path: &Path) -> Result<IntegrityManifest> {
+    let manifest = fs::read_to_string(path)
+        .with_context(|| format!("failed to read integrity manifest at {}", path.display()))?;
+
+    serde_json::from_str(&manifest)
+        .with_context(|| format!("failed to parse integrity manifest at {}", path.display()))
+}
+
+fn verify_integrity_payload(
+    payload: &str,
+    public_key_hex: &str,
+    signature_hex: &str,
+    source: &str,
+) -> Result<IntegrityConfig> {
+    verify_integrity_signature(payload, public_key_hex, signature_hex)?;
+    let config = serde_json::from_str::<IntegrityConfig>(payload)
+        .with_context(|| format!("failed to parse {source}"))?;
+    validate_integrity_config(config)
 }
 
 fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityConfig> {
@@ -2711,6 +2931,31 @@ mod tests {
         build_engine(config).expect("engine should be created")
     }
 
+    fn build_test_runtime(config: IntegrityConfig) -> RuntimeState {
+        build_runtime_state(config).expect("runtime state should build")
+    }
+
+    fn signed_manifest(config: &IntegrityConfig, seed: u8) -> IntegrityManifest {
+        let config_payload = canonical_config_payload(config).expect("payload should serialize");
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let signature = signing_key.sign(&Sha256::digest(config_payload.as_bytes()));
+
+        IntegrityManifest {
+            config_payload,
+            public_key: hex::encode(signing_key.verifying_key().to_bytes()),
+            signature: hex::encode(signature.to_bytes()),
+        }
+    }
+
+    fn write_test_manifest(path: &Path, config: &IntegrityConfig, seed: u8) {
+        let manifest = signed_manifest(config, seed);
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
+        )
+        .expect("manifest should be written");
+    }
+
     fn autoscaling_test_config(include_background_route: bool) -> IntegrityConfig {
         let mut routes = vec![
             IntegrityRoute::user("/api/guest-call-legacy"),
@@ -2731,19 +2976,21 @@ mod tests {
     }
 
     fn build_test_state(config: IntegrityConfig, telemetry: TelemetryHandle) -> AppState {
-        let engine = build_test_engine(&config);
-        let route_registry =
-            Arc::new(RouteRegistry::build(&config).expect("route registry should build"));
-        let concurrency_limits = build_concurrency_limits(&config);
+        build_test_state_with_manifest(config, telemetry, PathBuf::from("integrity.lock"))
+    }
 
+    fn build_test_state_with_manifest(
+        config: IntegrityConfig,
+        telemetry: TelemetryHandle,
+        manifest_path: PathBuf,
+    ) -> AppState {
         AppState {
-            engine,
-            config,
-            route_registry,
-            concurrency_limits,
+            runtime: Arc::new(ArcSwap::from_pointee(build_test_runtime(config))),
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
             telemetry,
+            manifest_path,
+            background_workers: Arc::new(BackgroundWorkerManager::default()),
         }
     }
 
@@ -2865,6 +3112,68 @@ mod tests {
             error.to_string().contains("Integrity Validation Failed"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_runtime_from_disk_swaps_in_new_routes() {
+        let temp_dir = unique_test_dir("graceful-reload-state");
+        let manifest_path = temp_dir.join("integrity.lock");
+        let initial = IntegrityConfig {
+            routes: vec![IntegrityRoute::user(DEFAULT_ROUTE)],
+            ..IntegrityConfig::default_sealed()
+        };
+        write_test_manifest(&manifest_path, &initial, 11);
+        let state = build_test_state_with_manifest(
+            initial,
+            telemetry::init_test_telemetry(),
+            manifest_path.clone(),
+        );
+
+        let mut reloaded = IntegrityConfig {
+            routes: vec![IntegrityRoute::user(DEFAULT_ROUTE)],
+            ..IntegrityConfig::default_sealed()
+        };
+        reloaded
+            .routes
+            .push(IntegrityRoute::user("/api/guest-loop"));
+        write_test_manifest(&manifest_path, &reloaded, 12);
+
+        reload_runtime_from_disk(&state)
+            .await
+            .expect("runtime should reload from manifest");
+
+        let runtime = state.runtime.load_full();
+        assert!(runtime.config.sealed_route("/api/guest-loop").is_some());
+        assert!(runtime.concurrency_limits.contains_key("/api/guest-loop"));
+    }
+
+    #[tokio::test]
+    async fn reload_runtime_from_disk_keeps_previous_state_on_invalid_manifest() {
+        let temp_dir = unique_test_dir("graceful-reload-invalid");
+        let manifest_path = temp_dir.join("integrity.lock");
+        let initial = IntegrityConfig {
+            routes: vec![IntegrityRoute::user(DEFAULT_ROUTE)],
+            ..IntegrityConfig::default_sealed()
+        };
+        write_test_manifest(&manifest_path, &initial, 13);
+        let state = build_test_state_with_manifest(
+            initial,
+            telemetry::init_test_telemetry(),
+            manifest_path.clone(),
+        );
+
+        fs::write(&manifest_path, "{ invalid json").expect("invalid manifest should be written");
+
+        let error = reload_runtime_from_disk(&state)
+            .await
+            .expect_err("invalid manifest should not replace the runtime");
+
+        assert!(error
+            .to_string()
+            .contains("failed to parse integrity manifest"));
+        let runtime = state.runtime.load_full();
+        assert!(runtime.config.sealed_route(DEFAULT_ROUTE).is_some());
+        assert!(runtime.config.sealed_route("/api/guest-loop").is_none());
     }
 
     #[test]
@@ -3126,19 +3435,24 @@ mod tests {
     #[tokio::test]
     async fn router_returns_service_unavailable_when_route_concurrency_is_exhausted() {
         let config = IntegrityConfig::default_sealed();
-        let route_registry =
-            Arc::new(RouteRegistry::build(&config).expect("route registry should build"));
-        let app = build_app(AppState {
+        let runtime = RuntimeState {
             engine: build_test_engine(&config),
-            config,
-            route_registry,
+            route_registry: Arc::new(
+                RouteRegistry::build(&config).expect("route registry should build"),
+            ),
             concurrency_limits: Arc::new(HashMap::from([(
                 DEFAULT_ROUTE.to_owned(),
                 Arc::new(RouteExecutionControl::new(0)),
             )])),
+            config,
+        };
+        let app = build_app(AppState {
+            runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
             telemetry: telemetry::init_test_telemetry(),
+            manifest_path: PathBuf::from("integrity.lock"),
+            background_workers: Arc::new(BackgroundWorkerManager::default()),
         });
 
         let response = app
@@ -3231,7 +3545,8 @@ mod tests {
     async fn router_returns_scaling_metrics_for_privileged_route() {
         let config = autoscaling_test_config(false);
         let state = build_test_state(config, telemetry::init_test_telemetry());
-        state
+        let runtime = state.runtime.load_full();
+        runtime
             .concurrency_limits
             .get("/api/guest-call-legacy")
             .expect("legacy route should have a limiter")
@@ -3779,6 +4094,62 @@ mod tests {
             body.contains("Routing loop detected"),
             "unexpected loop-detected response body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_in_flight_requests() {
+        use axum::routing::get;
+        use tokio::sync::Notify;
+
+        async fn slow_handler(State(started): State<Arc<Notify>>) -> &'static str {
+            started.notify_one();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            "done"
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should expose an address");
+        let started = Arc::new(Notify::new());
+        let app = Router::new()
+            .route("/slow", get(slow_handler))
+            .with_state(Arc::clone(&started));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("server should shut down cleanly");
+        });
+
+        let request = tokio::spawn(async move {
+            Client::new()
+                .get(format!("http://{address}/slow"))
+                .send()
+                .await
+                .expect("request should complete")
+        });
+
+        started.notified().await;
+        let _ = shutdown_tx.send(());
+
+        let response = request.await.expect("request task should complete");
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .expect("response body should be readable");
+
+        server.await.expect("server task should complete");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "done");
     }
 
     #[test]
