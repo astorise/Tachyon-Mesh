@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,25 +16,34 @@ const DEFAULT_MAX_STDOUT_BYTES: usize = 64 * 1024;
 const DEFAULT_GUEST_FUEL_BUDGET: u64 = 500_000_000;
 const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
+const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 
 fn default_max_concurrency() -> u32 {
     DEFAULT_ROUTE_MAX_CONCURRENCY
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+fn default_route_version() -> String {
+    DEFAULT_ROUTE_VERSION.to_owned()
+}
+
+fn is_default_route_version(version: &String) -> bool {
+    version == DEFAULT_ROUTE_VERSION
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteRole {
     User,
     System,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct HeaderMatch {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RouteTarget {
     pub module: String,
     #[serde(default)]
@@ -42,10 +52,19 @@ pub struct RouteTarget {
     pub match_header: Option<HeaderMatch>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SealedRoute {
     pub path: String,
     pub role: RouteRole,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(
+        default = "default_route_version",
+        skip_serializing_if = "is_default_route_version"
+    )]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dependencies: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -58,7 +77,7 @@ pub struct SealedRoute {
     pub volumes: Vec<SealedVolume>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SealedVolume {
     pub host_path: String,
     pub guest_path: String,
@@ -89,6 +108,9 @@ struct GenerateRequest {
     system_routes: Vec<String>,
     secret_routes: Vec<String>,
     route_targets: Vec<String>,
+    route_names: Vec<String>,
+    route_versions: Vec<String>,
+    route_dependencies: Vec<String>,
     route_scales: Vec<String>,
     volumes: Vec<String>,
     memory_mib: u32,
@@ -162,6 +184,12 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         system_routes: parse_optional_routes_arg(&subcommand.matches.args, "system-route")?,
         secret_routes: parse_optional_routes_arg(&subcommand.matches.args, "secret-route")?,
         route_targets: parse_optional_routes_arg(&subcommand.matches.args, "route-target")?,
+        route_names: parse_optional_routes_arg(&subcommand.matches.args, "route-name")?,
+        route_versions: parse_optional_routes_arg(&subcommand.matches.args, "route-version")?,
+        route_dependencies: parse_optional_routes_arg(
+            &subcommand.matches.args,
+            "route-dependency",
+        )?,
         route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
         volumes: parse_optional_string_args(&subcommand.matches.args, "volume", "volume")?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
@@ -188,6 +216,9 @@ fn parse_generate_request_from_args(
     let mut system_routes = Vec::new();
     let mut secret_routes = Vec::new();
     let mut route_targets = Vec::new();
+    let mut route_names = Vec::new();
+    let mut route_versions = Vec::new();
+    let mut route_dependencies = Vec::new();
     let mut route_scales = Vec::new();
     let mut volumes = Vec::new();
     let mut memory_mib = None;
@@ -245,6 +276,45 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--route-name=") {
+            route_names.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--route-name" {
+            let route_name = args.next().context(
+                "missing value for `--route-name`; expected `--route-name /api/guest-example=guest-example`",
+            )?;
+            route_names.push(route_name);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--route-version=") {
+            route_versions.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--route-version" {
+            let route_version = args.next().context(
+                "missing value for `--route-version`; expected `--route-version /api/guest-example=1.2.3`",
+            )?;
+            route_versions.push(route_version);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--route-dependency=") {
+            route_dependencies.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--route-dependency" {
+            let route_dependency = args.next().context(
+                "missing value for `--route-dependency`; expected `--route-dependency /api/faas-a=faas-b@^3.1.0`",
+            )?;
+            route_dependencies.push(route_dependency);
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix("--memory=") {
             memory_mib = Some(parse_memory_value(value)?);
             continue;
@@ -297,6 +367,9 @@ fn parse_generate_request_from_args(
         system_routes,
         secret_routes,
         route_targets,
+        route_names,
+        route_versions,
+        route_dependencies,
         route_scales,
         volumes,
         memory_mib,
@@ -338,6 +411,9 @@ impl SealedConfig {
             request.route_scales,
             request.volumes,
             request.route_targets,
+            request.route_names,
+            request.route_versions,
+            request.route_dependencies,
         )?;
         let memory_mib = usize::try_from(request.memory_mib)
             .context("memory limit is too large for this platform")?;
@@ -435,6 +511,7 @@ fn parse_memory_value(value: &str) -> Result<u32> {
     Ok(memory_mib)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_routes(
     user_routes: Vec<String>,
     system_routes: Vec<String>,
@@ -442,6 +519,9 @@ fn normalize_routes(
     route_scales: Vec<String>,
     route_volumes: Vec<String>,
     route_targets: Vec<String>,
+    route_names: Vec<String>,
+    route_versions: Vec<String>,
+    route_dependencies: Vec<String>,
 ) -> Result<Vec<SealedRoute>> {
     if user_routes.is_empty() {
         bail!("at least one `--route` value must be provided");
@@ -463,8 +543,11 @@ fn normalize_routes(
         normalized.insert(
             path.clone(),
             SealedRoute {
-                path,
+                path: path.clone(),
                 role: RouteRole::User,
+                name: default_route_name(&path),
+                version: default_route_version(),
+                dependencies: BTreeMap::new(),
                 allowed_secrets: Vec::new(),
                 targets: Vec::new(),
                 min_instances: 0,
@@ -479,6 +562,9 @@ fn normalize_routes(
         let sealed_route = SealedRoute {
             path: path.clone(),
             role: RouteRole::System,
+            name: default_route_name(&path),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -502,6 +588,33 @@ fn normalize_routes(
         }
 
         normalized.insert(path, sealed_route);
+    }
+
+    for route_name in route_names {
+        let (path, name) = parse_route_name(&route_name)?;
+        let normalized_path = normalize_route(&path)?;
+        let sealed_route = normalized.get_mut(&normalized_path).ok_or_else(|| {
+            anyhow!("route name `{normalized_path}` must target a declared sealed route")
+        })?;
+        sealed_route.name = normalize_route_name(&name)?;
+    }
+
+    for route_version in route_versions {
+        let (path, version) = parse_route_version(&route_version)?;
+        let normalized_path = normalize_route(&path)?;
+        let sealed_route = normalized.get_mut(&normalized_path).ok_or_else(|| {
+            anyhow!("route version `{normalized_path}` must target a declared sealed route")
+        })?;
+        sealed_route.version = version;
+    }
+
+    for route_dependency in route_dependencies {
+        let (path, dependency, requirement) = parse_route_dependency(&route_dependency)?;
+        let normalized_path = normalize_route(&path)?;
+        let sealed_route = normalized.get_mut(&normalized_path).ok_or_else(|| {
+            anyhow!("route dependency `{normalized_path}` must target a declared sealed route")
+        })?;
+        insert_route_dependency(sealed_route, dependency, requirement)?;
     }
 
     for secret_route in secret_routes {
@@ -685,6 +798,26 @@ fn insert_route_target(route: &mut SealedRoute, target: RouteTarget) {
     route.targets.push(target);
 }
 
+fn insert_route_dependency(
+    route: &mut SealedRoute,
+    dependency: String,
+    requirement: String,
+) -> Result<()> {
+    if let Some(existing) = route.dependencies.get(&dependency) {
+        if existing == &requirement {
+            return Ok(());
+        }
+
+        bail!(
+            "route `{}` defines dependency `{dependency}` more than once",
+            route.path
+        );
+    }
+
+    route.dependencies.insert(dependency, requirement);
+    Ok(())
+}
+
 fn finalize_route(route: SealedRoute) -> Result<SealedRoute> {
     if route.targets.is_empty() && resolve_function_name(&route.path).is_none() {
         bail!(
@@ -694,6 +827,77 @@ fn finalize_route(route: SealedRoute) -> Result<SealedRoute> {
     }
 
     Ok(route)
+}
+
+fn default_route_name(path: &str) -> String {
+    resolve_function_name(path)
+        .unwrap_or_else(|| path.trim_matches('/'))
+        .to_owned()
+}
+
+fn normalize_route_name(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("route names must include a non-empty service name");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        bail!("route names must not contain path separators");
+    }
+
+    Ok(trimmed.to_owned())
+}
+
+fn parse_route_name(value: &str) -> Result<(String, String)> {
+    let (path, name) = value.split_once('=').context(
+        "route names must use the `/path=NAME` syntax, for example `/api/faas-b-v2=faas-b`",
+    )?;
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("route names must include a non-empty path before `=`");
+    }
+
+    Ok((path.to_owned(), name.trim().to_owned()))
+}
+
+fn parse_route_version(value: &str) -> Result<(String, String)> {
+    let (path, version) = value.split_once('=').context(
+        "route versions must use the `/path=VERSION` syntax, for example `/api/faas-b-v2=2.1.0`",
+    )?;
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("route versions must include a non-empty path before `=`");
+    }
+    let version = Version::parse(version.trim()).with_context(|| {
+        format!(
+            "failed to parse route version `{}` in `{value}` as semantic version",
+            version.trim()
+        )
+    })?;
+
+    Ok((path.to_owned(), version.to_string()))
+}
+
+fn parse_route_dependency(value: &str) -> Result<(String, String, String)> {
+    let (path, dependency_spec) = value.split_once('=').context(
+        "route dependencies must use the `/path=NAME@REQ` syntax, for example `/api/faas-a=faas-b@^3.1.0`",
+    )?;
+    let path = path.trim();
+    if path.is_empty() {
+        bail!("route dependencies must include a non-empty path before `=`");
+    }
+
+    let (dependency, requirement) = dependency_spec.trim().split_once('@').context(
+        "route dependencies must use the `/path=NAME@REQ` syntax, for example `/api/faas-a=faas-b@^3.1.0`",
+    )?;
+    let dependency = normalize_route_name(dependency)?;
+    let requirement = VersionReq::parse(requirement.trim()).with_context(|| {
+        format!(
+            "failed to parse route dependency requirement `{}` in `{value}`",
+            requirement.trim()
+        )
+    })?;
+
+    Ok((path.to_owned(), dependency, requirement.to_string()))
 }
 
 fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
@@ -924,6 +1128,9 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect("routes should normalize");
 
@@ -933,6 +1140,9 @@ mod tests {
                 SealedRoute {
                     path: "/api/guest-example".to_owned(),
                     role: RouteRole::User,
+                    name: "guest-example".to_owned(),
+                    version: default_route_version(),
+                    dependencies: BTreeMap::new(),
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
                     min_instances: 0,
@@ -942,6 +1152,9 @@ mod tests {
                 SealedRoute {
                     path: "/api/guest-malicious".to_owned(),
                     role: RouteRole::User,
+                    name: "guest-malicious".to_owned(),
+                    version: default_route_version(),
+                    dependencies: BTreeMap::new(),
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
                     min_instances: 0,
@@ -951,6 +1164,9 @@ mod tests {
                 SealedRoute {
                     path: "/metrics".to_owned(),
                     role: RouteRole::System,
+                    name: "metrics".to_owned(),
+                    version: default_route_version(),
+                    dependencies: BTreeMap::new(),
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
                     min_instances: 0,
@@ -968,6 +1184,9 @@ mod tests {
             system_routes: vec!["/metrics".to_owned()],
             secret_routes: vec!["/api/guest-example=DB_PASS".to_owned()],
             route_targets: Vec::new(),
+            route_names: vec!["/api/guest-example=faas-a".to_owned()],
+            route_versions: vec!["/api/guest-example=2.0.0".to_owned()],
+            route_dependencies: vec!["/api/guest-example=faas-b@^3.1.0".to_owned()],
             route_scales: vec!["/api/guest-example=2:16".to_owned()],
             volumes: vec!["/api/guest-example=/tmp/tachyon_data:/app/data:ro".to_owned()],
             memory_mib: 64,
@@ -982,6 +1201,9 @@ mod tests {
                 SealedRoute {
                     path: "/api/guest-example".to_owned(),
                     role: RouteRole::User,
+                    name: "faas-a".to_owned(),
+                    version: "2.0.0".to_owned(),
+                    dependencies: BTreeMap::from([("faas-b".to_owned(), "^3.1.0".to_owned(),)]),
                     allowed_secrets: vec!["DB_PASS".to_owned()],
                     targets: Vec::new(),
                     min_instances: 2,
@@ -995,6 +1217,9 @@ mod tests {
                 SealedRoute {
                     path: "/metrics".to_owned(),
                     role: RouteRole::System,
+                    name: "metrics".to_owned(),
+                    version: default_route_version(),
+                    dependencies: BTreeMap::new(),
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
                     min_instances: 0,
@@ -1008,6 +1233,9 @@ mod tests {
             .canonical_payload()
             .expect("payload should serialize deterministically");
         assert!(payload.contains("\"path\":\"/api/guest-example\""));
+        assert!(payload.contains("\"name\":\"faas-a\""));
+        assert!(payload.contains("\"version\":\"2.0.0\""));
+        assert!(payload.contains("\"dependencies\":{\"faas-b\":\"^3.1.0\"}"));
         assert!(payload.contains("\"role\":\"system\""));
         assert!(payload.contains("\"allowed_secrets\":[\"DB_PASS\"]"));
         assert!(payload.contains("\"min_instances\":2"));
@@ -1030,6 +1258,12 @@ mod tests {
                 "/api/guest-example=DB_PASS,API_KEY",
                 "--route-target",
                 "/api/guest-example=guest-example,weight=70",
+                "--route-name",
+                "/api/guest-example=faas-a",
+                "--route-version",
+                "/api/guest-example=2.0.0",
+                "--route-dependency",
+                "/api/guest-example=faas-b@^3.1.0",
                 "--route-scale",
                 "/api/guest-example=1:8",
                 "--volume",
@@ -1053,6 +1287,9 @@ mod tests {
                 system_routes: vec!["/metrics".to_owned()],
                 secret_routes: vec!["/api/guest-example=DB_PASS,API_KEY".to_owned()],
                 route_targets: vec!["/api/guest-example=guest-example,weight=70".to_owned()],
+                route_names: vec!["/api/guest-example=faas-a".to_owned()],
+                route_versions: vec!["/api/guest-example=2.0.0".to_owned()],
+                route_dependencies: vec!["/api/guest-example=faas-b@^3.1.0".to_owned()],
                 route_scales: vec!["/api/guest-example=1:8".to_owned()],
                 volumes: vec!["/api/guest-example=C:\\\\tachyon_data:/app/data:rw".to_owned()],
                 memory_mib: 64,
@@ -1069,6 +1306,9 @@ mod tests {
             vec!["/api/guest-example=3:7".to_owned()],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect("route scaling should normalize");
 
@@ -1077,6 +1317,9 @@ mod tests {
             vec![SealedRoute {
                 path: "/api/guest-example".to_owned(),
                 role: RouteRole::User,
+                name: "guest-example".to_owned(),
+                version: default_route_version(),
+                dependencies: BTreeMap::new(),
                 allowed_secrets: Vec::new(),
                 targets: Vec::new(),
                 min_instances: 3,
@@ -1091,6 +1334,9 @@ mod tests {
         let error = normalize_routes(
             vec!["/metrics".to_owned()],
             vec!["/metrics/".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1112,6 +1358,9 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect_err("secret route must target a declared user route");
 
@@ -1129,6 +1378,9 @@ mod tests {
             vec!["/api/missing=1:8".to_owned()],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect_err("route scaling must target a declared route");
 
@@ -1144,6 +1396,9 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["/api/guest-example=1:0".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )
@@ -1171,6 +1426,9 @@ mod tests {
             Vec::new(),
             vec!["C:\\\\tachyon_data:/app/data:rw".to_owned()],
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect("single route volume should normalize");
 
@@ -1196,6 +1454,9 @@ mod tests {
             Vec::new(),
             vec!["/tmp/tachyon_data:/app/data:rw".to_owned()],
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect_err("implicit volume should be rejected when more than one route exists");
 
@@ -1217,6 +1478,9 @@ mod tests {
                 "/api/checkout=checkout-v2,weight=10".to_owned(),
                 "/api/checkout=checkout-beta,header=X-Cohort=beta".to_owned(),
             ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect("route targets should normalize");
 
@@ -1225,6 +1489,9 @@ mod tests {
             vec![SealedRoute {
                 path: "/api/checkout".to_owned(),
                 role: RouteRole::User,
+                name: "checkout".to_owned(),
+                version: default_route_version(),
+                dependencies: BTreeMap::new(),
                 allowed_secrets: Vec::new(),
                 targets: vec![
                     RouteTarget {
@@ -1262,6 +1529,9 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec!["/api/unknown=guest-loop,weight=100".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect_err("route target should require a declared route");
 
