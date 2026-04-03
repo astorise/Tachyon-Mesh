@@ -37,33 +37,24 @@ At startup, `core-host` SHALL hash the embedded configuration payload, reconstru
 
 ### Requirement: Integrity manifest seals route execution roles
 The workspace SHALL seal each configured route in `integrity.lock` as a structured entry
-containing the normalized route path, an execution role of `user` or `system`, optional
-`allowed_secrets`, route-scaling fields `min_instances` plus `max_concurrency`, and
-optional route volume mounts containing `host_path`, `guest_path`, and `readonly`.
+containing the normalized route path, an execution role of `user` or `system`, a logical service
+`name`, a semantic `version`, optional dependency constraints, optional `allowed_secrets`,
+route-scaling fields `min_instances` plus `max_concurrency`, and optional route volume mounts
+containing `host_path`, `guest_path`, and `readonly`.
 
-#### Scenario: Generating a manifest with explicit route scaling
-- **WHEN** a developer runs `tachyon-cli generate --route /api/guest-example --route-scale /api/guest-example=2:16 --memory 64`
-- **THEN** the canonical configuration payload includes `/api/guest-example` with `min_instances = 2`
-- **AND** the same route entry includes `max_concurrency = 16`
+#### Scenario: Generating a manifest with explicit route SemVer metadata
+- **WHEN** a developer runs `tachyon-cli generate --route /api/faas-a --route-name /api/faas-a=faas-a --route-version /api/faas-a=2.0.0 --route-dependency /api/faas-a=faas-b@^3.1.0 --memory 64`
+- **THEN** the canonical configuration payload includes `/api/faas-a`
+- **AND** the same route entry includes `name = "faas-a"` and `version = "2.0.0"`
+- **AND** the same route entry includes a dependency map containing `faas-b = "^3.1.0"`
 - **AND** the route remains normalized before it is signed
 
-#### Scenario: Loading an older manifest without scaling fields
-- **WHEN** `core-host` starts with a sealed manifest whose route entries omit `min_instances` and `max_concurrency`
+#### Scenario: Loading an older manifest without SemVer route metadata
+- **WHEN** `core-host` starts with a sealed manifest whose route entries omit `name`, `version`, and `dependencies`
 - **THEN** integrity validation still succeeds
-- **AND** the host defaults `min_instances` to `0`
-- **AND** the host defaults `max_concurrency` to `100`
-
-#### Scenario: Generating a manifest with explicit route volumes
-- **WHEN** a developer runs `tachyon-cli generate --route /api/guest-volume --volume /api/guest-volume=/tmp/tachyon_data:/app/data:rw --memory 64`
-- **THEN** the canonical configuration payload includes `/api/guest-volume`
-- **AND** the same route entry includes a volume with `host_path = /tmp/tachyon_data`
-- **AND** the volume includes `guest_path = /app/data` and `readonly = false`
-- **AND** the route remains normalized before it is signed
-
-#### Scenario: Loading an older manifest without volume fields
-- **WHEN** `core-host` starts with a sealed manifest whose route entries omit `volumes`
-- **THEN** integrity validation still succeeds
-- **AND** the host defaults the route volume list to empty
+- **AND** the host defaults `name` from the route path
+- **AND** the host defaults `version` to `0.0.0`
+- **AND** the host defaults the dependency map to empty
 
 ### Requirement: Host rejects ambiguous or invalid sealed route metadata
 `core-host` SHALL normalize sealed route paths, reject duplicates, and refuse to start if any sealed route metadata is invalid.
@@ -72,3 +63,4 @@ optional route volume mounts containing `host_path`, `guest_path`, and `readonly
 - **WHEN** the embedded configuration payload contains the same normalized route more than once
 - **THEN** `core-host` fails integrity validation before serving traffic
 - **AND** the error reports that the sealed route metadata is ambiguous
+
