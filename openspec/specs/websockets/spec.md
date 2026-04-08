@@ -1,5 +1,9 @@
-## ADDED Requirements
+# WebSockets
 
+## Purpose
+Define how Tachyon exposes WebSocket resources to guests, lets routes opt into upgrades, and binds upgraded sockets into Wasmtime without blocking the host runtime.
+
+## Requirements
 ### Requirement: The WIT contract exposes a bidirectional WebSocket connection resource
 The Tachyon WIT package SHALL define a WebSocket connection resource with typed frame variants and an `on-connect` guest entrypoint for bidirectional messaging.
 
