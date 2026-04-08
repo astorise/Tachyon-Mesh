@@ -209,7 +209,7 @@ struct GuestRequest {
     body: Bytes,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct GuestHttpResponse {
     status: StatusCode,
     body: Bytes,
@@ -326,6 +326,10 @@ struct IntegrityRoute {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dependencies: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requires_credentials: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    middleware: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     targets: Vec<RouteTarget>,
@@ -361,6 +365,7 @@ struct ResolvedRoute {
     name: String,
     version: Version,
     dependencies: HashMap<String, VersionReq>,
+    requires_credentials: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -734,126 +739,14 @@ async fn faas_handler(
             format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
         )
             .into_response(),
-        Some(route) => {
-            if route.role == RouteRole::System && should_shed_system_route(&state.telemetry) {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("system route `{normalized_path}` shed under load"),
-                )
-                    .into_response()
-            } else {
-                match runtime.concurrency_limits.get(&normalized_path).cloned() {
-                    None => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("route `{normalized_path}` is missing a concurrency limiter"),
-                    )
-                        .into_response(),
-                    Some(semaphore) => match acquire_route_permit(semaphore).await {
-                        Ok(permit) => {
-                            let _permit = permit;
-                            match select_route_module(&route, &headers) {
-                                Ok(selected_module) => {
-                                    let propagated_headers = extract_propagated_headers(&headers);
-                                    let engine = runtime.engine.clone();
-                                    let request_config = runtime.config.clone();
-                                    let response_config = runtime.config.clone();
-                                    let route_registry = Arc::clone(&runtime.route_registry);
-                                    let concurrency_limits =
-                                        Arc::clone(&runtime.concurrency_limits);
-                                    let telemetry_context = GuestTelemetryContext {
-                                        handle: state.telemetry.clone(),
-                                        trace_id: trace_id.clone(),
-                                    };
-                                    let runtime_telemetry = state.telemetry.clone();
-                                    let secret_access =
-                                        SecretAccess::from_route(&route, &state.secrets_vault);
-                                    let task_route = route.clone();
-                                    let task_function_name = selected_module.clone();
-                                    let task_propagated_headers = propagated_headers.clone();
-                                    let guest_request = GuestRequest {
-                                        method: method.to_string(),
-                                        uri: uri.to_string(),
-                                        body,
-                                    };
-                                    let result = tokio::task::spawn_blocking(move || {
-                                        execute_guest(
-                                            &engine,
-                                            &task_function_name,
-                                            guest_request,
-                                            &task_route,
-                                            GuestExecutionContext {
-                                                config: request_config,
-                                                runtime_telemetry,
-                                                secret_access,
-                                                telemetry: Some(telemetry_context),
-                                                concurrency_limits,
-                                                propagated_headers: task_propagated_headers,
-                                            },
-                                        )
-                                    })
-                                    .await;
-
-                                    match result {
-                                        Ok(Ok(output)) => {
-                                            let response = match output {
-                                                GuestExecutionOutput::Http(response) => response,
-                                                GuestExecutionOutput::LegacyStdout(stdout) => {
-                                                    GuestHttpResponse {
-                                                        status: StatusCode::OK,
-                                                        body: stdout,
-                                                    }
-                                                }
-                                            };
-
-                                            match resolve_mesh_response(
-                                                &state.http_client,
-                                                &response_config,
-                                                &route_registry,
-                                                &route,
-                                                hop_limit,
-                                                &propagated_headers,
-                                                response,
-                                            )
-                                            .await
-                                            {
-                                                Ok(response) => {
-                                                    (response.status, response.body).into_response()
-                                                }
-                                                Err(error) => {
-                                                    (StatusCode::BAD_GATEWAY, error).into_response()
-                                                }
-                                            }
-                                        }
-                                        Ok(Err(error)) => {
-                                            error.log_if_needed(&selected_module);
-                                            error.into_response(&response_config).into_response()
-                                        }
-                                        Err(error) => (
-                                            StatusCode::INTERNAL_SERVER_ERROR,
-                                            format!("guest execution task failed: {error}"),
-                                        )
-                                            .into_response(),
-                                    }
-                                }
-                                Err(error) => {
-                                    (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
-                                }
-                            }
-                        }
-                        Err(RoutePermitError::Closed) => (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("route `{normalized_path}` is currently unavailable"),
-                        )
-                            .into_response(),
-                        Err(RoutePermitError::TimedOut) => (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("route `{normalized_path}` is saturated"),
-                        )
-                            .into_response(),
-                    },
-                }
-            }
-        }
+        Some(route) => match execute_route_with_middleware(
+            &state, &runtime, &route, &headers, &method, &uri, &body, hop_limit, &trace_id,
+        )
+        .await
+        {
+            Ok(response) => (response.status, response.body).into_response(),
+            Err((status, message)) => (status, message).into_response(),
+        },
     };
 
     telemetry::record_event(
@@ -866,6 +759,176 @@ async fn faas_handler(
     );
 
     response
+}
+
+async fn execute_route_with_middleware(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    hop_limit: HopLimit,
+    trace_id: &str,
+) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    if let Some(middleware_name) = route.middleware.as_deref() {
+        let middleware_resolved = runtime
+            .route_registry
+            .resolve_named_route(middleware_name)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        let middleware_route = runtime
+            .config
+            .sealed_route(&middleware_resolved.path)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "route middleware `{middleware_name}` resolved to missing path `{}`",
+                        middleware_resolved.path
+                    ),
+                )
+            })?;
+        let middleware_response = execute_route_request(
+            state,
+            runtime,
+            &middleware_route,
+            headers,
+            method,
+            uri,
+            body,
+            hop_limit,
+            trace_id,
+        )
+        .await?;
+        if middleware_response.status != StatusCode::OK {
+            return Ok(middleware_response);
+        }
+    }
+
+    execute_route_request(
+        state, runtime, route, headers, method, uri, body, hop_limit, trace_id,
+    )
+    .await
+}
+
+async fn execute_route_request(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    hop_limit: HopLimit,
+    trace_id: &str,
+) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    if route.role == RouteRole::System && should_shed_system_route(&state.telemetry) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("system route `{}` shed under load", route.path),
+        ));
+    }
+
+    let semaphore = runtime
+        .concurrency_limits
+        .get(&route.path)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("route `{}` is missing a concurrency limiter", route.path),
+            )
+        })?;
+    let _permit = match acquire_route_permit(semaphore).await {
+        Ok(permit) => permit,
+        Err(RoutePermitError::Closed) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("route `{}` is currently unavailable", route.path),
+            ));
+        }
+        Err(RoutePermitError::TimedOut) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("route `{}` is saturated", route.path),
+            ));
+        }
+    };
+
+    let selected_module = select_route_module(route, headers)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let propagated_headers = extract_propagated_headers(headers);
+    let engine = runtime.engine.clone();
+    let request_config = runtime.config.clone();
+    let response_config = runtime.config.clone();
+    let route_registry = Arc::clone(&runtime.route_registry);
+    let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+    let telemetry_context = GuestTelemetryContext {
+        handle: state.telemetry.clone(),
+        trace_id: trace_id.to_owned(),
+    };
+    let runtime_telemetry = state.telemetry.clone();
+    let secret_access = SecretAccess::from_route(route, &state.secrets_vault);
+    let task_route = route.clone();
+    let task_function_name = selected_module.clone();
+    let task_propagated_headers = propagated_headers.clone();
+    let guest_request = GuestRequest {
+        method: method.to_string(),
+        uri: uri.to_string(),
+        body: body.clone(),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        execute_guest(
+            &engine,
+            &task_function_name,
+            guest_request,
+            &task_route,
+            GuestExecutionContext {
+                config: request_config,
+                runtime_telemetry,
+                secret_access,
+                telemetry: Some(telemetry_context),
+                concurrency_limits,
+                propagated_headers: task_propagated_headers,
+            },
+        )
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("guest execution task failed: {error}"),
+        )
+    })?;
+
+    let response = match result {
+        Ok(output) => match output {
+            GuestExecutionOutput::Http(response) => response,
+            GuestExecutionOutput::LegacyStdout(stdout) => GuestHttpResponse {
+                status: StatusCode::OK,
+                body: stdout,
+            },
+        },
+        Err(error) => {
+            error.log_if_needed(&selected_module);
+            let (status, message) = error.into_response(&response_config);
+            return Err((status, message));
+        }
+    };
+
+    resolve_mesh_response(
+        &state.http_client,
+        &response_config,
+        &route_registry,
+        route,
+        hop_limit,
+        &propagated_headers,
+        response,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_GATEWAY, error))
 }
 
 async fn acquire_route_permit(
@@ -1155,6 +1218,7 @@ impl RouteRegistry {
                 name: route.name.clone(),
                 version,
                 dependencies,
+                requires_credentials: route.requires_credentials.iter().cloned().collect(),
             };
             let version_text = resolved.version.to_string();
             if let Some(existing_path) = seen_versions.insert(
@@ -1193,6 +1257,21 @@ impl RouteRegistry {
                 .map_err(anyhow::Error::msg)?;
         }
 
+        for route in &config.routes {
+            if let Some(middleware) = &route.middleware {
+                let resolved_middleware = registry
+                    .resolve_named_route(middleware)
+                    .map_err(anyhow::Error::msg)?;
+                if resolved_middleware.path == route.path {
+                    return Err(anyhow!(
+                        "Integrity Validation Failed: route `{}` cannot use itself (`{}`) as middleware",
+                        route.path,
+                        middleware
+                    ));
+                }
+            }
+        }
+
         Ok(registry)
     }
 
@@ -1201,24 +1280,26 @@ impl RouteRegistry {
         route: &ResolvedRoute,
     ) -> std::result::Result<(), String> {
         for (dependency_name, requirement) in &route.dependencies {
-            if self
-                .by_name
-                .get(dependency_name)
-                .into_iter()
-                .flatten()
-                .any(|candidate| requirement.matches(&candidate.version))
-            {
-                continue;
-            }
+            let dependency =
+                self.resolve_dependency_candidate(route, dependency_name, requirement)?;
+            let missing_credentials = dependency
+                .requires_credentials
+                .difference(&route.requires_credentials)
+                .cloned()
+                .collect::<Vec<_>>();
 
-            return Err(format!(
-                "Dependency resolution failed: route {} ({}@{}) requires {} matching {}, but no compatible version was loaded",
-                route.path,
-                route.name,
-                route.version,
-                dependency_name,
-                requirement
-            ));
+            if !missing_credentials.is_empty() {
+                return Err(format!(
+                    "Credential delegation failed: route {} ({}@{}) must also declare {:?} to satisfy dependency {} ({}@{})",
+                    route.path,
+                    route.name,
+                    route.version,
+                    missing_credentials,
+                    dependency.path,
+                    dependency.name,
+                    dependency.version
+                ));
+            }
         }
 
         Ok(())
@@ -1241,6 +1322,24 @@ impl RouteRegistry {
             )
         })?;
 
+        self.resolve_dependency_candidate(caller, dependency_name, requirement)
+    }
+
+    fn resolve_named_route(&self, route_name: &str) -> std::result::Result<&ResolvedRoute, String> {
+        self.by_name
+            .get(route_name)
+            .and_then(|routes| routes.first())
+            .ok_or_else(|| {
+                format!("route middleware `{route_name}` does not match any sealed route name")
+            })
+    }
+
+    fn resolve_dependency_candidate(
+        &self,
+        caller: &ResolvedRoute,
+        dependency_name: &str,
+        requirement: &VersionReq,
+    ) -> std::result::Result<&ResolvedRoute, String> {
         self.by_name
             .get(dependency_name)
             .into_iter()
@@ -2107,6 +2206,8 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         name: normalize_route_name(&route.name, &normalized)?,
         version: normalize_route_version(&route.version, &normalized)?,
         dependencies: normalize_route_dependencies(route.dependencies, &normalized)?,
+        requires_credentials: normalize_route_credentials(route.requires_credentials)?,
+        middleware: normalize_route_middleware(route.middleware, &normalized)?,
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
         targets: normalize_route_targets(route.targets)?,
         min_instances: route.min_instances,
@@ -2176,6 +2277,34 @@ fn normalize_route_dependencies(
             Ok((normalized_name, parsed.to_string()))
         })
         .collect()
+}
+
+fn normalize_route_credentials(credentials: Vec<String>) -> Result<Vec<String>> {
+    credentials
+        .into_iter()
+        .map(|credential| {
+            let trimmed = credential.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route credentials must not be empty"
+                ));
+            }
+            Ok(trimmed.to_owned())
+        })
+        .collect::<Result<BTreeSet<_>>>()
+        .map(|credentials| credentials.into_iter().collect())
+}
+
+fn normalize_route_middleware(middleware: Option<String>, path: &str) -> Result<Option<String>> {
+    middleware
+        .map(|middleware| {
+            normalize_service_name(&middleware).map_err(|error| {
+                anyhow!(
+                    "Integrity Validation Failed: route `{path}` has an invalid `middleware`: {error}"
+                )
+            })
+        })
+        .transpose()
 }
 
 fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
@@ -2761,6 +2890,8 @@ impl IntegrityRoute {
             name: default_route_name(path),
             version: default_route_version(),
             dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -2777,6 +2908,8 @@ impl IntegrityRoute {
             name: default_route_name(path),
             version: default_route_version(),
             dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -2793,6 +2926,8 @@ impl IntegrityRoute {
             name: default_route_name(path),
             version: default_route_version(),
             dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
             allowed_secrets: allowed_secrets
                 .iter()
                 .map(|secret| (*secret).to_owned())
@@ -3001,6 +3136,8 @@ mod tests {
             name: "guest-volume".to_owned(),
             version: default_route_version(),
             dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -4226,6 +4363,8 @@ mod tests {
         assert_eq!(route.name, "guest-example");
         assert_eq!(route.version, DEFAULT_ROUTE_VERSION);
         assert!(route.dependencies.is_empty());
+        assert!(route.requires_credentials.is_empty());
+        assert!(route.middleware.is_none());
         assert_eq!(route.min_instances, 0);
         assert_eq!(route.max_concurrency, DEFAULT_ROUTE_MAX_CONCURRENCY);
         assert!(route.volumes.is_empty());
@@ -4246,6 +4385,188 @@ mod tests {
     }
 
     #[test]
+    fn validate_integrity_config_rejects_missing_delegated_credentials() {
+        let mut config = IntegrityConfig::default_sealed();
+        let faas_a = dependency_route("/api/faas-a", "faas-a", "2.0.0", &[("faas-b", "^2.0")]);
+        let mut faas_b = versioned_route("/api/faas-b-v2", "faas-b", "2.1.0");
+        faas_b.requires_credentials = vec!["c2".to_owned()];
+        config.routes = vec![faas_a, faas_b];
+
+        let error = validate_integrity_config(config)
+            .expect_err("missing delegated credentials should fail validation");
+
+        assert!(error.to_string().contains("Credential delegation failed"));
+        assert!(error.to_string().contains("c2"));
+    }
+
+    #[test]
+    fn validate_integrity_config_accepts_satisfied_delegated_credentials() {
+        let mut config = IntegrityConfig::default_sealed();
+        let mut faas_a = dependency_route("/api/faas-a", "faas-a", "2.0.0", &[("faas-b", "^2.0")]);
+        faas_a.requires_credentials = vec!["c2".to_owned()];
+        let mut faas_b = versioned_route("/api/faas-b-v2", "faas-b", "2.1.0");
+        faas_b.requires_credentials = vec!["c2".to_owned()];
+        config.routes = vec![faas_a, faas_b];
+
+        let config = validate_integrity_config(config)
+            .expect("delegated credentials should satisfy dependency validation");
+        let route = config
+            .sealed_route("/api/faas-a")
+            .expect("caller route should remain sealed");
+
+        assert_eq!(route.requires_credentials, vec!["c2".to_owned()]);
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_unknown_middleware_route() {
+        let mut config = IntegrityConfig::default_sealed();
+        let mut protected = IntegrityRoute::user(DEFAULT_ROUTE);
+        protected.middleware = Some("missing-auth".to_owned());
+        config.routes = vec![protected];
+
+        let error = validate_integrity_config(config)
+            .expect_err("unknown middleware route should fail validation");
+
+        assert!(error
+            .to_string()
+            .contains("route middleware `missing-auth`"));
+    }
+
+    #[test]
+    fn middleware_routes_short_circuit_non_ok_responses_and_allow_ok_responses() {
+        fn simulate_middleware_chain(
+            runtime: &RuntimeState,
+            route: &IntegrityRoute,
+            responses: &HashMap<String, GuestHttpResponse>,
+            visited: &mut Vec<String>,
+        ) -> GuestHttpResponse {
+            if let Some(middleware_name) = route.middleware.as_deref() {
+                let middleware = runtime
+                    .route_registry
+                    .resolve_named_route(middleware_name)
+                    .expect("middleware route should resolve");
+                let middleware_route = runtime
+                    .config
+                    .sealed_route(&middleware.path)
+                    .expect("middleware route should stay sealed");
+                visited.push(middleware_route.path.clone());
+                let middleware_response = responses
+                    .get(&middleware_route.path)
+                    .expect("middleware response should be defined")
+                    .clone();
+                if middleware_response.status != StatusCode::OK {
+                    return middleware_response;
+                }
+            }
+
+            visited.push(route.path.clone());
+            responses
+                .get(&route.path)
+                .expect("main route response should be defined")
+                .clone()
+        }
+
+        let mut protected_allow = targeted_route(
+            "/api/protected-allow",
+            vec![weighted_target("guest-example", 100)],
+        );
+        protected_allow.name = "protected-allow".to_owned();
+        protected_allow.middleware = Some("allow-middleware".to_owned());
+
+        let mut protected_deny = targeted_route(
+            "/api/protected-deny",
+            vec![weighted_target("guest-example", 100)],
+        );
+        protected_deny.name = "protected-deny".to_owned();
+        protected_deny.middleware = Some("deny-middleware".to_owned());
+
+        let mut allow_middleware = IntegrityRoute::user("/api/allow-middleware");
+        allow_middleware.name = "allow-middleware".to_owned();
+
+        let mut deny_middleware = IntegrityRoute::user("/api/deny-middleware");
+        deny_middleware.name = "deny-middleware".to_owned();
+
+        let config = IntegrityConfig {
+            routes: vec![
+                protected_allow.clone(),
+                protected_deny.clone(),
+                allow_middleware,
+                deny_middleware,
+            ],
+            ..IntegrityConfig::default_sealed()
+        };
+        let runtime = build_test_runtime(
+            validate_integrity_config(config).expect("test config should validate"),
+        );
+
+        let allow_route = runtime
+            .config
+            .sealed_route("/api/protected-allow")
+            .expect("allow route should stay sealed");
+        let deny_route = runtime
+            .config
+            .sealed_route("/api/protected-deny")
+            .expect("deny route should stay sealed");
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            "/api/allow-middleware".to_owned(),
+            GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from("middleware allowed"),
+            },
+        );
+        responses.insert(
+            "/api/protected-allow".to_owned(),
+            GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from(expected_guest_example_body(
+                    "FaaS received an empty payload",
+                )),
+            },
+        );
+        responses.insert(
+            "/api/deny-middleware".to_owned(),
+            GuestHttpResponse {
+                status: StatusCode::FORBIDDEN,
+                body: Bytes::from("forbidden"),
+            },
+        );
+        responses.insert(
+            "/api/protected-deny".to_owned(),
+            GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from("main route should not execute"),
+            },
+        );
+
+        let mut allow_visited = Vec::new();
+        let allow_response =
+            simulate_middleware_chain(&runtime, allow_route, &responses, &mut allow_visited);
+        assert_eq!(
+            allow_visited,
+            vec![
+                "/api/allow-middleware".to_owned(),
+                "/api/protected-allow".to_owned()
+            ]
+        );
+        assert_eq!(allow_response.status, StatusCode::OK);
+        assert_eq!(
+            allow_response.body,
+            Bytes::from(expected_guest_example_body(
+                "FaaS received an empty payload"
+            ))
+        );
+
+        let mut deny_visited = Vec::new();
+        let deny_response =
+            simulate_middleware_chain(&runtime, deny_route, &responses, &mut deny_visited);
+        assert_eq!(deny_visited, vec!["/api/deny-middleware".to_owned()]);
+        assert_eq!(deny_response.status, StatusCode::FORBIDDEN);
+        assert_eq!(deny_response.body, Bytes::from("forbidden"));
+    }
+
+    #[test]
     fn validate_integrity_config_normalizes_route_volumes() {
         let mut config = IntegrityConfig::default_sealed();
         config.routes = vec![IntegrityRoute {
@@ -4254,6 +4575,8 @@ mod tests {
             name: "guest-volume".to_owned(),
             version: default_route_version(),
             dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
@@ -4289,6 +4612,8 @@ mod tests {
             name: "guest-example".to_owned(),
             version: default_route_version(),
             dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             min_instances: 0,
