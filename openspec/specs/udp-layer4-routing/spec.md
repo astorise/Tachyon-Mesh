@@ -1,5 +1,9 @@
-## ADDED Requirements
+# UDP Layer4 Routing
 
+## Purpose
+Define how Tachyon binds UDP ports to guest targets, exposes a packet-oriented guest contract, and protects the host with bounded asynchronous dispatch.
+
+## Requirements
 ### Requirement: Hosts can bind UDP ports to packet-handling targets
 The host manifest SHALL allow operators to map Layer 4 UDP ports to target names independently from TCP mappings.
 
