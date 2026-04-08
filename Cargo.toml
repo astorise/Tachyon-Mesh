@@ -16,6 +16,7 @@ members = [
     "system-faas-storage-broker",
     "system-faas-k8s-scaler",
     "system-faas-keda",
+    "system-faas-cert-manager",
     "system-faas-prom",
     "tachyon-cli",
 ]
