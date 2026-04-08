@@ -115,6 +115,8 @@ pub struct SealedVolume {
     #[serde(default)]
     pub readonly: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eviction_policy: Option<VolumeEvictionPolicy>,
@@ -838,6 +840,7 @@ fn parse_volume_spec(value: &str) -> Result<SealedVolume> {
     }
 
     let mut volume_type = VolumeType::Host;
+    let mut ttl_seconds = None;
     let mut idle_timeout = None;
     let mut eviction_policy = None;
     for option in segments {
@@ -857,6 +860,9 @@ fn parse_volume_spec(value: &str) -> Result<SealedVolume> {
                     "ram" => VolumeType::Ram,
                     _ => bail!("volume `type` must be `host` or `ram`"),
                 };
+            }
+            "ttl_seconds" => {
+                ttl_seconds = Some(parse_ttl_seconds(option_value)?);
             }
             "idle_timeout" => {
                 validate_idle_timeout(option_value)?;
@@ -887,6 +893,7 @@ fn parse_volume_spec(value: &str) -> Result<SealedVolume> {
         host_path: host_path.to_owned(),
         guest_path: normalize_guest_volume_path(&mapping[separator + 1..])?,
         readonly,
+        ttl_seconds,
         idle_timeout,
         eviction_policy,
     })
@@ -977,6 +984,18 @@ fn validate_idle_timeout(value: &str) -> Result<()> {
 
     let _ = suffix;
     Ok(())
+}
+
+fn parse_ttl_seconds(value: &str) -> Result<u64> {
+    let ttl_seconds = value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("failed to parse volume `ttl_seconds {value}`"))?;
+    if ttl_seconds == 0 {
+        bail!("volume `ttl_seconds` must be greater than zero");
+    }
+
+    Ok(ttl_seconds)
 }
 
 fn insert_route_target(route: &mut SealedRoute, target: RouteTarget) {
@@ -1475,6 +1494,7 @@ mod tests {
                         host_path: "/tmp/tachyon_data".to_owned(),
                         guest_path: "/app/data".to_owned(),
                         readonly: true,
+                        ttl_seconds: None,
                         idle_timeout: None,
                         eviction_policy: None,
                     }],
@@ -1780,6 +1800,7 @@ mod tests {
                 host_path: "C:\\\\tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: true,
+                ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
             }]
@@ -1861,6 +1882,7 @@ mod tests {
                 host_path: "/tmp/tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: false,
+                ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
             }]
@@ -1894,8 +1916,40 @@ mod tests {
                 host_path: "/tmp/tachyon_ram".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: false,
+                ttl_seconds: None,
                 idle_timeout: Some("50ms".to_owned()),
                 eviction_policy: Some(VolumeEvictionPolicy::Hibernate),
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_routes_accepts_volume_ttl_seconds() {
+        let routes = normalize_routes(
+            vec!["/api/guest-volume".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["/tmp/tachyon_data:/app/data:ro,ttl_seconds=300".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("volume ttl should normalize");
+
+        assert_eq!(
+            routes[0].volumes,
+            vec![SealedVolume {
+                volume_type: VolumeType::Host,
+                host_path: "/tmp/tachyon_data".to_owned(),
+                guest_path: "/app/data".to_owned(),
+                readonly: true,
+                ttl_seconds: Some(300),
+                idle_timeout: None,
+                eviction_policy: None,
             }]
         );
     }

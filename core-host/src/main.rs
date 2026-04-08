@@ -26,7 +26,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, Once,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -95,6 +95,7 @@ const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
 const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
+const VOLUME_GC_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const KUBERNETES_SERVICE_BASE_URL: &str = "https://kubernetes.default.svc";
 const MOCK_K8S_URL_ENV: &str = "TACHYON_MOCK_K8S_URL";
 #[cfg(not(test))]
@@ -362,6 +363,12 @@ struct ResolvedStorageWriteTarget {
     host_target: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TtlManagedPath {
+    host_path: PathBuf,
+    ttl: Duration,
+}
+
 #[derive(Clone, Default)]
 struct VolumeManager {
     volumes: Arc<Mutex<HashMap<String, Arc<ManagedVolume>>>>,
@@ -481,6 +488,8 @@ struct IntegrityVolume {
     #[serde(default)]
     readonly: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_timeout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     eviction_policy: Option<VolumeEvictionPolicy>,
@@ -545,6 +554,7 @@ async fn run() -> Result<()> {
         background_workers: Arc::clone(&background_workers),
     };
     spawn_reload_watcher(state.clone());
+    spawn_volume_gc_sweeper(state.clone());
     let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind(&runtime.config.host_address)
@@ -1208,6 +1218,165 @@ impl Drop for RouteVolumeLeaseGuard {
     }
 }
 
+async fn run_volume_gc_tick(runtime: Arc<RuntimeState>) -> Result<()> {
+    let managed_paths = collect_ttl_managed_paths(&runtime.config);
+    let mut handles = Vec::with_capacity(managed_paths.len());
+
+    for managed_path in managed_paths {
+        handles.push(tokio::task::spawn_blocking(move || {
+            sweep_ttl_managed_path(&managed_path)
+        }));
+    }
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("volume GC worker failed: {error:#}"),
+            Err(error) => tracing::warn!("volume GC blocking task failed: {error}"),
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_ttl_managed_paths(config: &IntegrityConfig) -> Vec<TtlManagedPath> {
+    let mut deduped = BTreeMap::<PathBuf, Duration>::new();
+
+    for route in &config.routes {
+        for volume in &route.volumes {
+            let Some(ttl_seconds) = volume.ttl_seconds else {
+                continue;
+            };
+            let ttl = Duration::from_secs(ttl_seconds);
+            let host_path = normalize_path(PathBuf::from(&volume.host_path));
+            deduped
+                .entry(host_path)
+                .and_modify(|existing| {
+                    if ttl < *existing {
+                        *existing = ttl;
+                    }
+                })
+                .or_insert(ttl);
+        }
+    }
+
+    deduped
+        .into_iter()
+        .map(|(host_path, ttl)| TtlManagedPath { host_path, ttl })
+        .collect()
+}
+
+fn sweep_ttl_managed_path(managed_path: &TtlManagedPath) -> Result<()> {
+    let read_dir = match fs::read_dir(&managed_path.host_path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read TTL-managed path `{}`",
+                    managed_path.host_path.display()
+                )
+            })
+        }
+    };
+
+    for entry in read_dir {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to enumerate an entry inside TTL-managed path `{}`",
+                managed_path.host_path.display()
+            )
+        })?;
+        let entry_path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read metadata for TTL-managed entry `{}`",
+                        entry_path.display()
+                    )
+                })
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read modified time for TTL-managed entry `{}`",
+                        entry_path.display()
+                    )
+                })
+            }
+        };
+
+        if !ttl_entry_is_stale(modified, managed_path.ttl) {
+            continue;
+        }
+
+        if let Err(error) = remove_stale_ttl_entry(&entry_path, metadata.is_dir()) {
+            tracing::warn!(
+                path = %entry_path.display(),
+                "volume GC failed to remove stale entry gracefully: {error:#}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn ttl_entry_is_stale(modified: SystemTime, ttl: Duration) -> bool {
+    SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age >= ttl)
+}
+
+fn remove_stale_ttl_entry(path: &Path, is_dir: bool) -> Result<()> {
+    let result = if is_dir {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+
+    match result {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "volume GC removed stale entry");
+            Ok(())
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove stale TTL-managed entry `{}`",
+                path.display()
+            )
+        }),
+    }
+}
+
 fn resolve_storage_write_target(
     route: &IntegrityRoute,
     path: &str,
@@ -1432,6 +1601,20 @@ fn spawn_reload_watcher(state: AppState) {
 
 #[cfg(not(unix))]
 fn spawn_reload_watcher(_state: AppState) {}
+
+fn spawn_volume_gc_sweeper(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(VOLUME_GC_TICK_INTERVAL);
+
+        loop {
+            interval.tick().await;
+            let runtime = state.runtime.load_full();
+            if let Err(error) = run_volume_gc_tick(runtime).await {
+                tracing::warn!("volume GC sweep failed: {error:#}");
+            }
+        }
+    });
+}
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
 async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
@@ -3208,6 +3391,7 @@ fn normalize_route_volumes(
             volume.guest_path.clone(),
             volume.host_path.clone(),
             volume.readonly,
+            volume.ttl_seconds,
             volume.idle_timeout.clone(),
             volume.eviction_policy.clone(),
         )) {
@@ -3250,6 +3434,11 @@ fn validate_route_volume(
     }
 
     let guest_path = normalize_guest_volume_path(&volume.guest_path)?;
+    if volume.ttl_seconds.is_some_and(|ttl| ttl == 0) {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` must set `ttl_seconds` above zero"
+        ));
+    }
     let idle_timeout = volume
         .idle_timeout
         .as_deref()
@@ -3279,6 +3468,7 @@ fn validate_route_volume(
         host_path: host_path.to_owned(),
         guest_path,
         readonly: volume.readonly,
+        ttl_seconds: volume.ttl_seconds,
         idle_timeout,
         eviction_policy: volume.eviction_policy,
     })
@@ -4175,6 +4365,7 @@ mod tests {
                 host_path: host_path.display().to_string(),
                 guest_path: "/app/data".to_owned(),
                 readonly,
+                ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
             }],
@@ -4203,6 +4394,7 @@ mod tests {
                 host_path: host_path.display().to_string(),
                 guest_path: "/app/data".to_owned(),
                 readonly: false,
+                ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
             }],
@@ -4227,8 +4419,34 @@ mod tests {
                 host_path: host_path.display().to_string(),
                 guest_path: "/app/data".to_owned(),
                 readonly: false,
+                ttl_seconds: None,
                 idle_timeout: Some("50ms".to_owned()),
                 eviction_policy: Some(VolumeEvictionPolicy::Hibernate),
+            }],
+        }
+    }
+
+    fn ttl_managed_volume_route(host_path: &std::path::Path, ttl_seconds: u64) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/api/guest-volume".to_owned(),
+            role: RouteRole::User,
+            name: "guest-volume".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
+                host_path: host_path.display().to_string(),
+                guest_path: "/app/data".to_owned(),
+                readonly: true,
+                ttl_seconds: Some(ttl_seconds),
+                idle_timeout: None,
+                eviction_policy: None,
             }],
         }
     }
@@ -5677,6 +5895,7 @@ mod tests {
                 host_path: "  /tmp/tachyon_data  ".to_owned(),
                 guest_path: "/app/data/".to_owned(),
                 readonly: true,
+                ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
             }],
@@ -5694,6 +5913,7 @@ mod tests {
                 host_path: "/tmp/tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: true,
+                ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
             }]
@@ -5720,6 +5940,7 @@ mod tests {
                 host_path: "/tmp/tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: false,
+                ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
             }],
@@ -5749,6 +5970,39 @@ mod tests {
         assert_eq!(
             route.volumes[0].eviction_policy,
             Some(VolumeEvictionPolicy::Hibernate)
+        );
+    }
+
+    #[test]
+    fn validate_integrity_config_accepts_volume_ttl_seconds() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![ttl_managed_volume_route(Path::new("/tmp/tachyon-ttl"), 300)];
+
+        let config = validate_integrity_config(config).expect("volume ttl should validate");
+        let route = config
+            .sealed_route("/api/guest-volume")
+            .expect("route should remain sealed");
+
+        assert_eq!(route.volumes[0].ttl_seconds, Some(300));
+    }
+
+    #[test]
+    fn collect_ttl_managed_paths_deduplicates_by_shortest_ttl() {
+        let shared_dir = Path::new("/tmp/tachyon-ttl-shared");
+        let config = IntegrityConfig {
+            routes: vec![
+                ttl_managed_volume_route(shared_dir, 300),
+                ttl_managed_volume_route(shared_dir, 60),
+            ],
+            ..IntegrityConfig::default_sealed()
+        };
+
+        assert_eq!(
+            collect_ttl_managed_paths(&config),
+            vec![TtlManagedPath {
+                host_path: PathBuf::from("/tmp/tachyon-ttl-shared"),
+                ttl: Duration::from_secs(60),
+            }]
         );
     }
 
@@ -5800,6 +6054,40 @@ mod tests {
                 "write-7",
             ]
         );
+
+        let _ = fs::remove_dir_all(volume_dir);
+    }
+
+    #[tokio::test]
+    async fn volume_gc_tick_removes_stale_entries_from_short_lived_volume() {
+        let volume_dir = unique_test_dir("tachyon-volume-gc");
+        let stale_file = volume_dir.join("stale.txt");
+        let stale_dir = volume_dir.join("stale-dir");
+        fs::write(&stale_file, "stale").expect("stale file should be created");
+        fs::create_dir_all(&stale_dir).expect("stale directory should be created");
+        fs::write(stale_dir.join("nested.txt"), "stale").expect("nested file should be created");
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let fresh_file = volume_dir.join("fresh.txt");
+        fs::write(&fresh_file, "fresh").expect("fresh file should be created");
+
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![ttl_managed_volume_route(&volume_dir, 1)];
+
+        run_volume_gc_tick(Arc::new(build_test_runtime(config)))
+            .await
+            .expect("volume GC tick should complete");
+
+        assert!(
+            !stale_file.exists(),
+            "stale file should be removed by the GC sweep"
+        );
+        assert!(
+            !stale_dir.exists(),
+            "stale directory should be removed by the GC sweep"
+        );
+        assert!(fresh_file.exists(), "fresh file should not be removed");
 
         let _ = fs::remove_dir_all(volume_dir);
     }
