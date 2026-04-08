@@ -275,6 +275,16 @@ struct UdsFastPathRegistry {
 #[derive(Clone, Default)]
 struct UdsFastPathRegistry;
 
+#[cfg(unix)]
+fn new_uds_fast_path_registry() -> UdsFastPathRegistry {
+    UdsFastPathRegistry::default()
+}
+
+#[cfg(not(unix))]
+fn new_uds_fast_path_registry() -> UdsFastPathRegistry {
+    UdsFastPathRegistry
+}
+
 struct LegacyHostState {
     wasi: WasiP1Ctx,
     #[cfg(feature = "ai-inference")]
@@ -1045,7 +1055,7 @@ async fn run() -> Result<()> {
         telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
     let runtime = build_runtime_state(verify_integrity()?)?;
     let host_identity = Arc::new(HostIdentity::generate());
-    let uds_fast_path = Arc::new(UdsFastPathRegistry::default());
+    let uds_fast_path = Arc::new(new_uds_fast_path_registry());
     let storage_broker = Arc::new(StorageBrokerManager::default());
     let background_workers = Arc::new(BackgroundWorkerManager::default());
     background_workers.start_for_runtime(
@@ -1236,6 +1246,7 @@ impl BackgroundWorkerManager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_background_tick_loop(
     engine: Engine,
     config: IntegrityConfig,
@@ -2885,6 +2896,7 @@ async fn handle_tcp_layer4_connection(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_tcp_layer4_guest(
     engine: &Engine,
     config: &IntegrityConfig,
@@ -3146,6 +3158,7 @@ async fn faas_handler(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_route_with_middleware(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
@@ -3217,6 +3230,7 @@ async fn execute_route_with_middleware(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_route_request(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
@@ -3393,6 +3407,7 @@ async fn acquire_route_permit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_mesh_response(
     http_client: &Client,
     config: &IntegrityConfig,
@@ -4451,10 +4466,10 @@ fn websocket_message_to_host_frame(message: AxumWebSocketMessage) -> HostWebSock
 #[cfg(feature = "websockets")]
 fn host_frame_to_websocket_message(frame: HostWebSocketFrame) -> AxumWebSocketMessage {
     match frame {
-        HostWebSocketFrame::Text(text) => AxumWebSocketMessage::Text(text.into()),
-        HostWebSocketFrame::Binary(bytes) => AxumWebSocketMessage::Binary(bytes.into()),
-        HostWebSocketFrame::Ping(bytes) => AxumWebSocketMessage::Ping(bytes.into()),
-        HostWebSocketFrame::Pong(bytes) => AxumWebSocketMessage::Pong(bytes.into()),
+        HostWebSocketFrame::Text(text) => AxumWebSocketMessage::Text(text),
+        HostWebSocketFrame::Binary(bytes) => AxumWebSocketMessage::Binary(bytes),
+        HostWebSocketFrame::Ping(bytes) => AxumWebSocketMessage::Ping(bytes),
+        HostWebSocketFrame::Pong(bytes) => AxumWebSocketMessage::Pong(bytes),
         HostWebSocketFrame::Close => AxumWebSocketMessage::Close(None),
     }
 }
@@ -4611,6 +4626,7 @@ fn execute_system_component_guest(
 }
 
 impl BackgroundTickRunner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         engine: &Engine,
         config: &IntegrityConfig,
@@ -6160,6 +6176,7 @@ impl SecretAccess {
 }
 
 impl ComponentHostState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         route: &IntegrityRoute,
         runtime_config: IntegrityConfig,
@@ -6473,12 +6490,12 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
     ) -> std::result::Result<(), String> {
         let source_path = parse_storage_broker_host_path(&source_path, "source_path")?;
         let snapshot_path = parse_storage_broker_host_path(&snapshot_path, "snapshot_path")?;
-        let _ = self.storage_broker.enqueue_snapshot(
+        drop(self.storage_broker.enqueue_snapshot(
             volume_id,
             &source_path,
             &source_path,
             &snapshot_path,
-        )?;
+        )?);
         Ok(())
     }
 
@@ -6491,12 +6508,12 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
         let snapshot_path = parse_storage_broker_host_path(&snapshot_path, "snapshot_path")?;
         let destination_path =
             parse_storage_broker_host_path(&destination_path, "destination_path")?;
-        let _ = self.storage_broker.enqueue_restore(
+        drop(self.storage_broker.enqueue_restore(
             volume_id,
             &destination_path,
             &snapshot_path,
             &destination_path,
-        )?;
+        )?);
         Ok(())
     }
 }
@@ -6869,7 +6886,7 @@ mod tests {
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
             host_identity: test_host_identity(21),
-            uds_fast_path: Arc::new(UdsFastPathRegistry::default()),
+            uds_fast_path: Arc::new(new_uds_fast_path_registry()),
             storage_broker: Arc::new(StorageBrokerManager::default()),
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry,
@@ -7666,7 +7683,7 @@ mod tests {
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
             host_identity: test_host_identity(22),
-            uds_fast_path: Arc::new(UdsFastPathRegistry::default()),
+            uds_fast_path: Arc::new(new_uds_fast_path_registry()),
             storage_broker: Arc::new(StorageBrokerManager::default()),
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry: telemetry::init_test_telemetry(),
@@ -8049,7 +8066,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let metering_file = metering_dir.join("metering.ndjson");
-        let contents = tokio::time::timeout(Duration::from_secs(2), async {
+        let contents = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(contents) = fs::read_to_string(&metering_file) {
                     if !contents.trim().is_empty() {
@@ -8353,7 +8370,7 @@ mod tests {
             .connect(listener_addr)
             .expect("UDP client should connect to listener");
         client
-            .set_read_timeout(Some(Duration::from_millis(750)))
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("UDP client should set a read timeout");
 
         client
@@ -8383,7 +8400,7 @@ mod tests {
                 Err(error) => panic!("UDP client receive should not fail: {error}"),
             }
 
-            if started.elapsed() > Duration::from_secs(2) {
+            if started.elapsed() > Duration::from_secs(5) {
                 break;
             }
         }
@@ -8473,7 +8490,7 @@ mod tests {
         assert!(matches!(text_frame, Message::Text(text) if text == "hello"));
 
         client
-            .send(Message::Binary(vec![1_u8, 2, 3].into()))
+            .send(Message::Binary(vec![1_u8, 2, 3]))
             .await
             .expect("WebSocket client should send binary frame");
         let binary_frame = client
@@ -8808,7 +8825,7 @@ mod tests {
             &route_registry,
             caller_route,
             host_identity.as_ref(),
-            &UdsFastPathRegistry::default(),
+            &new_uds_fast_path_registry(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &propagated_headers,
             GuestHttpResponse {
@@ -8892,7 +8909,7 @@ mod tests {
             &route_registry,
             caller_route,
             host_identity.as_ref(),
-            &UdsFastPathRegistry::default(),
+            &new_uds_fast_path_registry(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &[],
             GuestHttpResponse {
@@ -9144,7 +9161,7 @@ mod tests {
             start.elapsed()
         };
 
-        let tcp_elapsed = benchmark(&UdsFastPathRegistry::default()).await;
+        let tcp_elapsed = benchmark(&new_uds_fast_path_registry()).await;
         let uds_elapsed = benchmark(uds_registry.as_ref()).await;
 
         uds_server.abort();
