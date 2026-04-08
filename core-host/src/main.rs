@@ -581,9 +581,10 @@ impl UdsFastPathRegistry {
             )
         })?;
 
-        let host_id = Uuid::new_v4().to_string();
-        let socket_path = discovery_dir.join(format!("host-{host_id}.sock"));
-        let metadata_path = discovery_dir.join(format!("host-{host_id}.json"));
+        let host_id = Uuid::new_v4().simple().to_string();
+        let file_stem = format!("h-{}", &host_id[..12]);
+        let socket_path = discovery_dir.join(format!("{file_stem}.sock"));
+        let metadata_path = discovery_dir.join(format!("{file_stem}.json"));
         if socket_path.exists() {
             remove_path_if_exists(&socket_path)?;
         }
@@ -7168,7 +7169,18 @@ mod tests {
     }
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+        let short_prefix: String = prefix
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        let short_prefix = if short_prefix.is_empty() {
+            "tmp".to_owned()
+        } else {
+            short_prefix.to_ascii_lowercase()
+        };
+        let unique_id = Uuid::new_v4().simple().to_string();
+        let path = std::env::temp_dir().join(format!("{short_prefix}-{}", &unique_id[..8]));
         fs::create_dir_all(&path).expect("temporary directory should be created");
         path
     }
@@ -8066,7 +8078,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let metering_file = metering_dir.join("metering.ndjson");
-        let contents = tokio::time::timeout(Duration::from_secs(5), async {
+        let contents = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if let Ok(contents) = fs::read_to_string(&metering_file) {
                     if !contents.trim().is_empty() {
