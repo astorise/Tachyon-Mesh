@@ -35,6 +35,15 @@ interface scaling-metrics {
     get-pending-queue-size: func(route-path: string) -> u32;
 }
 
+interface storage-broker {
+    enum write-mode {
+        overwrite,
+        append,
+    }
+
+    enqueue-write: func(path: string, mode: write-mode, body: list<u8>) -> result<_, string>;
+}
+
 interface outbound-http {
     send-request: func(method: string, url: string, body: list<u8>) -> result<u16, string>;
 }
@@ -57,6 +66,7 @@ world faas-guest {
 world system-faas-guest {
     import telemetry-reader;
     import scaling-metrics;
+    import storage-broker;
     export handler;
 }
 
