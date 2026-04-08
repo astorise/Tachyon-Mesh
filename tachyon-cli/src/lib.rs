@@ -111,6 +111,18 @@ pub struct SealedRoute {
     pub volumes: Vec<SealedVolume>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SealedLayer4Config {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp: Vec<SealedTcpBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SealedTcpBinding {
+    pub port: u16,
+    pub target: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SealedVolume {
     #[serde(
@@ -138,6 +150,8 @@ pub struct SealedConfig {
     pub guest_fuel_budget: u64,
     pub guest_memory_limit_bytes: usize,
     pub resource_limit_response: String,
+    #[serde(default, skip_serializing_if = "SealedLayer4Config::is_empty")]
+    pub layer4: SealedLayer4Config,
     #[serde(
         default = "default_telemetry_sample_rate",
         skip_serializing_if = "is_default_telemetry_sample_rate"
@@ -165,6 +179,7 @@ struct GenerateRequest {
     route_credentials: Vec<String>,
     route_middlewares: Vec<String>,
     route_scales: Vec<String>,
+    tcp_ports: Vec<String>,
     volumes: Vec<String>,
     telemetry_sample_rate: f64,
     memory_mib: u32,
@@ -174,6 +189,12 @@ struct GenerateRequest {
 struct RouteScaling {
     min_instances: u32,
     max_concurrency: u32,
+}
+
+impl SealedLayer4Config {
+    fn is_empty(&self) -> bool {
+        self.tcp.is_empty()
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -247,6 +268,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         route_credentials: parse_optional_routes_arg(&subcommand.matches.args, "route-credential")?,
         route_middlewares: parse_optional_routes_arg(&subcommand.matches.args, "route-middleware")?,
         route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
+        tcp_ports: parse_optional_string_args(&subcommand.matches.args, "tcp-port", "tcp-port")?,
         volumes: parse_optional_string_args(&subcommand.matches.args, "volume", "volume")?,
         telemetry_sample_rate: parse_telemetry_sample_rate_arg(&subcommand.matches.args)?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
@@ -279,6 +301,7 @@ fn parse_generate_request_from_args(
     let mut route_credentials = Vec::new();
     let mut route_middlewares = Vec::new();
     let mut route_scales = Vec::new();
+    let mut tcp_ports = Vec::new();
     let mut volumes = Vec::new();
     let mut telemetry_sample_rate = DEFAULT_TELEMETRY_SAMPLE_RATE;
     let mut memory_mib = None;
@@ -424,6 +447,19 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--tcp-port=") {
+            tcp_ports.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--tcp-port" {
+            let binding = args.next().context(
+                "missing value for `--tcp-port`; expected `--tcp-port 2222=guest-tcp-echo`",
+            )?;
+            tcp_ports.push(binding);
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix("--volume=") {
             volumes.push(value.to_owned());
             continue;
@@ -472,6 +508,7 @@ fn parse_generate_request_from_args(
         route_credentials,
         route_middlewares,
         route_scales,
+        tcp_ports,
         volumes,
         telemetry_sample_rate,
         memory_mib,
@@ -525,6 +562,7 @@ impl SealedConfig {
             request.route_credentials,
             request.route_middlewares,
         )?;
+        let layer4 = normalize_tcp_bindings(request.tcp_ports, &routes)?;
         let memory_mib = usize::try_from(request.memory_mib)
             .context("memory limit is too large for this platform")?;
         let guest_memory_limit_bytes = memory_mib
@@ -537,6 +575,7 @@ impl SealedConfig {
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes,
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            layer4,
             telemetry_sample_rate: request.telemetry_sample_rate,
             routes,
         })
@@ -842,6 +881,56 @@ fn normalize_routes(
         .into_values()
         .map(finalize_route)
         .collect::<Result<Vec<_>>>()
+}
+
+fn normalize_tcp_bindings(
+    bindings: Vec<String>,
+    routes: &[SealedRoute],
+) -> Result<SealedLayer4Config> {
+    let route_names = routes
+        .iter()
+        .map(|route| route.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut normalized = bindings
+        .into_iter()
+        .map(|binding| {
+            let (port, target) = parse_tcp_binding(&binding)?;
+            if !route_names.contains(&target) {
+                bail!("TCP Layer 4 target `{target}` must reference a declared sealed route name");
+            }
+            Ok(SealedTcpBinding { port, target })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    normalized.sort_by_key(|binding| binding.port);
+    for pair in normalized.windows(2) {
+        if pair[0].port == pair[1].port {
+            bail!(
+                "TCP Layer 4 port `{}` is defined more than once",
+                pair[0].port
+            );
+        }
+    }
+
+    Ok(SealedLayer4Config { tcp: normalized })
+}
+
+fn parse_tcp_binding(value: &str) -> Result<(u16, String)> {
+    let trimmed = value.trim();
+    let (port, target) = trimmed
+        .split_once('=')
+        .context("TCP Layer 4 bindings must use the `PORT=TARGET` syntax")?;
+    let port = port
+        .trim()
+        .parse::<u16>()
+        .with_context(|| format!("failed to parse TCP Layer 4 port `{port}`"))?;
+    if port == 0 {
+        bail!("TCP Layer 4 bindings must use a port above zero");
+    }
+
+    let target = normalize_route_name(target.trim())
+        .context("TCP Layer 4 targets must use a non-empty sealed route name")?;
+    Ok((port, target))
 }
 
 fn parse_route_volume(
@@ -1534,6 +1623,7 @@ mod tests {
             route_credentials: Vec::new(),
             route_middlewares: Vec::new(),
             route_scales: vec!["/api/guest-example=2:16".to_owned()],
+            tcp_ports: vec!["2222=faas-a".to_owned()],
             volumes: vec!["/api/guest-example=/tmp/tachyon_data:/app/data:ro".to_owned()],
             telemetry_sample_rate: 0.25,
             memory_mib: 64,
@@ -1542,6 +1632,15 @@ mod tests {
 
         assert_eq!(config.guest_fuel_budget, DEFAULT_GUEST_FUEL_BUDGET);
         assert_eq!(config.guest_memory_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            config.layer4,
+            SealedLayer4Config {
+                tcp: vec![SealedTcpBinding {
+                    port: 2222,
+                    target: "faas-a".to_owned(),
+                }]
+            }
+        );
         assert_eq!(config.telemetry_sample_rate, 0.25);
         assert_eq!(
             config.routes,
@@ -1596,6 +1695,7 @@ mod tests {
         assert!(payload.contains("\"allowed_secrets\":[\"DB_PASS\"]"));
         assert!(payload.contains("\"min_instances\":2"));
         assert!(payload.contains("\"max_concurrency\":16"));
+        assert!(payload.contains("\"layer4\":{\"tcp\":[{\"port\":2222,\"target\":\"faas-a\"}]}"));
         assert!(payload.contains("\"guest_path\":\"/app/data\""));
         assert!(payload.contains("\"readonly\":true"));
         assert!(payload.contains("\"telemetry_sample_rate\":0.25"));
@@ -1623,6 +1723,8 @@ mod tests {
                 "/api/guest-example=faas-b@^3.1.0",
                 "--route-scale",
                 "/api/guest-example=1:8",
+                "--tcp-port",
+                "2222=faas-a",
                 "--telemetry-sample-rate",
                 "0.5",
                 "--volume",
@@ -1652,6 +1754,7 @@ mod tests {
                 route_credentials: Vec::new(),
                 route_middlewares: Vec::new(),
                 route_scales: vec!["/api/guest-example=1:8".to_owned()],
+                tcp_ports: vec!["2222=faas-a".to_owned()],
                 volumes: vec!["/api/guest-example=C:\\\\tachyon_data:/app/data:rw".to_owned()],
                 telemetry_sample_rate: 0.5,
                 memory_mib: 64,

@@ -39,7 +39,7 @@ use std::{
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
@@ -47,8 +47,9 @@ use wasmtime::{
     ResourceLimiter, Store, Trap, TypedFunc,
 };
 use wasmtime_wasi::{
+    cli::{InputFile, IsTerminal, OutputFile, StdinStream, StdoutStream},
     p1::{self, WasiP1Ctx},
-    p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
+    p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult},
     DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 #[cfg(feature = "ai-inference")]
@@ -194,6 +195,12 @@ struct RuntimeState {
     config: IntegrityConfig,
     route_registry: Arc<RouteRegistry>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+}
+
+struct TcpLayer4ListenerHandle {
+    #[cfg_attr(not(test), allow(dead_code))]
+    local_addr: SocketAddr,
+    join_handle: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -662,6 +669,7 @@ impl UdsFastPathRegistry {
 enum ResourceLimitKind {
     Fuel,
     Memory,
+    Stdout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -839,6 +847,18 @@ enum VolumeEvictionPolicy {
     Hibernate,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+struct IntegrityLayer4Config {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tcp: Vec<IntegrityTcpBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct IntegrityTcpBinding {
+    port: u16,
+    target: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct IntegrityRoute {
     path: String,
@@ -895,6 +915,8 @@ struct IntegrityConfig {
     guest_fuel_budget: u64,
     guest_memory_limit_bytes: usize,
     resource_limit_response: String,
+    #[serde(default, skip_serializing_if = "IntegrityLayer4Config::is_empty")]
+    layer4: IntegrityLayer4Config,
     #[serde(
         default = "default_telemetry_sample_rate",
         skip_serializing_if = "is_default_telemetry_sample_rate"
@@ -916,6 +938,12 @@ struct ResolvedRoute {
 struct RouteRegistry {
     by_name: HashMap<String, Vec<ResolvedRoute>>,
     by_path: HashMap<String, ResolvedRoute>,
+}
+
+impl IntegrityLayer4Config {
+    fn is_empty(&self) -> bool {
+        self.tcp.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -965,7 +993,8 @@ async fn run() -> Result<()> {
     spawn_metering_exporter(state.clone(), export_receiver);
     spawn_reload_watcher(state.clone());
     spawn_volume_gc_sweeper(state.clone());
-    let app = build_app(state);
+    let app = build_app(state.clone());
+    let tcp_layer4_listeners = start_tcp_layer4_listeners(state).await?;
     let uds_server = start_uds_fast_path_listener(app.clone(), &runtime.config, uds_fast_path)?;
 
     let listener = tokio::net::TcpListener::bind(&runtime.config.host_address)
@@ -988,6 +1017,10 @@ async fn run() -> Result<()> {
     if let Some(server) = uds_server {
         server.abort();
         let _ = server.await;
+    }
+    for listener in tcp_layer4_listeners {
+        listener.join_handle.abort();
+        let _ = listener.join_handle.await;
     }
     background_workers.stop_all().await;
     Ok(())
@@ -2286,6 +2319,197 @@ fn start_uds_fast_path_listener(
     Ok(None)
 }
 
+fn layer4_bind_address(host_address: &str, port: u16) -> Result<SocketAddr> {
+    let mut address = host_address.parse::<SocketAddr>().with_context(|| {
+        format!("failed to parse `host_address` `{host_address}` for Layer 4 TCP binding")
+    })?;
+    address.set_port(port);
+    Ok(address)
+}
+
+async fn start_tcp_layer4_listeners(state: AppState) -> Result<Vec<TcpLayer4ListenerHandle>> {
+    let runtime = state.runtime.load_full();
+    let mut listeners = Vec::new();
+
+    for binding in &runtime.config.layer4.tcp {
+        let resolved = runtime
+            .route_registry
+            .resolve_named_route(&binding.target)
+            .map_err(|error| {
+                anyhow!(
+                    "invalid TCP Layer 4 binding target `{}`: {error}",
+                    binding.target
+                )
+            })?;
+        let route = runtime
+            .config
+            .sealed_route(&resolved.path)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "TCP Layer 4 binding target `{}` resolved to a missing route",
+                    binding.target
+                )
+            })?;
+        let bind_address = layer4_bind_address(&runtime.config.host_address, binding.port)?;
+        let listener = tokio::net::TcpListener::bind(bind_address)
+            .await
+            .with_context(|| format!("failed to bind TCP Layer 4 listener on {bind_address}"))?;
+        let local_addr = listener
+            .local_addr()
+            .context("failed to read bound TCP Layer 4 listener address")?;
+        let listener_state = state.clone();
+        let listener_route = route.clone();
+        let listener_target = binding.target.clone();
+        let join_handle = tokio::spawn(async move {
+            loop {
+                let (stream, remote_addr) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(
+                            port = local_addr.port(),
+                            target = listener_target,
+                            "TCP Layer 4 listener accept failed: {error}"
+                        );
+                        break;
+                    }
+                };
+
+                let connection_state = listener_state.clone();
+                let connection_route = listener_route.clone();
+                let connection_target = connection_route.name.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        handle_tcp_layer4_connection(connection_state, connection_route, stream)
+                            .await
+                    {
+                        tracing::warn!(
+                            target = %connection_target,
+                            remote = %remote_addr,
+                            "TCP Layer 4 connection failed: {error:#}"
+                        );
+                    }
+                });
+            }
+        });
+
+        listeners.push(TcpLayer4ListenerHandle {
+            local_addr,
+            join_handle,
+        });
+    }
+
+    Ok(listeners)
+}
+
+async fn handle_tcp_layer4_connection(
+    state: AppState,
+    route: IntegrityRoute,
+    stream: tokio::net::TcpStream,
+) -> Result<()> {
+    let runtime = state.runtime.load_full();
+    let volume_leases = state
+        .volume_manager
+        .acquire_route_volumes(&route, Arc::clone(&state.storage_broker))
+        .await
+        .map_err(|error| anyhow!("failed to acquire TCP Layer 4 volumes: {error}"))?;
+    let semaphore = runtime
+        .concurrency_limits
+        .get(&route.path)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "TCP Layer 4 route `{}` is missing a concurrency limiter",
+                route.path
+            )
+        })?;
+    let permit = acquire_route_permit(semaphore)
+        .await
+        .map_err(|error| match error {
+            RoutePermitError::Closed => {
+                anyhow!("TCP Layer 4 route `{}` is unavailable", route.path)
+            }
+            RoutePermitError::TimedOut => {
+                anyhow!("TCP Layer 4 route `{}` is saturated", route.path)
+            }
+        })?;
+    let function_name = select_stream_route_module(&route)
+        .map_err(|error| anyhow!("failed to resolve TCP Layer 4 target module: {error}"))?;
+    let engine = runtime.engine.clone();
+    let config = runtime.config.clone();
+    let socket = stream
+        .into_std()
+        .context("failed to convert TCP Layer 4 socket into std mode")?;
+    socket
+        .set_nonblocking(false)
+        .context("failed to set TCP Layer 4 socket into blocking mode")?;
+    let stdin_socket = socket
+        .try_clone()
+        .context("failed to clone TCP Layer 4 socket for guest stdin")?;
+    let host_identity = Arc::clone(&state.host_identity);
+    let storage_broker = Arc::clone(&state.storage_broker);
+    let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+    let telemetry = state.telemetry.clone();
+
+    let (result_tx, result_rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _volume_leases = volume_leases;
+        let _permit = permit;
+        let _ = result_tx.send(execute_tcp_layer4_guest(
+            &engine,
+            &config,
+            &route,
+            &function_name,
+            TcpSocketStdin::new(stdin_socket),
+            TcpSocketStdout::new(socket),
+            telemetry,
+            host_identity,
+            storage_broker,
+            concurrency_limits,
+        ));
+    });
+    result_rx
+        .await
+        .context("TCP Layer 4 guest thread exited before returning a result")??;
+    Ok(())
+}
+
+fn execute_tcp_layer4_guest(
+    engine: &Engine,
+    config: &IntegrityConfig,
+    route: &IntegrityRoute,
+    function_name: &str,
+    stdin_stream: TcpSocketStdin,
+    stdout_stream: TcpSocketStdout,
+    runtime_telemetry: TelemetryHandle,
+    host_identity: Arc<HostIdentity>,
+    storage_broker: Arc<StorageBrokerManager>,
+    concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+) -> std::result::Result<(), ExecutionError> {
+    let execution = GuestExecutionContext {
+        config: config.clone(),
+        sampled_execution: false,
+        runtime_telemetry,
+        secret_access: SecretAccess::from_route(route, &SecretsVault::load()),
+        request_headers: HeaderMap::new(),
+        host_identity,
+        storage_broker,
+        telemetry: None,
+        concurrency_limits,
+        propagated_headers: Vec::new(),
+    };
+    let (module_path, module) = resolve_legacy_guest_module(engine, function_name)?;
+    execute_legacy_guest_with_stdio(
+        engine,
+        route,
+        &module_path,
+        module,
+        &execution,
+        stdin_stream,
+        stdout_stream,
+    )
+}
+
 async fn hop_limit_middleware(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -2755,6 +2979,15 @@ fn select_route_module(
     headers: &HeaderMap,
 ) -> std::result::Result<String, String> {
     select_route_module_with_roll(route, headers, None)
+}
+
+fn select_stream_route_module(route: &IntegrityRoute) -> std::result::Result<String, String> {
+    if route.targets.is_empty() {
+        return Ok(route.name.clone());
+    }
+
+    select_route_module_with_roll(route, &HeaderMap::new(), None)
+        .or_else(|_| Ok(route.name.clone()))
 }
 
 fn select_route_module_with_roll(
@@ -3563,11 +3796,19 @@ fn execute_legacy_guest(
     execution: &GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
     let linker = build_linker(engine)?;
-    let stdout = MemoryOutputPipe::new(execution.config.max_stdout_bytes);
+    let stdin_file = create_guest_stdin_file(&body)?;
+    let stdout_file = create_guest_stdout_file()?;
+    let stdout_path = stdout_file.path.clone();
     let mut wasi = WasiCtxBuilder::new();
     wasi.arg(legacy_guest_program_name(module_path))
-        .stdin(MemoryInputPipe::new(body))
-        .stdout(stdout.clone());
+        .stdin(InputFile::new(stdin_file.file.try_clone().map_err(|error| {
+            guest_execution_error(error.into(), "failed to clone guest stdin file handle")
+        })?))
+        .stdout(OutputFile::new(
+            stdout_file.file.try_clone().map_err(|error| {
+                guest_execution_error(error.into(), "failed to clone guest stdout file handle")
+            })?,
+        ));
 
     if let Some(module_dir) = module_path.parent() {
         wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
@@ -3607,14 +3848,271 @@ fn execute_legacy_guest(
     record_wasm_end(execution.telemetry.as_ref());
     let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
     handle_guest_entrypoint_result(entrypoint_name, call_result)?;
+    stdout_file.file.sync_all().map_err(|error| {
+        guest_execution_error(error.into(), "failed to flush guest stdout temp file to disk")
+    })?;
+    let stdout_bytes = read_guest_stdout_file(&stdout_path, execution.config.max_stdout_bytes)?;
 
     Ok(GuestExecutionOutcome {
-        output: GuestExecutionOutput::LegacyStdout(split_guest_stdout(
-            function_name,
-            stdout.contents(),
-        )),
+        output: GuestExecutionOutput::LegacyStdout(split_guest_stdout(function_name, stdout_bytes)),
         fuel_consumed,
     })
+}
+
+fn execute_legacy_guest_with_stdio(
+    engine: &Engine,
+    route: &IntegrityRoute,
+    module_path: &Path,
+    module: Module,
+    execution: &GuestExecutionContext,
+    stdin: impl StdinStream + 'static,
+    stdout: impl StdoutStream + 'static,
+) -> std::result::Result<(), ExecutionError> {
+    let linker = build_linker(engine)?;
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.arg(legacy_guest_program_name(module_path))
+        .stdin(stdin)
+        .stdout(stdout);
+
+    if let Some(module_dir) = module_path.parent() {
+        wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
+            .map_err(|error| {
+                guest_execution_error(
+                    error,
+                    format!(
+                        "failed to preopen guest module directory {}",
+                        module_dir.display()
+                    ),
+                )
+            })?;
+    }
+
+    preopen_route_volumes(&mut wasi, route)?;
+
+    let wasi = wasi.build_p1();
+    let mut store = Store::new(
+        engine,
+        LegacyHostState::new(wasi, execution.config.guest_memory_limit_bytes),
+    );
+    store.limiter(|state| &mut state.limits);
+    maybe_set_guest_fuel_budget(&mut store, execution)?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(|error| guest_execution_error(error, "failed to instantiate guest module"))?;
+    let (entrypoint_name, entrypoint) =
+        resolve_guest_entrypoint(&mut store, &instance).map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to resolve exported function `faas_entry` or `_start`",
+            )
+        })?;
+
+    record_wasm_start(execution.telemetry.as_ref());
+    let call_result = entrypoint.call(&mut store, ());
+    record_wasm_end(execution.telemetry.as_ref());
+    let _ = sampled_fuel_consumed(&mut store, execution)?;
+    handle_guest_entrypoint_result(entrypoint_name, call_result)?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct TcpSocketStdin {
+    socket: Arc<Mutex<std::net::TcpStream>>,
+}
+
+impl TcpSocketStdin {
+    fn new(socket: std::net::TcpStream) -> Self {
+        Self {
+            socket: Arc::new(Mutex::new(socket)),
+        }
+    }
+}
+
+impl IsTerminal for TcpSocketStdin {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdinStream for TcpSocketStdin {
+    fn p2_stream(&self) -> Box<dyn InputStream> {
+        Box::new(self.clone())
+    }
+
+    fn async_stream(&self) -> Box<dyn tokio::io::AsyncRead + Send + Sync> {
+        Box::new(tokio::io::empty())
+    }
+}
+
+#[async_trait::async_trait]
+impl InputStream for TcpSocketStdin {
+    fn read(&mut self, size: usize) -> StreamResult<Bytes> {
+        if size == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let mut socket = self
+            .socket
+            .lock()
+            .map_err(|_| StreamError::trap("tcp stdin socket lock poisoned"))?;
+        let mut buffer = vec![0_u8; size];
+        loop {
+            match std::io::Read::read(&mut *socket, &mut buffer) {
+                Ok(0) => return Err(StreamError::Closed),
+                Ok(read) => {
+                    buffer.truncate(read);
+                    return Ok(Bytes::from(buffer));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(StreamError::LastOperationFailed(error.into())),
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for TcpSocketStdin {
+    async fn ready(&mut self) {}
+}
+
+#[derive(Clone)]
+struct TcpSocketStdout {
+    socket: Arc<Mutex<std::net::TcpStream>>,
+}
+
+impl TcpSocketStdout {
+    fn new(socket: std::net::TcpStream) -> Self {
+        Self {
+            socket: Arc::new(Mutex::new(socket)),
+        }
+    }
+}
+
+impl IsTerminal for TcpSocketStdout {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for TcpSocketStdout {
+    fn p2_stream(&self) -> Box<dyn OutputStream> {
+        Box::new(self.clone())
+    }
+
+    fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
+        Box::new(tokio::io::sink())
+    }
+}
+
+#[async_trait::async_trait]
+impl OutputStream for TcpSocketStdout {
+    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        let mut socket = self
+            .socket
+            .lock()
+            .map_err(|_| StreamError::trap("tcp stdout socket lock poisoned"))?;
+        loop {
+            match std::io::Write::write_all(&mut *socket, &bytes) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(StreamError::LastOperationFailed(error.into())),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> StreamResult<()> {
+        let mut socket = self
+            .socket
+            .lock()
+            .map_err(|_| StreamError::trap("tcp stdout socket lock poisoned"))?;
+        std::io::Write::flush(&mut *socket)
+            .map_err(|error| StreamError::LastOperationFailed(error.into()))
+    }
+
+    fn check_write(&mut self) -> StreamResult<usize> {
+        Ok(4096)
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for TcpSocketStdout {
+    async fn ready(&mut self) {}
+}
+
+struct GuestTempFile {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl Drop for GuestTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn create_guest_stdin_file(body: &Bytes) -> std::result::Result<GuestTempFile, ExecutionError> {
+    let path = guest_temp_file_path("stdin");
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .read(true)
+        .open(&path)
+        .map_err(|error| {
+            guest_execution_error(error.into(), "failed to create guest stdin temp file")
+        })?;
+    file.write_all(body).map_err(|error| {
+        guest_execution_error(error.into(), "failed to write guest stdin temp file")
+    })?;
+    file.flush().map_err(|error| {
+        guest_execution_error(error.into(), "failed to flush guest stdin temp file")
+    })?;
+    file.sync_all().map_err(|error| {
+        guest_execution_error(error.into(), "failed to sync guest stdin temp file to disk")
+    })?;
+    drop(file);
+    let file = fs::File::open(&path).map_err(|error| {
+        guest_execution_error(error.into(), "failed to reopen guest stdin temp file")
+    })?;
+    Ok(GuestTempFile { path, file })
+}
+
+fn create_guest_stdout_file() -> std::result::Result<GuestTempFile, ExecutionError> {
+    let path = guest_temp_file_path("stdout");
+    let file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .read(true)
+        .open(&path)
+        .map_err(|error| {
+            guest_execution_error(error.into(), "failed to create guest stdout temp file")
+        })?;
+    Ok(GuestTempFile { path, file })
+}
+
+fn guest_temp_file_path(kind: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("tachyon-{kind}-{}.tmp", Uuid::new_v4()));
+    path
+}
+
+fn read_guest_stdout_file(
+    path: &Path,
+    max_stdout_bytes: usize,
+) -> std::result::Result<Bytes, ExecutionError> {
+    let stdout = fs::read(path).map_err(|error| {
+        guest_execution_error(error.into(), "failed to read guest stdout temp file")
+    })?;
+    if stdout.len() > max_stdout_bytes {
+        return Err(ExecutionError::ResourceLimitExceeded {
+            kind: ResourceLimitKind::Stdout,
+            detail: format!(
+                "guest wrote {} bytes to stdout with a configured limit of {} bytes",
+                stdout.len(),
+                max_stdout_bytes
+            ),
+        });
+    }
+    Ok(Bytes::from(stdout))
 }
 
 fn maybe_set_guest_fuel_budget<T>(
@@ -4037,7 +4535,8 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
     }
 
     config.routes = normalize_config_routes(config.routes)?;
-    RouteRegistry::build(&config)?;
+    let route_registry = RouteRegistry::build(&config)?;
+    config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
     Ok(config)
 }
 
@@ -4062,6 +4561,58 @@ fn normalize_config_routes(routes: Vec<IntegrityRoute>) -> Result<Vec<IntegrityR
             ));
         }
     }
+    Ok(normalized)
+}
+
+fn normalize_layer4_config(
+    mut layer4: IntegrityLayer4Config,
+    route_registry: &RouteRegistry,
+) -> Result<IntegrityLayer4Config> {
+    layer4.tcp = normalize_tcp_bindings(layer4.tcp, route_registry)?;
+    Ok(layer4)
+}
+
+fn normalize_tcp_bindings(
+    bindings: Vec<IntegrityTcpBinding>,
+    route_registry: &RouteRegistry,
+) -> Result<Vec<IntegrityTcpBinding>> {
+    let mut normalized = bindings
+        .into_iter()
+        .map(|binding| {
+            if binding.port == 0 {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: TCP Layer 4 bindings must use a port above zero"
+                ));
+            }
+
+            let target = normalize_service_name(&binding.target).map_err(|error| {
+                anyhow!("Integrity Validation Failed: TCP Layer 4 target is invalid: {error}")
+            })?;
+            route_registry
+                .resolve_named_route(&target)
+                .map_err(|error| {
+                    anyhow!(
+                    "Integrity Validation Failed: TCP Layer 4 target `{target}` is invalid: {error}"
+                )
+                })?;
+
+            Ok(IntegrityTcpBinding {
+                port: binding.port,
+                target,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    normalized.sort_by_key(|binding| binding.port);
+    for pair in normalized.windows(2) {
+        if pair[0].port == pair[1].port {
+            return Err(anyhow!(
+                "Integrity Validation Failed: TCP Layer 4 port `{}` is defined more than once",
+                pair[0].port
+            ));
+        }
+    }
+
     Ok(normalized)
 }
 
@@ -4943,6 +5494,7 @@ impl IntegrityConfig {
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            layer4: IntegrityLayer4Config::default(),
             telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
             routes: vec![
                 IntegrityRoute::user_with_secrets(DEFAULT_ROUTE, &["DB_PASS"]),
@@ -5069,6 +5621,7 @@ impl fmt::Display for ResourceLimitKind {
         match self {
             Self::Fuel => f.write_str("fuel"),
             Self::Memory => f.write_str("memory"),
+            Self::Stdout => f.write_str("stdout"),
         }
     }
 }
@@ -5101,6 +5654,20 @@ impl fmt::Display for GuestModuleNotFound {
 }
 
 impl std::error::Error for GuestModuleNotFound {}
+
+impl fmt::Display for ExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GuestModuleNotFound(error) => write!(f, "{error}"),
+            Self::ResourceLimitExceeded { kind, detail } => {
+                write!(f, "guest exceeded its {kind} quota: {detail}")
+            }
+            Self::Internal(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutionError {}
 
 impl ExecutionError {
     fn into_response(self, config: &IntegrityConfig) -> (StatusCode, String) {
@@ -5210,6 +5777,7 @@ mod tests {
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            layer4: IntegrityLayer4Config::default(),
             telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
             routes,
         }
@@ -5349,6 +5917,31 @@ mod tests {
                 eviction_policy: None,
             }],
         }
+    }
+
+    fn tcp_echo_test_route(max_concurrency: u32) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/tcp/echo".to_owned(),
+            role: RouteRole::User,
+            name: "guest-tcp-echo".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            min_instances: 0,
+            max_concurrency,
+            volumes: Vec::new(),
+        }
+    }
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("temporary TCP listener should bind")
+            .local_addr()
+            .expect("temporary TCP listener should expose an address")
+            .port()
     }
 
     fn hibernating_ram_route(host_path: &std::path::Path) -> IntegrityRoute {
@@ -5702,6 +6295,44 @@ mod tests {
                 output: GuestExecutionOutput::LegacyStdout(Bytes::from(
                     "MESH_FETCH:http://legacy-service:8081/ping\n"
                 )),
+                fuel_consumed: None,
+            }
+        );
+    }
+
+    #[test]
+    fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
+        let config = IntegrityConfig::default_sealed();
+        let engine = build_test_engine(&config);
+        let route = tcp_echo_test_route(1);
+        let response = execute_guest(
+            &engine,
+            "guest-tcp-echo",
+            GuestRequest {
+                method: "TCP".to_owned(),
+                uri: "tcp://guest-tcp-echo".to_owned(),
+                body: Bytes::from_static(b"ping over tcp"),
+            },
+            &route,
+            GuestExecutionContext {
+                config,
+                sampled_execution: false,
+                runtime_telemetry: telemetry::init_test_telemetry(),
+                secret_access: SecretAccess::default(),
+                request_headers: HeaderMap::new(),
+                host_identity: test_host_identity(32),
+                storage_broker: Arc::new(StorageBrokerManager::default()),
+                telemetry: None,
+                concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
+                propagated_headers: Vec::new(),
+            },
+        )
+        .expect("legacy guest execution should succeed");
+
+        assert_eq!(
+            response,
+            GuestExecutionOutcome {
+                output: GuestExecutionOutput::LegacyStdout(Bytes::from_static(b"ping over tcp")),
                 fuel_consumed: None,
             }
         );
@@ -6326,6 +6957,200 @@ mod tests {
         assert!(contents.contains("\"fuel_consumed\":"));
 
         let _ = fs::remove_dir_all(metering_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_layer4_listener_echoes_and_releases_route_permit() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let port = free_tcp_port();
+        let route = tcp_echo_test_route(1);
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: "127.0.0.1:8080".to_owned(),
+            layer4: IntegrityLayer4Config {
+                tcp: vec![IntegrityTcpBinding {
+                    port,
+                    target: "guest-tcp-echo".to_owned(),
+                }],
+            },
+            routes: vec![route.clone()],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("TCP Layer 4 config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let listeners = start_tcp_layer4_listeners(state.clone())
+            .await
+            .expect("TCP Layer 4 listener should start");
+        let listener_addr = listeners
+            .first()
+            .expect("one TCP Layer 4 listener should be started")
+            .local_addr;
+
+        let mut stream = tokio::net::TcpStream::connect(listener_addr)
+            .await
+            .expect("TCP client should connect");
+        stream
+            .write_all(b"ping over tcp")
+            .await
+            .expect("TCP client should write");
+        stream
+            .shutdown()
+            .await
+            .expect("TCP client should close write");
+
+        let mut echoed = Vec::new();
+        stream
+            .read_to_end(&mut echoed)
+            .await
+            .expect("TCP client should read echoed bytes");
+        assert_eq!(echoed, b"ping over tcp");
+
+        let runtime = state.runtime.load_full();
+        let control = runtime
+            .concurrency_limits
+            .get(&route.path)
+            .expect("TCP route should have a limiter");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if control.semaphore.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("TCP Layer 4 permit should be released after disconnect");
+
+        for listener in listeners {
+            listener.join_handle.abort();
+            let _ = listener.join_handle.await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_layer4_connection_handler_echoes_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let route = tcp_echo_test_route(1);
+        let config = validate_integrity_config(IntegrityConfig {
+            routes: vec![route.clone()],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("TCP Layer 4 config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let listener_addr = listener
+            .local_addr()
+            .expect("test listener should expose a local address");
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(listener_addr)
+                .await
+                .expect("TCP client should connect");
+            stream
+                .write_all(b"ping over tcp")
+                .await
+                .expect("TCP client should write");
+            stream
+                .shutdown()
+                .await
+                .expect("TCP client should close write");
+
+            let mut echoed = Vec::new();
+            stream
+                .read_to_end(&mut echoed)
+                .await
+                .expect("TCP client should read echoed bytes");
+            echoed
+        });
+
+        let (server_stream, _) = listener.accept().await.expect("listener should accept");
+        handle_tcp_layer4_connection(state, route, server_stream)
+            .await
+            .expect("TCP Layer 4 connection should complete");
+
+        assert_eq!(
+            client.await.expect("client task should finish"),
+            b"ping over tcp"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_layer4_listener_streams_echo_before_client_eof() {
+        use std::time::Duration;
+
+        let port = free_tcp_port();
+        let route = tcp_echo_test_route(1);
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: "127.0.0.1:8080".to_owned(),
+            layer4: IntegrityLayer4Config {
+                tcp: vec![IntegrityTcpBinding {
+                    port,
+                    target: "guest-tcp-echo".to_owned(),
+                }],
+            },
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("TCP Layer 4 config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let listeners = start_tcp_layer4_listeners(state)
+            .await
+            .expect("TCP Layer 4 listener should start");
+        let listener_addr = listeners
+            .first()
+            .expect("one TCP Layer 4 listener should be started")
+            .local_addr;
+
+        let trailing = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let mut stream =
+                std::net::TcpStream::connect(listener_addr).expect("TCP client should connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("TCP client should set a read timeout");
+            stream
+                .write_all(b"ping")
+                .expect("TCP client should write first chunk");
+
+            let mut first_chunk = [0_u8; 4];
+            stream
+                .read_exact(&mut first_chunk)
+                .expect("TCP listener should echo before client EOF");
+            assert_eq!(&first_chunk, b"ping");
+
+            stream
+                .write_all(b" pong")
+                .expect("TCP client should write second chunk");
+
+            let mut second_chunk = [0_u8; 5];
+            stream
+                .read_exact(&mut second_chunk)
+                .expect("TCP listener should keep streaming echoed chunks");
+            assert_eq!(&second_chunk, b" pong");
+
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("TCP client should close write side");
+
+            let mut trailing = Vec::new();
+            stream
+                .read_to_end(&mut trailing)
+                .expect("TCP client should drain trailing bytes");
+            trailing
+        })
+        .join()
+        .expect("TCP client thread should finish");
+        assert!(trailing.is_empty());
+
+        for listener in listeners {
+            listener.join_handle.abort();
+            let _ = listener.join_handle.await;
+        }
     }
 
     #[cfg(feature = "secrets-vault")]
@@ -7164,6 +7989,29 @@ mod tests {
         .expect_err("sample rates above one should fail validation");
 
         assert!(error.to_string().contains("`telemetry_sample_rate`"));
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_duplicate_tcp_layer4_ports() {
+        let error = validate_integrity_config(IntegrityConfig {
+            layer4: IntegrityLayer4Config {
+                tcp: vec![
+                    IntegrityTcpBinding {
+                        port: 2222,
+                        target: "guest-tcp-echo".to_owned(),
+                    },
+                    IntegrityTcpBinding {
+                        port: 2222,
+                        target: "guest-tcp-echo".to_owned(),
+                    },
+                ],
+            },
+            routes: vec![tcp_echo_test_route(1)],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect_err("duplicate TCP Layer 4 ports should fail validation");
+
+        assert!(error.to_string().contains("Layer 4 port `2222`"));
     }
 
     #[test]

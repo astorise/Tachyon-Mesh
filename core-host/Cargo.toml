@@ -11,6 +11,7 @@ secrets-vault = []
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 arc-swap = "1.7"
 axum = "0.7"
 bytes = "1.5"
