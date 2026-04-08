@@ -838,6 +838,13 @@ fn normalize_guest_volume_path(path: &str) -> Result<String> {
 }
 
 fn insert_route_volume(route: &mut SealedRoute, volume: SealedVolume) -> Result<()> {
+    if route.role == RouteRole::User && !volume.readonly {
+        bail!(
+            "route `{}` is a user route and cannot request writable host mounts; use `:ro` and delegate writes through a system storage broker",
+            route.path
+        );
+    }
+
     if let Some(existing) = route
         .volumes
         .iter()
@@ -1642,7 +1649,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            vec!["C:\\\\tachyon_data:/app/data:rw".to_owned()],
+            vec!["C:\\\\tachyon_data:/app/data:ro".to_owned()],
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1657,7 +1664,7 @@ mod tests {
             vec![SealedVolume {
                 host_path: "C:\\\\tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
-                readonly: false,
+                readonly: true,
             }]
         );
     }
@@ -1685,6 +1692,59 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must target a declared sealed route"));
+    }
+
+    #[test]
+    fn normalize_routes_rejects_writable_user_volume_mounts() {
+        let error = normalize_routes(
+            vec!["/api/guest-volume".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["/tmp/tachyon_data:/app/data:rw".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("user volume mounts should stay read-only");
+
+        assert!(error
+            .to_string()
+            .contains("cannot request writable host mounts"));
+    }
+
+    #[test]
+    fn normalize_routes_allows_writable_system_volume_mounts() {
+        let routes = normalize_routes(
+            vec!["/api/guest-volume".to_owned()],
+            vec!["/system/storage-broker".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            vec!["/system/storage-broker=/tmp/tachyon_data:/app/data:rw".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("system volume mounts should allow rw access");
+
+        let broker = routes
+            .iter()
+            .find(|route| route.path == "/system/storage-broker")
+            .expect("system route should be present");
+        assert_eq!(
+            broker.volumes,
+            vec![SealedVolume {
+                host_path: "/tmp/tachyon_data".to_owned(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
+            }]
+        );
     }
 
     #[test]

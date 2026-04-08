@@ -19,11 +19,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt, fs,
+    io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, Once,
+        Arc, Condvar, Mutex, Once,
     },
     time::{Duration, Instant},
 };
@@ -125,6 +126,7 @@ struct AppState {
     runtime: Arc<ArcSwap<RuntimeState>>,
     http_client: Client,
     secrets_vault: SecretsVault,
+    storage_broker: Arc<StorageBrokerManager>,
     telemetry: TelemetryHandle,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     manifest_path: PathBuf,
@@ -155,6 +157,9 @@ struct ComponentHostState {
     table: ResourceTable,
     limits: GuestResourceLimiter,
     secrets: SecretAccess,
+    route_path: String,
+    volumes: Vec<IntegrityVolume>,
+    storage_broker: Arc<StorageBrokerManager>,
     telemetry: TelemetryHandle,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
@@ -171,6 +176,7 @@ struct GuestExecutionContext {
     config: IntegrityConfig,
     runtime_telemetry: TelemetryHandle,
     secret_access: SecretAccess,
+    storage_broker: Arc<StorageBrokerManager>,
     telemetry: Option<GuestTelemetryContext>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
@@ -286,6 +292,44 @@ struct RouteExecutionControl {
     pending_waiters: AtomicUsize,
 }
 
+#[derive(Clone, Default)]
+struct StorageBrokerManager {
+    queues: Arc<Mutex<HashMap<PathBuf, Arc<StorageVolumeQueue>>>>,
+}
+
+struct StorageVolumeQueue {
+    volume_root: PathBuf,
+    sender: std::sync::mpsc::Sender<StorageBrokerWriteRequest>,
+    state: Mutex<StorageVolumeQueueState>,
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct StorageVolumeQueueState {
+    pending: usize,
+}
+
+#[derive(Clone, Debug)]
+struct StorageBrokerWriteRequest {
+    route_path: String,
+    guest_path: String,
+    host_target: PathBuf,
+    mode: StorageWriteMode,
+    body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageWriteMode {
+    Overwrite,
+    Append,
+}
+
+struct ResolvedStorageWriteTarget {
+    volume_root: PathBuf,
+    guest_path: String,
+    host_target: PathBuf,
+}
+
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
 #[derive(Debug, Deserialize, Serialize)]
 struct IntegrityManifest {
@@ -393,13 +437,15 @@ async fn run() -> Result<()> {
     init_host_tracing();
     let telemetry = telemetry::init_telemetry();
     let runtime = build_runtime_state(verify_integrity()?)?;
+    let storage_broker = Arc::new(StorageBrokerManager::default());
     let background_workers = Arc::new(BackgroundWorkerManager::default());
-    background_workers.start_for_runtime(&runtime, telemetry.clone());
+    background_workers.start_for_runtime(&runtime, telemetry.clone(), Arc::clone(&storage_broker));
 
     let state = AppState {
         runtime: Arc::new(ArcSwap::from_pointee(runtime.clone())),
         http_client: Client::new(),
         secrets_vault: SecretsVault::load(),
+        storage_broker,
         telemetry,
         manifest_path: integrity_manifest_path(),
         background_workers: Arc::clone(&background_workers),
@@ -429,7 +475,12 @@ async fn run() -> Result<()> {
 }
 
 impl BackgroundWorkerManager {
-    fn start_for_runtime(&self, runtime: &RuntimeState, telemetry: TelemetryHandle) {
+    fn start_for_runtime(
+        &self,
+        runtime: &RuntimeState,
+        telemetry: TelemetryHandle,
+        storage_broker: Arc<StorageBrokerManager>,
+    ) {
         let mut new_workers = Vec::new();
         let mut started_workers = 0_u32;
 
@@ -458,6 +509,7 @@ impl BackgroundWorkerManager {
                 &function_name,
                 telemetry.clone(),
                 Arc::clone(&runtime.concurrency_limits),
+                Arc::clone(&storage_broker),
             )
             .is_err()
             {
@@ -472,6 +524,7 @@ impl BackgroundWorkerManager {
             let worker_config = runtime.config.clone();
             let worker_telemetry = telemetry.clone();
             let worker_limits = Arc::clone(&runtime.concurrency_limits);
+            let worker_storage_broker = Arc::clone(&storage_broker);
             let worker_stop = Arc::clone(&stop_requested);
             let join_handle = tokio::task::spawn_blocking(move || {
                 run_background_tick_loop(
@@ -479,6 +532,7 @@ impl BackgroundWorkerManager {
                     worker_config,
                     worker_telemetry,
                     worker_limits,
+                    worker_storage_broker,
                     worker_route,
                     worker_function_name,
                     worker_stop,
@@ -507,9 +561,14 @@ impl BackgroundWorkerManager {
     }
 
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
-    async fn replace_with(&self, runtime: &RuntimeState, telemetry: TelemetryHandle) {
+    async fn replace_with(
+        &self,
+        runtime: &RuntimeState,
+        telemetry: TelemetryHandle,
+        storage_broker: Arc<StorageBrokerManager>,
+    ) {
         self.stop_all().await;
-        self.start_for_runtime(runtime, telemetry);
+        self.start_for_runtime(runtime, telemetry, storage_broker);
     }
 
     async fn stop_all(&self) {
@@ -541,6 +600,7 @@ fn run_background_tick_loop(
     config: IntegrityConfig,
     telemetry: TelemetryHandle,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    storage_broker: Arc<StorageBrokerManager>,
     route: IntegrityRoute,
     function_name: String,
     stop_requested: Arc<AtomicBool>,
@@ -552,6 +612,7 @@ fn run_background_tick_loop(
         &function_name,
         telemetry,
         concurrency_limits,
+        storage_broker,
     ) {
         Ok(runner) => runner,
         Err(error) => {
@@ -593,6 +654,217 @@ fn wait_for_background_tick(stop_requested: &AtomicBool) -> bool {
     }
 }
 
+impl StorageBrokerManager {
+    fn enqueue_write_for_route(
+        &self,
+        route: &IntegrityRoute,
+        path: &str,
+        mode: StorageWriteMode,
+        body: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        let resolved = resolve_storage_write_target(route, path)?;
+        let queue = self.queue_for_volume(&resolved.volume_root);
+        queue.enqueue(StorageBrokerWriteRequest {
+            route_path: route.path.clone(),
+            guest_path: resolved.guest_path,
+            host_target: resolved.host_target,
+            mode,
+            body,
+        })
+    }
+
+    fn queue_for_volume(&self, volume_root: &Path) -> Arc<StorageVolumeQueue> {
+        let key = normalize_path(volume_root.to_path_buf());
+        let mut queues = self
+            .queues
+            .lock()
+            .expect("storage broker queues should not be poisoned");
+        Arc::clone(
+            queues
+                .entry(key.clone())
+                .or_insert_with(|| StorageVolumeQueue::new(key)),
+        )
+    }
+
+    #[cfg(test)]
+    fn wait_for_volume_idle(&self, volume_root: &Path, timeout: Duration) -> bool {
+        self.queue_for_volume(volume_root).wait_for_idle(timeout)
+    }
+}
+
+impl StorageVolumeQueue {
+    fn new(volume_root: PathBuf) -> Arc<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel::<StorageBrokerWriteRequest>();
+        let queue = Arc::new(Self {
+            volume_root,
+            sender,
+            state: Mutex::new(StorageVolumeQueueState::default()),
+            idle: Condvar::new(),
+        });
+        let worker = Arc::clone(&queue);
+        std::thread::spawn(move || worker.run(receiver));
+        queue
+    }
+
+    fn enqueue(&self, request: StorageBrokerWriteRequest) -> std::result::Result<(), String> {
+        self.state
+            .lock()
+            .expect("storage broker queue state should not be poisoned")
+            .pending += 1;
+        if self.sender.send(request).is_ok() {
+            return Ok(());
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("storage broker queue state should not be poisoned");
+        state.pending = state.pending.saturating_sub(1);
+        self.idle.notify_all();
+        Err(format!(
+            "storage broker queue for `{}` is not available",
+            self.volume_root.display()
+        ))
+    }
+
+    fn run(self: Arc<Self>, receiver: std::sync::mpsc::Receiver<StorageBrokerWriteRequest>) {
+        while let Ok(request) = receiver.recv() {
+            if let Err(error) = process_storage_write_request(&request) {
+                tracing::warn!(
+                    route = %request.route_path,
+                    guest_path = %request.guest_path,
+                    host_target = %request.host_target.display(),
+                    "storage broker write failed: {error}"
+                );
+            }
+
+            let mut state = self
+                .state
+                .lock()
+                .expect("storage broker queue state should not be poisoned");
+            state.pending = state.pending.saturating_sub(1);
+            self.idle.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .state
+            .lock()
+            .expect("storage broker queue state should not be poisoned");
+
+        while state.pending > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+
+            let (next_state, result) = self
+                .idle
+                .wait_timeout(state, remaining)
+                .expect("storage broker queue state should not be poisoned");
+            state = next_state;
+            if result.timed_out() && state.pending > 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+fn resolve_storage_write_target(
+    route: &IntegrityRoute,
+    path: &str,
+) -> std::result::Result<ResolvedStorageWriteTarget, String> {
+    let normalized_path =
+        normalize_guest_volume_path(path).map_err(|error| format!("{error:#}"))?;
+    let volume = route
+        .volumes
+        .iter()
+        .filter(|volume| !volume.readonly)
+        .filter(|volume| guest_path_matches_volume(&normalized_path, &volume.guest_path))
+        .max_by_key(|volume| volume.guest_path.len())
+        .ok_or_else(|| {
+            format!(
+                "route `{}` cannot broker writes to `{normalized_path}` because no writable mounted volume matches that path",
+                route.path
+            )
+        })?;
+
+    let relative_path = normalized_path
+        .strip_prefix(&volume.guest_path)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    if relative_path.is_empty() {
+        return Err(format!(
+            "storage broker path `{normalized_path}` must target a file beneath mounted guest path `{}`",
+            volume.guest_path
+        ));
+    }
+
+    let volume_root = normalize_path(PathBuf::from(&volume.host_path));
+    let mut host_target = volume_root.clone();
+    for segment in relative_path.split('/') {
+        host_target.push(segment);
+    }
+
+    Ok(ResolvedStorageWriteTarget {
+        volume_root,
+        guest_path: normalized_path,
+        host_target,
+    })
+}
+
+fn guest_path_matches_volume(path: &str, guest_path: &str) -> bool {
+    path == guest_path
+        || path
+            .strip_prefix(guest_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn process_storage_write_request(request: &StorageBrokerWriteRequest) -> Result<()> {
+    if let Some(parent) = request.host_target.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create broker parent directory for {}",
+                request.host_target.display()
+            )
+        })?;
+    }
+
+    match request.mode {
+        StorageWriteMode::Overwrite => {
+            fs::write(&request.host_target, &request.body).with_context(|| {
+                format!(
+                    "failed to overwrite {} through storage broker",
+                    request.host_target.display()
+                )
+            })
+        }
+        StorageWriteMode::Append => {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&request.host_target)
+                .with_context(|| {
+                    format!(
+                        "failed to open {} for append through storage broker",
+                        request.host_target.display()
+                    )
+                })?;
+            file.write_all(&request.body).with_context(|| {
+                format!(
+                    "failed to append to {} through storage broker",
+                    request.host_target.display()
+                )
+            })
+        }
+    }
+}
+
 #[cfg(unix)]
 fn spawn_reload_watcher(state: AppState) {
     tokio::spawn(async move {
@@ -631,7 +903,11 @@ async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
 
     state
         .background_workers
-        .replace_with(&runtime, state.telemetry.clone())
+        .replace_with(
+            &runtime,
+            state.telemetry.clone(),
+            Arc::clone(&state.storage_broker),
+        )
         .await;
     state.runtime.store(Arc::new(runtime));
     tracing::info!(
@@ -865,6 +1141,7 @@ async fn execute_route_request(
     let response_config = runtime.config.clone();
     let route_registry = Arc::clone(&runtime.route_registry);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+    let storage_broker = Arc::clone(&state.storage_broker);
     let telemetry_context = GuestTelemetryContext {
         handle: state.telemetry.clone(),
         trace_id: trace_id.to_owned(),
@@ -889,6 +1166,7 @@ async fn execute_route_request(
                 config: request_config,
                 runtime_telemetry,
                 secret_access,
+                storage_broker,
                 telemetry: Some(telemetry_context),
                 concurrency_limits,
                 propagated_headers: task_propagated_headers,
@@ -1477,6 +1755,7 @@ fn execute_component_guest(
             execution.config.guest_memory_limit_bytes,
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
+            Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
         )?,
@@ -1557,6 +1836,16 @@ fn execute_system_component_guest(
             "failed to add scaling metrics functions to system component linker",
         )
     })?;
+    system_component_bindings::tachyon::mesh::storage_broker::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add storage broker functions to system component linker",
+        )
+    })?;
 
     let mut store = Store::new(
         engine,
@@ -1565,6 +1854,7 @@ fn execute_system_component_guest(
             execution.config.guest_memory_limit_bytes,
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
+            Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
         )?,
@@ -1619,6 +1909,7 @@ impl BackgroundTickRunner {
         function_name: &str,
         telemetry: TelemetryHandle,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+        storage_broker: Arc<StorageBrokerManager>,
     ) -> std::result::Result<Self, ExecutionError> {
         let module_path = resolve_guest_module_path(function_name)
             .map_err(ExecutionError::GuestModuleNotFound)?;
@@ -1667,6 +1958,7 @@ impl BackgroundTickRunner {
                 config.guest_memory_limit_bytes,
                 telemetry,
                 SecretAccess::default(),
+                storage_broker,
                 concurrency_limits,
                 Vec::new(),
             )?,
@@ -2212,7 +2504,7 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         targets: normalize_route_targets(route.targets)?,
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
-        volumes: normalize_route_volumes(route.volumes, &normalized)?,
+        volumes: normalize_route_volumes(route.volumes, route.role, &normalized)?,
     })
 }
 
@@ -2355,13 +2647,14 @@ fn normalize_header_match(header_match: HeaderMatch) -> Result<HeaderMatch> {
 
 fn normalize_route_volumes(
     volumes: Vec<IntegrityVolume>,
+    route_role: RouteRole,
     route_path: &str,
 ) -> Result<Vec<IntegrityVolume>> {
     let mut normalized = BTreeSet::new();
     let mut deduped = Vec::new();
 
     for volume in volumes {
-        let volume = validate_route_volume(volume)?;
+        let volume = validate_route_volume(volume, route_role, route_path)?;
         if !normalized.insert((
             volume.guest_path.clone(),
             volume.host_path.clone(),
@@ -2387,11 +2680,21 @@ fn normalize_route_volumes(
     Ok(deduped)
 }
 
-fn validate_route_volume(volume: IntegrityVolume) -> Result<IntegrityVolume> {
+fn validate_route_volume(
+    volume: IntegrityVolume,
+    route_role: RouteRole,
+    route_path: &str,
+) -> Result<IntegrityVolume> {
     let host_path = volume.host_path.trim();
     if host_path.is_empty() {
         return Err(anyhow!(
             "Integrity Validation Failed: route volumes must include a non-empty `host_path`"
+        ));
+    }
+
+    if route_role == RouteRole::User && !volume.readonly {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` is a user route and cannot request writable direct host mounts; use a system storage broker instead"
         ));
     }
 
@@ -2663,6 +2966,7 @@ impl ComponentHostState {
         max_memory_bytes: usize,
         telemetry: TelemetryHandle,
         secrets: SecretAccess,
+        storage_broker: Arc<StorageBrokerManager>,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
         propagated_headers: Vec<PropagatedHeader>,
     ) -> std::result::Result<Self, ExecutionError> {
@@ -2671,6 +2975,9 @@ impl ComponentHostState {
             table: ResourceTable::new(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
             secrets,
+            route_path: route.path.clone(),
+            volumes: route.volumes.clone(),
+            storage_broker,
             telemetry,
             concurrency_limits,
             propagated_headers,
@@ -2800,6 +3107,41 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
 impl system_component_bindings::tachyon::mesh::scaling_metrics::Host for ComponentHostState {
     fn get_pending_queue_size(&mut self, route_path: String) -> u32 {
         self.pending_queue_size(&route_path)
+    }
+}
+
+impl system_component_bindings::tachyon::mesh::storage_broker::Host for ComponentHostState {
+    fn enqueue_write(
+        &mut self,
+        path: String,
+        mode: system_component_bindings::tachyon::mesh::storage_broker::WriteMode,
+        body: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        let mode = match mode {
+            system_component_bindings::tachyon::mesh::storage_broker::WriteMode::Overwrite => {
+                StorageWriteMode::Overwrite
+            }
+            system_component_bindings::tachyon::mesh::storage_broker::WriteMode::Append => {
+                StorageWriteMode::Append
+            }
+        };
+        let route = IntegrityRoute {
+            path: self.route_path.clone(),
+            role: RouteRole::System,
+            name: String::new(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: self.volumes.clone(),
+        };
+
+        self.storage_broker
+            .enqueue_write_for_route(&route, &path, mode, body)
     }
 }
 
@@ -3123,6 +3465,7 @@ mod tests {
             runtime: Arc::new(ArcSwap::from_pointee(build_test_runtime(config))),
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
+            storage_broker: Arc::new(StorageBrokerManager::default()),
             telemetry,
             manifest_path,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
@@ -3146,6 +3489,31 @@ mod tests {
                 host_path: host_path.display().to_string(),
                 guest_path: "/app/data".to_owned(),
                 readonly,
+            }],
+        }
+    }
+
+    fn storage_broker_test_route(host_path: &std::path::Path) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/system/storage-broker".to_owned(),
+            role: RouteRole::System,
+            name: "storage-broker".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: vec![RouteTarget {
+                module: "system-faas-storage-broker".to_owned(),
+                weight: 100,
+                match_header: None,
+            }],
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                host_path: host_path.display().to_string(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
             }],
         }
     }
@@ -3334,6 +3702,7 @@ mod tests {
                 secret_access: SecretAccess::from_route(&route, &SecretsVault::load()),
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
@@ -3370,6 +3739,7 @@ mod tests {
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
+                storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
@@ -3408,6 +3778,7 @@ mod tests {
                 config: config.clone(),
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
+                storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
                 propagated_headers: Vec::new(),
@@ -3436,6 +3807,7 @@ mod tests {
                 config: config.clone(),
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
+                storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
                 propagated_headers: Vec::new(),
@@ -3587,6 +3959,7 @@ mod tests {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
+            storage_broker: Arc::new(StorageBrokerManager::default()),
             telemetry: telemetry::init_test_telemetry(),
             manifest_path: PathBuf::from("integrity.lock"),
             background_workers: Arc::new(BackgroundWorkerManager::default()),
@@ -3631,6 +4004,7 @@ mod tests {
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
+                storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
@@ -3770,6 +4144,7 @@ mod tests {
                 "k8s-scaler",
                 telemetry::init_test_telemetry(),
                 concurrency_limits,
+                Arc::new(StorageBrokerManager::default()),
             )
             .expect("background scaler should instantiate");
 
@@ -4584,7 +4959,7 @@ mod tests {
             volumes: vec![IntegrityVolume {
                 host_path: "  /tmp/tachyon_data  ".to_owned(),
                 guest_path: "/app/data/".to_owned(),
-                readonly: false,
+                readonly: true,
             }],
         }];
 
@@ -4598,9 +4973,91 @@ mod tests {
             vec![IntegrityVolume {
                 host_path: "/tmp/tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
-                readonly: false,
+                readonly: true,
             }]
         );
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_writable_user_route_volumes() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![IntegrityRoute {
+            path: "/api/guest-volume".to_owned(),
+            role: RouteRole::User,
+            name: "guest-volume".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                host_path: "/tmp/tachyon_data".to_owned(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
+            }],
+        }];
+
+        let error = validate_integrity_config(config)
+            .expect_err("writable user volumes should fail validation");
+
+        assert!(error
+            .to_string()
+            .contains("cannot request writable direct host mounts"));
+    }
+
+    #[test]
+    fn storage_broker_serializes_concurrent_writes_against_shared_volume() {
+        let volume_dir = unique_test_dir("tachyon-storage-broker");
+        let route = storage_broker_test_route(&volume_dir);
+        let broker = StorageBrokerManager::default();
+        let start = Arc::new(std::sync::Barrier::new(9));
+
+        let handles = (0..8)
+            .map(|index| {
+                let broker = broker.clone();
+                let route = route.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    broker
+                        .enqueue_write_for_route(
+                            &route,
+                            "/app/data/state.txt",
+                            StorageWriteMode::Append,
+                            format!("write-{index}\n").into_bytes(),
+                        )
+                        .expect("broker write should be accepted");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        for handle in handles {
+            handle.join().expect("broker worker thread should complete");
+        }
+
+        assert!(
+            broker.wait_for_volume_idle(&volume_dir, Duration::from_secs(5)),
+            "broker queue should drain"
+        );
+
+        let contents = fs::read_to_string(volume_dir.join("state.txt"))
+            .expect("brokered writes should reach the shared host volume");
+        let mut lines = contents.lines().collect::<Vec<_>>();
+        lines.sort_unstable();
+
+        assert_eq!(
+            lines,
+            vec![
+                "write-0", "write-1", "write-2", "write-3", "write-4", "write-5", "write-6",
+                "write-7",
+            ]
+        );
+
+        let _ = fs::remove_dir_all(volume_dir);
     }
 
     #[test]

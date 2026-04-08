@@ -9,6 +9,7 @@ members = [
     "guest-malicious",
     "guest-volume",
     "legacy-mock",
+    "system-faas-storage-broker",
     "system-faas-k8s-scaler",
     "system-faas-keda",
     "system-faas-prom",
