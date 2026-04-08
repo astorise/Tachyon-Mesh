@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
@@ -121,12 +121,21 @@ fn is_default_route_version(version: &String) -> bool {
     version == DEFAULT_ROUTE_VERSION
 }
 
+fn default_volume_type() -> VolumeType {
+    VolumeType::Host
+}
+
+fn is_default_volume_type(volume_type: &VolumeType) -> bool {
+    *volume_type == VolumeType::Host
+}
+
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<ArcSwap<RuntimeState>>,
     http_client: Client,
     secrets_vault: SecretsVault,
     storage_broker: Arc<StorageBrokerManager>,
+    volume_manager: Arc<VolumeManager>,
     telemetry: TelemetryHandle,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     manifest_path: PathBuf,
@@ -299,7 +308,7 @@ struct StorageBrokerManager {
 
 struct StorageVolumeQueue {
     volume_root: PathBuf,
-    sender: std::sync::mpsc::Sender<StorageBrokerWriteRequest>,
+    sender: std::sync::mpsc::Sender<StorageBrokerOperation>,
     state: Mutex<StorageVolumeQueueState>,
     idle: Condvar,
 }
@@ -309,6 +318,13 @@ struct StorageVolumeQueueState {
     pending: usize,
 }
 
+#[derive(Debug)]
+enum StorageBrokerOperation {
+    Write(StorageBrokerWriteRequest),
+    Snapshot(StorageBrokerSnapshotRequest),
+    Restore(StorageBrokerRestoreRequest),
+}
+
 #[derive(Clone, Debug)]
 struct StorageBrokerWriteRequest {
     route_path: String,
@@ -316,6 +332,22 @@ struct StorageBrokerWriteRequest {
     host_target: PathBuf,
     mode: StorageWriteMode,
     body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct StorageBrokerSnapshotRequest {
+    volume_id: String,
+    source_path: PathBuf,
+    snapshot_path: PathBuf,
+    completion: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+#[derive(Debug)]
+struct StorageBrokerRestoreRequest {
+    volume_id: String,
+    snapshot_path: PathBuf,
+    destination_path: PathBuf,
+    completion: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -328,6 +360,44 @@ struct ResolvedStorageWriteTarget {
     volume_root: PathBuf,
     guest_path: String,
     host_target: PathBuf,
+}
+
+#[derive(Clone, Default)]
+struct VolumeManager {
+    volumes: Arc<Mutex<HashMap<String, Arc<ManagedVolume>>>>,
+}
+
+struct ManagedVolume {
+    id: String,
+    route_path: String,
+    guest_path: String,
+    active_path: PathBuf,
+    snapshot_path: PathBuf,
+    idle_timeout: Duration,
+    storage_broker: Arc<StorageBrokerManager>,
+    state: Mutex<ManagedVolumeState>,
+    notify: Notify,
+}
+
+struct ManagedVolumeState {
+    lifecycle: ManagedVolumeLifecycle,
+    active_leases: usize,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedVolumeLifecycle {
+    Active,
+    Hibernating,
+    OnDisk,
+}
+
+struct ManagedVolumeLease {
+    volume: Arc<ManagedVolume>,
+}
+
+struct RouteVolumeLeaseGuard {
+    leases: Vec<ManagedVolumeLease>,
 }
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -354,6 +424,19 @@ struct GuestLogRecord {
     level: String,
     target: Option<String>,
     fields: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum VolumeType {
+    Host,
+    Ram,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum VolumeEvictionPolicy {
+    Hibernate,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -387,10 +470,20 @@ struct IntegrityRoute {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct IntegrityVolume {
+    #[serde(
+        rename = "type",
+        default = "default_volume_type",
+        skip_serializing_if = "is_default_volume_type"
+    )]
+    volume_type: VolumeType,
     host_path: String,
     guest_path: String,
     #[serde(default)]
     readonly: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idle_timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    eviction_policy: Option<VolumeEvictionPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -446,6 +539,7 @@ async fn run() -> Result<()> {
         http_client: Client::new(),
         secrets_vault: SecretsVault::load(),
         storage_broker,
+        volume_manager: Arc::new(VolumeManager::default()),
         telemetry,
         manifest_path: integrity_manifest_path(),
         background_workers: Arc::clone(&background_workers),
@@ -664,13 +758,55 @@ impl StorageBrokerManager {
     ) -> std::result::Result<(), String> {
         let resolved = resolve_storage_write_target(route, path)?;
         let queue = self.queue_for_volume(&resolved.volume_root);
-        queue.enqueue(StorageBrokerWriteRequest {
+        queue.enqueue(StorageBrokerOperation::Write(StorageBrokerWriteRequest {
             route_path: route.path.clone(),
             guest_path: resolved.guest_path,
             host_target: resolved.host_target,
             mode,
             body,
-        })
+        }))
+    }
+
+    fn enqueue_snapshot(
+        &self,
+        volume_id: String,
+        volume_root: &Path,
+        source_path: &Path,
+        snapshot_path: &Path,
+    ) -> std::result::Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>, String>
+    {
+        let queue = self.queue_for_volume(volume_root);
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        queue.enqueue(StorageBrokerOperation::Snapshot(
+            StorageBrokerSnapshotRequest {
+                volume_id,
+                source_path: source_path.to_path_buf(),
+                snapshot_path: snapshot_path.to_path_buf(),
+                completion,
+            },
+        ))?;
+        Ok(receiver)
+    }
+
+    fn enqueue_restore(
+        &self,
+        volume_id: String,
+        volume_root: &Path,
+        snapshot_path: &Path,
+        destination_path: &Path,
+    ) -> std::result::Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>, String>
+    {
+        let queue = self.queue_for_volume(volume_root);
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        queue.enqueue(StorageBrokerOperation::Restore(
+            StorageBrokerRestoreRequest {
+                volume_id,
+                snapshot_path: snapshot_path.to_path_buf(),
+                destination_path: destination_path.to_path_buf(),
+                completion,
+            },
+        ))?;
+        Ok(receiver)
     }
 
     fn queue_for_volume(&self, volume_root: &Path) -> Arc<StorageVolumeQueue> {
@@ -694,7 +830,7 @@ impl StorageBrokerManager {
 
 impl StorageVolumeQueue {
     fn new(volume_root: PathBuf) -> Arc<Self> {
-        let (sender, receiver) = std::sync::mpsc::channel::<StorageBrokerWriteRequest>();
+        let (sender, receiver) = std::sync::mpsc::channel::<StorageBrokerOperation>();
         let queue = Arc::new(Self {
             volume_root,
             sender,
@@ -706,12 +842,12 @@ impl StorageVolumeQueue {
         queue
     }
 
-    fn enqueue(&self, request: StorageBrokerWriteRequest) -> std::result::Result<(), String> {
+    fn enqueue(&self, operation: StorageBrokerOperation) -> std::result::Result<(), String> {
         self.state
             .lock()
             .expect("storage broker queue state should not be poisoned")
             .pending += 1;
-        if self.sender.send(request).is_ok() {
+        if self.sender.send(operation).is_ok() {
             return Ok(());
         }
 
@@ -727,15 +863,44 @@ impl StorageVolumeQueue {
         ))
     }
 
-    fn run(self: Arc<Self>, receiver: std::sync::mpsc::Receiver<StorageBrokerWriteRequest>) {
-        while let Ok(request) = receiver.recv() {
-            if let Err(error) = process_storage_write_request(&request) {
-                tracing::warn!(
-                    route = %request.route_path,
-                    guest_path = %request.guest_path,
-                    host_target = %request.host_target.display(),
-                    "storage broker write failed: {error}"
-                );
+    fn run(self: Arc<Self>, receiver: std::sync::mpsc::Receiver<StorageBrokerOperation>) {
+        while let Ok(operation) = receiver.recv() {
+            match operation {
+                StorageBrokerOperation::Write(request) => {
+                    if let Err(error) = process_storage_write_request(&request) {
+                        tracing::warn!(
+                            route = %request.route_path,
+                            guest_path = %request.guest_path,
+                            host_target = %request.host_target.display(),
+                            "storage broker write failed: {error}"
+                        );
+                    }
+                }
+                StorageBrokerOperation::Snapshot(request) => {
+                    let result = process_storage_snapshot_request(&request)
+                        .map_err(|error| format!("{error:#}"));
+                    if let Err(error) = &result {
+                        tracing::warn!(
+                            volume_id = %request.volume_id,
+                            snapshot_path = %request.snapshot_path.display(),
+                            "storage broker snapshot failed: {error}"
+                        );
+                    }
+                    let _ = request.completion.send(result);
+                }
+                StorageBrokerOperation::Restore(request) => {
+                    let result = process_storage_restore_request(&request)
+                        .map_err(|error| format!("{error:#}"));
+                    if let Err(error) = &result {
+                        tracing::warn!(
+                            volume_id = %request.volume_id,
+                            snapshot_path = %request.snapshot_path.display(),
+                            destination_path = %request.destination_path.display(),
+                            "storage broker restore failed: {error}"
+                        );
+                    }
+                    let _ = request.completion.send(result);
+                }
             }
 
             let mut state = self
@@ -772,6 +937,274 @@ impl StorageVolumeQueue {
         }
 
         true
+    }
+}
+
+impl VolumeManager {
+    async fn acquire_route_volumes(
+        &self,
+        route: &IntegrityRoute,
+        storage_broker: Arc<StorageBrokerManager>,
+    ) -> std::result::Result<RouteVolumeLeaseGuard, String> {
+        let mut leases = Vec::new();
+        for volume in route
+            .volumes
+            .iter()
+            .filter(|volume| volume.is_hibernation_capable())
+        {
+            let managed = self.managed_volume(route, volume, Arc::clone(&storage_broker))?;
+            leases.push(managed.acquire().await?);
+        }
+
+        Ok(RouteVolumeLeaseGuard { leases })
+    }
+
+    fn managed_volume(
+        &self,
+        route: &IntegrityRoute,
+        volume: &IntegrityVolume,
+        storage_broker: Arc<StorageBrokerManager>,
+    ) -> std::result::Result<Arc<ManagedVolume>, String> {
+        let key = managed_volume_key(&route.path, &volume.guest_path);
+        let mut volumes = self
+            .volumes
+            .lock()
+            .expect("managed volume registry should not be poisoned");
+        if let Some(volume) = volumes.get(&key) {
+            return Ok(Arc::clone(volume));
+        }
+
+        let managed = Arc::new(ManagedVolume::new(&route.path, volume, storage_broker)?);
+        volumes.insert(key, Arc::clone(&managed));
+        Ok(managed)
+    }
+
+    #[cfg(test)]
+    fn managed_volume_for_route(
+        &self,
+        route_path: &str,
+        guest_path: &str,
+    ) -> Option<Arc<ManagedVolume>> {
+        self.volumes
+            .lock()
+            .expect("managed volume registry should not be poisoned")
+            .get(&managed_volume_key(route_path, guest_path))
+            .cloned()
+    }
+}
+
+impl ManagedVolume {
+    fn new(
+        route_path: &str,
+        volume: &IntegrityVolume,
+        storage_broker: Arc<StorageBrokerManager>,
+    ) -> std::result::Result<Self, String> {
+        let active_path = normalize_path(PathBuf::from(&volume.host_path));
+        fs::create_dir_all(&active_path).map_err(|error| {
+            format!(
+                "failed to initialize RAM volume directory `{}` for route `{route_path}`: {error}",
+                active_path.display()
+            )
+        })?;
+
+        Ok(Self {
+            id: managed_volume_id(route_path, &volume.guest_path),
+            route_path: route_path.to_owned(),
+            guest_path: volume.guest_path.clone(),
+            snapshot_path: snapshot_path_for_volume(&active_path),
+            active_path,
+            idle_timeout: volume
+                .parsed_idle_timeout()
+                .map_err(|error| format!("{error:#}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "route `{route_path}` volume `{}` is missing an `idle_timeout` for hibernation",
+                        volume.guest_path
+                    )
+                })?,
+            state: Mutex::new(ManagedVolumeState {
+                lifecycle: ManagedVolumeLifecycle::Active,
+                active_leases: 0,
+                generation: 0,
+            }),
+            notify: Notify::new(),
+            storage_broker,
+        })
+    }
+
+    async fn acquire(self: &Arc<Self>) -> std::result::Result<ManagedVolumeLease, String> {
+        loop {
+            let should_restore = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("managed volume state should not be poisoned");
+                match state.lifecycle {
+                    ManagedVolumeLifecycle::Active => {
+                        state.active_leases = state.active_leases.saturating_add(1);
+                        state.generation = state.generation.saturating_add(1);
+                        return Ok(ManagedVolumeLease {
+                            volume: Arc::clone(self),
+                        });
+                    }
+                    ManagedVolumeLifecycle::OnDisk => {
+                        state.lifecycle = ManagedVolumeLifecycle::Hibernating;
+                        state.generation = state.generation.saturating_add(1);
+                        true
+                    }
+                    ManagedVolumeLifecycle::Hibernating => false,
+                }
+            };
+
+            if should_restore {
+                let completion = self.storage_broker.enqueue_restore(
+                    self.id.clone(),
+                    &self.active_path,
+                    &self.snapshot_path,
+                    &self.active_path,
+                )?;
+                match completion.await {
+                    Ok(Ok(())) => self.finish_restore(ManagedVolumeLifecycle::Active),
+                    Ok(Err(error)) => {
+                        self.finish_restore(ManagedVolumeLifecycle::OnDisk);
+                        return Err(format!(
+                            "failed to restore hibernated volume `{}`: {error}",
+                            self.id
+                        ));
+                    }
+                    Err(_) => {
+                        self.finish_restore(ManagedVolumeLifecycle::OnDisk);
+                        return Err(format!(
+                            "storage broker restore completion channel closed for volume `{}`",
+                            self.id
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            self.notify.notified().await;
+        }
+    }
+
+    fn release(self: &Arc<Self>) {
+        let generation = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("managed volume state should not be poisoned");
+            state.active_leases = state.active_leases.saturating_sub(1);
+            state.generation = state.generation.saturating_add(1);
+            if state.lifecycle == ManagedVolumeLifecycle::Active && state.active_leases == 0 {
+                Some(state.generation)
+            } else {
+                None
+            }
+        };
+
+        if let Some(generation) = generation {
+            self.schedule_hibernation(generation);
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn schedule_hibernation(self: &Arc<Self>, generation: u64) {
+        let volume = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(volume.idle_timeout).await;
+
+            let should_snapshot = {
+                let mut state = volume
+                    .state
+                    .lock()
+                    .expect("managed volume state should not be poisoned");
+                if state.lifecycle != ManagedVolumeLifecycle::Active
+                    || state.active_leases != 0
+                    || state.generation != generation
+                {
+                    return;
+                }
+
+                state.lifecycle = ManagedVolumeLifecycle::Hibernating;
+                state.generation = state.generation.saturating_add(1);
+                true
+            };
+
+            if !should_snapshot {
+                return;
+            }
+
+            let completion = match volume.storage_broker.enqueue_snapshot(
+                volume.id.clone(),
+                &volume.active_path,
+                &volume.active_path,
+                &volume.snapshot_path,
+            ) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    tracing::warn!(
+                        volume_id = %volume.id,
+                        route = %volume.route_path,
+                        guest_path = %volume.guest_path,
+                        "failed to schedule hibernation snapshot: {error}"
+                    );
+                    volume.finish_restore(ManagedVolumeLifecycle::Active);
+                    return;
+                }
+            };
+
+            match completion.await {
+                Ok(Ok(())) => volume.finish_restore(ManagedVolumeLifecycle::OnDisk),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        volume_id = %volume.id,
+                        route = %volume.route_path,
+                        guest_path = %volume.guest_path,
+                        "hibernation snapshot failed: {error}"
+                    );
+                    volume.finish_restore(ManagedVolumeLifecycle::Active);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        volume_id = %volume.id,
+                        route = %volume.route_path,
+                        guest_path = %volume.guest_path,
+                        "hibernation snapshot completion channel closed unexpectedly"
+                    );
+                    volume.finish_restore(ManagedVolumeLifecycle::Active);
+                }
+            }
+        });
+    }
+
+    fn finish_restore(&self, lifecycle: ManagedVolumeLifecycle) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("managed volume state should not be poisoned");
+        state.lifecycle = lifecycle;
+        state.generation = state.generation.saturating_add(1);
+        self.notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn lifecycle(&self) -> ManagedVolumeLifecycle {
+        self.state
+            .lock()
+            .expect("managed volume state should not be poisoned")
+            .lifecycle
+    }
+}
+
+impl Drop for ManagedVolumeLease {
+    fn drop(&mut self) {
+        self.volume.release();
+    }
+}
+
+impl Drop for RouteVolumeLeaseGuard {
+    fn drop(&mut self) {
+        let _ = self.leases.len();
     }
 }
 
@@ -816,6 +1249,18 @@ fn resolve_storage_write_target(
         guest_path: normalized_path,
         host_target,
     })
+}
+
+fn parse_storage_broker_host_path(
+    value: &str,
+    label: &str,
+) -> std::result::Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("storage broker `{label}` must not be empty"));
+    }
+
+    Ok(PathBuf::from(trimmed))
 }
 
 fn guest_path_matches_volume(path: &str, guest_path: &str) -> bool {
@@ -863,6 +1308,103 @@ fn process_storage_write_request(request: &StorageBrokerWriteRequest) -> Result<
             })
         }
     }
+}
+
+fn process_storage_snapshot_request(request: &StorageBrokerSnapshotRequest) -> Result<()> {
+    copy_directory_tree(&request.source_path, &request.snapshot_path)?;
+    remove_path_if_exists(&request.source_path)?;
+    Ok(())
+}
+
+fn process_storage_restore_request(request: &StorageBrokerRestoreRequest) -> Result<()> {
+    copy_directory_tree(&request.snapshot_path, &request.destination_path)
+}
+
+fn copy_directory_tree(source: &Path, destination: &Path) -> Result<()> {
+    remove_path_if_exists(destination)?;
+    fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "failed to create destination directory `{}`",
+            destination.display()
+        )
+    })?;
+
+    if !source.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("failed to read directory `{}`", source.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry inside `{}`", source.display()))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = entry.metadata().with_context(|| {
+            format!(
+                "failed to read metadata for broker copy source `{}`",
+                source_path.display()
+            )
+        })?;
+
+        if metadata.is_dir() {
+            copy_directory_tree(&source_path, &destination_path)?;
+        } else {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create destination parent directory `{}`",
+                        parent.display()
+                    )
+                })?;
+            }
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy `{}` to `{}`",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for `{}`", path.display()))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove directory `{}`", path.display()))?;
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to remove file `{}`", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn managed_volume_key(route_path: &str, guest_path: &str) -> String {
+    format!("{route_path}:{guest_path}")
+}
+
+fn managed_volume_id(route_path: &str, guest_path: &str) -> String {
+    format!(
+        "{}:{}",
+        route_path.trim_matches('/').replace('/', "_"),
+        guest_path.trim_matches('/').replace('/', "_")
+    )
+}
+
+fn snapshot_path_for_volume(active_path: &Path) -> PathBuf {
+    let mut snapshot = active_path.to_path_buf();
+    snapshot.set_extension("snapshot");
+    snapshot
 }
 
 #[cfg(unix)]
@@ -1106,6 +1648,12 @@ async fn execute_route_request(
             format!("system route `{}` shed under load", route.path),
         ));
     }
+
+    let _volume_leases = state
+        .volume_manager
+        .acquire_route_volumes(route, Arc::clone(&state.storage_broker))
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
 
     let semaphore = runtime
         .concurrency_limits
@@ -2656,9 +3204,12 @@ fn normalize_route_volumes(
     for volume in volumes {
         let volume = validate_route_volume(volume, route_role, route_path)?;
         if !normalized.insert((
+            volume.volume_type.clone(),
             volume.guest_path.clone(),
             volume.host_path.clone(),
             volume.readonly,
+            volume.idle_timeout.clone(),
+            volume.eviction_policy.clone(),
         )) {
             continue;
         }
@@ -2692,16 +3243,44 @@ fn validate_route_volume(
         ));
     }
 
-    if route_role == RouteRole::User && !volume.readonly {
+    if route_role == RouteRole::User && volume.volume_type == VolumeType::Host && !volume.readonly {
         return Err(anyhow!(
             "Integrity Validation Failed: route `{route_path}` is a user route and cannot request writable direct host mounts; use a system storage broker instead"
         ));
     }
 
+    let guest_path = normalize_guest_volume_path(&volume.guest_path)?;
+    let idle_timeout = volume
+        .idle_timeout
+        .as_deref()
+        .map(|timeout| normalize_idle_timeout(timeout, route_path, &guest_path))
+        .transpose()?;
+
+    if volume.eviction_policy.is_some() && volume.volume_type != VolumeType::Ram {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` can only set `eviction_policy` for `type = \"ram\"` volumes"
+        ));
+    }
+
+    if idle_timeout.is_some() && volume.volume_type != VolumeType::Ram {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` can only set `idle_timeout` for `type = \"ram\"` volumes"
+        ));
+    }
+
+    if volume.eviction_policy == Some(VolumeEvictionPolicy::Hibernate) && idle_timeout.is_none() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` must set `idle_timeout` when `eviction_policy = \"hibernate\"`"
+        ));
+    }
+
     Ok(IntegrityVolume {
+        volume_type: volume.volume_type,
         host_path: host_path.to_owned(),
-        guest_path: normalize_guest_volume_path(&volume.guest_path)?,
+        guest_path,
         readonly: volume.readonly,
+        idle_timeout,
+        eviction_policy: volume.eviction_policy,
     })
 }
 
@@ -2746,6 +3325,50 @@ fn normalize_guest_volume_path(path: &str) -> Result<String> {
     }
 
     Ok(normalized)
+}
+
+fn normalize_idle_timeout(value: &str, route_path: &str, guest_path: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` has an empty `idle_timeout`"
+        ));
+    }
+
+    parse_hibernation_duration(trimmed).with_context(|| {
+        format!(
+            "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` has an invalid `idle_timeout`"
+        )
+    })?;
+
+    Ok(trimmed.to_owned())
+}
+
+fn parse_hibernation_duration(value: &str) -> Result<Duration> {
+    let trimmed = value.trim();
+    let (digits, multiplier) = if let Some(value) = trimmed.strip_suffix("ms") {
+        (value, Duration::from_millis(1))
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        (value, Duration::from_secs(1))
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        (value, Duration::from_secs(60))
+    } else {
+        return Err(anyhow!(
+            "idle_timeout must use one of the `ms`, `s`, or `m` suffixes"
+        ));
+    };
+
+    let amount = digits
+        .trim()
+        .parse::<u64>()
+        .context("idle_timeout must start with an unsigned integer")?;
+    if amount == 0 {
+        return Err(anyhow!("idle_timeout must be greater than zero"));
+    }
+
+    multiplier
+        .checked_mul(u32::try_from(amount).context("idle_timeout is too large")?)
+        .ok_or_else(|| anyhow!("idle_timeout is too large"))
 }
 
 fn normalize_allowed_secrets(allowed_secrets: Vec<String>) -> Result<Vec<String>> {
@@ -3008,6 +3631,14 @@ fn preopen_route_volumes(
     route: &IntegrityRoute,
 ) -> std::result::Result<(), ExecutionError> {
     for volume in &route.volumes {
+        if volume.volume_type == VolumeType::Ram {
+            fs::create_dir_all(&volume.host_path).map_err(|error| {
+                ExecutionError::Internal(format!(
+                    "failed to initialize RAM volume `{}` for route `{}`: {error}",
+                    volume.host_path, route.path
+                ))
+            })?;
+        }
         wasi.preopened_dir(
             &volume.host_path,
             &volume.guest_path,
@@ -3142,6 +3773,41 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
 
         self.storage_broker
             .enqueue_write_for_route(&route, &path, mode, body)
+    }
+
+    fn snapshot_volume(
+        &mut self,
+        volume_id: String,
+        source_path: String,
+        snapshot_path: String,
+    ) -> std::result::Result<(), String> {
+        let source_path = parse_storage_broker_host_path(&source_path, "source_path")?;
+        let snapshot_path = parse_storage_broker_host_path(&snapshot_path, "snapshot_path")?;
+        let _ = self.storage_broker.enqueue_snapshot(
+            volume_id,
+            &source_path,
+            &source_path,
+            &snapshot_path,
+        )?;
+        Ok(())
+    }
+
+    fn restore_volume(
+        &mut self,
+        volume_id: String,
+        snapshot_path: String,
+        destination_path: String,
+    ) -> std::result::Result<(), String> {
+        let snapshot_path = parse_storage_broker_host_path(&snapshot_path, "snapshot_path")?;
+        let destination_path =
+            parse_storage_broker_host_path(&destination_path, "destination_path")?;
+        let _ = self.storage_broker.enqueue_restore(
+            volume_id,
+            &destination_path,
+            &snapshot_path,
+            &destination_path,
+        )?;
+        Ok(())
     }
 }
 
@@ -3282,6 +3948,21 @@ impl IntegrityRoute {
     }
 }
 
+impl IntegrityVolume {
+    fn is_hibernation_capable(&self) -> bool {
+        self.volume_type == VolumeType::Ram
+            && self.eviction_policy == Some(VolumeEvictionPolicy::Hibernate)
+            && self.idle_timeout.is_some()
+    }
+
+    fn parsed_idle_timeout(&self) -> Result<Option<Duration>> {
+        self.idle_timeout
+            .as_deref()
+            .map(parse_hibernation_duration)
+            .transpose()
+    }
+}
+
 impl GuestResourceLimiter {
     fn new(max_memory_bytes: usize) -> Self {
         Self { max_memory_bytes }
@@ -3384,7 +4065,10 @@ mod tests {
     use axum::{body::Body, http::Request};
     use ed25519_dalek::{Signer, SigningKey};
     use http_body_util::BodyExt;
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
     use tower::util::ServiceExt;
 
     type CapturedForwardedHeaders = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
@@ -3466,6 +4150,7 @@ mod tests {
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
             storage_broker: Arc::new(StorageBrokerManager::default()),
+            volume_manager: Arc::new(VolumeManager::default()),
             telemetry,
             manifest_path,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
@@ -3486,9 +4171,12 @@ mod tests {
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
                 host_path: host_path.display().to_string(),
                 guest_path: "/app/data".to_owned(),
                 readonly,
+                idle_timeout: None,
+                eviction_policy: None,
             }],
         }
     }
@@ -3511,9 +4199,36 @@ mod tests {
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
                 host_path: host_path.display().to_string(),
                 guest_path: "/app/data".to_owned(),
                 readonly: false,
+                idle_timeout: None,
+                eviction_policy: None,
+            }],
+        }
+    }
+
+    fn hibernating_ram_route(host_path: &std::path::Path) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/api/guest-volume".to_owned(),
+            role: RouteRole::User,
+            name: "guest-volume".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Ram,
+                host_path: host_path.display().to_string(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
+                idle_timeout: Some("50ms".to_owned()),
+                eviction_policy: Some(VolumeEvictionPolicy::Hibernate),
             }],
         }
     }
@@ -3960,6 +4675,7 @@ mod tests {
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
             storage_broker: Arc::new(StorageBrokerManager::default()),
+            volume_manager: Arc::new(VolumeManager::default()),
             telemetry: telemetry::init_test_telemetry(),
             manifest_path: PathBuf::from("integrity.lock"),
             background_workers: Arc::new(BackgroundWorkerManager::default()),
@@ -4957,9 +5673,12 @@ mod tests {
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
                 host_path: "  /tmp/tachyon_data  ".to_owned(),
                 guest_path: "/app/data/".to_owned(),
                 readonly: true,
+                idle_timeout: None,
+                eviction_policy: None,
             }],
         }];
 
@@ -4971,9 +5690,12 @@ mod tests {
         assert_eq!(
             route.volumes,
             vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
                 host_path: "/tmp/tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: true,
+                idle_timeout: None,
+                eviction_policy: None,
             }]
         );
     }
@@ -4994,9 +5716,12 @@ mod tests {
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
                 host_path: "/tmp/tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: false,
+                idle_timeout: None,
+                eviction_policy: None,
             }],
         }];
 
@@ -5006,6 +5731,25 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot request writable direct host mounts"));
+    }
+
+    #[test]
+    fn validate_integrity_config_accepts_hibernating_ram_volume() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![hibernating_ram_route(Path::new("/tmp/tachyon-ram-cache"))];
+
+        let config =
+            validate_integrity_config(config).expect("hibernating RAM volume should validate");
+        let route = config
+            .sealed_route("/api/guest-volume")
+            .expect("route should remain sealed");
+
+        assert_eq!(route.volumes[0].volume_type, VolumeType::Ram);
+        assert_eq!(route.volumes[0].idle_timeout.as_deref(), Some("50ms"));
+        assert_eq!(
+            route.volumes[0].eviction_policy,
+            Some(VolumeEvictionPolicy::Hibernate)
+        );
     }
 
     #[test]
@@ -5058,6 +5802,60 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(volume_dir);
+    }
+
+    #[tokio::test]
+    async fn hibernating_ram_volume_swaps_out_and_restores_state() {
+        let volume_dir = unique_test_dir("tachyon-ram-hibernate");
+        let route = hibernating_ram_route(&volume_dir);
+        let broker = Arc::new(StorageBrokerManager::default());
+        let volume_manager = VolumeManager::default();
+
+        {
+            let _leases = volume_manager
+                .acquire_route_volumes(&route, Arc::clone(&broker))
+                .await
+                .expect("initial route volume acquisition should succeed");
+            fs::write(volume_dir.join("state.txt"), "hibernated state")
+                .expect("state file should be written");
+        }
+
+        let managed = volume_manager
+            .managed_volume_for_route(&route.path, "/app/data")
+            .expect("managed volume should be registered");
+        let snapshot_path = snapshot_path_for_volume(&volume_dir);
+
+        for _ in 0..50 {
+            if managed.lifecycle() == ManagedVolumeLifecycle::OnDisk {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(managed.lifecycle(), ManagedVolumeLifecycle::OnDisk);
+        assert!(
+            snapshot_path.join("state.txt").exists(),
+            "snapshot should contain the persisted state file"
+        );
+        assert!(
+            !volume_dir.exists(),
+            "active RAM volume directory should be released after hibernation"
+        );
+
+        let _restored = volume_manager
+            .acquire_route_volumes(&route, Arc::clone(&broker))
+            .await
+            .expect("restoring hibernated volume should succeed");
+
+        assert_eq!(managed.lifecycle(), ManagedVolumeLifecycle::Active);
+        assert_eq!(
+            fs::read_to_string(volume_dir.join("state.txt"))
+                .expect("restored RAM volume should expose the original file"),
+            "hibernated state"
+        );
+
+        let _ = fs::remove_dir_all(volume_dir);
+        let _ = fs::remove_dir_all(snapshot_path);
     }
 
     #[test]

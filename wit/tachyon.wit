@@ -42,6 +42,8 @@ interface storage-broker {
     }
 
     enqueue-write: func(path: string, mode: write-mode, body: list<u8>) -> result<_, string>;
+    snapshot-volume: func(volume-id: string, source-path: string, snapshot-path: string) -> result<_, string>;
+    restore-volume: func(volume-id: string, snapshot-path: string, destination-path: string) -> result<_, string>;
 }
 
 interface outbound-http {

@@ -30,6 +30,14 @@ fn is_default_route_version(version: &String) -> bool {
     version == DEFAULT_ROUTE_VERSION
 }
 
+fn default_volume_type() -> VolumeType {
+    VolumeType::Host
+}
+
+fn is_default_volume_type(volume_type: &VolumeType) -> bool {
+    *volume_type == VolumeType::Host
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteRole {
@@ -50,6 +58,19 @@ pub struct RouteTarget {
     pub weight: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_header: Option<HeaderMatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeType {
+    Host,
+    Ram,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeEvictionPolicy {
+    Hibernate,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -83,10 +104,20 @@ pub struct SealedRoute {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SealedVolume {
+    #[serde(
+        rename = "type",
+        default = "default_volume_type",
+        skip_serializing_if = "is_default_volume_type"
+    )]
+    pub volume_type: VolumeType,
     pub host_path: String,
     pub guest_path: String,
     #[serde(default)]
     pub readonly: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction_policy: Option<VolumeEvictionPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -753,15 +784,19 @@ fn parse_route_volume(
         bail!("volume values cannot be empty");
     }
 
-    let (route_path, volume_spec) = match trimmed.split_once('=') {
-        Some((path, volume_spec)) => {
+    let route_separator = trimmed.find('=');
+    let mapping_separator = trimmed.find(":/");
+    let (route_path, volume_spec) = match (route_separator, mapping_separator) {
+        (Some(route_separator), Some(mapping_separator)) if route_separator < mapping_separator => {
+            let (path, volume_spec) = trimmed.split_at(route_separator);
+            let volume_spec = &volume_spec[1..];
             let path = path.trim();
             if path.is_empty() {
                 bail!("volume values must include a non-empty route before `=`");
             }
             (Some(path.to_owned()), volume_spec.trim())
         }
-        None => {
+        _ => {
             if sealed_route_count != 1 {
                 bail!(
                     "volume `{trimmed}` must target a declared sealed route using `/path=HOST:GUEST[:ro|rw]` when more than one route is configured"
@@ -780,13 +815,18 @@ fn parse_volume_spec(value: &str) -> Result<SealedVolume> {
         bail!("volume definitions cannot be empty");
     }
 
-    let (mapping, readonly) = match trimmed.rsplit_once(':') {
+    let mut segments = trimmed.split(',');
+    let mapping_segment = segments
+        .next()
+        .context("volume definitions cannot be empty")?
+        .trim();
+    let (mapping, readonly) = match mapping_segment.rsplit_once(':') {
         Some((mapping, mode))
             if matches!(mode.trim().to_ascii_lowercase().as_str(), "ro" | "rw") =>
         {
             (mapping.trim(), mode.trim().eq_ignore_ascii_case("ro"))
         }
-        _ => (trimmed, false),
+        _ => (mapping_segment, false),
     };
 
     let separator = mapping.rfind(":/").context(
@@ -797,10 +837,58 @@ fn parse_volume_spec(value: &str) -> Result<SealedVolume> {
         bail!("volume definitions must include a non-empty host path");
     }
 
+    let mut volume_type = VolumeType::Host;
+    let mut idle_timeout = None;
+    let mut eviction_policy = None;
+    for option in segments {
+        let (key, option_value) = option
+            .split_once('=')
+            .context("volume options must use the `key=value` syntax")?;
+        let key = key.trim();
+        let option_value = option_value.trim();
+        if option_value.is_empty() {
+            bail!("volume option `{key}` must include a non-empty value");
+        }
+
+        match key {
+            "type" => {
+                volume_type = match option_value {
+                    "host" => VolumeType::Host,
+                    "ram" => VolumeType::Ram,
+                    _ => bail!("volume `type` must be `host` or `ram`"),
+                };
+            }
+            "idle_timeout" => {
+                validate_idle_timeout(option_value)?;
+                idle_timeout = Some(option_value.to_owned());
+            }
+            "eviction_policy" => {
+                eviction_policy = Some(match option_value {
+                    "hibernate" => VolumeEvictionPolicy::Hibernate,
+                    _ => bail!("volume `eviction_policy` must be `hibernate`"),
+                });
+            }
+            _ => bail!("unsupported volume option `{key}`"),
+        }
+    }
+
+    if idle_timeout.is_some() && volume_type != VolumeType::Ram {
+        bail!("volume `idle_timeout` is only valid for `type=ram`");
+    }
+    if eviction_policy.is_some() && volume_type != VolumeType::Ram {
+        bail!("volume `eviction_policy` is only valid for `type=ram`");
+    }
+    if eviction_policy == Some(VolumeEvictionPolicy::Hibernate) && idle_timeout.is_none() {
+        bail!("volume `eviction_policy=hibernate` requires `idle_timeout`");
+    }
+
     Ok(SealedVolume {
+        volume_type,
         host_path: host_path.to_owned(),
         guest_path: normalize_guest_volume_path(&mapping[separator + 1..])?,
         readonly,
+        idle_timeout,
+        eviction_policy,
     })
 }
 
@@ -838,7 +926,7 @@ fn normalize_guest_volume_path(path: &str) -> Result<String> {
 }
 
 fn insert_route_volume(route: &mut SealedRoute, volume: SealedVolume) -> Result<()> {
-    if route.role == RouteRole::User && !volume.readonly {
+    if route.role == RouteRole::User && volume.volume_type == VolumeType::Host && !volume.readonly {
         bail!(
             "route `{}` is a user route and cannot request writable host mounts; use `:ro` and delegate writes through a system storage broker",
             route.path
@@ -865,6 +953,29 @@ fn insert_route_volume(route: &mut SealedRoute, volume: SealedVolume) -> Result<
     route
         .volumes
         .sort_by(|left, right| left.guest_path.cmp(&right.guest_path));
+    Ok(())
+}
+
+fn validate_idle_timeout(value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    let (digits, suffix) = if let Some(value) = trimmed.strip_suffix("ms") {
+        (value.trim(), "ms")
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        (value.trim(), "s")
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        (value.trim(), "m")
+    } else {
+        bail!("volume `idle_timeout` must use one of the `ms`, `s`, or `m` suffixes");
+    };
+
+    let amount = digits
+        .parse::<u64>()
+        .with_context(|| format!("failed to parse volume `idle_timeout {trimmed}`"))?;
+    if amount == 0 {
+        bail!("volume `idle_timeout` must be greater than zero");
+    }
+
+    let _ = suffix;
     Ok(())
 }
 
@@ -1360,9 +1471,12 @@ mod tests {
                     min_instances: 2,
                     max_concurrency: 16,
                     volumes: vec![SealedVolume {
+                        volume_type: VolumeType::Host,
                         host_path: "/tmp/tachyon_data".to_owned(),
                         guest_path: "/app/data".to_owned(),
                         readonly: true,
+                        idle_timeout: None,
+                        eviction_policy: None,
                     }],
                 },
                 SealedRoute {
@@ -1662,9 +1776,12 @@ mod tests {
         assert_eq!(
             routes[0].volumes,
             vec![SealedVolume {
+                volume_type: VolumeType::Host,
                 host_path: "C:\\\\tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: true,
+                idle_timeout: None,
+                eviction_policy: None,
             }]
         );
     }
@@ -1740,9 +1857,45 @@ mod tests {
         assert_eq!(
             broker.volumes,
             vec![SealedVolume {
+                volume_type: VolumeType::Host,
                 host_path: "/tmp/tachyon_data".to_owned(),
                 guest_path: "/app/data".to_owned(),
                 readonly: false,
+                idle_timeout: None,
+                eviction_policy: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_routes_allows_writable_user_ram_volume_mounts() {
+        let routes = normalize_routes(
+            vec!["/api/guest-volume".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                "/tmp/tachyon_ram:/app/data:rw,type=ram,idle_timeout=50ms,eviction_policy=hibernate"
+                    .to_owned(),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("user RAM volumes should allow writable access");
+
+        assert_eq!(
+            routes[0].volumes,
+            vec![SealedVolume {
+                volume_type: VolumeType::Ram,
+                host_path: "/tmp/tachyon_ram".to_owned(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
+                idle_timeout: Some("50ms".to_owned()),
+                eviction_policy: Some(VolumeEvictionPolicy::Hibernate),
             }]
         );
     }
