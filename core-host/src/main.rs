@@ -39,6 +39,7 @@ use std::{
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 #[cfg(unix)]
 use tokio::net::UnixListener;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use uuid::Uuid;
 use wasmtime::{
@@ -70,6 +71,13 @@ mod system_component_bindings {
     wasmtime::component::bindgen!({
         path: "../wit",
         world: "system-faas-guest",
+    });
+}
+
+mod udp_component_bindings {
+    wasmtime::component::bindgen!({
+        path: "../wit",
+        world: "udp-faas-guest",
     });
 }
 
@@ -115,6 +123,9 @@ const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const VOLUME_GC_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const TELEMETRY_EXPORT_QUEUE_CAPACITY: usize = 1024;
 const TELEMETRY_EXPORT_BATCH_SIZE: usize = 32;
+const UDP_LAYER4_QUEUE_CAPACITY: usize = 256;
+const UDP_LAYER4_MAX_WORKERS_PER_LISTENER: usize = 8;
+const UDP_LAYER4_MAX_DATAGRAM_SIZE: usize = 65_507;
 const IDENTITY_TOKEN_TTL: Duration = Duration::from_secs(30);
 const IDENTITY_TOKEN_PREFIX: &str = "tachyon.v1";
 const KUBERNETES_SERVICE_BASE_URL: &str = "https://kubernetes.default.svc";
@@ -201,6 +212,12 @@ struct TcpLayer4ListenerHandle {
     #[cfg_attr(not(test), allow(dead_code))]
     local_addr: SocketAddr,
     join_handle: tokio::task::JoinHandle<()>,
+}
+
+struct UdpLayer4ListenerHandle {
+    #[cfg_attr(not(test), allow(dead_code))]
+    local_addr: SocketAddr,
+    join_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -322,6 +339,12 @@ struct GuestHttpResponse {
     body: Bytes,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UdpResponseDatagram {
+    target: SocketAddr,
+    payload: Bytes,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum GuestExecutionOutput {
     Http(GuestHttpResponse),
@@ -337,6 +360,12 @@ struct GuestExecutionOutcome {
 struct RouteExecutionResult {
     response: GuestHttpResponse,
     fuel_consumed: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct UdpInboundDatagram {
+    source: SocketAddr,
+    payload: Bytes,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -851,10 +880,18 @@ enum VolumeEvictionPolicy {
 struct IntegrityLayer4Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tcp: Vec<IntegrityTcpBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    udp: Vec<IntegrityUdpBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct IntegrityTcpBinding {
+    port: u16,
+    target: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct IntegrityUdpBinding {
     port: u16,
     target: String,
 }
@@ -942,7 +979,7 @@ struct RouteRegistry {
 
 impl IntegrityLayer4Config {
     fn is_empty(&self) -> bool {
-        self.tcp.is_empty()
+        self.tcp.is_empty() && self.udp.is_empty()
     }
 }
 
@@ -994,6 +1031,7 @@ async fn run() -> Result<()> {
     spawn_reload_watcher(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     let app = build_app(state.clone());
+    let udp_layer4_listeners = start_udp_layer4_listeners(state.clone()).await?;
     let tcp_layer4_listeners = start_tcp_layer4_listeners(state).await?;
     let uds_server = start_uds_fast_path_listener(app.clone(), &runtime.config, uds_fast_path)?;
 
@@ -1017,6 +1055,12 @@ async fn run() -> Result<()> {
     if let Some(server) = uds_server {
         server.abort();
         let _ = server.await;
+    }
+    for listener in udp_layer4_listeners {
+        for handle in listener.join_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
     for listener in tcp_layer4_listeners {
         listener.join_handle.abort();
@@ -2321,10 +2365,140 @@ fn start_uds_fast_path_listener(
 
 fn layer4_bind_address(host_address: &str, port: u16) -> Result<SocketAddr> {
     let mut address = host_address.parse::<SocketAddr>().with_context(|| {
-        format!("failed to parse `host_address` `{host_address}` for Layer 4 TCP binding")
+        format!("failed to parse `host_address` `{host_address}` for Layer 4 binding")
     })?;
     address.set_port(port);
     Ok(address)
+}
+
+async fn start_udp_layer4_listeners(state: AppState) -> Result<Vec<UdpLayer4ListenerHandle>> {
+    start_udp_layer4_listeners_with_queue_capacity(state, UDP_LAYER4_QUEUE_CAPACITY).await
+}
+
+async fn start_udp_layer4_listeners_with_queue_capacity(
+    state: AppState,
+    queue_capacity: usize,
+) -> Result<Vec<UdpLayer4ListenerHandle>> {
+    let runtime = state.runtime.load_full();
+    let mut listeners = Vec::new();
+
+    for binding in &runtime.config.layer4.udp {
+        let resolved = runtime
+            .route_registry
+            .resolve_named_route(&binding.target)
+            .map_err(|error| {
+                anyhow!(
+                    "invalid UDP Layer 4 binding target `{}`: {error}",
+                    binding.target
+                )
+            })?;
+        let route = runtime
+            .config
+            .sealed_route(&resolved.path)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "UDP Layer 4 binding target `{}` resolved to a missing route",
+                    binding.target
+                )
+            })?;
+        let bind_address = layer4_bind_address(&runtime.config.host_address, binding.port)?;
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind(bind_address)
+                .await
+                .with_context(|| {
+                    format!("failed to bind UDP Layer 4 listener on {bind_address}")
+                })?,
+        );
+        let local_addr = socket
+            .local_addr()
+            .context("failed to read bound UDP Layer 4 listener address")?;
+        let (tx, rx) = mpsc::channel::<UdpInboundDatagram>(queue_capacity.max(1));
+        let rx = Arc::new(TokioMutex::new(rx));
+        let listener_socket = Arc::clone(&socket);
+        let listener_target = binding.target.clone();
+        let listener_handle = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; UDP_LAYER4_MAX_DATAGRAM_SIZE];
+            loop {
+                let (size, source) = match listener_socket.recv_from(&mut buffer).await {
+                    Ok(received) => received,
+                    Err(error) => {
+                        tracing::warn!(
+                            port = local_addr.port(),
+                            target = listener_target,
+                            "UDP Layer 4 listener receive failed: {error}"
+                        );
+                        break;
+                    }
+                };
+
+                let packet = UdpInboundDatagram {
+                    source,
+                    payload: Bytes::copy_from_slice(&buffer[..size]),
+                };
+                if let Err(error) = tx.try_send(packet) {
+                    match error {
+                        mpsc::error::TrySendError::Full(_) => {
+                            tracing::warn!(
+                                port = local_addr.port(),
+                                remote = %source,
+                                target = listener_target,
+                                "dropping UDP datagram because the safe queue threshold was exceeded"
+                            );
+                        }
+                        mpsc::error::TrySendError::Closed(_) => break,
+                    }
+                }
+            }
+        });
+
+        let mut join_handles = vec![listener_handle];
+        for _ in 0..udp_listener_worker_count(route.max_concurrency) {
+            let worker_state = state.clone();
+            let worker_route = route.clone();
+            let worker_socket = Arc::clone(&socket);
+            let worker_rx = Arc::clone(&rx);
+            let worker_target = binding.target.clone();
+            join_handles.push(tokio::spawn(async move {
+                loop {
+                    let packet = {
+                        let mut receiver = worker_rx.lock().await;
+                        receiver.recv().await
+                    };
+                    let Some(packet) = packet else {
+                        break;
+                    };
+                    if let Err(error) = handle_udp_layer4_datagram(
+                        worker_state.clone(),
+                        worker_route.clone(),
+                        Arc::clone(&worker_socket),
+                        packet,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            target = %worker_target,
+                            "UDP Layer 4 datagram failed: {error:#}"
+                        );
+                    }
+                }
+            }));
+        }
+
+        listeners.push(UdpLayer4ListenerHandle {
+            local_addr,
+            join_handles,
+        });
+    }
+
+    Ok(listeners)
+}
+
+fn udp_listener_worker_count(max_concurrency: u32) -> usize {
+    usize::try_from(max_concurrency)
+        .ok()
+        .map(|count| count.clamp(1, UDP_LAYER4_MAX_WORKERS_PER_LISTENER))
+        .unwrap_or(UDP_LAYER4_MAX_WORKERS_PER_LISTENER)
 }
 
 async fn start_tcp_layer4_listeners(state: AppState) -> Result<Vec<TcpLayer4ListenerHandle>> {
@@ -2400,6 +2574,90 @@ async fn start_tcp_layer4_listeners(state: AppState) -> Result<Vec<TcpLayer4List
     }
 
     Ok(listeners)
+}
+
+async fn handle_udp_layer4_datagram(
+    state: AppState,
+    route: IntegrityRoute,
+    socket: Arc<tokio::net::UdpSocket>,
+    datagram: UdpInboundDatagram,
+) -> Result<()> {
+    let runtime = state.runtime.load_full();
+    let volume_leases = state
+        .volume_manager
+        .acquire_route_volumes(&route, Arc::clone(&state.storage_broker))
+        .await
+        .map_err(|error| anyhow!("failed to acquire UDP Layer 4 volumes: {error}"))?;
+    let semaphore = runtime
+        .concurrency_limits
+        .get(&route.path)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "UDP Layer 4 route `{}` is missing a concurrency limiter",
+                route.path
+            )
+        })?;
+    let permit = match acquire_route_permit(semaphore).await {
+        Ok(permit) => permit,
+        Err(RoutePermitError::Closed) => return Ok(()),
+        Err(RoutePermitError::TimedOut) => {
+            tracing::warn!(
+                route = %route.path,
+                remote = %datagram.source,
+                "dropping UDP datagram because the route is saturated"
+            );
+            return Ok(());
+        }
+    };
+    let function_name = select_stream_route_module(&route)
+        .map_err(|error| anyhow!("failed to resolve UDP Layer 4 target module: {error}"))?;
+    let engine = runtime.engine.clone();
+    let config = runtime.config.clone();
+    let runtime_telemetry = state.telemetry.clone();
+    let host_identity = Arc::clone(&state.host_identity);
+    let storage_broker = Arc::clone(&state.storage_broker);
+    let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+    let request_headers = HeaderMap::new();
+    let route_for_execution = route.clone();
+    let source = datagram.source;
+    let payload = datagram.payload;
+    let responses = tokio::task::spawn_blocking(move || {
+        let _volume_leases = volume_leases;
+        let _permit = permit;
+        let execution = GuestExecutionContext {
+            config: config.clone(),
+            sampled_execution: false,
+            runtime_telemetry,
+            secret_access: SecretAccess::from_route(&route_for_execution, &SecretsVault::load()),
+            request_headers,
+            host_identity,
+            storage_broker,
+            telemetry: None,
+            concurrency_limits,
+            propagated_headers: Vec::new(),
+        };
+        execute_udp_layer4_guest(
+            &engine,
+            &route_for_execution,
+            &function_name,
+            source,
+            payload,
+            &execution,
+        )
+    })
+    .await
+    .context("UDP Layer 4 worker exited before returning a result")?
+    .map_err(|error| anyhow!("UDP Layer 4 guest failed: {error:?}"))?;
+
+    for response in responses {
+        socket
+            .send_to(&response.payload, response.target)
+            .await
+            .with_context(|| format!("failed to send UDP datagram to {}", response.target))?;
+    }
+
+    Ok(())
 }
 
 async fn handle_tcp_layer4_connection(
@@ -3580,6 +3838,130 @@ fn execute_component_guest(
     })
 }
 
+fn execute_udp_layer4_guest(
+    engine: &Engine,
+    route: &IntegrityRoute,
+    function_name: &str,
+    source: SocketAddr,
+    payload: Bytes,
+    execution: &GuestExecutionContext,
+) -> std::result::Result<Vec<UdpResponseDatagram>, ExecutionError> {
+    let module_path =
+        resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
+    let component = Component::from_file(engine, &module_path).map_err(|error| {
+        guest_execution_error(
+            error,
+            format!(
+                "failed to load UDP guest component from {}",
+                module_path.display()
+            ),
+        )
+    })?;
+
+    execute_udp_component_guest(
+        engine,
+        route,
+        &module_path,
+        &component,
+        source,
+        payload,
+        execution,
+    )
+}
+
+fn execute_udp_component_guest(
+    engine: &Engine,
+    route: &IntegrityRoute,
+    component_path: &Path,
+    component: &Component,
+    source: SocketAddr,
+    payload: Bytes,
+    execution: &GuestExecutionContext,
+) -> std::result::Result<Vec<UdpResponseDatagram>, ExecutionError> {
+    let mut linker = ComponentLinker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add WASI preview2 functions to UDP component linker",
+        )
+    })?;
+    udp_component_bindings::tachyon::mesh::secrets_vault::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add secrets vault functions to UDP component linker",
+        )
+    })?;
+    let mut store = Store::new(
+        engine,
+        ComponentHostState::new(
+            route,
+            execution.config.clone(),
+            execution.config.guest_memory_limit_bytes,
+            execution.runtime_telemetry.clone(),
+            execution.secret_access.clone(),
+            execution.request_headers.clone(),
+            Arc::clone(&execution.host_identity),
+            Arc::clone(&execution.storage_broker),
+            Arc::clone(&execution.concurrency_limits),
+            execution.propagated_headers.clone(),
+        )?,
+    );
+    store.limiter(|state| &mut state.limits);
+    maybe_set_guest_fuel_budget(&mut store, execution)?;
+
+    let bindings = udp_component_bindings::UdpFaasGuest::instantiate(
+        &mut store, component, &linker,
+    )
+    .map_err(|error| {
+        let message = format!(
+            "failed to instantiate UDP guest component from {}",
+            component_path.display()
+        );
+        let error_message = error.to_string();
+        if error_message.contains("no exported instance named `tachyon:mesh/udp-handler`") {
+            ExecutionError::Internal(format!(
+                "guest component `{}` does not export the UDP packet handler",
+                component_path.display()
+            ))
+        } else {
+            guest_execution_error(error, message)
+        }
+    })?;
+    record_wasm_start(execution.telemetry.as_ref());
+    let source_ip = source.ip().to_string();
+    let response = bindings.tachyon_mesh_udp_handler().call_handle_packet(
+        &mut store,
+        &source_ip,
+        source.port(),
+        payload.as_ref(),
+    );
+    record_wasm_end(execution.telemetry.as_ref());
+    let _fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
+    let response = response.map_err(|error| {
+        guest_execution_error(error, "guest UDP component `handle-packet` trapped")
+    })?;
+
+    response
+        .into_iter()
+        .map(|datagram| {
+            let target_ip = datagram.target_ip.parse::<IpAddr>().map_err(|error| {
+                ExecutionError::Internal(format!(
+                    "guest UDP component returned an invalid target IP `{}`: {error}",
+                    datagram.target_ip
+                ))
+            })?;
+            Ok(UdpResponseDatagram {
+                target: SocketAddr::new(target_ip, datagram.target_port),
+                payload: Bytes::from(datagram.payload),
+            })
+        })
+        .collect()
+}
+
 fn execute_system_component_guest(
     engine: &Engine,
     request: GuestRequest,
@@ -3801,14 +4183,12 @@ fn execute_legacy_guest(
     let stdout_path = stdout_file.path.clone();
     let mut wasi = WasiCtxBuilder::new();
     wasi.arg(legacy_guest_program_name(module_path))
-        .stdin(InputFile::new(stdin_file.file.try_clone().map_err(|error| {
-            guest_execution_error(error.into(), "failed to clone guest stdin file handle")
-        })?))
-        .stdout(OutputFile::new(
-            stdout_file.file.try_clone().map_err(|error| {
-                guest_execution_error(error.into(), "failed to clone guest stdout file handle")
-            })?,
-        ));
+        .stdin(InputFile::new(stdin_file.file.try_clone().map_err(
+            |error| guest_execution_error(error.into(), "failed to clone guest stdin file handle"),
+        )?))
+        .stdout(OutputFile::new(stdout_file.file.try_clone().map_err(
+            |error| guest_execution_error(error.into(), "failed to clone guest stdout file handle"),
+        )?));
 
     if let Some(module_dir) = module_path.parent() {
         wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
@@ -3849,7 +4229,10 @@ fn execute_legacy_guest(
     let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
     handle_guest_entrypoint_result(entrypoint_name, call_result)?;
     stdout_file.file.sync_all().map_err(|error| {
-        guest_execution_error(error.into(), "failed to flush guest stdout temp file to disk")
+        guest_execution_error(
+            error.into(),
+            "failed to flush guest stdout temp file to disk",
+        )
     })?;
     let stdout_bytes = read_guest_stdout_file(&stdout_path, execution.config.max_stdout_bytes)?;
 
@@ -4569,6 +4952,7 @@ fn normalize_layer4_config(
     route_registry: &RouteRegistry,
 ) -> Result<IntegrityLayer4Config> {
     layer4.tcp = normalize_tcp_bindings(layer4.tcp, route_registry)?;
+    layer4.udp = normalize_udp_bindings(layer4.udp, route_registry)?;
     Ok(layer4)
 }
 
@@ -4608,6 +4992,50 @@ fn normalize_tcp_bindings(
         if pair[0].port == pair[1].port {
             return Err(anyhow!(
                 "Integrity Validation Failed: TCP Layer 4 port `{}` is defined more than once",
+                pair[0].port
+            ));
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_udp_bindings(
+    bindings: Vec<IntegrityUdpBinding>,
+    route_registry: &RouteRegistry,
+) -> Result<Vec<IntegrityUdpBinding>> {
+    let mut normalized = bindings
+        .into_iter()
+        .map(|binding| {
+            if binding.port == 0 {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: UDP Layer 4 bindings must use a port above zero"
+                ));
+            }
+
+            let target = normalize_service_name(&binding.target).map_err(|error| {
+                anyhow!("Integrity Validation Failed: UDP Layer 4 target is invalid: {error}")
+            })?;
+            route_registry
+                .resolve_named_route(&target)
+                .map_err(|error| {
+                    anyhow!(
+                        "Integrity Validation Failed: UDP Layer 4 target `{target}` is invalid: {error}"
+                    )
+                })?;
+
+            Ok(IntegrityUdpBinding {
+                port: binding.port,
+                target,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    normalized.sort_by_key(|binding| binding.port);
+    for pair in normalized.windows(2) {
+        if pair[0].port == pair[1].port {
+            return Err(anyhow!(
+                "Integrity Validation Failed: UDP Layer 4 port `{}` is defined more than once",
                 pair[0].port
             ));
         }
@@ -5331,6 +5759,27 @@ impl component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHostSta
     }
 }
 
+impl udp_component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHostState {
+    fn get_secret(
+        &mut self,
+        name: String,
+    ) -> std::result::Result<String, udp_component_bindings::tachyon::mesh::secrets_vault::Error>
+    {
+        self.secrets.get_secret(&name).map_err(|error| match error {
+            SecretAccessErrorKind::NotFound => {
+                udp_component_bindings::tachyon::mesh::secrets_vault::Error::NotFound
+            }
+            SecretAccessErrorKind::PermissionDenied => {
+                udp_component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied
+            }
+            #[cfg(not(feature = "secrets-vault"))]
+            SecretAccessErrorKind::VaultDisabled => {
+                udp_component_bindings::tachyon::mesh::secrets_vault::Error::VaultDisabled
+            }
+        })
+    }
+}
+
 impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for ComponentHostState {
     fn get_metrics(
         &mut self,
@@ -5936,11 +6385,36 @@ mod tests {
         }
     }
 
+    fn udp_echo_test_route(max_concurrency: u32) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/udp/echo".to_owned(),
+            role: RouteRole::User,
+            name: "guest-udp-echo".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            min_instances: 0,
+            max_concurrency,
+            volumes: Vec::new(),
+        }
+    }
+
     fn free_tcp_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
             .expect("temporary TCP listener should bind")
             .local_addr()
             .expect("temporary TCP listener should expose an address")
+            .port()
+    }
+
+    fn free_udp_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("temporary UDP socket should bind")
+            .local_addr()
+            .expect("temporary UDP socket should expose an address")
             .port()
     }
 
@@ -6973,6 +7447,7 @@ mod tests {
                     port,
                     target: "guest-tcp-echo".to_owned(),
                 }],
+                udp: Vec::new(),
             },
             routes: vec![route.clone()],
             ..IntegrityConfig::default_sealed()
@@ -7091,6 +7566,7 @@ mod tests {
                     port,
                     target: "guest-tcp-echo".to_owned(),
                 }],
+                udp: Vec::new(),
             },
             routes: vec![route],
             ..IntegrityConfig::default_sealed()
@@ -7150,6 +7626,146 @@ mod tests {
         for listener in listeners {
             listener.join_handle.abort();
             let _ = listener.join_handle.await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn udp_layer4_listener_echoes_datagrams() {
+        use std::time::Duration;
+
+        let port = free_udp_port();
+        let route = udp_echo_test_route(1);
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: "127.0.0.1:8080".to_owned(),
+            layer4: IntegrityLayer4Config {
+                tcp: Vec::new(),
+                udp: vec![IntegrityUdpBinding {
+                    port,
+                    target: "guest-udp-echo".to_owned(),
+                }],
+            },
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("UDP Layer 4 config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let listeners = start_udp_layer4_listeners(state)
+            .await
+            .expect("UDP Layer 4 listener should start");
+        let listener_addr = listeners
+            .first()
+            .expect("one UDP Layer 4 listener should be started")
+            .local_addr;
+
+        let client =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("UDP client socket should bind");
+        client
+            .connect(listener_addr)
+            .expect("UDP client should connect to listener");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("UDP client should set a read timeout");
+        client
+            .send(b"ping over udp")
+            .expect("UDP client should send datagram");
+
+        let mut buffer = [0_u8; 64];
+        let received = client
+            .recv(&mut buffer)
+            .expect("UDP client should receive echoed datagram");
+        assert_eq!(&buffer[..received], b"ping over udp");
+
+        for listener in listeners {
+            for handle in listener.join_handles {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn udp_layer4_listener_drops_when_safe_queue_is_full() {
+        use std::time::{Duration, Instant};
+
+        let port = free_udp_port();
+        let route = udp_echo_test_route(1);
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: "127.0.0.1:8080".to_owned(),
+            layer4: IntegrityLayer4Config {
+                tcp: Vec::new(),
+                udp: vec![IntegrityUdpBinding {
+                    port,
+                    target: "guest-udp-echo".to_owned(),
+                }],
+            },
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("UDP Layer 4 config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let listeners = start_udp_layer4_listeners_with_queue_capacity(state, 1)
+            .await
+            .expect("UDP Layer 4 listener should start");
+        let listener_addr = listeners
+            .first()
+            .expect("one UDP Layer 4 listener should be started")
+            .local_addr;
+
+        let client =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("UDP client socket should bind");
+        client
+            .connect(listener_addr)
+            .expect("UDP client should connect to listener");
+        client
+            .set_read_timeout(Some(Duration::from_millis(750)))
+            .expect("UDP client should set a read timeout");
+
+        client
+            .send(b"delay:200")
+            .expect("UDP client should send slow datagram");
+        for index in 0..16 {
+            let payload = format!("packet-{index}");
+            client
+                .send(payload.as_bytes())
+                .expect("UDP client should send queued datagram");
+        }
+
+        let started = Instant::now();
+        let mut responses = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 64];
+            match client.recv(&mut buffer) {
+                Ok(received) => {
+                    responses.push(String::from_utf8_lossy(&buffer[..received]).into_owned())
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(error) => panic!("UDP client receive should not fail: {error}"),
+            }
+
+            if started.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+        }
+
+        assert!(
+            responses.iter().any(|payload| payload == "delay:200"),
+            "the initially accepted datagram should complete"
+        );
+        assert!(
+            responses.len() <= 2,
+            "queue overload should drop excess datagrams, got {responses:?}"
+        );
+
+        for listener in listeners {
+            for handle in listener.join_handles {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
     }
 
@@ -8005,6 +8621,7 @@ mod tests {
                         target: "guest-tcp-echo".to_owned(),
                     },
                 ],
+                udp: Vec::new(),
             },
             routes: vec![tcp_echo_test_route(1)],
             ..IntegrityConfig::default_sealed()
@@ -8012,6 +8629,30 @@ mod tests {
         .expect_err("duplicate TCP Layer 4 ports should fail validation");
 
         assert!(error.to_string().contains("Layer 4 port `2222`"));
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_duplicate_udp_layer4_ports() {
+        let error = validate_integrity_config(IntegrityConfig {
+            layer4: IntegrityLayer4Config {
+                tcp: Vec::new(),
+                udp: vec![
+                    IntegrityUdpBinding {
+                        port: 5353,
+                        target: "guest-udp-echo".to_owned(),
+                    },
+                    IntegrityUdpBinding {
+                        port: 5353,
+                        target: "guest-udp-echo".to_owned(),
+                    },
+                ],
+            },
+            routes: vec![udp_echo_test_route(1)],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect_err("duplicate UDP Layer 4 ports should fail validation");
+
+        assert!(error.to_string().contains("Layer 4 port `5353`"));
     }
 
     #[test]

@@ -115,10 +115,18 @@ pub struct SealedRoute {
 pub struct SealedLayer4Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tcp: Vec<SealedTcpBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp: Vec<SealedUdpBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SealedTcpBinding {
+    pub port: u16,
+    pub target: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SealedUdpBinding {
     pub port: u16,
     pub target: String,
 }
@@ -180,6 +188,7 @@ struct GenerateRequest {
     route_middlewares: Vec<String>,
     route_scales: Vec<String>,
     tcp_ports: Vec<String>,
+    udp_ports: Vec<String>,
     volumes: Vec<String>,
     telemetry_sample_rate: f64,
     memory_mib: u32,
@@ -193,7 +202,7 @@ struct RouteScaling {
 
 impl SealedLayer4Config {
     fn is_empty(&self) -> bool {
-        self.tcp.is_empty()
+        self.tcp.is_empty() && self.udp.is_empty()
     }
 }
 
@@ -269,6 +278,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         route_middlewares: parse_optional_routes_arg(&subcommand.matches.args, "route-middleware")?,
         route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
         tcp_ports: parse_optional_string_args(&subcommand.matches.args, "tcp-port", "tcp-port")?,
+        udp_ports: parse_optional_string_args(&subcommand.matches.args, "udp-port", "udp-port")?,
         volumes: parse_optional_string_args(&subcommand.matches.args, "volume", "volume")?,
         telemetry_sample_rate: parse_telemetry_sample_rate_arg(&subcommand.matches.args)?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
@@ -302,6 +312,7 @@ fn parse_generate_request_from_args(
     let mut route_middlewares = Vec::new();
     let mut route_scales = Vec::new();
     let mut tcp_ports = Vec::new();
+    let mut udp_ports = Vec::new();
     let mut volumes = Vec::new();
     let mut telemetry_sample_rate = DEFAULT_TELEMETRY_SAMPLE_RATE;
     let mut memory_mib = None;
@@ -460,6 +471,19 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--udp-port=") {
+            udp_ports.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--udp-port" {
+            let binding = args.next().context(
+                "missing value for `--udp-port`; expected `--udp-port 5353=guest-udp-echo`",
+            )?;
+            udp_ports.push(binding);
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix("--volume=") {
             volumes.push(value.to_owned());
             continue;
@@ -509,6 +533,7 @@ fn parse_generate_request_from_args(
         route_middlewares,
         route_scales,
         tcp_ports,
+        udp_ports,
         volumes,
         telemetry_sample_rate,
         memory_mib,
@@ -562,7 +587,7 @@ impl SealedConfig {
             request.route_credentials,
             request.route_middlewares,
         )?;
-        let layer4 = normalize_tcp_bindings(request.tcp_ports, &routes)?;
+        let layer4 = normalize_layer4_bindings(request.tcp_ports, request.udp_ports, &routes)?;
         let memory_mib = usize::try_from(request.memory_mib)
             .context("memory limit is too large for this platform")?;
         let guest_memory_limit_bytes = memory_mib
@@ -883,15 +908,16 @@ fn normalize_routes(
         .collect::<Result<Vec<_>>>()
 }
 
-fn normalize_tcp_bindings(
-    bindings: Vec<String>,
+fn normalize_layer4_bindings(
+    tcp_bindings: Vec<String>,
+    udp_bindings: Vec<String>,
     routes: &[SealedRoute],
 ) -> Result<SealedLayer4Config> {
     let route_names = routes
         .iter()
         .map(|route| route.name.clone())
         .collect::<BTreeSet<_>>();
-    let mut normalized = bindings
+    let mut normalized_tcp = tcp_bindings
         .into_iter()
         .map(|binding| {
             let (port, target) = parse_tcp_binding(&binding)?;
@@ -902,8 +928,8 @@ fn normalize_tcp_bindings(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    normalized.sort_by_key(|binding| binding.port);
-    for pair in normalized.windows(2) {
+    normalized_tcp.sort_by_key(|binding| binding.port);
+    for pair in normalized_tcp.windows(2) {
         if pair[0].port == pair[1].port {
             bail!(
                 "TCP Layer 4 port `{}` is defined more than once",
@@ -912,7 +938,31 @@ fn normalize_tcp_bindings(
         }
     }
 
-    Ok(SealedLayer4Config { tcp: normalized })
+    let mut normalized_udp = udp_bindings
+        .into_iter()
+        .map(|binding| {
+            let (port, target) = parse_udp_binding(&binding)?;
+            if !route_names.contains(&target) {
+                bail!("UDP Layer 4 target `{target}` must reference a declared sealed route name");
+            }
+            Ok(SealedUdpBinding { port, target })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    normalized_udp.sort_by_key(|binding| binding.port);
+    for pair in normalized_udp.windows(2) {
+        if pair[0].port == pair[1].port {
+            bail!(
+                "UDP Layer 4 port `{}` is defined more than once",
+                pair[0].port
+            );
+        }
+    }
+
+    Ok(SealedLayer4Config {
+        tcp: normalized_tcp,
+        udp: normalized_udp,
+    })
 }
 
 fn parse_tcp_binding(value: &str) -> Result<(u16, String)> {
@@ -930,6 +980,24 @@ fn parse_tcp_binding(value: &str) -> Result<(u16, String)> {
 
     let target = normalize_route_name(target.trim())
         .context("TCP Layer 4 targets must use a non-empty sealed route name")?;
+    Ok((port, target))
+}
+
+fn parse_udp_binding(value: &str) -> Result<(u16, String)> {
+    let trimmed = value.trim();
+    let (port, target) = trimmed
+        .split_once('=')
+        .context("UDP Layer 4 bindings must use the `PORT=TARGET` syntax")?;
+    let port = port
+        .trim()
+        .parse::<u16>()
+        .with_context(|| format!("failed to parse UDP Layer 4 port `{port}`"))?;
+    if port == 0 {
+        bail!("UDP Layer 4 bindings must use a port above zero");
+    }
+
+    let target = normalize_route_name(target.trim())
+        .context("UDP Layer 4 targets must use a non-empty sealed route name")?;
     Ok((port, target))
 }
 
@@ -1624,6 +1692,7 @@ mod tests {
             route_middlewares: Vec::new(),
             route_scales: vec!["/api/guest-example=2:16".to_owned()],
             tcp_ports: vec!["2222=faas-a".to_owned()],
+            udp_ports: vec!["5353=faas-a".to_owned()],
             volumes: vec!["/api/guest-example=/tmp/tachyon_data:/app/data:ro".to_owned()],
             telemetry_sample_rate: 0.25,
             memory_mib: 64,
@@ -1638,7 +1707,11 @@ mod tests {
                 tcp: vec![SealedTcpBinding {
                     port: 2222,
                     target: "faas-a".to_owned(),
-                }]
+                }],
+                udp: vec![SealedUdpBinding {
+                    port: 5353,
+                    target: "faas-a".to_owned(),
+                }],
             }
         );
         assert_eq!(config.telemetry_sample_rate, 0.25);
@@ -1695,7 +1768,7 @@ mod tests {
         assert!(payload.contains("\"allowed_secrets\":[\"DB_PASS\"]"));
         assert!(payload.contains("\"min_instances\":2"));
         assert!(payload.contains("\"max_concurrency\":16"));
-        assert!(payload.contains("\"layer4\":{\"tcp\":[{\"port\":2222,\"target\":\"faas-a\"}]}"));
+        assert!(payload.contains("\"layer4\":{\"tcp\":[{\"port\":2222,\"target\":\"faas-a\"}],\"udp\":[{\"port\":5353,\"target\":\"faas-a\"}]}"));
         assert!(payload.contains("\"guest_path\":\"/app/data\""));
         assert!(payload.contains("\"readonly\":true"));
         assert!(payload.contains("\"telemetry_sample_rate\":0.25"));
@@ -1725,6 +1798,8 @@ mod tests {
                 "/api/guest-example=1:8",
                 "--tcp-port",
                 "2222=faas-a",
+                "--udp-port",
+                "5353=faas-a",
                 "--telemetry-sample-rate",
                 "0.5",
                 "--volume",
@@ -1755,6 +1830,7 @@ mod tests {
                 route_middlewares: Vec::new(),
                 route_scales: vec!["/api/guest-example=1:8".to_owned()],
                 tcp_ports: vec!["2222=faas-a".to_owned()],
+                udp_ports: vec!["5353=faas-a".to_owned()],
                 volumes: vec!["/api/guest-example=C:\\\\tachyon_data:/app/data:rw".to_owned()],
                 telemetry_sample_rate: 0.5,
                 memory_mib: 64,
