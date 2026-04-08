@@ -9137,15 +9137,21 @@ mod tests {
         .expect("UDS benchmark server should start");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let mut benchmark = |registry: &UdsFastPathRegistry| async {
+        async fn benchmark(
+            registry: &UdsFastPathRegistry,
+            config: &IntegrityConfig,
+            route_registry: &RouteRegistry,
+            caller_route: &IntegrityRoute,
+            host_identity: &HostIdentity,
+        ) -> Duration {
             let start = Instant::now();
             for _ in 0..24 {
                 let response = resolve_mesh_response(
                     &Client::new(),
-                    &config,
-                    &route_registry,
+                    config,
+                    route_registry,
                     caller_route,
-                    host_identity.as_ref(),
+                    host_identity,
                     registry,
                     HopLimit(DEFAULT_HOP_LIMIT),
                     &[],
@@ -9159,10 +9165,25 @@ mod tests {
                 assert_eq!(response.status, StatusCode::OK);
             }
             start.elapsed()
-        };
+        }
 
-        let tcp_elapsed = benchmark(&new_uds_fast_path_registry()).await;
-        let uds_elapsed = benchmark(uds_registry.as_ref()).await;
+        let tcp_registry = new_uds_fast_path_registry();
+        let tcp_elapsed = benchmark(
+            &tcp_registry,
+            &config,
+            &route_registry,
+            caller_route,
+            host_identity.as_ref(),
+        )
+        .await;
+        let uds_elapsed = benchmark(
+            uds_registry.as_ref(),
+            &config,
+            &route_registry,
+            caller_route,
+            host_identity.as_ref(),
+        )
+        .await;
 
         uds_server.abort();
         let _ = uds_server.await;
