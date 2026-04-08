@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-ai-inference = ["dep:wasmtime-wasi-nn"]
+ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:wasmtime-wasi-nn"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 secrets-vault = []
 websockets = ["axum/ws", "dep:futures-util"]
@@ -16,6 +16,8 @@ async-trait = "0.1"
 arc-swap = "1.7"
 axum = "0.7"
 bytes = "1.5"
+candle-core = { version = "0.9.2", optional = true }
+candle-nn = { version = "0.9.2", optional = true }
 ed25519-dalek = "2"
 futures-util = { version = "0.3", optional = true }
 forwarded-header-value = { version = "0.1", optional = true }

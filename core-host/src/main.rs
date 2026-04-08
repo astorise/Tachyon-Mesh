@@ -58,8 +58,10 @@ use wasmtime_wasi::{
     DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 #[cfg(feature = "ai-inference")]
-use wasmtime_wasi_nn::{backend, witx::WasiNnCtx, Backend as WasiNnBackend, InMemoryRegistry};
+use wasmtime_wasi_nn::witx::WasiNnCtx;
 
+#[cfg(feature = "ai-inference")]
+mod ai_inference;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
 mod telemetry;
@@ -195,6 +197,10 @@ fn is_default_volume_type(volume_type: &VolumeType) -> bool {
     *volume_type == VolumeType::Host
 }
 
+fn is_default_model_device(device: &ModelDevice) -> bool {
+    *device == ModelDevice::Cpu
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -222,6 +228,8 @@ struct RuntimeState {
     config: IntegrityConfig,
     route_registry: Arc<RouteRegistry>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    #[cfg(feature = "ai-inference")]
+    ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }
 
 struct TcpLayer4ListenerHandle {
@@ -324,6 +332,8 @@ struct GuestExecutionContext {
     telemetry: Option<GuestTelemetryContext>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
+    #[cfg(feature = "ai-inference")]
+    ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }
 
 struct BackgroundTickRunner {
@@ -927,6 +937,26 @@ enum VolumeEvictionPolicy {
     Hibernate,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ModelDevice {
+    #[default]
+    Cpu,
+    Cuda,
+    Metal,
+}
+
+impl ModelDevice {
+    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Metal => "metal",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 struct IntegrityLayer4Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -968,12 +998,22 @@ struct IntegrityRoute {
     allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     targets: Vec<RouteTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    models: Vec<IntegrityModelBinding>,
     #[serde(default)]
     min_instances: u32,
     #[serde(default = "default_max_concurrency")]
     max_concurrency: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     volumes: Vec<IntegrityVolume>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct IntegrityModelBinding {
+    alias: String,
+    path: String,
+    #[serde(default, skip_serializing_if = "is_default_model_device")]
+    device: ModelDevice,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2264,6 +2304,8 @@ fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeState> {
         metered_engine: build_engine(&config, true)?,
         route_registry: Arc::new(RouteRegistry::build(&config)?),
         concurrency_limits: build_concurrency_limits(&config),
+        #[cfg(feature = "ai-inference")]
+        ai_runtime: Arc::new(ai_inference::AiInferenceRuntime::from_config(&config)?),
         config,
     })
 }
@@ -2689,6 +2731,8 @@ async fn handle_udp_layer4_datagram(
             telemetry: None,
             concurrency_limits,
             propagated_headers: Vec::new(),
+            #[cfg(feature = "ai-inference")]
+            ai_runtime: Arc::clone(&runtime.ai_runtime),
         };
         execute_udp_layer4_guest(
             &engine,
@@ -2805,6 +2849,8 @@ async fn handle_websocket_connection(
             telemetry: None,
             concurrency_limits,
             propagated_headers: Vec::new(),
+            #[cfg(feature = "ai-inference")]
+            ai_runtime: Arc::clone(&runtime.ai_runtime),
         };
         let _ = result_tx.send(execute_websocket_guest(
             &engine,
@@ -2873,6 +2919,8 @@ async fn handle_tcp_layer4_connection(
     let storage_broker = Arc::clone(&state.storage_broker);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let telemetry = state.telemetry.clone();
+    #[cfg(feature = "ai-inference")]
+    let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
     let (result_tx, result_rx) = oneshot::channel();
     std::thread::spawn(move || {
@@ -2889,6 +2937,8 @@ async fn handle_tcp_layer4_connection(
             host_identity,
             storage_broker,
             concurrency_limits,
+            #[cfg(feature = "ai-inference")]
+            ai_runtime,
         ));
     });
     result_rx
@@ -2909,6 +2959,7 @@ fn execute_tcp_layer4_guest(
     host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 ) -> std::result::Result<(), ExecutionError> {
     let execution = GuestExecutionContext {
         config: config.clone(),
@@ -2921,6 +2972,8 @@ fn execute_tcp_layer4_guest(
         telemetry: None,
         concurrency_limits,
         propagated_headers: Vec::new(),
+        #[cfg(feature = "ai-inference")]
+        ai_runtime,
     };
     let (module_path, module) = resolve_legacy_guest_module(engine, function_name)?;
     execute_legacy_guest_with_stdio(
@@ -3313,6 +3366,8 @@ async fn execute_route_request(
     let task_propagated_headers = propagated_headers.clone();
     let task_request_headers = headers.clone();
     let task_host_identity = Arc::clone(&state.host_identity);
+    #[cfg(feature = "ai-inference")]
+    let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
     let guest_request = GuestRequest {
         method: method.to_string(),
         uri: uri.to_string(),
@@ -3335,6 +3390,8 @@ async fn execute_route_request(
                 telemetry: telemetry_context,
                 concurrency_limits,
                 propagated_headers: task_propagated_headers,
+                #[cfg(feature = "ai-inference")]
+                ai_runtime: task_ai_runtime,
             },
         )
     })
@@ -4768,7 +4825,12 @@ fn execute_legacy_guest(
     let wasi = wasi.build_p1();
     let mut store = Store::new(
         engine,
-        LegacyHostState::new(wasi, execution.config.guest_memory_limit_bytes),
+        LegacyHostState::new(
+            wasi,
+            execution.config.guest_memory_limit_bytes,
+            #[cfg(feature = "ai-inference")]
+            Arc::clone(&execution.ai_runtime),
+        ),
     );
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
@@ -4835,7 +4897,12 @@ fn execute_legacy_guest_with_stdio(
     let wasi = wasi.build_p1();
     let mut store = Store::new(
         engine,
-        LegacyHostState::new(wasi, execution.config.guest_memory_limit_bytes),
+        LegacyHostState::new(
+            wasi,
+            execution.config.guest_memory_limit_bytes,
+            #[cfg(feature = "ai-inference")]
+            Arc::clone(&execution.ai_runtime),
+        ),
     );
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
@@ -5504,6 +5571,7 @@ fn normalize_config_routes(routes: Vec<IntegrityRoute>) -> Result<Vec<IntegrityR
             ));
         }
     }
+    ensure_unique_model_aliases(&normalized)?;
     Ok(normalized)
 }
 
@@ -5635,6 +5703,7 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         middleware: normalize_route_middleware(route.middleware, &normalized)?,
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
         targets: normalize_route_targets(route.targets)?,
+        models: normalize_route_models(route.models, &normalized)?,
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
         volumes: normalize_route_volumes(route.volumes, route.role, &normalized)?,
@@ -5646,6 +5715,55 @@ fn normalize_route_targets(targets: Vec<RouteTarget>) -> Result<Vec<RouteTarget>
         .into_iter()
         .map(normalize_route_target)
         .collect::<Result<Vec<_>>>()
+}
+
+fn normalize_route_models(
+    models: Vec<IntegrityModelBinding>,
+    route_path: &str,
+) -> Result<Vec<IntegrityModelBinding>> {
+    let mut deduped = BTreeMap::new();
+
+    for model in models {
+        let alias = normalize_service_name(&model.alias).map_err(|error| {
+            anyhow!(
+                "Integrity Validation Failed: route `{route_path}` has an invalid model alias `{}`: {error}",
+                model.alias
+            )
+        })?;
+        let path = model.path.trim();
+        if path.is_empty() {
+            return Err(anyhow!(
+                "Integrity Validation Failed: route `{route_path}` model `{alias}` must include a non-empty `path`"
+            ));
+        }
+
+        deduped
+            .entry(alias.clone())
+            .or_insert(IntegrityModelBinding {
+                alias,
+                path: path.to_owned(),
+                device: model.device,
+            });
+    }
+
+    Ok(deduped.into_values().collect())
+}
+
+fn ensure_unique_model_aliases(routes: &[IntegrityRoute]) -> Result<()> {
+    let mut owners = HashMap::new();
+
+    for route in routes {
+        for model in &route.models {
+            if let Some(previous_route) = owners.insert(model.alias.clone(), route.path.clone()) {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: model alias `{}` is declared by both route `{previous_route}` and route `{}`",
+                    model.alias, route.path
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn normalize_route_name(name: &str, path: &str) -> Result<String> {
@@ -6112,21 +6230,23 @@ fn forward_guest_log(function_name: &str, record: GuestLogRecord) {
 }
 
 impl LegacyHostState {
-    fn new(wasi: WasiP1Ctx, max_memory_bytes: usize) -> Self {
+    fn new(
+        wasi: WasiP1Ctx,
+        max_memory_bytes: usize,
+        #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+    ) -> Self {
         Self {
             wasi,
             #[cfg(feature = "ai-inference")]
-            wasi_nn: build_wasi_nn_ctx(),
+            wasi_nn: build_wasi_nn_ctx(ai_runtime.as_ref()),
             limits: GuestResourceLimiter::new(max_memory_bytes),
         }
     }
 }
 
 #[cfg(feature = "ai-inference")]
-fn build_wasi_nn_ctx() -> WasiNnCtx {
-    let registry = InMemoryRegistry::new();
-    let backends = [WasiNnBackend::from(backend::onnx::OnnxBackend::default())];
-    WasiNnCtx::new(backends, registry.into())
+fn build_wasi_nn_ctx(runtime: &ai_inference::AiInferenceRuntime) -> WasiNnCtx {
+    runtime.build_wasi_nn_ctx()
 }
 
 impl SecretsVault {
@@ -6612,6 +6732,7 @@ impl IntegrityRoute {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -6630,6 +6751,7 @@ impl IntegrityRoute {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -6651,6 +6773,7 @@ impl IntegrityRoute {
                 .map(|secret| (*secret).to_owned())
                 .collect(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -6825,6 +6948,14 @@ mod tests {
         build_runtime_state(config).expect("runtime state should build")
     }
 
+    #[cfg(feature = "ai-inference")]
+    fn test_ai_runtime(config: &IntegrityConfig) -> Arc<ai_inference::AiInferenceRuntime> {
+        Arc::new(
+            ai_inference::AiInferenceRuntime::from_config(config)
+                .expect("AI inference runtime should build"),
+        )
+    }
+
     fn signed_manifest(config: &IntegrityConfig, seed: u8) -> IntegrityManifest {
         let config_payload = canonical_config_payload(config).expect("payload should serialize");
         let signing_key = SigningKey::from_bytes(&[seed; 32]);
@@ -6907,6 +7038,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -6937,6 +7069,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -6967,6 +7100,7 @@ mod tests {
                 websocket: false,
                 match_header: None,
             }],
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -6997,6 +7131,7 @@ mod tests {
                 websocket: false,
                 match_header: None,
             }],
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -7022,6 +7157,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency,
             volumes: Vec::new(),
@@ -7039,6 +7175,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency,
             volumes: Vec::new(),
@@ -7072,6 +7209,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -7097,6 +7235,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -7361,6 +7500,8 @@ mod tests {
             .sealed_route("/api/guest-example")
             .expect("sealed route should exist")
             .clone();
+        #[cfg(feature = "ai-inference")]
+        let ai_runtime = test_ai_runtime(&config);
         let response = execute_guest(
             &engine,
             "guest-example",
@@ -7381,6 +7522,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                #[cfg(feature = "ai-inference")]
+                ai_runtime,
             },
         )
         .expect("guest execution should succeed");
@@ -7404,6 +7547,8 @@ mod tests {
         let config = IntegrityConfig::default_sealed();
         let engine = build_test_engine(&config);
         let route = IntegrityRoute::user("/api/guest-call-legacy");
+        #[cfg(feature = "ai-inference")]
+        let ai_runtime = test_ai_runtime(&config);
         let response = execute_guest(
             &engine,
             "guest-call-legacy",
@@ -7424,6 +7569,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                #[cfg(feature = "ai-inference")]
+                ai_runtime,
             },
         )
         .expect("legacy guest execution should succeed");
@@ -7444,6 +7591,8 @@ mod tests {
         let config = IntegrityConfig::default_sealed();
         let engine = build_test_engine(&config);
         let route = tcp_echo_test_route(1);
+        #[cfg(feature = "ai-inference")]
+        let ai_runtime = test_ai_runtime(&config);
         let response = execute_guest(
             &engine,
             "guest-tcp-echo",
@@ -7464,6 +7613,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                #[cfg(feature = "ai-inference")]
+                ai_runtime,
             },
         )
         .expect("legacy guest execution should succeed");
@@ -7477,6 +7628,67 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ai-inference")]
+    #[test]
+    fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "llama3".to_owned(),
+            path: "/models/llama3.gguf".to_owned(),
+            device: ModelDevice::Cuda,
+        }];
+        let config = IntegrityConfig {
+            routes: vec![route.clone()],
+            ..IntegrityConfig::default_sealed()
+        };
+        let engine = build_test_engine(&config);
+        let ai_runtime = test_ai_runtime(&config);
+
+        let response = execute_guest(
+            &engine,
+            "guest-ai",
+            GuestRequest {
+                method: "POST".to_owned(),
+                uri: "/api/guest-ai".to_owned(),
+                body: Bytes::from_static(
+                    br#"{"model":"llama3","shape":[1,4],"values":[1.0,2.0,3.0,4.0],"output_len":17,"response_kind":"text"}"#,
+                ),
+            },
+            &route,
+            GuestExecutionContext {
+                config,
+                sampled_execution: false,
+                runtime_telemetry: telemetry::init_test_telemetry(),
+                secret_access: SecretAccess::default(),
+                request_headers: HeaderMap::new(),
+                host_identity: test_host_identity(35),
+                storage_broker: Arc::new(StorageBrokerManager::default()),
+                telemetry: None,
+                concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
+                propagated_headers: Vec::new(),
+                ai_runtime,
+            },
+        )
+        .expect("AI guest execution should succeed");
+
+        let GuestExecutionOutcome {
+            output: GuestExecutionOutput::LegacyStdout(stdout),
+            ..
+        } = response
+        else {
+            panic!("AI guest should return legacy stdout");
+        };
+
+        let payload: Value =
+            serde_json::from_slice(&stdout).expect("guest response should be JSON");
+        assert_eq!(payload["model"], Value::String("llama3".to_owned()));
+        assert_eq!(
+            payload["text"],
+            Value::String("MOCK_LLM_RESPONSE".to_owned())
+        );
+        assert_eq!(payload["output_bytes"], Value::from(17));
+    }
+
     #[test]
     fn execute_guest_persists_volume_data_for_component_guest() {
         let volume_dir = unique_test_dir("tachyon-volume-test");
@@ -7486,6 +7698,8 @@ mod tests {
             ..IntegrityConfig::default_sealed()
         };
         let engine = build_test_engine(&config);
+        #[cfg(feature = "ai-inference")]
+        let ai_runtime = test_ai_runtime(&config);
 
         let save_response = execute_guest(
             &engine,
@@ -7507,6 +7721,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
                 propagated_headers: Vec::new(),
+                #[cfg(feature = "ai-inference")]
+                ai_runtime: Arc::clone(&ai_runtime),
             },
         )
         .expect("volume guest should write successfully");
@@ -7542,6 +7758,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
                 propagated_headers: Vec::new(),
+                #[cfg(feature = "ai-inference")]
+                ai_runtime,
             },
         )
         .expect("volume guest should read successfully");
@@ -7688,6 +7906,8 @@ mod tests {
                 DEFAULT_ROUTE.to_owned(),
                 Arc::new(RouteExecutionControl::new(0)),
             )])),
+            #[cfg(feature = "ai-inference")]
+            ai_runtime: test_ai_runtime(&config),
             config,
         };
         let app = build_app(AppState {
@@ -7729,6 +7949,8 @@ mod tests {
         let config = IntegrityConfig::default_sealed();
         let engine = build_test_engine(&config);
         let route = IntegrityRoute::user("/metrics");
+        #[cfg(feature = "ai-inference")]
+        let ai_runtime = test_ai_runtime(&config);
         let error = execute_guest(
             &engine,
             "metrics",
@@ -7749,6 +7971,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                #[cfg(feature = "ai-inference")]
+                ai_runtime,
             },
         )
         .expect_err("privileged metrics guest should fail as a user route");
@@ -9663,6 +9887,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -9708,6 +9933,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -9727,6 +9953,56 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot request writable direct host mounts"));
+    }
+
+    #[test]
+    fn validate_integrity_config_normalizes_model_bindings() {
+        let mut config = IntegrityConfig::default_sealed();
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: " llama3 ".to_owned(),
+            path: "  /models/llama3.gguf ".to_owned(),
+            device: ModelDevice::Cuda,
+        }];
+        config.routes = vec![route];
+
+        let config = validate_integrity_config(config).expect("model bindings should validate");
+        let route = config
+            .sealed_route("/api/guest-ai")
+            .expect("AI route should stay available");
+
+        assert_eq!(
+            route.models,
+            vec![IntegrityModelBinding {
+                alias: "llama3".to_owned(),
+                path: "/models/llama3.gguf".to_owned(),
+                device: ModelDevice::Cuda,
+            }]
+        );
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
+        let mut first = IntegrityRoute::user("/api/guest-ai");
+        first.models = vec![IntegrityModelBinding {
+            alias: "shared".to_owned(),
+            path: "/models/shared-a.gguf".to_owned(),
+            device: ModelDevice::Cpu,
+        }];
+        let mut second = IntegrityRoute::user("/api/assistant");
+        second.models = vec![IntegrityModelBinding {
+            alias: "shared".to_owned(),
+            path: "/models/shared-b.gguf".to_owned(),
+            device: ModelDevice::Metal,
+        }];
+
+        let error = validate_integrity_config(IntegrityConfig {
+            routes: vec![first, second],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect_err("duplicate model aliases should fail validation");
+
+        assert!(error.to_string().contains("model alias `shared`"));
     }
 
     #[test]
@@ -10022,6 +10298,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            models: Vec::new(),
             min_instances: 0,
             max_concurrency: 0,
             volumes: Vec::new(),

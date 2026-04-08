@@ -17,12 +17,29 @@ struct InferenceRequest {
     values: Vec<f32>,
     #[serde(default = "default_output_len")]
     output_len: usize,
+    #[serde(default)]
+    response_kind: ResponseKind,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ResponseKind {
+    #[default]
+    Floats,
+    Text,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-struct InferenceResponse {
+struct FloatInferenceResponse {
     model: String,
     output: Vec<f32>,
+    output_bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct TextInferenceResponse {
+    model: String,
+    text: String,
     output_bytes: usize,
 }
 
@@ -61,23 +78,9 @@ fn read_request_body() -> io::Result<Vec<u8>> {
 
 fn handle_request(body: &[u8]) -> Result<String, String> {
     let request = parse_request(body)?;
-    let model_path = resolve_model_path(&request.model)?;
     ensure_tensor_matches_shape(&request)?;
 
-    let model_bytes = fs::read(&model_path).map_err(|error| {
-        format!(
-            "failed to read ONNX model `{}`: {error}",
-            model_path.display()
-        )
-    })?;
-    let graph = GraphBuilder::new(GraphEncoding::Onnx, ExecutionTarget::CPU)
-        .build_from_bytes([model_bytes])
-        .map_err(|error| {
-            format!(
-                "failed to load ONNX model `{}`: {error}",
-                model_path.display()
-            )
-        })?;
+    let graph = load_graph(&request.model)?;
     let mut execution = graph
         .init_execution_context()
         .map_err(|error| format!("failed to create execution context: {error}"))?;
@@ -88,25 +91,51 @@ fn handle_request(body: &[u8]) -> Result<String, String> {
         .compute()
         .map_err(|error| format!("WASI-NN compute failed: {error}"))?;
 
-    let mut output = vec![0f32; request.output_len];
-    let output_bytes = execution
-        .get_output(0, &mut output)
-        .map_err(|error| format!("failed to read output tensor: {error}"))?;
-    let output_len = output_bytes / std::mem::size_of::<f32>();
-    if output_len > output.len() {
-        return Err(format!(
-            "model produced {output_len} floats but only {} slots were allocated",
-            output.len()
-        ));
-    }
-    output.truncate(output_len);
+    match request.response_kind {
+        ResponseKind::Floats => {
+            let mut output = vec![0f32; request.output_len];
+            let output_bytes = execution
+                .get_output(0, &mut output)
+                .map_err(|error| format!("failed to read output tensor: {error}"))?;
+            let output_len = output_bytes / std::mem::size_of::<f32>();
+            if output_len > output.len() {
+                return Err(format!(
+                    "model produced {output_len} floats but only {} slots were allocated",
+                    output.len()
+                ));
+            }
+            output.truncate(output_len);
 
-    serde_json::to_string(&InferenceResponse {
-        model: request.model,
-        output,
-        output_bytes,
-    })
-    .map_err(|error| format!("failed to serialize inference response: {error}"))
+            serde_json::to_string(&FloatInferenceResponse {
+                model: request.model,
+                output,
+                output_bytes,
+            })
+            .map_err(|error| format!("failed to serialize inference response: {error}"))
+        }
+        ResponseKind::Text => {
+            let mut output = vec![0u8; request.output_len];
+            let output_bytes = execution
+                .get_output(0, &mut output)
+                .map_err(|error| format!("failed to read output tensor: {error}"))?;
+            if output_bytes > output.len() {
+                return Err(format!(
+                    "model produced {output_bytes} bytes but only {} slots were allocated",
+                    output.len()
+                ));
+            }
+            output.truncate(output_bytes);
+            let text = String::from_utf8(output)
+                .map_err(|error| format!("model produced non UTF-8 text output: {error}"))?;
+
+            serde_json::to_string(&TextInferenceResponse {
+                model: request.model,
+                text,
+                output_bytes,
+            })
+            .map_err(|error| format!("failed to serialize inference response: {error}"))
+        }
+    }
 }
 
 fn parse_request(body: &[u8]) -> Result<InferenceRequest, String> {
@@ -168,6 +197,38 @@ fn resolve_model_path(model: &str) -> Result<PathBuf, String> {
     Ok(Path::new(DEFAULT_MODEL_DIR).join(relative))
 }
 
+fn load_graph(model: &str) -> Result<wasi_nn::Graph, String> {
+    if should_use_preloaded_model(model) {
+        return GraphBuilder::new(GraphEncoding::Onnx, ExecutionTarget::CPU)
+            .build_from_cache(model)
+            .map_err(|error| format!("failed to load preloaded model alias `{model}`: {error}"));
+    }
+
+    let model_path = resolve_model_path(model)?;
+    let model_bytes = fs::read(&model_path).map_err(|error| {
+        format!(
+            "failed to read ONNX model `{}`: {error}",
+            model_path.display()
+        )
+    })?;
+    GraphBuilder::new(GraphEncoding::Onnx, ExecutionTarget::CPU)
+        .build_from_bytes([model_bytes])
+        .map_err(|error| {
+            format!(
+                "failed to load ONNX model `{}`: {error}",
+                model_path.display()
+            )
+        })
+}
+
+fn should_use_preloaded_model(model: &str) -> bool {
+    let trimmed = model.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
+        && !trimmed.contains('.')
+}
+
 fn json_error(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
@@ -187,6 +248,7 @@ mod tests {
         assert_eq!(request.shape, vec![1, 4]);
         assert_eq!(request.values.len(), 4);
         assert_eq!(request.output_len, 4);
+        assert_eq!(request.response_kind, ResponseKind::Floats);
     }
 
     #[test]
@@ -203,11 +265,19 @@ mod tests {
             shape: vec![1, 8],
             values: vec![1.0, 2.0, 3.0, 4.0],
             output_len: 4,
+            response_kind: ResponseKind::Floats,
         };
 
         let error =
             ensure_tensor_matches_shape(&request).expect_err("mismatched tensor size must fail");
 
         assert!(error.contains("expects 8 input values"));
+    }
+
+    #[test]
+    fn preloaded_model_aliases_skip_filesystem_resolution() {
+        assert!(should_use_preloaded_model("llama3"));
+        assert!(!should_use_preloaded_model("model.onnx"));
+        assert!(!should_use_preloaded_model("nested/model.onnx"));
     }
 }
