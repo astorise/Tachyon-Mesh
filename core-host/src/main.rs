@@ -9,6 +9,12 @@ use axum::{
     Extension, Router,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+#[cfg(unix)]
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as HyperConnectionBuilder,
+    service::TowerToHyperService,
+};
 use rand::Rng;
 use reqwest::Client;
 use semver::{Version, VersionReq};
@@ -16,6 +22,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt, fs,
@@ -29,6 +37,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use uuid::Uuid;
 use wasmtime::{
@@ -93,6 +103,8 @@ const COHORT_HEADER: &str = "x-cohort";
 const TACHYON_COHORT_HEADER: &str = "x-tachyon-cohort";
 const TACHYON_IDENTITY_HEADER: &str = "x-tachyon-identity";
 const TACHYON_SYSTEM_PUBLIC_KEY_ENV: &str = "TACHYON_SYSTEM_PUBLIC_KEY";
+#[cfg(unix)]
+const TACHYON_DISCOVERY_DIR_ENV: &str = "TACHYON_DISCOVERY_DIR";
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
 const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
@@ -102,6 +114,8 @@ const IDENTITY_TOKEN_TTL: Duration = Duration::from_secs(30);
 const IDENTITY_TOKEN_PREFIX: &str = "tachyon.v1";
 const KUBERNETES_SERVICE_BASE_URL: &str = "https://kubernetes.default.svc";
 const MOCK_K8S_URL_ENV: &str = "TACHYON_MOCK_K8S_URL";
+#[cfg(unix)]
+const DEFAULT_DISCOVERY_DIR: &str = "/tmp/tachyon/peers";
 #[cfg(not(test))]
 const ROUTE_CONCURRENCY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -151,6 +165,7 @@ struct AppState {
     http_client: Client,
     secrets_vault: SecretsVault,
     host_identity: Arc<HostIdentity>,
+    uds_fast_path: Arc<UdsFastPathRegistry>,
     storage_broker: Arc<StorageBrokerManager>,
     volume_manager: Arc<VolumeManager>,
     telemetry: TelemetryHandle,
@@ -170,6 +185,42 @@ struct RuntimeState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HopLimit(u32);
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct UdsPeerMetadata {
+    host_id: String,
+    ip: String,
+    socket_path: String,
+    protocols: Vec<String>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveredUdsPeer {
+    metadata_path: PathBuf,
+    socket_path: PathBuf,
+    metadata: UdsPeerMetadata,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalUdsEndpoint {
+    metadata_path: PathBuf,
+    socket_path: PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct UdsFastPathRegistry {
+    discovery_dir_override: Arc<Mutex<Option<PathBuf>>>,
+    peers: Arc<Mutex<HashMap<String, DiscoveredUdsPeer>>>,
+    local_endpoint: Arc<Mutex<Option<LocalUdsEndpoint>>>,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Default)]
+struct UdsFastPathRegistry;
 
 struct LegacyHostState {
     wasi: WasiP1Ctx,
@@ -380,6 +431,205 @@ impl HostIdentity {
         }
 
         Ok(claims)
+    }
+}
+
+#[cfg(unix)]
+impl UdsFastPathRegistry {
+    #[cfg(test)]
+    fn with_discovery_dir(path: PathBuf) -> Self {
+        let registry = Self::default();
+        *registry
+            .discovery_dir_override
+            .lock()
+            .expect("UDS discovery override should not be poisoned") = Some(path);
+        registry
+    }
+
+    fn discovery_dir(&self) -> PathBuf {
+        if let Some(path) = self
+            .discovery_dir_override
+            .lock()
+            .expect("UDS discovery override should not be poisoned")
+            .clone()
+        {
+            return path;
+        }
+
+        std::env::var_os(TACHYON_DISCOVERY_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DISCOVERY_DIR))
+    }
+
+    fn bind_local_listener(&self, config: &IntegrityConfig) -> Result<UnixListener> {
+        let discovery_dir = self.discovery_dir();
+        fs::create_dir_all(&discovery_dir).with_context(|| {
+            format!(
+                "failed to create UDS discovery directory `{}`",
+                discovery_dir.display()
+            )
+        })?;
+
+        let host_id = Uuid::new_v4().to_string();
+        let socket_path = discovery_dir.join(format!("host-{host_id}.sock"));
+        let metadata_path = discovery_dir.join(format!("host-{host_id}.json"));
+        if socket_path.exists() {
+            remove_path_if_exists(&socket_path)?;
+        }
+
+        let listener = UnixListener::bind(&socket_path).with_context(|| {
+            format!(
+                "failed to bind UDS fast-path listener at `{}`",
+                socket_path.display()
+            )
+        })?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660)).with_context(
+            || {
+                format!(
+                    "failed to tighten permissions on UDS socket `{}`",
+                    socket_path.display()
+                )
+            },
+        )?;
+
+        let metadata = UdsPeerMetadata {
+            host_id,
+            ip: discovery_publish_ip(config)?,
+            socket_path: socket_path.display().to_string(),
+            protocols: vec!["http/1.1".to_owned(), "h2".to_owned()],
+        };
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&metadata)
+                .context("failed to serialize UDS peer metadata")?,
+        )
+        .with_context(|| {
+            format!(
+                "failed to publish UDS peer metadata `{}`",
+                metadata_path.display()
+            )
+        })?;
+
+        let peer = DiscoveredUdsPeer {
+            metadata_path: metadata_path.clone(),
+            socket_path: socket_path.clone(),
+            metadata: metadata.clone(),
+        };
+        self.peers
+            .lock()
+            .expect("UDS peer cache should not be poisoned")
+            .insert(metadata.ip.clone(), peer);
+        *self
+            .local_endpoint
+            .lock()
+            .expect("local UDS endpoint should not be poisoned") = Some(LocalUdsEndpoint {
+            metadata_path,
+            socket_path,
+        });
+
+        Ok(listener)
+    }
+
+    fn discover_peer_for_url(&self, url: &str) -> Option<DiscoveredUdsPeer> {
+        let host = reqwest::Url::parse(url).ok()?.host_str()?.to_owned();
+        let peers = self.refresh_peers();
+        peers.get(&host).cloned()
+    }
+
+    fn note_connect_failure(&self, peer: &DiscoveredUdsPeer) {
+        self.peers
+            .lock()
+            .expect("UDS peer cache should not be poisoned")
+            .remove(&peer.metadata.ip);
+        if !peer.socket_path.exists() {
+            let _ = fs::remove_file(&peer.metadata_path);
+        }
+    }
+
+    fn refresh_peers(&self) -> HashMap<String, DiscoveredUdsPeer> {
+        let discovery_dir = self.discovery_dir();
+        let mut discovered = HashMap::new();
+        let entries = match fs::read_dir(&discovery_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.peers
+                    .lock()
+                    .expect("UDS peer cache should not be poisoned")
+                    .clear();
+                return discovered;
+            }
+            Err(_) => {
+                return self
+                    .peers
+                    .lock()
+                    .expect("UDS peer cache should not be poisoned")
+                    .clone()
+            }
+        };
+
+        for entry in entries.flatten() {
+            let metadata_path = entry.path();
+            if metadata_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            let metadata = match fs::read(&metadata_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<UdsPeerMetadata>(&bytes).ok())
+            {
+                Some(metadata) => metadata,
+                None => continue,
+            };
+
+            let socket_path = PathBuf::from(&metadata.socket_path);
+            if !socket_path.exists() {
+                let _ = fs::remove_file(&metadata_path);
+                continue;
+            }
+
+            discovered.insert(
+                metadata.ip.clone(),
+                DiscoveredUdsPeer {
+                    metadata_path,
+                    socket_path,
+                    metadata,
+                },
+            );
+        }
+
+        *self
+            .peers
+            .lock()
+            .expect("UDS peer cache should not be poisoned") = discovered.clone();
+        discovered
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UdsFastPathRegistry {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.local_endpoint) != 1 {
+            return;
+        }
+
+        let local_endpoint = self
+            .local_endpoint
+            .lock()
+            .expect("local UDS endpoint should not be poisoned")
+            .clone();
+        if let Some(endpoint) = local_endpoint {
+            let _ = fs::remove_file(endpoint.metadata_path);
+            let _ = fs::remove_file(endpoint.socket_path);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl UdsFastPathRegistry {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn with_discovery_dir(_path: PathBuf) -> Self {
+        Self
     }
 }
 
@@ -658,6 +908,7 @@ async fn run() -> Result<()> {
     let telemetry = telemetry::init_telemetry();
     let runtime = build_runtime_state(verify_integrity()?)?;
     let host_identity = Arc::new(HostIdentity::generate());
+    let uds_fast_path = Arc::new(UdsFastPathRegistry::default());
     let storage_broker = Arc::new(StorageBrokerManager::default());
     let background_workers = Arc::new(BackgroundWorkerManager::default());
     background_workers.start_for_runtime(
@@ -672,6 +923,7 @@ async fn run() -> Result<()> {
         http_client: Client::new(),
         secrets_vault: SecretsVault::load(),
         host_identity,
+        uds_fast_path: Arc::clone(&uds_fast_path),
         storage_broker,
         volume_manager: Arc::new(VolumeManager::default()),
         telemetry,
@@ -681,6 +933,7 @@ async fn run() -> Result<()> {
     spawn_reload_watcher(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     let app = build_app(state);
+    let uds_server = start_uds_fast_path_listener(app.clone(), &runtime.config, uds_fast_path)?;
 
     let listener = tokio::net::TcpListener::bind(&runtime.config.host_address)
         .await
@@ -699,6 +952,10 @@ async fn run() -> Result<()> {
     .await
     .context("axum server exited unexpectedly")?;
 
+    if let Some(server) = uds_server {
+        server.abort();
+        let _ = server.await;
+    }
     background_workers.stop_all().await;
     Ok(())
 }
@@ -1868,6 +2125,49 @@ fn build_app(state: AppState) -> Router {
     app.with_state(state)
 }
 
+#[cfg(unix)]
+fn start_uds_fast_path_listener(
+    app: Router,
+    config: &IntegrityConfig,
+    registry: Arc<UdsFastPathRegistry>,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    let listener = registry.bind_local_listener(config)?;
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    tracing::warn!("UDS fast-path listener accept failed: {error}");
+                    break;
+                }
+            };
+
+            let service = app.clone();
+            tokio::spawn(async move {
+                let builder = HyperConnectionBuilder::new(TokioExecutor::new());
+                let connection = builder.serve_connection_with_upgrades(
+                    TokioIo::new(stream),
+                    TowerToHyperService::new(service),
+                );
+                if let Err(error) = connection.await {
+                    tracing::warn!("UDS fast-path connection failed: {error}");
+                }
+            });
+        }
+    });
+
+    Ok(Some(handle))
+}
+
+#[cfg(not(unix))]
+fn start_uds_fast_path_listener(
+    _app: Router,
+    _config: &IntegrityConfig,
+    _registry: Arc<UdsFastPathRegistry>,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    Ok(None)
+}
+
 async fn hop_limit_middleware(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -2108,6 +2408,7 @@ async fn execute_route_request(
         &route_registry,
         route,
         &state.host_identity,
+        &state.uds_fast_path,
         hop_limit,
         &propagated_headers,
         response,
@@ -2146,6 +2447,7 @@ async fn resolve_mesh_response(
     route_registry: &RouteRegistry,
     caller_route: &IntegrityRoute,
     host_identity: &HostIdentity,
+    uds_fast_path: &UdsFastPathRegistry,
     hop_limit: HopLimit,
     propagated_headers: &[PropagatedHeader],
     response: GuestHttpResponse,
@@ -2155,26 +2457,24 @@ async fn resolve_mesh_response(
     };
     let url = resolve_mesh_fetch_target(config, route_registry, caller_route, target)?;
     let inject_identity = is_internal_mesh_target(target);
-
-    let mut request = http_client
-        .get(&url)
-        .header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
-    for header in propagated_headers
-        .iter()
-        .filter(|header| !header.name.eq_ignore_ascii_case(TACHYON_IDENTITY_HEADER))
-    {
-        request = request.header(&header.name, &header.value);
-    }
-    if inject_identity {
-        let token = host_identity
-            .sign_route(caller_route)
-            .map_err(|error| format!("failed to sign mesh caller identity: {error:#}"))?;
-        request = request.header(TACHYON_IDENTITY_HEADER, format!("Bearer {token}"));
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("mesh fetch to `{url}` failed: {error}"))?;
+    let identity_token = if inject_identity {
+        Some(
+            host_identity
+                .sign_route(caller_route)
+                .map_err(|error| format!("failed to sign mesh caller identity: {error:#}"))?,
+        )
+    } else {
+        None
+    };
+    let response = send_mesh_fetch_request(
+        http_client,
+        uds_fast_path,
+        &url,
+        hop_limit,
+        propagated_headers,
+        identity_token.as_deref(),
+    )
+    .await?;
 
     let status = response.status();
     let body = response.bytes().await.map_err(|error| {
@@ -2188,6 +2488,75 @@ async fn resolve_mesh_response(
             "mesh fetch to `{url}` returned an error status: {status}"
         ))
     }
+}
+
+fn apply_mesh_fetch_headers(
+    mut request: reqwest::RequestBuilder,
+    hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
+    identity_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    request = request.header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
+    for header in propagated_headers
+        .iter()
+        .filter(|header| !header.name.eq_ignore_ascii_case(TACHYON_IDENTITY_HEADER))
+    {
+        request = request.header(&header.name, &header.value);
+    }
+    if let Some(identity_token) = identity_token {
+        request = request.header(TACHYON_IDENTITY_HEADER, format!("Bearer {identity_token}"));
+    }
+
+    request
+}
+
+async fn send_mesh_fetch_request(
+    http_client: &Client,
+    _uds_fast_path: &UdsFastPathRegistry,
+    url: &str,
+    hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
+    identity_token: Option<&str>,
+) -> std::result::Result<reqwest::Response, String> {
+    #[cfg(unix)]
+    if let Some(peer) = _uds_fast_path.discover_peer_for_url(url) {
+        let uds_client = Client::builder()
+            .unix_socket(peer.socket_path.as_path())
+            .build()
+            .map_err(|error| {
+                format!(
+                    "failed to build UDS mesh client for `{}`: {error}",
+                    peer.socket_path.display()
+                )
+            })?;
+        let request = apply_mesh_fetch_headers(
+            uds_client.get(url),
+            hop_limit,
+            propagated_headers,
+            identity_token,
+        );
+        match request.send().await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                _uds_fast_path.note_connect_failure(&peer);
+                tracing::debug!(
+                    socket = %peer.socket_path.display(),
+                    url = %url,
+                    "UDS fast-path unavailable, falling back to TCP: {error}"
+                );
+            }
+        }
+    }
+
+    apply_mesh_fetch_headers(
+        http_client.get(url),
+        hop_limit,
+        propagated_headers,
+        identity_token,
+    )
+    .send()
+    .await
+    .map_err(|error| format!("mesh fetch to `{url}` failed: {error}"))
 }
 
 fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
@@ -2573,6 +2942,45 @@ fn client_connect_host(ip: IpAddr) -> String {
         IpAddr::V6(ip) if ip.is_unspecified() => format!("[{}]", Ipv6Addr::LOCALHOST),
         IpAddr::V6(ip) => format!("[{ip}]"),
     }
+}
+
+#[cfg(unix)]
+fn discovery_publish_ip(config: &IntegrityConfig) -> Result<String> {
+    let host_address = config.host_address.trim();
+    if host_address.is_empty() {
+        return Err(anyhow!(
+            "cannot publish a UDS fast-path endpoint without a configured host address"
+        ));
+    }
+
+    if let Ok(socket_addr) = host_address.parse::<SocketAddr>() {
+        return Ok(match socket_addr.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) if ip.is_unspecified() => Ipv6Addr::LOCALHOST.to_string(),
+            IpAddr::V6(ip) => ip.to_string(),
+        });
+    }
+
+    let host = host_address
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or(host_address)
+        .split(':')
+        .next()
+        .unwrap_or(host_address)
+        .trim_matches('[')
+        .trim_matches(']');
+    if host.is_empty() {
+        return Err(anyhow!(
+            "cannot derive a publishable IP from host address `{host_address}`"
+        ));
+    }
+
+    Ok(host.to_owned())
 }
 
 fn loop_detected_response() -> Response {
@@ -4569,6 +4977,7 @@ mod tests {
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
             host_identity: test_host_identity(21),
+            uds_fast_path: Arc::new(UdsFastPathRegistry::default()),
             storage_broker: Arc::new(StorageBrokerManager::default()),
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry,
@@ -5218,6 +5627,7 @@ mod tests {
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
             host_identity: test_host_identity(22),
+            uds_fast_path: Arc::new(UdsFastPathRegistry::default()),
             storage_broker: Arc::new(StorageBrokerManager::default()),
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry: telemetry::init_test_telemetry(),
@@ -5806,6 +6216,7 @@ mod tests {
             &route_registry,
             caller_route,
             host_identity.as_ref(),
+            &UdsFastPathRegistry::default(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &propagated_headers,
             GuestHttpResponse {
@@ -5889,6 +6300,7 @@ mod tests {
             &route_registry,
             caller_route,
             host_identity.as_ref(),
+            &UdsFastPathRegistry::default(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &[],
             GuestHttpResponse {
@@ -5910,6 +6322,248 @@ mod tests {
                 .as_slice(),
             &["".to_owned()]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uds_fast_path_registration_publishes_socket_metadata() {
+        let discovery_dir = unique_test_dir("tachyon-uds-discovery");
+        let registry = Arc::new(UdsFastPathRegistry::with_discovery_dir(
+            discovery_dir.clone(),
+        ));
+        let config = IntegrityConfig {
+            host_address: "127.0.0.1:19090".to_owned(),
+            ..IntegrityConfig::default_sealed()
+        };
+        let app = axum::Router::new().route("/ping", axum::routing::get(|| async { "ok" }));
+        let server = start_uds_fast_path_listener(app, &config, Arc::clone(&registry))
+            .expect("UDS listener should register")
+            .expect("UDS listener should start on Unix");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let metadata_files = fs::read_dir(&discovery_dir)
+            .expect("discovery dir should exist")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        assert_eq!(metadata_files.len(), 1);
+
+        let metadata: UdsPeerMetadata = serde_json::from_slice(
+            &fs::read(&metadata_files[0]).expect("metadata should be readable"),
+        )
+        .expect("metadata should parse");
+        assert_eq!(metadata.ip, "127.0.0.1");
+        assert!(
+            Path::new(&metadata.socket_path).exists(),
+            "published UDS socket should exist"
+        );
+
+        server.abort();
+        let _ = server.await;
+        drop(registry);
+        let _ = fs::remove_dir_all(discovery_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_mesh_response_prefers_local_uds_fast_path() {
+        use axum::routing::get;
+
+        let discovery_dir = unique_test_dir("tachyon-uds-fast-path");
+        let registry = Arc::new(UdsFastPathRegistry::with_discovery_dir(
+            discovery_dir.clone(),
+        ));
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = "127.0.0.1:19191".to_owned();
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route(DEFAULT_ROUTE)
+            .expect("default route should remain sealed");
+        let app = axum::Router::new().route("/ping", get(|| async { "uds-fast-path" }));
+        let server = start_uds_fast_path_listener(app, &config, Arc::clone(&registry))
+            .expect("UDS listener should register")
+            .expect("UDS listener should start on Unix");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = resolve_mesh_response(
+            &Client::new(),
+            &config,
+            &route_registry,
+            caller_route,
+            test_host_identity(42).as_ref(),
+            registry.as_ref(),
+            HopLimit(DEFAULT_HOP_LIMIT),
+            &[],
+            GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from("MESH_FETCH:/ping"),
+            },
+        )
+        .await
+        .expect("UDS fast-path request should succeed");
+
+        server.abort();
+        let _ = server.await;
+        drop(registry);
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from("uds-fast-path"));
+        let _ = fs::remove_dir_all(discovery_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_mesh_response_falls_back_to_tcp_when_peer_metadata_is_stale() {
+        use axum::routing::get;
+
+        let discovery_dir = unique_test_dir("tachyon-uds-stale-peer");
+        let metadata_path = discovery_dir.join("stale-peer.json");
+        fs::create_dir_all(&discovery_dir).expect("discovery dir should be created");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TCP listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("TCP listener should expose an address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/ping", get(|| async { "tcp-fallback" })),
+            )
+            .await
+            .expect("TCP fallback server should stay healthy");
+        });
+
+        let stale_socket = discovery_dir.join("missing.sock");
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&UdsPeerMetadata {
+                host_id: "stale".to_owned(),
+                ip: "127.0.0.1".to_owned(),
+                socket_path: stale_socket.display().to_string(),
+                protocols: vec!["http/1.1".to_owned()],
+            })
+            .expect("stale metadata should serialize"),
+        )
+        .expect("stale metadata should be written");
+
+        let registry = UdsFastPathRegistry::with_discovery_dir(discovery_dir.clone());
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = address.to_string();
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route(DEFAULT_ROUTE)
+            .expect("default route should remain sealed");
+
+        let response = resolve_mesh_response(
+            &Client::new(),
+            &config,
+            &route_registry,
+            caller_route,
+            test_host_identity(43).as_ref(),
+            &registry,
+            HopLimit(DEFAULT_HOP_LIMIT),
+            &[],
+            GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from("MESH_FETCH:/ping"),
+            },
+        )
+        .await
+        .expect("stale peer should fall back to TCP");
+
+        server.abort();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from("tcp-fallback"));
+        assert!(
+            !metadata_path.exists(),
+            "missing-socket metadata should be removed during discovery refresh"
+        );
+        let _ = fs::remove_dir_all(discovery_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uds_fast_path_is_faster_than_loopback_tcp_for_repeated_mesh_fetches() {
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TCP listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("TCP listener should expose an address");
+        let tcp_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/ping", get(|| async { "ok" })),
+            )
+            .await
+            .expect("TCP benchmark server should stay healthy");
+        });
+
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = address.to_string();
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route(DEFAULT_ROUTE)
+            .expect("default route should remain sealed");
+        let host_identity = test_host_identity(44);
+
+        let discovery_dir = unique_test_dir("tachyon-uds-benchmark");
+        let uds_registry = Arc::new(UdsFastPathRegistry::with_discovery_dir(
+            discovery_dir.clone(),
+        ));
+        let uds_server = start_uds_fast_path_listener(
+            axum::Router::new().route("/ping", get(|| async { "ok" })),
+            &config,
+            Arc::clone(&uds_registry),
+        )
+        .expect("UDS benchmark server should register")
+        .expect("UDS benchmark server should start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut benchmark = |registry: &UdsFastPathRegistry| async {
+            let start = Instant::now();
+            for _ in 0..24 {
+                let response = resolve_mesh_response(
+                    &Client::new(),
+                    &config,
+                    &route_registry,
+                    caller_route,
+                    host_identity.as_ref(),
+                    registry,
+                    HopLimit(DEFAULT_HOP_LIMIT),
+                    &[],
+                    GuestHttpResponse {
+                        status: StatusCode::OK,
+                        body: Bytes::from("MESH_FETCH:/ping"),
+                    },
+                )
+                .await
+                .expect("benchmark mesh fetch should succeed");
+                assert_eq!(response.status, StatusCode::OK);
+            }
+            start.elapsed()
+        };
+
+        let tcp_elapsed = benchmark(&UdsFastPathRegistry::default()).await;
+        let uds_elapsed = benchmark(uds_registry.as_ref()).await;
+
+        uds_server.abort();
+        let _ = uds_server.await;
+        tcp_server.abort();
+
+        assert!(
+            uds_elapsed < tcp_elapsed,
+            "UDS fast-path should beat loopback TCP (uds={uds_elapsed:?}, tcp={tcp_elapsed:?})"
+        );
+        let _ = fs::remove_dir_all(discovery_dir);
     }
 
     #[tokio::test]
