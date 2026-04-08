@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Router,
 };
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use reqwest::Client;
 use semver::{Version, VersionReq};
@@ -91,11 +91,15 @@ const DEFAULT_HOP_LIMIT: u32 = 10;
 const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
 const COHORT_HEADER: &str = "x-cohort";
 const TACHYON_COHORT_HEADER: &str = "x-tachyon-cohort";
+const TACHYON_IDENTITY_HEADER: &str = "x-tachyon-identity";
+const TACHYON_SYSTEM_PUBLIC_KEY_ENV: &str = "TACHYON_SYSTEM_PUBLIC_KEY";
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
 const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const VOLUME_GC_TICK_INTERVAL: Duration = Duration::from_secs(60);
+const IDENTITY_TOKEN_TTL: Duration = Duration::from_secs(30);
+const IDENTITY_TOKEN_PREFIX: &str = "tachyon.v1";
 const KUBERNETES_SERVICE_BASE_URL: &str = "https://kubernetes.default.svc";
 const MOCK_K8S_URL_ENV: &str = "TACHYON_MOCK_K8S_URL";
 #[cfg(not(test))]
@@ -118,6 +122,17 @@ fn default_route_version() -> String {
     DEFAULT_ROUTE_VERSION.to_owned()
 }
 
+fn unix_timestamp_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("system clock is set before the Unix epoch")?
+        .as_secs())
+}
+
+fn forbidden_error(message: &str) -> String {
+    format!("forbidden:{message}")
+}
+
 fn is_default_route_version(version: &String) -> bool {
     version == DEFAULT_ROUTE_VERSION
 }
@@ -135,6 +150,7 @@ struct AppState {
     runtime: Arc<ArcSwap<RuntimeState>>,
     http_client: Client,
     secrets_vault: SecretsVault,
+    host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     volume_manager: Arc<VolumeManager>,
     telemetry: TelemetryHandle,
@@ -167,8 +183,9 @@ struct ComponentHostState {
     table: ResourceTable,
     limits: GuestResourceLimiter,
     secrets: SecretAccess,
-    route_path: String,
-    volumes: Vec<IntegrityVolume>,
+    runtime_config: IntegrityConfig,
+    request_headers: HeaderMap,
+    host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     telemetry: TelemetryHandle,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
@@ -186,6 +203,8 @@ struct GuestExecutionContext {
     config: IntegrityConfig,
     runtime_telemetry: TelemetryHandle,
     secret_access: SecretAccess,
+    request_headers: HeaderMap,
+    host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     telemetry: Option<GuestTelemetryContext>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
@@ -263,6 +282,105 @@ struct RouteTarget {
 struct PropagatedHeader {
     name: String,
     value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct CallerIdentityClaims {
+    route_path: String,
+    role: RouteRole,
+    issued_at: u64,
+    expires_at: u64,
+}
+
+#[derive(Clone)]
+struct HostIdentity {
+    signing_key: Arc<SigningKey>,
+    public_key: VerifyingKey,
+    public_key_hex: String,
+}
+
+impl HostIdentity {
+    fn generate() -> Self {
+        Self::from_signing_key(SigningKey::from_bytes(&rand::random::<[u8; 32]>()))
+    }
+
+    fn from_signing_key(signing_key: SigningKey) -> Self {
+        let public_key = signing_key.verifying_key();
+        Self {
+            signing_key: Arc::new(signing_key),
+            public_key_hex: hex::encode(public_key.to_bytes()),
+            public_key,
+        }
+    }
+
+    fn sign_route(&self, route: &IntegrityRoute) -> Result<String> {
+        let now = unix_timestamp_seconds()?;
+        self.sign_claims(&CallerIdentityClaims {
+            route_path: normalize_route_path(&route.path),
+            role: route.role,
+            issued_at: now,
+            expires_at: now.saturating_add(IDENTITY_TOKEN_TTL.as_secs()),
+        })
+    }
+
+    fn sign_claims(&self, claims: &CallerIdentityClaims) -> Result<String> {
+        let payload =
+            serde_json::to_vec(claims).context("failed to serialize signed caller identity")?;
+        let signature = self.signing_key.sign(&payload);
+        Ok(format!(
+            "{IDENTITY_TOKEN_PREFIX}.{}.{}",
+            hex::encode(payload),
+            hex::encode(signature.to_bytes())
+        ))
+    }
+
+    fn verify_header(
+        &self,
+        headers: &HeaderMap,
+    ) -> std::result::Result<CallerIdentityClaims, String> {
+        let raw = headers
+            .get(TACHYON_IDENTITY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| forbidden_error("missing host-signed caller identity"))?;
+        let token = raw
+            .strip_prefix("Bearer ")
+            .or_else(|| raw.strip_prefix("bearer "))
+            .unwrap_or(raw);
+        self.verify_token(token)
+            .map_err(|error| forbidden_error(&error))
+    }
+
+    fn verify_token(&self, token: &str) -> std::result::Result<CallerIdentityClaims, String> {
+        let Some(rest) = token.strip_prefix(&format!("{IDENTITY_TOKEN_PREFIX}.")) else {
+            return Err("caller identity token has an invalid prefix".to_owned());
+        };
+        let Some((payload_hex, signature_hex)) = rest.split_once('.') else {
+            return Err("caller identity token is malformed".to_owned());
+        };
+        let payload = hex::decode(payload_hex)
+            .map_err(|_| "caller identity token payload is not valid hex".to_owned())?;
+        let signature_bytes = decode_hex_array::<64>(signature_hex, "caller identity signature")
+            .map_err(|error| error.to_string())?;
+        let signature = Signature::from_bytes(&signature_bytes);
+
+        self.public_key
+            .verify(&payload, &signature)
+            .map_err(|_| "caller identity token signature verification failed".to_owned())?;
+
+        let claims: CallerIdentityClaims = serde_json::from_slice(&payload)
+            .map_err(|_| "caller identity token payload is not valid JSON".to_owned())?;
+        let now = unix_timestamp_seconds().map_err(|error| error.to_string())?;
+        if claims.issued_at > claims.expires_at {
+            return Err("caller identity token timestamps are invalid".to_owned());
+        }
+        if now > claims.expires_at {
+            return Err("caller identity token has expired".to_owned());
+        }
+
+        Ok(claims)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -539,14 +657,21 @@ async fn run() -> Result<()> {
     init_host_tracing();
     let telemetry = telemetry::init_telemetry();
     let runtime = build_runtime_state(verify_integrity()?)?;
+    let host_identity = Arc::new(HostIdentity::generate());
     let storage_broker = Arc::new(StorageBrokerManager::default());
     let background_workers = Arc::new(BackgroundWorkerManager::default());
-    background_workers.start_for_runtime(&runtime, telemetry.clone(), Arc::clone(&storage_broker));
+    background_workers.start_for_runtime(
+        &runtime,
+        telemetry.clone(),
+        Arc::clone(&host_identity),
+        Arc::clone(&storage_broker),
+    );
 
     let state = AppState {
         runtime: Arc::new(ArcSwap::from_pointee(runtime.clone())),
         http_client: Client::new(),
         secrets_vault: SecretsVault::load(),
+        host_identity,
         storage_broker,
         volume_manager: Arc::new(VolumeManager::default()),
         telemetry,
@@ -583,6 +708,7 @@ impl BackgroundWorkerManager {
         &self,
         runtime: &RuntimeState,
         telemetry: TelemetryHandle,
+        host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
     ) {
         let mut new_workers = Vec::new();
@@ -613,6 +739,7 @@ impl BackgroundWorkerManager {
                 &function_name,
                 telemetry.clone(),
                 Arc::clone(&runtime.concurrency_limits),
+                Arc::clone(&host_identity),
                 Arc::clone(&storage_broker),
             )
             .is_err()
@@ -628,6 +755,7 @@ impl BackgroundWorkerManager {
             let worker_config = runtime.config.clone();
             let worker_telemetry = telemetry.clone();
             let worker_limits = Arc::clone(&runtime.concurrency_limits);
+            let worker_host_identity = Arc::clone(&host_identity);
             let worker_storage_broker = Arc::clone(&storage_broker);
             let worker_stop = Arc::clone(&stop_requested);
             let join_handle = tokio::task::spawn_blocking(move || {
@@ -636,6 +764,7 @@ impl BackgroundWorkerManager {
                     worker_config,
                     worker_telemetry,
                     worker_limits,
+                    worker_host_identity,
                     worker_storage_broker,
                     worker_route,
                     worker_function_name,
@@ -669,10 +798,11 @@ impl BackgroundWorkerManager {
         &self,
         runtime: &RuntimeState,
         telemetry: TelemetryHandle,
+        host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
     ) {
         self.stop_all().await;
-        self.start_for_runtime(runtime, telemetry, storage_broker);
+        self.start_for_runtime(runtime, telemetry, host_identity, storage_broker);
     }
 
     async fn stop_all(&self) {
@@ -704,6 +834,7 @@ fn run_background_tick_loop(
     config: IntegrityConfig,
     telemetry: TelemetryHandle,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     route: IntegrityRoute,
     function_name: String,
@@ -716,6 +847,7 @@ fn run_background_tick_loop(
         &function_name,
         telemetry,
         concurrency_limits,
+        host_identity,
         storage_broker,
     ) {
         Ok(runner) => runner,
@@ -759,6 +891,7 @@ fn wait_for_background_tick(stop_requested: &AtomicBool) -> bool {
 }
 
 impl StorageBrokerManager {
+    #[cfg(test)]
     fn enqueue_write_for_route(
         &self,
         route: &IntegrityRoute,
@@ -767,9 +900,19 @@ impl StorageBrokerManager {
         body: Vec<u8>,
     ) -> std::result::Result<(), String> {
         let resolved = resolve_storage_write_target(route, path)?;
+        self.enqueue_write_target(route.path.clone(), resolved, mode, body)
+    }
+
+    fn enqueue_write_target(
+        &self,
+        route_path: String,
+        resolved: ResolvedStorageWriteTarget,
+        mode: StorageWriteMode,
+        body: Vec<u8>,
+    ) -> std::result::Result<(), String> {
         let queue = self.queue_for_volume(&resolved.volume_root);
         queue.enqueue(StorageBrokerOperation::Write(StorageBrokerWriteRequest {
-            route_path: route.path.clone(),
+            route_path,
             guest_path: resolved.guest_path,
             host_target: resolved.host_target,
             mode,
@@ -1386,12 +1529,11 @@ fn resolve_storage_write_target(
     let volume = route
         .volumes
         .iter()
-        .filter(|volume| !volume.readonly)
         .filter(|volume| guest_path_matches_volume(&normalized_path, &volume.guest_path))
         .max_by_key(|volume| volume.guest_path.len())
         .ok_or_else(|| {
             format!(
-                "route `{}` cannot broker writes to `{normalized_path}` because no writable mounted volume matches that path",
+                "route `{}` cannot broker writes to `{normalized_path}` because no mounted volume matches that path",
                 route.path
             )
         })?;
@@ -1430,6 +1572,34 @@ fn parse_storage_broker_host_path(
     }
 
     Ok(PathBuf::from(trimmed))
+}
+
+fn authorize_storage_broker_write(
+    config: &IntegrityConfig,
+    headers: &HeaderMap,
+    host_identity: &HostIdentity,
+    path: &str,
+) -> std::result::Result<(IntegrityRoute, ResolvedStorageWriteTarget), String> {
+    let claims = host_identity.verify_header(headers)?;
+    let route = config
+        .sealed_route(&claims.route_path)
+        .cloned()
+        .ok_or_else(|| {
+            forbidden_error(&format!(
+                "signed caller route `{}` is not sealed in `integrity.lock`",
+                claims.route_path
+            ))
+        })?;
+    if route.role != claims.role {
+        return Err(forbidden_error(&format!(
+            "signed caller role mismatch for route `{}`",
+            claims.route_path
+        )));
+    }
+
+    let resolved =
+        resolve_storage_write_target(&route, path).map_err(|error| forbidden_error(&error))?;
+    Ok((route, resolved))
 }
 
 fn guest_path_matches_volume(path: &str, guest_path: &str) -> bool {
@@ -1631,6 +1801,7 @@ async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         .replace_with(
             &runtime,
             state.telemetry.clone(),
+            Arc::clone(&state.host_identity),
             Arc::clone(&state.storage_broker),
         )
         .await;
@@ -1882,6 +2053,8 @@ async fn execute_route_request(
     let task_route = route.clone();
     let task_function_name = selected_module.clone();
     let task_propagated_headers = propagated_headers.clone();
+    let task_request_headers = headers.clone();
+    let task_host_identity = Arc::clone(&state.host_identity);
     let guest_request = GuestRequest {
         method: method.to_string(),
         uri: uri.to_string(),
@@ -1897,6 +2070,8 @@ async fn execute_route_request(
                 config: request_config,
                 runtime_telemetry,
                 secret_access,
+                request_headers: task_request_headers,
+                host_identity: task_host_identity,
                 storage_broker,
                 telemetry: Some(telemetry_context),
                 concurrency_limits,
@@ -1932,6 +2107,7 @@ async fn execute_route_request(
         &response_config,
         &route_registry,
         route,
+        &state.host_identity,
         hop_limit,
         &propagated_headers,
         response,
@@ -1969,6 +2145,7 @@ async fn resolve_mesh_response(
     config: &IntegrityConfig,
     route_registry: &RouteRegistry,
     caller_route: &IntegrityRoute,
+    host_identity: &HostIdentity,
     hop_limit: HopLimit,
     propagated_headers: &[PropagatedHeader],
     response: GuestHttpResponse,
@@ -1977,12 +2154,22 @@ async fn resolve_mesh_response(
         return Ok(response);
     };
     let url = resolve_mesh_fetch_target(config, route_registry, caller_route, target)?;
+    let inject_identity = is_internal_mesh_target(target);
 
     let mut request = http_client
         .get(&url)
         .header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
-    for header in propagated_headers {
+    for header in propagated_headers
+        .iter()
+        .filter(|header| !header.name.eq_ignore_ascii_case(TACHYON_IDENTITY_HEADER))
+    {
         request = request.header(&header.name, &header.value);
+    }
+    if inject_identity {
+        let token = host_identity
+            .sign_route(caller_route)
+            .map_err(|error| format!("failed to sign mesh caller identity: {error:#}"))?;
+        request = request.header(TACHYON_IDENTITY_HEADER, format!("Bearer {token}"));
     }
     let response = request
         .send()
@@ -2010,6 +2197,18 @@ fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
         .strip_prefix("MESH_FETCH:")
         .map(str::trim)
         .filter(|url| !url.is_empty())
+}
+
+fn is_internal_mesh_target(target: &str) -> bool {
+    if target.starts_with('/') {
+        return true;
+    }
+
+    (target.starts_with("http://") || target.starts_with("https://"))
+        && reqwest::Url::parse(target)
+            .ok()
+            .and_then(|url| url.host_str().map(is_internal_mesh_host))
+            .unwrap_or(false)
 }
 
 fn select_route_module(
@@ -2483,9 +2682,12 @@ fn execute_component_guest(
         engine,
         ComponentHostState::new(
             route,
+            execution.config.clone(),
             execution.config.guest_memory_limit_bytes,
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
+            execution.request_headers.clone(),
+            Arc::clone(&execution.host_identity),
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
@@ -2582,9 +2784,12 @@ fn execute_system_component_guest(
         engine,
         ComponentHostState::new(
             route,
+            execution.config.clone(),
             execution.config.guest_memory_limit_bytes,
             execution.runtime_telemetry.clone(),
             execution.secret_access.clone(),
+            execution.request_headers.clone(),
+            Arc::clone(&execution.host_identity),
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
@@ -2640,6 +2845,7 @@ impl BackgroundTickRunner {
         function_name: &str,
         telemetry: TelemetryHandle,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+        host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
     ) -> std::result::Result<Self, ExecutionError> {
         let module_path = resolve_guest_module_path(function_name)
@@ -2686,9 +2892,12 @@ impl BackgroundTickRunner {
             engine,
             ComponentHostState::new(
                 route,
+                config.clone(),
                 config.guest_memory_limit_bytes,
                 telemetry,
                 SecretAccess::default(),
+                HeaderMap::new(),
+                host_identity,
                 storage_broker,
                 concurrency_limits,
                 Vec::new(),
@@ -3776,20 +3985,24 @@ impl SecretAccess {
 impl ComponentHostState {
     fn new(
         route: &IntegrityRoute,
+        runtime_config: IntegrityConfig,
         max_memory_bytes: usize,
         telemetry: TelemetryHandle,
         secrets: SecretAccess,
+        request_headers: HeaderMap,
+        host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
         propagated_headers: Vec<PropagatedHeader>,
     ) -> std::result::Result<Self, ExecutionError> {
         Ok(Self {
-            ctx: build_component_wasi_ctx(route)?,
+            ctx: build_component_wasi_ctx(route, host_identity.as_ref())?,
             table: ResourceTable::new(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
             secrets,
-            route_path: route.path.clone(),
-            volumes: route.volumes.clone(),
+            runtime_config,
+            request_headers,
+            host_identity,
             storage_broker,
             telemetry,
             concurrency_limits,
@@ -3808,12 +4021,30 @@ impl ComponentHostState {
 
 fn build_component_wasi_ctx(
     route: &IntegrityRoute,
+    host_identity: &HostIdentity,
 ) -> std::result::Result<WasiCtx, ExecutionError> {
     // Intentionally do not inherit the host environment. Secrets stay in host memory
     // and are only reachable through the typed vault import.
     let mut wasi = WasiCtxBuilder::new();
+    for (name, value) in system_runtime_environment(route, host_identity) {
+        wasi.env(&name, &value);
+    }
     preopen_route_volumes(&mut wasi, route)?;
     Ok(wasi.build())
+}
+
+fn system_runtime_environment(
+    route: &IntegrityRoute,
+    host_identity: &HostIdentity,
+) -> Vec<(String, String)> {
+    if route.role != RouteRole::System {
+        return Vec::new();
+    }
+
+    vec![(
+        TACHYON_SYSTEM_PUBLIC_KEY_ENV.to_owned(),
+        host_identity.public_key_hex.clone(),
+    )]
 }
 
 fn preopen_route_volumes(
@@ -3946,23 +4177,15 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
                 StorageWriteMode::Append
             }
         };
-        let route = IntegrityRoute {
-            path: self.route_path.clone(),
-            role: RouteRole::System,
-            name: String::new(),
-            version: default_route_version(),
-            dependencies: BTreeMap::new(),
-            requires_credentials: Vec::new(),
-            middleware: None,
-            allowed_secrets: Vec::new(),
-            targets: Vec::new(),
-            min_instances: 0,
-            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
-            volumes: self.volumes.clone(),
-        };
+        let (route, resolved) = authorize_storage_broker_write(
+            &self.runtime_config,
+            &self.request_headers,
+            self.host_identity.as_ref(),
+            &path,
+        )?;
 
         self.storage_broker
-            .enqueue_write_for_route(&route, &path, mode, body)
+            .enqueue_write_target(route.path, resolved, mode, body)
     }
 
     fn snapshot_volume(
@@ -4261,7 +4484,7 @@ mod tests {
     };
     use tower::util::ServiceExt;
 
-    type CapturedForwardedHeaders = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+    type CapturedForwardedHeaders = Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
 
     fn expected_secret_status() -> &'static str {
         if cfg!(feature = "secrets-vault") {
@@ -4296,6 +4519,12 @@ mod tests {
             public_key: hex::encode(signing_key.verifying_key().to_bytes()),
             signature: hex::encode(signature.to_bytes()),
         }
+    }
+
+    fn test_host_identity(seed: u8) -> Arc<HostIdentity> {
+        Arc::new(HostIdentity::from_signing_key(SigningKey::from_bytes(
+            &[seed; 32],
+        )))
     }
 
     fn write_test_manifest(path: &Path, config: &IntegrityConfig, seed: u8) {
@@ -4339,6 +4568,7 @@ mod tests {
             runtime: Arc::new(ArcSwap::from_pointee(build_test_runtime(config))),
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
+            host_identity: test_host_identity(21),
             storage_broker: Arc::new(StorageBrokerManager::default()),
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry,
@@ -4364,6 +4594,36 @@ mod tests {
                 volume_type: VolumeType::Host,
                 host_path: host_path.display().to_string(),
                 guest_path: "/app/data".to_owned(),
+                readonly,
+                ttl_seconds: None,
+                idle_timeout: None,
+                eviction_policy: None,
+            }],
+        }
+    }
+
+    fn scoped_volume_test_route(
+        path: &str,
+        host_path: &std::path::Path,
+        guest_path: &str,
+        readonly: bool,
+    ) -> IntegrityRoute {
+        IntegrityRoute {
+            path: path.to_owned(),
+            role: RouteRole::User,
+            name: default_route_name(path),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
+                host_path: host_path.display().to_string(),
+                guest_path: guest_path.to_owned(),
                 readonly,
                 ttl_seconds: None,
                 idle_timeout: None,
@@ -4552,6 +4812,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn system_runtime_environment_only_exposes_host_public_key_to_system_routes() {
+        let host_identity = test_host_identity(12);
+        let system_env = system_runtime_environment(
+            &IntegrityRoute::system("/system/storage-broker"),
+            &host_identity,
+        );
+        let user_env =
+            system_runtime_environment(&IntegrityRoute::user("/api/guest"), &host_identity);
+
+        assert_eq!(
+            system_env,
+            vec![(
+                TACHYON_SYSTEM_PUBLIC_KEY_ENV.to_owned(),
+                host_identity.public_key_hex.clone()
+            )]
+        );
+        assert!(user_env.is_empty());
+    }
+
+    #[test]
+    fn host_identity_round_trips_signed_route_claims() {
+        let host_identity = test_host_identity(13);
+        let route = IntegrityRoute::user("/api/tenant-a");
+        let token = host_identity
+            .sign_route(&route)
+            .expect("identity token should sign");
+
+        let claims = host_identity
+            .verify_token(&token)
+            .expect("identity token should verify");
+
+        assert_eq!(claims.route_path, "/api/tenant-a");
+        assert_eq!(claims.role, RouteRole::User);
+        assert!(claims.expires_at >= claims.issued_at);
+    }
+
+    #[test]
+    fn host_identity_rejects_expired_tokens() {
+        let host_identity = test_host_identity(14);
+        let now = unix_timestamp_seconds().expect("system clock should be available");
+        let token = host_identity
+            .sign_claims(&CallerIdentityClaims {
+                route_path: "/api/tenant-a".to_owned(),
+                role: RouteRole::User,
+                issued_at: now.saturating_sub(10),
+                expires_at: now.saturating_sub(1),
+            })
+            .expect("expired identity token should still sign");
+
+        let error = host_identity
+            .verify_token(&token)
+            .expect_err("expired identity token should be rejected");
+
+        assert!(error.contains("expired"), "unexpected error: {error}");
+    }
+
     #[tokio::test]
     async fn reload_runtime_from_disk_swaps_in_new_routes() {
         let temp_dir = unique_test_dir("graceful-reload-state");
@@ -4635,6 +4952,8 @@ mod tests {
                 secret_access: SecretAccess::from_route(&route, &SecretsVault::load()),
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                request_headers: HeaderMap::new(),
+                host_identity: test_host_identity(30),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
@@ -4672,6 +4991,8 @@ mod tests {
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
+                request_headers: HeaderMap::new(),
+                host_identity: test_host_identity(31),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
@@ -4711,6 +5032,8 @@ mod tests {
                 config: config.clone(),
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
+                request_headers: HeaderMap::new(),
+                host_identity: test_host_identity(32),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
@@ -4740,6 +5063,8 @@ mod tests {
                 config: config.clone(),
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
+                request_headers: HeaderMap::new(),
+                host_identity: test_host_identity(33),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
@@ -4892,6 +5217,7 @@ mod tests {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             http_client: Client::new(),
             secrets_vault: SecretsVault::load(),
+            host_identity: test_host_identity(22),
             storage_broker: Arc::new(StorageBrokerManager::default()),
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry: telemetry::init_test_telemetry(),
@@ -4938,6 +5264,8 @@ mod tests {
                 config,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
+                request_headers: HeaderMap::new(),
+                host_identity: test_host_identity(34),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
@@ -5078,6 +5406,7 @@ mod tests {
                 "k8s-scaler",
                 telemetry::init_test_telemetry(),
                 concurrency_limits,
+                test_host_identity(35),
                 Arc::new(StorageBrokerManager::default()),
             )
             .expect("background scaler should instantiate");
@@ -5432,6 +5761,11 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_owned(),
+                    headers
+                        .get(TACHYON_IDENTITY_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned(),
                 ));
             "ok"
         }
@@ -5454,8 +5788,14 @@ mod tests {
 
         let mut inbound_headers = HeaderMap::new();
         inbound_headers.insert(COHORT_HEADER, HeaderValue::from_static("beta"));
+        inbound_headers.insert(
+            TACHYON_IDENTITY_HEADER,
+            HeaderValue::from_static("Bearer spoofed"),
+        );
         let propagated_headers = extract_propagated_headers(&inbound_headers);
-        let config = IntegrityConfig::default_sealed();
+        let host_identity = test_host_identity(40);
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = address.to_string();
         let route_registry = RouteRegistry::build(&config).expect("route registry should build");
         let caller_route = config
             .sealed_route(DEFAULT_ROUTE)
@@ -5465,15 +5805,99 @@ mod tests {
             &config,
             &route_registry,
             caller_route,
+            host_identity.as_ref(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &propagated_headers,
+            GuestHttpResponse {
+                status: StatusCode::OK,
+                body: Bytes::from("MESH_FETCH:/ping"),
+            },
+        )
+        .await
+        .expect("mesh fetch should succeed");
+
+        server.abort();
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, Bytes::from("ok"));
+        let captured = captured
+            .lock()
+            .expect("captured headers should not be poisoned");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0, (DEFAULT_HOP_LIMIT - 1).to_string());
+        assert_eq!(captured[0].1, "beta");
+        assert_eq!(captured[0].2, "beta");
+        assert_ne!(captured[0].3, "Bearer spoofed");
+        let claims = host_identity
+            .verify_token(
+                captured[0]
+                    .3
+                    .strip_prefix("Bearer ")
+                    .expect("mesh identity header should include a bearer token"),
+            )
+            .expect("mesh identity header should verify");
+        assert_eq!(claims.route_path, DEFAULT_ROUTE);
+        assert_eq!(claims.role, RouteRole::User);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_mesh_response_does_not_leak_identity_headers_to_external_targets() {
+        use axum::{extract::State, routing::get, Router};
+
+        async fn capture_identity_header(
+            State(captured): State<Arc<std::sync::Mutex<Vec<String>>>>,
+            headers: HeaderMap,
+        ) -> &'static str {
+            captured
+                .lock()
+                .expect("captured headers should not be poisoned")
+                .push(
+                    headers
+                        .get(TACHYON_IDENTITY_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+            "ok"
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/ping", get(capture_identity_header))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should expose an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock server should stay healthy");
+        });
+
+        let config = IntegrityConfig::default_sealed();
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route(DEFAULT_ROUTE)
+            .expect("default route should remain sealed");
+        let host_identity = test_host_identity(41);
+        let response = resolve_mesh_response(
+            &Client::new(),
+            &config,
+            &route_registry,
+            caller_route,
+            host_identity.as_ref(),
+            HopLimit(DEFAULT_HOP_LIMIT),
+            &[],
             GuestHttpResponse {
                 status: StatusCode::OK,
                 body: Bytes::from(format!("MESH_FETCH:http://{address}/ping")),
             },
         )
         .await
-        .expect("mesh fetch should succeed");
+        .expect("external mesh fetch should succeed");
 
         server.abort();
 
@@ -5484,11 +5908,7 @@ mod tests {
                 .lock()
                 .expect("captured headers should not be poisoned")
                 .as_slice(),
-            &[(
-                (DEFAULT_HOP_LIMIT - 1).to_string(),
-                "beta".to_owned(),
-                "beta".to_owned()
-            )]
+            &["".to_owned()]
         );
     }
 
@@ -6056,6 +6476,94 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(volume_dir);
+    }
+
+    #[tokio::test]
+    async fn storage_broker_enforces_signed_caller_scope_with_http_403() {
+        let shared_dir = unique_test_dir("tachyon-zero-trust-broker");
+        let tenant_a_dir = shared_dir.join("tenant-a");
+        let tenant_b_dir = shared_dir.join("tenant-b");
+        let config = validate_integrity_config(IntegrityConfig {
+            routes: vec![
+                scoped_volume_test_route("/api/tenant-a", &tenant_a_dir, "/data/tenant-a", true),
+                scoped_volume_test_route("/api/tenant-b", &tenant_b_dir, "/data/tenant-b", true),
+                storage_broker_test_route(&shared_dir),
+            ],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("zero-trust broker config should validate");
+
+        let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+        let broker = Arc::clone(&state.storage_broker);
+        let caller_route = config
+            .sealed_route("/api/tenant-a")
+            .expect("tenant-a route should remain sealed");
+        let token = state
+            .host_identity
+            .sign_route(caller_route)
+            .expect("caller token should sign");
+        let app = build_app(state);
+
+        let forged = app
+            .clone()
+            .oneshot(
+                Request::post("/system/storage-broker?path=/data/tenant-a/forged.txt")
+                    .header(TACHYON_IDENTITY_HEADER, "Bearer forged")
+                    .body(Body::from("forged"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::post("/system/storage-broker?path=/data/tenant-a/state.txt")
+                    .header(TACHYON_IDENTITY_HEADER, format!("Bearer {token}"))
+                    .body(Body::from("allowed"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert!(
+            broker.wait_for_volume_idle(&tenant_a_dir, Duration::from_secs(5)),
+            "tenant-a broker queue should drain"
+        );
+        assert_eq!(
+            fs::read_to_string(tenant_a_dir.join("state.txt"))
+                .expect("authorized write should reach tenant-a volume"),
+            "allowed"
+        );
+
+        let denied = app
+            .oneshot(
+                Request::post("/system/storage-broker?path=/data/tenant-b/state.txt")
+                    .header(TACHYON_IDENTITY_HEADER, format!("Bearer {token}"))
+                    .body(Body::from("blocked"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let denied_body = denied
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        assert!(
+            String::from_utf8_lossy(&denied_body).contains("cannot broker writes"),
+            "unexpected denial body: {:?}",
+            denied_body
+        );
+        assert!(
+            !tenant_b_dir.join("state.txt").exists(),
+            "out-of-scope write should not create tenant-b data"
+        );
+
+        let _ = fs::remove_dir_all(shared_dir);
     }
 
     #[tokio::test]

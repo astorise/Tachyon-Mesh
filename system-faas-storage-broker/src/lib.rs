@@ -70,9 +70,20 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
 
         match result {
             Ok(()) => response(202, "Accepted"),
-            Err(error) => response(500, error),
+            Err(error) => {
+                let (status, body) = map_broker_error(error);
+                response(status, body)
+            }
         }
     }
+}
+
+fn map_broker_error(error: String) -> (u16, Vec<u8>) {
+    if let Some(message) = error.strip_prefix("forbidden:") {
+        return (403, message.trim().as_bytes().to_vec());
+    }
+
+    (500, error.into_bytes())
 }
 
 fn parse_broker_request(uri: &str) -> Result<BrokerOperation, &'static str> {
