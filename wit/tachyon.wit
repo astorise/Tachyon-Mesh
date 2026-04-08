@@ -25,6 +25,21 @@ interface udp-handler {
     handle-packet: func(source-ip: string, source-port: u16, payload: list<u8>) -> list<datagram>;
 }
 
+interface websocket {
+    variant frame {
+        text(string),
+        binary(list<u8>),
+        ping(list<u8>),
+        pong(list<u8>),
+        close,
+    }
+
+    resource connection {
+        send: func(frame: frame) -> result<_, string>;
+        receive: func() -> option<frame>;
+    }
+}
+
 interface telemetry-reader {
     record metrics-snapshot {
         total-requests: u64,
@@ -78,6 +93,13 @@ world faas-guest {
 world udp-faas-guest {
     import secrets-vault;
     export udp-handler;
+}
+
+world websocket-faas-guest {
+    import secrets-vault;
+    import websocket;
+    use websocket.{connection};
+    export on-connect: func(connection: borrow<connection>);
 }
 
 world system-faas-guest {
