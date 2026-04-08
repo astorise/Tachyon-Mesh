@@ -59,5 +59,9 @@ fn stdout_write(buffer: &[u8]) {
     };
     let errno = unsafe { fd_write(1, &ciovec, 1, &mut written) };
     assert_eq!(errno, 0, "fd_write should succeed");
-    assert_eq!(written, buffer.len(), "fd_write should write the full chunk");
+    assert_eq!(
+        written,
+        buffer.len(),
+        "fd_write should write the full chunk"
+    );
 }
