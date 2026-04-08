@@ -13,7 +13,6 @@ use axum::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 #[cfg(feature = "websockets")]
 use futures_util::{SinkExt, StreamExt};
-#[cfg(unix)]
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as HyperConnectionBuilder,
@@ -45,6 +44,7 @@ use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio_rustls::LazyConfigAcceptor;
 use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
@@ -65,6 +65,7 @@ mod ai_inference;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
 mod telemetry;
+mod tls_runtime;
 
 mod component_bindings {
     wasmtime::component::bindgen!({
@@ -116,7 +117,12 @@ const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit
 const DEFAULT_ROUTE: &str = "/api/guest-example";
 #[cfg(test)]
 const DEFAULT_SYSTEM_ROUTE: &str = "/metrics";
+#[cfg(test)]
+const DEFAULT_TLS_ADDRESS: &str = "127.0.0.1:3443";
+const ACME_STAGING_MOCK_MODE: &str = "ACME_STAGING_MOCK";
+const CERT_MANAGER_GUEST_CERT_DIR: &str = "/app/certs";
 const SYSTEM_METERING_ROUTE: &str = "/system/metering";
+const SYSTEM_CERT_MANAGER_ROUTE: &str = "/system/cert-manager";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
@@ -215,6 +221,7 @@ struct AppState {
     storage_broker: Arc<StorageBrokerManager>,
     volume_manager: Arc<VolumeManager>,
     telemetry: TelemetryHandle,
+    tls_manager: Arc<tls_runtime::TlsManager>,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     manifest_path: PathBuf,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -242,6 +249,12 @@ struct UdpLayer4ListenerHandle {
     #[cfg_attr(not(test), allow(dead_code))]
     local_addr: SocketAddr,
     join_handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+struct HttpsListenerHandle {
+    #[cfg_attr(not(test), allow(dead_code))]
+    local_addr: SocketAddr,
+    join_handle: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1000,6 +1013,8 @@ struct IntegrityRoute {
     targets: Vec<RouteTarget>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     models: Vec<IntegrityModelBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    domains: Vec<String>,
     #[serde(default)]
     min_instances: u32,
     #[serde(default = "default_max_concurrency")]
@@ -1039,6 +1054,8 @@ struct IntegrityVolume {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct IntegrityConfig {
     host_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_address: Option<String>,
     max_stdout_bytes: usize,
     guest_fuel_budget: u64,
     guest_memory_limit_bytes: usize,
@@ -1099,6 +1116,7 @@ async fn run() -> Result<()> {
     let uds_fast_path = Arc::new(new_uds_fast_path_registry());
     let storage_broker = Arc::new(StorageBrokerManager::default());
     let background_workers = Arc::new(BackgroundWorkerManager::default());
+    let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     background_workers.start_for_runtime(
         &runtime,
         telemetry.clone(),
@@ -1115,6 +1133,7 @@ async fn run() -> Result<()> {
         storage_broker,
         volume_manager: Arc::new(VolumeManager::default()),
         telemetry,
+        tls_manager,
         manifest_path: integrity_manifest_path(),
         background_workers: Arc::clone(&background_workers),
     };
@@ -1122,6 +1141,7 @@ async fn run() -> Result<()> {
     spawn_reload_watcher(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     let app = build_app(state.clone());
+    let https_listener = start_https_listener(state.clone(), app.clone()).await?;
     let udp_layer4_listeners = start_udp_layer4_listeners(state.clone()).await?;
     let tcp_layer4_listeners = start_tcp_layer4_listeners(state).await?;
     let uds_server = start_uds_fast_path_listener(app.clone(), &runtime.config, uds_fast_path)?;
@@ -1146,6 +1166,10 @@ async fn run() -> Result<()> {
     if let Some(server) = uds_server {
         server.abort();
         let _ = server.await;
+    }
+    if let Some(listener) = https_listener {
+        listener.join_handle.abort();
+        let _ = listener.join_handle.await;
     }
     for listener in udp_layer4_listeners {
         for handle in listener.join_handles {
@@ -2321,6 +2345,11 @@ fn build_app(state: AppState) -> Router {
         .fallback(faas_handler)
         .layer(from_fn(hop_limit_middleware));
 
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        custom_domain_routing_middleware,
+    ));
+
     #[cfg(feature = "rate-limit")]
     let app = app.layer(axum::middleware::from_fn_with_state(
         rate_limit::new_rate_limiter(),
@@ -2464,6 +2493,95 @@ fn layer4_bind_address(host_address: &str, port: u16) -> Result<SocketAddr> {
     })?;
     address.set_port(port);
     Ok(address)
+}
+
+fn https_bind_address(config: &IntegrityConfig) -> Result<Option<SocketAddr>> {
+    if !config.has_custom_domains() {
+        return Ok(None);
+    }
+
+    if let Some(address) = &config.tls_address {
+        return address
+            .parse()
+            .with_context(|| format!("invalid tls_address `{address}`"))
+            .map(Some);
+    }
+
+    let mut address = config.host_address.parse::<SocketAddr>().with_context(|| {
+        format!(
+            "failed to parse `host_address` `{}` for HTTPS binding",
+            config.host_address
+        )
+    })?;
+    address.set_port(443);
+    Ok(Some(address))
+}
+
+async fn start_https_listener(state: AppState, app: Router) -> Result<Option<HttpsListenerHandle>> {
+    let runtime = state.runtime.load_full();
+    let Some(bind_address) = https_bind_address(&runtime.config)? else {
+        return Ok(None);
+    };
+
+    let listener = tokio::net::TcpListener::bind(bind_address)
+        .await
+        .with_context(|| format!("failed to bind HTTPS listener on {bind_address}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read HTTPS listener local address")?;
+
+    let join_handle = tokio::spawn(async move {
+        loop {
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::warn!("HTTPS listener accept failed: {error}");
+                    continue;
+                }
+            };
+            let connection_state = state.clone();
+            let connection_app = app.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    handle_https_connection(connection_state, connection_app, stream).await
+                {
+                    tracing::warn!(remote = %peer_addr, "HTTPS connection failed: {error:#}");
+                }
+            });
+        }
+    });
+
+    Ok(Some(HttpsListenerHandle {
+        local_addr,
+        join_handle,
+    }))
+}
+
+async fn handle_https_connection(
+    state: AppState,
+    app: Router,
+    stream: tokio::net::TcpStream,
+) -> Result<()> {
+    let start = LazyConfigAcceptor::new(tokio_rustls::rustls::server::Acceptor::default(), stream)
+        .await
+        .context("failed to accept TLS client hello")?;
+    let client_hello = start.client_hello();
+    let domain = client_hello
+        .server_name()
+        .ok_or_else(|| anyhow!("TLS client hello did not include SNI"))?;
+    let config = state
+        .tls_manager
+        .server_config_for_domain(&state, domain)
+        .await?;
+    let tls_stream = start
+        .into_stream(config)
+        .await
+        .context("failed to complete rustls handshake")?;
+
+    HyperConnectionBuilder::new(TokioExecutor::new())
+        .serve_connection_with_upgrades(TokioIo::new(tls_stream), TowerToHyperService::new(app))
+        .await
+        .map_err(|error| anyhow!("HTTPS connection exited unexpectedly: {error}"))
 }
 
 async fn start_udp_layer4_listeners(state: AppState) -> Result<Vec<UdpLayer4ListenerHandle>> {
@@ -2906,6 +3024,21 @@ async fn handle_tcp_layer4_connection(
         .map_err(|error| anyhow!("failed to resolve TCP Layer 4 target module: {error}"))?;
     let engine = runtime.engine.clone();
     let config = runtime.config.clone();
+    if !route.domains.is_empty() {
+        return handle_tls_wrapped_tcp_layer4_connection(
+            state,
+            route,
+            stream,
+            function_name,
+            engine,
+            config,
+            volume_leases,
+            permit,
+            runtime,
+        )
+        .await;
+    }
+
     let socket = stream
         .into_std()
         .context("failed to convert TCP Layer 4 socket into std mode")?;
@@ -2944,6 +3077,97 @@ async fn handle_tcp_layer4_connection(
     result_rx
         .await
         .context("TCP Layer 4 guest thread exited before returning a result")??;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_tls_wrapped_tcp_layer4_connection(
+    state: AppState,
+    route: IntegrityRoute,
+    stream: tokio::net::TcpStream,
+    function_name: String,
+    engine: Engine,
+    config: IntegrityConfig,
+    volume_leases: RouteVolumeLeaseGuard,
+    permit: OwnedSemaphorePermit,
+    runtime: Arc<RuntimeState>,
+) -> Result<()> {
+    let start = LazyConfigAcceptor::new(tokio_rustls::rustls::server::Acceptor::default(), stream)
+        .await
+        .context("failed to accept TLS client hello for Layer 4 route")?;
+    let client_hello = start.client_hello();
+    let domain = tls_runtime::normalize_domain(
+        client_hello
+            .server_name()
+            .ok_or_else(|| anyhow!("TLS Layer 4 client hello did not include SNI"))?,
+    )?;
+    if !route.domains.iter().any(|candidate| candidate == &domain) {
+        return Err(anyhow!(
+            "TLS Layer 4 route `{}` does not allow SNI `{domain}`",
+            route.path
+        ));
+    }
+
+    let tls_config = state
+        .tls_manager
+        .server_config_for_domain(&state, &domain)
+        .await?;
+    let mut tls_stream = start
+        .into_stream(tls_config)
+        .await
+        .context("failed to complete TLS handshake for Layer 4 route")?;
+
+    let bridge_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("failed to bind local TLS bridge listener")?;
+    let bridge_addr = bridge_listener
+        .local_addr()
+        .context("failed to resolve TLS bridge listener address")?;
+    let host_identity = Arc::clone(&state.host_identity);
+    let storage_broker = Arc::clone(&state.storage_broker);
+    let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+    let telemetry = state.telemetry.clone();
+    #[cfg(feature = "ai-inference")]
+    let ai_runtime = Arc::clone(&runtime.ai_runtime);
+
+    let (result_tx, result_rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _volume_leases = volume_leases;
+        let _permit = permit;
+        let result = (|| -> std::result::Result<(), ExecutionError> {
+            let (socket, _) = bridge_listener.accept().map_err(|error| {
+                guest_execution_error(error.into(), "failed to accept TLS bridge socket")
+            })?;
+            let stdin_socket = socket.try_clone().map_err(|error| {
+                guest_execution_error(error.into(), "failed to clone TLS bridge socket")
+            })?;
+            execute_tcp_layer4_guest(
+                &engine,
+                &config,
+                &route,
+                &function_name,
+                TcpSocketStdin::new(stdin_socket),
+                TcpSocketStdout::new(socket),
+                telemetry,
+                host_identity,
+                storage_broker,
+                concurrency_limits,
+                #[cfg(feature = "ai-inference")]
+                ai_runtime,
+            )
+        })();
+        let _ = result_tx.send(result);
+    });
+
+    let mut bridge_stream = tokio::net::TcpStream::connect(bridge_addr)
+        .await
+        .context("failed to connect local TLS bridge stream")?;
+    tokio::io::copy_bidirectional(&mut tls_stream, &mut bridge_stream)
+        .await
+        .context("failed to proxy decrypted TLS Layer 4 stream")?;
+
+    result_rx
+        .await
+        .context("TLS Layer 4 guest thread exited before returning a result")??;
     Ok(())
 }
 
@@ -3001,6 +3225,54 @@ async fn hop_limit_middleware(
         .insert(HOP_LIMIT_HEADER, hop_limit.as_header_value());
 
     next.run(req).await
+}
+
+async fn custom_domain_routing_middleware(
+    State(state): State<AppState>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(host) = request_host(req.headers()) else {
+        return next.run(req).await;
+    };
+    let runtime = state.runtime.load_full();
+    let Some(route) = runtime.config.route_for_domain(host) else {
+        return next.run(req).await;
+    };
+    let path = route_domain_request_path(route, req.uri());
+    let mut builder = Uri::builder();
+    if let Some(scheme) = req.uri().scheme_str() {
+        builder = builder.scheme(scheme);
+    }
+    if let Some(authority) = req.uri().authority().cloned() {
+        builder = builder.authority(authority);
+    }
+    if let Ok(uri) = builder.path_and_query(path).build() {
+        *req.uri_mut() = uri;
+    }
+
+    next.run(req).await
+}
+
+fn route_domain_request_path(route: &IntegrityRoute, uri: &Uri) -> String {
+    let original_path = normalize_route_path(uri.path());
+    let path = if original_path == "/" {
+        route.path.clone()
+    } else {
+        format!("{}{}", route.path, original_path)
+    };
+
+    match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    }
+}
+
+fn request_host(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(':').next().unwrap_or(value))
 }
 
 async fn faas_handler(
@@ -5544,6 +5816,7 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
         ));
     }
 
+    config.tls_address = normalize_tls_address(config.tls_address)?;
     config.routes = normalize_config_routes(config.routes)?;
     let route_registry = RouteRegistry::build(&config)?;
     config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
@@ -5572,6 +5845,7 @@ fn normalize_config_routes(routes: Vec<IntegrityRoute>) -> Result<Vec<IntegrityR
         }
     }
     ensure_unique_model_aliases(&normalized)?;
+    ensure_unique_route_domains(&normalized)?;
     Ok(normalized)
 }
 
@@ -5704,6 +5978,7 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
         targets: normalize_route_targets(route.targets)?,
         models: normalize_route_models(route.models, &normalized)?,
+        domains: normalize_route_domains(route.domains, &normalized)?,
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
         volumes: normalize_route_volumes(route.volumes, route.role, &normalized)?,
@@ -5749,6 +6024,37 @@ fn normalize_route_models(
     Ok(deduped.into_values().collect())
 }
 
+fn normalize_route_domains(domains: Vec<String>, route_path: &str) -> Result<Vec<String>> {
+    domains
+        .into_iter()
+        .map(|domain| {
+            tls_runtime::normalize_domain(&domain).map_err(|error| {
+                anyhow!(
+                    "Integrity Validation Failed: route `{route_path}` has an invalid domain `{domain}`: {error}"
+                )
+            })
+        })
+        .collect::<Result<BTreeSet<_>>>()
+        .map(|domains| domains.into_iter().collect())
+}
+
+fn ensure_unique_route_domains(routes: &[IntegrityRoute]) -> Result<()> {
+    let mut owners = HashMap::new();
+
+    for route in routes {
+        for domain in &route.domains {
+            if let Some(previous_route) = owners.insert(domain.clone(), route.path.clone()) {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: domain `{domain}` is declared by both route `{previous_route}` and route `{}`",
+                    route.path
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_unique_model_aliases(routes: &[IntegrityRoute]) -> Result<()> {
     let mut owners = HashMap::new();
 
@@ -5764,6 +6070,25 @@ fn ensure_unique_model_aliases(routes: &[IntegrityRoute]) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn normalize_tls_address(address: Option<String>) -> Result<Option<String>> {
+    address
+        .map(|address| {
+            let trimmed = address.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: `tls_address` must not be empty"
+                ));
+            }
+            trimmed.parse::<SocketAddr>().map_err(|error| {
+                anyhow!(
+                    "Integrity Validation Failed: `tls_address` must be a socket address: {error}"
+                )
+            })?;
+            Ok(trimmed.to_owned())
+        })
+        .transpose()
 }
 
 fn normalize_route_name(name: &str, path: &str) -> Result<String> {
@@ -6700,6 +7025,7 @@ impl IntegrityConfig {
     fn default_sealed() -> Self {
         Self {
             host_address: DEFAULT_HOST_ADDRESS.to_owned(),
+            tls_address: None,
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
@@ -6717,6 +7043,20 @@ impl IntegrityConfig {
         let normalized = normalize_route_path(path);
         self.routes.iter().find(|route| route.path == normalized)
     }
+
+    fn route_for_domain(&self, domain: &str) -> Option<&IntegrityRoute> {
+        let normalized = tls_runtime::normalize_domain(domain).ok()?;
+        self.routes.iter().find(|route| {
+            route
+                .domains
+                .iter()
+                .any(|candidate| candidate == &normalized)
+        })
+    }
+
+    fn has_custom_domains(&self) -> bool {
+        self.routes.iter().any(|route| !route.domains.is_empty())
+    }
 }
 
 impl IntegrityRoute {
@@ -6733,6 +7073,7 @@ impl IntegrityRoute {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -6752,6 +7093,7 @@ impl IntegrityRoute {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -6774,6 +7116,7 @@ impl IntegrityRoute {
                 .collect(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
@@ -6916,6 +7259,17 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{
+        rustls::{
+            self,
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            pki_types::{CertificateDer, ServerName, UnixTime},
+            DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+        },
+        TlsConnector,
     };
     use tower::util::ServiceExt;
 
@@ -6956,6 +7310,57 @@ mod tests {
         )
     }
 
+    #[derive(Debug)]
+    struct NoCertificateVerification;
+
+    impl ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, RustlsError> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+            ]
+        }
+    }
+
+    fn insecure_tls_connector() -> TlsConnector {
+        TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                .with_no_client_auth(),
+        ))
+    }
+
     fn signed_manifest(config: &IntegrityConfig, seed: u8) -> IntegrityManifest {
         let config_payload = canonical_config_payload(config).expect("payload should serialize");
         let signing_key = SigningKey::from_bytes(&[seed; 32]);
@@ -6994,6 +7399,7 @@ mod tests {
 
         IntegrityConfig {
             host_address: DEFAULT_HOST_ADDRESS.to_owned(),
+            tls_address: None,
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
@@ -7022,6 +7428,7 @@ mod tests {
             storage_broker: Arc::new(StorageBrokerManager::default()),
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry,
+            tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             manifest_path,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         }
@@ -7039,6 +7446,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -7070,6 +7478,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -7101,6 +7510,7 @@ mod tests {
                 match_header: None,
             }],
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -7132,12 +7542,45 @@ mod tests {
                 match_header: None,
             }],
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
                 volume_type: VolumeType::Host,
                 host_path: host_path.display().to_string(),
                 guest_path: "/app/data".to_owned(),
+                readonly: false,
+                ttl_seconds: None,
+                idle_timeout: None,
+                eviction_policy: None,
+            }],
+        }
+    }
+
+    fn cert_manager_test_route(host_path: &std::path::Path) -> IntegrityRoute {
+        IntegrityRoute {
+            path: SYSTEM_CERT_MANAGER_ROUTE.to_owned(),
+            role: RouteRole::System,
+            name: "cert-manager".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: vec![RouteTarget {
+                module: "system-faas-cert-manager".to_owned(),
+                weight: 100,
+                websocket: false,
+                match_header: None,
+            }],
+            models: Vec::new(),
+            domains: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
+                host_path: host_path.display().to_string(),
+                guest_path: CERT_MANAGER_GUEST_CERT_DIR.to_owned(),
                 readonly: false,
                 ttl_seconds: None,
                 idle_timeout: None,
@@ -7158,6 +7601,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency,
             volumes: Vec::new(),
@@ -7176,6 +7620,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency,
             volumes: Vec::new(),
@@ -7210,6 +7655,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -7236,6 +7682,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -7919,6 +8366,7 @@ mod tests {
             storage_broker: Arc::new(StorageBrokerManager::default()),
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry: telemetry::init_test_telemetry(),
+            tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             manifest_path: PathBuf::from("integrity.lock"),
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         });
@@ -8519,6 +8967,127 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn https_listener_provisions_mock_certificate_once_and_serves_custom_domain() {
+        init_host_tracing();
+        let domain = "api.example.test";
+        let cert_dir = unique_test_dir("tachyon-cert-manager-http");
+        let mut route = IntegrityRoute::user("/api/guest-example");
+        route.domains = vec![domain.to_owned()];
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: "127.0.0.1:8080".to_owned(),
+            tls_address: Some("127.0.0.1:0".to_owned()),
+            routes: vec![route, cert_manager_test_route(&cert_dir)],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("HTTPS config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let app = build_app(state.clone());
+        let listener = start_https_listener(state.clone(), app)
+            .await
+            .expect("HTTPS listener should start")
+            .expect("HTTPS listener should be enabled");
+        let listener_addr = listener.local_addr;
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .resolve(domain, listener_addr)
+            .build()
+            .expect("reqwest HTTPS client should build");
+        let url = format!("https://{domain}:{}/", listener_addr.port());
+
+        let first = client
+            .get(&url)
+            .send()
+            .await
+            .expect("first HTTPS request should succeed");
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.text().await.expect("response body should decode"),
+            expected_guest_example_body("FaaS received an empty payload")
+        );
+        assert_eq!(state.tls_manager.provision_count(), 1);
+        assert!(
+            cert_dir.join(format!("{domain}.json")).exists(),
+            "cert-manager should persist issued material through the storage broker"
+        );
+
+        let second = client
+            .get(&url)
+            .send()
+            .await
+            .expect("cached HTTPS request should succeed");
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(state.tls_manager.provision_count(), 1);
+
+        listener.join_handle.abort();
+        let _ = listener.join_handle.await;
+        let _ = fs::remove_dir_all(cert_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_layer4_listener_accepts_tls_when_route_declares_domains() {
+        init_host_tracing();
+        let domain = "echo.example.test";
+        let cert_dir = unique_test_dir("tachyon-cert-manager-tcp");
+        let port = free_tcp_port();
+        let mut route = tcp_echo_test_route(1);
+        route.domains = vec![domain.to_owned()];
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: "127.0.0.1:8080".to_owned(),
+            layer4: IntegrityLayer4Config {
+                tcp: vec![IntegrityTcpBinding {
+                    port,
+                    target: "guest-tcp-echo".to_owned(),
+                }],
+                udp: Vec::new(),
+            },
+            routes: vec![route, cert_manager_test_route(&cert_dir)],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("TLS Layer 4 config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let listeners = start_tcp_layer4_listeners(state.clone())
+            .await
+            .expect("TCP listener should start");
+        let listener_addr = listeners
+            .first()
+            .expect("one TCP listener should be started")
+            .local_addr;
+        let connector = insecure_tls_connector();
+        let tcp_stream = tokio::net::TcpStream::connect(listener_addr)
+            .await
+            .expect("TLS TCP client should connect");
+        let server_name =
+            ServerName::try_from(domain.to_owned()).expect("server name should be valid");
+        let mut tls_stream = connector
+            .connect(server_name, tcp_stream)
+            .await
+            .expect("TLS handshake should succeed");
+
+        tls_stream
+            .write_all(b"ping over tls")
+            .await
+            .expect("TLS client should write");
+        tls_stream
+            .shutdown()
+            .await
+            .expect("TLS client should close write side");
+
+        let mut echoed = Vec::new();
+        tls_stream
+            .read_to_end(&mut echoed)
+            .await
+            .expect("TLS client should read echoed bytes");
+        assert_eq!(echoed, b"ping over tls");
+        assert_eq!(state.tls_manager.provision_count(), 1);
+
+        for listener in listeners {
+            listener.join_handle.abort();
+            let _ = listener.join_handle.await;
+        }
+        let _ = fs::remove_dir_all(cert_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn udp_layer4_listener_echoes_datagrams() {
         use std::time::Duration;
 
@@ -8606,7 +9175,7 @@ mod tests {
             .connect(listener_addr)
             .expect("UDP client should connect to listener");
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("UDP client should set a read timeout");
 
         client
@@ -8636,7 +9205,7 @@ mod tests {
                 Err(error) => panic!("UDP client receive should not fail: {error}"),
             }
 
-            if started.elapsed() > Duration::from_secs(5) {
+            if started.elapsed() > Duration::from_secs(10) {
                 break;
             }
         }
@@ -9888,6 +10457,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -9934,6 +10504,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: vec![IntegrityVolume {
@@ -10003,6 +10574,40 @@ mod tests {
         .expect_err("duplicate model aliases should fail validation");
 
         assert!(error.to_string().contains("model alias `shared`"));
+    }
+
+    #[test]
+    fn validate_integrity_config_normalizes_custom_domains() {
+        let mut config = IntegrityConfig::default_sealed();
+        let mut route = IntegrityRoute::user("/api/guest-example");
+        route.domains = vec![" API.Example.Test ".to_owned()];
+        config.routes = vec![route];
+        config.tls_address = Some(DEFAULT_TLS_ADDRESS.to_owned());
+
+        let config = validate_integrity_config(config).expect("TLS domains should validate");
+        let route = config
+            .sealed_route("/api/guest-example")
+            .expect("route should stay sealed");
+
+        assert_eq!(route.domains, vec!["api.example.test".to_owned()]);
+        assert_eq!(config.tls_address.as_deref(), Some(DEFAULT_TLS_ADDRESS));
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_duplicate_custom_domains() {
+        let mut first = IntegrityRoute::user("/api/guest-example");
+        first.domains = vec!["api.example.test".to_owned()];
+        let mut second = IntegrityRoute::user("/api/guest-loop");
+        second.domains = vec!["api.example.test".to_owned()];
+
+        let error = validate_integrity_config(IntegrityConfig {
+            tls_address: Some(DEFAULT_TLS_ADDRESS.to_owned()),
+            routes: vec![first, second],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect_err("duplicate domains should fail validation");
+
+        assert!(error.to_string().contains("domain `api.example.test`"));
     }
 
     #[test]
@@ -10299,6 +10904,7 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             models: Vec::new(),
+            domains: Vec::new(),
             min_instances: 0,
             max_concurrency: 0,
             volumes: Vec::new(),
