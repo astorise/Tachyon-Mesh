@@ -94,6 +94,13 @@
               "required": false
             },
             {
+              "name": "tcp-port",
+              "description": "Expose a raw TCP port using PORT=TARGET.",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
               "name": "volume",
               "description": "Attach a host directory using [/route=]HOST:GUEST[:ro|rw][,ttl_seconds=N][,type=ram][,idle_timeout=50ms][,eviction_policy=hibernate].",
               "takesValue": true,
