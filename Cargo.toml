@@ -8,6 +8,7 @@ members = [
     "guest-loop",
     "guest-malicious",
     "guest-tcp-echo",
+    "guest-udp-echo",
     "guest-volume",
     "legacy-mock",
     "system-faas-metering",

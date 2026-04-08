@@ -15,6 +15,16 @@ interface handler {
     handle-request: func(req: request) -> response;
 }
 
+interface udp-handler {
+    record datagram {
+        target-ip: string,
+        target-port: u16,
+        payload: list<u8>,
+    }
+
+    handle-packet: func(source-ip: string, source-port: u16, payload: list<u8>) -> list<datagram>;
+}
+
 interface telemetry-reader {
     record metrics-snapshot {
         total-requests: u64,
@@ -63,6 +73,11 @@ interface secrets-vault {
 world faas-guest {
     import secrets-vault;
     export handler;
+}
+
+world udp-faas-guest {
+    import secrets-vault;
+    export udp-handler;
 }
 
 world system-faas-guest {

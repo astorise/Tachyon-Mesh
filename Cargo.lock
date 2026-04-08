@@ -2045,6 +2045,13 @@ name = "guest-tcp-echo"
 version = "0.1.0"
 
 [[package]]
+name = "guest-udp-echo"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "guest-volume"
 version = "0.1.0"
 dependencies = [
