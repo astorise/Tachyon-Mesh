@@ -64,6 +64,7 @@ jobs:
           cargo build -p guest-volume --target wasm32-wasip2 --release
           cargo build -p system-faas-keda --target wasm32-wasip2 --release
           cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
+          cargo build -p system-faas-metering --target wasm32-wasip2 --release
           cargo build -p system-faas-prom --target wasm32-wasip2 --release
           cargo build -p system-faas-storage-broker --target wasm32-wasip2 --release
           cargo build -p guest-call-legacy --target wasm32-wasip1 --release
@@ -96,6 +97,7 @@ jobs:
             target/wasm32-wasip2/release/guest_udp_echo.wasm
             target/wasm32-wasip2/release/guest_volume.wasm
             target/wasm32-wasip2/release/k8s_scaler.wasm
+            target/wasm32-wasip2/release/metering.wasm
             target/wasm32-wasip2/release/metrics.wasm
             target/wasm32-wasip2/release/scaling.wasm
             target/wasm32-wasip2/release/system_faas_storage_broker.wasm
