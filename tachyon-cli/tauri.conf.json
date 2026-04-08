@@ -46,7 +46,7 @@
             },
             {
               "name": "route-target",
-              "description": "Attach a guest target using /path=MODULE[,weight=80][,header=X-Cohort=beta].",
+              "description": "Attach a guest target using /path=MODULE[,weight=80][,header=X-Cohort=beta][,websocket=true].",
               "takesValue": true,
               "multiple": true,
               "required": false

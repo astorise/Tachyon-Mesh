@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
+#[cfg(feature = "websockets")]
+use axum::extract::ws::{Message as AxumWebSocketMessage, WebSocket, WebSocketUpgrade};
 use axum::{
     body::Bytes,
     extract::State,
@@ -9,6 +11,8 @@ use axum::{
     Extension, Router,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+#[cfg(feature = "websockets")]
+use futures_util::{SinkExt, StreamExt};
 #[cfg(unix)]
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -78,6 +82,14 @@ mod udp_component_bindings {
     wasmtime::component::bindgen!({
         path: "../wit",
         world: "udp-faas-guest",
+    });
+}
+
+#[cfg(feature = "websockets")]
+mod websocket_component_bindings {
+    wasmtime::component::bindgen!({
+        path: "../wit",
+        world: "websocket-faas-guest",
     });
 }
 
@@ -181,6 +193,10 @@ fn default_volume_type() -> VolumeType {
 
 fn is_default_volume_type(volume_type: &VolumeType) -> bool {
     *volume_type == VolumeType::Host
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone)]
@@ -368,6 +384,22 @@ struct UdpInboundDatagram {
     payload: Bytes,
 }
 
+#[cfg(feature = "websockets")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostWebSocketFrame {
+    Text(String),
+    Binary(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    Close,
+}
+
+#[cfg(feature = "websockets")]
+struct HostWebSocketConnection {
+    incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
+    outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum RouteRole {
@@ -386,8 +418,16 @@ struct RouteTarget {
     module: String,
     #[serde(default)]
     weight: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    websocket: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     match_header: Option<HeaderMatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectedRouteTarget {
+    module: String,
+    websocket: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2287,6 +2327,7 @@ async fn export_metering_batch(
         HopLimit(DEFAULT_HOP_LIMIT),
         None,
         false,
+        None,
     )
     .await
     .map_err(|(status, message)| format!("metering route failed with {status}: {message}"))?;
@@ -2660,6 +2701,118 @@ async fn handle_udp_layer4_datagram(
     Ok(())
 }
 
+#[cfg(feature = "websockets")]
+async fn handle_websocket_connection(
+    state: AppState,
+    route: IntegrityRoute,
+    function_name: String,
+    socket: WebSocket,
+) -> Result<()> {
+    let runtime = state.runtime.load_full();
+    let volume_leases = state
+        .volume_manager
+        .acquire_route_volumes(&route, Arc::clone(&state.storage_broker))
+        .await
+        .map_err(|error| anyhow!("failed to acquire WebSocket route volumes: {error}"))?;
+    let semaphore = runtime
+        .concurrency_limits
+        .get(&route.path)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "WebSocket route `{}` is missing a concurrency limiter",
+                route.path
+            )
+        })?;
+    let permit = acquire_route_permit(semaphore)
+        .await
+        .map_err(|error| match error {
+            RoutePermitError::Closed => anyhow!("WebSocket route `{}` is unavailable", route.path),
+            RoutePermitError::TimedOut => anyhow!("WebSocket route `{}` is saturated", route.path),
+        })?;
+    let engine = runtime.engine.clone();
+    let config = runtime.config.clone();
+    let runtime_telemetry = state.telemetry.clone();
+    let host_identity = Arc::clone(&state.host_identity);
+    let storage_broker = Arc::clone(&state.storage_broker);
+    let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+    let secret_access = SecretAccess::from_route(&route, &state.secrets_vault);
+    let (incoming_tx, incoming_rx) = std::sync::mpsc::channel::<HostWebSocketFrame>();
+    let (outgoing_tx, mut outgoing_rx) =
+        tokio::sync::mpsc::unbounded_channel::<HostWebSocketFrame>();
+    let (mut writer, mut reader) = socket.split();
+
+    let reader_handle = tokio::spawn(async move {
+        while let Some(message) = reader.next().await {
+            match message {
+                Ok(message) => {
+                    let frame = websocket_message_to_host_frame(message);
+                    let should_close = matches!(frame, HostWebSocketFrame::Close);
+                    if incoming_tx.send(frame).is_err() || should_close {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("WebSocket receive failed: {error}");
+                    let _ = incoming_tx.send(HostWebSocketFrame::Close);
+                    break;
+                }
+            }
+        }
+    });
+
+    let writer_handle = tokio::spawn(async move {
+        while let Some(frame) = outgoing_rx.recv().await {
+            let should_close = matches!(frame, HostWebSocketFrame::Close);
+            if writer
+                .send(host_frame_to_websocket_message(frame))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if should_close {
+                break;
+            }
+        }
+        let _ = writer.close().await;
+    });
+
+    let (result_tx, result_rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _volume_leases = volume_leases;
+        let _permit = permit;
+        let execution = GuestExecutionContext {
+            config,
+            sampled_execution: false,
+            runtime_telemetry,
+            secret_access,
+            request_headers: HeaderMap::new(),
+            host_identity,
+            storage_broker,
+            telemetry: None,
+            concurrency_limits,
+            propagated_headers: Vec::new(),
+        };
+        let _ = result_tx.send(execute_websocket_guest(
+            &engine,
+            &route,
+            &function_name,
+            incoming_rx,
+            outgoing_tx,
+            &execution,
+        ));
+    });
+
+    let result = result_rx
+        .await
+        .context("WebSocket guest thread exited before returning a result")?;
+    let _ = reader_handle.await;
+    let _ = writer_handle.await;
+    result.map_err(|error| anyhow!("WebSocket guest failed: {error:?}"))?;
+    Ok(())
+}
+
 async fn handle_tcp_layer4_connection(
     state: AppState,
     route: IntegrityRoute,
@@ -2787,11 +2940,12 @@ async fn hop_limit_middleware(
 async fn faas_handler(
     State(state): State<AppState>,
     Extension(hop_limit): Extension<HopLimit>,
+    #[cfg(feature = "websockets")] ws: Option<WebSocketUpgrade>,
     headers: HeaderMap,
     method: Method,
     uri: Uri,
     body: Bytes,
-) -> impl IntoResponse {
+) -> Response {
     let _active_request = telemetry::begin_request(&state.telemetry);
     let runtime = state.runtime.load_full();
     let normalized_path = normalize_route_path(uri.path());
@@ -2810,37 +2964,174 @@ async fn faas_handler(
         },
     );
 
-    let (response, fuel_consumed): (Response, Option<u64>) =
-        match runtime.config.sealed_route(&normalized_path).cloned() {
-            None => (
+    let (response, fuel_consumed): (Response, Option<u64>) = match runtime
+        .config
+        .sealed_route(&normalized_path)
+        .cloned()
+    {
+        None => (
+            (
+                StatusCode::NOT_FOUND,
+                format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
+            )
+                .into_response(),
+            None,
+        ),
+        Some(route) => match select_route_target(&route, &headers) {
+            Err(error) => (
                 (
-                    StatusCode::NOT_FOUND,
-                    format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "failed to resolve route target for `{}`: {error}",
+                        route.path
+                    ),
                 )
                     .into_response(),
                 None,
             ),
-            Some(route) => match execute_route_with_middleware(
-                &state,
-                &runtime,
-                &route,
-                &headers,
-                &method,
-                &uri,
-                &body,
-                hop_limit,
-                Some(&trace_id),
-                sampled_execution,
-            )
-            .await
-            {
-                Ok(result) => (
-                    (result.response.status, result.response.body).into_response(),
-                    result.fuel_consumed,
-                ),
-                Err((status, message)) => ((status, message).into_response(), None),
-            },
-        };
+            Ok(selected_target) => {
+                #[cfg(feature = "websockets")]
+                {
+                    if selected_target.websocket {
+                        let status = if is_websocket_upgrade_request(&headers) {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::UPGRADE_REQUIRED
+                        };
+                        match ws {
+                            Some(upgrade) => {
+                                let websocket_state = state.clone();
+                                let websocket_route = route.clone();
+                                let websocket_module = selected_target.module.clone();
+                                let websocket_target = selected_target.module.clone();
+                                (
+                                    upgrade
+                                        .on_upgrade(move |socket| async move {
+                                            if let Err(error) = handle_websocket_connection(
+                                                websocket_state,
+                                                websocket_route,
+                                                websocket_module,
+                                                socket,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    target = %websocket_target,
+                                                    "WebSocket session failed: {error:#}"
+                                                );
+                                            }
+                                        })
+                                        .into_response(),
+                                    None,
+                                )
+                            }
+                            None => (
+                                (
+                                    status,
+                                    format!(
+                                        "route `{}` requires a valid WebSocket upgrade request",
+                                        route.path
+                                    ),
+                                )
+                                    .into_response(),
+                                None,
+                            ),
+                        }
+                    } else if is_websocket_upgrade_request(&headers) {
+                        (
+                            (
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "route `{}` is not configured for WebSocket upgrades",
+                                    route.path
+                                ),
+                            )
+                                .into_response(),
+                            None,
+                        )
+                    } else {
+                        match execute_route_with_middleware(
+                            &state,
+                            &runtime,
+                            &route,
+                            &headers,
+                            &method,
+                            &uri,
+                            &body,
+                            hop_limit,
+                            Some(&trace_id),
+                            sampled_execution,
+                            Some(selected_target.module.as_str()),
+                        )
+                        .await
+                        {
+                            Ok(result) => (
+                                (result.response.status, result.response.body).into_response(),
+                                result.fuel_consumed,
+                            ),
+                            Err((status, message)) => ((status, message).into_response(), None),
+                        }
+                    }
+                }
+
+                #[cfg(not(feature = "websockets"))]
+                {
+                    if selected_target.websocket {
+                        let status = if is_websocket_upgrade_request(&headers) {
+                            StatusCode::NOT_IMPLEMENTED
+                        } else {
+                            StatusCode::UPGRADE_REQUIRED
+                        };
+                        (
+                            (
+                                status,
+                                format!(
+                                    "route `{}` requires the `websockets` host feature to accept upgraded traffic",
+                                    route.path
+                                ),
+                            )
+                                .into_response(),
+                            None,
+                        )
+                    } else if is_websocket_upgrade_request(&headers) {
+                        (
+                            (
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "route `{}` is not configured for WebSocket upgrades",
+                                    route.path
+                                ),
+                            )
+                                .into_response(),
+                            None,
+                        )
+                    } else {
+                        match execute_route_with_middleware(
+                            &state,
+                            &runtime,
+                            &route,
+                            &headers,
+                            &method,
+                            &uri,
+                            &body,
+                            hop_limit,
+                            Some(&trace_id),
+                            sampled_execution,
+                            Some(selected_target.module.as_str()),
+                        )
+                        .await
+                        {
+                            Ok(result) => (
+                                (result.response.status, result.response.body).into_response(),
+                                result.fuel_consumed,
+                            ),
+                            Err((status, message)) => ((status, message).into_response(), None),
+                        }
+                    }
+                }
+            }
+        },
+    };
 
     telemetry::record_event(
         &state.telemetry,
@@ -2866,6 +3157,7 @@ async fn execute_route_with_middleware(
     hop_limit: HopLimit,
     trace_id: Option<&str>,
     sampled_execution: bool,
+    selected_module: Option<&str>,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     let mut accumulated_fuel = None;
 
@@ -2898,6 +3190,7 @@ async fn execute_route_with_middleware(
             hop_limit,
             trace_id,
             sampled_execution,
+            None,
         )
         .await?;
         if middleware_response.response.status != StatusCode::OK {
@@ -2917,6 +3210,7 @@ async fn execute_route_with_middleware(
         hop_limit,
         trace_id,
         sampled_execution,
+        selected_module,
     )
     .await?;
     result.fuel_consumed = merge_fuel_samples(accumulated_fuel, result.fuel_consumed);
@@ -2934,6 +3228,7 @@ async fn execute_route_request(
     hop_limit: HopLimit,
     trace_id: Option<&str>,
     sampled_execution: bool,
+    selected_module: Option<&str>,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     if route.role == RouteRole::System && should_shed_system_route(&state.telemetry) {
         return Err((
@@ -2974,8 +3269,13 @@ async fn execute_route_request(
         }
     };
 
-    let selected_module = select_route_module(route, headers)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let selected_module = selected_module
+        .map(str::to_owned)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            select_route_module(route, headers)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
+        })?;
     let propagated_headers = extract_propagated_headers(headers);
     let engine = if sampled_execution {
         runtime.metered_engine.clone()
@@ -3236,7 +3536,7 @@ fn select_route_module(
     route: &IntegrityRoute,
     headers: &HeaderMap,
 ) -> std::result::Result<String, String> {
-    select_route_module_with_roll(route, headers, None)
+    select_route_target_with_roll(route, headers, None).map(|target| target.module)
 }
 
 fn select_stream_route_module(route: &IntegrityRoute) -> std::result::Result<String, String> {
@@ -3244,22 +3544,40 @@ fn select_stream_route_module(route: &IntegrityRoute) -> std::result::Result<Str
         return Ok(route.name.clone());
     }
 
-    select_route_module_with_roll(route, &HeaderMap::new(), None)
+    select_route_target_with_roll(route, &HeaderMap::new(), None)
+        .map(|target| target.module)
         .or_else(|_| Ok(route.name.clone()))
 }
 
-fn select_route_module_with_roll(
+fn select_route_target(
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+) -> std::result::Result<SelectedRouteTarget, String> {
+    select_route_target_with_roll(route, headers, None)
+}
+
+fn select_route_target_with_roll(
     route: &IntegrityRoute,
     headers: &HeaderMap,
     random_roll: Option<u64>,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<SelectedRouteTarget, String> {
+    if route.targets.is_empty() {
+        return Ok(SelectedRouteTarget {
+            module: route.name.clone(),
+            websocket: false,
+        });
+    }
+
     for target in &route.targets {
         if target
             .match_header
             .as_ref()
             .is_some_and(|matcher| request_header_matches(headers, matcher))
         {
-            return Ok(target.module.clone());
+            return Ok(SelectedRouteTarget {
+                module: target.module.clone(),
+                websocket: target.websocket,
+            });
         }
     }
 
@@ -3280,17 +3598,25 @@ fn select_route_module_with_roll(
             }
             cumulative_weight = cumulative_weight.saturating_add(u64::from(target.weight));
             if draw < cumulative_weight {
-                return Ok(target.module.clone());
+                return Ok(SelectedRouteTarget {
+                    module: target.module.clone(),
+                    websocket: target.websocket,
+                });
             }
         }
     }
 
-    resolve_function_name(&route.path).ok_or_else(|| {
-        format!(
-            "route `{}` does not define a routable guest target",
-            route.path
-        )
-    })
+    resolve_function_name(&route.path)
+        .map(|module| SelectedRouteTarget {
+            module,
+            websocket: false,
+        })
+        .ok_or_else(|| {
+            format!(
+                "route `{}` does not define a routable guest target",
+                route.path
+            )
+        })
 }
 
 fn request_header_matches(headers: &HeaderMap, matcher: &HeaderMatch) -> bool {
@@ -3299,6 +3625,26 @@ fn request_header_matches(headers: &HeaderMap, matcher: &HeaderMatch) -> bool {
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .is_some_and(|value| value == matcher.value)
+}
+
+fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {
+    let connection_upgrade = headers
+        .get("connection")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|segment| segment.eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false);
+    let websocket_upgrade = headers
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    connection_upgrade && websocket_upgrade
 }
 
 fn extract_propagated_headers(headers: &HeaderMap) -> Vec<PropagatedHeader> {
@@ -3960,6 +4306,203 @@ fn execute_udp_component_guest(
             })
         })
         .collect()
+}
+
+#[cfg(feature = "websockets")]
+fn execute_websocket_guest(
+    engine: &Engine,
+    route: &IntegrityRoute,
+    function_name: &str,
+    incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
+    outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+    execution: &GuestExecutionContext,
+) -> std::result::Result<(), ExecutionError> {
+    let module_path =
+        resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
+    let component = Component::from_file(engine, &module_path).map_err(|error| {
+        guest_execution_error(
+            error,
+            format!(
+                "failed to load WebSocket guest component from {}",
+                module_path.display()
+            ),
+        )
+    })?;
+
+    execute_websocket_component_guest(
+        engine,
+        route,
+        &module_path,
+        &component,
+        incoming,
+        outgoing,
+        execution,
+    )
+}
+
+#[cfg(feature = "websockets")]
+fn execute_websocket_component_guest(
+    engine: &Engine,
+    route: &IntegrityRoute,
+    component_path: &Path,
+    component: &Component,
+    incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
+    outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+    execution: &GuestExecutionContext,
+) -> std::result::Result<(), ExecutionError> {
+    let mut linker = ComponentLinker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add WASI preview2 functions to WebSocket component linker",
+        )
+    })?;
+    websocket_component_bindings::tachyon::mesh::secrets_vault::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add secrets vault functions to WebSocket component linker",
+        )
+    })?;
+    websocket_component_bindings::tachyon::mesh::websocket::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add WebSocket host functions to component linker",
+        )
+    })?;
+    let mut store = Store::new(
+        engine,
+        ComponentHostState::new(
+            route,
+            execution.config.clone(),
+            execution.config.guest_memory_limit_bytes,
+            execution.runtime_telemetry.clone(),
+            execution.secret_access.clone(),
+            execution.request_headers.clone(),
+            Arc::clone(&execution.host_identity),
+            Arc::clone(&execution.storage_broker),
+            Arc::clone(&execution.concurrency_limits),
+            execution.propagated_headers.clone(),
+        )?,
+    );
+    store.limiter(|state| &mut state.limits);
+    maybe_set_guest_fuel_budget(&mut store, execution)?;
+
+    let stored_connection = store
+        .data_mut()
+        .table
+        .push(HostWebSocketConnection { incoming, outgoing })
+        .map_err(|error| {
+            ExecutionError::Internal(format!(
+                "failed to store WebSocket connection resource for {}: {error}",
+                component_path.display()
+            ))
+        })?;
+    let connection = wasmtime::component::Resource::<
+        websocket_component_bindings::tachyon::mesh::websocket::Connection,
+    >::new_own(stored_connection.rep());
+
+    let bindings = websocket_component_bindings::WebsocketFaasGuest::instantiate(
+        &mut store, component, &linker,
+    )
+    .map_err(|error| {
+        let message = format!(
+            "failed to instantiate WebSocket guest component from {}",
+            component_path.display()
+        );
+        let error_message = error.to_string();
+        if error_message.contains("on-connect") {
+            ExecutionError::Internal(format!(
+                "guest component `{}` does not export the WebSocket `on-connect` handler",
+                component_path.display()
+            ))
+        } else {
+            guest_execution_error(error, message)
+        }
+    })?;
+    record_wasm_start(execution.telemetry.as_ref());
+    let result = bindings.call_on_connect(&mut store, connection);
+    record_wasm_end(execution.telemetry.as_ref());
+    let _fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
+    result.map_err(|error| {
+        guest_execution_error(error, "guest WebSocket component `on-connect` trapped")
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "websockets")]
+fn websocket_message_to_host_frame(message: AxumWebSocketMessage) -> HostWebSocketFrame {
+    match message {
+        AxumWebSocketMessage::Text(text) => HostWebSocketFrame::Text(text.to_string()),
+        AxumWebSocketMessage::Binary(bytes) => HostWebSocketFrame::Binary(bytes.to_vec()),
+        AxumWebSocketMessage::Ping(bytes) => HostWebSocketFrame::Ping(bytes.to_vec()),
+        AxumWebSocketMessage::Pong(bytes) => HostWebSocketFrame::Pong(bytes.to_vec()),
+        AxumWebSocketMessage::Close(_) => HostWebSocketFrame::Close,
+    }
+}
+
+#[cfg(feature = "websockets")]
+fn host_frame_to_websocket_message(frame: HostWebSocketFrame) -> AxumWebSocketMessage {
+    match frame {
+        HostWebSocketFrame::Text(text) => AxumWebSocketMessage::Text(text.into()),
+        HostWebSocketFrame::Binary(bytes) => AxumWebSocketMessage::Binary(bytes.into()),
+        HostWebSocketFrame::Ping(bytes) => AxumWebSocketMessage::Ping(bytes.into()),
+        HostWebSocketFrame::Pong(bytes) => AxumWebSocketMessage::Pong(bytes.into()),
+        HostWebSocketFrame::Close => AxumWebSocketMessage::Close(None),
+    }
+}
+
+#[cfg(feature = "websockets")]
+fn websocket_binding_frame_to_host_frame(
+    frame: websocket_component_bindings::tachyon::mesh::websocket::Frame,
+) -> HostWebSocketFrame {
+    match frame {
+        websocket_component_bindings::tachyon::mesh::websocket::Frame::Text(text) => {
+            HostWebSocketFrame::Text(text)
+        }
+        websocket_component_bindings::tachyon::mesh::websocket::Frame::Binary(bytes) => {
+            HostWebSocketFrame::Binary(bytes)
+        }
+        websocket_component_bindings::tachyon::mesh::websocket::Frame::Ping(bytes) => {
+            HostWebSocketFrame::Ping(bytes)
+        }
+        websocket_component_bindings::tachyon::mesh::websocket::Frame::Pong(bytes) => {
+            HostWebSocketFrame::Pong(bytes)
+        }
+        websocket_component_bindings::tachyon::mesh::websocket::Frame::Close => {
+            HostWebSocketFrame::Close
+        }
+    }
+}
+
+#[cfg(feature = "websockets")]
+fn host_frame_to_websocket_binding_frame(
+    frame: HostWebSocketFrame,
+) -> websocket_component_bindings::tachyon::mesh::websocket::Frame {
+    match frame {
+        HostWebSocketFrame::Text(text) => {
+            websocket_component_bindings::tachyon::mesh::websocket::Frame::Text(text)
+        }
+        HostWebSocketFrame::Binary(bytes) => {
+            websocket_component_bindings::tachyon::mesh::websocket::Frame::Binary(bytes)
+        }
+        HostWebSocketFrame::Ping(bytes) => {
+            websocket_component_bindings::tachyon::mesh::websocket::Frame::Ping(bytes)
+        }
+        HostWebSocketFrame::Pong(bytes) => {
+            websocket_component_bindings::tachyon::mesh::websocket::Frame::Pong(bytes)
+        }
+        HostWebSocketFrame::Close => {
+            websocket_component_bindings::tachyon::mesh::websocket::Frame::Close
+        }
+    }
 }
 
 fn execute_system_component_guest(
@@ -5193,6 +5736,7 @@ fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
     Ok(RouteTarget {
         module,
         weight: target.weight,
+        websocket: target.websocket,
         match_header: target
             .match_header
             .map(normalize_header_match)
@@ -5780,6 +6324,85 @@ impl udp_component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHos
     }
 }
 
+#[cfg(feature = "websockets")]
+impl websocket_component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHostState {
+    fn get_secret(
+        &mut self,
+        name: String,
+    ) -> std::result::Result<
+        String,
+        websocket_component_bindings::tachyon::mesh::secrets_vault::Error,
+    > {
+        self.secrets.get_secret(&name).map_err(|error| match error {
+            SecretAccessErrorKind::NotFound => {
+                websocket_component_bindings::tachyon::mesh::secrets_vault::Error::NotFound
+            }
+            SecretAccessErrorKind::PermissionDenied => {
+                websocket_component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied
+            }
+            #[cfg(not(feature = "secrets-vault"))]
+            SecretAccessErrorKind::VaultDisabled => {
+                websocket_component_bindings::tachyon::mesh::secrets_vault::Error::VaultDisabled
+            }
+        })
+    }
+}
+
+#[cfg(feature = "websockets")]
+impl websocket_component_bindings::tachyon::mesh::websocket::Host for ComponentHostState {}
+
+#[cfg(feature = "websockets")]
+impl websocket_component_bindings::tachyon::mesh::websocket::HostConnection for ComponentHostState {
+    fn send(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            websocket_component_bindings::tachyon::mesh::websocket::Connection,
+        >,
+        frame: websocket_component_bindings::tachyon::mesh::websocket::Frame,
+    ) -> std::result::Result<(), String> {
+        let handle =
+            wasmtime::component::Resource::<HostWebSocketConnection>::new_borrow(self_.rep());
+        let connection = self
+            .table
+            .get(&handle)
+            .map_err(|error| format!("failed to access WebSocket connection resource: {error}"))?;
+        connection
+            .outgoing
+            .send(websocket_binding_frame_to_host_frame(frame))
+            .map_err(|_| "WebSocket connection is closed".to_owned())
+    }
+
+    fn receive(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            websocket_component_bindings::tachyon::mesh::websocket::Connection,
+        >,
+    ) -> Option<websocket_component_bindings::tachyon::mesh::websocket::Frame> {
+        let handle =
+            wasmtime::component::Resource::<HostWebSocketConnection>::new_borrow(self_.rep());
+        let connection = match self.table.get_mut(&handle) {
+            Ok(connection) => connection,
+            Err(_) => return None,
+        };
+        connection
+            .incoming
+            .recv()
+            .ok()
+            .map(host_frame_to_websocket_binding_frame)
+    }
+
+    fn drop(
+        &mut self,
+        rep: wasmtime::component::Resource<
+            websocket_component_bindings::tachyon::mesh::websocket::Connection,
+        >,
+    ) -> wasmtime::Result<()> {
+        self.table
+            .delete(wasmtime::component::Resource::<HostWebSocketConnection>::new_own(rep.rep()))?;
+        Ok(())
+    }
+}
+
 impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for ComponentHostState {
     fn get_metrics(
         &mut self,
@@ -6323,6 +6946,7 @@ mod tests {
             targets: vec![RouteTarget {
                 module: "system-faas-storage-broker".to_owned(),
                 weight: 100,
+                websocket: false,
                 match_header: None,
             }],
             min_instances: 0,
@@ -6352,6 +6976,7 @@ mod tests {
             targets: vec![RouteTarget {
                 module: "system-faas-metering".to_owned(),
                 weight: 100,
+                websocket: false,
                 match_header: None,
             }],
             min_instances: 0,
@@ -6499,6 +7124,7 @@ mod tests {
         RouteTarget {
             module: module.to_owned(),
             weight,
+            websocket: false,
             match_header: None,
         }
     }
@@ -6507,10 +7133,20 @@ mod tests {
         RouteTarget {
             module: module.to_owned(),
             weight: 0,
+            websocket: false,
             match_header: Some(HeaderMatch {
                 name: header_name.to_owned(),
                 value: header_value.to_owned(),
             }),
+        }
+    }
+
+    fn websocket_target(module: &str) -> RouteTarget {
+        RouteTarget {
+            module: module.to_owned(),
+            weight: 100,
+            websocket: true,
+            match_header: None,
         }
     }
 
@@ -7769,6 +8405,104 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn websocket_upgrade_is_rejected_without_feature_flag() {
+        let route = targeted_route("/ws/echo", vec![websocket_target("guest-websocket-echo")]);
+        let app = build_app(build_test_state(
+            IntegrityConfig {
+                routes: vec![route],
+                ..IntegrityConfig::default_sealed()
+            },
+            telemetry::init_test_telemetry(),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::get("/ws/echo")
+                    .header("connection", "Upgrade")
+                    .header("upgrade", "websocket")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[cfg(feature = "websockets")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_route_upgrades_and_echoes_frames() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let route = targeted_route("/ws/echo", vec![websocket_target("guest-websocket-echo")]);
+        let config = validate_integrity_config(IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("WebSocket route config should validate");
+        let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("WebSocket test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("WebSocket test listener should expose an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .expect("WebSocket test server should stay up");
+        });
+
+        let url = format!("ws://{address}/ws/echo");
+        let (mut client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("WebSocket client should connect");
+
+        client
+            .send(Message::Text("hello".into()))
+            .await
+            .expect("WebSocket client should send text frame");
+        let text_frame = client
+            .next()
+            .await
+            .expect("WebSocket server should respond")
+            .expect("WebSocket frame should be valid");
+        assert!(matches!(text_frame, Message::Text(text) if text == "hello"));
+
+        client
+            .send(Message::Binary(vec![1_u8, 2, 3].into()))
+            .await
+            .expect("WebSocket client should send binary frame");
+        let binary_frame = client
+            .next()
+            .await
+            .expect("WebSocket server should respond to binary frame")
+            .expect("WebSocket frame should be valid");
+        assert!(matches!(binary_frame, Message::Binary(bytes) if bytes == vec![1_u8, 2, 3]));
+
+        client
+            .close(None)
+            .await
+            .expect("WebSocket client should initiate close");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match client.next().await {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => panic!("WebSocket close should not error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("WebSocket guest should shut down after close");
+
+        server.abort();
+        let _ = server.await;
+    }
+
     #[cfg(feature = "secrets-vault")]
     #[tokio::test]
     async fn router_denies_secret_lookup_without_sealed_grant() {
@@ -7853,9 +8587,12 @@ mod tests {
         headers.insert(COHORT_HEADER, HeaderValue::from_static("beta"));
 
         assert_eq!(
-            select_route_module_with_roll(&route, &headers, Some(42))
+            select_route_target_with_roll(&route, &headers, Some(42))
                 .expect("header-target route should resolve"),
-            "guest-loop"
+            SelectedRouteTarget {
+                module: "guest-loop".to_owned(),
+                websocket: false,
+            }
         );
     }
 
@@ -7870,19 +8607,28 @@ mod tests {
         );
 
         assert_eq!(
-            select_route_module_with_roll(&route, &HeaderMap::new(), Some(0))
+            select_route_target_with_roll(&route, &HeaderMap::new(), Some(0))
                 .expect("weighted route should resolve"),
-            "guest-example"
+            SelectedRouteTarget {
+                module: "guest-example".to_owned(),
+                websocket: false,
+            }
         );
         assert_eq!(
-            select_route_module_with_roll(&route, &HeaderMap::new(), Some(89))
+            select_route_target_with_roll(&route, &HeaderMap::new(), Some(89))
                 .expect("weighted route should resolve"),
-            "guest-example"
+            SelectedRouteTarget {
+                module: "guest-example".to_owned(),
+                websocket: false,
+            }
         );
         assert_eq!(
-            select_route_module_with_roll(&route, &HeaderMap::new(), Some(90))
+            select_route_target_with_roll(&route, &HeaderMap::new(), Some(90))
                 .expect("weighted route should resolve"),
-            "guest-loop"
+            SelectedRouteTarget {
+                module: "guest-loop".to_owned(),
+                websocket: false,
+            }
         );
     }
 
@@ -7894,9 +8640,12 @@ mod tests {
         );
 
         assert_eq!(
-            select_route_module_with_roll(&route, &HeaderMap::new(), Some(0))
+            select_route_target_with_roll(&route, &HeaderMap::new(), Some(0))
                 .expect("route should fall back to the path module"),
-            "guest-example"
+            SelectedRouteTarget {
+                module: "guest-example".to_owned(),
+                websocket: false,
+            }
         );
     }
 

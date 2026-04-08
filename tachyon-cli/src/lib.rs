@@ -47,6 +47,10 @@ fn is_default_volume_type(volume_type: &VolumeType) -> bool {
     *volume_type == VolumeType::Host
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteRole {
@@ -65,6 +69,8 @@ pub struct RouteTarget {
     pub module: String,
     #[serde(default)]
     pub weight: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub websocket: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_header: Option<HeaderMatch>,
 }
@@ -364,7 +370,7 @@ fn parse_generate_request_from_args(
 
         if arg == "--route-target" {
             let route_target = args.next().context(
-                "missing value for `--route-target`; expected `--route-target /api/checkout=checkout-v2,weight=10`",
+                "missing value for `--route-target`; expected `--route-target /api/checkout=checkout-v2,weight=10,websocket=true`",
             )?;
             route_targets.push(route_target);
             continue;
@@ -1398,7 +1404,7 @@ fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
 
 fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
     let (path, target) = value.split_once('=').context(
-        "route targets must use the `/path=MODULE[,weight=80][,header=X-Cohort=beta]` syntax",
+        "route targets must use the `/path=MODULE[,weight=80][,header=X-Cohort=beta][,websocket=true]` syntax",
     )?;
 
     let path = path.trim();
@@ -1413,6 +1419,7 @@ fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
             .context("route targets must include a module name after `=`")?,
     )?;
     let mut weight = None;
+    let mut websocket = None;
     let mut match_header = None;
 
     for segment in segments {
@@ -1446,7 +1453,17 @@ fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
             continue;
         }
 
-        bail!("unsupported route target option `{segment}`; expected `weight=` or `header=`");
+        if let Some(raw_websocket) = segment.strip_prefix("websocket=") {
+            if websocket.is_some() {
+                bail!("route target `{value}` defines `websocket` more than once");
+            }
+            websocket = Some(parse_bool_option(raw_websocket, value, "websocket")?);
+            continue;
+        }
+
+        bail!(
+            "unsupported route target option `{segment}`; expected `weight=`, `header=` or `websocket=`"
+        );
     }
 
     Ok((
@@ -1454,9 +1471,21 @@ fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
         RouteTarget {
             module,
             weight: weight.unwrap_or_else(|| u32::from(match_header.is_none()) * 100),
+            websocket: websocket.unwrap_or(false),
             match_header,
         },
     ))
+}
+
+fn parse_bool_option(raw: &str, original: &str, option: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => bail!(
+            "route target `{original}` has invalid `{option}` value `{}`",
+            raw.trim()
+        ),
+    }
 }
 
 fn normalize_target_module(module: &str) -> Result<String> {
@@ -2242,16 +2271,19 @@ mod tests {
                     RouteTarget {
                         module: "checkout-v1".to_owned(),
                         weight: 90,
+                        websocket: false,
                         match_header: None,
                     },
                     RouteTarget {
                         module: "checkout-v2".to_owned(),
                         weight: 10,
+                        websocket: false,
                         match_header: None,
                     },
                     RouteTarget {
                         module: "checkout-beta".to_owned(),
                         weight: 0,
+                        websocket: false,
                         match_header: Some(HeaderMatch {
                             name: "x-cohort".to_owned(),
                             value: "beta".to_owned(),
@@ -2261,6 +2293,34 @@ mod tests {
                 min_instances: 0,
                 max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                 volumes: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn normalize_routes_accepts_websocket_targets() {
+        let routes = normalize_routes(
+            vec!["/ws/echo".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["/ws/echo=guest-websocket-echo,websocket=true".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("WebSocket route targets should normalize");
+
+        assert_eq!(
+            routes[0].targets,
+            vec![RouteTarget {
+                module: "guest-websocket-echo".to_owned(),
+                weight: 100,
+                websocket: true,
+                match_header: None,
             }]
         );
     }
