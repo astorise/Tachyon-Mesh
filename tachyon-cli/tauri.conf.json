@@ -101,6 +101,12 @@
               "required": false
             },
             {
+              "name": "telemetry-sample-rate",
+              "description": "Probability between 0.0 and 1.0 used for sampled tracing and fuel metering.",
+              "takesValue": true,
+              "required": false
+            },
+            {
               "name": "memory",
               "short": "m",
               "description": "Guest memory limit in MiB.",

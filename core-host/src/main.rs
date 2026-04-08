@@ -39,7 +39,7 @@ use std::{
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
@@ -93,6 +93,7 @@ const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit
 const DEFAULT_ROUTE: &str = "/api/guest-example";
 #[cfg(test)]
 const DEFAULT_SYSTEM_ROUTE: &str = "/metrics";
+const SYSTEM_METERING_ROUTE: &str = "/system/metering";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
@@ -108,8 +109,11 @@ const TACHYON_DISCOVERY_DIR_ENV: &str = "TACHYON_DISCOVERY_DIR";
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
 const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
+const DEFAULT_TELEMETRY_SAMPLE_RATE: f64 = 0.0;
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const VOLUME_GC_TICK_INTERVAL: Duration = Duration::from_secs(60);
+const TELEMETRY_EXPORT_QUEUE_CAPACITY: usize = 1024;
+const TELEMETRY_EXPORT_BATCH_SIZE: usize = 32;
 const IDENTITY_TOKEN_TTL: Duration = Duration::from_secs(30);
 const IDENTITY_TOKEN_PREFIX: &str = "tachyon.v1";
 const KUBERNETES_SERVICE_BASE_URL: &str = "https://kubernetes.default.svc";
@@ -134,6 +138,14 @@ fn default_max_concurrency() -> u32 {
 
 fn default_route_version() -> String {
     DEFAULT_ROUTE_VERSION.to_owned()
+}
+
+fn default_telemetry_sample_rate() -> f64 {
+    DEFAULT_TELEMETRY_SAMPLE_RATE
+}
+
+fn is_default_telemetry_sample_rate(sample_rate: &f64) -> bool {
+    (*sample_rate - DEFAULT_TELEMETRY_SAMPLE_RATE).abs() < f64::EPSILON
 }
 
 fn unix_timestamp_seconds() -> Result<u64> {
@@ -178,6 +190,7 @@ struct AppState {
 #[derive(Clone)]
 struct RuntimeState {
     engine: Engine,
+    metered_engine: Engine,
     config: IntegrityConfig,
     route_registry: Arc<RouteRegistry>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
@@ -252,6 +265,7 @@ struct GuestTelemetryContext {
 
 struct GuestExecutionContext {
     config: IntegrityConfig,
+    sampled_execution: bool,
     runtime_telemetry: TelemetryHandle,
     secret_access: SecretAccess,
     request_headers: HeaderMap,
@@ -305,6 +319,17 @@ struct GuestHttpResponse {
 enum GuestExecutionOutput {
     Http(GuestHttpResponse),
     LegacyStdout(Bytes),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GuestExecutionOutcome {
+    output: GuestExecutionOutput,
+    fuel_consumed: Option<u64>,
+}
+
+struct RouteExecutionResult {
+    response: GuestHttpResponse,
+    fuel_consumed: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -863,13 +888,18 @@ struct IntegrityVolume {
     eviction_policy: Option<VolumeEvictionPolicy>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct IntegrityConfig {
     host_address: String,
     max_stdout_bytes: usize,
     guest_fuel_budget: u64,
     guest_memory_limit_bytes: usize,
     resource_limit_response: String,
+    #[serde(
+        default = "default_telemetry_sample_rate",
+        skip_serializing_if = "is_default_telemetry_sample_rate"
+    )]
+    telemetry_sample_rate: f64,
     routes: Vec<IntegrityRoute>,
 }
 
@@ -905,7 +935,9 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     init_host_tracing();
-    let telemetry = telemetry::init_telemetry();
+    let (export_sender, export_receiver) = mpsc::channel(TELEMETRY_EXPORT_QUEUE_CAPACITY);
+    let telemetry =
+        telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
     let runtime = build_runtime_state(verify_integrity()?)?;
     let host_identity = Arc::new(HostIdentity::generate());
     let uds_fast_path = Arc::new(UdsFastPathRegistry::default());
@@ -930,6 +962,7 @@ async fn run() -> Result<()> {
         manifest_path: integrity_manifest_path(),
         background_workers: Arc::clone(&background_workers),
     };
+    spawn_metering_exporter(state.clone(), export_receiver);
     spawn_reload_watcher(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     let app = build_app(state);
@@ -990,7 +1023,7 @@ impl BackgroundWorkerManager {
             }
 
             if BackgroundTickRunner::new(
-                &runtime.engine,
+                &runtime.metered_engine,
                 &runtime.config,
                 route,
                 &function_name,
@@ -1008,7 +1041,7 @@ impl BackgroundWorkerManager {
             let worker_route = route.clone();
             let worker_path = worker_route.path.clone();
             let worker_function_name = function_name.to_owned();
-            let worker_engine = runtime.engine.clone();
+            let worker_engine = runtime.metered_engine.clone();
             let worker_config = runtime.config.clone();
             let worker_telemetry = telemetry.clone();
             let worker_limits = Arc::clone(&runtime.concurrency_limits);
@@ -2098,7 +2131,8 @@ async fn shutdown_signal() {
 
 fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeState> {
     Ok(RuntimeState {
-        engine: build_engine(&config)?,
+        engine: build_engine(&config, false)?,
+        metered_engine: build_engine(&config, true)?,
         route_registry: Arc::new(RouteRegistry::build(&config)?),
         concurrency_limits: build_concurrency_limits(&config),
         config,
@@ -2123,6 +2157,90 @@ fn build_app(state: AppState) -> Router {
     ));
 
     app.with_state(state)
+}
+
+fn should_sample_telemetry(sample_rate: f64) -> bool {
+    sample_rate > 0.0 && rand::thread_rng().gen_bool(sample_rate.clamp(0.0, 1.0))
+}
+
+fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn generate_traceparent() -> String {
+    let trace_id = Uuid::new_v4().simple().to_string();
+    let span_id = format!("{:016x}", rand::thread_rng().gen::<u64>());
+    format!("00-{trace_id}-{span_id}-01")
+}
+
+fn encode_metering_batch(batch: Vec<String>) -> Bytes {
+    let mut payload = batch.join("\n");
+    if !payload.is_empty() {
+        payload.push('\n');
+    }
+    Bytes::from(payload)
+}
+
+async fn export_metering_batch(
+    state: &AppState,
+    batch: Vec<String>,
+) -> std::result::Result<(), String> {
+    let runtime = state.runtime.load_full();
+    let Some(route) = runtime.config.sealed_route(SYSTEM_METERING_ROUTE).cloned() else {
+        return Ok(());
+    };
+
+    let headers = HeaderMap::new();
+    let method = Method::POST;
+    let uri = Uri::from_static(SYSTEM_METERING_ROUTE);
+    let body = encode_metering_batch(batch);
+    let result = execute_route_with_middleware(
+        state,
+        &runtime,
+        &route,
+        &headers,
+        &method,
+        &uri,
+        &body,
+        HopLimit(DEFAULT_HOP_LIMIT),
+        None,
+        false,
+    )
+    .await
+    .map_err(|(status, message)| format!("metering route failed with {status}: {message}"))?;
+
+    if result.response.status.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "metering route returned HTTP {}",
+            result.response.status
+        ))
+    }
+}
+
+fn spawn_metering_exporter(state: AppState, mut receiver: mpsc::Receiver<String>) {
+    tokio::spawn(async move {
+        while let Some(first_record) = receiver.recv().await {
+            let mut batch = vec![first_record];
+            while batch.len() < TELEMETRY_EXPORT_BATCH_SIZE {
+                match receiver.try_recv() {
+                    Ok(record) => batch.push(record),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+
+            if let Err(error) = export_metering_batch(&state, batch).await {
+                tracing::warn!("telemetry metering export failed: {error}");
+            }
+        }
+    });
 }
 
 #[cfg(unix)]
@@ -2196,36 +2314,58 @@ async fn faas_handler(
     let runtime = state.runtime.load_full();
     let normalized_path = normalize_route_path(uri.path());
     let trace_id = Uuid::new_v4().to_string();
+    let sampled_execution = normalized_path != SYSTEM_METERING_ROUTE
+        && should_sample_telemetry(runtime.config.telemetry_sample_rate);
+    let traceparent = sampled_execution.then(generate_traceparent);
     telemetry::record_event(
         &state.telemetry,
         TelemetryEvent::RequestStart {
             trace_id: trace_id.clone(),
             path: normalized_path.clone(),
+            sampled: sampled_execution,
+            traceparent: traceparent.clone(),
             timestamp: Instant::now(),
         },
     );
 
-    let response: Response = match runtime.config.sealed_route(&normalized_path).cloned() {
-        None => (
-            StatusCode::NOT_FOUND,
-            format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
-        )
-            .into_response(),
-        Some(route) => match execute_route_with_middleware(
-            &state, &runtime, &route, &headers, &method, &uri, &body, hop_limit, &trace_id,
-        )
-        .await
-        {
-            Ok(response) => (response.status, response.body).into_response(),
-            Err((status, message)) => (status, message).into_response(),
-        },
-    };
+    let (response, fuel_consumed): (Response, Option<u64>) =
+        match runtime.config.sealed_route(&normalized_path).cloned() {
+            None => (
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("route `{normalized_path}` is not sealed in `integrity.lock`"),
+                )
+                    .into_response(),
+                None,
+            ),
+            Some(route) => match execute_route_with_middleware(
+                &state,
+                &runtime,
+                &route,
+                &headers,
+                &method,
+                &uri,
+                &body,
+                hop_limit,
+                Some(&trace_id),
+                sampled_execution,
+            )
+            .await
+            {
+                Ok(result) => (
+                    (result.response.status, result.response.body).into_response(),
+                    result.fuel_consumed,
+                ),
+                Err((status, message)) => ((status, message).into_response(), None),
+            },
+        };
 
     telemetry::record_event(
         &state.telemetry,
         TelemetryEvent::RequestEnd {
             trace_id,
             status: response.status().as_u16(),
+            fuel_consumed,
             timestamp: Instant::now(),
         },
     );
@@ -2242,8 +2382,11 @@ async fn execute_route_with_middleware(
     uri: &Uri,
     body: &Bytes,
     hop_limit: HopLimit,
-    trace_id: &str,
-) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    trace_id: Option<&str>,
+    sampled_execution: bool,
+) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
+    let mut accumulated_fuel = None;
+
     if let Some(middleware_name) = route.middleware.as_deref() {
         let middleware_resolved = runtime
             .route_registry
@@ -2272,17 +2415,30 @@ async fn execute_route_with_middleware(
             body,
             hop_limit,
             trace_id,
+            sampled_execution,
         )
         .await?;
-        if middleware_response.status != StatusCode::OK {
+        if middleware_response.response.status != StatusCode::OK {
             return Ok(middleware_response);
         }
+        accumulated_fuel = merge_fuel_samples(accumulated_fuel, middleware_response.fuel_consumed);
     }
 
-    execute_route_request(
-        state, runtime, route, headers, method, uri, body, hop_limit, trace_id,
+    let mut result = execute_route_request(
+        state,
+        runtime,
+        route,
+        headers,
+        method,
+        uri,
+        body,
+        hop_limit,
+        trace_id,
+        sampled_execution,
     )
-    .await
+    .await?;
+    result.fuel_consumed = merge_fuel_samples(accumulated_fuel, result.fuel_consumed);
+    Ok(result)
 }
 
 async fn execute_route_request(
@@ -2294,8 +2450,9 @@ async fn execute_route_request(
     uri: &Uri,
     body: &Bytes,
     hop_limit: HopLimit,
-    trace_id: &str,
-) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    trace_id: Option<&str>,
+    sampled_execution: bool,
+) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     if route.role == RouteRole::System && should_shed_system_route(&state.telemetry) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2338,16 +2495,20 @@ async fn execute_route_request(
     let selected_module = select_route_module(route, headers)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let propagated_headers = extract_propagated_headers(headers);
-    let engine = runtime.engine.clone();
+    let engine = if sampled_execution {
+        runtime.metered_engine.clone()
+    } else {
+        runtime.engine.clone()
+    };
     let request_config = runtime.config.clone();
     let response_config = runtime.config.clone();
     let route_registry = Arc::clone(&runtime.route_registry);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let storage_broker = Arc::clone(&state.storage_broker);
-    let telemetry_context = GuestTelemetryContext {
+    let telemetry_context = trace_id.map(|trace_id| GuestTelemetryContext {
         handle: state.telemetry.clone(),
         trace_id: trace_id.to_owned(),
-    };
+    });
     let runtime_telemetry = state.telemetry.clone();
     let secret_access = SecretAccess::from_route(route, &state.secrets_vault);
     let task_route = route.clone();
@@ -2368,12 +2529,13 @@ async fn execute_route_request(
             &task_route,
             GuestExecutionContext {
                 config: request_config,
+                sampled_execution,
                 runtime_telemetry,
                 secret_access,
                 request_headers: task_request_headers,
                 host_identity: task_host_identity,
                 storage_broker,
-                telemetry: Some(telemetry_context),
+                telemetry: telemetry_context,
                 concurrency_limits,
                 propagated_headers: task_propagated_headers,
             },
@@ -2387,13 +2549,16 @@ async fn execute_route_request(
         )
     })?;
 
-    let response = match result {
-        Ok(output) => match output {
-            GuestExecutionOutput::Http(response) => response,
-            GuestExecutionOutput::LegacyStdout(stdout) => GuestHttpResponse {
-                status: StatusCode::OK,
-                body: stdout,
-            },
+    let (response, fuel_consumed) = match result {
+        Ok(outcome) => match outcome.output {
+            GuestExecutionOutput::Http(response) => (response, outcome.fuel_consumed),
+            GuestExecutionOutput::LegacyStdout(stdout) => (
+                GuestHttpResponse {
+                    status: StatusCode::OK,
+                    body: stdout,
+                },
+                outcome.fuel_consumed,
+            ),
         },
         Err(error) => {
             error.log_if_needed(&selected_module);
@@ -2402,7 +2567,7 @@ async fn execute_route_request(
         }
     };
 
-    resolve_mesh_response(
+    let response = resolve_mesh_response(
         &state.http_client,
         &response_config,
         &route_registry,
@@ -2414,7 +2579,12 @@ async fn execute_route_request(
         response,
     )
     .await
-    .map_err(|error| (StatusCode::BAD_GATEWAY, error))
+    .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+
+    Ok(RouteExecutionResult {
+        response,
+        fuel_consumed,
+    })
 }
 
 async fn acquire_route_permit(
@@ -3008,7 +3178,7 @@ fn execute_guest(
     request: GuestRequest,
     route: &IntegrityRoute,
     execution: GuestExecutionContext,
-) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
+) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
     #[cfg(not(feature = "ai-inference"))]
     if requires_ai_inference_feature(function_name) {
         return Err(ExecutionError::Internal(format!(
@@ -3020,10 +3190,10 @@ fn execute_guest(
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
 
     if let Ok(component) = Component::from_file(engine, &module_path) {
-        return match route.role {
+        let component_result = match route.role {
             RouteRole::User => execute_component_guest(
                 engine,
-                request,
+                request.clone(),
                 route,
                 &module_path,
                 &component,
@@ -3031,24 +3201,23 @@ fn execute_guest(
             ),
             RouteRole::System => execute_system_component_guest(
                 engine,
-                request,
+                request.clone(),
                 route,
                 &module_path,
                 &component,
                 &execution,
             ),
         };
+
+        match component_result {
+            Ok(response) => return Ok(response),
+            Err(ExecutionError::Internal(message))
+                if message.contains("no exported instance named `tachyon:mesh/handler`") => {}
+            Err(error) => return Err(error),
+        }
     }
 
-    let module = Module::from_file(engine, &module_path).map_err(|error| {
-        guest_execution_error(
-            error,
-            format!(
-                "failed to load guest artifact from {}",
-                module_path.display()
-            ),
-        )
-    })?;
+    let (module_path, module) = resolve_legacy_guest_module(engine, function_name)?;
 
     execute_legacy_guest(
         engine,
@@ -3061,6 +3230,40 @@ fn execute_guest(
     )
 }
 
+fn resolve_legacy_guest_module(
+    engine: &Engine,
+    function_name: &str,
+) -> std::result::Result<(PathBuf, Module), ExecutionError> {
+    let candidates = guest_module_candidate_paths(function_name);
+    let candidate_strings = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let mut last_error = None;
+
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+
+        match Module::from_file(engine, &candidate) {
+            Ok(module) => return Ok((normalize_path(candidate), module)),
+            Err(error) => last_error = Some((normalize_path(candidate), error)),
+        }
+    }
+
+    if let Some((path, error)) = last_error {
+        return Err(guest_execution_error(
+            error,
+            format!("failed to load guest artifact from {}", path.display()),
+        ));
+    }
+
+    Err(ExecutionError::GuestModuleNotFound(
+        GuestModuleNotFound::new(function_name, format_candidate_list(&candidate_strings)),
+    ))
+}
+
 fn execute_component_guest(
     engine: &Engine,
     request: GuestRequest,
@@ -3068,7 +3271,7 @@ fn execute_component_guest(
     component_path: &Path,
     component: &Component,
     execution: &GuestExecutionContext,
-) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
+) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
         guest_execution_error(
@@ -3102,9 +3305,7 @@ fn execute_component_guest(
         )?,
     );
     store.limiter(|state| &mut state.limits);
-    store
-        .set_fuel(execution.config.guest_fuel_budget)
-        .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
+    maybe_set_guest_fuel_budget(&mut store, execution)?;
 
     let bindings = component_bindings::FaasGuest::instantiate(&mut store, component, &linker)
         .map_err(|error| {
@@ -3126,6 +3327,7 @@ fn execute_component_guest(
         },
     );
     record_wasm_end(execution.telemetry.as_ref());
+    let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
     let response = response.map_err(|error| {
         guest_execution_error(error, "guest component `handle-request` trapped")
     })?;
@@ -3136,10 +3338,13 @@ fn execute_component_guest(
         ))
     })?;
 
-    Ok(GuestExecutionOutput::Http(GuestHttpResponse {
-        status,
-        body: Bytes::from(response.body),
-    }))
+    Ok(GuestExecutionOutcome {
+        output: GuestExecutionOutput::Http(GuestHttpResponse {
+            status,
+            body: Bytes::from(response.body),
+        }),
+        fuel_consumed,
+    })
 }
 
 fn execute_system_component_guest(
@@ -3149,7 +3354,7 @@ fn execute_system_component_guest(
     component_path: &Path,
     component: &Component,
     execution: &GuestExecutionContext,
-) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
+) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
         guest_execution_error(
@@ -3204,9 +3409,7 @@ fn execute_system_component_guest(
         )?,
     );
     store.limiter(|state| &mut state.limits);
-    store
-        .set_fuel(execution.config.guest_fuel_budget)
-        .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
+    maybe_set_guest_fuel_budget(&mut store, execution)?;
 
     let bindings =
         system_component_bindings::SystemFaasGuest::instantiate(&mut store, component, &linker)
@@ -3229,6 +3432,7 @@ fn execute_system_component_guest(
         },
     );
     record_wasm_end(execution.telemetry.as_ref());
+    let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
     let response = response.map_err(|error| {
         guest_execution_error(error, "system guest component `handle-request` trapped")
     })?;
@@ -3239,10 +3443,13 @@ fn execute_system_component_guest(
         ))
     })?;
 
-    Ok(GuestExecutionOutput::Http(GuestHttpResponse {
-        status,
-        body: Bytes::from(response.body),
-    }))
+    Ok(GuestExecutionOutcome {
+        output: GuestExecutionOutput::Http(GuestHttpResponse {
+            status,
+            body: Bytes::from(response.body),
+        }),
+        fuel_consumed,
+    })
 }
 
 impl BackgroundTickRunner {
@@ -3354,7 +3561,7 @@ fn execute_legacy_guest(
     module_path: &Path,
     module: Module,
     execution: &GuestExecutionContext,
-) -> std::result::Result<GuestExecutionOutput, ExecutionError> {
+) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
     let linker = build_linker(engine)?;
     let stdout = MemoryOutputPipe::new(execution.config.max_stdout_bytes);
     let mut wasi = WasiCtxBuilder::new();
@@ -3383,9 +3590,7 @@ fn execute_legacy_guest(
         LegacyHostState::new(wasi, execution.config.guest_memory_limit_bytes),
     );
     store.limiter(|state| &mut state.limits);
-    store
-        .set_fuel(execution.config.guest_fuel_budget)
-        .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
+    maybe_set_guest_fuel_budget(&mut store, execution)?;
     let instance = linker
         .instantiate(&mut store, &module)
         .map_err(|error| guest_execution_error(error, "failed to instantiate guest module"))?;
@@ -3400,12 +3605,45 @@ fn execute_legacy_guest(
     record_wasm_start(execution.telemetry.as_ref());
     let call_result = entrypoint.call(&mut store, ());
     record_wasm_end(execution.telemetry.as_ref());
+    let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
     handle_guest_entrypoint_result(entrypoint_name, call_result)?;
 
-    Ok(GuestExecutionOutput::LegacyStdout(split_guest_stdout(
-        function_name,
-        stdout.contents(),
-    )))
+    Ok(GuestExecutionOutcome {
+        output: GuestExecutionOutput::LegacyStdout(split_guest_stdout(
+            function_name,
+            stdout.contents(),
+        )),
+        fuel_consumed,
+    })
+}
+
+fn maybe_set_guest_fuel_budget<T>(
+    store: &mut Store<T>,
+    execution: &GuestExecutionContext,
+) -> std::result::Result<(), ExecutionError> {
+    if !execution.sampled_execution {
+        return Ok(());
+    }
+
+    store
+        .set_fuel(execution.config.guest_fuel_budget)
+        .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))
+}
+
+fn sampled_fuel_consumed<T>(
+    store: &mut Store<T>,
+    execution: &GuestExecutionContext,
+) -> std::result::Result<Option<u64>, ExecutionError> {
+    if !execution.sampled_execution {
+        return Ok(None);
+    }
+
+    let remaining = store
+        .get_fuel()
+        .map_err(|error| guest_execution_error(error, "failed to read remaining guest fuel"))?;
+    Ok(Some(
+        execution.config.guest_fuel_budget.saturating_sub(remaining),
+    ))
 }
 
 fn legacy_guest_program_name(module_path: &Path) -> String {
@@ -3617,9 +3855,9 @@ fn handle_guest_entrypoint_result(
     }
 }
 
-fn build_engine(integrity_config: &IntegrityConfig) -> Result<Engine> {
+fn build_engine(integrity_config: &IntegrityConfig, enable_fuel_metering: bool) -> Result<Engine> {
     let mut config = Config::new();
-    config.consume_fuel(true);
+    config.consume_fuel(enable_fuel_metering);
     config.wasm_component_model(true);
     config.allocation_strategy(build_pooling_config(integrity_config)?);
 
@@ -3787,6 +4025,14 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
     if config.resource_limit_response.trim().is_empty() {
         return Err(anyhow!(
             "Integrity Validation Failed: embedded sealed configuration is missing `resource_limit_response`"
+        ));
+    }
+
+    if !config.telemetry_sample_rate.is_finite()
+        || !(0.0..=1.0).contains(&config.telemetry_sample_rate)
+    {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration must set `telemetry_sample_rate` between 0.0 and 1.0"
         ));
     }
 
@@ -4697,6 +4943,7 @@ impl IntegrityConfig {
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
             routes: vec![
                 IntegrityRoute::user_with_secrets(DEFAULT_ROUTE, &["DB_PASS"]),
                 IntegrityRoute::system(DEFAULT_SYSTEM_ROUTE),
@@ -4910,7 +5157,11 @@ mod tests {
     }
 
     fn build_test_engine(config: &IntegrityConfig) -> Engine {
-        build_engine(config).expect("engine should be created")
+        build_engine(config, false).expect("engine should be created")
+    }
+
+    fn build_test_metered_engine(config: &IntegrityConfig) -> Engine {
+        build_engine(config, true).expect("metered engine should be created")
     }
 
     fn build_test_runtime(config: IntegrityConfig) -> RuntimeState {
@@ -4959,6 +5210,7 @@ mod tests {
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
             routes,
         }
     }
@@ -5053,6 +5305,35 @@ mod tests {
             allowed_secrets: Vec::new(),
             targets: vec![RouteTarget {
                 module: "system-faas-storage-broker".to_owned(),
+                weight: 100,
+                match_header: None,
+            }],
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
+                host_path: host_path.display().to_string(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
+                ttl_seconds: None,
+                idle_timeout: None,
+                eviction_policy: None,
+            }],
+        }
+    }
+
+    fn metering_test_route(host_path: &std::path::Path) -> IntegrityRoute {
+        IntegrityRoute {
+            path: SYSTEM_METERING_ROUTE.to_owned(),
+            role: RouteRole::System,
+            name: "metering".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: vec![RouteTarget {
+                module: "system-faas-metering".to_owned(),
                 weight: 100,
                 match_header: None,
             }],
@@ -5360,6 +5641,7 @@ mod tests {
             GuestExecutionContext {
                 secret_access: SecretAccess::from_route(&route, &SecretsVault::load()),
                 config,
+                sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(30),
@@ -5373,12 +5655,15 @@ mod tests {
 
         assert_eq!(
             response,
-            GuestExecutionOutput::Http(GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from(expected_guest_example_body(
-                    "FaaS received: Hello Lean FaaS!"
-                )),
-            })
+            GuestExecutionOutcome {
+                output: GuestExecutionOutput::Http(GuestHttpResponse {
+                    status: StatusCode::OK,
+                    body: Bytes::from(expected_guest_example_body(
+                        "FaaS received: Hello Lean FaaS!"
+                    )),
+                }),
+                fuel_consumed: None,
+            }
         );
     }
 
@@ -5398,6 +5683,7 @@ mod tests {
             &route,
             GuestExecutionContext {
                 config,
+                sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
@@ -5412,9 +5698,12 @@ mod tests {
 
         assert_eq!(
             response,
-            GuestExecutionOutput::LegacyStdout(Bytes::from(
-                "MESH_FETCH:http://legacy-service:8081/ping\n"
-            ))
+            GuestExecutionOutcome {
+                output: GuestExecutionOutput::LegacyStdout(Bytes::from(
+                    "MESH_FETCH:http://legacy-service:8081/ping\n"
+                )),
+                fuel_consumed: None,
+            }
         );
     }
 
@@ -5439,6 +5728,7 @@ mod tests {
             &route,
             GuestExecutionContext {
                 config: config.clone(),
+                sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
@@ -5453,10 +5743,13 @@ mod tests {
 
         assert_eq!(
             save_response,
-            GuestExecutionOutput::Http(GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from("Saved"),
-            })
+            GuestExecutionOutcome {
+                output: GuestExecutionOutput::Http(GuestHttpResponse {
+                    status: StatusCode::OK,
+                    body: Bytes::from("Saved"),
+                }),
+                fuel_consumed: None,
+            }
         );
 
         let read_response = execute_guest(
@@ -5470,6 +5763,7 @@ mod tests {
             &route,
             GuestExecutionContext {
                 config: config.clone(),
+                sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
@@ -5484,10 +5778,13 @@ mod tests {
 
         assert_eq!(
             read_response,
-            GuestExecutionOutput::Http(GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from("Hello Stateful World"),
-            })
+            GuestExecutionOutcome {
+                output: GuestExecutionOutput::Http(GuestHttpResponse {
+                    status: StatusCode::OK,
+                    body: Bytes::from("Hello Stateful World"),
+                }),
+                fuel_consumed: None,
+            }
         );
         assert_eq!(
             fs::read_to_string(volume_dir.join("state.txt"))
@@ -5613,6 +5910,7 @@ mod tests {
         let config = IntegrityConfig::default_sealed();
         let runtime = RuntimeState {
             engine: build_test_engine(&config),
+            metered_engine: build_test_metered_engine(&config),
             route_registry: Arc::new(
                 RouteRegistry::build(&config).expect("route registry should build"),
             ),
@@ -5672,6 +5970,7 @@ mod tests {
             &route,
             GuestExecutionContext {
                 config,
+                sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
@@ -5806,7 +6105,7 @@ mod tests {
             .pending_waiters
             .store(75, Ordering::SeqCst);
         tokio::task::spawn_blocking(move || {
-            let engine = build_test_engine(&config);
+            let engine = build_test_metered_engine(&config);
             let mut runner = BackgroundTickRunner::new(
                 &engine,
                 &config,
@@ -5881,10 +6180,14 @@ mod tests {
                     .lock()
                     .expect("captured telemetry should not be poisoned")
                     .push(line);
+                true
             }
         });
         let app = build_app(build_test_state(
-            IntegrityConfig::default_sealed(),
+            IntegrityConfig {
+                telemetry_sample_rate: 1.0,
+                ..IntegrityConfig::default_sealed()
+            },
             telemetry,
         ));
 
@@ -5919,11 +6222,110 @@ mod tests {
             serde_json::from_str(&line).expect("telemetry output should be valid JSON");
 
         assert_eq!(record["path"], "/api/guest-example");
+        assert_eq!(record["sampled"], true);
         assert_eq!(record["status"], 200);
         assert!(record["trace_id"].as_str().is_some());
+        assert!(record["traceparent"].as_str().is_some());
+        assert!(record["fuel_consumed"].as_u64().is_some());
         assert!(record["total_duration_us"].as_u64().is_some());
         assert!(record["wasm_duration_us"].as_u64().is_some());
         assert!(record["host_overhead_us"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn router_skips_telemetry_export_for_unsampled_requests() {
+        use std::{
+            sync::{Arc, Mutex},
+            time::Duration,
+        };
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let telemetry = telemetry::init_test_telemetry_with_emitter({
+            let captured = Arc::clone(&captured);
+            move |line| {
+                captured
+                    .lock()
+                    .expect("captured telemetry should not be poisoned")
+                    .push(line);
+                true
+            }
+        });
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
+            telemetry,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::post("/api/guest-example")
+                    .body(Body::from("Hello Lean FaaS!"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            captured
+                .lock()
+                .expect("captured telemetry should not be poisoned")
+                .is_empty(),
+            "unsampled requests should not enqueue telemetry export records"
+        );
+    }
+
+    #[tokio::test]
+    async fn metering_exporter_drains_sampled_records_off_request_path() {
+        use std::time::Duration;
+
+        let metering_dir = unique_test_dir("tachyon-metering-export");
+        let (export_sender, export_receiver) = mpsc::channel(TELEMETRY_EXPORT_QUEUE_CAPACITY);
+        let telemetry = telemetry::init_test_telemetry_with_emitter(move |line| {
+            export_sender.try_send(line).is_ok()
+        });
+        let config = IntegrityConfig {
+            telemetry_sample_rate: 1.0,
+            routes: vec![
+                IntegrityRoute::user_with_secrets(DEFAULT_ROUTE, &["DB_PASS"]),
+                metering_test_route(&metering_dir),
+            ],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config, telemetry);
+        spawn_metering_exporter(state.clone(), export_receiver);
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/api/guest-example")
+                    .body(Body::from("Hello Lean FaaS!"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let metering_file = metering_dir.join("metering.ndjson");
+        let contents = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = fs::read_to_string(&metering_file) {
+                    if !contents.trim().is_empty() {
+                        break contents;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("metering exporter should flush a batch");
+
+        assert!(contents.contains("\"path\":\"/api/guest-example\""));
+        assert!(contents.contains("\"sampled\":true"));
+        assert!(contents.contains("\"fuel_consumed\":"));
+
+        let _ = fs::remove_dir_all(metering_dir);
     }
 
     #[cfg(feature = "secrets-vault")]
@@ -6751,6 +7153,17 @@ mod tests {
         assert_eq!(route.min_instances, 0);
         assert_eq!(route.max_concurrency, DEFAULT_ROUTE_MAX_CONCURRENCY);
         assert!(route.volumes.is_empty());
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_invalid_telemetry_sample_rate() {
+        let error = validate_integrity_config(IntegrityConfig {
+            telemetry_sample_rate: 1.5,
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect_err("sample rates above one should fail validation");
+
+        assert!(error.to_string().contains("`telemetry_sample_rate`"));
     }
 
     #[test]

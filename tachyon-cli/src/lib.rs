@@ -17,6 +17,7 @@ const DEFAULT_GUEST_FUEL_BUDGET: u64 = 500_000_000;
 const DEFAULT_RESOURCE_LIMIT_RESPONSE: &str = "Execution trapped: Resource limit exceeded";
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
 const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
+const DEFAULT_TELEMETRY_SAMPLE_RATE: f64 = 0.0;
 
 fn default_max_concurrency() -> u32 {
     DEFAULT_ROUTE_MAX_CONCURRENCY
@@ -28,6 +29,14 @@ fn default_route_version() -> String {
 
 fn is_default_route_version(version: &String) -> bool {
     version == DEFAULT_ROUTE_VERSION
+}
+
+fn default_telemetry_sample_rate() -> f64 {
+    DEFAULT_TELEMETRY_SAMPLE_RATE
+}
+
+fn is_default_telemetry_sample_rate(sample_rate: &f64) -> bool {
+    (*sample_rate - DEFAULT_TELEMETRY_SAMPLE_RATE).abs() < f64::EPSILON
 }
 
 fn default_volume_type() -> VolumeType {
@@ -122,13 +131,18 @@ pub struct SealedVolume {
     pub eviction_policy: Option<VolumeEvictionPolicy>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SealedConfig {
     pub host_address: String,
     pub max_stdout_bytes: usize,
     pub guest_fuel_budget: u64,
     pub guest_memory_limit_bytes: usize,
     pub resource_limit_response: String,
+    #[serde(
+        default = "default_telemetry_sample_rate",
+        skip_serializing_if = "is_default_telemetry_sample_rate"
+    )]
+    pub telemetry_sample_rate: f64,
     pub routes: Vec<SealedRoute>,
 }
 
@@ -139,7 +153,7 @@ struct IntegrityManifest {
     signature: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct GenerateRequest {
     user_routes: Vec<String>,
     system_routes: Vec<String>,
@@ -152,6 +166,7 @@ struct GenerateRequest {
     route_middlewares: Vec<String>,
     route_scales: Vec<String>,
     volumes: Vec<String>,
+    telemetry_sample_rate: f64,
     memory_mib: u32,
 }
 
@@ -233,6 +248,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         route_middlewares: parse_optional_routes_arg(&subcommand.matches.args, "route-middleware")?,
         route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
         volumes: parse_optional_string_args(&subcommand.matches.args, "volume", "volume")?,
+        telemetry_sample_rate: parse_telemetry_sample_rate_arg(&subcommand.matches.args)?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
     };
 
@@ -264,6 +280,7 @@ fn parse_generate_request_from_args(
     let mut route_middlewares = Vec::new();
     let mut route_scales = Vec::new();
     let mut volumes = Vec::new();
+    let mut telemetry_sample_rate = DEFAULT_TELEMETRY_SAMPLE_RATE;
     let mut memory_mib = None;
 
     while let Some(arg) = args.next() {
@@ -389,6 +406,11 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--telemetry-sample-rate=") {
+            telemetry_sample_rate = parse_telemetry_sample_rate_value(value)?;
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix("--route-scale=") {
             route_scales.push(value.to_owned());
             continue;
@@ -412,6 +434,14 @@ fn parse_generate_request_from_args(
                 "missing value for `--volume`; expected `--volume /api/guest-volume=/tmp/tachyon_data:/app/data:rw`",
             )?;
             volumes.push(volume);
+            continue;
+        }
+
+        if arg == "--telemetry-sample-rate" {
+            let value = args.next().context(
+                "missing value for `--telemetry-sample-rate`; expected `--telemetry-sample-rate 0.001`",
+            )?;
+            telemetry_sample_rate = parse_telemetry_sample_rate_value(&value)?;
             continue;
         }
 
@@ -443,6 +473,7 @@ fn parse_generate_request_from_args(
         route_middlewares,
         route_scales,
         volumes,
+        telemetry_sample_rate,
         memory_mib,
     }))
 }
@@ -475,6 +506,12 @@ fn generate_manifest(request: GenerateRequest) -> Result<PathBuf> {
 
 impl SealedConfig {
     fn from_request(request: GenerateRequest) -> Result<Self> {
+        if !request.telemetry_sample_rate.is_finite()
+            || !(0.0..=1.0).contains(&request.telemetry_sample_rate)
+        {
+            bail!("`telemetry_sample_rate` must be between 0.0 and 1.0");
+        }
+
         let routes = normalize_routes(
             request.user_routes,
             request.system_routes,
@@ -500,6 +537,7 @@ impl SealedConfig {
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes,
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            telemetry_sample_rate: request.telemetry_sample_rate,
             routes,
         })
     }
@@ -572,6 +610,23 @@ fn parse_memory_arg(
     parse_memory_value(&value)
 }
 
+#[cfg(desktop)]
+fn parse_telemetry_sample_rate_arg(
+    args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
+) -> Result<f64> {
+    let Some(arg) = args.get("telemetry-sample-rate") else {
+        return Ok(DEFAULT_TELEMETRY_SAMPLE_RATE);
+    };
+
+    let value = match &arg.value {
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        _ => bail!("`--telemetry-sample-rate` must be provided as a number between 0.0 and 1.0"),
+    };
+
+    parse_telemetry_sample_rate_value(&value)
+}
+
 fn parse_memory_value(value: &str) -> Result<u32> {
     let memory_mib = value
         .parse::<u32>()
@@ -582,6 +637,18 @@ fn parse_memory_value(value: &str) -> Result<u32> {
     }
 
     Ok(memory_mib)
+}
+
+fn parse_telemetry_sample_rate_value(value: &str) -> Result<f64> {
+    let sample_rate = value.parse::<f64>().with_context(|| {
+        format!("failed to parse `--telemetry-sample-rate {value}` as a floating-point number")
+    })?;
+
+    if !sample_rate.is_finite() || !(0.0..=1.0).contains(&sample_rate) {
+        bail!("`--telemetry-sample-rate` must be between 0.0 and 1.0");
+    }
+
+    Ok(sample_rate)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1468,12 +1535,14 @@ mod tests {
             route_middlewares: Vec::new(),
             route_scales: vec!["/api/guest-example=2:16".to_owned()],
             volumes: vec!["/api/guest-example=/tmp/tachyon_data:/app/data:ro".to_owned()],
+            telemetry_sample_rate: 0.25,
             memory_mib: 64,
         })
         .expect("request should produce a sealed config");
 
         assert_eq!(config.guest_fuel_budget, DEFAULT_GUEST_FUEL_BUDGET);
         assert_eq!(config.guest_memory_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.telemetry_sample_rate, 0.25);
         assert_eq!(
             config.routes,
             vec![
@@ -1529,6 +1598,7 @@ mod tests {
         assert!(payload.contains("\"max_concurrency\":16"));
         assert!(payload.contains("\"guest_path\":\"/app/data\""));
         assert!(payload.contains("\"readonly\":true"));
+        assert!(payload.contains("\"telemetry_sample_rate\":0.25"));
     }
 
     #[test]
@@ -1553,6 +1623,8 @@ mod tests {
                 "/api/guest-example=faas-b@^3.1.0",
                 "--route-scale",
                 "/api/guest-example=1:8",
+                "--telemetry-sample-rate",
+                "0.5",
                 "--volume",
                 "/api/guest-example=C:\\\\tachyon_data:/app/data:rw",
                 "--memory",
@@ -1581,6 +1653,7 @@ mod tests {
                 route_middlewares: Vec::new(),
                 route_scales: vec!["/api/guest-example=1:8".to_owned()],
                 volumes: vec!["/api/guest-example=C:\\\\tachyon_data:/app/data:rw".to_owned()],
+                telemetry_sample_rate: 0.5,
                 memory_mib: 64,
             }
         );
