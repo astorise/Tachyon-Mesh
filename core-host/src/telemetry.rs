@@ -42,6 +42,8 @@ pub(crate) enum TelemetryEvent {
     RequestStart {
         trace_id: String,
         path: String,
+        sampled: bool,
+        traceparent: Option<String>,
         timestamp: Instant,
     },
     WasmStart {
@@ -55,6 +57,7 @@ pub(crate) enum TelemetryEvent {
     RequestEnd {
         trace_id: String,
         status: u16,
+        fuel_consumed: Option<u64>,
         timestamp: Instant,
     },
 }
@@ -74,6 +77,9 @@ struct AggregatedMetrics {
 #[derive(Default)]
 struct RequestState {
     path: Option<String>,
+    sampled: bool,
+    traceparent: Option<String>,
+    fuel_consumed: Option<u64>,
     request_started_at: Option<Instant>,
     wasm_started_at: Option<Instant>,
     wasm_finished_at: Option<Instant>,
@@ -81,20 +87,25 @@ struct RequestState {
 
 struct CompletedRequest {
     line: String,
+    sampled: bool,
     status: u16,
     total_duration_us: u64,
     wasm_duration_us: u64,
     host_overhead_us: u64,
 }
 
-type TelemetryEmitter = Arc<dyn Fn(String) + Send + Sync>;
+type TelemetryEmitter = Arc<dyn Fn(String) -> bool + Send + Sync>;
 
 pub(crate) struct ActiveRequestGuard {
     active_requests: Arc<AtomicUsize>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn init_telemetry() -> TelemetryHandle {
-    init_telemetry_with_emitter(|line| println!("{line}"))
+    init_telemetry_with_emitter(|line| {
+        println!("{line}");
+        true
+    })
 }
 
 pub(crate) fn record_event(handle: &TelemetryHandle, event: TelemetryEvent) {
@@ -122,9 +133,9 @@ pub(crate) fn snapshot(handle: &TelemetryHandle) -> TelemetrySnapshot {
     handle.snapshot.snapshot()
 }
 
-fn init_telemetry_with_emitter<F>(emitter: F) -> TelemetryHandle
+pub(crate) fn init_telemetry_with_emitter<F>(emitter: F) -> TelemetryHandle
 where
-    F: Fn(String) + Send + Sync + 'static,
+    F: Fn(String) -> bool + Send + Sync + 'static,
 {
     let (sender, receiver) = mpsc::channel(TELEMETRY_CHANNEL_CAPACITY);
     let emitter: TelemetryEmitter = Arc::new(emitter);
@@ -160,7 +171,9 @@ async fn run_telemetry_worker(
 
     while let Some(event) = receiver.recv().await {
         if let Some(completed) = apply_event(&mut requests, &snapshot, event) {
-            emitter(completed.line);
+            if completed.sampled && !(emitter)(completed.line) {
+                snapshot.record_dropped_event();
+            }
         }
     }
 }
@@ -174,11 +187,15 @@ fn apply_event(
         TelemetryEvent::RequestStart {
             trace_id,
             path,
+            sampled,
+            traceparent,
             timestamp,
         } => {
             snapshot.record_request_started();
             let state = requests.entry(trace_id).or_default();
             state.path = Some(path);
+            state.sampled = sampled;
+            state.traceparent = traceparent;
             state.request_started_at = Some(timestamp);
             None
         }
@@ -199,9 +216,11 @@ fn apply_event(
         TelemetryEvent::RequestEnd {
             trace_id,
             status,
+            fuel_consumed,
             timestamp,
         } => {
-            let state = requests.remove(&trace_id).unwrap_or_default();
+            let mut state = requests.remove(&trace_id).unwrap_or_default();
+            state.fuel_consumed = fuel_consumed;
             let completed = state.complete(trace_id, status, timestamp);
             snapshot.record_request_completed(&completed);
             Some(completed)
@@ -306,13 +325,17 @@ impl RequestState {
         CompletedRequest {
             line: json!({
                 "trace_id": trace_id,
+                "sampled": self.sampled,
+                "traceparent": self.traceparent,
                 "path": self.path,
                 "status": status,
+                "fuel_consumed": self.fuel_consumed,
                 "total_duration_us": total_duration_us,
                 "wasm_duration_us": wasm_duration_us,
                 "host_overhead_us": host_overhead_us,
             })
             .to_string(),
+            sampled: self.sampled,
             status,
             total_duration_us,
             wasm_duration_us,
@@ -339,13 +362,13 @@ fn u128_to_u64(value: u128) -> u64 {
 
 #[cfg(test)]
 pub(crate) fn init_test_telemetry() -> TelemetryHandle {
-    init_telemetry_with_emitter(|_| {})
+    init_telemetry_with_emitter(|_| true)
 }
 
 #[cfg(test)]
 pub(crate) fn init_test_telemetry_with_emitter<F>(emitter: F) -> TelemetryHandle
 where
-    F: Fn(String) + Send + Sync + 'static,
+    F: Fn(String) -> bool + Send + Sync + 'static,
 {
     init_telemetry_with_emitter(emitter)
 }
@@ -368,6 +391,10 @@ mod tests {
             TelemetryEvent::RequestStart {
                 trace_id: "trace-1".to_owned(),
                 path: "/api/guest-example".to_owned(),
+                sampled: true,
+                traceparent: Some(
+                    "00-00000000000000000000000000000001-0000000000000001-01".to_owned(),
+                ),
                 timestamp: started_at,
             },
         );
@@ -393,6 +420,7 @@ mod tests {
             TelemetryEvent::RequestEnd {
                 trace_id: "trace-1".to_owned(),
                 status: 200,
+                fuel_consumed: Some(42),
                 timestamp: started_at + Duration::from_micros(100),
             },
         )
@@ -402,8 +430,14 @@ mod tests {
             serde_json::from_str(&completed.line).expect("telemetry worker should emit valid JSON");
 
         assert_eq!(record["trace_id"], "trace-1");
+        assert_eq!(record["sampled"], true);
+        assert_eq!(
+            record["traceparent"],
+            "00-00000000000000000000000000000001-0000000000000001-01"
+        );
         assert_eq!(record["path"], "/api/guest-example");
         assert_eq!(record["status"], 200);
+        assert_eq!(record["fuel_consumed"], 42);
         assert_eq!(record["total_duration_us"], 100);
         assert_eq!(record["wasm_duration_us"], 50);
         assert_eq!(record["host_overhead_us"], 50);
@@ -430,6 +464,8 @@ mod tests {
             TelemetryEvent::RequestStart {
                 trace_id: "trace-404".to_owned(),
                 path: "/api/missing".to_owned(),
+                sampled: false,
+                traceparent: None,
                 timestamp: started_at,
             },
         );
@@ -439,6 +475,7 @@ mod tests {
             TelemetryEvent::RequestEnd {
                 trace_id: "trace-404".to_owned(),
                 status: 404,
+                fuel_consumed: None,
                 timestamp: started_at + Duration::from_micros(25),
             },
         )
