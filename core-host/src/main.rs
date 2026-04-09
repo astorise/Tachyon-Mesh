@@ -55,8 +55,10 @@ use wasmtime::{
     Config, Engine, Instance, Linker as ModuleLinker, Module, PoolingAllocationConfig,
     ResourceLimiter, Store, Trap, TypedFunc,
 };
+#[cfg(test)]
+use wasmtime_wasi::cli::OutputFile;
 use wasmtime_wasi::{
-    cli::{InputFile, IsTerminal, OutputFile, StdinStream, StdoutStream},
+    cli::{InputFile, IsTerminal, StdinStream, StdoutStream},
     p1::{self, WasiP1Ctx},
     p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult},
     DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
@@ -129,6 +131,7 @@ const ACME_STAGING_MOCK_MODE: &str = "ACME_STAGING_MOCK";
 const CERT_MANAGER_GUEST_CERT_DIR: &str = "/app/certs";
 const SYSTEM_METERING_ROUTE: &str = "/system/metering";
 const SYSTEM_CERT_MANAGER_ROUTE: &str = "/system/cert-manager";
+const SYSTEM_LOGGER_ROUTE: &str = "/system/logger";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
@@ -141,6 +144,9 @@ const TACHYON_IDENTITY_HEADER: &str = "x-tachyon-identity";
 const TACHYON_SYSTEM_PUBLIC_KEY_ENV: &str = "TACHYON_SYSTEM_PUBLIC_KEY";
 #[cfg(unix)]
 const TACHYON_DISCOVERY_DIR_ENV: &str = "TACHYON_DISCOVERY_DIR";
+const LOG_QUEUE_CAPACITY: usize = 64_000;
+const LOG_BATCH_SIZE: usize = 1_000;
+const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
 const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
@@ -221,6 +227,7 @@ fn is_false(value: &bool) -> bool {
 struct AppState {
     runtime: Arc<ArcSwap<RuntimeState>>,
     http_client: Client,
+    async_log_sender: mpsc::Sender<AsyncLogEntry>,
     secrets_vault: SecretsVault,
     host_identity: Arc<HostIdentity>,
     uds_fast_path: Arc<UdsFastPathRegistry>,
@@ -344,6 +351,7 @@ struct GuestExecutionContext {
     config: IntegrityConfig,
     sampled_execution: bool,
     runtime_telemetry: TelemetryHandle,
+    async_log_sender: mpsc::Sender<AsyncLogEntry>,
     secret_access: SecretAccess,
     request_headers: HeaderMap,
     host_identity: Arc<HostIdentity>,
@@ -1084,6 +1092,26 @@ struct GuestLogRecord {
     fields: Map<String, Value>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum GuestLogStreamType {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct AsyncLogEntry {
+    target_name: String,
+    timestamp_unix_ms: u64,
+    stream_type: GuestLogStreamType,
+    level: String,
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guest_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    structured_fields: Option<Value>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum VolumeType {
@@ -1266,6 +1294,7 @@ async fn run() -> Result<()> {
     let storage_broker = Arc::new(StorageBrokerManager::default());
     let background_workers = Arc::new(BackgroundWorkerManager::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
+    let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
     background_workers.start_for_runtime(
         &runtime,
         telemetry.clone(),
@@ -1276,6 +1305,7 @@ async fn run() -> Result<()> {
     let state = AppState {
         runtime: Arc::new(ArcSwap::from_pointee(runtime.clone())),
         http_client: Client::new(),
+        async_log_sender,
         secrets_vault: SecretsVault::load(),
         host_identity,
         uds_fast_path: Arc::clone(&uds_fast_path),
@@ -1293,6 +1323,7 @@ async fn run() -> Result<()> {
         Arc::clone(&state.storage_broker),
     )?;
     spawn_metering_exporter(state.clone(), export_receiver);
+    spawn_async_log_exporter(state.clone(), async_log_receiver);
     spawn_reload_watcher(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     let app = build_app(state.clone());
@@ -3002,7 +3033,20 @@ fn prewarm_legacy_route(
     let (_, module) = resolve_legacy_guest_module(&runtime.engine, function_name)?;
     let linker = build_linker(&runtime.engine)?;
     let stdin_file = create_guest_stdin_file(&Bytes::new())?;
-    let stdout_file = create_guest_stdout_file()?;
+    let stdout_capture = AsyncGuestOutputCapture::new(
+        function_name,
+        GuestLogStreamType::Stdout,
+        disconnected_log_sender(),
+        false,
+        runtime.config.max_stdout_bytes,
+    );
+    let stderr_capture = AsyncGuestOutputCapture::new(
+        function_name,
+        GuestLogStreamType::Stderr,
+        disconnected_log_sender(),
+        false,
+        0,
+    );
 
     let mut wasi = WasiCtxBuilder::new();
     wasi.arg(legacy_guest_program_name(module_path))
@@ -3014,14 +3058,8 @@ fn prewarm_legacy_route(
                 )
             },
         )?))
-        .stdout(OutputFile::new(stdout_file.file.try_clone().map_err(
-            |error| {
-                guest_execution_error(
-                    error.into(),
-                    "failed to clone prewarm guest stdout file handle",
-                )
-            },
-        )?));
+        .stdout(stdout_capture)
+        .stderr(stderr_capture);
 
     if let Some(module_dir) = module_path.parent() {
         wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
@@ -3196,6 +3234,27 @@ fn spawn_metering_exporter(state: AppState, mut receiver: mpsc::Receiver<String>
     });
 }
 
+fn spawn_async_log_exporter(state: AppState, mut receiver: mpsc::Receiver<AsyncLogEntry>) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        while let Some(first_entry) = receiver.recv().await {
+            let mut batch = vec![first_entry];
+            while batch.len() < LOG_BATCH_SIZE {
+                match tokio::time::timeout(LOG_BATCH_FLUSH_INTERVAL, receiver.recv()).await {
+                    Ok(Some(entry)) => batch.push(entry),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+
+            if let Err(error) = export_log_batch(&state, batch).await {
+                tracing::warn!("async guest log export failed: {error}");
+            }
+        }
+    });
+}
+
 async fn serve_http_listener(listener: tokio::net::TcpListener, app: Router) -> Result<()> {
     loop {
         let (stream, peer_addr) = listener
@@ -3213,6 +3272,48 @@ async fn serve_http_listener(listener: tokio::net::TcpListener, app: Router) -> 
                 tracing::warn!(remote = %peer_addr, "HTTP connection failed: {error}");
             }
         });
+    }
+}
+
+async fn export_log_batch(
+    state: &AppState,
+    batch: Vec<AsyncLogEntry>,
+) -> std::result::Result<(), String> {
+    let runtime = state.runtime.load_full();
+    let Some(route) = runtime.config.sealed_route(SYSTEM_LOGGER_ROUTE).cloned() else {
+        return Ok(());
+    };
+
+    let headers = HeaderMap::new();
+    let method = Method::POST;
+    let uri = Uri::from_static(SYSTEM_LOGGER_ROUTE);
+    let body = serde_json::to_vec(&batch)
+        .map_err(|error| format!("failed to serialize log batch: {error}"))?;
+    let trailers = Vec::new();
+    let result = execute_route_with_middleware(
+        state,
+        &runtime,
+        &route,
+        &headers,
+        &method,
+        &uri,
+        &Bytes::from(body),
+        &trailers,
+        HopLimit(DEFAULT_HOP_LIMIT),
+        None,
+        false,
+        None,
+    )
+    .await
+    .map_err(|(status, message)| format!("logger route failed with {status}: {message}"))?;
+
+    if result.response.status.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "logger route returned unexpected status {}",
+            result.response.status
+        ))
     }
 }
 
@@ -3614,6 +3715,7 @@ async fn handle_udp_layer4_datagram(
             config: config.clone(),
             sampled_execution: false,
             runtime_telemetry,
+            async_log_sender: state.async_log_sender.clone(),
             secret_access: SecretAccess::from_route(&route_for_execution, &SecretsVault::load()),
             request_headers,
             host_identity,
@@ -3732,6 +3834,7 @@ async fn handle_websocket_connection(
             config,
             sampled_execution: false,
             runtime_telemetry,
+            async_log_sender: state.async_log_sender.clone(),
             secret_access,
             request_headers: HeaderMap::new(),
             host_identity,
@@ -3961,6 +4064,7 @@ fn execute_tcp_layer4_guest(
         config: config.clone(),
         sampled_execution: false,
         runtime_telemetry,
+        async_log_sender: disconnected_log_sender(),
         secret_access: SecretAccess::from_route(route, &SecretsVault::load()),
         request_headers: HeaderMap::new(),
         host_identity,
@@ -4535,12 +4639,13 @@ async fn execute_route_request(
     let task_propagated_headers = propagated_headers.clone();
     let task_request_headers = headers.clone();
     let task_host_identity = Arc::clone(&state.host_identity);
+    let task_async_log_sender = state.async_log_sender.clone();
     #[cfg(feature = "ai-inference")]
     let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
     let guest_request = GuestRequest {
         method: method.to_string(),
         uri: uri.to_string(),
-        headers: header_map_to_guest_fields(&headers),
+        headers: header_map_to_guest_fields(headers),
         body: body.clone(),
         trailers: trailers.clone(),
     };
@@ -4554,6 +4659,7 @@ async fn execute_route_request(
                 config: request_config,
                 sampled_execution,
                 runtime_telemetry,
+                async_log_sender: task_async_log_sender,
                 secret_access,
                 request_headers: task_request_headers,
                 host_identity: task_host_identity,
@@ -5978,16 +6084,27 @@ fn execute_legacy_guest(
 ) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
     let linker = build_linker(engine)?;
     let stdin_file = create_guest_stdin_file(&body)?;
-    let stdout_file = create_guest_stdout_file()?;
-    let stdout_path = stdout_file.path.clone();
+    let stdout_capture = AsyncGuestOutputCapture::new(
+        function_name,
+        GuestLogStreamType::Stdout,
+        execution.async_log_sender.clone(),
+        true,
+        execution.config.max_stdout_bytes,
+    );
+    let stderr_capture = AsyncGuestOutputCapture::new(
+        function_name,
+        GuestLogStreamType::Stderr,
+        execution.async_log_sender.clone(),
+        false,
+        0,
+    );
     let mut wasi = WasiCtxBuilder::new();
     wasi.arg(legacy_guest_program_name(module_path))
         .stdin(InputFile::new(stdin_file.file.try_clone().map_err(
             |error| guest_execution_error(error.into(), "failed to clone guest stdin file handle"),
         )?))
-        .stdout(OutputFile::new(stdout_file.file.try_clone().map_err(
-            |error| guest_execution_error(error.into(), "failed to clone guest stdout file handle"),
-        )?));
+        .stdout(stdout_capture.clone())
+        .stderr(stderr_capture);
 
     if let Some(module_dir) = module_path.parent() {
         wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
@@ -6032,16 +6149,10 @@ fn execute_legacy_guest(
     record_wasm_end(execution.telemetry.as_ref());
     let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
     handle_guest_entrypoint_result(entrypoint_name, call_result)?;
-    stdout_file.file.sync_all().map_err(|error| {
-        guest_execution_error(
-            error.into(),
-            "failed to flush guest stdout temp file to disk",
-        )
-    })?;
-    let stdout_bytes = read_guest_stdout_file(&stdout_path, execution.config.max_stdout_bytes)?;
+    let stdout_bytes = stdout_capture.finish()?;
 
     Ok(GuestExecutionOutcome {
-        output: GuestExecutionOutput::LegacyStdout(split_guest_stdout(function_name, stdout_bytes)),
+        output: GuestExecutionOutput::LegacyStdout(stdout_bytes),
         fuel_consumed,
     })
 }
@@ -6231,6 +6342,114 @@ impl Pollable for TcpSocketStdout {
     async fn ready(&mut self) {}
 }
 
+#[derive(Default)]
+struct AsyncGuestOutputState {
+    function_name: String,
+    capture_response: bool,
+    max_response_bytes: usize,
+    response: Vec<u8>,
+    pending: Vec<u8>,
+    response_overflowed: bool,
+    sender: Option<mpsc::Sender<AsyncLogEntry>>,
+    stream_type: Option<GuestLogStreamType>,
+}
+
+#[derive(Clone, Default)]
+struct AsyncGuestOutputCapture {
+    state: Arc<Mutex<AsyncGuestOutputState>>,
+}
+
+impl AsyncGuestOutputCapture {
+    fn new(
+        function_name: impl Into<String>,
+        stream_type: GuestLogStreamType,
+        sender: mpsc::Sender<AsyncLogEntry>,
+        capture_response: bool,
+        max_response_bytes: usize,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(AsyncGuestOutputState {
+                function_name: function_name.into(),
+                capture_response,
+                max_response_bytes,
+                response: Vec::new(),
+                pending: Vec::new(),
+                response_overflowed: false,
+                sender: Some(sender),
+                stream_type: Some(stream_type),
+            })),
+        }
+    }
+
+    fn finish(&self) -> std::result::Result<Bytes, ExecutionError> {
+        let mut state = self.state.lock().map_err(|_| {
+            ExecutionError::Internal("guest async stdout capture lock poisoned".to_owned())
+        })?;
+        flush_async_guest_output(&mut state);
+        if state.response_overflowed {
+            return Err(ExecutionError::ResourceLimitExceeded {
+                kind: ResourceLimitKind::Stdout,
+                detail: format!(
+                    "guest wrote more than {} response bytes to stdout",
+                    state.max_response_bytes
+                ),
+            });
+        }
+
+        Ok(Bytes::from(std::mem::take(&mut state.response)))
+    }
+}
+
+impl IsTerminal for AsyncGuestOutputCapture {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for AsyncGuestOutputCapture {
+    fn p2_stream(&self) -> Box<dyn OutputStream> {
+        Box::new(self.clone())
+    }
+
+    fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
+        Box::new(tokio::io::sink())
+    }
+}
+
+#[async_trait::async_trait]
+impl OutputStream for AsyncGuestOutputCapture {
+    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| StreamError::trap("guest async stdout capture lock poisoned"))?;
+        state.pending.extend_from_slice(&bytes);
+        while let Some(position) = state.pending.iter().position(|byte| *byte == b'\n') {
+            let segment = state.pending.drain(..=position).collect::<Vec<_>>();
+            handle_async_guest_segment(&mut state, &segment);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> StreamResult<()> {
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> StreamResult<usize> {
+        Ok(4096)
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for AsyncGuestOutputCapture {
+    async fn ready(&mut self) {}
+}
+
+fn disconnected_log_sender() -> mpsc::Sender<AsyncLogEntry> {
+    let (sender, _receiver) = mpsc::channel(1);
+    sender
+}
+
 struct GuestTempFile {
     path: PathBuf,
     file: fs::File,
@@ -6268,6 +6487,7 @@ fn create_guest_stdin_file(body: &Bytes) -> std::result::Result<GuestTempFile, E
     Ok(GuestTempFile { path, file })
 }
 
+#[cfg(test)]
 fn create_guest_stdout_file() -> std::result::Result<GuestTempFile, ExecutionError> {
     let path = guest_temp_file_path("stdout");
     let file = fs::OpenOptions::new()
@@ -6287,6 +6507,7 @@ fn guest_temp_file_path(kind: &str) -> PathBuf {
     path
 }
 
+#[cfg(test)]
 fn read_guest_stdout_file(
     path: &Path,
     max_stdout_bytes: usize,
@@ -7481,6 +7702,7 @@ fn classify_resource_limit(error: &wasmtime::Error) -> Option<ResourceLimitKind>
     })
 }
 
+#[cfg(test)]
 fn split_guest_stdout(function_name: &str, stdout: Bytes) -> Bytes {
     let output = String::from_utf8_lossy(&stdout);
     let mut response = String::new();
@@ -7508,6 +7730,102 @@ fn parse_guest_log_line(line: &str) -> Option<GuestLogRecord> {
     serde_json::from_str::<GuestLogRecord>(line).ok()
 }
 
+fn flush_async_guest_output(state: &mut AsyncGuestOutputState) {
+    if state.pending.is_empty() {
+        return;
+    }
+
+    let segment = std::mem::take(&mut state.pending);
+    handle_async_guest_segment(state, &segment);
+}
+
+fn handle_async_guest_segment(state: &mut AsyncGuestOutputState, segment: &[u8]) {
+    let text = String::from_utf8_lossy(segment);
+    let line = trim_line_endings(&text);
+    if line.is_empty() {
+        if state.capture_response {
+            append_async_guest_response(state, segment);
+        }
+        return;
+    }
+
+    if let Some(record) = parse_guest_log_line(line) {
+        enqueue_structured_guest_log(state, record);
+        return;
+    }
+
+    if state.capture_response {
+        append_async_guest_response(state, segment);
+    } else {
+        enqueue_raw_guest_log(state, line.to_owned());
+    }
+}
+
+fn append_async_guest_response(state: &mut AsyncGuestOutputState, segment: &[u8]) {
+    if state.response_overflowed {
+        return;
+    }
+
+    state.response.extend_from_slice(segment);
+    if state.response.len() > state.max_response_bytes {
+        state.response_overflowed = true;
+    }
+}
+
+fn enqueue_structured_guest_log(state: &AsyncGuestOutputState, record: GuestLogRecord) {
+    let message = record
+        .fields
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("guest emitted a structured log")
+        .to_owned();
+    enqueue_async_guest_log(
+        state,
+        record.level,
+        message,
+        record.target,
+        Some(Value::Object(record.fields)),
+    );
+}
+
+fn enqueue_raw_guest_log(state: &AsyncGuestOutputState, message: String) {
+    let level = match state.stream_type {
+        Some(GuestLogStreamType::Stderr) => "error",
+        _ => "info",
+    };
+    enqueue_async_guest_log(state, level.to_owned(), message, None, None);
+}
+
+fn enqueue_async_guest_log(
+    state: &AsyncGuestOutputState,
+    level: String,
+    message: String,
+    guest_target: Option<String>,
+    structured_fields: Option<Value>,
+) {
+    let Some(sender) = &state.sender else {
+        return;
+    };
+    let Some(stream_type) = state.stream_type else {
+        return;
+    };
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default();
+
+    let _ = sender.try_send(AsyncLogEntry {
+        target_name: state.function_name.clone(),
+        timestamp_unix_ms,
+        stream_type,
+        level,
+        message,
+        guest_target,
+        structured_fields,
+    });
+}
+
+#[cfg(test)]
 fn forward_guest_log(function_name: &str, record: GuestLogRecord) {
     let level = record.level.to_ascii_uppercase();
     let target = record.target.unwrap_or_else(|| "guest".to_owned());
@@ -8337,6 +8655,10 @@ mod tests {
         T::decode(framed).expect("protobuf payload should decode")
     }
 
+    fn test_log_sender() -> mpsc::Sender<AsyncLogEntry> {
+        disconnected_log_sender()
+    }
+
     fn build_test_engine(config: &IntegrityConfig) -> Engine {
         build_engine(config, false).expect("engine should be created")
     }
@@ -8466,9 +8788,11 @@ mod tests {
         telemetry: TelemetryHandle,
         manifest_path: PathBuf,
     ) -> AppState {
+        let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
         let state = AppState {
             runtime: Arc::new(ArcSwap::from_pointee(build_test_runtime(config))),
             http_client: Client::new(),
+            async_log_sender,
             secrets_vault: SecretsVault::load(),
             host_identity: test_host_identity(21),
             uds_fast_path: Arc::new(new_uds_fast_path_registry()),
@@ -8488,6 +8812,7 @@ mod tests {
         )
         .expect("test runtime should prewarm successfully");
         drop(runtime);
+        spawn_async_log_exporter(state.clone(), async_log_receiver);
         state
     }
 
@@ -8517,6 +8842,132 @@ mod tests {
                 eviction_policy: None,
             }],
         }
+    }
+
+    fn logger_test_route(host_path: &std::path::Path) -> IntegrityRoute {
+        IntegrityRoute {
+            path: SYSTEM_LOGGER_ROUTE.to_owned(),
+            role: RouteRole::System,
+            name: "system-faas-logger".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            resiliency: None,
+            models: Vec::new(),
+            domains: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
+                host_path: host_path.display().to_string(),
+                guest_path: "/app/data".to_owned(),
+                readonly: false,
+                ttl_seconds: None,
+                idle_timeout: None,
+                eviction_policy: None,
+            }],
+        }
+    }
+
+    fn log_storm_test_route() -> IntegrityRoute {
+        let mut route = IntegrityRoute::user("/api/guest-log-storm");
+        route.name = "guest-log-storm".to_owned();
+        route
+    }
+
+    fn execute_legacy_guest_with_sync_file_capture(
+        engine: &Engine,
+        function_name: &str,
+        body: Bytes,
+        route: &IntegrityRoute,
+        execution: &GuestExecutionContext,
+    ) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
+        let (module_path, module) = resolve_legacy_guest_module(engine, function_name)?;
+        let linker = build_linker(engine)?;
+        let stdin_file = create_guest_stdin_file(&body)?;
+        let stdout_file = create_guest_stdout_file()?;
+        let stdout_path = stdout_file.path.clone();
+        let mut wasi = WasiCtxBuilder::new();
+        wasi.arg(legacy_guest_program_name(&module_path))
+            .stdin(InputFile::new(stdin_file.file.try_clone().map_err(
+                |error| {
+                    guest_execution_error(error.into(), "failed to clone guest stdin file handle")
+                },
+            )?))
+            .stderr(AsyncGuestOutputCapture::new(
+                format!("{function_name}-sync-benchmark"),
+                GuestLogStreamType::Stderr,
+                disconnected_log_sender(),
+                false,
+                0,
+            ));
+
+        if let Some(module_dir) = module_path.parent() {
+            wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
+                .map_err(|error| {
+                    guest_execution_error(
+                        error,
+                        format!(
+                            "failed to preopen guest module directory {}",
+                            module_dir.display()
+                        ),
+                    )
+                })?;
+        }
+
+        preopen_route_volumes(&mut wasi, route)?;
+
+        let stdout_clone = stdout_file.file.try_clone().map_err(|error| {
+            guest_execution_error(
+                error.into(),
+                "failed to clone sync benchmark stdout file handle",
+            )
+        })?;
+        wasi.stdout(OutputFile::new(stdout_clone));
+        let wasi = wasi.build_p1();
+        let mut store = Store::new(
+            engine,
+            LegacyHostState::new(
+                wasi,
+                execution.config.guest_memory_limit_bytes,
+                #[cfg(feature = "ai-inference")]
+                Arc::clone(&execution.ai_runtime),
+            ),
+        );
+        store.limiter(|state| &mut state.limits);
+        maybe_set_guest_fuel_budget(&mut store, execution)?;
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|error| guest_execution_error(error, "failed to instantiate guest module"))?;
+        let (entrypoint_name, entrypoint) = resolve_guest_entrypoint(&mut store, &instance)
+            .map_err(|error| {
+                guest_execution_error(
+                    error,
+                    "failed to resolve exported function `faas_entry` or `_start`",
+                )
+            })?;
+
+        let call_result = entrypoint.call(&mut store, ());
+        let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
+        handle_guest_entrypoint_result(entrypoint_name, call_result)?;
+        stdout_file.file.sync_all().map_err(|error| {
+            guest_execution_error(
+                error.into(),
+                "failed to flush guest stdout temp file to disk",
+            )
+        })?;
+        let stdout_bytes = read_guest_stdout_file(&stdout_path, execution.config.max_stdout_bytes)?;
+
+        Ok(GuestExecutionOutcome {
+            output: GuestExecutionOutput::LegacyStdout(split_guest_stdout(
+                function_name,
+                stdout_bytes,
+            )),
+            fuel_consumed,
+        })
     }
 
     fn scoped_volume_test_route(
@@ -9032,6 +9483,7 @@ mod tests {
                 config,
                 sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                async_log_sender: test_log_sender(),
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(30),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
@@ -9074,6 +9526,7 @@ mod tests {
                 config,
                 sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                async_log_sender: test_log_sender(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(31),
@@ -9118,6 +9571,7 @@ mod tests {
                 config,
                 sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                async_log_sender: test_log_sender(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(32),
@@ -9171,6 +9625,7 @@ mod tests {
                 config,
                 sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                async_log_sender: test_log_sender(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(35),
@@ -9222,6 +9677,7 @@ mod tests {
                 config: config.clone(),
                 sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                async_log_sender: test_log_sender(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(32),
@@ -9254,6 +9710,7 @@ mod tests {
                 config: config.clone(),
                 sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                async_log_sender: test_log_sender(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(33),
@@ -9438,6 +9895,151 @@ mod tests {
         let _ = connection_task.await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_logger_exports_log_storm_without_leaking_logs_into_response() {
+        let log_dir = unique_test_dir("tachyon-async-logger");
+        let config = validate_integrity_config(IntegrityConfig {
+            routes: vec![log_storm_test_route(), logger_test_route(&log_dir)],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("async logger config should validate");
+        let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
+
+        let response = app
+            .oneshot(
+                Request::post("/api/guest-log-storm")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        assert_eq!(String::from_utf8_lossy(&body).trim(), "storm-complete");
+
+        let log_file = log_dir.join("guest-logs.ndjson");
+        for _ in 0..30 {
+            if log_file.exists()
+                && fs::metadata(&log_file)
+                    .map(|metadata| metadata.len() > 0)
+                    .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let contents = fs::read_to_string(&log_file).expect("logger output should exist");
+        assert!(contents.contains("\"target_name\":\"guest-log-storm\""));
+        assert!(contents.contains("\"message\":\"storm-"));
+
+        let _ = fs::remove_dir_all(log_dir);
+    }
+
+    #[test]
+    #[ignore = "manual performance comparison for async logging validation"]
+    fn async_log_capture_is_faster_than_sync_file_capture() {
+        let route = log_storm_test_route();
+        let config = validate_integrity_config(IntegrityConfig {
+            max_stdout_bytes: 16 * 1024 * 1024,
+            routes: vec![route.clone()],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("benchmark config should validate");
+        let engine = build_test_engine(&config);
+        let async_execution = GuestExecutionContext {
+            config: config.clone(),
+            sampled_execution: false,
+            runtime_telemetry: telemetry::init_test_telemetry(),
+            async_log_sender: test_log_sender(),
+            secret_access: SecretAccess::default(),
+            request_headers: HeaderMap::new(),
+            host_identity: test_host_identity(44),
+            storage_broker: Arc::new(StorageBrokerManager::default()),
+            telemetry: None,
+            concurrency_limits: build_concurrency_limits(&config),
+            propagated_headers: Vec::new(),
+            #[cfg(feature = "ai-inference")]
+            ai_runtime: test_ai_runtime(&config),
+        };
+
+        let request = GuestRequest::new("POST", "/api/guest-log-storm", Bytes::new());
+
+        let async_start = Instant::now();
+        let async_result = execute_guest(
+            &engine,
+            "guest-log-storm",
+            request.clone(),
+            &route,
+            async_execution,
+        )
+        .expect("async log capture should succeed");
+        let async_elapsed = async_start.elapsed();
+
+        let sync_execution = GuestExecutionContext {
+            config: config.clone(),
+            sampled_execution: false,
+            runtime_telemetry: telemetry::init_test_telemetry(),
+            async_log_sender: test_log_sender(),
+            secret_access: SecretAccess::default(),
+            request_headers: HeaderMap::new(),
+            host_identity: test_host_identity(45),
+            storage_broker: Arc::new(StorageBrokerManager::default()),
+            telemetry: None,
+            concurrency_limits: build_concurrency_limits(&config),
+            propagated_headers: Vec::new(),
+            #[cfg(feature = "ai-inference")]
+            ai_runtime: test_ai_runtime(&config),
+        };
+        let sync_start = Instant::now();
+        let sync_result = execute_legacy_guest_with_sync_file_capture(
+            &engine,
+            "guest-log-storm",
+            request.body,
+            &route,
+            &sync_execution,
+        )
+        .expect("sync log capture should succeed");
+        let sync_elapsed = sync_start.elapsed();
+
+        let GuestExecutionOutcome {
+            output: GuestExecutionOutput::LegacyStdout(async_stdout),
+            ..
+        } = async_result
+        else {
+            panic!("async benchmark should return legacy stdout");
+        };
+        let GuestExecutionOutcome {
+            output: GuestExecutionOutput::LegacyStdout(sync_stdout),
+            ..
+        } = sync_result
+        else {
+            panic!("sync benchmark should return legacy stdout");
+        };
+
+        assert_eq!(
+            String::from_utf8_lossy(&async_stdout).trim(),
+            "storm-complete"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&sync_stdout).trim(),
+            "storm-complete"
+        );
+        eprintln!(
+            "guest-log-storm benchmark: async_capture={async_elapsed:?}, sync_file_capture={sync_elapsed:?}"
+        );
+        assert!(
+            async_elapsed < sync_elapsed,
+            "expected async capture to beat sync file capture (async={async_elapsed:?}, sync={sync_elapsed:?})"
+        );
+    }
+
     #[tokio::test]
     async fn router_rejects_exhausted_hop_limit_header() {
         let app = build_app(build_test_state(
@@ -9508,6 +10110,7 @@ mod tests {
         let app = build_app(AppState {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             http_client: Client::new(),
+            async_log_sender: test_log_sender(),
             secrets_vault: SecretsVault::load(),
             host_identity: test_host_identity(22),
             uds_fast_path: Arc::new(new_uds_fast_path_registry()),
@@ -9556,6 +10159,7 @@ mod tests {
                 config,
                 sampled_execution: false,
                 runtime_telemetry: telemetry::init_test_telemetry(),
+                async_log_sender: test_log_sender(),
                 secret_access: SecretAccess::default(),
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(34),

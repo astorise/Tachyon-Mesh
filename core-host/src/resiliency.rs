@@ -153,7 +153,9 @@ mod tests {
         RouteExecutionResult {
             response: super::super::GuestHttpResponse {
                 status,
+                headers: Vec::new(),
                 body: Bytes::from(body.to_owned()),
+                trailers: Vec::new(),
             },
             fuel_consumed: None,
         }

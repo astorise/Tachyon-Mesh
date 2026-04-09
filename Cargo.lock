@@ -2283,6 +2283,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-log-storm"
+version = "0.1.0"
+
+[[package]]
 name = "guest-loop"
 version = "0.1.0"
 
@@ -5421,6 +5425,15 @@ dependencies = [
 name = "system-faas-keda"
 version = "0.1.0"
 dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "system-faas-logger"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "wit-bindgen 0.46.0",
 ]
 
