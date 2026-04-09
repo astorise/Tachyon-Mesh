@@ -1,0 +1,351 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+mod bindings {
+    use super::Component;
+
+    wit_bindgen::generate!({
+        path: "../wit",
+        world: "control-plane-faas",
+    });
+
+    export!(Component);
+}
+
+use serde::{Deserialize, Serialize};
+
+const STEER_ROUTE_ENV: &str = "STEER_ROUTE";
+const PEER_URLS_ENV: &str = "PEER_URLS";
+const BUFFER_ROUTE_ENV: &str = "BUFFER_ROUTE";
+const SOFT_LIMIT_ENV: &str = "SOFT_LIMIT";
+const RECOVER_LIMIT_ENV: &str = "RECOVER_LIMIT";
+const SATURATED_LIMIT_ENV: &str = "SATURATED_LIMIT";
+const GOSSIP_PATH_ENV: &str = "GOSSIP_PATH";
+const DEFAULT_BUFFER_ROUTE: &str = "/system/buffer";
+const DEFAULT_GOSSIP_PATH: &str = "/system/gossip";
+const DEFAULT_SOFT_LIMIT: u8 = 85;
+const DEFAULT_RECOVER_LIMIT: u8 = 60;
+const DEFAULT_SATURATED_LIMIT: u8 = 95;
+
+static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct Component;
+
+impl bindings::Guest for Component {
+    fn on_tick() {
+        if let Err(error) = evaluate_cluster_pressure() {
+            eprintln!("system-faas-gossip tick failed: {error}");
+        }
+    }
+}
+
+impl bindings::exports::tachyon::mesh::handler::Guest for Component {
+    fn handle_request(
+        _req: bindings::exports::tachyon::mesh::handler::Request,
+    ) -> bindings::exports::tachyon::mesh::handler::Response {
+        let snapshot = local_snapshot();
+        match serde_json::to_vec(&snapshot) {
+            Ok(body) => response(200, body, &[("content-type", "application/json")]),
+            Err(error) => response(
+                500,
+                format!("failed to encode gossip snapshot: {error}").into_bytes(),
+                &[],
+            ),
+        }
+    }
+}
+
+fn evaluate_cluster_pressure() -> Result<(), String> {
+    let steer_route = normalize_route(&required_env(STEER_ROUTE_ENV)?)?;
+    let buffer_route = normalize_route(&env_or_default(BUFFER_ROUTE_ENV, DEFAULT_BUFFER_ROUTE))?;
+    let soft_limit = parse_limit(SOFT_LIMIT_ENV, DEFAULT_SOFT_LIMIT)?;
+    let recover_limit = parse_limit(RECOVER_LIMIT_ENV, DEFAULT_RECOVER_LIMIT)?;
+    let saturated_limit = parse_limit(SATURATED_LIMIT_ENV, DEFAULT_SATURATED_LIMIT)?;
+    let local = local_snapshot();
+    let local_pressure = local.effective_pressure();
+
+    if local_pressure <= recover_limit {
+        bindings::tachyon::mesh::routing_control::update_target(&steer_route, &steer_route)?;
+        return Ok(());
+    }
+
+    if local_pressure < soft_limit {
+        return Ok(());
+    }
+
+    let peers = fetch_peer_snapshots()?;
+    let healthy_peers = peers
+        .into_iter()
+        .filter(|peer| peer.snapshot.effective_pressure() < saturated_limit)
+        .collect::<Vec<_>>();
+
+    if healthy_peers.is_empty() {
+        bindings::tachyon::mesh::routing_control::update_target(&steer_route, &buffer_route)?;
+        return Ok(());
+    }
+
+    let Some(choice) = power_of_two_choices(&healthy_peers) else {
+        return Ok(());
+    };
+
+    if choice.snapshot.effective_pressure() >= local_pressure && local_pressure < saturated_limit {
+        return Ok(());
+    }
+
+    bindings::tachyon::mesh::routing_control::update_target(
+        &steer_route,
+        &format!("{}{}", choice.base_url, steer_route),
+    )
+}
+
+fn fetch_peer_snapshots() -> Result<Vec<PeerCandidate>, String> {
+    let gossip_path = env_or_default(GOSSIP_PATH_ENV, DEFAULT_GOSSIP_PATH);
+    let peers = parse_peer_entries(
+        &std::env::var(PEER_URLS_ENV).unwrap_or_default(),
+        &gossip_path,
+    );
+    let mut snapshots = Vec::new();
+    for peer in peers {
+        let response = bindings::tachyon::mesh::outbound_http::send_request(
+            "GET",
+            &peer.snapshot_url,
+            &[],
+            &[],
+        )?;
+        if response.status >= 400 {
+            continue;
+        }
+        if let Ok(snapshot) = serde_json::from_slice::<TelemetrySnapshot>(&response.body) {
+            snapshots.push(PeerCandidate {
+                base_url: peer.base_url,
+                snapshot,
+            });
+        }
+    }
+    Ok(snapshots)
+}
+
+fn local_snapshot() -> TelemetrySnapshot {
+    let snapshot = bindings::tachyon::mesh::telemetry_reader::get_metrics();
+    TelemetrySnapshot {
+        total_requests: snapshot.total_requests,
+        completed_requests: snapshot.completed_requests,
+        error_requests: snapshot.error_requests,
+        active_requests: snapshot.active_requests,
+        cpu_pressure: snapshot.cpu_pressure,
+        ram_pressure: snapshot.ram_pressure,
+        active_instances: snapshot.active_instances,
+        allocated_memory_pages: snapshot.allocated_memory_pages,
+        dropped_events: snapshot.dropped_events,
+        last_status: snapshot.last_status,
+        total_duration_us: snapshot.total_duration_us,
+        total_wasm_duration_us: snapshot.total_wasm_duration_us,
+        total_host_overhead_us: snapshot.total_host_overhead_us,
+    }
+}
+
+fn power_of_two_choices(peers: &[PeerCandidate]) -> Option<&PeerCandidate> {
+    if peers.is_empty() {
+        return None;
+    }
+    if peers.len() == 1 {
+        return peers.first();
+    }
+
+    let seed = TICK_COUNTER.fetch_add(1, Ordering::Relaxed) as usize;
+    let first = &peers[seed % peers.len()];
+    let second = &peers[(seed + 1) % peers.len()];
+    Some(prefer_healthier_peer(first, second))
+}
+
+fn prefer_healthier_peer<'a>(
+    left: &'a PeerCandidate,
+    right: &'a PeerCandidate,
+) -> &'a PeerCandidate {
+    let left_score = left.snapshot.effective_pressure();
+    let right_score = right.snapshot.effective_pressure();
+    match left_score.cmp(&right_score) {
+        std::cmp::Ordering::Less => left,
+        std::cmp::Ordering::Greater => right,
+        std::cmp::Ordering::Equal => {
+            if left.snapshot.active_requests <= right.snapshot.active_requests {
+                left
+            } else {
+                right
+            }
+        }
+    }
+}
+
+fn parse_peer_entries(value: &str, gossip_path: &str) -> Vec<PeerEndpoint> {
+    value
+        .split(',')
+        .filter_map(|entry| {
+            let trimmed = entry.trim().trim_end_matches('/');
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            let normalized_gossip = normalize_route(gossip_path).ok()?;
+            if trimmed.ends_with(&normalized_gossip) {
+                let base_url = trimmed
+                    .strip_suffix(&normalized_gossip)
+                    .unwrap_or(trimmed)
+                    .trim_end_matches('/')
+                    .to_owned();
+                return Some(PeerEndpoint {
+                    base_url: base_url.clone(),
+                    snapshot_url: format!("{base_url}{normalized_gossip}"),
+                });
+            }
+
+            Some(PeerEndpoint {
+                base_url: trimmed.to_owned(),
+                snapshot_url: format!("{trimmed}{normalized_gossip}"),
+            })
+        })
+        .collect()
+}
+
+fn normalize_route(route: &str) -> Result<String, String> {
+    let trimmed = route.trim();
+    if trimmed.is_empty() {
+        return Err("route must not be empty".to_owned());
+    }
+    Ok(if trimmed.starts_with('/') {
+        trimmed.trim_end_matches('/').to_owned()
+    } else {
+        format!("/{}", trimmed.trim_end_matches('/'))
+    })
+}
+
+fn required_env(name: &str) -> Result<String, String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing required environment variable `{name}`"))
+}
+
+fn env_or_default(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn parse_limit(name: &str, default: u8) -> Result<u8, String> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u8>()
+            .map_err(|error| format!("failed to parse `{name}` as u8: {error}")),
+        _ => Ok(default),
+    }
+}
+
+fn response(
+    status: u16,
+    body: impl Into<Vec<u8>>,
+    headers: &[(&str, &str)],
+) -> bindings::exports::tachyon::mesh::handler::Response {
+    bindings::exports::tachyon::mesh::handler::Response {
+        status,
+        headers: headers
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+        body: body.into(),
+        trailers: vec![],
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PeerEndpoint {
+    base_url: String,
+    snapshot_url: String,
+}
+
+#[derive(Clone, Debug)]
+struct PeerCandidate {
+    base_url: String,
+    snapshot: TelemetrySnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TelemetrySnapshot {
+    total_requests: u64,
+    completed_requests: u64,
+    error_requests: u64,
+    active_requests: u32,
+    cpu_pressure: u8,
+    ram_pressure: u8,
+    active_instances: u32,
+    allocated_memory_pages: u32,
+    dropped_events: u64,
+    last_status: u16,
+    total_duration_us: u64,
+    total_wasm_duration_us: u64,
+    total_host_overhead_us: u64,
+}
+
+impl TelemetrySnapshot {
+    fn effective_pressure(&self) -> u8 {
+        self.cpu_pressure.max(self.ram_pressure)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(cpu: u8, ram: u8, active_requests: u32) -> TelemetrySnapshot {
+        TelemetrySnapshot {
+            total_requests: 0,
+            completed_requests: 0,
+            error_requests: 0,
+            active_requests,
+            cpu_pressure: cpu,
+            ram_pressure: ram,
+            active_instances: 0,
+            allocated_memory_pages: 0,
+            dropped_events: 0,
+            last_status: 0,
+            total_duration_us: 0,
+            total_wasm_duration_us: 0,
+            total_host_overhead_us: 0,
+        }
+    }
+
+    #[test]
+    fn peer_entries_accept_base_urls_and_full_paths() {
+        let peers = parse_peer_entries(
+            "http://node-a:8080, http://node-b:8080/system/gossip",
+            "/system/gossip",
+        );
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].base_url, "http://node-a:8080");
+        assert_eq!(peers[0].snapshot_url, "http://node-a:8080/system/gossip");
+        assert_eq!(peers[1].base_url, "http://node-b:8080");
+        assert_eq!(peers[1].snapshot_url, "http://node-b:8080/system/gossip");
+    }
+
+    #[test]
+    fn p2c_prefers_lower_pressure_then_lower_activity() {
+        TICK_COUNTER.store(0, Ordering::Relaxed);
+        let peers = vec![
+            PeerCandidate {
+                base_url: "http://node-a".to_owned(),
+                snapshot: snapshot(90, 40, 10),
+            },
+            PeerCandidate {
+                base_url: "http://node-b".to_owned(),
+                snapshot: snapshot(30, 20, 5),
+            },
+        ];
+
+        let choice = power_of_two_choices(&peers).expect("a peer should be selected");
+        assert_eq!(choice.base_url, "http://node-b");
+    }
+}

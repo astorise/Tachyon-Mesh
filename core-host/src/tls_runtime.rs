@@ -248,6 +248,8 @@ impl TlsManager {
         let host_identity = Arc::clone(&state.host_identity);
         let storage_broker = Arc::clone(&state.storage_broker);
         let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+        let route_overrides = Arc::clone(&state.route_overrides);
+        let host_load = Arc::clone(&state.host_load);
         let async_log_sender = state.async_log_sender.clone();
         #[cfg(feature = "ai-inference")]
         let ai_runtime = Arc::clone(&runtime.ai_runtime);
@@ -270,6 +272,8 @@ impl TlsManager {
                     telemetry: None,
                     concurrency_limits,
                     propagated_headers: Vec::new(),
+                    route_overrides,
+                    host_load,
                     #[cfg(feature = "ai-inference")]
                     ai_runtime,
                 },

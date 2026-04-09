@@ -52,6 +52,10 @@ interface telemetry-reader {
         completed-requests: u64,
         error-requests: u64,
         active-requests: u32,
+        cpu-pressure: u8,
+        ram-pressure: u8,
+        active-instances: u32,
+        allocated-memory-pages: u32,
         dropped-events: u64,
         last-status: u16,
         total-duration-us: u64,
@@ -87,6 +91,10 @@ interface outbound-http {
     }
 
     send-request: func(method: string, url: string, headers: headers, body: list<u8>) -> result<response, string>;
+}
+
+interface routing-control {
+    update-target: func(route-path: string, destination: string) -> result<_, string>;
 }
 
 interface secrets-vault {
@@ -125,6 +133,17 @@ world system-faas-guest {
 
 world background-system-faas {
     import scaling-metrics;
+    import telemetry-reader;
     import outbound-http;
+    import routing-control;
+    export on-tick: func();
+}
+
+world control-plane-faas {
+    import telemetry-reader;
+    import scaling-metrics;
+    import outbound-http;
+    import routing-control;
+    export handler;
     export on-tick: func();
 }
