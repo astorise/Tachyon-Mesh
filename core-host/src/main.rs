@@ -73,6 +73,9 @@ mod ai_inference;
 mod rate_limit;
 #[cfg(feature = "resiliency")]
 mod resiliency;
+#[cfg(feature = "http3")]
+mod server_h3;
+mod store;
 mod telemetry;
 mod tls_runtime;
 
@@ -202,6 +205,22 @@ fn unix_timestamp_seconds() -> Result<u64> {
         .as_secs())
 }
 
+fn core_store_path(manifest_path: &Path) -> PathBuf {
+    manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("tachyon.db")
+}
+
+async fn open_core_store_for_manifest(manifest_path: &Path) -> Result<Arc<store::CoreStore>> {
+    let manifest_path = manifest_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        store::CoreStore::open(&core_store_path(&manifest_path)).map(Arc::new)
+    })
+    .await
+    .context("core store initialization task failed")?
+}
+
 fn forbidden_error(message: &str) -> String {
     format!("forbidden:{message}")
 }
@@ -236,6 +255,7 @@ struct AppState {
     host_identity: Arc<HostIdentity>,
     uds_fast_path: Arc<UdsFastPathRegistry>,
     storage_broker: Arc<StorageBrokerManager>,
+    core_store: Arc<store::CoreStore>,
     volume_manager: Arc<VolumeManager>,
     telemetry: TelemetryHandle,
     tls_manager: Arc<tls_runtime::TlsManager>,
@@ -277,6 +297,12 @@ struct UdpLayer4ListenerHandle {
 
 struct HttpsListenerHandle {
     #[cfg_attr(not(test), allow(dead_code))]
+    local_addr: SocketAddr,
+    join_handle: tokio::task::JoinHandle<()>,
+}
+
+struct Http3ListenerHandle {
+    #[allow(dead_code)]
     local_addr: SocketAddr,
     join_handle: tokio::task::JoinHandle<()>,
 }
@@ -1034,13 +1060,15 @@ struct RouteExecutionControl {
     prewarmed_instances: AtomicUsize,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct StorageBrokerManager {
+    core_store: Arc<store::CoreStore>,
     queues: Arc<Mutex<HashMap<PathBuf, Arc<StorageVolumeQueue>>>>,
 }
 
 struct StorageVolumeQueue {
     volume_root: PathBuf,
+    core_store: Arc<store::CoreStore>,
     sender: std::sync::mpsc::Sender<StorageBrokerOperation>,
     state: Mutex<StorageVolumeQueueState>,
     idle: Condvar,
@@ -1419,13 +1447,15 @@ async fn run() -> Result<()> {
 }
 
 async fn serve_host() -> Result<()> {
+    let manifest_path = integrity_manifest_path();
     let (export_sender, export_receiver) = mpsc::channel(TELEMETRY_EXPORT_QUEUE_CAPACITY);
     let telemetry =
         telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
     let runtime = build_runtime_state(verify_integrity()?)?;
+    let core_store = open_core_store_for_manifest(&manifest_path).await?;
     let host_identity = Arc::new(HostIdentity::generate());
     let uds_fast_path = Arc::new(new_uds_fast_path_registry());
-    let storage_broker = Arc::new(StorageBrokerManager::default());
+    let storage_broker = Arc::new(StorageBrokerManager::new(Arc::clone(&core_store)));
     let background_workers = Arc::new(BackgroundWorkerManager::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
@@ -1445,12 +1475,14 @@ async fn serve_host() -> Result<()> {
         host_identity,
         uds_fast_path: Arc::clone(&uds_fast_path),
         storage_broker,
+        core_store,
         volume_manager: Arc::new(VolumeManager::default()),
         telemetry,
         tls_manager,
-        manifest_path: integrity_manifest_path(),
+        manifest_path,
         background_workers: Arc::clone(&background_workers),
     };
+    state.tls_manager.prime_from_store(&state).await?;
     prewarm_runtime_routes(
         &runtime,
         state.telemetry.clone(),
@@ -1464,6 +1496,7 @@ async fn serve_host() -> Result<()> {
     spawn_volume_gc_sweeper(state.clone());
     let app = build_app(state.clone());
     let https_listener = start_https_listener(state.clone(), app.clone()).await?;
+    let http3_listener = start_http3_listener(state.clone(), app.clone()).await?;
     let udp_layer4_listeners = start_udp_layer4_listeners(state.clone()).await?;
     let tcp_layer4_listeners = start_tcp_layer4_listeners(state).await?;
     let uds_server = start_uds_fast_path_listener(app.clone(), &runtime.config, uds_fast_path)?;
@@ -1489,6 +1522,10 @@ async fn serve_host() -> Result<()> {
         let _ = server.await;
     }
     if let Some(listener) = https_listener {
+        listener.join_handle.abort();
+        let _ = listener.join_handle.await;
+    }
+    if let Some(listener) = http3_listener {
         listener.join_handle.abort();
         let _ = listener.join_handle.await;
     }
@@ -1759,6 +1796,13 @@ fn wait_for_background_tick(stop_requested: &AtomicBool) -> bool {
 }
 
 impl StorageBrokerManager {
+    fn new(core_store: Arc<store::CoreStore>) -> Self {
+        Self {
+            core_store,
+            queues: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     #[cfg(test)]
     fn enqueue_write_for_route(
         &self,
@@ -1839,7 +1883,7 @@ impl StorageBrokerManager {
         Arc::clone(
             queues
                 .entry(key.clone())
-                .or_insert_with(|| StorageVolumeQueue::new(key)),
+                .or_insert_with(|| StorageVolumeQueue::new(key, Arc::clone(&self.core_store))),
         )
     }
 
@@ -1849,11 +1893,21 @@ impl StorageBrokerManager {
     }
 }
 
+impl Default for StorageBrokerManager {
+    fn default() -> Self {
+        let path = std::env::temp_dir().join(format!("tachyon-store-{}.db", Uuid::new_v4()));
+        let core_store =
+            store::CoreStore::open(&path).expect("default storage broker core store should open");
+        Self::new(Arc::new(core_store))
+    }
+}
+
 impl StorageVolumeQueue {
-    fn new(volume_root: PathBuf) -> Arc<Self> {
+    fn new(volume_root: PathBuf, core_store: Arc<store::CoreStore>) -> Arc<Self> {
         let (sender, receiver) = std::sync::mpsc::channel::<StorageBrokerOperation>();
         let queue = Arc::new(Self {
             volume_root,
+            core_store,
             sender,
             state: Mutex::new(StorageVolumeQueueState::default()),
             idle: Condvar::new(),
@@ -1898,7 +1952,7 @@ impl StorageVolumeQueue {
                     }
                 }
                 StorageBrokerOperation::Snapshot(request) => {
-                    let result = process_storage_snapshot_request(&request)
+                    let result = process_storage_snapshot_request(&request, &self.core_store)
                         .map_err(|error| format!("{error:#}"));
                     if let Err(error) = &result {
                         tracing::warn!(
@@ -1910,7 +1964,7 @@ impl StorageVolumeQueue {
                     let _ = request.completion.send(result);
                 }
                 StorageBrokerOperation::Restore(request) => {
-                    let result = process_storage_restore_request(&request)
+                    let result = process_storage_restore_request(&request, &self.core_store)
                         .map_err(|error| format!("{error:#}"));
                     if let Err(error) = &result {
                         tracing::warn!(
@@ -2517,13 +2571,39 @@ fn process_storage_write_request(request: &StorageBrokerWriteRequest) -> Result<
     }
 }
 
-fn process_storage_snapshot_request(request: &StorageBrokerSnapshotRequest) -> Result<()> {
-    copy_directory_tree(&request.source_path, &request.snapshot_path)?;
+fn process_storage_snapshot_request(
+    request: &StorageBrokerSnapshotRequest,
+    core_store: &store::CoreStore,
+) -> Result<()> {
+    let _ = &request.snapshot_path;
+    core_store
+        .snapshot_directory(&request.volume_id, &request.source_path)
+        .with_context(|| {
+            format!(
+                "failed to persist hibernation snapshot for volume `{}`",
+                request.volume_id
+            )
+        })?;
     remove_path_if_exists(&request.source_path)?;
     Ok(())
 }
 
-fn process_storage_restore_request(request: &StorageBrokerRestoreRequest) -> Result<()> {
+fn process_storage_restore_request(
+    request: &StorageBrokerRestoreRequest,
+    core_store: &store::CoreStore,
+) -> Result<()> {
+    let restored = core_store
+        .restore_directory(&request.volume_id, &request.destination_path)
+        .with_context(|| {
+            format!(
+                "failed to restore hibernation snapshot for volume `{}`",
+                request.volume_id
+            )
+        })?;
+    if restored {
+        return Ok(());
+    }
+
     copy_directory_tree(&request.snapshot_path, &request.destination_path)
 }
 
@@ -3316,7 +3396,15 @@ fn prewarm_legacy_route(
     function_name: &str,
     module_path: &Path,
 ) -> std::result::Result<(), ExecutionError> {
-    let (_, module) = resolve_legacy_guest_module(&runtime.engine, function_name)?;
+    let module = Module::from_file(&runtime.engine, module_path).map_err(|error| {
+        guest_execution_error(
+            error,
+            format!(
+                "failed to load legacy guest artifact during prewarm from {}",
+                module_path.display()
+            ),
+        )
+    })?;
     let linker = build_linker(&runtime.engine)?;
     let stdin_file = create_guest_stdin_file(&Bytes::new())?;
     let stdout_capture = AsyncGuestOutputCapture::new(
@@ -3741,6 +3829,19 @@ async fn handle_https_connection(
         .serve_connection_with_upgrades(TokioIo::new(tls_stream), TowerToHyperService::new(app))
         .await
         .map_err(|error| anyhow!("HTTPS connection exited unexpectedly: {error}"))
+}
+
+#[cfg(feature = "http3")]
+async fn start_http3_listener(state: AppState, app: Router) -> Result<Option<Http3ListenerHandle>> {
+    server_h3::start_http3_listener(state, app).await
+}
+
+#[cfg(not(feature = "http3"))]
+async fn start_http3_listener(
+    _state: AppState,
+    _app: Router,
+) -> Result<Option<Http3ListenerHandle>> {
+    Ok(None)
 }
 
 async fn start_udp_layer4_listeners(state: AppState) -> Result<Vec<UdpLayer4ListenerHandle>> {
@@ -4361,7 +4462,12 @@ fn execute_tcp_layer4_guest(
         #[cfg(feature = "ai-inference")]
         ai_runtime,
     };
-    let (module_path, module) = resolve_legacy_guest_module(engine, function_name)?;
+    let (module_path, module) = resolve_legacy_guest_module(
+        engine,
+        function_name,
+        &execution.storage_broker.core_store,
+        "default",
+    )?;
     execute_legacy_guest_with_stdio(
         engine,
         route,
@@ -5694,8 +5800,18 @@ fn execute_guest(
 
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
+    let cache_scope = if execution.sampled_execution {
+        "metered"
+    } else {
+        "default"
+    };
 
-    if let Ok(component) = Component::from_file(engine, &module_path) {
+    if let Ok(component) = load_component_with_core_store(
+        engine,
+        &module_path,
+        &execution.storage_broker.core_store,
+        cache_scope,
+    ) {
         let component_result = match route.role {
             RouteRole::User => execute_component_guest(
                 engine,
@@ -5723,7 +5839,12 @@ fn execute_guest(
         }
     }
 
-    let (module_path, module) = resolve_legacy_guest_module(engine, function_name)?;
+    let (module_path, module) = resolve_legacy_guest_module(
+        engine,
+        function_name,
+        &execution.storage_broker.core_store,
+        cache_scope,
+    )?;
 
     execute_legacy_guest(
         engine,
@@ -5736,9 +5857,69 @@ fn execute_guest(
     )
 }
 
+#[derive(Clone, Copy)]
+enum CompiledArtifactKind {
+    Component,
+    Module,
+}
+
+fn load_component_with_core_store(
+    engine: &Engine,
+    module_path: &Path,
+    core_store: &store::CoreStore,
+    cache_scope: &str,
+) -> Result<Component> {
+    let wasm_bytes = fs::read(module_path).with_context(|| {
+        format!(
+            "failed to read guest component artifact from {}",
+            module_path.display()
+        )
+    })?;
+    let cache_key = compiled_artifact_cache_key(
+        module_path,
+        &wasm_bytes,
+        CompiledArtifactKind::Component,
+        cache_scope,
+    );
+
+    if let Some(cached) = core_store
+        .get(store::CoreStoreBucket::CwasmCache, &cache_key)
+        .with_context(|| {
+            format!(
+                "failed to read cached component `{}`",
+                module_path.display()
+            )
+        })?
+    {
+        // SAFETY: cached bytes originate from Engine::precompile_component for this host.
+        if let Ok(component) = unsafe { Component::deserialize(engine, &cached) } {
+            return Ok(component);
+        }
+    }
+
+    let compiled = engine.precompile_component(&wasm_bytes).map_err(|error| {
+        anyhow!(
+            "failed to precompile guest component artifact from {}: {error}",
+            module_path.display()
+        )
+    })?;
+    core_store
+        .put(store::CoreStoreBucket::CwasmCache, &cache_key, &compiled)
+        .with_context(|| format!("failed to cache component `{}`", module_path.display()))?;
+    // SAFETY: compiled bytes were produced by Engine::precompile_component above.
+    unsafe { Component::deserialize(engine, &compiled) }.map_err(|error| {
+        anyhow!(
+            "failed to deserialize cached guest component from {}: {error}",
+            module_path.display()
+        )
+    })
+}
+
 fn resolve_legacy_guest_module(
     engine: &Engine,
     function_name: &str,
+    core_store: &store::CoreStore,
+    cache_scope: &str,
 ) -> std::result::Result<(PathBuf, Module), ExecutionError> {
     let candidates = guest_module_candidate_paths(function_name);
     let candidate_strings = candidates
@@ -5752,22 +5933,90 @@ fn resolve_legacy_guest_module(
             continue;
         }
 
-        match Module::from_file(engine, &candidate) {
+        match load_module_with_core_store(engine, &candidate, core_store, cache_scope) {
             Ok(module) => return Ok((normalize_path(candidate), module)),
             Err(error) => last_error = Some((normalize_path(candidate), error)),
         }
     }
 
     if let Some((path, error)) = last_error {
-        return Err(guest_execution_error(
-            error,
-            format!("failed to load guest artifact from {}", path.display()),
-        ));
+        return Err(ExecutionError::Internal(format!(
+            "failed to load guest artifact from {}: {error:#}",
+            path.display()
+        )));
     }
 
     Err(ExecutionError::GuestModuleNotFound(
         GuestModuleNotFound::new(function_name, format_candidate_list(&candidate_strings)),
     ))
+}
+
+fn load_module_with_core_store(
+    engine: &Engine,
+    module_path: &Path,
+    core_store: &store::CoreStore,
+    cache_scope: &str,
+) -> Result<Module> {
+    let wasm_bytes = fs::read(module_path).with_context(|| {
+        format!(
+            "failed to read guest module artifact from {}",
+            module_path.display()
+        )
+    })?;
+    let cache_key = compiled_artifact_cache_key(
+        module_path,
+        &wasm_bytes,
+        CompiledArtifactKind::Module,
+        cache_scope,
+    );
+
+    if let Some(cached) = core_store
+        .get(store::CoreStoreBucket::CwasmCache, &cache_key)
+        .with_context(|| format!("failed to read cached module `{}`", module_path.display()))?
+    {
+        // SAFETY: cached bytes originate from Engine::precompile_module for this host.
+        if let Ok(module) = unsafe { Module::deserialize(engine, &cached) } {
+            return Ok(module);
+        }
+    }
+
+    let compiled = engine.precompile_module(&wasm_bytes).map_err(|error| {
+        anyhow!(
+            "failed to precompile guest module artifact from {}: {error}",
+            module_path.display()
+        )
+    })?;
+    core_store
+        .put(store::CoreStoreBucket::CwasmCache, &cache_key, &compiled)
+        .with_context(|| format!("failed to cache module `{}`", module_path.display()))?;
+    // SAFETY: compiled bytes were produced by Engine::precompile_module above.
+    unsafe { Module::deserialize(engine, &compiled) }.map_err(|error| {
+        anyhow!(
+            "failed to deserialize cached guest module from {}: {error}",
+            module_path.display()
+        )
+    })
+}
+
+fn compiled_artifact_cache_key(
+    module_path: &Path,
+    wasm_bytes: &[u8],
+    kind: CompiledArtifactKind,
+    cache_scope: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(wasm_bytes);
+    let digest = hasher.finalize();
+    let kind = match kind {
+        CompiledArtifactKind::Component => "component",
+        CompiledArtifactKind::Module => "module",
+    };
+
+    format!(
+        "{kind}:{cache_scope}:{}:{}",
+        module_path.display(),
+        hex::encode(digest)
+    )
 }
 
 fn execute_component_guest(
@@ -5867,14 +6116,17 @@ fn execute_udp_layer4_guest(
 ) -> std::result::Result<Vec<UdpResponseDatagram>, ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
-    let component = Component::from_file(engine, &module_path).map_err(|error| {
-        guest_execution_error(
-            error,
-            format!(
-                "failed to load UDP guest component from {}",
-                module_path.display()
-            ),
-        )
+    let component = load_component_with_core_store(
+        engine,
+        &module_path,
+        &execution.storage_broker.core_store,
+        "default",
+    )
+    .map_err(|error| {
+        ExecutionError::Internal(format!(
+            "failed to load UDP guest component from {}: {error:#}",
+            module_path.display()
+        ))
     })?;
 
     execute_udp_component_guest(
@@ -5992,14 +6244,17 @@ fn execute_websocket_guest(
 ) -> std::result::Result<(), ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
-    let component = Component::from_file(engine, &module_path).map_err(|error| {
-        guest_execution_error(
-            error,
-            format!(
-                "failed to load WebSocket guest component from {}",
-                module_path.display()
-            ),
-        )
+    let component = load_component_with_core_store(
+        engine,
+        &module_path,
+        &execution.storage_broker.core_store,
+        "default",
+    )
+    .map_err(|error| {
+        ExecutionError::Internal(format!(
+            "failed to load WebSocket guest component from {}: {error:#}",
+            module_path.display()
+        ))
     })?;
 
     execute_websocket_component_guest(
@@ -9275,7 +9530,11 @@ mod tests {
     }
 
     fn build_test_state(config: IntegrityConfig, telemetry: TelemetryHandle) -> AppState {
-        build_test_state_with_manifest(config, telemetry, PathBuf::from("integrity.lock"))
+        build_test_state_with_manifest(
+            config,
+            telemetry,
+            unique_test_dir("integrity-manifest").join("integrity.lock"),
+        )
     }
 
     fn build_test_state_with_manifest(
@@ -9284,6 +9543,10 @@ mod tests {
         manifest_path: PathBuf,
     ) -> AppState {
         let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
+        let core_store = Arc::new(
+            store::CoreStore::open(&core_store_path(&manifest_path))
+                .expect("test core store should open"),
+        );
         let state = AppState {
             runtime: Arc::new(ArcSwap::from_pointee(build_test_runtime(config))),
             draining_runtimes: Arc::new(Mutex::new(Vec::new())),
@@ -9292,7 +9555,8 @@ mod tests {
             secrets_vault: SecretsVault::load(),
             host_identity: test_host_identity(21),
             uds_fast_path: Arc::new(new_uds_fast_path_registry()),
-            storage_broker: Arc::new(StorageBrokerManager::default()),
+            storage_broker: Arc::new(StorageBrokerManager::new(Arc::clone(&core_store))),
+            core_store,
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry,
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
@@ -9381,7 +9645,12 @@ mod tests {
         route: &IntegrityRoute,
         execution: &GuestExecutionContext,
     ) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
-        let (module_path, module) = resolve_legacy_guest_module(engine, function_name)?;
+        let (module_path, module) = resolve_legacy_guest_module(
+            engine,
+            function_name,
+            &execution.storage_broker.core_store,
+            "default",
+        )?;
         let linker = build_linker(engine)?;
         let stdin_file = create_guest_stdin_file(&body)?;
         let stdout_file = create_guest_stdout_file()?;
@@ -10792,6 +11061,11 @@ mod tests {
             ai_runtime: test_ai_runtime(&config),
             config,
         };
+        let core_store_manifest = unique_test_dir("app-state-manifest").join("integrity.lock");
+        let core_store = Arc::new(
+            store::CoreStore::open(&core_store_path(&core_store_manifest))
+                .expect("test core store should open"),
+        );
         let app = build_app(AppState {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             draining_runtimes: Arc::new(Mutex::new(Vec::new())),
@@ -10800,11 +11074,12 @@ mod tests {
             secrets_vault: SecretsVault::load(),
             host_identity: test_host_identity(22),
             uds_fast_path: Arc::new(new_uds_fast_path_registry()),
-            storage_broker: Arc::new(StorageBrokerManager::default()),
+            storage_broker: Arc::new(StorageBrokerManager::new(Arc::clone(&core_store))),
+            core_store,
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry: telemetry::init_test_telemetry(),
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
-            manifest_path: PathBuf::from("integrity.lock"),
+            manifest_path: core_store_manifest,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         });
 
@@ -11454,6 +11729,106 @@ mod tests {
 
         listener.join_handle.abort();
         let _ = listener.join_handle.await;
+        let _ = fs::remove_dir_all(cert_dir);
+    }
+
+    #[cfg(feature = "http3")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_listener_serves_guest_routes_over_quic() {
+        use bytes::Buf;
+        use h3::client;
+        use quinn::crypto::rustls::QuicClientConfig;
+
+        init_host_tracing();
+        let domain = "api.example.test";
+        let cert_dir = unique_test_dir("tachyon-cert-manager-http3");
+        let mut route = IntegrityRoute::user("/api/guest-example");
+        route.domains = vec![domain.to_owned()];
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: "127.0.0.1:8080".to_owned(),
+            tls_address: Some("127.0.0.1:0".to_owned()),
+            routes: vec![route, cert_manager_test_route(&cert_dir)],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("HTTP/3 config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let app = build_app(state.clone());
+        let listener = start_http3_listener(state.clone(), app)
+            .await
+            .expect("HTTP/3 listener should start")
+            .expect("HTTP/3 listener should be enabled");
+        let listener_addr = listener.local_addr;
+
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("HTTP/3 client protocol versions should build")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+        client_crypto.enable_early_data = true;
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(client_crypto).expect("HTTP/3 client config should convert"),
+        ));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+            .expect("HTTP/3 client endpoint should bind");
+        endpoint.set_default_client_config(client_config);
+        let connection = endpoint
+            .connect(listener_addr, domain)
+            .expect("HTTP/3 connect future should build")
+            .await
+            .expect("HTTP/3 handshake should succeed");
+
+        let (mut driver, mut sender) = client::new(h3_quinn::Connection::new(connection.clone()))
+            .await
+            .expect("HTTP/3 client should initialize");
+        let drive_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let url = format!(
+            "https://{domain}:{}/api/guest-example",
+            listener_addr.port()
+        );
+        let mut request_stream = sender
+            .send_request(
+                Request::get(&url)
+                    .body(())
+                    .expect("HTTP/3 request should build"),
+            )
+            .await
+            .expect("HTTP/3 request should send");
+        request_stream
+            .finish()
+            .await
+            .expect("HTTP/3 request body should finish");
+        let response = request_stream
+            .recv_response()
+            .await
+            .expect("HTTP/3 response head should arrive");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = Vec::new();
+        while let Some(chunk) = request_stream
+            .recv_data()
+            .await
+            .expect("HTTP/3 response body should stream")
+        {
+            let mut chunk = chunk;
+            let bytes = chunk.copy_to_bytes(chunk.remaining());
+            body.extend_from_slice(&bytes);
+        }
+        assert_eq!(
+            String::from_utf8(body).expect("HTTP/3 response body should be UTF-8"),
+            expected_guest_example_body("FaaS received an empty payload")
+        );
+
+        connection.close(0u32.into(), b"done");
+        let _ = drive_task.await;
+        listener.join_handle.abort();
+        let _ = listener.join_handle.await;
+        endpoint.wait_idle().await;
         let _ = fs::remove_dir_all(cert_dir);
     }
 
@@ -13307,7 +13682,6 @@ mod tests {
         let managed = volume_manager
             .managed_volume_for_route(&route.path, "/app/data")
             .expect("managed volume should be registered");
-        let snapshot_path = snapshot_path_for_volume(&volume_dir);
 
         for _ in 0..50 {
             if managed.lifecycle() == ManagedVolumeLifecycle::OnDisk {
@@ -13318,8 +13692,15 @@ mod tests {
 
         assert_eq!(managed.lifecycle(), ManagedVolumeLifecycle::OnDisk);
         assert!(
-            snapshot_path.join("state.txt").exists(),
-            "snapshot should contain the persisted state file"
+            broker
+                .core_store
+                .get(
+                    store::CoreStoreBucket::HibernationState,
+                    &managed_volume_id(&route.path, "/app/data"),
+                )
+                .expect("hibernation state lookup should succeed")
+                .is_some(),
+            "hibernation snapshot should be persisted in the core store"
         );
         assert!(
             !volume_dir.exists(),
@@ -13339,7 +13720,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(volume_dir);
-        let _ = fs::remove_dir_all(snapshot_path);
     }
 
     #[test]
