@@ -2521,6 +2521,7 @@ fn prewarm_route_instance(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prewarm_component_route(
     runtime: &RuntimeState,
     route: &IntegrityRoute,
@@ -2635,6 +2636,7 @@ fn prewarm_component_route(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prewarm_http_component_instance(
     engine: &Engine,
     runtime_config: IntegrityConfig,
@@ -2695,6 +2697,7 @@ fn prewarm_http_component_instance(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prewarm_udp_component_instance(
     engine: &Engine,
     runtime_config: IntegrityConfig,
@@ -2755,6 +2758,7 @@ fn prewarm_udp_component_instance(
 }
 
 #[cfg(feature = "websockets")]
+#[allow(clippy::too_many_arguments)]
 fn prewarm_websocket_component_instance(
     engine: &Engine,
     runtime_config: IntegrityConfig,
@@ -2826,6 +2830,7 @@ fn prewarm_websocket_component_instance(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prewarm_system_component_instance(
     engine: &Engine,
     runtime_config: IntegrityConfig,
