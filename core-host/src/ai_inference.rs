@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Result};
-use candle_core::{DType, Device, Tensor as CandleTensor};
+use candle_core::{
+    bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
+    Tensor as CandleTensor,
+};
 use candle_nn::VarMap;
 use std::{
     collections::{HashMap, VecDeque},
@@ -343,6 +346,7 @@ struct CandleModel {
     alias: String,
     path: String,
     requested_target: String,
+    attention_stack: TurboQuantAttentionStack,
     _variables: VarMap,
 }
 
@@ -359,6 +363,7 @@ impl CandleModel {
             alias: binding.alias.clone(),
             path: binding.path.clone(),
             requested_target: binding.device.as_str().to_owned(),
+            attention_stack: TurboQuantAttentionStack::default(),
             _variables: VarMap::new(),
         })
     }
@@ -379,6 +384,14 @@ impl CandleModel {
                 self.alias, self.requested_target, self.path
             ))
         })?;
+        self.attention_stack
+            .run_mock_prompt(batch_size.max(1), longest_prompt.max(1))
+            .map_err(|error| {
+                backend_access_error(format!(
+                    "failed to execute TurboQuant attention mock for `{}` on requested `{}` from `{}`: {error}",
+                    self.alias, self.requested_target, self.path
+                ))
+            })?;
 
         Ok(WasiTensor::new(
             vec![MOCK_INFERENCE_RESPONSE.len() as u32],
@@ -407,10 +420,194 @@ fn backend_access_error(message: impl Into<String>) -> BackendError {
     BackendError::BackendAccess(format_err!("{}", message.into()))
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KvPrecision {
+    Q8_0,
+    F16,
+}
+
+#[derive(Clone)]
+struct TurboQuantAttentionStack {
+    total_layers: usize,
+    boundary_layers: usize,
+    threshold: f32,
+    bits: u8,
+}
+
+impl Default for TurboQuantAttentionStack {
+    fn default() -> Self {
+        Self {
+            total_layers: 8,
+            boundary_layers: 2,
+            threshold: 1.0e-4,
+            bits: 2,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TurboQuantLayerDecision {
+    layer_idx: usize,
+    k_precision: KvPrecision,
+    v_compressed: bool,
+}
+
+impl TurboQuantAttentionStack {
+    fn layer_decision(&self, layer_idx: usize) -> TurboQuantLayerDecision {
+        TurboQuantLayerDecision {
+            layer_idx,
+            k_precision: KvPrecision::Q8_0,
+            v_compressed: self.should_compress(layer_idx),
+        }
+    }
+
+    fn should_compress(&self, layer_idx: usize) -> bool {
+        layer_idx >= self.boundary_layers && layer_idx + self.boundary_layers < self.total_layers
+    }
+
+    fn run_mock_prompt(&self, batch_size: usize, prompt_len: usize) -> Result<()> {
+        let value_count = batch_size.max(1) * prompt_len.max(1);
+        let values = quantizable_fixture_values(value_count);
+        let k_tensor = CandleTensor::from_vec(values.clone(), (value_count,), &Device::Cpu)?;
+        let v_tensor = CandleTensor::from_vec(values.clone(), (value_count,), &Device::Cpu)?;
+        let attention =
+            CandleTensor::from_vec(vec![1.0f32; value_count], (value_count,), &Device::Cpu)?;
+
+        let _ = k_tensor;
+        for layer_idx in 0..self.total_layers {
+            let decision = self.layer_decision(layer_idx);
+            if decision.v_compressed {
+                let packed = compress_tensor_values(&v_tensor, self.bits)?;
+                let packed_tensor = CandleTensor::from_vec(
+                    packed,
+                    (turboquant_sys::packed_len(value_count, self.bits)?,),
+                    &Device::Cpu,
+                )?;
+                let restored = packed_tensor.apply_op2_no_bwd(
+                    &attention,
+                    &TurboQuantDecompressor {
+                        bits: self.bits,
+                        threshold: self.threshold,
+                        value_count,
+                    },
+                )?;
+                let restored_values = restored.to_vec1::<f32>()?;
+                if restored_values.len() != value_count {
+                    return Err(anyhow!(
+                        "TurboQuant restored {} values for layer {layer_idx} but expected {value_count}",
+                        restored_values.len()
+                    ));
+                }
+            } else {
+                let restored_values = v_tensor.to_vec1::<f32>()?;
+                if restored_values.len() != value_count {
+                    return Err(anyhow!(
+                        "standard value cache restored {} values for layer {layer_idx} but expected {value_count}",
+                        restored_values.len()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct TurboQuantDecompressor {
+    bits: u8,
+    threshold: f32,
+    value_count: usize,
+}
+
+impl CustomOp2 for TurboQuantDecompressor {
+    fn name(&self) -> &'static str {
+        "turboquant-decompressor"
+    }
+
+    fn cpu_fwd(
+        &self,
+        packed_storage: &CpuStorage,
+        packed_layout: &Layout,
+        attention_storage: &CpuStorage,
+        attention_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        let packed =
+            contiguous_u8_slice(packed_storage, packed_layout, "TurboQuant packed values")?;
+        let attention =
+            contiguous_f32_slice(attention_storage, attention_layout, "TurboQuant attention")?;
+        if attention.len() != self.value_count {
+            candle_bail!(
+                "TurboQuant attention tensor must contain {} values but contains {}",
+                self.value_count,
+                attention.len()
+            );
+        }
+        let output = turboquant_sys::decompress_values_sparse(
+            packed,
+            self.value_count,
+            self.bits,
+            attention,
+            self.threshold,
+        )
+        .map_err(|error| candle_core::Error::Msg(error.to_string()).bt())?;
+        Ok((
+            CpuStorage::F32(output),
+            Shape::from_dims(&[self.value_count]),
+        ))
+    }
+}
+
+fn compress_tensor_values(tensor: &CandleTensor, bits: u8) -> Result<Vec<u8>> {
+    let values = tensor.to_vec1::<f32>()?;
+    turboquant_sys::compress_values(&values, bits).map_err(|error| anyhow!(error.to_string()))
+}
+
+fn contiguous_u8_slice<'a>(
+    storage: &'a CpuStorage,
+    layout: &Layout,
+    label: &str,
+) -> candle_core::Result<&'a [u8]> {
+    let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "{label} must be contiguous before invoking TurboQuant"
+        ))
+        .bt()
+    })?;
+    match storage {
+        CpuStorage::U8(values) => Ok(&values[start..end]),
+        _ => candle_bail!("{label} must use a u8 storage tensor"),
+    }
+}
+
+fn contiguous_f32_slice<'a>(
+    storage: &'a CpuStorage,
+    layout: &Layout,
+    label: &str,
+) -> candle_core::Result<&'a [f32]> {
+    let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "{label} must be contiguous before invoking TurboQuant"
+        ))
+        .bt()
+    })?;
+    match storage {
+        CpuStorage::F32(values) => Ok(&values[start..end]),
+        _ => candle_bail!("{label} must use an f32 storage tensor"),
+    }
+}
+
+fn quantizable_fixture_values(value_count: usize) -> Vec<f32> {
+    const LEVELS: [f32; 4] = [-1.0, -0.33333334, 0.33333334, 1.0];
+    (0..value_count)
+        .map(|index| LEVELS[(index * 3 + 1) % LEVELS.len()])
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{IntegrityConfig, IntegrityRoute, ModelDevice};
+    use std::{fs, path::PathBuf};
 
     #[test]
     fn runtime_preloads_model_aliases_from_config() {
@@ -477,6 +674,88 @@ mod tests {
         assert_eq!(snapshot.requests_processed, 8);
         assert_eq!(snapshot.batches_processed, 1);
         assert_eq!(snapshot.max_batch_size, 8);
+    }
+
+    #[test]
+    fn turboquant_ffi_match() {
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../turboquant-sys/fixtures");
+        let source_bytes =
+            fs::read(fixture_dir.join("v_tensor_f32.bin")).expect("source fixture should exist");
+        let packed_bytes =
+            fs::read(fixture_dir.join("v_tensor_tq.bin")).expect("packed fixture should exist");
+        let value_count = source_bytes.len() / std::mem::size_of::<f32>();
+        let packed_tensor =
+            CandleTensor::from_vec(packed_bytes.clone(), (packed_bytes.len(),), &Device::Cpu)
+                .expect("packed tensor should build");
+        let attention =
+            CandleTensor::from_vec(vec![1.0f32; value_count], (value_count,), &Device::Cpu)
+                .expect("attention tensor should build");
+
+        let restored = packed_tensor
+            .apply_op2_no_bwd(
+                &attention,
+                &TurboQuantDecompressor {
+                    bits: 2,
+                    threshold: 0.0,
+                    value_count,
+                },
+            )
+            .expect("TurboQuant custom op should restore fixture values");
+        let actual = restored
+            .to_vec1::<f32>()
+            .expect("restored tensor should convert to a vec");
+        let actual_bytes = actual
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_bytes, source_bytes);
+    }
+
+    #[test]
+    fn boundary_layers_bypass_turboquant_value_compression() {
+        let stack = TurboQuantAttentionStack::default();
+
+        let decisions = (0..stack.total_layers)
+            .map(|layer_idx| stack.layer_decision(layer_idx))
+            .collect::<Vec<_>>();
+
+        assert_eq!(decisions[0].k_precision, KvPrecision::Q8_0);
+        assert_eq!(decisions[1].k_precision, KvPrecision::Q8_0);
+        assert!(!decisions[0].v_compressed);
+        assert!(!decisions[1].v_compressed);
+        assert!(decisions[2].v_compressed);
+        assert!(decisions[3].v_compressed);
+        assert!(decisions[4].v_compressed);
+        assert!(decisions[5].v_compressed);
+        assert!(!decisions[6].v_compressed);
+        assert!(!decisions[7].v_compressed);
+    }
+
+    #[test]
+    fn sparse_decode_skips_low_attention_values() {
+        let source = vec![-1.0f32, -0.33333334f32, 0.33333334f32, 1.0f32];
+        let packed = turboquant_sys::compress_values(&source, 2).expect("packing should succeed");
+        let packed_tensor =
+            CandleTensor::from_vec(packed, (1,), &Device::Cpu).expect("packed tensor should build");
+        let attention = CandleTensor::from_vec(vec![1.0f32, 0.0, 0.5, 0.0], (4,), &Device::Cpu)
+            .expect("attention tensor should build");
+
+        let restored = packed_tensor
+            .apply_op2_no_bwd(
+                &attention,
+                &TurboQuantDecompressor {
+                    bits: 2,
+                    threshold: 0.1,
+                    value_count: 4,
+                },
+            )
+            .expect("TurboQuant sparse decode should succeed")
+            .to_vec1::<f32>()
+            .expect("restored tensor should convert");
+
+        assert_eq!(restored, vec![-1.0, 0.0, 0.33333334, 0.0]);
     }
 
     fn config_with_model(alias: &str) -> IntegrityConfig {

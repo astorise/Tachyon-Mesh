@@ -19,6 +19,7 @@ members = [
     "system-faas-cert-manager",
     "system-faas-prom",
     "tachyon-cli",
+    "turboquant-sys",
 ]
 resolver = "2"
 
