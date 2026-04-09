@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt, fs,
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -164,6 +164,19 @@ const TELEMETRY_EXPORT_BATCH_SIZE: usize = 32;
 const UDP_LAYER4_QUEUE_CAPACITY: usize = 256;
 const UDP_LAYER4_MAX_WORKERS_PER_LISTENER: usize = 8;
 const UDP_LAYER4_MAX_DATAGRAM_SIZE: usize = 65_507;
+const BUFFER_RAM_REQUEST_CAPACITY: usize = 32;
+const BUFFER_TOTAL_REQUEST_CAPACITY: usize = 256;
+const BUFFER_REPLAY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const BUFFER_RESPONSE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const BUFFER_RESPONSE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+const PRESSURE_MONITOR_IDLE_SLEEP_INTERVAL: Duration = Duration::from_secs(60);
+const PRESSURE_MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const PEER_PRESSURE_STALE_AFTER: Duration = Duration::from_secs(10);
+const PRESSURE_CAUTION_ACTIVE_REQUEST_THRESHOLD: usize = 8;
+const PRESSURE_SATURATED_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const IDENTITY_TOKEN_TTL: Duration = Duration::from_secs(30);
 const IDENTITY_TOKEN_PREFIX: &str = "tachyon.v1";
 const KUBERNETES_SERVICE_BASE_URL: &str = "https://kubernetes.default.svc";
@@ -212,6 +225,13 @@ fn core_store_path(manifest_path: &Path) -> PathBuf {
         .join("tachyon.db")
 }
 
+fn buffered_request_spool_dir(manifest_path: &Path) -> PathBuf {
+    manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("buffered-requests")
+}
+
 async fn open_core_store_for_manifest(manifest_path: &Path) -> Result<Arc<store::CoreStore>> {
     let manifest_path = manifest_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -256,6 +276,7 @@ struct AppState {
     uds_fast_path: Arc<UdsFastPathRegistry>,
     storage_broker: Arc<StorageBrokerManager>,
     core_store: Arc<store::CoreStore>,
+    buffered_requests: Arc<BufferedRequestManager>,
     volume_manager: Arc<VolumeManager>,
     telemetry: TelemetryHandle,
     tls_manager: Arc<tls_runtime::TlsManager>,
@@ -317,6 +338,10 @@ struct UdsPeerMetadata {
     ip: String,
     socket_path: String,
     protocols: Vec<String>,
+    #[serde(default)]
+    pressure_state: PeerPressureState,
+    #[serde(default)]
+    last_pressure_update_unix_ms: u64,
 }
 
 #[cfg(unix)]
@@ -478,6 +503,62 @@ struct RouteExecutionResult {
     response: GuestHttpResponse,
     fuel_consumed: Option<u64>,
     completion_guard: Option<RouteResponseGuard>,
+}
+
+type BufferedRouteResult = std::result::Result<RouteExecutionResult, (StatusCode, String)>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferedRequestTier {
+    Ram,
+    Disk,
+}
+
+#[derive(Clone)]
+struct BufferedRequestManager {
+    disk_dir: PathBuf,
+    ram_capacity: usize,
+    total_capacity: usize,
+    state: Arc<Mutex<BufferedRequestState>>,
+    notify: Arc<Notify>,
+}
+
+struct BufferedRequestState {
+    next_id: u64,
+    ram_queue: VecDeque<BufferedMemoryRequest>,
+    disk_queue: VecDeque<BufferedDiskRequest>,
+}
+
+struct BufferedMemoryRequest {
+    id: String,
+    request: BufferedRouteRequest,
+    completion: oneshot::Sender<BufferedRouteResult>,
+}
+
+struct BufferedDiskRequest {
+    id: String,
+    path: PathBuf,
+    completion: oneshot::Sender<BufferedRouteResult>,
+}
+
+struct BufferedQueueItem {
+    id: String,
+    request: BufferedRouteRequest,
+    completion: oneshot::Sender<BufferedRouteResult>,
+    disk_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct BufferedRouteRequest {
+    route_path: String,
+    selected_module: String,
+    method: String,
+    uri: String,
+    headers: GuestHttpFields,
+    body: Vec<u8>,
+    trailers: GuestHttpFields,
+    hop_limit: u32,
+    trace_id: Option<String>,
+    sampled_execution: bool,
 }
 
 impl fmt::Debug for RouteExecutionResult {
@@ -880,6 +961,8 @@ impl UdsFastPathRegistry {
             ip: discovery_publish_ip(config)?,
             socket_path: socket_path.display().to_string(),
             protocols: vec!["http/1.1".to_owned(), "h2".to_owned()],
+            pressure_state: PeerPressureState::Idle,
+            last_pressure_update_unix_ms: 0,
         };
         fs::write(
             &metadata_path,
@@ -901,7 +984,7 @@ impl UdsFastPathRegistry {
         self.peers
             .lock()
             .expect("UDS peer cache should not be poisoned")
-            .insert(metadata.ip.clone(), peer);
+            .insert(metadata.host_id.clone(), peer);
         *self
             .local_endpoint
             .lock()
@@ -915,15 +998,115 @@ impl UdsFastPathRegistry {
 
     fn discover_peer_for_url(&self, url: &str) -> Option<DiscoveredUdsPeer> {
         let host = reqwest::Url::parse(url).ok()?.host_str()?.to_owned();
+        let now_unix_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let mut candidates = self
+            .refresh_peers()
+            .into_values()
+            .filter(|peer| peer.metadata.ip == host)
+            .filter(|peer| {
+                peer.metadata.last_pressure_update_unix_ms == 0
+                    || now_unix_ms.saturating_sub(peer.metadata.last_pressure_update_unix_ms)
+                        <= PEER_PRESSURE_STALE_AFTER.as_millis() as u64
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1 {
+            return candidates.pop();
+        }
+
+        let first_index = rand::thread_rng().gen_range(0..candidates.len());
+        let mut second_index = rand::thread_rng().gen_range(0..candidates.len() - 1);
+        if second_index >= first_index {
+            second_index += 1;
+        }
+        let first = &candidates[first_index];
+        let second = &candidates[second_index];
+        let preferred = if first.metadata.pressure_state <= second.metadata.pressure_state {
+            first
+        } else {
+            second
+        };
+        Some(preferred.clone())
+    }
+
+    fn active_peer_count(&self) -> usize {
         let peers = self.refresh_peers();
-        peers.get(&host).cloned()
+        let local_host = self
+            .local_endpoint
+            .lock()
+            .expect("local UDS endpoint should not be poisoned")
+            .as_ref()
+            .and_then(|endpoint| {
+                fs::read(&endpoint.metadata_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<UdsPeerMetadata>(&bytes).ok())
+                    .map(|metadata| metadata.host_id)
+            });
+
+        peers
+            .values()
+            .filter(|peer| Some(peer.metadata.host_id.clone()) != local_host)
+            .count()
+    }
+
+    fn write_local_pressure_state(
+        &self,
+        pressure_state: PeerPressureState,
+        updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        let Some(endpoint) = self
+            .local_endpoint
+            .lock()
+            .expect("local UDS endpoint should not be poisoned")
+            .clone()
+        else {
+            return Ok(());
+        };
+        let mut metadata: UdsPeerMetadata =
+            serde_json::from_slice(&fs::read(&endpoint.metadata_path).with_context(|| {
+                format!(
+                    "failed to read local UDS metadata `{}`",
+                    endpoint.metadata_path.display()
+                )
+            })?)
+            .context("failed to parse local UDS metadata")?;
+        metadata.pressure_state = pressure_state;
+        metadata.last_pressure_update_unix_ms = updated_at_unix_ms;
+        fs::write(
+            &endpoint.metadata_path,
+            serde_json::to_vec_pretty(&metadata).context("failed to serialize pressure state")?,
+        )
+        .with_context(|| {
+            format!(
+                "failed to persist local pressure state to `{}`",
+                endpoint.metadata_path.display()
+            )
+        })?;
+        self.peers
+            .lock()
+            .expect("UDS peer cache should not be poisoned")
+            .insert(
+                metadata.host_id.clone(),
+                DiscoveredUdsPeer {
+                    metadata_path: endpoint.metadata_path,
+                    socket_path: endpoint.socket_path,
+                    metadata,
+                },
+            );
+        Ok(())
     }
 
     fn note_connect_failure(&self, peer: &DiscoveredUdsPeer) {
         self.peers
             .lock()
             .expect("UDS peer cache should not be poisoned")
-            .remove(&peer.metadata.ip);
+            .remove(&peer.metadata.host_id);
         if !peer.socket_path.exists() {
             let _ = fs::remove_file(&peer.metadata_path);
         }
@@ -971,7 +1154,7 @@ impl UdsFastPathRegistry {
             }
 
             discovered.insert(
-                metadata.ip.clone(),
+                metadata.host_id.clone(),
                 DiscoveredUdsPeer {
                     metadata_path,
                     socket_path,
@@ -1013,6 +1196,18 @@ impl UdsFastPathRegistry {
     #[allow(dead_code)]
     fn with_discovery_dir(_path: PathBuf) -> Self {
         Self
+    }
+
+    fn active_peer_count(&self) -> usize {
+        0
+    }
+
+    fn write_local_pressure_state(
+        &self,
+        _pressure_state: PeerPressureState,
+        _updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1456,6 +1651,9 @@ async fn serve_host() -> Result<()> {
     let host_identity = Arc::new(HostIdentity::generate());
     let uds_fast_path = Arc::new(new_uds_fast_path_registry());
     let storage_broker = Arc::new(StorageBrokerManager::new(Arc::clone(&core_store)));
+    let buffered_requests = Arc::new(BufferedRequestManager::new(buffered_request_spool_dir(
+        &manifest_path,
+    )));
     let background_workers = Arc::new(BackgroundWorkerManager::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
@@ -1476,6 +1674,7 @@ async fn serve_host() -> Result<()> {
         uds_fast_path: Arc::clone(&uds_fast_path),
         storage_broker,
         core_store,
+        buffered_requests,
         volume_manager: Arc::new(VolumeManager::default()),
         telemetry,
         tls_manager,
@@ -1494,6 +1693,8 @@ async fn serve_host() -> Result<()> {
     spawn_reload_watcher(state.clone());
     spawn_draining_runtime_reaper(state.clone());
     spawn_volume_gc_sweeper(state.clone());
+    spawn_buffered_request_replayer(state.clone());
+    spawn_pressure_monitor(state.clone());
     let app = build_app(state.clone());
     let https_listener = start_https_listener(state.clone(), app.clone()).await?;
     let http3_listener = start_http3_listener(state.clone(), app.clone()).await?;
@@ -2012,6 +2213,157 @@ impl StorageVolumeQueue {
         }
 
         true
+    }
+}
+
+impl BufferedRequestManager {
+    fn new(disk_dir: PathBuf) -> Self {
+        fs::create_dir_all(&disk_dir).unwrap_or_else(|error| {
+            panic!(
+                "buffered request spool directory `{}` should initialize: {error}",
+                disk_dir.display()
+            )
+        });
+        Self {
+            disk_dir,
+            ram_capacity: BUFFER_RAM_REQUEST_CAPACITY,
+            total_capacity: BUFFER_TOTAL_REQUEST_CAPACITY,
+            state: Arc::new(Mutex::new(BufferedRequestState {
+                next_id: 0,
+                ram_queue: VecDeque::new(),
+                disk_queue: VecDeque::new(),
+            })),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn enqueue(
+        &self,
+        request: BufferedRouteRequest,
+    ) -> std::result::Result<(oneshot::Receiver<BufferedRouteResult>, BufferedRequestTier), String>
+    {
+        let (completion, receiver) = oneshot::channel();
+        let mut state = self
+            .state
+            .lock()
+            .expect("buffered request state should not be poisoned");
+        let total_queued = state.ram_queue.len() + state.disk_queue.len();
+        if total_queued >= self.total_capacity {
+            return Err("buffer manager is full".to_owned());
+        }
+
+        let id = format!("buffered-{}", state.next_id);
+        state.next_id = state.next_id.saturating_add(1);
+        if state.ram_queue.len() < self.ram_capacity {
+            state.ram_queue.push_back(BufferedMemoryRequest {
+                id,
+                request,
+                completion,
+            });
+            drop(state);
+            self.notify.notify_one();
+            Ok((receiver, BufferedRequestTier::Ram))
+        } else {
+            let path = self.disk_dir.join(format!("{id}.json"));
+            let payload = serde_json::to_vec(&request)
+                .map_err(|error| format!("failed to serialize buffered request: {error}"))?;
+            fs::write(&path, payload).map_err(|error| {
+                format!(
+                    "failed to persist buffered request spool file `{}`: {error}",
+                    path.display()
+                )
+            })?;
+            state.disk_queue.push_back(BufferedDiskRequest {
+                id,
+                path,
+                completion,
+            });
+            drop(state);
+            self.notify.notify_one();
+            Ok((receiver, BufferedRequestTier::Disk))
+        }
+    }
+
+    fn pop_next(&self) -> std::result::Result<Option<BufferedQueueItem>, String> {
+        let queued = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("buffered request state should not be poisoned");
+            if let Some(request) = state.ram_queue.pop_front() {
+                return Ok(Some(BufferedQueueItem {
+                    id: request.id,
+                    request: request.request,
+                    completion: request.completion,
+                    disk_path: None,
+                }));
+            }
+            state.disk_queue.pop_front()
+        };
+
+        let Some(request) = queued else {
+            return Ok(None);
+        };
+        let payload = fs::read(&request.path).map_err(|error| {
+            format!(
+                "failed to read buffered request spool file `{}`: {error}",
+                request.path.display()
+            )
+        })?;
+        let buffered = serde_json::from_slice(&payload)
+            .map_err(|error| format!("failed to deserialize buffered request: {error}"))?;
+        Ok(Some(BufferedQueueItem {
+            id: request.id,
+            request: buffered,
+            completion: request.completion,
+            disk_path: Some(request.path),
+        }))
+    }
+
+    fn requeue_front(&self, item: BufferedQueueItem) -> std::result::Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("buffered request state should not be poisoned");
+        match item.disk_path {
+            Some(path) => state.disk_queue.push_front(BufferedDiskRequest {
+                id: item.id,
+                path,
+                completion: item.completion,
+            }),
+            None => state.ram_queue.push_front(BufferedMemoryRequest {
+                id: item.id,
+                request: item.request,
+                completion: item.completion,
+            }),
+        }
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    fn complete(&self, item: BufferedQueueItem, result: BufferedRouteResult) {
+        if let Some(path) = &item.disk_path {
+            let _ = fs::remove_file(path);
+        }
+        let _ = item.completion.send(result);
+    }
+
+    fn pending_count(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .expect("buffered request state should not be poisoned");
+        state.ram_queue.len() + state.disk_queue.len()
+    }
+
+    #[cfg(test)]
+    fn disk_spill_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("buffered request state should not be poisoned")
+            .disk_queue
+            .len()
     }
 }
 
@@ -2730,6 +3082,143 @@ fn spawn_volume_gc_sweeper(state: AppState) {
             if let Err(error) = run_volume_gc_tick(runtime).await {
                 tracing::warn!("volume GC sweep failed: {error:#}");
             }
+        }
+    });
+}
+
+fn spawn_buffered_request_replayer(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            state.buffered_requests.notify.notified().await;
+
+            loop {
+                if state.buffered_requests.pending_count() == 0 {
+                    break;
+                }
+
+                let runtime = state.runtime.load_full();
+                if telemetry::active_requests(&state.telemetry)
+                    >= PRESSURE_SATURATED_ACTIVE_REQUEST_THRESHOLD
+                {
+                    tokio::time::sleep(BUFFER_REPLAY_RETRY_INTERVAL).await;
+                    continue;
+                }
+
+                let Some(buffered) = state.buffered_requests.pop_next().unwrap_or_else(|error| {
+                    tracing::warn!("failed to load buffered request: {error}");
+                    None
+                }) else {
+                    break;
+                };
+
+                let Some(route) = runtime
+                    .config
+                    .sealed_route(&buffered.request.route_path)
+                    .cloned()
+                else {
+                    state.buffered_requests.complete(
+                        buffered,
+                        Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "buffered route is no longer sealed".to_owned(),
+                        )),
+                    );
+                    continue;
+                };
+                let Some(semaphore) = runtime.concurrency_limits.get(&route.path).cloned() else {
+                    state.buffered_requests.complete(
+                        buffered,
+                        Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "buffered route is missing a concurrency limiter".to_owned(),
+                        )),
+                    );
+                    continue;
+                };
+
+                let permit = match Arc::clone(&semaphore.semaphore).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(TryAcquireError::NoPermits) => {
+                        let _ = state.buffered_requests.requeue_front(buffered);
+                        tokio::time::sleep(BUFFER_REPLAY_RETRY_INTERVAL).await;
+                        continue;
+                    }
+                    Err(TryAcquireError::Closed) => {
+                        state.buffered_requests.complete(
+                            buffered,
+                            Err((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("route `{}` is currently unavailable", route.path),
+                            )),
+                        );
+                        continue;
+                    }
+                };
+
+                let result = execute_buffered_route_request(
+                    &state,
+                    &runtime,
+                    &route,
+                    semaphore,
+                    permit,
+                    buffered.request.clone(),
+                )
+                .await;
+                state.buffered_requests.complete(buffered, result);
+            }
+        }
+    });
+}
+
+fn spawn_pressure_monitor(state: AppState) {
+    tokio::spawn(async move {
+        let mut previous_state = PeerPressureState::Idle;
+        loop {
+            let peer_count = state.uds_fast_path.active_peer_count();
+            if peer_count == 0 {
+                tokio::time::sleep(PRESSURE_MONITOR_IDLE_SLEEP_INTERVAL).await;
+                continue;
+            }
+
+            let runtime = state.runtime.load_full();
+            let active_requests = telemetry::active_requests(&state.telemetry);
+            let pending_requests = runtime
+                .concurrency_limits
+                .values()
+                .map(|control| control.pending_queue_size() as usize)
+                .sum::<usize>();
+            let saturated_entry = active_requests >= PRESSURE_SATURATED_ACTIVE_REQUEST_THRESHOLD
+                || pending_requests >= PRESSURE_CAUTION_ACTIVE_REQUEST_THRESHOLD;
+            let saturated_exit = active_requests
+                < PRESSURE_SATURATED_ACTIVE_REQUEST_THRESHOLD
+                    .saturating_sub(PRESSURE_CAUTION_ACTIVE_REQUEST_THRESHOLD)
+                && pending_requests == 0;
+            let caution_entry = active_requests >= PRESSURE_CAUTION_ACTIVE_REQUEST_THRESHOLD
+                || pending_requests > 0;
+            let caution_exit = active_requests
+                < (PRESSURE_CAUTION_ACTIVE_REQUEST_THRESHOLD / 2).max(1)
+                && pending_requests == 0;
+            let pressure_state = match previous_state {
+                PeerPressureState::Saturated if !saturated_exit => PeerPressureState::Saturated,
+                PeerPressureState::Caution if !caution_exit && !saturated_entry => {
+                    PeerPressureState::Caution
+                }
+                _ if saturated_entry => PeerPressureState::Saturated,
+                _ if caution_entry => PeerPressureState::Caution,
+                _ => PeerPressureState::Idle,
+            };
+            let now_unix_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or_default();
+            if let Err(error) = state
+                .uds_fast_path
+                .write_local_pressure_state(pressure_state, now_unix_ms)
+            {
+                tracing::debug!("failed to update local pressure metadata: {error:#}");
+            }
+            previous_state = pressure_state;
+            tokio::time::sleep(PRESSURE_MONITOR_POLL_INTERVAL).await;
         }
     });
 }
@@ -4556,6 +5045,15 @@ fn header_map_to_guest_fields(headers: &HeaderMap) -> GuestHttpFields {
         .collect()
 }
 
+fn guest_fields_to_header_map(
+    fields: &GuestHttpFields,
+    label: &str,
+) -> std::result::Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    insert_guest_fields(&mut headers, fields, label)?;
+    Ok(headers)
+}
+
 fn insert_guest_fields(
     target: &mut HeaderMap,
     fields: &GuestHttpFields,
@@ -4973,12 +5471,13 @@ async fn execute_route_request(
             format!("system route `{}` shed under load", route.path),
         ));
     }
-
-    let _volume_leases = state
-        .volume_manager
-        .acquire_route_volumes(route, Arc::clone(&state.storage_broker))
-        .await
-        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let selected_module = selected_module
+        .map(str::to_owned)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            select_route_module(route, headers)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
+        })?;
 
     let semaphore = runtime
         .concurrency_limits
@@ -4990,31 +5489,105 @@ async fn execute_route_request(
                 format!("route `{}` is missing a concurrency limiter", route.path),
             )
         })?;
-    let _permit = match acquire_route_permit(Arc::clone(&semaphore)).await {
-        Ok(permit) => permit,
-        Err(RoutePermitError::Closed) => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("route `{}` is currently unavailable", route.path),
-            ));
+    match acquire_route_permit(Arc::clone(&semaphore)).await {
+        Ok(permit) => {
+            execute_route_request_with_acquired_permit(
+                state,
+                runtime,
+                route,
+                headers.clone(),
+                method.clone(),
+                uri.clone(),
+                body.clone(),
+                trailers.clone(),
+                hop_limit,
+                trace_id.map(str::to_owned),
+                sampled_execution,
+                selected_module,
+                semaphore,
+                permit,
+            )
+            .await
         }
+        Err(RoutePermitError::Closed) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("route `{}` is currently unavailable", route.path),
+        )),
         Err(RoutePermitError::TimedOut) => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("route `{}` is saturated", route.path),
-            ));
+            let (receiver, buffered_tier) = state
+                .buffered_requests
+                .enqueue(BufferedRouteRequest {
+                    route_path: route.path.clone(),
+                    selected_module,
+                    method: method.to_string(),
+                    uri: uri.to_string(),
+                    headers: header_map_to_guest_fields(headers),
+                    body: body.to_vec(),
+                    trailers: trailers.clone(),
+                    hop_limit: hop_limit.0,
+                    trace_id: trace_id.map(str::to_owned),
+                    sampled_execution,
+                })
+                .map_err(|error| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "route `{}` is saturated and buffering failed: {error}",
+                            route.path
+                        ),
+                    )
+                })?;
+            match tokio::time::timeout(BUFFER_RESPONSE_WAIT_TIMEOUT, receiver).await {
+                Ok(Ok(Ok(mut result))) => {
+                    result.response.headers.push((
+                        "x-tachyon-buffered".to_owned(),
+                        match buffered_tier {
+                            BufferedRequestTier::Ram => "ram",
+                            BufferedRequestTier::Disk => "disk",
+                        }
+                        .to_owned(),
+                    ));
+                    Ok(result)
+                }
+                Ok(Ok(Err(error))) => Err(error),
+                Ok(Err(_)) => Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("route `{}` buffered request was canceled", route.path),
+                )),
+                Err(_) => Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("route `{}` buffered request timed out", route.path),
+                )),
+            }
         }
-    };
+    }
+}
 
-    let selected_module = selected_module
-        .map(str::to_owned)
-        .map(Ok)
-        .unwrap_or_else(|| {
-            select_route_module(route, headers)
-                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
-        })?;
+#[allow(clippy::too_many_arguments)]
+async fn execute_route_request_with_acquired_permit(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: &IntegrityRoute,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+    trailers: GuestHttpFields,
+    hop_limit: HopLimit,
+    trace_id: Option<String>,
+    sampled_execution: bool,
+    selected_module: String,
+    semaphore: Arc<RouteExecutionControl>,
+    permit: OwnedSemaphorePermit,
+) -> BufferedRouteResult {
+    let _volume_leases = state
+        .volume_manager
+        .acquire_route_volumes(route, Arc::clone(&state.storage_broker))
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let _permit = permit;
     let active_request_guard = semaphore.begin_request();
-    let propagated_headers = extract_propagated_headers(headers);
+    let propagated_headers = extract_propagated_headers(&headers);
     let engine = if sampled_execution {
         runtime.metered_engine.clone()
     } else {
@@ -5025,9 +5598,9 @@ async fn execute_route_request(
     let route_registry = Arc::clone(&runtime.route_registry);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let storage_broker = Arc::clone(&state.storage_broker);
-    let telemetry_context = trace_id.map(|trace_id| GuestTelemetryContext {
+    let telemetry_context = trace_id.as_ref().map(|trace_id| GuestTelemetryContext {
         handle: state.telemetry.clone(),
-        trace_id: trace_id.to_owned(),
+        trace_id: trace_id.clone(),
     });
     let runtime_telemetry = state.telemetry.clone();
     let secret_access = SecretAccess::from_route(route, &state.secrets_vault);
@@ -5042,7 +5615,7 @@ async fn execute_route_request(
     let guest_request = GuestRequest {
         method: method.to_string(),
         uri: uri.to_string(),
-        headers: header_map_to_guest_fields(headers),
+        headers: header_map_to_guest_fields(&headers),
         body: body.clone(),
         trailers: trailers.clone(),
     };
@@ -5111,6 +5684,47 @@ async fn execute_route_request(
         fuel_consumed,
         completion_guard: Some(active_request_guard.into_response_guard()),
     })
+}
+
+async fn execute_buffered_route_request(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: &IntegrityRoute,
+    semaphore: Arc<RouteExecutionControl>,
+    permit: OwnedSemaphorePermit,
+    request: BufferedRouteRequest,
+) -> BufferedRouteResult {
+    let method = Method::from_bytes(request.method.as_bytes()).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to decode buffered request method: {error}"),
+        )
+    })?;
+    let uri = request.uri.parse::<Uri>().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to decode buffered request URI: {error}"),
+        )
+    })?;
+    let headers = guest_fields_to_header_map(&request.headers, "buffered request headers")
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    execute_route_request_with_acquired_permit(
+        state,
+        runtime,
+        route,
+        headers,
+        method,
+        uri,
+        Bytes::from(request.body),
+        request.trailers,
+        HopLimit(request.hop_limit),
+        request.trace_id,
+        request.sampled_execution,
+        request.selected_module,
+        semaphore,
+        permit,
+    )
+    .await
 }
 
 async fn acquire_route_permit(
@@ -8607,7 +9221,7 @@ impl SecretAccess {
         #[cfg(not(feature = "secrets-vault"))]
         {
             let _ = name;
-            return Err(SecretAccessErrorKind::VaultDisabled);
+            Err(SecretAccessErrorKind::VaultDisabled)
         }
 
         #[cfg(feature = "secrets-vault")]
@@ -9543,6 +10157,9 @@ mod tests {
         manifest_path: PathBuf,
     ) -> AppState {
         let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
+        let buffered_requests = Arc::new(BufferedRequestManager::new(buffered_request_spool_dir(
+            &manifest_path,
+        )));
         let core_store = Arc::new(
             store::CoreStore::open(&core_store_path(&manifest_path))
                 .expect("test core store should open"),
@@ -9557,6 +10174,7 @@ mod tests {
             uds_fast_path: Arc::new(new_uds_fast_path_registry()),
             storage_broker: Arc::new(StorageBrokerManager::new(Arc::clone(&core_store))),
             core_store,
+            buffered_requests,
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry,
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
@@ -9573,6 +10191,10 @@ mod tests {
         .expect("test runtime should prewarm successfully");
         drop(runtime);
         spawn_async_log_exporter(state.clone(), async_log_receiver);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            spawn_buffered_request_replayer(state.clone());
+            spawn_pressure_monitor(state.clone());
+        }
         state
     }
 
@@ -11062,11 +11684,14 @@ mod tests {
             config,
         };
         let core_store_manifest = unique_test_dir("app-state-manifest").join("integrity.lock");
+        let buffered_requests = Arc::new(BufferedRequestManager::new(buffered_request_spool_dir(
+            &core_store_manifest,
+        )));
         let core_store = Arc::new(
             store::CoreStore::open(&core_store_path(&core_store_manifest))
                 .expect("test core store should open"),
         );
-        let app = build_app(AppState {
+        let state = AppState {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             draining_runtimes: Arc::new(Mutex::new(Vec::new())),
             http_client: Client::new(),
@@ -11076,12 +11701,16 @@ mod tests {
             uds_fast_path: Arc::new(new_uds_fast_path_registry()),
             storage_broker: Arc::new(StorageBrokerManager::new(Arc::clone(&core_store))),
             core_store,
+            buffered_requests,
             volume_manager: Arc::new(VolumeManager::default()),
             telemetry: telemetry::init_test_telemetry(),
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             manifest_path: core_store_manifest,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
-        });
+        };
+        spawn_buffered_request_replayer(state.clone());
+        spawn_pressure_monitor(state.clone());
+        let app = build_app(state);
 
         let response = app
             .oneshot(
@@ -11101,7 +11730,34 @@ mod tests {
             .expect("response body should collect")
             .to_bytes();
 
-        assert!(String::from_utf8_lossy(&body).contains("saturated"));
+        assert!(String::from_utf8_lossy(&body).contains("buffered request timed out"));
+    }
+
+    #[test]
+    fn buffered_request_manager_spills_to_disk_after_ram_capacity() {
+        let spool_dir = unique_test_dir("buffered-request-spool");
+        let manager = BufferedRequestManager::new(spool_dir);
+        let request = BufferedRouteRequest {
+            route_path: DEFAULT_ROUTE.to_owned(),
+            selected_module: "guest-example".to_owned(),
+            method: "POST".to_owned(),
+            uri: "http://localhost/api/guest-example".to_owned(),
+            headers: Vec::new(),
+            body: b"payload".to_vec(),
+            trailers: Vec::new(),
+            hop_limit: DEFAULT_HOP_LIMIT,
+            trace_id: None,
+            sampled_execution: false,
+        };
+
+        for _ in 0..=BUFFER_RAM_REQUEST_CAPACITY {
+            let _ = manager
+                .enqueue(request.clone())
+                .expect("buffered request should enqueue");
+        }
+
+        assert_eq!(manager.pending_count(), BUFFER_RAM_REQUEST_CAPACITY + 1);
+        assert_eq!(manager.disk_spill_count(), 1);
     }
 
     #[test]
@@ -12660,6 +13316,8 @@ mod tests {
                 ip: "127.0.0.1".to_owned(),
                 socket_path: stale_socket.display().to_string(),
                 protocols: vec!["http/1.1".to_owned()],
+                pressure_state: PeerPressureState::Idle,
+                last_pressure_update_unix_ms: 0,
             })
             .expect("stale metadata should serialize"),
         )
@@ -13995,4 +14653,12 @@ mod tests {
             other => panic!("unexpected error variant: {other:?}"),
         }
     }
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PeerPressureState {
+    #[default]
+    Idle,
+    Caution,
+    Saturated,
 }
