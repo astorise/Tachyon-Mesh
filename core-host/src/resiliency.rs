@@ -158,6 +158,7 @@ mod tests {
                 trailers: Vec::new(),
             },
             fuel_consumed: None,
+            completion_guard: None,
         }
     }
 
