@@ -37,6 +37,11 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
         };
         let body = format!("{payload} | env: {env_status} | secret: {secret_status}").into_bytes();
 
-        bindings::exports::tachyon::mesh::handler::Response { status: 200, body }
+        bindings::exports::tachyon::mesh::handler::Response {
+            status: 200,
+            headers: vec![],
+            body,
+            trailers: vec![],
+        }
     }
 }

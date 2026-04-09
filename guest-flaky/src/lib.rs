@@ -56,6 +56,8 @@ fn parse_delay_ms(body: &str) -> Option<u64> {
 fn response(status: u16, body: String) -> bindings::exports::tachyon::mesh::handler::Response {
     bindings::exports::tachyon::mesh::handler::Response {
         status,
+        headers: vec![],
         body: body.into_bytes(),
+        trailers: vec![],
     }
 }

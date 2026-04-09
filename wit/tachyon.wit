@@ -1,15 +1,21 @@
 package tachyon:mesh;
 
 interface handler {
+    type headers = list<tuple<string, string>>;
+
     record request {
         method: string,
         uri: string,
+        headers: headers,
         body: list<u8>,
+        trailers: headers,
     }
 
     record response {
         status: u16,
+        headers: headers,
         body: list<u8>,
+        trailers: headers,
     }
 
     handle-request: func(req: request) -> response;

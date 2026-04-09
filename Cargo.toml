@@ -6,6 +6,7 @@ members = [
     "guest-call-legacy",
     "guest-example",
     "guest-flaky",
+    "guest-grpc",
     "guest-loop",
     "guest-malicious",
     "guest-tcp-echo",
