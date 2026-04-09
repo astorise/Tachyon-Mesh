@@ -121,6 +121,8 @@ pub struct SealedRoute {
     pub requires_credentials: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub middleware: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -225,6 +227,7 @@ struct GenerateRequest {
     route_dependencies: Vec<String>,
     route_credentials: Vec<String>,
     route_middlewares: Vec<String>,
+    route_envs: Vec<String>,
     route_scales: Vec<String>,
     tcp_ports: Vec<String>,
     udp_ports: Vec<String>,
@@ -321,6 +324,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         )?,
         route_credentials: parse_optional_routes_arg(&subcommand.matches.args, "route-credential")?,
         route_middlewares: parse_optional_routes_arg(&subcommand.matches.args, "route-middleware")?,
+        route_envs: parse_optional_routes_arg(&subcommand.matches.args, "route-env")?,
         route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
         tcp_ports: parse_optional_string_args(&subcommand.matches.args, "tcp-port", "tcp-port")?,
         udp_ports: parse_optional_string_args(&subcommand.matches.args, "udp-port", "udp-port")?,
@@ -358,6 +362,7 @@ fn parse_generate_request_from_args(
     let mut route_dependencies = Vec::new();
     let mut route_credentials = Vec::new();
     let mut route_middlewares = Vec::new();
+    let mut route_envs = Vec::new();
     let mut route_scales = Vec::new();
     let mut tcp_ports = Vec::new();
     let mut udp_ports = Vec::new();
@@ -522,6 +527,19 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--route-env=") {
+            route_envs.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--route-env" {
+            let route_env = args.next().context(
+                "missing value for `--route-env`; expected `--route-env /system/sqs=QUEUE_URL=https://queue.example`",
+            )?;
+            route_envs.push(route_env);
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix("--memory=") {
             memory_mib = Some(parse_memory_value(value)?);
             continue;
@@ -621,6 +639,7 @@ fn parse_generate_request_from_args(
         route_dependencies,
         route_credentials,
         route_middlewares,
+        route_envs,
         route_scales,
         tcp_ports,
         udp_ports,
@@ -664,7 +683,7 @@ impl SealedConfig {
             bail!("`telemetry_sample_rate` must be between 0.0 and 1.0");
         }
 
-        let routes = normalize_routes(
+        let routes = normalize_routes_with_env(
             request.user_routes,
             request.system_routes,
             request.secret_routes,
@@ -677,6 +696,7 @@ impl SealedConfig {
             request.route_dependencies,
             request.route_credentials,
             request.route_middlewares,
+            request.route_envs,
         )?;
         let batch_targets = normalize_batch_targets(
             request.batch_targets,
@@ -813,6 +833,7 @@ fn parse_telemetry_sample_rate_value(value: &str) -> Result<f64> {
     Ok(sample_rate)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn normalize_routes(
     user_routes: Vec<String>,
@@ -827,6 +848,39 @@ fn normalize_routes(
     route_dependencies: Vec<String>,
     route_credentials: Vec<String>,
     route_middlewares: Vec<String>,
+) -> Result<Vec<SealedRoute>> {
+    normalize_routes_with_env(
+        user_routes,
+        system_routes,
+        secret_routes,
+        allow_empty,
+        route_scales,
+        route_volumes,
+        route_targets,
+        route_names,
+        route_versions,
+        route_dependencies,
+        route_credentials,
+        route_middlewares,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_routes_with_env(
+    user_routes: Vec<String>,
+    system_routes: Vec<String>,
+    secret_routes: Vec<String>,
+    allow_empty: bool,
+    route_scales: Vec<String>,
+    route_volumes: Vec<String>,
+    route_targets: Vec<String>,
+    route_names: Vec<String>,
+    route_versions: Vec<String>,
+    route_dependencies: Vec<String>,
+    route_credentials: Vec<String>,
+    route_middlewares: Vec<String>,
+    route_envs: Vec<String>,
 ) -> Result<Vec<SealedRoute>> {
     if user_routes.is_empty() {
         if allow_empty {
@@ -858,6 +912,7 @@ fn normalize_routes(
                 dependencies: BTreeMap::new(),
                 requires_credentials: Vec::new(),
                 middleware: None,
+                env: BTreeMap::new(),
                 allowed_secrets: Vec::new(),
                 targets: Vec::new(),
                 resiliency: None,
@@ -878,6 +933,7 @@ fn normalize_routes(
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -950,6 +1006,15 @@ fn normalize_routes(
             anyhow!("route middleware `{normalized_path}` must target a declared sealed route")
         })?;
         sealed_route.middleware = Some(middleware);
+    }
+
+    for route_env in route_envs {
+        let (path, key, value) = parse_route_env(&route_env)?;
+        let normalized_path = normalize_route(&path)?;
+        let sealed_route = normalized.get_mut(&normalized_path).ok_or_else(|| {
+            anyhow!("route env `{normalized_path}` must target a declared sealed route")
+        })?;
+        sealed_route.env.insert(key, value);
     }
 
     for secret_route in secret_routes {
@@ -1578,6 +1643,22 @@ fn parse_route_middleware(value: &str) -> Result<(String, String)> {
     Ok((path.to_owned(), normalize_route_name(middleware)?))
 }
 
+fn parse_route_env(value: &str) -> Result<(String, String, String)> {
+    let trimmed = value.trim();
+    let (path, remainder) = trimmed.split_once('=').context(
+        "route env values must use the `/path=KEY=VALUE` syntax, for example `/system/sqs=QUEUE_URL=https://queue.example`",
+    )?;
+    let (key, env_value) = remainder.split_once('=').context(
+        "route env values must use the `/path=KEY=VALUE` syntax, for example `/system/sqs=QUEUE_URL=https://queue.example`",
+    )?;
+    let path = normalize_route(path)?;
+    let key = key.trim();
+    if key.is_empty() {
+        bail!("route env values must include a non-empty key");
+    }
+    Ok((path, key.to_owned(), env_value.trim().to_owned()))
+}
+
 fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
     let (path, secrets) = value.split_once('=').context(
         "secret routes must use the `/path=NAME[,NAME]` syntax, for example `/api/guest-example=DB_PASS`",
@@ -1870,6 +1951,7 @@ mod tests {
                     dependencies: BTreeMap::new(),
                     requires_credentials: Vec::new(),
                     middleware: None,
+                    env: BTreeMap::new(),
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
                     resiliency: None,
@@ -1885,6 +1967,7 @@ mod tests {
                     dependencies: BTreeMap::new(),
                     requires_credentials: Vec::new(),
                     middleware: None,
+                    env: BTreeMap::new(),
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
                     resiliency: None,
@@ -1900,6 +1983,7 @@ mod tests {
                     dependencies: BTreeMap::new(),
                     requires_credentials: Vec::new(),
                     middleware: None,
+                    env: BTreeMap::new(),
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
                     resiliency: None,
@@ -1926,6 +2010,7 @@ mod tests {
             route_dependencies: vec!["/api/guest-example=faas-b@^3.1.0".to_owned()],
             route_credentials: Vec::new(),
             route_middlewares: Vec::new(),
+            route_envs: vec!["/metrics=QUEUE_URL=https://queue.example/mock".to_owned()],
             route_scales: vec!["/api/guest-example=2:16".to_owned()],
             tcp_ports: vec!["2222=faas-a".to_owned()],
             udp_ports: vec!["5353=faas-a".to_owned()],
@@ -1962,6 +2047,7 @@ mod tests {
                     dependencies: BTreeMap::from([("faas-b".to_owned(), "^3.1.0".to_owned(),)]),
                     requires_credentials: Vec::new(),
                     middleware: None,
+                    env: BTreeMap::new(),
                     allowed_secrets: vec!["DB_PASS".to_owned()],
                     targets: Vec::new(),
                     resiliency: None,
@@ -1985,6 +2071,10 @@ mod tests {
                     dependencies: BTreeMap::new(),
                     requires_credentials: Vec::new(),
                     middleware: None,
+                    env: BTreeMap::from([(
+                        "QUEUE_URL".to_owned(),
+                        "https://queue.example/mock".to_owned(),
+                    )]),
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
                     resiliency: None,
@@ -2007,6 +2097,7 @@ mod tests {
         assert!(payload.contains("\"min_instances\":2"));
         assert!(payload.contains("\"max_concurrency\":16"));
         assert!(payload.contains("\"layer4\":{\"tcp\":[{\"port\":2222,\"target\":\"faas-a\"}],\"udp\":[{\"port\":5353,\"target\":\"faas-a\"}]}"));
+        assert!(payload.contains("\"env\":{\"QUEUE_URL\":\"https://queue.example/mock\"}"));
         assert!(payload.contains("\"guest_path\":\"/app/data\""));
         assert!(payload.contains("\"readonly\":true"));
         assert!(payload.contains("\"telemetry_sample_rate\":0.25"));
@@ -2032,6 +2123,8 @@ mod tests {
                 "/api/guest-example=2.0.0",
                 "--route-dependency",
                 "/api/guest-example=faas-b@^3.1.0",
+                "--route-env",
+                "/metrics=QUEUE_URL=https://queue.example/mock",
                 "--route-scale",
                 "/api/guest-example=1:8",
                 "--tcp-port",
@@ -2069,6 +2162,7 @@ mod tests {
                 route_dependencies: vec!["/api/guest-example=faas-b@^3.1.0".to_owned()],
                 route_credentials: Vec::new(),
                 route_middlewares: Vec::new(),
+                route_envs: vec!["/metrics=QUEUE_URL=https://queue.example/mock".to_owned()],
                 route_scales: vec!["/api/guest-example=1:8".to_owned()],
                 tcp_ports: vec!["2222=faas-a".to_owned()],
                 udp_ports: vec!["5353=faas-a".to_owned()],
@@ -2141,6 +2235,7 @@ mod tests {
                 dependencies: BTreeMap::new(),
                 requires_credentials: Vec::new(),
                 middleware: None,
+                env: BTreeMap::new(),
                 allowed_secrets: Vec::new(),
                 targets: Vec::new(),
                 resiliency: None,
@@ -2148,6 +2243,45 @@ mod tests {
                 max_concurrency: 7,
                 volumes: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn normalize_routes_applies_route_env_overrides() {
+        let routes = normalize_routes_with_env(
+            vec!["/api/guest-example".to_owned()],
+            vec!["/system/sqs".to_owned()],
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                "/system/sqs=QUEUE_URL=https://queue.example/mock".to_owned(),
+                "/system/sqs=TARGET_ROUTE=/api/guest-example".to_owned(),
+            ],
+        )
+        .expect("route envs should normalize");
+
+        let connector = routes
+            .iter()
+            .find(|route| route.path == "/system/sqs")
+            .expect("system connector route should exist");
+
+        assert_eq!(
+            connector.env,
+            BTreeMap::from([
+                (
+                    "QUEUE_URL".to_owned(),
+                    "https://queue.example/mock".to_owned(),
+                ),
+                ("TARGET_ROUTE".to_owned(), "/api/guest-example".to_owned()),
+            ])
         );
     }
 
@@ -2492,6 +2626,7 @@ mod tests {
                 dependencies: BTreeMap::new(),
                 requires_credentials: Vec::new(),
                 middleware: None,
+                env: BTreeMap::new(),
                 allowed_secrets: Vec::new(),
                 targets: vec![
                     RouteTarget {

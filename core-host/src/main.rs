@@ -1531,6 +1531,8 @@ struct IntegrityRoute {
     requires_credentials: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     middleware: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3594,12 +3596,14 @@ fn prewarm_route_instance(
         }
     }
 
-    prewarm_legacy_route(runtime, route, function_name, &module_path).map_err(|error| {
-        anyhow!(
-            "failed to prewarm guest `{function_name}`: {}",
-            execution_error_text(&error)
-        )
-    })
+    prewarm_legacy_route(runtime, route, function_name, &module_path, host_identity).map_err(
+        |error| {
+            anyhow!(
+                "failed to prewarm guest `{function_name}`: {}",
+                execution_error_text(&error)
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4009,6 +4013,7 @@ fn prewarm_legacy_route(
     route: &IntegrityRoute,
     function_name: &str,
     module_path: &Path,
+    host_identity: Arc<HostIdentity>,
 ) -> std::result::Result<(), ExecutionError> {
     let module = Module::from_file(&runtime.engine, module_path).map_err(|error| {
         guest_execution_error(
@@ -4048,6 +4053,7 @@ fn prewarm_legacy_route(
         )?))
         .stdout(stdout_capture)
         .stderr(stderr_capture);
+    add_route_environment(&mut wasi, route, host_identity.as_ref())?;
 
     if let Some(module_dir) = module_path.parent() {
         wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
@@ -7425,6 +7431,7 @@ fn execute_legacy_guest(
         )?))
         .stdout(stdout_capture.clone())
         .stderr(stderr_capture);
+    add_route_environment(&mut wasi, route, execution.host_identity.as_ref())?;
 
     if let Some(module_dir) = module_path.parent() {
         wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
@@ -7488,6 +7495,7 @@ fn execute_legacy_guest_with_stdio(
 ) -> std::result::Result<(), ExecutionError> {
     let linker = build_linker(engine)?;
     let mut wasi = WasiCtxBuilder::new();
+    add_route_environment(&mut wasi, route, execution.host_identity.as_ref())?;
     wasi.arg(legacy_guest_program_name(module_path))
         .stdin(stdin)
         .stdout(stdout);
@@ -8517,6 +8525,7 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         dependencies: normalize_route_dependencies(route.dependencies, &normalized)?,
         requires_credentials: normalize_route_credentials(route.requires_credentials)?,
         middleware: normalize_route_middleware(route.middleware, &normalized)?,
+        env: normalize_route_env(route.env, &normalized)?,
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
         targets: normalize_route_targets(route.targets)?,
         resiliency: normalize_route_resiliency(route.resiliency, &normalized)?,
@@ -8829,6 +8838,23 @@ fn normalize_route_middleware(middleware: Option<String>, path: &str) -> Result<
             })
         })
         .transpose()
+}
+
+fn normalize_route_env(
+    env: BTreeMap<String, String>,
+    route_path: &str,
+) -> Result<BTreeMap<String, String>> {
+    env.into_iter()
+        .map(|(key, value)| {
+            let normalized_key = key.trim().to_owned();
+            if normalized_key.is_empty() {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{route_path}` environment keys cannot be empty"
+                ));
+            }
+            Ok((normalized_key, value.trim().to_owned()))
+        })
+        .collect()
 }
 
 fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
@@ -9484,18 +9510,33 @@ fn build_component_wasi_ctx(
     Ok(wasi.build())
 }
 
+fn add_route_environment(
+    wasi: &mut WasiCtxBuilder,
+    route: &IntegrityRoute,
+    host_identity: &HostIdentity,
+) -> std::result::Result<(), ExecutionError> {
+    for (name, value) in system_runtime_environment(route, host_identity) {
+        wasi.env(&name, &value);
+    }
+    Ok(())
+}
+
 fn system_runtime_environment(
     route: &IntegrityRoute,
     host_identity: &HostIdentity,
 ) -> Vec<(String, String)> {
-    if route.role != RouteRole::System {
-        return Vec::new();
+    let mut env = route
+        .env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    if route.role == RouteRole::System {
+        env.push((
+            TACHYON_SYSTEM_PUBLIC_KEY_ENV.to_owned(),
+            host_identity.public_key_hex.clone(),
+        ));
     }
-
-    vec![(
-        TACHYON_SYSTEM_PUBLIC_KEY_ENV.to_owned(),
-        host_identity.public_key_hex.clone(),
-    )]
+    env
 }
 
 fn preopen_route_volumes(
@@ -9872,11 +9913,15 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
         &mut self,
         method: String,
         url: String,
+        headers: Vec<(String, String)>,
         body: Vec<u8>,
-    ) -> std::result::Result<u16, String> {
+    ) -> std::result::Result<
+        background_component_bindings::tachyon::mesh::outbound_http::Response,
+        String,
+    > {
         let method = reqwest::Method::from_bytes(method.trim().as_bytes())
             .map_err(|error| format!("invalid outbound HTTP method `{method}`: {error}"))?;
-        let url = rewrite_outbound_http_url(&url);
+        let url = rewrite_outbound_http_url(&url, &self.runtime_config);
 
         tracing::info!(
             method = %method,
@@ -9885,10 +9930,10 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             "autoscaling guest sending outbound HTTP request"
         );
 
-        let mut request = self
-            .outbound_http_client
-            .request(method, &url)
-            .header("content-type", "application/merge-patch+json");
+        let mut request = self.outbound_http_client.request(method, &url);
+        for (name, value) in headers {
+            request = request.header(&name, &value);
+        }
         for header in &self.propagated_headers {
             request = request.header(&header.name, &header.value);
         }
@@ -9896,12 +9941,45 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             .body(body)
             .send()
             .map_err(|error| format!("failed to send outbound HTTP request to `{url}`: {error}"))?;
+        let status = response.status().as_u16();
+        let response_headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let body = response
+            .bytes()
+            .map_err(|error| {
+                format!("failed to read outbound HTTP response body from `{url}`: {error}")
+            })?
+            .to_vec();
 
-        Ok(response.status().as_u16())
+        Ok(
+            background_component_bindings::tachyon::mesh::outbound_http::Response {
+                status,
+                headers: response_headers,
+                body,
+            },
+        )
     }
 }
 
-fn rewrite_outbound_http_url(url: &str) -> String {
+fn rewrite_outbound_http_url(url: &str, runtime_config: &IntegrityConfig) -> String {
+    if let Some(path) = url.strip_prefix("http://mesh") {
+        let host = runtime_config
+            .host_address
+            .parse::<SocketAddr>()
+            .map(|address| SocketAddr::new(loopback_ip_for(address.ip()), address.port()))
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| runtime_config.host_address.clone());
+        return format!("http://{host}{path}");
+    }
+
     let Some(mock_base_url) = std::env::var(MOCK_K8S_URL_ENV)
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_owned())
@@ -9914,6 +9992,13 @@ fn rewrite_outbound_http_url(url: &str) -> String {
         format!("{mock_base_url}{suffix}")
     } else {
         url.to_owned()
+    }
+}
+
+fn loopback_ip_for(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
     }
 }
 
@@ -9968,6 +10053,7 @@ impl IntegrityRoute {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -9989,6 +10075,7 @@ impl IntegrityRoute {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -10010,6 +10097,7 @@ impl IntegrityRoute {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: allowed_secrets
                 .iter()
                 .map(|secret| (*secret).to_owned())
@@ -10361,6 +10449,51 @@ mod tests {
         }
     }
 
+    fn sqs_connector_test_config(
+        host_address: SocketAddr,
+        queue_url: String,
+        target_route_path: &str,
+        target_module: &str,
+    ) -> IntegrityConfig {
+        let mut target_route = IntegrityRoute::user(target_route_path);
+        target_route.targets = vec![RouteTarget {
+            module: target_module.to_owned(),
+            weight: 100,
+            websocket: false,
+            match_header: None,
+        }];
+
+        let mut connector_route = IntegrityRoute::system("/system/sqs-connector");
+        connector_route.name = "sqs-connector".to_owned();
+        connector_route.targets = vec![RouteTarget {
+            module: "system-faas-sqs".to_owned(),
+            weight: 100,
+            websocket: false,
+            match_header: None,
+        }];
+        connector_route.dependencies = BTreeMap::from([(
+            default_route_name(target_route_path),
+            default_route_version(),
+        )]);
+        connector_route.env = BTreeMap::from([
+            ("QUEUE_URL".to_owned(), queue_url),
+            ("TARGET_ROUTE".to_owned(), target_route_path.to_owned()),
+        ]);
+
+        IntegrityConfig {
+            host_address: host_address.to_string(),
+            tls_address: None,
+            max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
+            guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
+            guest_memory_limit_bytes: DEFAULT_GUEST_MEMORY_LIMIT_BYTES,
+            resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
+            layer4: IntegrityLayer4Config::default(),
+            telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
+            batch_targets: Vec::new(),
+            routes: vec![target_route, connector_route],
+        }
+    }
+
     fn gc_batch_target(cache_dir: &Path, ttl_seconds: u64) -> IntegrityBatchTarget {
         IntegrityBatchTarget {
             name: "gc-job".to_owned(),
@@ -10445,6 +10578,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -10473,6 +10607,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -10609,6 +10744,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -10637,6 +10773,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: vec![RouteTarget {
                 module: "system-faas-storage-broker".to_owned(),
@@ -10670,6 +10807,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: vec![RouteTarget {
                 module: "system-faas-metering".to_owned(),
@@ -10703,6 +10841,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: vec![RouteTarget {
                 module: "system-faas-cert-manager".to_owned(),
@@ -10736,6 +10875,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -10756,6 +10896,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -10792,6 +10933,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -10820,6 +10962,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -10979,19 +11122,23 @@ mod tests {
     #[test]
     fn system_runtime_environment_only_exposes_host_public_key_to_system_routes() {
         let host_identity = test_host_identity(12);
-        let system_env = system_runtime_environment(
-            &IntegrityRoute::system("/system/storage-broker"),
-            &host_identity,
-        );
+        let mut system_route = IntegrityRoute::system("/system/storage-broker");
+        system_route
+            .env
+            .insert("QUEUE_URL".to_owned(), "http://queue.local/mock".to_owned());
+        let system_env = system_runtime_environment(&system_route, &host_identity);
         let user_env =
             system_runtime_environment(&IntegrityRoute::user("/api/guest"), &host_identity);
 
         assert_eq!(
             system_env,
-            vec![(
-                TACHYON_SYSTEM_PUBLIC_KEY_ENV.to_owned(),
-                host_identity.public_key_hex.clone()
-            )]
+            vec![
+                ("QUEUE_URL".to_owned(), "http://queue.local/mock".to_owned()),
+                (
+                    TACHYON_SYSTEM_PUBLIC_KEY_ENV.to_owned(),
+                    host_identity.public_key_hex.clone()
+                )
+            ]
         );
         assert!(user_env.is_empty());
     }
@@ -12183,6 +12330,241 @@ mod tests {
         assert!(requests.iter().all(|body| body.contains("\"replicas\":2")));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_sqs_connector_dispatches_and_acks_messages() {
+        use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct MockQueueState {
+            pending: Vec<(String, String)>,
+            deleted: Vec<String>,
+        }
+
+        async fn receive_messages(
+            State(state): State<Arc<Mutex<MockQueueState>>>,
+        ) -> impl IntoResponse {
+            let state = state
+                .lock()
+                .expect("mock queue state should not be poisoned");
+            Json(json!({
+                "messages": state.pending.iter().map(|(body, receipt_handle)| json!({
+                    "body": body,
+                    "receipt_handle": receipt_handle,
+                })).collect::<Vec<_>>()
+            }))
+        }
+
+        async fn delete_message(
+            State(state): State<Arc<Mutex<MockQueueState>>>,
+            body: Bytes,
+        ) -> StatusCode {
+            let payload: Value =
+                serde_json::from_slice(&body).expect("delete payload should be JSON");
+            let receipt_handle = payload["receipt_handle"]
+                .as_str()
+                .expect("delete payload should include a receipt handle");
+            let mut state = state
+                .lock()
+                .expect("mock queue state should not be poisoned");
+            state.deleted.push(receipt_handle.to_owned());
+            state
+                .pending
+                .retain(|(_, pending_receipt)| pending_receipt != receipt_handle);
+            StatusCode::OK
+        }
+
+        let queue_state = Arc::new(Mutex::new(MockQueueState {
+            pending: vec![("hello from queue".to_owned(), "receipt-1".to_owned())],
+            deleted: Vec::new(),
+        }));
+        let queue_app = Router::new()
+            .route("/queue/receive", post(receive_messages))
+            .route("/queue/delete", post(delete_message))
+            .with_state(Arc::clone(&queue_state));
+        let queue_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock queue listener should bind");
+        let queue_address = queue_listener
+            .local_addr()
+            .expect("mock queue listener should expose an address");
+        let queue_server = tokio::spawn(async move {
+            axum::serve(queue_listener, queue_app)
+                .await
+                .expect("mock queue server should stay up");
+        });
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+        let config = sqs_connector_test_config(
+            host_address,
+            format!("http://{queue_address}/queue"),
+            "/api/guest-example",
+            "guest-example",
+        );
+        let host_app = build_app(build_test_state(
+            config.clone(),
+            telemetry::init_test_telemetry(),
+        ));
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        tokio::task::spawn_blocking(move || {
+            let engine = build_test_metered_engine(&config);
+            let mut runner = BackgroundTickRunner::new(
+                &engine,
+                &config,
+                config
+                    .sealed_route("/system/sqs-connector")
+                    .expect("connector route should be sealed"),
+                "system-faas-sqs",
+                telemetry::init_test_telemetry(),
+                build_concurrency_limits(&config),
+                test_host_identity(36),
+                Arc::new(StorageBrokerManager::default()),
+            )
+            .expect("SQS connector should instantiate");
+            runner.tick().expect("SQS connector tick should succeed");
+        })
+        .await
+        .expect("background connector task should complete");
+
+        host_server.abort();
+        queue_server.abort();
+
+        let queue_state = queue_state
+            .lock()
+            .expect("mock queue state should not be poisoned");
+        assert_eq!(queue_state.deleted, vec!["receipt-1".to_owned()]);
+        assert!(queue_state.pending.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_sqs_connector_leaves_failed_messages_unacked() {
+        use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct MockQueueState {
+            pending: Vec<(String, String)>,
+            deleted: Vec<String>,
+        }
+
+        async fn receive_messages(
+            State(state): State<Arc<Mutex<MockQueueState>>>,
+        ) -> impl IntoResponse {
+            let state = state
+                .lock()
+                .expect("mock queue state should not be poisoned");
+            Json(json!({
+                "messages": state.pending.iter().map(|(body, receipt_handle)| json!({
+                    "body": body,
+                    "receipt_handle": receipt_handle,
+                })).collect::<Vec<_>>()
+            }))
+        }
+
+        async fn delete_message(
+            State(state): State<Arc<Mutex<MockQueueState>>>,
+            body: Bytes,
+        ) -> StatusCode {
+            let payload: Value =
+                serde_json::from_slice(&body).expect("delete payload should be JSON");
+            let receipt_handle = payload["receipt_handle"]
+                .as_str()
+                .expect("delete payload should include a receipt handle");
+            let mut state = state
+                .lock()
+                .expect("mock queue state should not be poisoned");
+            state.deleted.push(receipt_handle.to_owned());
+            state
+                .pending
+                .retain(|(_, pending_receipt)| pending_receipt != receipt_handle);
+            StatusCode::OK
+        }
+
+        let queue_state = Arc::new(Mutex::new(MockQueueState {
+            pending: vec![("force-fail".to_owned(), "receipt-2".to_owned())],
+            deleted: Vec::new(),
+        }));
+        let queue_app = Router::new()
+            .route("/queue/receive", post(receive_messages))
+            .route("/queue/delete", post(delete_message))
+            .with_state(Arc::clone(&queue_state));
+        let queue_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock queue listener should bind");
+        let queue_address = queue_listener
+            .local_addr()
+            .expect("mock queue listener should expose an address");
+        let queue_server = tokio::spawn(async move {
+            axum::serve(queue_listener, queue_app)
+                .await
+                .expect("mock queue server should stay up");
+        });
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+        let config = sqs_connector_test_config(
+            host_address,
+            format!("http://{queue_address}/queue"),
+            "/api/connector-target",
+            "guest-flaky",
+        );
+        let host_app = build_app(build_test_state(
+            config.clone(),
+            telemetry::init_test_telemetry(),
+        ));
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        tokio::task::spawn_blocking(move || {
+            let engine = build_test_metered_engine(&config);
+            let mut runner = BackgroundTickRunner::new(
+                &engine,
+                &config,
+                config
+                    .sealed_route("/system/sqs-connector")
+                    .expect("connector route should be sealed"),
+                "system-faas-sqs",
+                telemetry::init_test_telemetry(),
+                build_concurrency_limits(&config),
+                test_host_identity(37),
+                Arc::new(StorageBrokerManager::default()),
+            )
+            .expect("SQS connector should instantiate");
+            runner.tick().expect("SQS connector tick should succeed");
+        })
+        .await
+        .expect("background connector task should complete");
+
+        host_server.abort();
+        queue_server.abort();
+
+        let queue_state = queue_state
+            .lock()
+            .expect("mock queue state should not be poisoned");
+        assert!(queue_state.deleted.is_empty());
+        assert_eq!(queue_state.pending.len(), 1);
+        assert_eq!(queue_state.pending[0].1, "receipt-2");
+    }
+
     #[tokio::test]
     async fn router_sheds_system_routes_when_host_is_saturated() {
         let telemetry = telemetry::init_test_telemetry();
@@ -12793,7 +13175,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn udp_layer4_listener_echoes_datagrams() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let port = free_udp_port();
         let route = udp_echo_test_route(1);
@@ -12825,17 +13207,32 @@ mod tests {
             .connect(listener_addr)
             .expect("UDP client should connect to listener");
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .expect("UDP client should set a read timeout");
         client
             .send(b"ping over udp")
             .expect("UDP client should send datagram");
 
-        let mut buffer = [0_u8; 64];
-        let received = client
-            .recv(&mut buffer)
-            .expect("UDP client should receive echoed datagram");
-        assert_eq!(&buffer[..received], b"ping over udp");
+        let started = Instant::now();
+        loop {
+            let mut buffer = [0_u8; 64];
+            match client.recv(&mut buffer) {
+                Ok(received) => {
+                    assert_eq!(&buffer[..received], b"ping over udp");
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    assert!(
+                        started.elapsed() <= Duration::from_secs(10),
+                        "UDP client should receive echoed datagram before timing out"
+                    );
+                }
+                Err(error) => panic!("UDP client should receive echoed datagram: {error}"),
+            }
+        }
 
         for listener in listeners {
             for handle in listener.join_handles {
@@ -12879,7 +13276,7 @@ mod tests {
             .connect(listener_addr)
             .expect("UDP client should connect to listener");
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .expect("UDP client should set a read timeout");
 
         client
@@ -12894,7 +13291,7 @@ mod tests {
 
         let started = Instant::now();
         let mut responses = Vec::new();
-        loop {
+        while started.elapsed() <= Duration::from_secs(10) {
             let mut buffer = [0_u8; 64];
             match client.recv(&mut buffer) {
                 Ok(received) => {
@@ -12904,13 +13301,9 @@ mod tests {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || error.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    break;
+                    continue;
                 }
                 Err(error) => panic!("UDP client receive should not fail: {error}"),
-            }
-
-            if started.elapsed() > Duration::from_secs(10) {
-                break;
             }
         }
 
@@ -13993,6 +14386,40 @@ mod tests {
     }
 
     #[test]
+    fn validate_integrity_config_accepts_system_connector_dependencies() {
+        let host_address = DEFAULT_HOST_ADDRESS
+            .parse::<SocketAddr>()
+            .expect("default host address should parse");
+        let config = validate_integrity_config(sqs_connector_test_config(
+            host_address,
+            "http://queue.local/mock".to_owned(),
+            "/api/connector-target",
+            "guest-example",
+        ))
+        .expect("system connector dependencies should validate");
+
+        let connector = config
+            .sealed_route("/system/sqs-connector")
+            .expect("connector route should remain sealed");
+        let expected_requirement = VersionReq::parse(&default_route_version())
+            .expect("default route version should normalize as a requirement")
+            .to_string();
+
+        assert_eq!(
+            connector.dependencies.get("connector-target"),
+            Some(&expected_requirement)
+        );
+        assert_eq!(
+            connector.env.get("QUEUE_URL"),
+            Some(&"http://queue.local/mock".to_owned())
+        );
+        assert_eq!(
+            connector.env.get("TARGET_ROUTE"),
+            Some(&"/api/connector-target".to_owned())
+        );
+    }
+
+    #[test]
     fn validate_integrity_config_rejects_missing_delegated_credentials() {
         let mut config = IntegrityConfig::default_sealed();
         let faas_a = dependency_route("/api/faas-a", "faas-a", "2.0.0", &[("faas-b", "^2.0")]);
@@ -14176,6 +14603,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -14224,6 +14652,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
@@ -14634,6 +15063,7 @@ mod tests {
             dependencies: BTreeMap::new(),
             requires_credentials: Vec::new(),
             middleware: None,
+            env: BTreeMap::new(),
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,

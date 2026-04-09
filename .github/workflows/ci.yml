@@ -72,6 +72,7 @@ jobs:
           cargo build -p system-faas-logger --target wasm32-wasip2 --release
           cargo build -p system-faas-metering --target wasm32-wasip2 --release
           cargo build -p system-faas-prom --target wasm32-wasip2 --release
+          cargo build -p system-faas-sqs --target wasm32-wasip2 --release
           cargo build -p system-faas-storage-broker --target wasm32-wasip2 --release
           cargo build -p guest-call-legacy --target wasm32-wasip1 --release
           cargo build -p guest-loop --target wasm32-wasip1 --release
@@ -112,6 +113,7 @@ jobs:
             target/wasm32-wasip2/release/metering.wasm
             target/wasm32-wasip2/release/metrics.wasm
             target/wasm32-wasip2/release/scaling.wasm
+            target/wasm32-wasip2/release/system_faas_sqs.wasm
             target/wasm32-wasip2/release/system_faas_storage_broker.wasm
             target/wasm32-wasip1/release/guest_loop.wasm
 
