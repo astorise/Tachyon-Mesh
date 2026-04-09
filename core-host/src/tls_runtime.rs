@@ -31,6 +31,50 @@ pub(crate) struct TlsManager {
 }
 
 impl TlsManager {
+    pub(crate) async fn prime_from_store(&self, state: &crate::AppState) -> Result<()> {
+        let domains = state
+            .runtime
+            .load_full()
+            .config
+            .routes
+            .iter()
+            .flat_map(|route| route.domains.iter().cloned())
+            .collect::<Vec<_>>();
+        let core_store = Arc::clone(&state.core_store);
+
+        let persisted = tokio::task::spawn_blocking(move || {
+            let mut materials = Vec::new();
+            for domain in domains {
+                let Some(payload) =
+                    core_store.get(crate::store::CoreStoreBucket::TlsCerts, &domain)?
+                else {
+                    continue;
+                };
+                let material: CertificateMaterial =
+                    serde_json::from_slice(&payload).with_context(|| {
+                        format!("failed to decode cached TLS bundle for `{domain}`")
+                    })?;
+                materials.push((domain, material));
+            }
+            Ok::<_, anyhow::Error>(materials)
+        })
+        .await
+        .context("TLS cache priming task failed")??;
+
+        if persisted.is_empty() {
+            return Ok(());
+        }
+
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("TLS certificate cache lock poisoned"))?;
+        for (domain, material) in persisted {
+            cache.insert(domain, Arc::new(build_server_config(&material)?));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn server_config_for_domain(
         &self,
         state: &crate::AppState,
@@ -61,13 +105,19 @@ impl TlsManager {
             }
         }
 
-        let material = if let Some(material) = self.load_persisted_material(state, &normalized)? {
-            material
+        let (material, from_store) = if let Some((material, from_store)) =
+            self.load_persisted_material(state, &normalized).await?
+        {
+            (material, from_store)
         } else {
             let material = self.provision_via_cert_manager(state, &normalized).await?;
             self.provisions.fetch_add(1, Ordering::Relaxed);
-            material
+            (material, false)
         };
+
+        if !from_store {
+            self.persist_material(state, &material).await?;
+        }
 
         let config = Arc::new(build_server_config(&material)?);
         let mut cache = self
@@ -92,11 +142,24 @@ impl TlsManager {
         )
     }
 
-    fn load_persisted_material(
+    async fn load_persisted_material(
         &self,
         state: &crate::AppState,
         domain: &str,
-    ) -> Result<Option<CertificateMaterial>> {
+    ) -> Result<Option<(CertificateMaterial, bool)>> {
+        let domain_key = domain.to_owned();
+        let core_store = Arc::clone(&state.core_store);
+        if let Some(payload) = tokio::task::spawn_blocking(move || {
+            core_store.get(crate::store::CoreStoreBucket::TlsCerts, &domain_key)
+        })
+        .await
+        .context("TLS core-store lookup task failed")??
+        {
+            let material = serde_json::from_slice(&payload)
+                .with_context(|| format!("failed to parse cached TLS bundle for `{domain}`"))?;
+            return Ok(Some((material, true)));
+        }
+
         let runtime = state.runtime.load_full();
         let Some(route) = runtime
             .config
@@ -118,14 +181,30 @@ impl TlsManager {
             )
         })?;
 
-        serde_json::from_str(&payload)
-            .with_context(|| {
-                format!(
-                    "failed to parse persisted certificate bundle `{}`",
-                    resolved.host_target.display()
-                )
-            })
-            .map(Some)
+        let material = serde_json::from_str(&payload).with_context(|| {
+            format!(
+                "failed to parse persisted certificate bundle `{}`",
+                resolved.host_target.display()
+            )
+        })?;
+
+        Ok(Some((material, false)))
+    }
+
+    async fn persist_material(
+        &self,
+        state: &crate::AppState,
+        material: &CertificateMaterial,
+    ) -> Result<()> {
+        let domain = material.domain.clone();
+        let payload = serde_json::to_vec(material)
+            .context("failed to serialize TLS certificate material for persistence")?;
+        let core_store = Arc::clone(&state.core_store);
+        tokio::task::spawn_blocking(move || {
+            core_store.put(crate::store::CoreStoreBucket::TlsCerts, &domain, &payload)
+        })
+        .await
+        .context("TLS persistence task failed")?
     }
 
     async fn provision_via_cert_manager(
