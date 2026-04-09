@@ -175,6 +175,16 @@ pub struct SealedVolume {
     pub eviction_policy: Option<VolumeEvictionPolicy>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SealedBatchTarget {
+    pub name: String,
+    pub module: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<SealedVolume>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SealedConfig {
     pub host_address: String,
@@ -189,6 +199,8 @@ pub struct SealedConfig {
         skip_serializing_if = "is_default_telemetry_sample_rate"
     )]
     pub telemetry_sample_rate: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch_targets: Vec<SealedBatchTarget>,
     pub routes: Vec<SealedRoute>,
 }
 
@@ -204,6 +216,9 @@ struct GenerateRequest {
     user_routes: Vec<String>,
     system_routes: Vec<String>,
     secret_routes: Vec<String>,
+    batch_targets: Vec<String>,
+    batch_target_envs: Vec<String>,
+    batch_target_volumes: Vec<String>,
     route_targets: Vec<String>,
     route_names: Vec<String>,
     route_versions: Vec<String>,
@@ -288,9 +303,15 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
     }
 
     let request = GenerateRequest {
-        user_routes: parse_required_routes_arg(&subcommand.matches.args, "route")?,
+        user_routes: parse_optional_routes_arg(&subcommand.matches.args, "route")?,
         system_routes: parse_optional_routes_arg(&subcommand.matches.args, "system-route")?,
         secret_routes: parse_optional_routes_arg(&subcommand.matches.args, "secret-route")?,
+        batch_targets: parse_optional_routes_arg(&subcommand.matches.args, "batch-target")?,
+        batch_target_envs: parse_optional_routes_arg(&subcommand.matches.args, "batch-target-env")?,
+        batch_target_volumes: parse_optional_routes_arg(
+            &subcommand.matches.args,
+            "batch-target-volume",
+        )?,
         route_targets: parse_optional_routes_arg(&subcommand.matches.args, "route-target")?,
         route_names: parse_optional_routes_arg(&subcommand.matches.args, "route-name")?,
         route_versions: parse_optional_routes_arg(&subcommand.matches.args, "route-version")?,
@@ -328,6 +349,9 @@ fn parse_generate_request_from_args(
     let mut user_routes = Vec::new();
     let mut system_routes = Vec::new();
     let mut secret_routes = Vec::new();
+    let mut batch_targets = Vec::new();
+    let mut batch_target_envs = Vec::new();
+    let mut batch_target_volumes = Vec::new();
     let mut route_targets = Vec::new();
     let mut route_names = Vec::new();
     let mut route_versions = Vec::new();
@@ -378,6 +402,45 @@ fn parse_generate_request_from_args(
                 "missing value for `--secret-route`; expected `--secret-route /api/guest-example=DB_PASS`",
             )?;
             secret_routes.push(route);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--batch-target=") {
+            batch_targets.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--batch-target" {
+            let batch_target = args.next().context(
+                "missing value for `--batch-target`; expected `--batch-target gc-job=system-faas-gc`",
+            )?;
+            batch_targets.push(batch_target);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--batch-target-env=") {
+            batch_target_envs.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--batch-target-env" {
+            let batch_target_env = args.next().context(
+                "missing value for `--batch-target-env`; expected `--batch-target-env gc-job=TTL_SECONDS=300`",
+            )?;
+            batch_target_envs.push(batch_target_env);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--batch-target-volume=") {
+            batch_target_volumes.push(value.to_owned());
+            continue;
+        }
+
+        if arg == "--batch-target-volume" {
+            let batch_target_volume = args.next().context(
+                "missing value for `--batch-target-volume`; expected `--batch-target-volume gc-job=/tmp/test-cache:/cache:rw`",
+            )?;
+            batch_target_volumes.push(batch_target_volume);
             continue;
         }
 
@@ -541,14 +604,17 @@ fn parse_generate_request_from_args(
     }
 
     let memory_mib = memory_mib.context("missing required `--memory` argument")?;
-    if user_routes.is_empty() {
-        bail!("missing required `--route` argument");
+    if user_routes.is_empty() && batch_targets.is_empty() {
+        bail!("missing required `--route` or `--batch-target` argument");
     }
 
     Ok(Some(GenerateRequest {
         user_routes,
         system_routes,
         secret_routes,
+        batch_targets,
+        batch_target_envs,
+        batch_target_volumes,
         route_targets,
         route_names,
         route_versions,
@@ -602,6 +668,7 @@ impl SealedConfig {
             request.user_routes,
             request.system_routes,
             request.secret_routes,
+            !request.batch_targets.is_empty(),
             request.route_scales,
             request.volumes,
             request.route_targets,
@@ -610,6 +677,11 @@ impl SealedConfig {
             request.route_dependencies,
             request.route_credentials,
             request.route_middlewares,
+        )?;
+        let batch_targets = normalize_batch_targets(
+            request.batch_targets,
+            request.batch_target_envs,
+            request.batch_target_volumes,
         )?;
         let layer4 = normalize_layer4_bindings(request.tcp_ports, request.udp_ports, &routes)?;
         let memory_mib = usize::try_from(request.memory_mib)
@@ -626,6 +698,7 @@ impl SealedConfig {
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
             layer4,
             telemetry_sample_rate: request.telemetry_sample_rate,
+            batch_targets,
             routes,
         })
     }
@@ -636,6 +709,7 @@ impl SealedConfig {
 }
 
 #[cfg(desktop)]
+#[allow(dead_code)]
 fn parse_required_routes_arg(
     args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
     name: &str,
@@ -744,6 +818,7 @@ fn normalize_routes(
     user_routes: Vec<String>,
     system_routes: Vec<String>,
     secret_routes: Vec<String>,
+    allow_empty: bool,
     route_scales: Vec<String>,
     route_volumes: Vec<String>,
     route_targets: Vec<String>,
@@ -754,6 +829,9 @@ fn normalize_routes(
     route_middlewares: Vec<String>,
 ) -> Result<Vec<SealedRoute>> {
     if user_routes.is_empty() {
+        if allow_empty {
+            return Ok(Vec::new());
+        }
         bail!("at least one `--route` value must be provided");
     }
 
@@ -934,6 +1012,45 @@ fn normalize_routes(
         .collect::<Result<Vec<_>>>()
 }
 
+fn normalize_batch_targets(
+    batch_targets: Vec<String>,
+    batch_target_envs: Vec<String>,
+    batch_target_volumes: Vec<String>,
+) -> Result<Vec<SealedBatchTarget>> {
+    let mut normalized = BTreeMap::<String, SealedBatchTarget>::new();
+
+    for batch_target in batch_targets {
+        let (name, module) = parse_batch_target(&batch_target)?;
+        normalized.insert(
+            name.clone(),
+            SealedBatchTarget {
+                name,
+                module,
+                env: BTreeMap::new(),
+                volumes: Vec::new(),
+            },
+        );
+    }
+
+    for env in batch_target_envs {
+        let (name, key, value) = parse_batch_target_env(&env)?;
+        let target = normalized.get_mut(&name).ok_or_else(|| {
+            anyhow!("batch target env `{name}` must target a declared batch target")
+        })?;
+        target.env.insert(key, value);
+    }
+
+    for volume in batch_target_volumes {
+        let (name, parsed_volume) = parse_batch_target_volume(&volume)?;
+        let target = normalized.get_mut(&name).ok_or_else(|| {
+            anyhow!("batch target volume `{name}` must target a declared batch target")
+        })?;
+        insert_batch_target_volume(target, parsed_volume)?;
+    }
+
+    Ok(normalized.into_values().collect())
+}
+
 fn normalize_layer4_bindings(
     tcp_bindings: Vec<String>,
     udp_bindings: Vec<String>,
@@ -1025,6 +1142,45 @@ fn parse_udp_binding(value: &str) -> Result<(u16, String)> {
     let target = normalize_route_name(target.trim())
         .context("UDP Layer 4 targets must use a non-empty sealed route name")?;
     Ok((port, target))
+}
+
+fn parse_batch_target(value: &str) -> Result<(String, String)> {
+    let trimmed = value.trim();
+    let (name, module) = trimmed
+        .split_once('=')
+        .context("batch targets must use the `NAME=MODULE` syntax")?;
+    let name = normalize_route_name(name.trim())
+        .context("batch targets must use a non-empty target name")?;
+    let module = normalize_route_name(module.trim())
+        .context("batch targets must use a non-empty module name")?;
+    Ok((name, module))
+}
+
+fn parse_batch_target_env(value: &str) -> Result<(String, String, String)> {
+    let trimmed = value.trim();
+    let (name, remainder) = trimmed
+        .split_once('=')
+        .context("batch target env values must use the `NAME=KEY=VALUE` syntax")?;
+    let (key, env_value) = remainder
+        .split_once('=')
+        .context("batch target env values must use the `NAME=KEY=VALUE` syntax")?;
+    let name = normalize_route_name(name.trim())
+        .context("batch target env values must use a non-empty target name")?;
+    let key = key.trim();
+    if key.is_empty() {
+        bail!("batch target env values must include a non-empty key");
+    }
+    Ok((name, key.to_owned(), env_value.trim().to_owned()))
+}
+
+fn parse_batch_target_volume(value: &str) -> Result<(String, SealedVolume)> {
+    let trimmed = value.trim();
+    let (name, volume) = trimmed
+        .split_once('=')
+        .context("batch target volume values must use the `NAME=HOST:GUEST[:ro|rw]` syntax")?;
+    let name = normalize_route_name(name.trim())
+        .context("batch target volumes must use a non-empty target name")?;
+    Ok((name, parse_volume_spec(volume)?))
 }
 
 fn parse_route_volume(
@@ -1208,6 +1364,30 @@ fn insert_route_volume(route: &mut SealedRoute, volume: SealedVolume) -> Result<
 
     route.volumes.push(volume);
     route
+        .volumes
+        .sort_by(|left, right| left.guest_path.cmp(&right.guest_path));
+    Ok(())
+}
+
+fn insert_batch_target_volume(target: &mut SealedBatchTarget, volume: SealedVolume) -> Result<()> {
+    if let Some(existing) = target
+        .volumes
+        .iter()
+        .find(|existing| existing.guest_path == volume.guest_path)
+    {
+        if existing == &volume {
+            return Ok(());
+        }
+
+        bail!(
+            "batch target `{}` defines guest volume path `{}` more than once",
+            target.name,
+            volume.guest_path
+        );
+    }
+
+    target.volumes.push(volume);
+    target
         .volumes
         .sort_by(|left, right| left.guest_path.cmp(&right.guest_path));
     Ok(())
@@ -1667,6 +1847,7 @@ mod tests {
             ],
             vec!["/metrics/".to_owned()],
             Vec::new(),
+            false,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1736,6 +1917,9 @@ mod tests {
             user_routes: vec!["/api/guest-example".to_owned()],
             system_routes: vec!["/metrics".to_owned()],
             secret_routes: vec!["/api/guest-example=DB_PASS".to_owned()],
+            batch_targets: Vec::new(),
+            batch_target_envs: Vec::new(),
+            batch_target_volumes: Vec::new(),
             route_targets: Vec::new(),
             route_names: vec!["/api/guest-example=faas-a".to_owned()],
             route_versions: vec!["/api/guest-example=2.0.0".to_owned()],
@@ -1876,6 +2060,9 @@ mod tests {
                 ],
                 system_routes: vec!["/metrics".to_owned()],
                 secret_routes: vec!["/api/guest-example=DB_PASS,API_KEY".to_owned()],
+                batch_targets: Vec::new(),
+                batch_target_envs: Vec::new(),
+                batch_target_volumes: Vec::new(),
                 route_targets: vec!["/api/guest-example=guest-example,weight=70".to_owned()],
                 route_names: vec!["/api/guest-example=faas-a".to_owned()],
                 route_versions: vec!["/api/guest-example=2.0.0".to_owned()],
@@ -1932,6 +2119,7 @@ mod tests {
             vec!["/api/guest-example".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             vec!["/api/guest-example=3:7".to_owned()],
             Vec::new(),
             Vec::new(),
@@ -1969,6 +2157,7 @@ mod tests {
             vec!["/api/faas-a".to_owned()],
             vec!["/system/auth".to_owned()],
             Vec::new(),
+            false,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1993,6 +2182,7 @@ mod tests {
             vec!["/metrics".to_owned()],
             vec!["/metrics/".to_owned()],
             Vec::new(),
+            false,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2015,6 +2205,7 @@ mod tests {
             vec!["/api/guest-example".to_owned()],
             Vec::new(),
             vec!["/api/missing=DB_PASS".to_owned()],
+            false,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2037,6 +2228,7 @@ mod tests {
             vec!["/api/guest-example".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             vec!["/api/missing=1:8".to_owned()],
             Vec::new(),
             Vec::new(),
@@ -2059,6 +2251,7 @@ mod tests {
             vec!["/api/guest-example".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             vec!["/api/guest-example=1:0".to_owned()],
             Vec::new(),
             Vec::new(),
@@ -2089,6 +2282,7 @@ mod tests {
             vec!["/api/guest-volume".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             vec!["C:\\\\tachyon_data:/app/data:ro".to_owned()],
             Vec::new(),
@@ -2123,6 +2317,7 @@ mod tests {
             ],
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             vec!["/tmp/tachyon_data:/app/data:rw".to_owned()],
             Vec::new(),
@@ -2145,6 +2340,7 @@ mod tests {
             vec!["/api/guest-volume".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             vec!["/tmp/tachyon_data:/app/data:rw".to_owned()],
             Vec::new(),
@@ -2167,6 +2363,7 @@ mod tests {
             vec!["/api/guest-volume".to_owned()],
             vec!["/system/storage-broker".to_owned()],
             Vec::new(),
+            false,
             Vec::new(),
             vec!["/system/storage-broker=/tmp/tachyon_data:/app/data:rw".to_owned()],
             Vec::new(),
@@ -2202,6 +2399,7 @@ mod tests {
             vec!["/api/guest-volume".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             vec![
                 "/tmp/tachyon_ram:/app/data:rw,type=ram,idle_timeout=50ms,eviction_policy=hibernate"
@@ -2236,6 +2434,7 @@ mod tests {
             vec!["/api/guest-volume".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             vec!["/tmp/tachyon_data:/app/data:ro,ttl_seconds=300".to_owned()],
             Vec::new(),
@@ -2267,6 +2466,7 @@ mod tests {
             vec!["/api/checkout".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             Vec::new(),
             vec![
@@ -2330,6 +2530,7 @@ mod tests {
             vec!["/ws/echo".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             Vec::new(),
             vec!["/ws/echo=guest-websocket-echo,websocket=true".to_owned()],
@@ -2358,6 +2559,7 @@ mod tests {
             vec!["/api/guest-example".to_owned()],
             Vec::new(),
             Vec::new(),
+            false,
             Vec::new(),
             Vec::new(),
             vec!["/api/unknown=guest-loop,weight=100".to_owned()],

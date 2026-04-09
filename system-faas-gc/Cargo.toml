@@ -1,0 +1,8 @@
+[package]
+name = "system-faas-gc"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "system_faas_gc"
+path = "src/main.rs"
