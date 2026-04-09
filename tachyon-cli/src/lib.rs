@@ -65,6 +65,22 @@ pub struct HeaderMatch {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RetryPolicy {
+    #[serde(default)]
+    pub max_retries: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_on: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ResiliencyConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<RetryPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RouteTarget {
     pub module: String,
     #[serde(default)]
@@ -109,6 +125,8 @@ pub struct SealedRoute {
     pub allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<RouteTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resiliency: Option<ResiliencyConfig>,
     #[serde(default)]
     pub min_instances: u32,
     #[serde(default = "default_max_concurrency")]
@@ -764,6 +782,7 @@ fn normalize_routes(
                 middleware: None,
                 allowed_secrets: Vec::new(),
                 targets: Vec::new(),
+                resiliency: None,
                 min_instances: 0,
                 max_concurrency: default_max_concurrency(),
                 volumes: Vec::new(),
@@ -783,6 +802,7 @@ fn normalize_routes(
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             min_instances: 0,
             max_concurrency: default_max_concurrency(),
             volumes: Vec::new(),
@@ -1671,6 +1691,7 @@ mod tests {
                     middleware: None,
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
+                    resiliency: None,
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                     volumes: Vec::new(),
@@ -1685,6 +1706,7 @@ mod tests {
                     middleware: None,
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
+                    resiliency: None,
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                     volumes: Vec::new(),
@@ -1699,6 +1721,7 @@ mod tests {
                     middleware: None,
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
+                    resiliency: None,
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                     volumes: Vec::new(),
@@ -1757,6 +1780,7 @@ mod tests {
                     middleware: None,
                     allowed_secrets: vec!["DB_PASS".to_owned()],
                     targets: Vec::new(),
+                    resiliency: None,
                     min_instances: 2,
                     max_concurrency: 16,
                     volumes: vec![SealedVolume {
@@ -1779,6 +1803,7 @@ mod tests {
                     middleware: None,
                     allowed_secrets: Vec::new(),
                     targets: Vec::new(),
+                    resiliency: None,
                     min_instances: 0,
                     max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                     volumes: Vec::new(),
@@ -1930,6 +1955,7 @@ mod tests {
                 middleware: None,
                 allowed_secrets: Vec::new(),
                 targets: Vec::new(),
+                resiliency: None,
                 min_instances: 3,
                 max_concurrency: 7,
                 volumes: Vec::new(),
@@ -2290,6 +2316,7 @@ mod tests {
                         }),
                     },
                 ],
+                resiliency: None,
                 min_instances: 0,
                 max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
                 volumes: Vec::new(),
