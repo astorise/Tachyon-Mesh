@@ -60,6 +60,7 @@ jobs:
           cargo build -p guest-ai --target wasm32-wasip1 --release
           cargo build -p guest-example --target wasm32-wasip2 --release
           cargo build -p guest-flaky --target wasm32-wasip2 --release
+          cargo build -p guest-grpc --target wasm32-wasip2 --release
           cargo build -p guest-tcp-echo --target wasm32-wasip1 --release
           cargo build -p guest-udp-echo --target wasm32-wasip2 --release
           cargo build -p guest-volume --target wasm32-wasip2 --release
@@ -96,6 +97,7 @@ jobs:
             target/wasm32-wasip1/release/guest_ai.wasm
             target/wasm32-wasip2/release/guest_example.wasm
             target/wasm32-wasip2/release/guest_flaky.wasm
+            target/wasm32-wasip2/release/guest_grpc.wasm
             target/wasm32-wasip1/release/guest_tcp_echo.wasm
             target/wasm32-wasip2/release/guest_udp_echo.wasm
             target/wasm32-wasip2/release/guest_volume.wasm

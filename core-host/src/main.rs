@@ -3,9 +3,9 @@ use arc_swap::ArcSwap;
 #[cfg(feature = "websockets")]
 use axum::extract::ws::{Message as AxumWebSocketMessage, WebSocket, WebSocketUpgrade};
 use axum::{
-    body::Bytes,
-    extract::State,
-    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    body::{Body, Bytes},
+    extract::{Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::from_fn,
     response::{IntoResponse, Response},
     Extension, Router,
@@ -13,6 +13,8 @@ use axum::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 #[cfg(feature = "websockets")]
 use futures_util::{SinkExt, StreamExt};
+use http_body_util::BodyExt;
+use hyper::body::{Frame, SizeHint};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as HyperConnectionBuilder,
@@ -33,10 +35,12 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, Once,
     },
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime},
 };
 use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
@@ -377,17 +381,28 @@ struct GuestResourceLimiter {
     max_memory_bytes: usize,
 }
 
+type GuestHttpFields = Vec<(String, String)>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GuestRequest {
     method: String,
     uri: String,
+    headers: GuestHttpFields,
     body: Bytes,
+    trailers: GuestHttpFields,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GuestHttpResponse {
     status: StatusCode,
+    headers: GuestHttpFields,
     body: Bytes,
+    trailers: GuestHttpFields,
+}
+
+struct GuestResponseBody {
+    data: Option<Bytes>,
+    trailers: Option<HeaderMap>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,6 +438,7 @@ struct RouteInvocation {
     method: Method,
     uri: Uri,
     body: Bytes,
+    trailers: GuestHttpFields,
     hop_limit: HopLimit,
     trace_id: Option<String>,
     sampled_execution: bool,
@@ -452,6 +468,74 @@ impl From<(StatusCode, String)> for RouteServiceError {
 impl From<RouteServiceError> for (StatusCode, String) {
     fn from(error: RouteServiceError) -> Self {
         (error.status, error.message)
+    }
+}
+
+impl GuestRequest {
+    fn new(method: impl Into<String>, uri: impl Into<String>, body: impl Into<Bytes>) -> Self {
+        Self {
+            method: method.into(),
+            uri: uri.into(),
+            headers: Vec::new(),
+            body: body.into(),
+            trailers: Vec::new(),
+        }
+    }
+}
+
+impl GuestHttpResponse {
+    fn new(status: StatusCode, body: impl Into<Bytes>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.into(),
+            trailers: Vec::new(),
+        }
+    }
+}
+
+impl GuestResponseBody {
+    fn new(data: Bytes, trailers: Option<HeaderMap>) -> Self {
+        Self {
+            data: Some(data),
+            trailers,
+        }
+    }
+}
+
+impl hyper::body::Body for GuestResponseBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(data) = self.data.take() {
+            if !data.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+        }
+
+        if let Some(trailers) = self.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.as_ref().map(Bytes::is_empty).unwrap_or(true) && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = SizeHint::default();
+        if let Some(data) = &self.data {
+            hint.set_exact(data.len() as u64);
+        } else {
+            hint.set_exact(0);
+        }
+        hint
     }
 }
 
@@ -1226,13 +1310,12 @@ async fn run() -> Result<()> {
             )
         })?;
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("axum server exited unexpectedly")?;
+    tokio::select! {
+        result = serve_http_listener(listener, app.clone()) => {
+            result.context("HTTP server exited unexpectedly")?;
+        }
+        _ = shutdown_signal() => {}
+    }
 
     if let Some(server) = uds_server {
         server.abort();
@@ -3066,6 +3149,7 @@ async fn export_metering_batch(
     let method = Method::POST;
     let uri = Uri::from_static(SYSTEM_METERING_ROUTE);
     let body = encode_metering_batch(batch);
+    let trailers = Vec::new();
     let result = execute_route_with_middleware(
         state,
         &runtime,
@@ -3074,6 +3158,7 @@ async fn export_metering_batch(
         &method,
         &uri,
         &body,
+        &trailers,
         HopLimit(DEFAULT_HOP_LIMIT),
         None,
         false,
@@ -3109,6 +3194,26 @@ fn spawn_metering_exporter(state: AppState, mut receiver: mpsc::Receiver<String>
             }
         }
     });
+}
+
+async fn serve_http_listener(listener: tokio::net::TcpListener, app: Router) -> Result<()> {
+    loop {
+        let (stream, peer_addr) = listener
+            .accept()
+            .await
+            .context("failed to accept HTTP connection")?;
+        let service = app.clone();
+        tokio::spawn(async move {
+            let builder = HyperConnectionBuilder::new(TokioExecutor::new());
+            let connection = builder.serve_connection_with_upgrades(
+                TokioIo::new(stream),
+                TowerToHyperService::new(service),
+            );
+            if let Err(error) = connection.await {
+                tracing::warn!(remote = %peer_addr, "HTTP connection failed: {error}");
+            }
+        });
+    }
 }
 
 #[cfg(unix)]
@@ -3942,6 +4047,66 @@ fn request_host(headers: &HeaderMap) -> Option<&str> {
         .map(|value| value.split(':').next().unwrap_or(value))
 }
 
+fn header_map_to_guest_fields(headers: &HeaderMap) -> GuestHttpFields {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = value
+                .to_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|_| String::from_utf8_lossy(value.as_bytes()).into_owned());
+            (name.as_str().to_owned(), value)
+        })
+        .collect()
+}
+
+fn insert_guest_fields(
+    target: &mut HeaderMap,
+    fields: &GuestHttpFields,
+    label: &str,
+) -> std::result::Result<(), String> {
+    for (name, value) in fields {
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| format!("guest returned an invalid {label} name `{name}`: {error}"))?;
+        let header_value = HeaderValue::from_str(value).map_err(|error| {
+            format!("guest returned an invalid {label} value for `{name}`: {error}")
+        })?;
+        target.append(header_name, header_value);
+    }
+
+    Ok(())
+}
+
+fn build_guest_response(response: GuestHttpResponse) -> std::result::Result<Response, String> {
+    let mut response_headers = HeaderMap::new();
+    insert_guest_fields(&mut response_headers, &response.headers, "response header")?;
+
+    let trailer_map = if response.trailers.is_empty() {
+        None
+    } else {
+        let mut trailers = HeaderMap::new();
+        insert_guest_fields(&mut trailers, &response.trailers, "response trailer")?;
+        Some(trailers)
+    };
+
+    let mut built = Response::builder()
+        .status(response.status)
+        .body(Body::new(GuestResponseBody::new(
+            response.body,
+            trailer_map,
+        )))
+        .map_err(|error| format!("failed to construct guest HTTP response: {error}"))?;
+    built.headers_mut().extend(response_headers);
+    Ok(built)
+}
+
+fn guest_response_into_response(response: GuestHttpResponse) -> Response {
+    match build_guest_response(response) {
+        Ok(response) => response,
+        Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+    }
+}
+
 #[cfg(not(feature = "resiliency"))]
 mod resiliency {
     use super::{execute_route_with_middleware_inner, RouteExecutionResult, RouteInvocation};
@@ -3958,11 +4123,25 @@ async fn faas_handler(
     State(state): State<AppState>,
     Extension(hop_limit): Extension<HopLimit>,
     #[cfg(feature = "websockets")] ws: Option<WebSocketUpgrade>,
-    headers: HeaderMap,
-    method: Method,
-    uri: Uri,
-    body: Bytes,
+    request: Request,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
+    let method = parts.method;
+    let uri = parts.uri;
+    let collected = match body.collect().await {
+        Ok(collected) => collected,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read request body: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let trailers = collected.trailers().cloned().unwrap_or_default();
+    let body = collected.to_bytes();
+    let trailer_fields = header_map_to_guest_fields(&trailers);
     let _active_request = telemetry::begin_request(&state.telemetry);
     let runtime = state.runtime.load_full();
     let normalized_path = normalize_route_path(uri.path());
@@ -4075,6 +4254,7 @@ async fn faas_handler(
                             &method,
                             &uri,
                             &body,
+                            &trailer_fields,
                             hop_limit,
                             Some(&trace_id),
                             sampled_execution,
@@ -4083,7 +4263,7 @@ async fn faas_handler(
                         .await
                         {
                             Ok(result) => (
-                                (result.response.status, result.response.body).into_response(),
+                                guest_response_into_response(result.response),
                                 result.fuel_consumed,
                             ),
                             Err((status, message)) => ((status, message).into_response(), None),
@@ -4131,6 +4311,7 @@ async fn faas_handler(
                             &method,
                             &uri,
                             &body,
+                            &trailer_fields,
                             hop_limit,
                             Some(&trace_id),
                             sampled_execution,
@@ -4139,7 +4320,7 @@ async fn faas_handler(
                         .await
                         {
                             Ok(result) => (
-                                (result.response.status, result.response.body).into_response(),
+                                guest_response_into_response(result.response),
                                 result.fuel_consumed,
                             ),
                             Err((status, message)) => ((status, message).into_response(), None),
@@ -4172,6 +4353,7 @@ async fn execute_route_with_middleware(
     method: &Method,
     uri: &Uri,
     body: &Bytes,
+    trailers: &GuestHttpFields,
     hop_limit: HopLimit,
     trace_id: Option<&str>,
     sampled_execution: bool,
@@ -4185,6 +4367,7 @@ async fn execute_route_with_middleware(
         method: method.clone(),
         uri: uri.clone(),
         body: body.clone(),
+        trailers: trailers.clone(),
         hop_limit,
         trace_id: trace_id.map(str::to_owned),
         sampled_execution,
@@ -4204,6 +4387,7 @@ pub(crate) async fn execute_route_with_middleware_inner(
     let method = &invocation.method;
     let uri = &invocation.uri;
     let body = &invocation.body;
+    let trailers = &invocation.trailers;
     let hop_limit = invocation.hop_limit;
     let trace_id = invocation.trace_id.as_deref();
     let sampled_execution = invocation.sampled_execution;
@@ -4236,6 +4420,7 @@ pub(crate) async fn execute_route_with_middleware_inner(
             method,
             uri,
             body,
+            trailers,
             hop_limit,
             trace_id,
             sampled_execution,
@@ -4256,6 +4441,7 @@ pub(crate) async fn execute_route_with_middleware_inner(
         method,
         uri,
         body,
+        trailers,
         hop_limit,
         trace_id,
         sampled_execution,
@@ -4275,6 +4461,7 @@ async fn execute_route_request(
     method: &Method,
     uri: &Uri,
     body: &Bytes,
+    trailers: &GuestHttpFields,
     hop_limit: HopLimit,
     trace_id: Option<&str>,
     sampled_execution: bool,
@@ -4353,7 +4540,9 @@ async fn execute_route_request(
     let guest_request = GuestRequest {
         method: method.to_string(),
         uri: uri.to_string(),
+        headers: header_map_to_guest_fields(&headers),
         body: body.clone(),
+        trailers: trailers.clone(),
     };
     let result = tokio::task::spawn_blocking(move || {
         execute_guest(
@@ -4389,10 +4578,7 @@ async fn execute_route_request(
         Ok(outcome) => match outcome.output {
             GuestExecutionOutput::Http(response) => (response, outcome.fuel_consumed),
             GuestExecutionOutput::LegacyStdout(stdout) => (
-                GuestHttpResponse {
-                    status: StatusCode::OK,
-                    body: stdout,
-                },
+                GuestHttpResponse::new(StatusCode::OK, stdout),
                 outcome.fuel_consumed,
             ),
         },
@@ -4484,12 +4670,18 @@ async fn resolve_mesh_response(
     .await?;
 
     let status = response.status();
+    let headers = header_map_to_guest_fields(response.headers());
     let body = response.bytes().await.map_err(|error| {
         format!("failed to read mesh fetch response body from `{url}`: {error}")
     })?;
 
     if status == StatusCode::LOOP_DETECTED || status.is_success() {
-        Ok(GuestHttpResponse { status, body })
+        Ok(GuestHttpResponse {
+            status,
+            headers,
+            body,
+            trailers: Vec::new(),
+        })
     } else {
         Err(format!(
             "mesh fetch to `{url}` returned an error status: {status}"
@@ -5215,7 +5407,9 @@ fn execute_component_guest(
         &component_bindings::exports::tachyon::mesh::handler::Request {
             method: request.method,
             uri: request.uri,
+            headers: request.headers,
             body: request.body.to_vec(),
+            trailers: request.trailers,
         },
     );
     record_wasm_end(execution.telemetry.as_ref());
@@ -5233,7 +5427,9 @@ fn execute_component_guest(
     Ok(GuestExecutionOutcome {
         output: GuestExecutionOutput::Http(GuestHttpResponse {
             status,
+            headers: response.headers,
             body: Bytes::from(response.body),
+            trailers: response.trailers,
         }),
         fuel_consumed,
     })
@@ -5641,7 +5837,9 @@ fn execute_system_component_guest(
         &system_component_bindings::exports::tachyon::mesh::handler::Request {
             method: request.method,
             uri: request.uri,
+            headers: request.headers,
             body: request.body.to_vec(),
+            trailers: request.trailers,
         },
     );
     record_wasm_end(execution.telemetry.as_ref());
@@ -5659,7 +5857,9 @@ fn execute_system_component_guest(
     Ok(GuestExecutionOutcome {
         output: GuestExecutionOutput::Http(GuestHttpResponse {
             status,
+            headers: response.headers,
             body: Bytes::from(response.body),
+            trailers: response.trailers,
         }),
         fuel_consumed,
     })
@@ -8057,7 +8257,8 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use ed25519_dalek::{Signer, SigningKey};
-    use http_body_util::BodyExt;
+    use http_body_util::{BodyExt, Full};
+    use prost::Message;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -8077,6 +8278,18 @@ mod tests {
 
     type CapturedForwardedHeaders = Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
 
+    #[derive(Clone, PartialEq, Message)]
+    struct TestGrpcHelloRequest {
+        #[prost(string, tag = "1")]
+        name: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct TestGrpcHelloResponse {
+        #[prost(string, tag = "1")]
+        message: String,
+    }
+
     fn expected_secret_status() -> &'static str {
         if cfg!(feature = "secrets-vault") {
             "super_secret_123"
@@ -8090,6 +8303,38 @@ mod tests {
             "{payload} | env: missing | secret: {}",
             expected_secret_status()
         )
+    }
+
+    fn encode_test_grpc_message<T>(message: &T) -> Vec<u8>
+    where
+        T: Message,
+    {
+        let mut payload = Vec::new();
+        message
+            .encode(&mut payload)
+            .expect("protobuf payload should encode");
+
+        let mut framed = Vec::with_capacity(payload.len() + 5);
+        framed.push(0);
+        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    fn decode_test_grpc_message<T>(payload: &[u8]) -> T
+    where
+        T: Message + Default,
+    {
+        assert!(
+            payload.len() >= 5,
+            "gRPC payload should include a frame header"
+        );
+        assert_eq!(payload[0], 0, "test gRPC payload should not be compressed");
+        let message_len =
+            u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+        let framed = &payload[5..];
+        assert_eq!(framed.len(), message_len, "gRPC frame length should match");
+        T::decode(framed).expect("protobuf payload should decode")
     }
 
     fn build_test_engine(config: &IntegrityConfig) -> Engine {
@@ -8780,11 +9025,7 @@ mod tests {
         let response = execute_guest(
             &engine,
             "guest-example",
-            GuestRequest {
-                method: "POST".to_owned(),
-                uri: "/api/guest-example".to_owned(),
-                body: Bytes::from("Hello Lean FaaS!"),
-            },
+            GuestRequest::new("POST", "/api/guest-example", "Hello Lean FaaS!"),
             &route,
             GuestExecutionContext {
                 secret_access: SecretAccess::from_route(&route, &SecretsVault::load()),
@@ -8806,12 +9047,12 @@ mod tests {
         assert_eq!(
             response,
             GuestExecutionOutcome {
-                output: GuestExecutionOutput::Http(GuestHttpResponse {
-                    status: StatusCode::OK,
-                    body: Bytes::from(expected_guest_example_body(
+                output: GuestExecutionOutput::Http(GuestHttpResponse::new(
+                    StatusCode::OK,
+                    Bytes::from(expected_guest_example_body(
                         "FaaS received: Hello Lean FaaS!"
                     )),
-                }),
+                )),
                 fuel_consumed: None,
             }
         );
@@ -8827,11 +9068,7 @@ mod tests {
         let response = execute_guest(
             &engine,
             "guest-call-legacy",
-            GuestRequest {
-                method: "GET".to_owned(),
-                uri: "/api/guest-call-legacy".to_owned(),
-                body: Bytes::new(),
-            },
+            GuestRequest::new("GET", "/api/guest-call-legacy", Bytes::new()),
             &route,
             GuestExecutionContext {
                 config,
@@ -8871,11 +9108,11 @@ mod tests {
         let response = execute_guest(
             &engine,
             "guest-tcp-echo",
-            GuestRequest {
-                method: "TCP".to_owned(),
-                uri: "tcp://guest-tcp-echo".to_owned(),
-                body: Bytes::from_static(b"ping over tcp"),
-            },
+            GuestRequest::new(
+                "TCP",
+                "tcp://guest-tcp-echo",
+                Bytes::from_static(b"ping over tcp"),
+            ),
             &route,
             GuestExecutionContext {
                 config,
@@ -8922,13 +9159,13 @@ mod tests {
         let response = execute_guest(
             &engine,
             "guest-ai",
-            GuestRequest {
-                method: "POST".to_owned(),
-                uri: "/api/guest-ai".to_owned(),
-                body: Bytes::from_static(
+            GuestRequest::new(
+                "POST",
+                "/api/guest-ai",
+                Bytes::from_static(
                     br#"{"model":"llama3","shape":[1,4],"values":[1.0,2.0,3.0,4.0],"output_len":17,"response_kind":"text"}"#,
                 ),
-            },
+            ),
             &route,
             GuestExecutionContext {
                 config,
@@ -8979,11 +9216,7 @@ mod tests {
         let save_response = execute_guest(
             &engine,
             "guest-volume",
-            GuestRequest {
-                method: "POST".to_owned(),
-                uri: "/api/guest-volume".to_owned(),
-                body: Bytes::from("Hello Stateful World"),
-            },
+            GuestRequest::new("POST", "/api/guest-volume", "Hello Stateful World"),
             &route,
             GuestExecutionContext {
                 config: config.clone(),
@@ -9005,10 +9238,9 @@ mod tests {
         assert_eq!(
             save_response,
             GuestExecutionOutcome {
-                output: GuestExecutionOutput::Http(GuestHttpResponse {
-                    status: StatusCode::OK,
-                    body: Bytes::from("Saved"),
-                }),
+                output: GuestExecutionOutput::Http(
+                    GuestHttpResponse::new(StatusCode::OK, "Saved",)
+                ),
                 fuel_consumed: None,
             }
         );
@@ -9016,11 +9248,7 @@ mod tests {
         let read_response = execute_guest(
             &engine,
             "guest-volume",
-            GuestRequest {
-                method: "GET".to_owned(),
-                uri: "/api/guest-volume".to_owned(),
-                body: Bytes::new(),
-            },
+            GuestRequest::new("GET", "/api/guest-volume", Bytes::new()),
             &route,
             GuestExecutionContext {
                 config: config.clone(),
@@ -9042,10 +9270,10 @@ mod tests {
         assert_eq!(
             read_response,
             GuestExecutionOutcome {
-                output: GuestExecutionOutput::Http(GuestHttpResponse {
-                    status: StatusCode::OK,
-                    body: Bytes::from("Hello Stateful World"),
-                }),
+                output: GuestExecutionOutput::Http(GuestHttpResponse::new(
+                    StatusCode::OK,
+                    "Hello Stateful World",
+                )),
                 fuel_consumed: None,
             }
         );
@@ -9116,6 +9344,98 @@ mod tests {
             String::from_utf8_lossy(&body).trim(),
             expected_guest_example_body("FaaS received an empty payload")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grpc_http2_route_returns_protobuf_body_and_grpc_status_trailer() {
+        let config = validate_integrity_config(IntegrityConfig {
+            routes: vec![targeted_route(
+                "/grpc/hello",
+                vec![weighted_target("guest-grpc", 100)],
+            )],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("gRPC route config should validate");
+        let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gRPC test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("gRPC test listener should expose an address");
+        let server = tokio::spawn(async move {
+            serve_http_listener(listener, app)
+                .await
+                .expect("gRPC test server should stay healthy");
+        });
+
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("gRPC client should connect");
+        let (mut sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .expect("HTTP/2 handshake should succeed");
+        let connection_task = tokio::spawn(async move {
+            connection
+                .await
+                .expect("HTTP/2 connection should stay healthy");
+        });
+
+        let request_body = encode_test_grpc_message(&TestGrpcHelloRequest {
+            name: "Tachyon".to_owned(),
+        });
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{address}/grpc/hello"))
+                    .version(hyper::Version::HTTP_2)
+                    .header("content-type", "application/grpc")
+                    .header("te", "trailers")
+                    .body(Full::new(Bytes::from(request_body)))
+                    .expect("gRPC request should build"),
+            )
+            .await
+            .expect("gRPC request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.version(), hyper::Version::HTTP_2);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/grpc")
+        );
+
+        let mut body = response.into_body();
+        let mut framed_payload = Vec::new();
+        let mut trailers = None;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.expect("HTTP/2 response frame should be readable");
+            if let Some(data) = frame.data_ref() {
+                framed_payload.extend_from_slice(data);
+            }
+            if let Some(frame_trailers) = frame.trailers_ref() {
+                trailers = Some(frame_trailers.clone());
+            }
+        }
+
+        let decoded = decode_test_grpc_message::<TestGrpcHelloResponse>(&framed_payload);
+        assert_eq!(decoded.message, "Hello, Tachyon!");
+        assert_eq!(
+            trailers
+                .as_ref()
+                .and_then(|trailers| trailers.get("grpc-status"))
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+
+        server.abort();
+        connection_task.abort();
+        let _ = server.await;
+        let _ = connection_task.await;
     }
 
     #[tokio::test]
@@ -9230,11 +9550,7 @@ mod tests {
         let error = execute_guest(
             &engine,
             "metrics",
-            GuestRequest {
-                method: "GET".to_owned(),
-                uri: "/metrics".to_owned(),
-                body: Bytes::new(),
-            },
+            GuestRequest::new("GET", "/metrics", Bytes::new()),
             &route,
             GuestExecutionContext {
                 config,
@@ -10461,10 +10777,7 @@ mod tests {
             &new_uds_fast_path_registry(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &propagated_headers,
-            GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from("MESH_FETCH:/ping"),
-            },
+            GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:/ping"),
         )
         .await
         .expect("mesh fetch should succeed");
@@ -10545,10 +10858,7 @@ mod tests {
             &new_uds_fast_path_registry(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &[],
-            GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from(format!("MESH_FETCH:http://{address}/ping")),
-            },
+            GuestHttpResponse::new(StatusCode::OK, format!("MESH_FETCH:http://{address}/ping")),
         )
         .await
         .expect("external mesh fetch should succeed");
@@ -10639,10 +10949,7 @@ mod tests {
             registry.as_ref(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &[],
-            GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from("MESH_FETCH:/ping"),
-            },
+            GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:/ping"),
         )
         .await
         .expect("UDS fast-path request should succeed");
@@ -10710,10 +11017,7 @@ mod tests {
             &registry,
             HopLimit(DEFAULT_HOP_LIMIT),
             &[],
-            GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from("MESH_FETCH:/ping"),
-            },
+            GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:/ping"),
         )
         .await
         .expect("stale peer should fall back to TCP");
@@ -10788,10 +11092,7 @@ mod tests {
                     registry,
                     HopLimit(DEFAULT_HOP_LIMIT),
                     &[],
-                    GuestHttpResponse {
-                        status: StatusCode::OK,
-                        body: Bytes::from("MESH_FETCH:/ping"),
-                    },
+                    GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:/ping"),
                 )
                 .await
                 .expect("benchmark mesh fetch should succeed");
@@ -11238,33 +11539,24 @@ mod tests {
         let mut responses = HashMap::new();
         responses.insert(
             "/api/allow-middleware".to_owned(),
-            GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from("middleware allowed"),
-            },
+            GuestHttpResponse::new(StatusCode::OK, "middleware allowed"),
         );
         responses.insert(
             "/api/protected-allow".to_owned(),
-            GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from(expected_guest_example_body(
+            GuestHttpResponse::new(
+                StatusCode::OK,
+                Bytes::from(expected_guest_example_body(
                     "FaaS received an empty payload",
                 )),
-            },
+            ),
         );
         responses.insert(
             "/api/deny-middleware".to_owned(),
-            GuestHttpResponse {
-                status: StatusCode::FORBIDDEN,
-                body: Bytes::from("forbidden"),
-            },
+            GuestHttpResponse::new(StatusCode::FORBIDDEN, "forbidden"),
         );
         responses.insert(
             "/api/protected-deny".to_owned(),
-            GuestHttpResponse {
-                status: StatusCode::OK,
-                body: Bytes::from("main route should not execute"),
-            },
+            GuestHttpResponse::new(StatusCode::OK, "main route should not execute"),
         );
 
         let mut allow_visited = Vec::new();

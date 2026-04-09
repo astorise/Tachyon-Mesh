@@ -757,6 +757,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "prost",
  "rand 0.8.5",
  "reqwest 0.12.28",
  "rustls-pemfile",
@@ -2270,6 +2271,14 @@ dependencies = [
 name = "guest-flaky"
 version = "0.1.0"
 dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "guest-grpc"
+version = "0.1.0"
+dependencies = [
+ "prost",
  "wit-bindgen 0.46.0",
 ]
 
@@ -4028,6 +4037,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

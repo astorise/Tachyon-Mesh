@@ -49,6 +49,11 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
         )
         .into_bytes();
 
-        bindings::exports::tachyon::mesh::handler::Response { status: 200, body }
+        bindings::exports::tachyon::mesh::handler::Response {
+            status: 200,
+            headers: vec![],
+            body,
+            trailers: vec![],
+        }
     }
 }

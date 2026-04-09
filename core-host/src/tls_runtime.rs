@@ -176,11 +176,7 @@ impl TlsManager {
             crate::execute_guest(
                 &engine,
                 &function_name,
-                crate::GuestRequest {
-                    method: "POST".to_owned(),
-                    uri,
-                    body: Bytes::new(),
-                },
+                crate::GuestRequest::new("POST", uri, Bytes::new()),
                 &route,
                 crate::GuestExecutionContext {
                     config,

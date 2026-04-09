@@ -167,7 +167,9 @@ fn response(
 ) -> bindings::exports::tachyon::mesh::handler::Response {
     bindings::exports::tachyon::mesh::handler::Response {
         status,
+        headers: vec![],
         body: body.into(),
+        trailers: vec![],
     }
 }
 
