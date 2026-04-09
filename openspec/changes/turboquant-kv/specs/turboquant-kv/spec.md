@@ -1,25 +1,41 @@
 ## ADDED Requirements
 
-### Requirement: TurboQuant GPU work starts with a failing Rust test harness
-The TurboQuant implementation SHALL define its Rust tests, expected tensor outputs, and FFI signatures before introducing the CUDA kernel implementation.
+### Requirement: Candle can invoke TurboQuant through a native FFI bridge
+The runtime SHALL expose the TurboQuant compression and decompression kernels to Rust through a dedicated FFI layer that can be called safely from Candle custom operators.
 
-#### Scenario: The initial test suite runs before the kernel exists
-- **WHEN** the TurboQuant Rust tests are compiled against the declared FFI boundary
-- **AND** the CUDA kernel is not yet implemented
-- **THEN** the tests fail in a controlled and diagnosable way that captures the expected quantization contract
+#### Scenario: The build enables TurboQuant support
+- **WHEN** the workspace builds with TurboQuant integration enabled
+- **THEN** the native C++ or CUDA sources are compiled through a Rust FFI crate
+- **AND** the Rust runtime can call the exported TurboQuant entrypoints from Candle code
 
-### Requirement: The FFI boundary for TurboQuant is typed and explicit
-The host AI module SHALL expose a C-compatible launcher for the TurboQuant kernel with typed pointers for the input tensor, compressed outputs, tensor metadata, and CUDA stream.
+### Requirement: TurboQuant applies asymmetric KV compression
+The inference runtime SHALL preserve the `K` cache in standard precision and SHALL only apply TurboQuant compression to the `V` cache.
 
-#### Scenario: Rust invokes the TurboQuant launcher
-- **WHEN** the Candle custom operator prepares device buffers for the input and output tensors
-- **THEN** it calls the declared `extern "C"` launcher with the GPU pointers, tensor dimensions, and stream handle
+#### Scenario: An attention layer stores a KV cache entry
+- **WHEN** the model writes cache state for a TurboQuant-enabled layer
+- **THEN** the `K` tensors remain in `q8_0` or `f16`
+- **AND** only the `V` tensors are passed through the TurboQuant compression path
 
-### Requirement: TurboQuant integrates with Candle as a GPU custom operator
-The TurboQuant compressor SHALL allocate its outputs on the GPU, invoke the CUDA kernel through the typed FFI boundary, and return the resulting storage objects back to Candle's execution graph.
+### Requirement: Boundary layers bypass TurboQuant value compression
+The inference runtime SHALL protect the first two and last two transformer layers from TurboQuant value compression.
 
-#### Scenario: Candle executes the TurboQuant custom operator
-- **WHEN** a model graph invokes the `TurboQuantCompressor`
-- **THEN** the operator allocates GPU output tensors
-- **AND** launches the CUDA implementation through the FFI boundary
-- **AND** returns the compressed GPU storage to the calling Candle graph
+#### Scenario: The model evaluates a protected boundary layer
+- **WHEN** the active layer index is within the first two or last two transformer blocks
+- **THEN** the runtime bypasses TurboQuant for that layer's `V` cache
+- **AND** keeps the cache in the standard high-precision representation
+
+### Requirement: TurboQuant supports sparse value decoding from attention scores
+The TurboQuant decompression path SHALL accept attention weights and a threshold so near-zero attention entries can skip value decoding work.
+
+#### Scenario: A cached token has negligible attention weight
+- **WHEN** the decompression path sees an attention weight below the configured threshold
+- **THEN** it skips the value decode work for that token
+- **AND** returns the equivalent zero contribution for the skipped entry
+
+### Requirement: TurboQuant integration is validated against reference fixtures
+The TurboQuant integration SHALL be verified against reference fixtures generated from the native implementation before it is used in model integration.
+
+#### Scenario: The fixture validation test runs
+- **WHEN** the Rust validation suite loads the reference TurboQuant fixtures
+- **THEN** the Candle custom operator output matches the reference packed representation bit-for-bit
+- **AND** the implementation is considered ready for model-level integration

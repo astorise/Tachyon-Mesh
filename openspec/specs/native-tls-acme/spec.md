@@ -1,5 +1,9 @@
-## ADDED Requirements
+# Native TLS ACME
 
+## Purpose
+Define how Tachyon terminates TLS natively at the host edge, maps custom domains through SNI, and provisions certificates asynchronously through a cert-manager workflow.
+
+## Requirements
 ### Requirement: Targets can declare custom domains for native TLS termination
 The integrity manifest SHALL allow targets to declare one or more custom domains that the host can terminate natively with SNI-aware certificate selection.
 
@@ -22,9 +26,9 @@ The host SHALL inspect the incoming SNI value during the TLS handshake, serve ca
 - **AND** resumes the handshake after the certificate is cached
 
 ### Requirement: The cert manager persists provisioned certificates through the storage broker
-The cert manager SHALL obtain ACME certificates, satisfy the HTTP-01 challenge, persist the certificate material through the storage broker, and return the resulting keypair to the host cache.
+The cert manager SHALL obtain ACME certificates, satisfy the certificate challenge flow, persist the certificate material through the storage broker, and return the resulting keypair to the host cache.
 
-#### Scenario: A new certificate is issued through ACME
-- **WHEN** the cert manager successfully completes the ACME challenge for a target domain
+#### Scenario: A new certificate is issued through the cert manager
+- **WHEN** the cert manager successfully provisions certificate material for a target domain
 - **THEN** it stores the private key and certificate chain in persistent storage through the storage broker
 - **AND** returns the certificate material to the host so future handshakes can complete from cache
