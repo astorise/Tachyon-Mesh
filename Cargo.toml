@@ -21,6 +21,7 @@ members = [
     "system-faas-keda",
     "system-faas-logger",
     "system-faas-cert-manager",
+    "system-faas-gc",
     "system-faas-prom",
     "tachyon-cli",
     "turboquant-sys",

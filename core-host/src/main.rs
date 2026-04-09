@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Router,
 };
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 #[cfg(feature = "websockets")]
 use futures_util::{SinkExt, StreamExt};
@@ -247,6 +248,8 @@ struct RuntimeState {
     metered_engine: Engine,
     config: IntegrityConfig,
     route_registry: Arc<RouteRegistry>,
+    #[allow(dead_code)]
+    batch_target_registry: Arc<BatchTargetRegistry>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     #[cfg(feature = "ai-inference")]
     ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
@@ -339,6 +342,11 @@ struct ComponentHostState {
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
     outbound_http_client: reqwest::blocking::Client,
+}
+
+struct BatchCommandState {
+    ctx: WasiCtx,
+    table: ResourceTable,
 }
 
 #[derive(Clone)]
@@ -1200,6 +1208,16 @@ struct IntegrityRoute {
     volumes: Vec<IntegrityVolume>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct IntegrityBatchTarget {
+    name: String,
+    module: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    volumes: Vec<IntegrityVolume>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct IntegrityModelBinding {
     alias: String,
@@ -1244,6 +1262,8 @@ struct IntegrityConfig {
         skip_serializing_if = "is_default_telemetry_sample_rate"
     )]
     telemetry_sample_rate: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    batch_targets: Vec<IntegrityBatchTarget>,
     routes: Vec<IntegrityRoute>,
 }
 
@@ -1262,6 +1282,11 @@ struct RouteRegistry {
     by_path: HashMap<String, ResolvedRoute>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct BatchTargetRegistry {
+    by_name: HashMap<String, IntegrityBatchTarget>,
+}
+
 impl IntegrityLayer4Config {
     fn is_empty(&self) -> bool {
         self.tcp.is_empty() && self.udp.is_empty()
@@ -1278,6 +1303,27 @@ enum ExecutionError {
     Internal(String),
 }
 
+#[derive(Debug, Parser)]
+#[command(name = "core-host")]
+struct HostCli {
+    #[command(subcommand)]
+    command: Option<HostCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum HostCommand {
+    Serve,
+    Run(RunCommand),
+}
+
+#[derive(Debug, ClapArgs)]
+struct RunCommand {
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    #[arg(long)]
+    target: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     run().await
@@ -1285,6 +1331,29 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     init_host_tracing();
+    let cli = HostCli::parse();
+    match cli.command.unwrap_or(HostCommand::Serve) {
+        HostCommand::Serve => serve_host().await,
+        HostCommand::Run(command) => {
+            let exit_code = match execute_batch_target_from_manifest(
+                command.manifest.unwrap_or_else(integrity_manifest_path),
+                &command.target,
+            )
+            .await
+            {
+                Ok(true) => 0,
+                Ok(false) => 1,
+                Err(error) => {
+                    tracing::error!("batch target `{}` failed: {error:#}", command.target);
+                    1
+                }
+            };
+            std::process::exit(exit_code);
+        }
+    }
+}
+
+async fn serve_host() -> Result<()> {
     let (export_sender, export_receiver) = mpsc::channel(TELEMETRY_EXPORT_QUEUE_CAPACITY);
     let telemetry =
         telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
@@ -1368,6 +1437,70 @@ async fn run() -> Result<()> {
     }
     background_workers.stop_all().await;
     Ok(())
+}
+
+async fn execute_batch_target_from_manifest(
+    manifest_path: PathBuf,
+    target_name: &str,
+) -> Result<bool> {
+    let config = load_integrity_config_from_manifest_path(&manifest_path)?;
+    let target = BatchTargetRegistry::build(&config)?
+        .get(target_name)
+        .cloned()
+        .ok_or_else(|| anyhow!("sealed manifest does not define batch target `{target_name}`"))?;
+    let engine = build_command_engine(&config)?;
+    let module_path =
+        resolve_guest_module_path(&target.module).map_err(|error| anyhow!(error.to_string()))?;
+    let component = Component::from_file(&engine, &module_path).map_err(|error| {
+        anyhow!(
+            "failed to load batch target component `{}` from {}: {error}",
+            target.name,
+            module_path.display()
+        )
+    })?;
+
+    let mut linker = ComponentLinker::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|error| {
+        anyhow!("failed to add WASI preview2 functions to batch target linker: {error}")
+    })?;
+
+    let mut wasi = WasiCtxBuilder::new();
+    let argv0 = module_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(target.module.as_str())
+        .to_owned();
+    let args = [argv0.as_str()];
+    wasi.inherit_stdio().args(&args);
+    for (key, value) in &target.env {
+        wasi.env(key, value);
+    }
+    preopen_batch_target_volumes(&mut wasi, &target)?;
+
+    let mut store = Store::new(
+        &engine,
+        BatchCommandState {
+            ctx: wasi.build(),
+            table: ResourceTable::new(),
+        },
+    );
+    let command =
+        wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut store, &component, &linker)
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to instantiate batch target `{}` from {}: {error}",
+                    target.name,
+                    module_path.display()
+                )
+            })?;
+
+    let run_result: std::result::Result<(), ()> = command
+        .wasi_cli_run()
+        .call_run(&mut store)
+        .await
+        .map_err(|error| anyhow!("failed to execute batch target `{}`: {error}", target.name))?;
+    Ok(run_result.is_ok())
 }
 
 impl BackgroundWorkerManager {
@@ -2518,6 +2651,7 @@ fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeState> {
         engine: build_engine(&config, false)?,
         metered_engine: build_engine(&config, true)?,
         route_registry: Arc::new(RouteRegistry::build(&config)?),
+        batch_target_registry: Arc::new(BatchTargetRegistry::build(&config)?),
         concurrency_limits: build_concurrency_limits(&config),
         #[cfg(feature = "ai-inference")]
         ai_runtime: Arc::new(ai_inference::AiInferenceRuntime::from_config(&config)?),
@@ -5295,6 +5429,30 @@ impl RouteRegistry {
     }
 }
 
+impl BatchTargetRegistry {
+    fn build(config: &IntegrityConfig) -> Result<Self> {
+        let mut registry = Self::default();
+        for target in &config.batch_targets {
+            if registry
+                .by_name
+                .insert(target.name.clone(), target.clone())
+                .is_some()
+            {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: batch target `{}` is defined more than once",
+                    target.name
+                ));
+            }
+        }
+
+        Ok(registry)
+    }
+
+    fn get(&self, name: &str) -> Option<&IntegrityBatchTarget> {
+        self.by_name.get(name)
+    }
+}
+
 fn client_connect_host(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(ip) if ip.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
@@ -6776,6 +6934,14 @@ fn build_engine(integrity_config: &IntegrityConfig, enable_fuel_metering: bool) 
         .map_err(|error| anyhow!("failed to create Wasmtime engine with pooling enabled: {error}"))
 }
 
+fn build_command_engine(_integrity_config: &IntegrityConfig) -> Result<Engine> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+
+    Engine::new(&config)
+        .map_err(|error| anyhow!("failed to create Wasmtime engine for batch execution: {error}"))
+}
+
 fn build_pooling_config(config: &IntegrityConfig) -> Result<PoolingAllocationConfig> {
     let total_route_concurrency = total_route_concurrency(&config.routes)?;
     let total_min_instances = total_min_instances(&config.routes)?;
@@ -6965,15 +7131,28 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
         ));
     }
 
+    if config.routes.is_empty() && config.batch_targets.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: embedded sealed configuration must define at least one route or batch target"
+        ));
+    }
+
     config.tls_address = normalize_tls_address(config.tls_address)?;
-    config.routes = normalize_config_routes(config.routes)?;
+    config.batch_targets = normalize_batch_targets(config.batch_targets)?;
+    config.routes = normalize_config_routes(config.routes, !config.batch_targets.is_empty())?;
     let route_registry = RouteRegistry::build(&config)?;
     config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
     Ok(config)
 }
 
-fn normalize_config_routes(routes: Vec<IntegrityRoute>) -> Result<Vec<IntegrityRoute>> {
+fn normalize_config_routes(
+    routes: Vec<IntegrityRoute>,
+    allow_empty: bool,
+) -> Result<Vec<IntegrityRoute>> {
     if routes.is_empty() {
+        if allow_empty {
+            return Ok(Vec::new());
+        }
         return Err(anyhow!(
             "Integrity Validation Failed: embedded sealed configuration must define at least one route"
         ));
@@ -6995,6 +7174,27 @@ fn normalize_config_routes(routes: Vec<IntegrityRoute>) -> Result<Vec<IntegrityR
     }
     ensure_unique_model_aliases(&normalized)?;
     ensure_unique_route_domains(&normalized)?;
+    Ok(normalized)
+}
+
+fn normalize_batch_targets(
+    targets: Vec<IntegrityBatchTarget>,
+) -> Result<Vec<IntegrityBatchTarget>> {
+    let mut normalized = targets
+        .into_iter()
+        .map(validate_integrity_batch_target)
+        .collect::<Result<Vec<_>>>()?;
+
+    normalized.sort_by(|left, right| left.name.cmp(&right.name));
+    for pair in normalized.windows(2) {
+        if pair[0].name == pair[1].name {
+            return Err(anyhow!(
+                "Integrity Validation Failed: batch target `{}` is defined more than once",
+                pair[0].name
+            ));
+        }
+    }
+
     Ok(normalized)
 }
 
@@ -7132,6 +7332,48 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
         volumes: normalize_route_volumes(route.volumes, route.role, &normalized)?,
+    })
+}
+
+fn validate_integrity_batch_target(target: IntegrityBatchTarget) -> Result<IntegrityBatchTarget> {
+    let name = target.name.trim();
+    if name.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: batch targets must include a non-empty `name`"
+        ));
+    }
+
+    let module = target.module.trim();
+    if module.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: batch target `{name}` must include a non-empty `module`"
+        ));
+    }
+
+    let env = target
+        .env
+        .into_iter()
+        .map(|(key, value)| {
+            let normalized_key = key.trim().to_owned();
+            if normalized_key.is_empty() {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: batch target `{name}` environment keys cannot be empty"
+                ));
+            }
+
+            Ok((normalized_key, value.trim().to_owned()))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    Ok(IntegrityBatchTarget {
+        name: name.to_owned(),
+        module: module.to_owned(),
+        env,
+        volumes: normalize_route_volumes(
+            target.volumes,
+            RouteRole::System,
+            &format!("batch target `{name}`"),
+        )?,
     })
 }
 
@@ -8034,6 +8276,39 @@ fn preopen_route_volumes(
     Ok(())
 }
 
+fn preopen_batch_target_volumes(
+    wasi: &mut WasiCtxBuilder,
+    target: &IntegrityBatchTarget,
+) -> Result<()> {
+    for volume in &target.volumes {
+        if volume.volume_type == VolumeType::Ram {
+            fs::create_dir_all(&volume.host_path).with_context(|| {
+                format!(
+                    "failed to initialize RAM volume `{}` for batch target `{}`",
+                    volume.host_path, target.name
+                )
+            })?;
+        }
+
+        wasi.preopened_dir(
+            &volume.host_path,
+            &volume.guest_path,
+            volume_dir_perms(volume.readonly),
+            volume_file_perms(volume.readonly),
+        )
+        .map_err(|error| {
+            anyhow!(
+                "failed to preopen volume `{}` for batch target `{}` at guest path `{}`: {error}",
+                volume.host_path,
+                target.name,
+                volume.guest_path
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 fn volume_dir_perms(readonly: bool) -> DirPerms {
     if readonly {
         DirPerms::READ
@@ -8051,6 +8326,15 @@ fn volume_file_perms(readonly: bool) -> FilePerms {
 }
 
 impl WasiView for ComponentHostState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
+    }
+}
+
+impl WasiView for BatchCommandState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.ctx,
@@ -8349,6 +8633,7 @@ impl IntegrityConfig {
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
             layer4: IntegrityLayer4Config::default(),
             telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
+            batch_targets: Vec::new(),
             routes: vec![
                 IntegrityRoute::user_with_secrets(DEFAULT_ROUTE, &["DB_PASS"]),
                 IntegrityRoute::system(DEFAULT_SYSTEM_ROUTE),
@@ -8775,7 +9060,28 @@ mod tests {
             resource_limit_response: DEFAULT_RESOURCE_LIMIT_RESPONSE.to_owned(),
             layer4: IntegrityLayer4Config::default(),
             telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
+            batch_targets: Vec::new(),
             routes,
+        }
+    }
+
+    fn gc_batch_target(cache_dir: &Path, ttl_seconds: u64) -> IntegrityBatchTarget {
+        IntegrityBatchTarget {
+            name: "gc-job".to_owned(),
+            module: "system-faas-gc".to_owned(),
+            env: BTreeMap::from([
+                ("TARGET_DIR".to_owned(), "/cache".to_owned()),
+                ("TTL_SECONDS".to_owned(), ttl_seconds.to_string()),
+            ]),
+            volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
+                host_path: cache_dir.display().to_string(),
+                guest_path: "/cache".to_owned(),
+                readonly: false,
+                ttl_seconds: None,
+                idle_timeout: None,
+                eviction_policy: None,
+            }],
         }
     }
 
@@ -9463,6 +9769,31 @@ mod tests {
         assert!(runtime.config.sealed_route("/api/guest-loop").is_none());
     }
 
+    #[tokio::test]
+    async fn run_mode_executes_gc_batch_target_and_deletes_stale_files() {
+        let temp_dir = unique_test_dir("batch-gc");
+        let cache_dir = temp_dir.join("cache");
+        fs::create_dir_all(cache_dir.join("nested")).expect("cache directory should exist");
+        let stale_file = cache_dir.join("nested").join("stale.txt");
+        fs::write(&stale_file, "stale").expect("stale file should be written");
+
+        let manifest_path = temp_dir.join("integrity.lock");
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes.clear();
+        config.batch_targets = vec![gc_batch_target(&cache_dir, 0)];
+        write_test_manifest(&manifest_path, &config, 14);
+
+        let success = execute_batch_target_from_manifest(manifest_path, "gc-job")
+            .await
+            .expect("batch target should execute successfully");
+
+        assert!(success, "batch target should exit successfully");
+        assert!(
+            !stale_file.exists(),
+            "batch GC target should delete stale files"
+        );
+    }
+
     #[test]
     fn execute_guest_returns_component_response_payload() {
         let config = IntegrityConfig::default_sealed();
@@ -10098,6 +10429,9 @@ mod tests {
             metered_engine: build_test_metered_engine(&config),
             route_registry: Arc::new(
                 RouteRegistry::build(&config).expect("route registry should build"),
+            ),
+            batch_target_registry: Arc::new(
+                BatchTargetRegistry::build(&config).expect("batch target registry should build"),
             ),
             concurrency_limits: Arc::new(HashMap::from([(
                 DEFAULT_ROUTE.to_owned(),
@@ -11877,6 +12211,23 @@ mod tests {
                 IntegrityRoute::system("/metrics"),
             ]
         );
+    }
+
+    #[test]
+    fn validate_integrity_config_accepts_batch_targets_without_routes() {
+        let temp_dir = unique_test_dir("batch-targets");
+        let cache_dir = temp_dir.join("cache");
+        fs::create_dir_all(&cache_dir).expect("cache directory should be created");
+
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes.clear();
+        config.batch_targets = vec![gc_batch_target(&cache_dir, 60)];
+
+        let config = validate_integrity_config(config).expect("batch-only config should validate");
+
+        assert!(config.routes.is_empty());
+        assert_eq!(config.batch_targets.len(), 1);
+        assert_eq!(config.batch_targets[0].name, "gc-job");
     }
 
     #[test]
