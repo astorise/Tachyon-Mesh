@@ -39,9 +39,14 @@ impl bindings::Guest for Component {
             }
 
             let body = format!(r#"{{"spec":{{"replicas":{DESIRED_REPLICAS}}}}}"#).into_bytes();
+            let headers = vec![(
+                "content-type".to_owned(),
+                "application/merge-patch+json".to_owned(),
+            )];
             if bindings::tachyon::mesh::outbound_http::send_request(
                 "PATCH",
                 KUBERNETES_DEPLOYMENT_URL,
+                &headers,
                 &body,
             )
             .is_ok()

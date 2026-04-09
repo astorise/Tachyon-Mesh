@@ -23,6 +23,7 @@ members = [
     "system-faas-cert-manager",
     "system-faas-gc",
     "system-faas-prom",
+    "system-faas-sqs",
     "tachyon-cli",
     "turboquant-sys",
 ]

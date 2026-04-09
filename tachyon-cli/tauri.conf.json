@@ -87,6 +87,13 @@
               "required": false
             },
             {
+              "name": "route-env",
+              "description": "Attach an environment variable using /path=KEY=VALUE.",
+              "takesValue": true,
+              "multiple": true,
+              "required": false
+            },
+            {
               "name": "route-scale",
               "description": "Apply per-route scaling using /path=min:max.",
               "takesValue": true,

@@ -78,7 +78,15 @@ interface storage-broker {
 }
 
 interface outbound-http {
-    send-request: func(method: string, url: string, body: list<u8>) -> result<u16, string>;
+    type headers = list<tuple<string, string>>;
+
+    record response {
+        status: u16,
+        headers: headers,
+        body: list<u8>,
+    }
+
+    send-request: func(method: string, url: string, headers: headers, body: list<u8>) -> result<response, string>;
 }
 
 interface secrets-vault {
