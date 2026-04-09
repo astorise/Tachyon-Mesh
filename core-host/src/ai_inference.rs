@@ -204,7 +204,6 @@ impl AiInferenceRuntime {
         WasiNnCtx::new(backends, WasiRegistry::from(registry))
     }
 
-    #[cfg(test)]
     pub(crate) fn loaded_model_aliases(&self) -> Vec<String> {
         let mut aliases = self.models.keys().cloned().collect::<Vec<_>>();
         aliases.sort();

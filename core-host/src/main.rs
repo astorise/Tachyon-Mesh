@@ -5425,6 +5425,49 @@ async fn forward_request_to_override(
     Ok(built)
 }
 
+fn requested_model_alias(
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<String> {
+    let header_alias = ["x-tachyon-model", "x-model-alias", "model-alias"]
+        .into_iter()
+        .find_map(|name| headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    let body_alias = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|payload| payload.as_object().cloned())
+        .and_then(|payload| {
+            ["model", "model_alias", "alias"]
+                .into_iter()
+                .find_map(|key| payload.get(key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        });
+
+    header_alias
+        .or(body_alias)
+        .filter(|alias| {
+            route.models.is_empty()
+                || route
+                    .models
+                    .iter()
+                    .any(|binding| binding.alias.eq_ignore_ascii_case(alias))
+        })
+        .or_else(|| {
+            if route.models.len() == 1 {
+                route.models.first().map(|binding| binding.alias.clone())
+            } else {
+                None
+            }
+        })
+}
+
 #[cfg(not(feature = "resiliency"))]
 mod resiliency {
     use super::{execute_route_with_middleware_inner, RouteExecutionResult, RouteInvocation};
@@ -5492,10 +5535,12 @@ async fn faas_handler(
             None,
         ),
         Some(route) => {
+            let requested_model = requested_model_alias(&route, &headers, &body);
             if let Some(destination) = control_plane_override_destination(
                 state.route_overrides.as_ref(),
                 &route.path,
                 &headers,
+                requested_model.as_deref(),
             ) {
                 if destination.starts_with("http://") || destination.starts_with("https://") {
                     match forward_request_to_override(
@@ -9820,6 +9865,21 @@ impl ComponentHostState {
             .unwrap_or_default()
     }
 
+    fn hot_model_aliases(&self) -> Vec<String> {
+        #[cfg(feature = "ai-inference")]
+        {
+            self.ai_runtime
+                .as_ref()
+                .map(|runtime| runtime.loaded_model_aliases())
+                .unwrap_or_default()
+        }
+
+        #[cfg(not(feature = "ai-inference"))]
+        {
+            Vec::new()
+        }
+    }
+
     #[cfg(feature = "ai-inference")]
     fn load_accelerator_model(
         &mut self,
@@ -9876,6 +9936,21 @@ struct ControlPlaneSnapshot {
     allocated_memory_pages: u32,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct RouteOverrideDescriptor {
+    #[serde(default)]
+    candidates: Vec<RouteOverrideCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RouteOverrideCandidate {
+    destination: String,
+    #[serde(default)]
+    hot_models: Vec<String>,
+    #[serde(default)]
+    effective_pressure: u8,
+}
+
 fn guest_memory_page_count(bytes: usize) -> usize {
     ((bytes.saturating_add(65_535)) / 65_536).max(1)
 }
@@ -9925,15 +10000,32 @@ fn control_plane_override_destination(
     route_overrides: &ArcSwap<HashMap<String, String>>,
     route_path: &str,
     headers: &HeaderMap,
+    requested_model: Option<&str>,
 ) -> Option<String> {
     if headers.contains_key(TACHYON_BUFFER_REPLAY_HEADER) {
         return None;
     }
 
-    route_overrides
+    let raw = route_overrides
         .load()
         .get(&normalize_route_path(route_path))
-        .cloned()
+        .cloned()?;
+
+    if let Ok(descriptor) = serde_json::from_str::<RouteOverrideDescriptor>(&raw) {
+        let selected = if let Some(alias) = requested_model {
+            descriptor.candidates.iter().find(|candidate| {
+                candidate
+                    .hot_models
+                    .iter()
+                    .any(|model| model.eq_ignore_ascii_case(alias))
+            })
+        } else {
+            descriptor.candidates.first()
+        };
+        return selected.map(|candidate| candidate.destination.clone());
+    }
+
+    Some(raw)
 }
 
 fn update_control_plane_route_override(
@@ -9947,13 +10039,32 @@ fn update_control_plane_route_override(
         return Err("route override destinations must not be empty".to_owned());
     }
 
-    if !normalized_destination.starts_with('/')
-        && !normalized_destination.starts_with("http://")
-        && !normalized_destination.starts_with("https://")
-    {
-        return Err(format!(
-            "route override `{normalized_destination}` must be an absolute route or URL"
-        ));
+    let direct_destination = normalized_destination.starts_with('/')
+        || normalized_destination.starts_with("http://")
+        || normalized_destination.starts_with("https://");
+    if !direct_destination {
+        let descriptor = serde_json::from_str::<RouteOverrideDescriptor>(normalized_destination)
+            .map_err(|_| {
+                format!(
+                    "route override `{normalized_destination}` must be an absolute route, URL, or serialized candidate descriptor"
+                )
+            })?;
+        if descriptor.candidates.is_empty() {
+            return Err(
+                "route override descriptors must include at least one candidate".to_owned(),
+            );
+        }
+        for candidate in &descriptor.candidates {
+            let candidate_destination = candidate.destination.trim();
+            if !candidate_destination.starts_with('/')
+                && !candidate_destination.starts_with("http://")
+                && !candidate_destination.starts_with("https://")
+            {
+                return Err(format!(
+                    "route override candidate `{candidate_destination}` must be an absolute route or URL"
+                ));
+            }
+        }
     }
 
     let mut next = (**route_overrides.load()).clone();
@@ -10295,6 +10406,7 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             self.concurrency_limits.as_ref(),
             &self.runtime_config,
         );
+        let hot_models = self.hot_model_aliases();
 
         system_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
             total_requests,
@@ -10305,6 +10417,7 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             ram_pressure: control_plane.ram_pressure,
             active_instances: control_plane.active_instances,
             allocated_memory_pages: control_plane.allocated_memory_pages,
+            hot_models,
             dropped_events,
             last_status,
             total_duration_us,
@@ -10333,6 +10446,7 @@ impl control_plane_component_bindings::tachyon::mesh::telemetry_reader::Host
             ram_pressure: snapshot.ram_pressure,
             active_instances: snapshot.active_instances,
             allocated_memory_pages: snapshot.allocated_memory_pages,
+            hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
             total_duration_us: snapshot.total_duration_us,
@@ -10359,6 +10473,7 @@ impl background_component_bindings::tachyon::mesh::telemetry_reader::Host for Co
             ram_pressure: snapshot.ram_pressure,
             active_instances: snapshot.active_instances,
             allocated_memory_pages: snapshot.allocated_memory_pages,
+            hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
             total_duration_us: snapshot.total_duration_us,
@@ -16121,10 +16236,7 @@ mod tests {
             .get("/api/guest-example")
             .cloned()
             .expect("gossip should install a route override");
-        assert_eq!(
-            override_target,
-            format!("http://{peer_address}/api/guest-example")
-        );
+        assert!(override_target.contains(&format!("http://{peer_address}/api/guest-example")));
 
         let response = Client::new()
             .post(format!("http://{host_address}/api/guest-example"))
@@ -16142,6 +16254,375 @@ mod tests {
             .lock()
             .expect("peer capture should not be poisoned");
         assert_eq!(captured.bodies, vec!["overflow-request".to_owned()]);
+
+        host_server.abort();
+        peer_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
+        use axum::{
+            body::Bytes as AxumBytes,
+            extract::State,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct PeerCapture {
+            bodies: Vec<String>,
+        }
+
+        async fn wrong_model_gossip() -> impl IntoResponse {
+            Json(json!({
+                "total_requests": 0_u64,
+                "completed_requests": 0_u64,
+                "error_requests": 0_u64,
+                "active_requests": 1_u32,
+                "cpu_pressure": 10_u8,
+                "ram_pressure": 10_u8,
+                "active_instances": 1_u32,
+                "allocated_memory_pages": 1_u32,
+                "hot_models": ["mistral"],
+                "dropped_events": 0_u64,
+                "last_status": 200_u16,
+                "total_duration_us": 0_u64,
+                "total_wasm_duration_us": 0_u64,
+                "total_host_overhead_us": 0_u64
+            }))
+        }
+
+        async fn right_model_gossip() -> impl IntoResponse {
+            Json(json!({
+                "total_requests": 0_u64,
+                "completed_requests": 0_u64,
+                "error_requests": 0_u64,
+                "active_requests": 2_u32,
+                "cpu_pressure": 20_u8,
+                "ram_pressure": 20_u8,
+                "active_instances": 1_u32,
+                "allocated_memory_pages": 1_u32,
+                "hot_models": ["llama3"],
+                "dropped_events": 0_u64,
+                "last_status": 200_u16,
+                "total_duration_us": 0_u64,
+                "total_wasm_duration_us": 0_u64,
+                "total_host_overhead_us": 0_u64
+            }))
+        }
+
+        async fn peer_target(
+            State(state): State<Arc<Mutex<PeerCapture>>>,
+            body: AxumBytes,
+        ) -> impl IntoResponse {
+            state
+                .lock()
+                .expect("peer capture should not be poisoned")
+                .bodies
+                .push(String::from_utf8_lossy(&body).to_string());
+            (StatusCode::OK, "peer-match")
+        }
+
+        let wrong_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let wrong_app = Router::new()
+            .route("/system/gossip", get(wrong_model_gossip))
+            .route("/api/guest-ai", post(peer_target))
+            .with_state(Arc::clone(&wrong_capture));
+        let wrong_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("wrong-model peer should bind");
+        let wrong_address = wrong_listener
+            .local_addr()
+            .expect("wrong-model peer should expose an address");
+        let wrong_server = tokio::spawn(async move {
+            axum::serve(wrong_listener, wrong_app)
+                .await
+                .expect("wrong-model peer should stay up");
+        });
+
+        let right_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let right_app = Router::new()
+            .route("/system/gossip", get(right_model_gossip))
+            .route("/api/guest-ai", post(peer_target))
+            .with_state(Arc::clone(&right_capture));
+        let right_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("matching-model peer should bind");
+        let right_address = right_listener
+            .local_addr()
+            .expect("matching-model peer should expose an address");
+        let right_server = tokio::spawn(async move {
+            axum::serve(right_listener, right_app)
+                .await
+                .expect("matching-model peer should stay up");
+        });
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+
+        let mut user_route =
+            targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
+        user_route.models = vec![IntegrityModelBinding {
+            alias: "llama3".to_owned(),
+            path: "/models/llama3.gguf".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::RealTime,
+        }];
+        let mut gossip_route = system_targeted_route("/system/gossip", "gossip");
+        let peer_urls = format!("http://{wrong_address},http://{right_address}");
+        gossip_route.env = route_env(&[
+            ("STEER_ROUTE", "/api/guest-ai"),
+            ("PEER_URLS", peer_urls.as_str()),
+            ("SOFT_LIMIT", "70"),
+            ("RECOVER_LIMIT", "50"),
+            ("SATURATED_LIMIT", "95"),
+            ("BUFFER_ROUTE", "/system/buffer"),
+        ]);
+        let config = IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![user_route, gossip_route.clone()],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+        state
+            .host_load
+            .active_instances
+            .store(200, Ordering::SeqCst);
+        let host_app = build_app(state.clone());
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        tokio::task::spawn_blocking({
+            let config = config.clone();
+            let route_overrides = Arc::clone(&state.route_overrides);
+            let host_load = Arc::clone(&state.host_load);
+            let storage_broker = Arc::clone(&state.storage_broker);
+            let telemetry = state.telemetry.clone();
+            let host_identity = Arc::clone(&state.host_identity);
+            move || {
+                let engine = build_test_metered_engine(&config);
+                let mut runner = BackgroundTickRunner::new(
+                    &engine,
+                    &config,
+                    config
+                        .sealed_route("/system/gossip")
+                        .expect("gossip route should be sealed"),
+                    "gossip",
+                    telemetry,
+                    build_concurrency_limits(&config),
+                    host_identity,
+                    storage_broker,
+                    route_overrides,
+                    host_load,
+                )
+                .expect("gossip component should instantiate");
+                runner.tick().expect("gossip tick should succeed");
+            }
+        })
+        .await
+        .expect("gossip task should complete");
+
+        let override_target = state
+            .route_overrides
+            .load()
+            .get("/api/guest-ai")
+            .cloned()
+            .expect("gossip should install a route override");
+        let descriptor: RouteOverrideDescriptor =
+            serde_json::from_str(&override_target).expect("override descriptor should parse");
+        assert_eq!(descriptor.candidates.len(), 2);
+
+        let response = Client::new()
+            .post(format!("http://{host_address}/api/guest-ai"))
+            .header("x-tachyon-model", "llama3")
+            .body("hot-model-request")
+            .send()
+            .await
+            .expect("host request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("response body should decode"),
+            "peer-match"
+        );
+
+        let wrong_capture = wrong_capture
+            .lock()
+            .expect("wrong-model capture should not be poisoned");
+        assert!(wrong_capture.bodies.is_empty());
+        let right_capture = right_capture
+            .lock()
+            .expect("matching-model capture should not be poisoned");
+        assert_eq!(right_capture.bodies, vec!["hot-model-request".to_owned()]);
+
+        host_server.abort();
+        wrong_server.abort();
+        right_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
+        use axum::{
+            body::Bytes as AxumBytes,
+            extract::State,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct PeerCapture {
+            bodies: Vec<String>,
+        }
+
+        async fn cold_peer_gossip() -> impl IntoResponse {
+            Json(json!({
+                "total_requests": 0_u64,
+                "completed_requests": 0_u64,
+                "error_requests": 0_u64,
+                "active_requests": 0_u32,
+                "cpu_pressure": 10_u8,
+                "ram_pressure": 10_u8,
+                "active_instances": 1_u32,
+                "allocated_memory_pages": 1_u32,
+                "hot_models": ["mistral"],
+                "dropped_events": 0_u64,
+                "last_status": 200_u16,
+                "total_duration_us": 0_u64,
+                "total_wasm_duration_us": 0_u64,
+                "total_host_overhead_us": 0_u64
+            }))
+        }
+
+        async fn peer_target(
+            State(state): State<Arc<Mutex<PeerCapture>>>,
+            body: AxumBytes,
+        ) -> impl IntoResponse {
+            state
+                .lock()
+                .expect("peer capture should not be poisoned")
+                .bodies
+                .push(String::from_utf8_lossy(&body).to_string());
+            (StatusCode::OK, "peer-cold")
+        }
+
+        let peer_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let peer_app = Router::new()
+            .route("/system/gossip", get(cold_peer_gossip))
+            .route("/api/guest-ai", post(peer_target))
+            .with_state(Arc::clone(&peer_capture));
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let peer_address = peer_listener
+            .local_addr()
+            .expect("peer listener should expose an address");
+        let peer_server = tokio::spawn(async move {
+            axum::serve(peer_listener, peer_app)
+                .await
+                .expect("peer app should stay up");
+        });
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+
+        let mut user_route =
+            targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
+        user_route.models = vec![IntegrityModelBinding {
+            alias: "llama3".to_owned(),
+            path: "/models/llama3.gguf".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::RealTime,
+        }];
+        let mut gossip_route = system_targeted_route("/system/gossip", "gossip");
+        let peer_urls = format!("http://{peer_address}");
+        gossip_route.env = route_env(&[
+            ("STEER_ROUTE", "/api/guest-ai"),
+            ("PEER_URLS", peer_urls.as_str()),
+            ("SOFT_LIMIT", "70"),
+            ("RECOVER_LIMIT", "50"),
+            ("SATURATED_LIMIT", "95"),
+            ("BUFFER_ROUTE", "/system/buffer"),
+        ]);
+        let config = IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![user_route, gossip_route.clone()],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+        state
+            .host_load
+            .active_instances
+            .store(200, Ordering::SeqCst);
+        let host_app = build_app(state.clone());
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        tokio::task::spawn_blocking({
+            let config = config.clone();
+            let route_overrides = Arc::clone(&state.route_overrides);
+            let host_load = Arc::clone(&state.host_load);
+            let storage_broker = Arc::clone(&state.storage_broker);
+            let telemetry = state.telemetry.clone();
+            let host_identity = Arc::clone(&state.host_identity);
+            move || {
+                let engine = build_test_metered_engine(&config);
+                let mut runner = BackgroundTickRunner::new(
+                    &engine,
+                    &config,
+                    config
+                        .sealed_route("/system/gossip")
+                        .expect("gossip route should be sealed"),
+                    "gossip",
+                    telemetry,
+                    build_concurrency_limits(&config),
+                    host_identity,
+                    storage_broker,
+                    route_overrides,
+                    host_load,
+                )
+                .expect("gossip component should instantiate");
+                runner.tick().expect("gossip tick should succeed");
+            }
+        })
+        .await
+        .expect("gossip task should complete");
+
+        let response = Client::new()
+            .post(format!("http://{host_address}/api/guest-ai"))
+            .header("x-tachyon-model", "llama3")
+            .body("local-only")
+            .send()
+            .await
+            .expect("host request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("response body should decode"),
+            expected_guest_example_body("FaaS received: local-only")
+        );
+
+        let peer_capture = peer_capture
+            .lock()
+            .expect("peer capture should not be poisoned");
+        assert!(peer_capture.bodies.is_empty());
 
         host_server.abort();
         peer_server.abort();
