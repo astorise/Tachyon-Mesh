@@ -5,11 +5,11 @@ use candle_core::{
 };
 use candle_nn::VarMap;
 use std::{
-    collections::{HashMap, VecDeque},
+    cmp::Ordering as CmpOrdering,
+    collections::{BinaryHeap, HashMap},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, RecvTimeoutError},
-        Arc,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -22,29 +22,42 @@ use wasmtime_wasi_nn::{
     Backend as WasiNnBackend, Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry,
 };
 
-use crate::{IntegrityConfig, IntegrityModelBinding};
+use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
 
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 const DEFAULT_BATCH_SIZE: usize = 32;
 const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(25);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum AcceleratorKind {
+    #[default]
+    Cpu,
+    Gpu,
+    Npu,
+    Tpu,
+}
+
 #[derive(Clone)]
 pub(crate) struct AiInferenceRuntime {
-    scheduler: CandleBatchScheduler,
+    schedulers: HashMap<AcceleratorKind, CandleBatchScheduler>,
     models: HashMap<String, Arc<CandleModel>>,
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SchedulerSnapshot {
     pub(crate) batches_processed: usize,
     pub(crate) requests_processed: usize,
     pub(crate) max_batch_size: usize,
+    pub(crate) completed_aliases: Vec<String>,
 }
 
 impl AiInferenceRuntime {
     pub(crate) fn from_config(config: &IntegrityConfig) -> Result<Self> {
-        let scheduler = CandleBatchScheduler::new(DEFAULT_BATCH_SIZE, DEFAULT_BATCH_WINDOW);
+        let mut schedulers = HashMap::from([(
+            AcceleratorKind::Cpu,
+            CandleBatchScheduler::new(DEFAULT_BATCH_SIZE, DEFAULT_BATCH_WINDOW),
+        )]);
         let mut models = HashMap::new();
 
         for route in &config.routes {
@@ -55,6 +68,11 @@ impl AiInferenceRuntime {
                         binding.alias
                     ));
                 }
+                schedulers
+                    .entry(AcceleratorKind::from_model_device(&binding.device))
+                    .or_insert_with(|| {
+                        CandleBatchScheduler::new(DEFAULT_BATCH_SIZE, DEFAULT_BATCH_WINDOW)
+                    });
                 models.insert(
                     binding.alias.clone(),
                     Arc::new(CandleModel::load_mock(binding)?),
@@ -62,7 +80,7 @@ impl AiInferenceRuntime {
             }
         }
 
-        Ok(Self { scheduler, models })
+        Ok(Self { schedulers, models })
     }
 
     pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
@@ -74,9 +92,10 @@ impl AiInferenceRuntime {
                     (
                         alias.clone(),
                         WasiGraph::from(Box::new(CandleModelGraph {
-                            alias: alias.clone(),
                             model: Arc::clone(model),
-                            scheduler: self.scheduler.clone(),
+                            scheduler: self
+                                .scheduler_for(model.accelerator)
+                                .expect("accelerator scheduler should exist for model"),
                         }) as Box<dyn BackendGraph>),
                     )
                 })
@@ -94,50 +113,145 @@ impl AiInferenceRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn scheduler_snapshot(&self) -> SchedulerSnapshot {
-        self.scheduler.snapshot()
+    pub(crate) fn scheduler_snapshot(&self, accelerator: AcceleratorKind) -> SchedulerSnapshot {
+        self.scheduler_for(accelerator)
+            .map(|scheduler| scheduler.snapshot())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
+        self.schedulers.contains_key(&accelerator)
+    }
+
+    pub(crate) fn load_component_model(
+        &self,
+        alias: &str,
+        accelerator: AcceleratorKind,
+    ) -> Result<(), String> {
+        if !self.supports_accelerator(accelerator) {
+            return Err(format!(
+                "{} accelerator is unavailable on this host",
+                accelerator.as_str()
+            ));
+        }
+
+        let model = self
+            .models
+            .get(alias)
+            .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
+        if model.accelerator != accelerator {
+            return Err(format!(
+                "model alias `{alias}` requires `{}` but `{}` was requested",
+                model.accelerator.as_str(),
+                accelerator.as_str()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compute_component_prompt(
+        &self,
+        alias: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
+        let model = self
+            .models
+            .get(alias)
+            .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
+        let output = self
+            .scheduler_for(model.accelerator)
+            .ok_or_else(|| {
+                format!(
+                    "{} accelerator is unavailable on this host",
+                    model.accelerator.as_str()
+                )
+            })?
+            .infer(
+                Arc::clone(model),
+                WasiTensor::new(vec![prompt.len() as u32], TensorType::U8, prompt.as_bytes().to_vec()),
+            )
+            .map_err(|error| error.to_string())?;
+        String::from_utf8(output.data).map_err(|error| error.to_string())
+    }
+
+    fn scheduler_for(&self, accelerator: AcceleratorKind) -> Option<CandleBatchScheduler> {
+        self.schedulers.get(&accelerator).cloned()
+    }
+}
+
+impl AcceleratorKind {
+    fn from_model_device(device: &crate::ModelDevice) -> Self {
+        match device {
+            crate::ModelDevice::Cpu => Self::Cpu,
+            crate::ModelDevice::Cuda | crate::ModelDevice::Metal => Self::Gpu,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+            Self::Npu => "npu",
+            Self::Tpu => "tpu",
+        }
     }
 }
 
 #[derive(Clone)]
 struct CandleBatchScheduler {
-    sender: mpsc::Sender<InferenceJob>,
+    shared: Arc<SchedulerShared>,
     #[cfg_attr(not(test), allow(dead_code))]
     metrics: Arc<SchedulerMetrics>,
 }
 
 impl CandleBatchScheduler {
     fn new(batch_size: usize, batch_window: Duration) -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let shared = Arc::new(SchedulerShared::default());
         let metrics = Arc::new(SchedulerMetrics::default());
         let worker_metrics = Arc::clone(&metrics);
+        let worker_shared = Arc::clone(&shared);
 
         thread::Builder::new()
             .name("tachyon-candle-batcher".to_owned())
-            .spawn(move || run_scheduler(receiver, worker_metrics, batch_size, batch_window))
+            .spawn(move || run_scheduler(worker_shared, worker_metrics, batch_size, batch_window))
             .expect("AI inference batch scheduler thread should start");
 
-        Self { sender, metrics }
+        Self { shared, metrics }
     }
 
-    fn infer(
-        &self,
-        alias: &str,
-        model: Arc<CandleModel>,
-        input: WasiTensor,
-    ) -> Result<WasiTensor, BackendError> {
-        let (response_tx, response_rx) = mpsc::channel();
-        self.sender
-            .send(InferenceJob {
-                alias: alias.to_owned(),
-                model,
-                input,
-                response_tx,
-            })
-            .map_err(|_| backend_access_error("AI inference scheduler is unavailable"))?;
+    fn infer(&self, model: Arc<CandleModel>, input: WasiTensor) -> Result<WasiTensor, BackendError> {
+        let response_rx = self.enqueue(model, input);
         response_rx.recv().map_err(|_| {
             backend_access_error("AI inference response channel closed unexpectedly")
         })?
+    }
+
+    fn enqueue(
+        &self,
+        model: Arc<CandleModel>,
+        input: WasiTensor,
+    ) -> mpsc::Receiver<Result<WasiTensor, BackendError>> {
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("AI inference scheduler queue should not be poisoned");
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        state.queue.push(PrioritizedInferenceJob::new(
+            model.qos.score(),
+            sequence,
+            InferenceJob {
+                alias: model.alias.clone(),
+                model,
+                input,
+                response_tx,
+            },
+        ));
+        drop(state);
+        self.shared.notify.notify_one();
+        response_rx
     }
 
     #[cfg(test)]
@@ -146,6 +260,12 @@ impl CandleBatchScheduler {
             batches_processed: self.metrics.batches_processed.load(Ordering::Relaxed),
             requests_processed: self.metrics.requests_processed.load(Ordering::Relaxed),
             max_batch_size: self.metrics.max_batch_size.load(Ordering::Relaxed),
+            completed_aliases: self
+                .metrics
+                .completed_aliases
+                .lock()
+                .expect("scheduler completion log should not be poisoned")
+                .clone(),
         }
     }
 }
@@ -155,15 +275,36 @@ struct SchedulerMetrics {
     batches_processed: AtomicUsize,
     requests_processed: AtomicUsize,
     max_batch_size: AtomicUsize,
+    #[cfg(test)]
+    completed_aliases: Mutex<Vec<String>>,
 }
 
 impl SchedulerMetrics {
-    fn record_batch(&self, batch_size: usize) {
+    fn record_batch(&self, batch: &[InferenceJob]) {
         self.batches_processed.fetch_add(1, Ordering::Relaxed);
         self.requests_processed
-            .fetch_add(batch_size, Ordering::Relaxed);
-        self.max_batch_size.fetch_max(batch_size, Ordering::Relaxed);
+            .fetch_add(batch.len(), Ordering::Relaxed);
+        self.max_batch_size.fetch_max(batch.len(), Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(first) = batch.first() {
+            self.completed_aliases
+                .lock()
+                .expect("scheduler completion log should not be poisoned")
+                .push(first.alias.clone());
+        }
     }
+}
+
+#[derive(Default)]
+struct SchedulerShared {
+    state: Mutex<SchedulerState>,
+    notify: Condvar,
+}
+
+#[derive(Default)]
+struct SchedulerState {
+    queue: BinaryHeap<PrioritizedInferenceJob>,
+    next_sequence: u64,
 }
 
 struct InferenceJob {
@@ -173,66 +314,149 @@ struct InferenceJob {
     response_tx: mpsc::Sender<Result<WasiTensor, BackendError>>,
 }
 
+struct PrioritizedInferenceJob {
+    qos_score: u16,
+    sequence: u64,
+    job: InferenceJob,
+}
+
+impl PrioritizedInferenceJob {
+    fn new(qos_score: u16, sequence: u64, job: InferenceJob) -> Self {
+        Self {
+            qos_score,
+            sequence,
+            job,
+        }
+    }
+
+    fn age(mut self) -> Self {
+        self.qos_score = self.qos_score.saturating_add(1);
+        self
+    }
+}
+
+impl PartialEq for PrioritizedInferenceJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.qos_score == other.qos_score && self.sequence == other.sequence
+    }
+}
+
+impl Eq for PrioritizedInferenceJob {}
+
+impl PartialOrd for PrioritizedInferenceJob {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrioritizedInferenceJob {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.qos_score
+            .cmp(&other.qos_score)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
 fn run_scheduler(
-    receiver: mpsc::Receiver<InferenceJob>,
+    shared: Arc<SchedulerShared>,
     metrics: Arc<SchedulerMetrics>,
     batch_size: usize,
     batch_window: Duration,
 ) {
-    let mut backlog = VecDeque::new();
-    let mut disconnected = false;
-
     loop {
-        let first = match backlog.pop_front() {
-            Some(job) => job,
-            None => match receiver.recv() {
-                Ok(job) => job,
-                Err(_) => break,
-            },
-        };
-
+        let first = wait_for_next_job(&shared);
         let batch_alias = first.alias.clone();
         let mut batch = vec![first];
         let deadline = Instant::now() + batch_window;
 
         while batch.len() < batch_size {
-            if let Some(index) = backlog.iter().position(|job| job.alias == batch_alias) {
-                let job = backlog
-                    .remove(index)
-                    .expect("backlog index selected from iterator should remain valid");
-                batch.push(job);
-                continue;
-            }
-
-            if disconnected {
-                break;
-            }
-
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let Some(job) = try_take_compatible_job(&shared, &batch_alias, remaining) else {
                 break;
-            }
-
-            match receiver.recv_timeout(remaining) {
-                Ok(job) if job.alias == batch_alias => batch.push(job),
-                Ok(job) => backlog.push_back(job),
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
+            };
+            batch.push(job);
         }
 
         let results = process_batch(&batch);
-        metrics.record_batch(batch.len());
+        metrics.record_batch(&batch);
         for (job, result) in batch.into_iter().zip(results.into_iter()) {
             let _ = job.response_tx.send(result);
         }
+        age_waiting_jobs(&shared);
+    }
+}
 
-        if disconnected && backlog.is_empty() {
-            break;
+fn wait_for_next_job(shared: &SchedulerShared) -> InferenceJob {
+    let mut state = shared
+        .state
+        .lock()
+        .expect("AI inference scheduler queue should not be poisoned");
+    loop {
+        if let Some(job) = state.queue.pop() {
+            return job.job;
         }
+        state = shared
+            .notify
+            .wait(state)
+            .expect("AI inference scheduler condvar should not be poisoned");
+    }
+}
+
+fn try_take_compatible_job(
+    shared: &SchedulerShared,
+    alias: &str,
+    wait_for: Duration,
+) -> Option<InferenceJob> {
+    let mut state = shared
+        .state
+        .lock()
+        .expect("AI inference scheduler queue should not be poisoned");
+    let deadline = Instant::now() + wait_for;
+
+    loop {
+        let mut deferred = Vec::new();
+        let mut selected = None;
+        while let Some(job) = state.queue.pop() {
+            if job.job.alias == alias {
+                selected = Some(job.job);
+                break;
+            }
+            deferred.push(job);
+        }
+        for job in deferred {
+            state.queue.push(job);
+        }
+        if selected.is_some() {
+            return selected;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let (next_state, _) = shared
+            .notify
+            .wait_timeout(state, remaining)
+            .expect("AI inference scheduler condvar should not be poisoned");
+        state = next_state;
+    }
+}
+
+fn age_waiting_jobs(shared: &SchedulerShared) {
+    let mut state = shared
+        .state
+        .lock()
+        .expect("AI inference scheduler queue should not be poisoned");
+    if state.queue.is_empty() {
+        return;
+    }
+    let aged = state
+        .queue
+        .drain()
+        .map(PrioritizedInferenceJob::age)
+        .collect::<Vec<_>>();
+    for job in aged {
+        state.queue.push(job);
     }
 }
 
@@ -243,6 +467,10 @@ fn process_batch(batch: &[InferenceJob]) -> Vec<Result<WasiTensor, BackendError>
         .max()
         .unwrap_or(1);
     let model = Arc::clone(&batch[0].model);
+    #[cfg(test)]
+    if model.mock_latency > Duration::ZERO {
+        thread::sleep(model.mock_latency);
+    }
     match model.run_mock_batch(batch.len(), longest_prompt) {
         Ok(output) => batch.iter().map(|_| Ok(output.clone())).collect(),
         Err(error) => {
@@ -257,7 +485,6 @@ fn process_batch(batch: &[InferenceJob]) -> Vec<Result<WasiTensor, BackendError>
 
 #[derive(Clone)]
 struct CandleModelGraph {
-    alias: String,
     model: Arc<CandleModel>,
     scheduler: CandleBatchScheduler,
 }
@@ -265,7 +492,6 @@ struct CandleModelGraph {
 impl BackendGraph for CandleModelGraph {
     fn init_execution_context(&self) -> Result<wasmtime_wasi_nn::ExecutionContext, BackendError> {
         Ok((Box::new(CandleExecutionContext {
-            alias: self.alias.clone(),
             model: Arc::clone(&self.model),
             scheduler: self.scheduler.clone(),
             input: None,
@@ -276,7 +502,6 @@ impl BackendGraph for CandleModelGraph {
 }
 
 struct CandleExecutionContext {
-    alias: String,
     model: Arc<CandleModel>,
     scheduler: CandleBatchScheduler,
     input: Option<WasiTensor>,
@@ -326,9 +551,7 @@ impl BackendExecutionContext for CandleExecutionContext {
             })?,
         };
 
-        let output = self
-            .scheduler
-            .infer(&self.alias, Arc::clone(&self.model), input)?;
+        let output = self.scheduler.infer(Arc::clone(&self.model), input)?;
         self.output = Some(output.clone());
 
         if use_named_io {
@@ -346,8 +569,12 @@ struct CandleModel {
     alias: String,
     path: String,
     requested_target: String,
+    accelerator: AcceleratorKind,
+    qos: RouteQos,
     attention_stack: TurboQuantAttentionStack,
     _variables: VarMap,
+    #[cfg(test)]
+    mock_latency: Duration,
 }
 
 impl CandleModel {
@@ -363,9 +590,19 @@ impl CandleModel {
             alias: binding.alias.clone(),
             path: binding.path.clone(),
             requested_target: binding.device.as_str().to_owned(),
+            accelerator: AcceleratorKind::from_model_device(&binding.device),
+            qos: binding.qos,
             attention_stack: TurboQuantAttentionStack::default(),
             _variables: VarMap::new(),
+            #[cfg(test)]
+            mock_latency: Duration::ZERO,
         })
+    }
+
+    #[cfg(test)]
+    fn with_mock_latency(mut self, mock_latency: Duration) -> Self {
+        self.mock_latency = mock_latency;
+        self
     }
 
     fn run_mock_batch(
@@ -617,11 +854,13 @@ mod tests {
                 alias: "llama3".to_owned(),
                 path: "/models/llama3.gguf".to_owned(),
                 device: ModelDevice::Cuda,
+                qos: RouteQos::Standard,
             },
             IntegrityModelBinding {
                 alias: "tiny".to_owned(),
                 path: "/models/tiny.gguf".to_owned(),
                 device: ModelDevice::Cpu,
+                qos: RouteQos::Standard,
             },
         ];
         let config = IntegrityConfig {
@@ -642,12 +881,15 @@ mod tests {
     fn scheduler_batches_concurrent_requests_for_same_alias() {
         let runtime = AiInferenceRuntime::from_config(&config_with_model("llama3"))
             .expect("runtime should build");
+        let scheduler = runtime
+            .scheduler_for(AcceleratorKind::Cpu)
+            .expect("cpu scheduler should exist");
         let mut handles = Vec::new();
         let barrier = Arc::new(std::sync::Barrier::new(8));
 
         for _ in 0..8 {
             let barrier = Arc::clone(&barrier);
-            let scheduler = runtime.scheduler.clone();
+            let scheduler = scheduler.clone();
             let model = runtime
                 .models
                 .get("llama3")
@@ -656,11 +898,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 barrier.wait();
                 scheduler
-                    .infer(
-                        "llama3",
-                        model,
-                        WasiTensor::new(vec![1], TensorType::U8, b"hello".to_vec()),
-                    )
+                    .infer(model, WasiTensor::new(vec![1], TensorType::U8, b"hello".to_vec()))
                     .expect("inference should succeed")
             }));
         }
@@ -670,10 +908,112 @@ mod tests {
             assert_eq!(output.data, MOCK_INFERENCE_RESPONSE.as_bytes());
         }
 
-        let snapshot = runtime.scheduler_snapshot();
+        let snapshot = runtime.scheduler_snapshot(AcceleratorKind::Cpu);
         assert_eq!(snapshot.requests_processed, 8);
         assert_eq!(snapshot.batches_processed, 1);
         assert_eq!(snapshot.max_batch_size, 8);
+    }
+
+    #[test]
+    fn realtime_qos_preempts_batch_backlog_on_gpu_scheduler() {
+        let scheduler = CandleBatchScheduler::new(1, Duration::from_millis(0));
+        let batch_model = Arc::new(
+            CandleModel::load_mock(&IntegrityModelBinding {
+                alias: "gpu-batch".to_owned(),
+                path: "/models/gpu-batch.gguf".to_owned(),
+                device: ModelDevice::Cuda,
+                qos: RouteQos::Batch,
+            })
+            .expect("batch model should load")
+            .with_mock_latency(Duration::from_millis(20)),
+        );
+        let realtime_model = Arc::new(
+            CandleModel::load_mock(&IntegrityModelBinding {
+                alias: "gpu-bot".to_owned(),
+                path: "/models/gpu-bot.gguf".to_owned(),
+                device: ModelDevice::Cuda,
+                qos: RouteQos::RealTime,
+            })
+            .expect("realtime model should load")
+            .with_mock_latency(Duration::from_millis(20)),
+        );
+
+        let mut receivers = Vec::new();
+        for _ in 0..6 {
+            receivers.push(scheduler.enqueue(
+                Arc::clone(&batch_model),
+                WasiTensor::new(vec![1], TensorType::U8, b"batch".to_vec()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+        let realtime_rx = scheduler.enqueue(
+            Arc::clone(&realtime_model),
+            WasiTensor::new(vec![1], TensorType::U8, b"realtime".to_vec()),
+        );
+
+        for receiver in receivers {
+            let _ = receiver
+                .recv()
+                .expect("batch response should arrive")
+                .expect("batch inference should succeed");
+        }
+        let _ = realtime_rx
+            .recv()
+            .expect("realtime response should arrive")
+            .expect("realtime inference should succeed");
+
+        let snapshot = scheduler.snapshot();
+        assert!(
+            snapshot.completed_aliases.len() >= 2,
+            "scheduler should have processed at least two batches"
+        );
+        assert_eq!(snapshot.completed_aliases[0], "gpu-batch");
+        assert_eq!(snapshot.completed_aliases[1], "gpu-bot");
+    }
+
+    #[test]
+    fn component_accelerator_runtime_rejects_unavailable_or_mismatched_devices() {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![
+            IntegrityModelBinding {
+                alias: "llama3".to_owned(),
+                path: "/models/llama3.gguf".to_owned(),
+                device: ModelDevice::Cuda,
+                qos: RouteQos::RealTime,
+            },
+            IntegrityModelBinding {
+                alias: "tiny".to_owned(),
+                path: "/models/tiny.gguf".to_owned(),
+                device: ModelDevice::Cpu,
+                qos: RouteQos::Batch,
+            },
+        ];
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime should build");
+
+        assert!(runtime.supports_accelerator(AcceleratorKind::Cpu));
+        assert!(runtime.supports_accelerator(AcceleratorKind::Gpu));
+        assert!(!runtime.supports_accelerator(AcceleratorKind::Tpu));
+        assert!(runtime.load_component_model("llama3", AcceleratorKind::Gpu).is_ok());
+        assert!(
+            runtime
+                .load_component_model("llama3", AcceleratorKind::Cpu)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .load_component_model("tiny", AcceleratorKind::Tpu)
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .compute_component_prompt("llama3", "hello")
+                .expect("component compute should succeed"),
+            MOCK_INFERENCE_RESPONSE
+        );
     }
 
     #[test]
@@ -764,6 +1104,7 @@ mod tests {
             alias: alias.to_owned(),
             path: format!("/models/{alias}.gguf"),
             device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
         }];
         IntegrityConfig {
             routes: vec![route],

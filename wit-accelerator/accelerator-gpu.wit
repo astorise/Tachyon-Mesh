@@ -1,0 +1,6 @@
+package tachyon:accelerator;
+
+interface gpu {
+    load-model: func(name: string) -> result<u32, string>;
+    compute: func(model-id: u32, prompt: string) -> result<string, string>;
+}
