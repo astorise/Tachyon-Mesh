@@ -1477,6 +1477,8 @@ enum ModelDevice {
     Cpu,
     Cuda,
     Metal,
+    Npu,
+    Tpu,
 }
 
 impl ModelDevice {
@@ -1486,6 +1488,8 @@ impl ModelDevice {
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
             Self::Metal => "metal",
+            Self::Npu => "npu",
+            Self::Tpu => "tpu",
         }
     }
 }
@@ -9400,7 +9404,11 @@ impl ComponentHostState {
             #[cfg(feature = "ai-inference")]
             ai_runtime: None,
             #[cfg(feature = "ai-inference")]
-            allowed_model_aliases: route.models.iter().map(|binding| binding.alias.clone()).collect(),
+            allowed_model_aliases: route
+                .models
+                .iter()
+                .map(|binding| binding.alias.clone())
+                .collect(),
             #[cfg(feature = "ai-inference")]
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
@@ -9432,13 +9440,8 @@ impl ComponentHostState {
             .load_component_model(&alias, accelerator)?;
         let model_id = self.next_accelerator_model_id;
         self.next_accelerator_model_id = self.next_accelerator_model_id.saturating_add(1);
-        self.accelerator_models.insert(
-            model_id,
-            LoadedAcceleratorModel {
-                alias,
-                accelerator,
-            },
-        );
+        self.accelerator_models
+            .insert(model_id, LoadedAcceleratorModel { alias, accelerator });
         Ok(model_id)
     }
 
