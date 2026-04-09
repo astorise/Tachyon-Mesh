@@ -154,6 +154,8 @@ const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 const DEFAULT_TELEMETRY_SAMPLE_RATE: f64 = 0.0;
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const VOLUME_GC_TICK_INTERVAL: Duration = Duration::from_secs(60);
+const DRAINING_REAPER_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const DRAINING_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 const TELEMETRY_EXPORT_QUEUE_CAPACITY: usize = 1024;
 const TELEMETRY_EXPORT_BATCH_SIZE: usize = 32;
 const UDP_LAYER4_QUEUE_CAPACITY: usize = 256;
@@ -227,6 +229,7 @@ fn is_false(value: &bool) -> bool {
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<ArcSwap<RuntimeState>>,
+    draining_runtimes: Arc<Mutex<Vec<DrainingRuntime>>>,
     http_client: Client,
     async_log_sender: mpsc::Sender<AsyncLogEntry>,
     secrets_vault: SecretsVault,
@@ -253,6 +256,11 @@ struct RuntimeState {
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     #[cfg(feature = "ai-inference")]
     ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+}
+
+struct DrainingRuntime {
+    runtime: Arc<RuntimeState>,
+    draining_since: Instant,
 }
 
 struct TcpLayer4ListenerHandle {
@@ -419,6 +427,7 @@ struct GuestHttpResponse {
 struct GuestResponseBody {
     data: Option<Bytes>,
     trailers: Option<HeaderMap>,
+    _completion_guard: Option<RouteResponseGuard>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,10 +448,33 @@ struct GuestExecutionOutcome {
     fuel_consumed: Option<u64>,
 }
 
-#[derive(Debug)]
 struct RouteExecutionResult {
     response: GuestHttpResponse,
     fuel_consumed: Option<u64>,
+    completion_guard: Option<RouteResponseGuard>,
+}
+
+impl fmt::Debug for RouteExecutionResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouteExecutionResult")
+            .field("response", &self.response)
+            .field("fuel_consumed", &self.fuel_consumed)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteLifecycleState {
+    Active,
+    Draining,
+}
+
+struct ActiveRouteRequestGuard {
+    control: Arc<RouteExecutionControl>,
+}
+
+struct RouteResponseGuard {
+    control: Arc<RouteExecutionControl>,
 }
 
 #[derive(Clone)]
@@ -511,10 +543,15 @@ impl GuestHttpResponse {
 }
 
 impl GuestResponseBody {
-    fn new(data: Bytes, trailers: Option<HeaderMap>) -> Self {
+    fn new(
+        data: Bytes,
+        trailers: Option<HeaderMap>,
+        completion_guard: Option<RouteResponseGuard>,
+    ) -> Self {
         Self {
             data: Some(data),
             trailers,
+            _completion_guard: completion_guard,
         }
     }
 }
@@ -552,6 +589,31 @@ impl hyper::body::Body for GuestResponseBody {
             hint.set_exact(0);
         }
         hint
+    }
+}
+
+impl ActiveRouteRequestGuard {
+    fn new(control: Arc<RouteExecutionControl>) -> Self {
+        control.active_requests.fetch_add(1, Ordering::SeqCst);
+        Self { control }
+    }
+
+    fn into_response_guard(self) -> RouteResponseGuard {
+        let control = Arc::clone(&self.control);
+        std::mem::forget(self);
+        RouteResponseGuard { control }
+    }
+}
+
+impl Drop for ActiveRouteRequestGuard {
+    fn drop(&mut self) {
+        self.control.active_requests.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for RouteResponseGuard {
+    fn drop(&mut self) {
+        self.control.active_requests.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -964,6 +1026,9 @@ struct GuestModuleNotFound {
 struct RouteExecutionControl {
     semaphore: Arc<Semaphore>,
     pending_waiters: AtomicUsize,
+    active_requests: AtomicUsize,
+    draining: AtomicBool,
+    draining_since: Mutex<Option<Instant>>,
     min_instances: u32,
     max_concurrency: u32,
     prewarmed_instances: AtomicUsize,
@@ -1373,6 +1438,7 @@ async fn serve_host() -> Result<()> {
 
     let state = AppState {
         runtime: Arc::new(ArcSwap::from_pointee(runtime.clone())),
+        draining_runtimes: Arc::new(Mutex::new(Vec::new())),
         http_client: Client::new(),
         async_log_sender,
         secrets_vault: SecretsVault::load(),
@@ -1394,6 +1460,7 @@ async fn serve_host() -> Result<()> {
     spawn_metering_exporter(state.clone(), export_receiver);
     spawn_async_log_exporter(state.clone(), async_log_receiver);
     spawn_reload_watcher(state.clone());
+    spawn_draining_runtime_reaper(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     let app = build_app(state.clone());
     let https_listener = start_https_listener(state.clone(), app.clone()).await?;
@@ -2587,6 +2654,51 @@ fn spawn_volume_gc_sweeper(state: AppState) {
     });
 }
 
+fn spawn_draining_runtime_reaper(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DRAINING_REAPER_TICK_INTERVAL);
+
+        loop {
+            interval.tick().await;
+            run_draining_runtime_reaper_tick(&state);
+        }
+    });
+}
+
+fn run_draining_runtime_reaper_tick(state: &AppState) {
+    let now = Instant::now();
+    let mut draining_runtimes = state
+        .draining_runtimes
+        .lock()
+        .expect("draining runtime list should not be poisoned");
+    let mut retained = Vec::with_capacity(draining_runtimes.len());
+
+    for draining in draining_runtimes.drain(..) {
+        let active_requests = draining.runtime.active_request_count();
+        let timed_out =
+            now.saturating_duration_since(draining.draining_since) >= DRAINING_ROUTE_TIMEOUT;
+        if active_requests == 0 || timed_out {
+            if timed_out && active_requests > 0 {
+                for control in draining.runtime.concurrency_limits.values() {
+                    control.force_terminate();
+                }
+            }
+
+            tracing::info!(
+                active_requests,
+                forced = timed_out && active_requests > 0,
+                drained_routes = draining.runtime.draining_route_count(),
+                "graceful draining reaped an inactive runtime generation"
+            );
+            continue;
+        }
+
+        retained.push(draining);
+    }
+
+    *draining_runtimes = retained;
+}
+
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
 async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
     let manifest_path = state.manifest_path.clone();
@@ -2602,6 +2714,17 @@ async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         Arc::clone(&state.host_identity),
         Arc::clone(&state.storage_broker),
     )?;
+    let previous_runtime = state.runtime.load_full();
+    let draining_since = Instant::now();
+    previous_runtime.mark_draining(draining_since);
+    state
+        .draining_runtimes
+        .lock()
+        .expect("draining runtime list should not be poisoned")
+        .push(DrainingRuntime {
+            runtime: previous_runtime,
+            draining_since,
+        });
 
     state
         .background_workers
@@ -2612,9 +2735,16 @@ async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
             Arc::clone(&state.storage_broker),
         )
         .await;
-    state.runtime.store(Arc::new(runtime));
+    let runtime = Arc::new(runtime);
+    state.runtime.store(Arc::clone(&runtime));
+    run_draining_runtime_reaper_tick(state);
     tracing::info!(
         manifest = %state.manifest_path.display(),
+        draining_generations = state
+            .draining_runtimes
+            .lock()
+            .expect("draining runtime list should not be poisoned")
+            .len(),
         "Hot reload successful"
     );
     Ok(())
@@ -2657,6 +2787,28 @@ fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeState> {
         ai_runtime: Arc::new(ai_inference::AiInferenceRuntime::from_config(&config)?),
         config,
     })
+}
+
+impl RuntimeState {
+    fn mark_draining(&self, started_at: Instant) {
+        for control in self.concurrency_limits.values() {
+            control.mark_draining(started_at);
+        }
+    }
+
+    fn active_request_count(&self) -> usize {
+        self.concurrency_limits
+            .values()
+            .map(|control| control.active_request_count())
+            .sum()
+    }
+
+    fn draining_route_count(&self) -> usize {
+        self.concurrency_limits
+            .values()
+            .filter(|control| control.lifecycle_state() == RouteLifecycleState::Draining)
+            .count()
+    }
 }
 
 fn prewarm_runtime_routes(
@@ -4315,7 +4467,10 @@ fn insert_guest_fields(
     Ok(())
 }
 
-fn build_guest_response(response: GuestHttpResponse) -> std::result::Result<Response, String> {
+fn build_guest_response(
+    response: GuestHttpResponse,
+    completion_guard: Option<RouteResponseGuard>,
+) -> std::result::Result<Response, String> {
     let mut response_headers = HeaderMap::new();
     insert_guest_fields(&mut response_headers, &response.headers, "response header")?;
 
@@ -4332,14 +4487,15 @@ fn build_guest_response(response: GuestHttpResponse) -> std::result::Result<Resp
         .body(Body::new(GuestResponseBody::new(
             response.body,
             trailer_map,
+            completion_guard,
         )))
         .map_err(|error| format!("failed to construct guest HTTP response: {error}"))?;
     built.headers_mut().extend(response_headers);
     Ok(built)
 }
 
-fn guest_response_into_response(response: GuestHttpResponse) -> Response {
-    match build_guest_response(response) {
+fn guest_response_into_response(result: RouteExecutionResult) -> Response {
+    match build_guest_response(result.response, result.completion_guard) {
         Ok(response) => response,
         Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
     }
@@ -4500,10 +4656,10 @@ async fn faas_handler(
                         )
                         .await
                         {
-                            Ok(result) => (
-                                guest_response_into_response(result.response),
-                                result.fuel_consumed,
-                            ),
+                            Ok(result) => {
+                                let fuel_consumed = result.fuel_consumed;
+                                (guest_response_into_response(result), fuel_consumed)
+                            }
                             Err((status, message)) => ((status, message).into_response(), None),
                         }
                     }
@@ -4557,10 +4713,10 @@ async fn faas_handler(
                         )
                         .await
                         {
-                            Ok(result) => (
-                                guest_response_into_response(result.response),
-                                result.fuel_consumed,
-                            ),
+                            Ok(result) => {
+                                let fuel_consumed = result.fuel_consumed;
+                                (guest_response_into_response(result), fuel_consumed)
+                            }
                             Err((status, message)) => ((status, message).into_response(), None),
                         }
                     }
@@ -4728,7 +4884,7 @@ async fn execute_route_request(
                 format!("route `{}` is missing a concurrency limiter", route.path),
             )
         })?;
-    let _permit = match acquire_route_permit(semaphore).await {
+    let _permit = match acquire_route_permit(Arc::clone(&semaphore)).await {
         Ok(permit) => permit,
         Err(RoutePermitError::Closed) => {
             return Err((
@@ -4751,6 +4907,7 @@ async fn execute_route_request(
             select_route_module(route, headers)
                 .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
         })?;
+    let active_request_guard = semaphore.begin_request();
     let propagated_headers = extract_propagated_headers(headers);
     let engine = if sampled_execution {
         runtime.metered_engine.clone()
@@ -4846,6 +5003,7 @@ async fn execute_route_request(
     Ok(RouteExecutionResult {
         response,
         fuel_consumed,
+        completion_guard: Some(active_request_guard.into_response_guard()),
     })
 }
 
@@ -7013,6 +7171,9 @@ impl RouteExecutionControl {
                     .expect("route max_concurrency should fit in usize"),
             )),
             pending_waiters: AtomicUsize::new(0),
+            active_requests: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
+            draining_since: Mutex::new(None),
             min_instances,
             max_concurrency,
             prewarmed_instances: AtomicUsize::new(0),
@@ -7027,6 +7188,34 @@ impl RouteExecutionControl {
 
     fn record_prewarm_success(&self) {
         self.prewarmed_instances.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn begin_request(self: &Arc<Self>) -> ActiveRouteRequestGuard {
+        ActiveRouteRequestGuard::new(Arc::clone(self))
+    }
+
+    fn mark_draining(&self, started_at: Instant) {
+        self.draining.store(true, Ordering::SeqCst);
+        *self
+            .draining_since
+            .lock()
+            .expect("route lifecycle state should not be poisoned") = Some(started_at);
+    }
+
+    fn force_terminate(&self) {
+        self.semaphore.close();
+    }
+
+    fn lifecycle_state(&self) -> RouteLifecycleState {
+        if self.draining.load(Ordering::SeqCst) {
+            RouteLifecycleState::Draining
+        } else {
+            RouteLifecycleState::Active
+        }
+    }
+
+    fn active_request_count(&self) -> usize {
+        self.active_requests.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -9097,6 +9286,7 @@ mod tests {
         let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
         let state = AppState {
             runtime: Arc::new(ArcSwap::from_pointee(build_test_runtime(config))),
+            draining_runtimes: Arc::new(Mutex::new(Vec::new())),
             http_client: Client::new(),
             async_log_sender,
             secrets_vault: SecretsVault::load(),
@@ -9527,6 +9717,13 @@ mod tests {
         route
     }
 
+    fn draining_test_route(module: &str, version: &str) -> IntegrityRoute {
+        let mut route = targeted_route("/api/drain", vec![weighted_target(module, 100)]);
+        route.name = "guest-drain".to_owned();
+        route.version = version.to_owned();
+        route
+    }
+
     fn targeted_route(path: &str, targets: Vec<RouteTarget>) -> IntegrityRoute {
         let mut route = IntegrityRoute::user(path);
         route.targets = targets;
@@ -9767,6 +9964,160 @@ mod tests {
         let runtime = state.runtime.load_full();
         assert!(runtime.config.sealed_route(DEFAULT_ROUTE).is_some());
         assert!(runtime.config.sealed_route("/api/guest-loop").is_none());
+    }
+
+    #[tokio::test]
+    async fn reload_runtime_from_disk_drains_previous_generation_until_response_flush() {
+        let temp_dir = unique_test_dir("graceful-drain");
+        let manifest_path = temp_dir.join("integrity.lock");
+        let initial = IntegrityConfig {
+            routes: vec![draining_test_route("guest-flaky", "1.0.0")],
+            ..IntegrityConfig::default_sealed()
+        };
+        write_test_manifest(&manifest_path, &initial, 31);
+        let state = build_test_state_with_manifest(
+            initial,
+            telemetry::init_test_telemetry(),
+            manifest_path.clone(),
+        );
+        let app = build_app(state.clone());
+
+        let slow_request = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                app.oneshot(
+                    Request::post("/api/drain")
+                        .body(Body::from("sleep:250"))
+                        .expect("slow request should build"),
+                )
+                .await
+                .expect("slow request should complete")
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let initial_runtime = state.runtime.load_full();
+        let initial_control = initial_runtime
+            .concurrency_limits
+            .get("/api/drain")
+            .cloned()
+            .expect("initial route control should exist");
+        assert_eq!(initial_control.active_request_count(), 1);
+        drop(initial_runtime);
+
+        let reloaded = IntegrityConfig {
+            routes: vec![draining_test_route("guest-example", "2.0.0")],
+            ..IntegrityConfig::default_sealed()
+        };
+        write_test_manifest(&manifest_path, &reloaded, 32);
+        reload_runtime_from_disk(&state)
+            .await
+            .expect("runtime should reload from manifest");
+
+        let fresh_response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/drain")
+                    .body(Body::from("hello-v2"))
+                    .expect("fresh request should build"),
+            )
+            .await
+            .expect("fresh request should complete");
+        let fresh_body = fresh_response
+            .into_body()
+            .collect()
+            .await
+            .expect("fresh response body should collect")
+            .to_bytes();
+        assert!(
+            String::from_utf8_lossy(&fresh_body).contains("FaaS received: hello-v2"),
+            "unexpected fresh body: {:?}",
+            fresh_body
+        );
+
+        let slow_response = slow_request
+            .await
+            .expect("slow request task should join cleanly");
+        assert_eq!(
+            state
+                .draining_runtimes
+                .lock()
+                .expect("draining runtime list should not be poisoned")
+                .len(),
+            1
+        );
+        run_draining_runtime_reaper_tick(&state);
+        assert_eq!(
+            state
+                .draining_runtimes
+                .lock()
+                .expect("draining runtime list should not be poisoned")
+                .len(),
+            1,
+            "the old generation should remain while its response body is still owned"
+        );
+        assert_eq!(initial_control.active_request_count(), 1);
+
+        let slow_body = slow_response
+            .into_body()
+            .collect()
+            .await
+            .expect("slow response body should collect")
+            .to_bytes();
+        assert_eq!(slow_body, Bytes::from_static(b"slept:250"));
+        run_draining_runtime_reaper_tick(&state);
+        assert_eq!(initial_control.active_request_count(), 0);
+        assert_eq!(
+            state
+                .draining_runtimes
+                .lock()
+                .expect("draining runtime list should not be poisoned")
+                .len(),
+            0,
+            "the old generation should be reaped once the response finishes flushing"
+        );
+    }
+
+    #[test]
+    fn draining_runtime_reaper_forces_timeout_after_deadline() {
+        let state = build_test_state(
+            IntegrityConfig {
+                routes: vec![draining_test_route("guest-flaky", "1.0.0")],
+                ..IntegrityConfig::default_sealed()
+            },
+            telemetry::init_test_telemetry(),
+        );
+        let runtime = state.runtime.load_full();
+        let control = runtime
+            .concurrency_limits
+            .get("/api/drain")
+            .cloned()
+            .expect("route control should exist");
+        let _guard = control.begin_request();
+        let draining_since = Instant::now()
+            .checked_sub(DRAINING_ROUTE_TIMEOUT + Duration::from_secs(1))
+            .expect("deadline subtraction should remain valid");
+        runtime.mark_draining(draining_since);
+        state
+            .draining_runtimes
+            .lock()
+            .expect("draining runtime list should not be poisoned")
+            .push(DrainingRuntime {
+                runtime,
+                draining_since,
+            });
+
+        run_draining_runtime_reaper_tick(&state);
+
+        assert_eq!(
+            state
+                .draining_runtimes
+                .lock()
+                .expect("draining runtime list should not be poisoned")
+                .len(),
+            0
+        );
+        assert!(control.semaphore.is_closed());
     }
 
     #[tokio::test]
@@ -10443,6 +10794,7 @@ mod tests {
         };
         let app = build_app(AppState {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
+            draining_runtimes: Arc::new(Mutex::new(Vec::new())),
             http_client: Client::new(),
             async_log_sender: test_log_sender(),
             secrets_vault: SecretsVault::load(),
@@ -11973,6 +12325,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "manual latency benchmark for UDS fast-path validation"]
     async fn uds_fast_path_is_faster_than_loopback_tcp_for_repeated_mesh_fetches() {
         use axum::routing::get;
 
