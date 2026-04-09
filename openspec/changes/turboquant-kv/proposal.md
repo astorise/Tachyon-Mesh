@@ -1,20 +1,20 @@
-# Proposal: Change 043 - TurboQuant KV Cache (CUDA FFI & TDD)
-
-## Context
-Long-context LLM inference is severely bottlenecked by the memory footprint of the KV Cache (the attention state). Google's recent TurboQuant algorithm compresses this cache from `f16` (16 bits) down to 3 bits + a 1-bit residual (PolarQuant + QJL), effectively reducing VRAM usage by ~6x. Integrating this into Tachyon's native Candle backend requires custom CUDA C++ kernels bridged to Rust. Because FFI boundaries and GPU memory manipulation are highly prone to silent memory corruption and subtle math errors, this integration mandates a strict Test-Driven Development (TDD) methodology.
+# Proposal: TurboQuant KV Cache Integration for Candle (FFI)
 
 ## Objective
-1. Define the mathematical baseline of the TurboQuant compression in pure Rust (CPU fallback or mocked expected tensors) as the "Source of Truth".
-2. Write unit tests that assert the equality between the baseline and the FFI CUDA output *before* implementing the C++ kernel.
-3. Implement the custom CUDA C++ kernels and bind them to Rust using the `cc` crate.
-4. Wrap the FFI in a `candle_core::CustomOp` to seamlessly inject it into the continuous batching scheduler (Change 042).
+Integrate the TurboQuant KV Cache compression algorithm (PolarQuant + QJL) into our Rust-based Service Mesh inference engine using Hugging Face's `candle` framework. This will allow massive context windows (e.g., for Pacbase legacy code analysis) on consumer GPUs by reducing the KV cache footprint by up to 6x.
 
-## Scope
-- Setup the `build.rs` pipeline for `.cu` files.
-- Create a comprehensive TDD test suite validating memory alignment, output shapes, and mathematical quantization thresholds.
-- Implement the `TurboQuantCompressor` and `TurboQuantDecompressor` CustomOps in Candle.
+## Problem Statement
+Standard float16/q8_0 KV caches cause Out-Of-Memory (OOM) errors on 8GB VRAM GPUs (like RTX 3070 Ti) when processing long context windows required for FaaS microservices extraction.
 
-## Success Metrics
-- 100% of the Rust unit tests pass (`cargo test --features cuda`).
-- The TDD test suite successfully catches deliberate off-by-one errors injected into the C++ kernel.
-- In an end-to-end integration test, the KV Cache memory allocation drops by >80% with an accuracy degradation (Perplexity) of less than 0.1% compared to unquantized `f16`.
+## Proposed Solution
+We will wrap the highly optimized C++/CUDA kernels from the `llama-cpp-turboquant` fork and expose them to Rust via FFI, integrated as a `CustomOp` in Candle. 
+
+To guarantee zero accuracy loss and high performance, the implementation MUST follow these three strict architectural rules:
+1. **Asymmetric K/V Compression:** The keys ($K$) must remain in `q8_0` (or `f16`). Only the values ($V$) will be compressed using TurboQuant (2-bit/3-bit).
+2. **Boundary Layers Protection:** The first 2 and last 2 layers of the LLM must bypass TurboQuant and keep $V$ in standard high-precision cache (`q8_0` or `f16`).
+3. **Sparse V Decoding:** The C++ decompression kernel must accept an attention score threshold. If the attention weight for a token is near zero, the kernel must skip the memory read and decompression of that token's $V$ vector.
+
+## Success Criteria
+- Memory consumption for KV cache is significantly reduced.
+- The model maintains coherence on long-context tasks (verified via Perplexity/Logit comparison).
+- The FFI integration passes bit-for-bit equivalence tests against the reference C++ implementation.

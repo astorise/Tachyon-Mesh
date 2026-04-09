@@ -770,6 +770,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "turboquant-sys",
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
@@ -6220,6 +6221,13 @@ dependencies = [
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
+]
+
+[[package]]
+name = "turboquant-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
