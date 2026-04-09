@@ -64,6 +64,8 @@ use wasmtime_wasi_nn::witx::WasiNnCtx;
 mod ai_inference;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
+#[cfg(feature = "resiliency")]
+mod resiliency;
 mod telemetry;
 mod tls_runtime;
 
@@ -406,9 +408,51 @@ struct GuestExecutionOutcome {
     fuel_consumed: Option<u64>,
 }
 
+#[derive(Debug)]
 struct RouteExecutionResult {
     response: GuestHttpResponse,
     fuel_consumed: Option<u64>,
+}
+
+#[derive(Clone)]
+struct RouteInvocation {
+    state: AppState,
+    runtime: Arc<RuntimeState>,
+    route: IntegrityRoute,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+    hop_limit: HopLimit,
+    trace_id: Option<String>,
+    sampled_execution: bool,
+    selected_module: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RouteServiceError {
+    status: StatusCode,
+    message: String,
+}
+
+impl fmt::Display for RouteServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for RouteServiceError {}
+
+impl From<(StatusCode, String)> for RouteServiceError {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self { status, message }
+    }
+}
+
+impl From<RouteServiceError> for (StatusCode, String) {
+    fn from(error: RouteServiceError) -> Self {
+        (error.status, error.message)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -444,6 +488,22 @@ enum RouteRole {
 struct HeaderMatch {
     name: String,
     value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct RetryPolicy {
+    #[serde(default)]
+    max_retries: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retry_on: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct ResiliencyConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_policy: Option<RetryPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1014,6 +1074,8 @@ struct IntegrityRoute {
     allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     targets: Vec<RouteTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resiliency: Option<ResiliencyConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     models: Vec<IntegrityModelBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3875,6 +3937,18 @@ fn request_host(headers: &HeaderMap) -> Option<&str> {
         .map(|value| value.split(':').next().unwrap_or(value))
 }
 
+#[cfg(not(feature = "resiliency"))]
+mod resiliency {
+    use super::{execute_route_with_middleware_inner, RouteExecutionResult, RouteInvocation};
+    use axum::http::StatusCode;
+
+    pub(crate) async fn execute_route_with_resiliency(
+        invocation: RouteInvocation,
+    ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
+        execute_route_with_middleware_inner(&invocation).await
+    }
+}
+
 async fn faas_handler(
     State(state): State<AppState>,
     Extension(hop_limit): Extension<HopLimit>,
@@ -4098,6 +4172,37 @@ async fn execute_route_with_middleware(
     sampled_execution: bool,
     selected_module: Option<&str>,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
+    let invocation = RouteInvocation {
+        state: state.clone(),
+        runtime: Arc::clone(runtime),
+        route: route.clone(),
+        headers: headers.clone(),
+        method: method.clone(),
+        uri: uri.clone(),
+        body: body.clone(),
+        hop_limit,
+        trace_id: trace_id.map(str::to_owned),
+        sampled_execution,
+        selected_module: selected_module.map(str::to_owned),
+    };
+
+    resiliency::execute_route_with_resiliency(invocation).await
+}
+
+pub(crate) async fn execute_route_with_middleware_inner(
+    invocation: &RouteInvocation,
+) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
+    let state = &invocation.state;
+    let runtime = &invocation.runtime;
+    let route = &invocation.route;
+    let headers = &invocation.headers;
+    let method = &invocation.method;
+    let uri = &invocation.uri;
+    let body = &invocation.body;
+    let hop_limit = invocation.hop_limit;
+    let trace_id = invocation.trace_id.as_deref();
+    let sampled_execution = invocation.sampled_execution;
+    let selected_module = invocation.selected_module.as_deref();
     let mut accumulated_fuel = None;
 
     if let Some(middleware_name) = route.middleware.as_deref() {
@@ -6595,6 +6700,7 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         middleware: normalize_route_middleware(route.middleware, &normalized)?,
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
         targets: normalize_route_targets(route.targets)?,
+        resiliency: normalize_route_resiliency(route.resiliency, &normalized)?,
         models: normalize_route_models(route.models, &normalized)?,
         domains: normalize_route_domains(route.domains, &normalized)?,
         min_instances: route.min_instances,
@@ -6608,6 +6714,76 @@ fn normalize_route_targets(targets: Vec<RouteTarget>) -> Result<Vec<RouteTarget>
         .into_iter()
         .map(normalize_route_target)
         .collect::<Result<Vec<_>>>()
+}
+
+fn normalize_route_resiliency(
+    resiliency: Option<ResiliencyConfig>,
+    route_path: &str,
+) -> Result<Option<ResiliencyConfig>> {
+    let Some(resiliency) = resiliency else {
+        return Ok(None);
+    };
+
+    let timeout_ms = resiliency
+        .timeout_ms
+        .map(|timeout_ms| {
+            if timeout_ms == 0 {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{route_path}` must set `resiliency.timeout_ms` above zero"
+                ));
+            }
+            Ok(timeout_ms)
+        })
+        .transpose()?;
+
+    let retry_policy = resiliency
+        .retry_policy
+        .map(|policy| normalize_retry_policy(policy, route_path))
+        .transpose()?;
+
+    if timeout_ms.is_none() && retry_policy.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(ResiliencyConfig {
+        timeout_ms,
+        retry_policy,
+    }))
+}
+
+fn normalize_retry_policy(policy: RetryPolicy, route_path: &str) -> Result<RetryPolicy> {
+    let retry_on = policy
+        .retry_on
+        .into_iter()
+        .map(|status| {
+            if !(100..=599).contains(&status) {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{route_path}` has an invalid `resiliency.retry_policy.retry_on` status `{status}`"
+                ));
+            }
+            Ok(status)
+        })
+        .collect::<Result<BTreeSet<_>>>()?
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if policy.max_retries == 0 && !retry_on.is_empty() {
+        return Ok(RetryPolicy {
+            max_retries: 0,
+            retry_on,
+        });
+    }
+
+    if policy.max_retries > 0 && retry_on.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` must configure at least one `resiliency.retry_policy.retry_on` status when `max_retries` is set"
+        ));
+    }
+
+    Ok(RetryPolicy {
+        max_retries: policy.max_retries,
+        retry_on,
+    })
 }
 
 fn normalize_route_models(
@@ -7690,6 +7866,7 @@ impl IntegrityRoute {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -7710,6 +7887,7 @@ impl IntegrityRoute {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -7733,6 +7911,7 @@ impl IntegrityRoute {
                 .map(|secret| (*secret).to_owned())
                 .collect(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8073,6 +8252,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8105,6 +8285,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8137,6 +8318,7 @@ mod tests {
                 websocket: false,
                 match_header: None,
             }],
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8169,6 +8351,7 @@ mod tests {
                 websocket: false,
                 match_header: None,
             }],
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8201,6 +8384,7 @@ mod tests {
                 websocket: false,
                 match_header: None,
             }],
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8228,6 +8412,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8247,6 +8432,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8282,6 +8468,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8309,6 +8496,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -8323,6 +8511,13 @@ mod tests {
                 eviction_policy: None,
             }],
         }
+    }
+
+    fn resiliency_test_route(resiliency: Option<ResiliencyConfig>) -> IntegrityRoute {
+        let mut route = IntegrityRoute::user("/api/guest-flaky");
+        route.name = "guest-flaky".to_owned();
+        route.resiliency = resiliency;
+        route
     }
 
     fn targeted_route(path: &str, targets: Vec<RouteTarget>) -> IntegrityRoute {
@@ -11106,6 +11301,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -11153,6 +11349,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -11553,6 +11750,7 @@ mod tests {
             middleware: None,
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
+            resiliency: None,
             models: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
@@ -11566,6 +11764,119 @@ mod tests {
         assert!(error
             .to_string()
             .contains("must set `max_concurrency` above zero"));
+    }
+
+    #[test]
+    fn validate_integrity_config_accepts_route_resiliency_policy() {
+        let mut config = IntegrityConfig::default_sealed();
+        let mut route = IntegrityRoute::user("/api/guest-example");
+        route.resiliency = Some(ResiliencyConfig {
+            timeout_ms: Some(500),
+            retry_policy: Some(RetryPolicy {
+                max_retries: 5,
+                retry_on: vec![503, 502, 503],
+            }),
+        });
+        config.routes = vec![route];
+
+        let config =
+            validate_integrity_config(config).expect("resiliency-enabled route should validate");
+        let route = config
+            .sealed_route("/api/guest-example")
+            .expect("route should remain sealed");
+
+        assert_eq!(
+            route.resiliency,
+            Some(ResiliencyConfig {
+                timeout_ms: Some(500),
+                retry_policy: Some(RetryPolicy {
+                    max_retries: 5,
+                    retry_on: vec![502, 503],
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_retry_policy_without_statuses() {
+        let mut config = IntegrityConfig::default_sealed();
+        let mut route = IntegrityRoute::user("/api/guest-example");
+        route.resiliency = Some(ResiliencyConfig {
+            timeout_ms: None,
+            retry_policy: Some(RetryPolicy {
+                max_retries: 2,
+                retry_on: Vec::new(),
+            }),
+        });
+        config.routes = vec![route];
+
+        let error = validate_integrity_config(config)
+            .expect_err("retry policy without retry_on statuses should fail validation");
+
+        assert!(error
+            .to_string()
+            .contains("must configure at least one `resiliency.retry_policy.retry_on` status"));
+    }
+
+    #[cfg(not(feature = "resiliency"))]
+    #[tokio::test]
+    async fn route_resiliency_config_is_overhead_free_when_feature_is_disabled() {
+        let config = validate_integrity_config(IntegrityConfig {
+            routes: vec![resiliency_test_route(Some(ResiliencyConfig {
+                timeout_ms: Some(500),
+                retry_policy: Some(RetryPolicy {
+                    max_retries: 5,
+                    retry_on: vec![503],
+                }),
+            }))],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("resiliency route should validate without the feature");
+        let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
+
+        let response = app
+            .oneshot(
+                Request::post("/api/guest-flaky")
+                    .body(Body::from("force-fail"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "resiliency")]
+    #[tokio::test]
+    async fn route_resiliency_timeout_applies_to_guest_execution() {
+        let config = validate_integrity_config(IntegrityConfig {
+            routes: vec![resiliency_test_route(Some(ResiliencyConfig {
+                timeout_ms: Some(50),
+                retry_policy: None,
+            }))],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("resiliency route should validate");
+        let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
+
+        let response = app
+            .oneshot(
+                Request::post("/api/guest-flaky")
+                    .body(Body::from("sleep:2000"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should collect")
+            .to_bytes();
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(String::from_utf8_lossy(&body).contains("timed out after 50ms"));
     }
 
     #[test]

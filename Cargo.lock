@@ -2267,6 +2267,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-flaky"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "guest-loop"
 version = "0.1.0"
 
