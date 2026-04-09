@@ -115,6 +115,14 @@ mod background_component_bindings {
     });
 }
 
+#[cfg(feature = "ai-inference")]
+mod accelerator_component_bindings {
+    wasmtime::component::bindgen!({
+        path: "../wit-accelerator",
+        world: "host",
+    });
+}
+
 #[cfg(test)]
 const DEFAULT_HOST_ADDRESS: &str = "0.0.0.0:8080";
 #[cfg(test)]
@@ -401,6 +409,21 @@ struct ComponentHostState {
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
     outbound_http_client: reqwest::blocking::Client,
+    #[cfg(feature = "ai-inference")]
+    ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
+    #[cfg(feature = "ai-inference")]
+    allowed_model_aliases: BTreeSet<String>,
+    #[cfg(feature = "ai-inference")]
+    accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
+    #[cfg(feature = "ai-inference")]
+    next_accelerator_model_id: u32,
+}
+
+#[cfg(feature = "ai-inference")]
+#[derive(Clone, Debug)]
+struct LoadedAcceleratorModel {
+    alias: String,
+    accelerator: ai_inference::AcceleratorKind,
 }
 
 struct BatchCommandState {
@@ -1421,6 +1444,32 @@ enum VolumeEvictionPolicy {
     Hibernate,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+enum RouteQos {
+    #[serde(rename = "RealTime", alias = "realtime", alias = "real-time")]
+    RealTime,
+    #[default]
+    #[serde(rename = "Standard", alias = "standard")]
+    Standard,
+    #[serde(rename = "Batch", alias = "batch")]
+    Batch,
+}
+
+impl RouteQos {
+    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    fn score(self) -> u16 {
+        match self {
+            Self::RealTime => 100,
+            Self::Standard => 50,
+            Self::Batch => 10,
+        }
+    }
+}
+
+fn is_default_route_qos(qos: &RouteQos) -> bool {
+    *qos == RouteQos::Standard
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ModelDevice {
@@ -1512,6 +1561,8 @@ struct IntegrityModelBinding {
     path: String,
     #[serde(default, skip_serializing_if = "is_default_model_device")]
     device: ModelDevice,
+    #[serde(default, skip_serializing_if = "is_default_route_qos")]
+    qos: RouteQos,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -3447,6 +3498,63 @@ fn route_modules_for_prewarm(route: &IntegrityRoute) -> Vec<String> {
     modules.into_iter().collect()
 }
 
+#[cfg(feature = "ai-inference")]
+fn add_accelerator_interfaces_to_component_linker(
+    linker: &mut ComponentLinker<ComponentHostState>,
+    ai_runtime: &ai_inference::AiInferenceRuntime,
+    context: &str,
+) -> std::result::Result<(), ExecutionError> {
+    accelerator_component_bindings::tachyon::accelerator::cpu::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            format!("failed to add CPU accelerator functions to {context}"),
+        )
+    })?;
+
+    if ai_runtime.supports_accelerator(ai_inference::AcceleratorKind::Gpu) {
+        accelerator_component_bindings::tachyon::accelerator::gpu::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                format!("failed to add GPU accelerator functions to {context}"),
+            )
+        })?;
+    }
+    if ai_runtime.supports_accelerator(ai_inference::AcceleratorKind::Npu) {
+        accelerator_component_bindings::tachyon::accelerator::npu::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                format!("failed to add NPU accelerator functions to {context}"),
+            )
+        })?;
+    }
+    if ai_runtime.supports_accelerator(ai_inference::AcceleratorKind::Tpu) {
+        accelerator_component_bindings::tachyon::accelerator::tpu::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                format!("failed to add TPU accelerator functions to {context}"),
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 fn prewarm_route_instance(
     runtime: &RuntimeState,
     route: &IntegrityRoute,
@@ -3592,6 +3700,8 @@ fn prewarm_component_route(
             host_identity,
             storage_broker,
             Arc::clone(&runtime.concurrency_limits),
+            #[cfg(feature = "ai-inference")]
+            Arc::clone(&runtime.ai_runtime),
         ) {
             Ok(()) => return Ok(()),
             Err(error) if !should_fall_back_from_component_prewarm(&error) => return Err(error),
@@ -3617,6 +3727,7 @@ fn prewarm_http_component_instance(
     host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 ) -> std::result::Result<(), ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
@@ -3635,6 +3746,12 @@ fn prewarm_http_component_instance(
             "failed to add secrets vault functions to prewarm HTTP component linker",
         )
     })?;
+    #[cfg(feature = "ai-inference")]
+    add_accelerator_interfaces_to_component_linker(
+        &mut linker,
+        ai_runtime.as_ref(),
+        "prewarm HTTP component linker",
+    )?;
 
     let mut store = Store::new(
         engine,
@@ -3651,6 +3768,10 @@ fn prewarm_http_component_instance(
             Vec::new(),
         )?,
     );
+    #[cfg(feature = "ai-inference")]
+    {
+        store.data_mut().ai_runtime = Some(ai_runtime);
+    }
     store.limiter(|state| &mut state.limits);
     let _ = component_bindings::FaasGuest::instantiate(&mut store, component, &linker).map_err(
         |error| {
@@ -6658,6 +6779,12 @@ fn execute_component_guest(
             "failed to add secrets vault functions to component linker",
         )
     })?;
+    #[cfg(feature = "ai-inference")]
+    add_accelerator_interfaces_to_component_linker(
+        &mut linker,
+        execution.ai_runtime.as_ref(),
+        "component linker",
+    )?;
     let mut store = Store::new(
         engine,
         ComponentHostState::new(
@@ -6673,6 +6800,10 @@ fn execute_component_guest(
             execution.propagated_headers.clone(),
         )?,
     );
+    #[cfg(feature = "ai-inference")]
+    {
+        store.data_mut().ai_runtime = Some(Arc::clone(&execution.ai_runtime));
+    }
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
 
@@ -8538,6 +8669,7 @@ fn normalize_route_models(
                 alias,
                 path: path.to_owned(),
                 device: model.device,
+                qos: model.qos,
             });
     }
 
@@ -9265,6 +9397,14 @@ impl ComponentHostState {
             concurrency_limits,
             propagated_headers,
             outbound_http_client: reqwest::blocking::Client::new(),
+            #[cfg(feature = "ai-inference")]
+            ai_runtime: None,
+            #[cfg(feature = "ai-inference")]
+            allowed_model_aliases: route.models.iter().map(|binding| binding.alias.clone()).collect(),
+            #[cfg(feature = "ai-inference")]
+            accelerator_models: HashMap::new(),
+            #[cfg(feature = "ai-inference")]
+            next_accelerator_model_id: 1,
         })
     }
 
@@ -9273,6 +9413,57 @@ impl ComponentHostState {
             .get(&normalize_route_path(route_path))
             .map(|control| control.pending_queue_size())
             .unwrap_or_default()
+    }
+
+    #[cfg(feature = "ai-inference")]
+    fn load_accelerator_model(
+        &mut self,
+        accelerator: ai_inference::AcceleratorKind,
+        alias: String,
+    ) -> std::result::Result<u32, String> {
+        if !self.allowed_model_aliases.contains(&alias) {
+            return Err(format!(
+                "model alias `{alias}` is not sealed for this route"
+            ));
+        }
+        self.ai_runtime
+            .as_ref()
+            .ok_or_else(|| "AI inference runtime is unavailable for this component".to_owned())?
+            .load_component_model(&alias, accelerator)?;
+        let model_id = self.next_accelerator_model_id;
+        self.next_accelerator_model_id = self.next_accelerator_model_id.saturating_add(1);
+        self.accelerator_models.insert(
+            model_id,
+            LoadedAcceleratorModel {
+                alias,
+                accelerator,
+            },
+        );
+        Ok(model_id)
+    }
+
+    #[cfg(feature = "ai-inference")]
+    fn compute_accelerator_prompt(
+        &self,
+        expected_accelerator: ai_inference::AcceleratorKind,
+        model_id: u32,
+        prompt: String,
+    ) -> std::result::Result<String, String> {
+        let loaded = self
+            .accelerator_models
+            .get(&model_id)
+            .ok_or_else(|| format!("accelerator model handle `{model_id}` is unknown"))?;
+        if loaded.accelerator != expected_accelerator {
+            return Err(format!(
+                "accelerator model handle `{model_id}` was loaded for `{}` not `{}`",
+                loaded.accelerator.as_str(),
+                expected_accelerator.as_str()
+            ));
+        }
+        self.ai_runtime
+            .as_ref()
+            .ok_or_else(|| "AI inference runtime is unavailable for this component".to_owned())?
+            .compute_component_prompt(&loaded.alias, &prompt)
     }
 }
 
@@ -9467,6 +9658,50 @@ impl websocket_component_bindings::tachyon::mesh::secrets_vault::Host for Compon
                 websocket_component_bindings::tachyon::mesh::secrets_vault::Error::VaultDisabled
             }
         })
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for ComponentHostState {
+    fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
+        self.load_accelerator_model(ai_inference::AcceleratorKind::Cpu, name)
+    }
+
+    fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
+        self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for ComponentHostState {
+    fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
+        self.load_accelerator_model(ai_inference::AcceleratorKind::Gpu, name)
+    }
+
+    fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
+        self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Gpu, model_id, prompt)
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+impl accelerator_component_bindings::tachyon::accelerator::npu::Host for ComponentHostState {
+    fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
+        self.load_accelerator_model(ai_inference::AcceleratorKind::Npu, name)
+    }
+
+    fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
+        self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Npu, model_id, prompt)
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+impl accelerator_component_bindings::tachyon::accelerator::tpu::Host for ComponentHostState {
+    fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
+        self.load_accelerator_model(ai_inference::AcceleratorKind::Tpu, name)
+    }
+
+    fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
+        self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Tpu, model_id, prompt)
     }
 }
 
@@ -11175,6 +11410,7 @@ mod tests {
             alias: "llama3".to_owned(),
             path: "/models/llama3.gguf".to_owned(),
             device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
         }];
         let config = IntegrityConfig {
             routes: vec![route.clone()],
@@ -14019,6 +14255,7 @@ mod tests {
             alias: " llama3 ".to_owned(),
             path: "  /models/llama3.gguf ".to_owned(),
             device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
         }];
         config.routes = vec![route];
 
@@ -14033,6 +14270,7 @@ mod tests {
                 alias: "llama3".to_owned(),
                 path: "/models/llama3.gguf".to_owned(),
                 device: ModelDevice::Cuda,
+                qos: RouteQos::Standard,
             }]
         );
     }
@@ -14044,12 +14282,14 @@ mod tests {
             alias: "shared".to_owned(),
             path: "/models/shared-a.gguf".to_owned(),
             device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
         }];
         let mut second = IntegrityRoute::user("/api/assistant");
         second.models = vec![IntegrityModelBinding {
             alias: "shared".to_owned(),
             path: "/models/shared-b.gguf".to_owned(),
             device: ModelDevice::Metal,
+            qos: RouteQos::Standard,
         }];
 
         let error = validate_integrity_config(IntegrityConfig {

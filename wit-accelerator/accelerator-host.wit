@@ -1,0 +1,8 @@
+package tachyon:accelerator;
+
+world host {
+    import cpu;
+    import gpu;
+    import npu;
+    import tpu;
+}
