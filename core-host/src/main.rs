@@ -296,6 +296,8 @@ struct AppState {
     buffered_requests: Arc<BufferedRequestManager>,
     volume_manager: Arc<VolumeManager>,
     route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    peer_capabilities: PeerCapabilityCache,
+    host_capabilities: Capabilities,
     host_load: Arc<HostLoadCounters>,
     telemetry: TelemetryHandle,
     tls_manager: Arc<tls_runtime::TlsManager>,
@@ -322,6 +324,169 @@ struct RuntimeState {
 struct HostLoadCounters {
     active_instances: AtomicUsize,
     allocated_memory_pages: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Capabilities {
+    mask: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CachedPeerCapabilities {
+    capabilities: Vec<String>,
+    capability_mask: u64,
+    effective_pressure: u8,
+}
+
+type PeerCapabilityCache = Arc<Mutex<HashMap<String, CachedPeerCapabilities>>>;
+
+impl Capabilities {
+    const CORE_WASI: u64 = 1 << 0;
+    const LEGACY_OCI: u64 = 1 << 1;
+    const ACCEL_CUDA: u64 = 1 << 2;
+    const ACCEL_OPENVINO: u64 = 1 << 3;
+    const ACCEL_TPU: u64 = 1 << 4;
+    const NET_LAYER4: u64 = 1 << 5;
+    const FEATURE_WEBSOCKETS: u64 = 1 << 6;
+    const FEATURE_HTTP3: u64 = 1 << 7;
+    const FEATURE_AI_INFERENCE: u64 = 1 << 8;
+    const OS_LINUX: u64 = 1 << 9;
+    const OS_WINDOWS: u64 = 1 << 10;
+
+    fn detect() -> Self {
+        let mut mask = Self::CORE_WASI | Self::NET_LAYER4;
+        if cfg!(target_os = "linux") {
+            mask |= Self::OS_LINUX;
+            if is_v1_container_runtime() {
+                mask |= Self::LEGACY_OCI;
+            }
+        }
+        if cfg!(target_os = "windows") {
+            mask |= Self::OS_WINDOWS;
+        }
+        if cfg!(feature = "websockets") {
+            mask |= Self::FEATURE_WEBSOCKETS;
+        }
+        if cfg!(feature = "http3") {
+            mask |= Self::FEATURE_HTTP3;
+        }
+        if cfg!(feature = "ai-inference") {
+            mask |= Self::FEATURE_AI_INFERENCE
+                | Self::ACCEL_CUDA
+                | Self::ACCEL_OPENVINO
+                | Self::ACCEL_TPU;
+        }
+        Self { mask }
+    }
+
+    fn from_mask(mask: u64) -> Self {
+        Self { mask }
+    }
+
+    fn from_requirement_list(requirements: &[String]) -> Result<Self> {
+        let mut mask = 0_u64;
+        let names = if requirements.is_empty() {
+            default_route_capabilities()
+        } else {
+            requirements.to_vec()
+        };
+        for requirement in names {
+            mask |= capability_flag(&requirement)?;
+        }
+        Ok(Self { mask })
+    }
+
+    fn supports(self, required: Self) -> bool {
+        (self.mask & required.mask) == required.mask
+    }
+
+    fn names(self) -> Vec<String> {
+        capability_names_from_mask(self.mask)
+    }
+
+    fn missing_names(self, required: Self) -> Vec<String> {
+        capability_names_from_mask(required.mask & !self.mask)
+    }
+}
+
+fn default_route_capabilities() -> Vec<String> {
+    vec!["core:wasi".to_owned()]
+}
+
+fn capability_flag(value: &str) -> Result<u64> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "core:wasi" => Ok(Capabilities::CORE_WASI),
+        "legacy:oci" => Ok(Capabilities::LEGACY_OCI),
+        "accel:cuda" => Ok(Capabilities::ACCEL_CUDA),
+        "accel:openvino" => Ok(Capabilities::ACCEL_OPENVINO),
+        "accel:tpu" => Ok(Capabilities::ACCEL_TPU),
+        "net:layer4" => Ok(Capabilities::NET_LAYER4),
+        "feature:websockets" => Ok(Capabilities::FEATURE_WEBSOCKETS),
+        "feature:http3" => Ok(Capabilities::FEATURE_HTTP3),
+        "feature:ai-inference" => Ok(Capabilities::FEATURE_AI_INFERENCE),
+        "os:linux" => Ok(Capabilities::OS_LINUX),
+        "os:windows" => Ok(Capabilities::OS_WINDOWS),
+        _ => Err(anyhow!("unknown capability `{value}`")),
+    }
+}
+
+fn capability_names_from_mask(mask: u64) -> Vec<String> {
+    [
+        (Capabilities::CORE_WASI, "core:wasi"),
+        (Capabilities::LEGACY_OCI, "legacy:oci"),
+        (Capabilities::ACCEL_CUDA, "accel:cuda"),
+        (Capabilities::ACCEL_OPENVINO, "accel:openvino"),
+        (Capabilities::ACCEL_TPU, "accel:tpu"),
+        (Capabilities::NET_LAYER4, "net:layer4"),
+        (Capabilities::FEATURE_WEBSOCKETS, "feature:websockets"),
+        (Capabilities::FEATURE_HTTP3, "feature:http3"),
+        (Capabilities::FEATURE_AI_INFERENCE, "feature:ai-inference"),
+        (Capabilities::OS_LINUX, "os:linux"),
+        (Capabilities::OS_WINDOWS, "os:windows"),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| (mask & *flag) != 0)
+    .map(|(_, name)| name.to_owned())
+    .collect()
+}
+
+fn normalize_capabilities(
+    capabilities: Vec<String>,
+    context: impl AsRef<str>,
+) -> Result<Vec<String>> {
+    let context = context.as_ref();
+    let mut normalized = BTreeSet::new();
+    let source = if capabilities.is_empty() {
+        default_route_capabilities()
+    } else {
+        capabilities
+    };
+    for capability in source {
+        let trimmed = capability.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!(
+                "Integrity Validation Failed: {context} must not contain empty capabilities"
+            ));
+        }
+        let canonical = trimmed.to_ascii_lowercase();
+        capability_flag(&canonical)
+            .map_err(|error| anyhow!("Integrity Validation Failed: {context} declares {error}"))?;
+        normalized.insert(canonical);
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn is_v1_container_runtime() -> bool {
+    std::env::var("TACHYON_LEGACY_OCI")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+        || Path::new("/.dockerenv").exists()
 }
 
 struct DrainingRuntime {
@@ -426,6 +591,8 @@ struct ComponentHostState {
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
     route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    peer_capabilities: PeerCapabilityCache,
+    host_capabilities: Capabilities,
     host_load: Arc<HostLoadCounters>,
     outbound_http_client: reqwest::blocking::Client,
     #[cfg(feature = "ai-inference")]
@@ -862,12 +1029,16 @@ struct RouteTarget {
     websocket: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     match_header: Option<HeaderMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requires: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectedRouteTarget {
     module: String,
     websocket: bool,
+    required_capabilities: Vec<String>,
+    required_capability_mask: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1768,6 +1939,8 @@ async fn serve_host() -> Result<()> {
     )));
     let background_workers = Arc::new(BackgroundWorkerManager::default());
     let route_overrides = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+    let peer_capabilities = Arc::new(Mutex::new(HashMap::new()));
+    let host_capabilities = Capabilities::detect();
     let host_load = Arc::new(HostLoadCounters::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
@@ -1777,6 +1950,8 @@ async fn serve_host() -> Result<()> {
         Arc::clone(&host_identity),
         Arc::clone(&storage_broker),
         Arc::clone(&route_overrides),
+        Arc::clone(&peer_capabilities),
+        host_capabilities,
         Arc::clone(&host_load),
     );
 
@@ -1793,6 +1968,8 @@ async fn serve_host() -> Result<()> {
         buffered_requests,
         volume_manager: Arc::new(VolumeManager::default()),
         route_overrides,
+        peer_capabilities,
+        host_capabilities,
         host_load,
         telemetry,
         tls_manager,
@@ -1927,6 +2104,7 @@ async fn execute_batch_target_from_manifest(
 }
 
 impl BackgroundWorkerManager {
+    #[allow(clippy::too_many_arguments)]
     fn start_for_runtime(
         &self,
         runtime: &RuntimeState,
@@ -1934,6 +2112,8 @@ impl BackgroundWorkerManager {
         host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
         route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+        peer_capabilities: PeerCapabilityCache,
+        host_capabilities: Capabilities,
         host_load: Arc<HostLoadCounters>,
     ) {
         let mut new_workers = Vec::new();
@@ -1967,6 +2147,8 @@ impl BackgroundWorkerManager {
                 Arc::clone(&host_identity),
                 Arc::clone(&storage_broker),
                 Arc::clone(&route_overrides),
+                Arc::clone(&peer_capabilities),
+                host_capabilities,
                 Arc::clone(&host_load),
             )
             .is_err()
@@ -1985,6 +2167,8 @@ impl BackgroundWorkerManager {
             let worker_host_identity = Arc::clone(&host_identity);
             let worker_storage_broker = Arc::clone(&storage_broker);
             let worker_route_overrides = Arc::clone(&route_overrides);
+            let worker_peer_capabilities = Arc::clone(&peer_capabilities);
+            let worker_host_capabilities = host_capabilities;
             let worker_host_load = Arc::clone(&host_load);
             let worker_stop = Arc::clone(&stop_requested);
             let join_handle = tokio::task::spawn_blocking(move || {
@@ -1996,6 +2180,8 @@ impl BackgroundWorkerManager {
                     worker_host_identity,
                     worker_storage_broker,
                     worker_route_overrides,
+                    worker_peer_capabilities,
+                    worker_host_capabilities,
                     worker_host_load,
                     worker_route,
                     worker_function_name,
@@ -2025,6 +2211,7 @@ impl BackgroundWorkerManager {
     }
 
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
     async fn replace_with(
         &self,
         runtime: &RuntimeState,
@@ -2032,6 +2219,8 @@ impl BackgroundWorkerManager {
         host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
         route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+        peer_capabilities: PeerCapabilityCache,
+        host_capabilities: Capabilities,
         host_load: Arc<HostLoadCounters>,
     ) {
         self.stop_all().await;
@@ -2041,6 +2230,8 @@ impl BackgroundWorkerManager {
             host_identity,
             storage_broker,
             route_overrides,
+            peer_capabilities,
+            host_capabilities,
             host_load,
         );
     }
@@ -2078,6 +2269,8 @@ fn run_background_tick_loop(
     host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    peer_capabilities: PeerCapabilityCache,
+    host_capabilities: Capabilities,
     host_load: Arc<HostLoadCounters>,
     route: IntegrityRoute,
     function_name: String,
@@ -2093,6 +2286,8 @@ fn run_background_tick_loop(
         host_identity,
         storage_broker,
         route_overrides,
+        peer_capabilities,
+        host_capabilities,
         host_load,
     ) {
         Ok(runner) => runner,
@@ -3442,6 +3637,8 @@ async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
             Arc::clone(&state.host_identity),
             Arc::clone(&state.storage_broker),
             Arc::clone(&state.route_overrides),
+            Arc::clone(&state.peer_capabilities),
+            state.host_capabilities,
             Arc::clone(&state.host_load),
         )
         .await;
@@ -3712,6 +3909,8 @@ fn prewarm_component_route(
             Arc::clone(&host_identity),
             Arc::clone(&storage_broker),
             Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Capabilities::detect(),
             Arc::new(HostLoadCounters::default()),
         ) {
             Ok(_) => return Ok(()),
@@ -5534,33 +5733,52 @@ async fn faas_handler(
                 .into_response(),
             None,
         ),
-        Some(route) => {
-            let requested_model = requested_model_alias(&route, &headers, &body);
-            if let Some(destination) = control_plane_override_destination(
-                state.route_overrides.as_ref(),
-                &route.path,
-                &headers,
-                requested_model.as_deref(),
-            ) {
-                if destination.starts_with("http://") || destination.starts_with("https://") {
-                    match forward_request_to_override(
-                        &state.http_client,
-                        &destination,
-                        &headers,
-                        &method,
-                        &body,
-                        hop_limit,
-                    )
-                    .await
-                    {
-                        Ok(response) => (response, None),
-                        Err((status, message)) => ((status, message).into_response(), None),
-                    }
-                } else {
-                    let override_path = normalize_route_path(&destination);
-                    match runtime.config.sealed_route(&override_path).cloned() {
+        Some(route) => match select_route_target(&route, &headers) {
+            Err(error) => (
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "failed to resolve route target for `{}`: {error}",
+                        route.path
+                    ),
+                )
+                    .into_response(),
+                None,
+            ),
+            Ok(selected_target) => {
+                let requested_model = requested_model_alias(&route, &headers, &body);
+                let required_capabilities =
+                    Capabilities::from_mask(selected_target.required_capability_mask);
+                let local_supports_target = state.host_capabilities.supports(required_capabilities);
+
+                if let Some(destination) = control_plane_override_destination(
+                    state.route_overrides.as_ref(),
+                    &state.peer_capabilities,
+                    &route.path,
+                    &headers,
+                    selected_target.required_capability_mask,
+                    requested_model.as_deref(),
+                ) {
+                    if destination.starts_with("http://") || destination.starts_with("https://") {
+                        match forward_request_to_override(
+                            &state.http_client,
+                            &destination,
+                            &headers,
+                            &method,
+                            &body,
+                            hop_limit,
+                        )
+                        .await
+                        {
+                            Ok(response) => (response, None),
+                            Err((status, message)) => ((status, message).into_response(), None),
+                        }
+                    } else {
+                        let override_path = normalize_route_path(&destination);
+                        match runtime.config.sealed_route(&override_path).cloned() {
                         Some(override_route) => {
-                            let override_headers = clone_headers_with_original_route(&headers, &route);
+                            let override_headers =
+                                clone_headers_with_original_route(&headers, &route);
                             match execute_route_with_middleware(
                                 &state,
                                 &runtime,
@@ -5598,117 +5816,118 @@ async fn faas_handler(
                             None,
                         ),
                     }
-                }
-            } else {
-                match select_route_target(&route, &headers) {
-                    Err(error) => (
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!(
-                                "failed to resolve route target for `{}`: {error}",
-                                route.path
-                            ),
-                        )
-                            .into_response(),
-                        None,
-                    ),
-                    Ok(selected_target) => {
-                        #[cfg(feature = "websockets")]
-                        {
-                            if selected_target.websocket {
-                                let status = if is_websocket_upgrade_request(&headers) {
-                                    StatusCode::BAD_REQUEST
-                                } else {
-                                    StatusCode::UPGRADE_REQUIRED
-                                };
-                                match ws {
-                                    Some(upgrade) => {
-                                        let websocket_state = state.clone();
-                                        let websocket_route = route.clone();
-                                        let websocket_module = selected_target.module.clone();
-                                        let websocket_target = selected_target.module.clone();
-                                        (
-                                            upgrade
-                                                .on_upgrade(move |socket| async move {
-                                                    if let Err(error) = handle_websocket_connection(
-                                                        websocket_state,
-                                                        websocket_route,
-                                                        websocket_module,
-                                                        socket,
-                                                    )
-                                                    .await
-                                                    {
-                                                        tracing::warn!(
-                                                            target = %websocket_target,
-                                                            "WebSocket session failed: {error:#}"
-                                                        );
-                                                    }
-                                                })
-                                                .into_response(),
-                                            None,
-                                        )
-                                    }
-                                    None => (
-                                        (
-                                            status,
-                                            format!(
-                                        "route `{}` requires a valid WebSocket upgrade request",
-                                        route.path
-                                    ),
-                                        )
+                    }
+                } else if !local_supports_target {
+                    let missing = state
+                        .host_capabilities
+                        .missing_names(required_capabilities)
+                        .join(", ");
+                    (
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "Missing Capability: route `{}` requires [{}] but no capable mesh peer is available",
+                            route.path, missing
+                        ),
+                    )
+                        .into_response(),
+                    None,
+                )
+                } else {
+                    #[cfg(feature = "websockets")]
+                    {
+                        if selected_target.websocket {
+                            let status = if is_websocket_upgrade_request(&headers) {
+                                StatusCode::BAD_REQUEST
+                            } else {
+                                StatusCode::UPGRADE_REQUIRED
+                            };
+                            match ws {
+                                Some(upgrade) => {
+                                    let websocket_state = state.clone();
+                                    let websocket_route = route.clone();
+                                    let websocket_module = selected_target.module.clone();
+                                    let websocket_target = selected_target.module.clone();
+                                    (
+                                        upgrade
+                                            .on_upgrade(move |socket| async move {
+                                                if let Err(error) = handle_websocket_connection(
+                                                    websocket_state,
+                                                    websocket_route,
+                                                    websocket_module,
+                                                    socket,
+                                                )
+                                                .await
+                                                {
+                                                    tracing::warn!(
+                                                        target = %websocket_target,
+                                                        "WebSocket session failed: {error:#}"
+                                                    );
+                                                }
+                                            })
                                             .into_response(),
                                         None,
-                                    ),
+                                    )
                                 }
-                            } else if is_websocket_upgrade_request(&headers) {
-                                (
+                                None => (
                                     (
-                                        StatusCode::BAD_REQUEST,
+                                        status,
                                         format!(
-                                            "route `{}` is not configured for WebSocket upgrades",
+                                            "route `{}` requires a valid WebSocket upgrade request",
                                             route.path
                                         ),
                                     )
                                         .into_response(),
                                     None,
+                                ),
+                            }
+                        } else if is_websocket_upgrade_request(&headers) {
+                            (
+                                (
+                                    StatusCode::BAD_REQUEST,
+                                    format!(
+                                        "route `{}` is not configured for WebSocket upgrades",
+                                        route.path
+                                    ),
                                 )
-                            } else {
-                                match execute_route_with_middleware(
-                                    &state,
-                                    &runtime,
-                                    &route,
-                                    &headers,
-                                    &method,
-                                    &uri,
-                                    &body,
-                                    &trailer_fields,
-                                    hop_limit,
-                                    Some(&trace_id),
-                                    sampled_execution,
-                                    Some(selected_target.module.as_str()),
-                                )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        let fuel_consumed = result.fuel_consumed;
-                                        (guest_response_into_response(result), fuel_consumed)
-                                    }
-                                    Err((status, message)) => {
-                                        ((status, message).into_response(), None)
-                                    }
+                                    .into_response(),
+                                None,
+                            )
+                        } else {
+                            match execute_route_with_middleware(
+                                &state,
+                                &runtime,
+                                &route,
+                                &headers,
+                                &method,
+                                &uri,
+                                &body,
+                                &trailer_fields,
+                                hop_limit,
+                                Some(&trace_id),
+                                sampled_execution,
+                                Some(selected_target.module.as_str()),
+                            )
+                            .await
+                            {
+                                Ok(result) => {
+                                    let fuel_consumed = result.fuel_consumed;
+                                    (guest_response_into_response(result), fuel_consumed)
                                 }
+                                Err((status, message)) => ((status, message).into_response(), None),
                             }
                         }
+                    }
 
-                        #[cfg(not(feature = "websockets"))]
-                        {
-                            if selected_target.websocket {
-                                let status = if is_websocket_upgrade_request(&headers) {
-                                    StatusCode::NOT_IMPLEMENTED
-                                } else {
-                                    StatusCode::UPGRADE_REQUIRED
-                                };
-                                (
+                    #[cfg(not(feature = "websockets"))]
+                    {
+                        if selected_target.websocket {
+                            let status = if is_websocket_upgrade_request(&headers) {
+                                StatusCode::NOT_IMPLEMENTED
+                            } else {
+                                StatusCode::UPGRADE_REQUIRED
+                            };
+                            (
                             (
                                 status,
                                 format!(
@@ -5719,49 +5938,46 @@ async fn faas_handler(
                                 .into_response(),
                             None,
                         )
-                            } else if is_websocket_upgrade_request(&headers) {
+                        } else if is_websocket_upgrade_request(&headers) {
+                            (
                                 (
-                                    (
-                                        StatusCode::BAD_REQUEST,
-                                        format!(
-                                            "route `{}` is not configured for WebSocket upgrades",
-                                            route.path
-                                        ),
-                                    )
-                                        .into_response(),
-                                    None,
+                                    StatusCode::BAD_REQUEST,
+                                    format!(
+                                        "route `{}` is not configured for WebSocket upgrades",
+                                        route.path
+                                    ),
                                 )
-                            } else {
-                                match execute_route_with_middleware(
-                                    &state,
-                                    &runtime,
-                                    &route,
-                                    &headers,
-                                    &method,
-                                    &uri,
-                                    &body,
-                                    &trailer_fields,
-                                    hop_limit,
-                                    Some(&trace_id),
-                                    sampled_execution,
-                                    Some(selected_target.module.as_str()),
-                                )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        let fuel_consumed = result.fuel_consumed;
-                                        (guest_response_into_response(result), fuel_consumed)
-                                    }
-                                    Err((status, message)) => {
-                                        ((status, message).into_response(), None)
-                                    }
+                                    .into_response(),
+                                None,
+                            )
+                        } else {
+                            match execute_route_with_middleware(
+                                &state,
+                                &runtime,
+                                &route,
+                                &headers,
+                                &method,
+                                &uri,
+                                &body,
+                                &trailer_fields,
+                                hop_limit,
+                                Some(&trace_id),
+                                sampled_execution,
+                                Some(selected_target.module.as_str()),
+                            )
+                            .await
+                            {
+                                Ok(result) => {
+                                    let fuel_consumed = result.fuel_consumed;
+                                    (guest_response_into_response(result), fuel_consumed)
                                 }
+                                Err((status, message)) => ((status, message).into_response(), None),
                             }
                         }
                     }
                 }
             }
-        }
+        },
     };
 
     telemetry::record_event(
@@ -6370,9 +6586,14 @@ fn select_route_target_with_roll(
     random_roll: Option<u64>,
 ) -> std::result::Result<SelectedRouteTarget, String> {
     if route.targets.is_empty() {
+        let required_capabilities = default_route_capabilities();
         return Ok(SelectedRouteTarget {
             module: route.name.clone(),
             websocket: false,
+            required_capability_mask: Capabilities::from_requirement_list(&required_capabilities)
+                .map_err(|error| error.to_string())?
+                .mask,
+            required_capabilities,
         });
     }
 
@@ -6382,9 +6603,20 @@ fn select_route_target_with_roll(
             .as_ref()
             .is_some_and(|matcher| request_header_matches(headers, matcher))
         {
+            let required_capabilities = if target.requires.is_empty() {
+                default_route_capabilities()
+            } else {
+                target.requires.clone()
+            };
             return Ok(SelectedRouteTarget {
                 module: target.module.clone(),
                 websocket: target.websocket,
+                required_capability_mask: Capabilities::from_requirement_list(
+                    &required_capabilities,
+                )
+                .map_err(|error| error.to_string())?
+                .mask,
+                required_capabilities,
             });
         }
     }
@@ -6406,9 +6638,20 @@ fn select_route_target_with_roll(
             }
             cumulative_weight = cumulative_weight.saturating_add(u64::from(target.weight));
             if draw < cumulative_weight {
+                let required_capabilities = if target.requires.is_empty() {
+                    default_route_capabilities()
+                } else {
+                    target.requires.clone()
+                };
                 return Ok(SelectedRouteTarget {
                     module: target.module.clone(),
                     websocket: target.websocket,
+                    required_capability_mask: Capabilities::from_requirement_list(
+                        &required_capabilities,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .mask,
+                    required_capabilities,
                 });
             }
         }
@@ -6418,6 +6661,8 @@ fn select_route_target_with_roll(
         .map(|module| SelectedRouteTarget {
             module,
             websocket: false,
+            required_capability_mask: Capabilities::CORE_WASI,
+            required_capabilities: default_route_capabilities(),
         })
         .ok_or_else(|| {
             format!(
@@ -7683,6 +7928,8 @@ impl BackgroundTickRunner {
         host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
         route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+        peer_capabilities: PeerCapabilityCache,
+        host_capabilities: Capabilities,
         host_load: Arc<HostLoadCounters>,
     ) -> std::result::Result<Self, ExecutionError> {
         let module_path = resolve_guest_module_path(function_name)
@@ -7761,6 +8008,8 @@ impl BackgroundTickRunner {
             )?,
         );
         store.data_mut().route_overrides = route_overrides;
+        store.data_mut().peer_capabilities = peer_capabilities;
+        store.data_mut().host_capabilities = host_capabilities;
         store.data_mut().host_load = host_load;
         store.limiter(|state| &mut state.limits);
         store
@@ -9288,6 +9537,10 @@ fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
             "Integrity Validation Failed: route target `{module}` must keep `weight` between 0 and 100"
         ));
     }
+    let requires = normalize_capabilities(
+        target.requires,
+        format!("route target `{module}` capabilities"),
+    )?;
 
     Ok(RouteTarget {
         module,
@@ -9297,6 +9550,7 @@ fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
             .match_header
             .map(normalize_header_match)
             .transpose()?,
+        requires,
     })
 }
 
@@ -9841,6 +10095,8 @@ impl ComponentHostState {
             concurrency_limits,
             propagated_headers,
             route_overrides: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_capabilities: Arc::new(Mutex::new(HashMap::new())),
+            host_capabilities: Capabilities::detect(),
             host_load: Arc::new(HostLoadCounters::default()),
             outbound_http_client: reqwest::blocking::Client::new(),
             #[cfg(feature = "ai-inference")]
@@ -9927,13 +10183,15 @@ impl ComponentHostState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ControlPlaneSnapshot {
     cpu_pressure: u8,
     ram_pressure: u8,
     active_tasks: u32,
     active_instances: u32,
     allocated_memory_pages: u32,
+    capability_mask: u64,
+    capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -9949,6 +10207,10 @@ struct RouteOverrideCandidate {
     hot_models: Vec<String>,
     #[serde(default)]
     effective_pressure: u8,
+    #[serde(default)]
+    capability_mask: u64,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 fn guest_memory_page_count(bytes: usize) -> usize {
@@ -9969,6 +10231,7 @@ fn control_plane_snapshot(
     host_load: &HostLoadCounters,
     concurrency_limits: &HashMap<String, Arc<RouteExecutionControl>>,
     runtime_config: &IntegrityConfig,
+    host_capabilities: Capabilities,
 ) -> ControlPlaneSnapshot {
     let active_tasks = telemetry::active_requests(telemetry).min(u32::MAX as usize) as u32;
     let active_instances = host_load.active_instances.load(Ordering::SeqCst);
@@ -9993,13 +10256,17 @@ fn control_plane_snapshot(
         active_tasks,
         active_instances: active_instances.min(u32::MAX as usize) as u32,
         allocated_memory_pages: allocated_memory_pages.min(u32::MAX as usize) as u32,
+        capability_mask: host_capabilities.mask,
+        capabilities: host_capabilities.names(),
     }
 }
 
 fn control_plane_override_destination(
     route_overrides: &ArcSwap<HashMap<String, String>>,
+    peer_capabilities: &PeerCapabilityCache,
     route_path: &str,
     headers: &HeaderMap,
+    required_capability_mask: u64,
     requested_model: Option<&str>,
 ) -> Option<String> {
     if headers.contains_key(TACHYON_BUFFER_REPLAY_HEADER) {
@@ -10012,24 +10279,33 @@ fn control_plane_override_destination(
         .cloned()?;
 
     if let Ok(descriptor) = serde_json::from_str::<RouteOverrideDescriptor>(&raw) {
-        let selected = if let Some(alias) = requested_model {
-            descriptor.candidates.iter().find(|candidate| {
+        let selected = descriptor.candidates.iter().find(|candidate| {
+            let supports_capabilities = candidate_supports_capabilities(
+                candidate,
+                peer_capabilities,
+                required_capability_mask,
+            );
+            let supports_model = requested_model.is_none_or(|alias| {
                 candidate
                     .hot_models
                     .iter()
                     .any(|model| model.eq_ignore_ascii_case(alias))
-            })
-        } else {
-            descriptor.candidates.first()
-        };
+            });
+            supports_capabilities && supports_model
+        });
         return selected.map(|candidate| candidate.destination.clone());
     }
 
-    Some(raw)
+    if destination_supports_capabilities(&raw, peer_capabilities, required_capability_mask) {
+        return Some(raw);
+    }
+
+    cached_capable_peer_destination(peer_capabilities, route_path, required_capability_mask)
 }
 
 fn update_control_plane_route_override(
     route_overrides: &ArcSwap<HashMap<String, String>>,
+    peer_capabilities: &PeerCapabilityCache,
     route_path: &str,
     destination: &str,
 ) -> std::result::Result<(), String> {
@@ -10065,6 +10341,7 @@ fn update_control_plane_route_override(
                 ));
             }
         }
+        cache_peer_capabilities(peer_capabilities, &descriptor.candidates);
     }
 
     let mut next = (**route_overrides.load()).clone();
@@ -10075,6 +10352,117 @@ fn update_control_plane_route_override(
     }
     route_overrides.store(Arc::new(next));
     Ok(())
+}
+
+fn candidate_supports_capabilities(
+    candidate: &RouteOverrideCandidate,
+    peer_capabilities: &PeerCapabilityCache,
+    required_capability_mask: u64,
+) -> bool {
+    if required_capability_mask == 0 || required_capability_mask == Capabilities::CORE_WASI {
+        return true;
+    }
+
+    let declared_mask = required_capability_mask_for_candidate(candidate);
+    if declared_mask != 0 {
+        return (declared_mask & required_capability_mask) == required_capability_mask;
+    }
+
+    destination_supports_capabilities(
+        &candidate.destination,
+        peer_capabilities,
+        required_capability_mask,
+    )
+}
+
+fn destination_supports_capabilities(
+    destination: &str,
+    peer_capabilities: &PeerCapabilityCache,
+    required_capability_mask: u64,
+) -> bool {
+    if required_capability_mask == 0 || required_capability_mask == Capabilities::CORE_WASI {
+        return true;
+    }
+
+    peer_base_url_for_destination(destination)
+        .and_then(|base_url| {
+            peer_capabilities
+                .lock()
+                .expect("peer capability cache should not be poisoned")
+                .get(&base_url)
+                .cloned()
+        })
+        .is_some_and(|peer| {
+            (peer.capability_mask & required_capability_mask) == required_capability_mask
+        })
+}
+
+fn cache_peer_capabilities(
+    peer_capabilities: &PeerCapabilityCache,
+    candidates: &[RouteOverrideCandidate],
+) {
+    let mut cache = peer_capabilities
+        .lock()
+        .expect("peer capability cache should not be poisoned");
+    for candidate in candidates {
+        let Some(base_url) = peer_base_url_for_destination(&candidate.destination) else {
+            continue;
+        };
+        let capability_mask = required_capability_mask_for_candidate(candidate);
+        if capability_mask == 0 {
+            continue;
+        }
+        let capabilities = if candidate.capabilities.is_empty() {
+            capability_names_from_mask(capability_mask)
+        } else {
+            candidate.capabilities.clone()
+        };
+        cache.insert(
+            base_url,
+            CachedPeerCapabilities {
+                capabilities,
+                capability_mask,
+                effective_pressure: candidate.effective_pressure,
+            },
+        );
+    }
+}
+
+fn required_capability_mask_for_candidate(candidate: &RouteOverrideCandidate) -> u64 {
+    if candidate.capability_mask != 0 {
+        return candidate.capability_mask;
+    }
+    Capabilities::from_requirement_list(&candidate.capabilities)
+        .map(|capabilities| capabilities.mask)
+        .unwrap_or(0)
+}
+
+fn peer_base_url_for_destination(destination: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(destination).ok()?;
+    let host = parsed.host_str()?;
+    let mut base = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        base.push(':');
+        base.push_str(&port.to_string());
+    }
+    Some(base)
+}
+
+fn cached_capable_peer_destination(
+    peer_capabilities: &PeerCapabilityCache,
+    route_path: &str,
+    required_capability_mask: u64,
+) -> Option<String> {
+    let cache = peer_capabilities
+        .lock()
+        .expect("peer capability cache should not be poisoned");
+    cache
+        .iter()
+        .filter(|(_, peer)| {
+            (peer.capability_mask & required_capability_mask) == required_capability_mask
+        })
+        .min_by_key(|(_, peer)| peer.effective_pressure)
+        .map(|(base_url, _)| format!("{base_url}{}", normalize_route_path(route_path)))
 }
 
 fn build_component_wasi_ctx(
@@ -10405,6 +10793,7 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             self.host_load.as_ref(),
             self.concurrency_limits.as_ref(),
             &self.runtime_config,
+            self.host_capabilities,
         );
         let hot_models = self.hot_model_aliases();
 
@@ -10417,6 +10806,8 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             ram_pressure: control_plane.ram_pressure,
             active_instances: control_plane.active_instances,
             allocated_memory_pages: control_plane.allocated_memory_pages,
+            capability_mask: control_plane.capability_mask,
+            capabilities: control_plane.capabilities,
             hot_models,
             dropped_events,
             last_status,
@@ -10446,6 +10837,8 @@ impl control_plane_component_bindings::tachyon::mesh::telemetry_reader::Host
             ram_pressure: snapshot.ram_pressure,
             active_instances: snapshot.active_instances,
             allocated_memory_pages: snapshot.allocated_memory_pages,
+            capability_mask: snapshot.capability_mask,
+            capabilities: snapshot.capabilities,
             hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
@@ -10473,6 +10866,8 @@ impl background_component_bindings::tachyon::mesh::telemetry_reader::Host for Co
             ram_pressure: snapshot.ram_pressure,
             active_instances: snapshot.active_instances,
             allocated_memory_pages: snapshot.allocated_memory_pages,
+            capability_mask: snapshot.capability_mask,
+            capabilities: snapshot.capabilities,
             hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
@@ -10571,6 +10966,7 @@ impl control_plane_component_bindings::tachyon::mesh::routing_control::Host for 
     ) -> std::result::Result<(), String> {
         update_control_plane_route_override(
             self.route_overrides.as_ref(),
+            &self.peer_capabilities,
             &route_path,
             &destination,
         )
@@ -10585,6 +10981,7 @@ impl background_component_bindings::tachyon::mesh::routing_control::Host for Com
     ) -> std::result::Result<(), String> {
         update_control_plane_route_override(
             self.route_overrides.as_ref(),
+            &self.peer_capabilities,
             &route_path,
             &destination,
         )
@@ -11040,8 +11437,21 @@ mod tests {
         Arc::new(ArcSwap::from_pointee(HashMap::new()))
     }
 
+    fn test_peer_capabilities() -> PeerCapabilityCache {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     fn test_host_load() -> Arc<HostLoadCounters> {
         Arc::new(HostLoadCounters::default())
+    }
+
+    fn test_selected_target(module: &str, websocket: bool) -> SelectedRouteTarget {
+        SelectedRouteTarget {
+            module: module.to_owned(),
+            websocket,
+            required_capabilities: default_route_capabilities(),
+            required_capability_mask: Capabilities::CORE_WASI,
+        }
     }
 
     fn build_test_engine(config: &IntegrityConfig) -> Engine {
@@ -11177,6 +11587,7 @@ mod tests {
             weight: 100,
             websocket: false,
             match_header: None,
+            requires: default_route_capabilities(),
         }];
 
         let mut connector_route = IntegrityRoute::system("/system/sqs-connector");
@@ -11186,6 +11597,7 @@ mod tests {
             weight: 100,
             websocket: false,
             match_header: None,
+            requires: default_route_capabilities(),
         }];
         connector_route.dependencies = BTreeMap::from([(
             default_route_name(target_route_path),
@@ -11264,6 +11676,8 @@ mod tests {
             buffered_requests,
             volume_manager: Arc::new(VolumeManager::default()),
             route_overrides: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_capabilities: Arc::new(Mutex::new(HashMap::new())),
+            host_capabilities: Capabilities::detect(),
             host_load: Arc::new(HostLoadCounters::default()),
             telemetry,
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
@@ -11498,6 +11912,7 @@ mod tests {
                 weight: 100,
                 websocket: false,
                 match_header: None,
+                requires: default_route_capabilities(),
             }],
             resiliency: None,
             models: Vec::new(),
@@ -11532,6 +11947,7 @@ mod tests {
                 weight: 100,
                 websocket: false,
                 match_header: None,
+                requires: default_route_capabilities(),
             }],
             resiliency: None,
             models: Vec::new(),
@@ -11566,6 +11982,7 @@ mod tests {
                 weight: 100,
                 websocket: false,
                 match_header: None,
+                requires: default_route_capabilities(),
             }],
             resiliency: None,
             models: Vec::new(),
@@ -11747,6 +12164,7 @@ mod tests {
             weight,
             websocket: false,
             match_header: None,
+            requires: default_route_capabilities(),
         }
     }
 
@@ -11759,6 +12177,7 @@ mod tests {
                 name: header_name.to_owned(),
                 value: header_value.to_owned(),
             }),
+            requires: default_route_capabilities(),
         }
     }
 
@@ -11768,7 +12187,17 @@ mod tests {
             weight: 100,
             websocket: true,
             match_header: None,
+            requires: default_route_capabilities(),
         }
+    }
+
+    fn capability_target(module: &str, requires: &[&str]) -> RouteTarget {
+        let mut target = weighted_target(module, 100);
+        target.requires = requires
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect();
+        target
     }
 
     fn system_targeted_route(path: &str, module: &str) -> IntegrityRoute {
@@ -12849,6 +13278,8 @@ mod tests {
             buffered_requests,
             volume_manager: Arc::new(VolumeManager::default()),
             route_overrides: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_capabilities: Arc::new(Mutex::new(HashMap::new())),
+            host_capabilities: Capabilities::detect(),
             host_load: Arc::new(HostLoadCounters::default()),
             telemetry: telemetry::init_test_telemetry(),
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
@@ -13074,6 +13505,8 @@ mod tests {
                 test_host_identity(35),
                 Arc::new(StorageBrokerManager::default()),
                 test_route_overrides(),
+                test_peer_capabilities(),
+                Capabilities::detect(),
                 test_host_load(),
             )
             .expect("background scaler should instantiate");
@@ -13196,6 +13629,8 @@ mod tests {
                 test_host_identity(36),
                 Arc::new(StorageBrokerManager::default()),
                 test_route_overrides(),
+                test_peer_capabilities(),
+                Capabilities::detect(),
                 test_host_load(),
             )
             .expect("SQS connector should instantiate");
@@ -13315,6 +13750,8 @@ mod tests {
                 test_host_identity(37),
                 Arc::new(StorageBrokerManager::default()),
                 test_route_overrides(),
+                test_peer_capabilities(),
+                Capabilities::detect(),
                 test_host_load(),
             )
             .expect("SQS connector should instantiate");
@@ -14277,10 +14714,7 @@ mod tests {
         assert_eq!(
             select_route_target_with_roll(&route, &headers, Some(42))
                 .expect("header-target route should resolve"),
-            SelectedRouteTarget {
-                module: "guest-loop".to_owned(),
-                websocket: false,
-            }
+            test_selected_target("guest-loop", false)
         );
     }
 
@@ -14297,26 +14731,17 @@ mod tests {
         assert_eq!(
             select_route_target_with_roll(&route, &HeaderMap::new(), Some(0))
                 .expect("weighted route should resolve"),
-            SelectedRouteTarget {
-                module: "guest-example".to_owned(),
-                websocket: false,
-            }
+            test_selected_target("guest-example", false)
         );
         assert_eq!(
             select_route_target_with_roll(&route, &HeaderMap::new(), Some(89))
                 .expect("weighted route should resolve"),
-            SelectedRouteTarget {
-                module: "guest-example".to_owned(),
-                websocket: false,
-            }
+            test_selected_target("guest-example", false)
         );
         assert_eq!(
             select_route_target_with_roll(&route, &HeaderMap::new(), Some(90))
                 .expect("weighted route should resolve"),
-            SelectedRouteTarget {
-                module: "guest-loop".to_owned(),
-                websocket: false,
-            }
+            test_selected_target("guest-loop", false)
         );
     }
 
@@ -14330,10 +14755,7 @@ mod tests {
         assert_eq!(
             select_route_target_with_roll(&route, &HeaderMap::new(), Some(0))
                 .expect("route should fall back to the path module"),
-            SelectedRouteTarget {
-                module: "guest-example".to_owned(),
-                websocket: false,
-            }
+            test_selected_target("guest-example", false)
         );
     }
 
@@ -16203,10 +16625,12 @@ mod tests {
         tokio::task::spawn_blocking({
             let config = config.clone();
             let route_overrides = Arc::clone(&state.route_overrides);
+            let peer_capabilities = Arc::clone(&state.peer_capabilities);
             let host_load = Arc::clone(&state.host_load);
             let storage_broker = Arc::clone(&state.storage_broker);
             let telemetry = state.telemetry.clone();
             let host_identity = Arc::clone(&state.host_identity);
+            let host_capabilities = state.host_capabilities;
             move || {
                 let engine = build_test_metered_engine(&config);
                 let mut runner = BackgroundTickRunner::new(
@@ -16221,6 +16645,8 @@ mod tests {
                     host_identity,
                     storage_broker,
                     route_overrides,
+                    peer_capabilities,
+                    host_capabilities,
                     host_load,
                 )
                 .expect("gossip component should instantiate");
@@ -16405,10 +16831,12 @@ mod tests {
         tokio::task::spawn_blocking({
             let config = config.clone();
             let route_overrides = Arc::clone(&state.route_overrides);
+            let peer_capabilities = Arc::clone(&state.peer_capabilities);
             let host_load = Arc::clone(&state.host_load);
             let storage_broker = Arc::clone(&state.storage_broker);
             let telemetry = state.telemetry.clone();
             let host_identity = Arc::clone(&state.host_identity);
+            let host_capabilities = state.host_capabilities;
             move || {
                 let engine = build_test_metered_engine(&config);
                 let mut runner = BackgroundTickRunner::new(
@@ -16423,6 +16851,8 @@ mod tests {
                     host_identity,
                     storage_broker,
                     route_overrides,
+                    peer_capabilities,
+                    host_capabilities,
                     host_load,
                 )
                 .expect("gossip component should instantiate");
@@ -16579,10 +17009,12 @@ mod tests {
         tokio::task::spawn_blocking({
             let config = config.clone();
             let route_overrides = Arc::clone(&state.route_overrides);
+            let peer_capabilities = Arc::clone(&state.peer_capabilities);
             let host_load = Arc::clone(&state.host_load);
             let storage_broker = Arc::clone(&state.storage_broker);
             let telemetry = state.telemetry.clone();
             let host_identity = Arc::clone(&state.host_identity);
+            let host_capabilities = state.host_capabilities;
             move || {
                 let engine = build_test_metered_engine(&config);
                 let mut runner = BackgroundTickRunner::new(
@@ -16597,6 +17029,8 @@ mod tests {
                     host_identity,
                     storage_broker,
                     route_overrides,
+                    peer_capabilities,
+                    host_capabilities,
                     host_load,
                 )
                 .expect("gossip component should instantiate");
@@ -16626,6 +17060,186 @@ mod tests {
 
         host_server.abort();
         peer_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capability_routing_skips_override_candidates_without_required_capabilities() {
+        use axum::{
+            body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post, Router,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct PeerCapture {
+            bodies: Vec<String>,
+        }
+
+        async fn peer_target(
+            State(state): State<Arc<Mutex<PeerCapture>>>,
+            body: AxumBytes,
+        ) -> impl IntoResponse {
+            state
+                .lock()
+                .expect("peer capture should not be poisoned")
+                .bodies
+                .push(String::from_utf8_lossy(&body).to_string());
+            (StatusCode::OK, "peer-capable")
+        }
+
+        let wrong_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let wrong_app = Router::new()
+            .route("/api/guest-example", post(peer_target))
+            .with_state(Arc::clone(&wrong_capture));
+        let wrong_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("incapable peer should bind");
+        let wrong_address = wrong_listener
+            .local_addr()
+            .expect("incapable peer should expose an address");
+        let wrong_server = tokio::spawn(async move {
+            axum::serve(wrong_listener, wrong_app)
+                .await
+                .expect("incapable peer should stay up");
+        });
+
+        let right_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let right_app = Router::new()
+            .route("/api/guest-example", post(peer_target))
+            .with_state(Arc::clone(&right_capture));
+        let right_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("capable peer should bind");
+        let right_address = right_listener
+            .local_addr()
+            .expect("capable peer should expose an address");
+        let right_server = tokio::spawn(async move {
+            axum::serve(right_listener, right_app)
+                .await
+                .expect("capable peer should stay up");
+        });
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+        let config = IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![targeted_route(
+                "/api/guest-example",
+                vec![capability_target(
+                    "guest-example",
+                    &["core:wasi", "accel:cuda"],
+                )],
+            )],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+        let host_app = build_app(state.clone());
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        let override_descriptor = serde_json::to_string(&RouteOverrideDescriptor {
+            candidates: vec![
+                RouteOverrideCandidate {
+                    destination: format!("http://{wrong_address}/api/guest-example"),
+                    hot_models: Vec::new(),
+                    effective_pressure: 5,
+                    capability_mask: Capabilities::CORE_WASI,
+                    capabilities: vec!["core:wasi".to_owned()],
+                },
+                RouteOverrideCandidate {
+                    destination: format!("http://{right_address}/api/guest-example"),
+                    hot_models: Vec::new(),
+                    effective_pressure: 10,
+                    capability_mask: Capabilities::CORE_WASI | Capabilities::ACCEL_CUDA,
+                    capabilities: vec!["core:wasi".to_owned(), "accel:cuda".to_owned()],
+                },
+            ],
+        })
+        .expect("override descriptor should serialize");
+        update_control_plane_route_override(
+            state.route_overrides.as_ref(),
+            &state.peer_capabilities,
+            "/api/guest-example",
+            &override_descriptor,
+        )
+        .expect("capability-aware override should install");
+
+        let response = Client::new()
+            .post(format!("http://{host_address}/api/guest-example"))
+            .body("capability-request")
+            .send()
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("response body should decode"),
+            "peer-capable"
+        );
+
+        let wrong_capture = wrong_capture
+            .lock()
+            .expect("incapable peer capture should not be poisoned");
+        assert!(wrong_capture.bodies.is_empty());
+        let right_capture = right_capture
+            .lock()
+            .expect("capable peer capture should not be poisoned");
+        assert_eq!(right_capture.bodies, vec!["capability-request".to_owned()]);
+        let cached = state
+            .peer_capabilities
+            .lock()
+            .expect("peer cache should not be poisoned");
+        assert_eq!(cached.len(), 2);
+
+        host_server.abort();
+        wrong_server.abort();
+        right_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capability_routing_returns_503_when_local_and_mesh_lack_requirements() {
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+        let config = IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![targeted_route(
+                "/api/guest-example",
+                vec![capability_target(
+                    "guest-example",
+                    &["core:wasi", "accel:cuda"],
+                )],
+            )],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let host_app = build_app(state);
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        let response = Client::new()
+            .post(format!("http://{host_address}/api/guest-example"))
+            .body("missing-capability")
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.text().await.expect("response body should decode");
+        assert!(body.contains("Missing Capability"));
+        assert!(body.contains("accel:cuda"));
+
+        host_server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -16665,6 +17279,7 @@ mod tests {
         let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
         update_control_plane_route_override(
             state.route_overrides.as_ref(),
+            &state.peer_capabilities,
             "/api/guest-volume",
             "/system/buffer",
         )
@@ -16694,10 +17309,12 @@ mod tests {
         tokio::task::spawn_blocking({
             let config = config.clone();
             let route_overrides = Arc::clone(&state.route_overrides);
+            let peer_capabilities = Arc::clone(&state.peer_capabilities);
             let host_load = Arc::clone(&state.host_load);
             let storage_broker = Arc::clone(&state.storage_broker);
             let telemetry = state.telemetry.clone();
             let host_identity = Arc::clone(&state.host_identity);
+            let host_capabilities = state.host_capabilities;
             move || {
                 let engine = build_test_metered_engine(&config);
                 let mut runner = BackgroundTickRunner::new(
@@ -16712,6 +17329,8 @@ mod tests {
                     host_identity,
                     storage_broker,
                     route_overrides,
+                    peer_capabilities,
+                    host_capabilities,
                     host_load,
                 )
                 .expect("buffer component should instantiate");
