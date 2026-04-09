@@ -115,6 +115,13 @@ mod background_component_bindings {
     });
 }
 
+mod control_plane_component_bindings {
+    wasmtime::component::bindgen!({
+        path: "../wit",
+        world: "control-plane-faas",
+    });
+}
+
 #[cfg(feature = "ai-inference")]
 mod accelerator_component_bindings {
     wasmtime::component::bindgen!({
@@ -153,6 +160,8 @@ const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
 const COHORT_HEADER: &str = "x-cohort";
 const TACHYON_COHORT_HEADER: &str = "x-tachyon-cohort";
 const TACHYON_IDENTITY_HEADER: &str = "x-tachyon-identity";
+const TACHYON_ORIGINAL_ROUTE_HEADER: &str = "x-tachyon-original-route";
+const TACHYON_BUFFER_REPLAY_HEADER: &str = "x-tachyon-buffer-replay";
 const TACHYON_SYSTEM_PUBLIC_KEY_ENV: &str = "TACHYON_SYSTEM_PUBLIC_KEY";
 #[cfg(unix)]
 const TACHYON_DISCOVERY_DIR_ENV: &str = "TACHYON_DISCOVERY_DIR";
@@ -286,6 +295,8 @@ struct AppState {
     core_store: Arc<store::CoreStore>,
     buffered_requests: Arc<BufferedRequestManager>,
     volume_manager: Arc<VolumeManager>,
+    route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    host_load: Arc<HostLoadCounters>,
     telemetry: TelemetryHandle,
     tls_manager: Arc<tls_runtime::TlsManager>,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -305,6 +316,12 @@ struct RuntimeState {
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     #[cfg(feature = "ai-inference")]
     ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+}
+
+#[derive(Default)]
+struct HostLoadCounters {
+    active_instances: AtomicUsize,
+    allocated_memory_pages: AtomicUsize,
 }
 
 struct DrainingRuntime {
@@ -408,6 +425,8 @@ struct ComponentHostState {
     telemetry: TelemetryHandle,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
+    route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    host_load: Arc<HostLoadCounters>,
     outbound_http_client: reqwest::blocking::Client,
     #[cfg(feature = "ai-inference")]
     ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
@@ -449,6 +468,8 @@ struct GuestExecutionContext {
     telemetry: Option<GuestTelemetryContext>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
+    route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    host_load: Arc<HostLoadCounters>,
     #[cfg(feature = "ai-inference")]
     ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }
@@ -457,7 +478,12 @@ struct BackgroundTickRunner {
     function_name: String,
     route_path: String,
     store: Store<ComponentHostState>,
-    bindings: background_component_bindings::BackgroundSystemFaas,
+    bindings: BackgroundGuestBindings,
+}
+
+enum BackgroundGuestBindings {
+    Background(background_component_bindings::BackgroundSystemFaas),
+    ControlPlane(control_plane_component_bindings::ControlPlaneFaas),
 }
 
 #[derive(Clone, Default)]
@@ -607,6 +633,11 @@ struct RouteResponseGuard {
     control: Arc<RouteExecutionControl>,
 }
 
+struct HostLoadGuard {
+    counters: Arc<HostLoadCounters>,
+    allocated_pages: usize,
+}
+
 #[derive(Clone)]
 struct RouteInvocation {
     state: AppState,
@@ -744,6 +775,30 @@ impl Drop for ActiveRouteRequestGuard {
 impl Drop for RouteResponseGuard {
     fn drop(&mut self) {
         self.control.active_requests.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl HostLoadGuard {
+    fn new(counters: Arc<HostLoadCounters>, allocated_pages: usize) -> Self {
+        counters.active_instances.fetch_add(1, Ordering::SeqCst);
+        counters
+            .allocated_memory_pages
+            .fetch_add(allocated_pages, Ordering::SeqCst);
+        Self {
+            counters,
+            allocated_pages,
+        }
+    }
+}
+
+impl Drop for HostLoadGuard {
+    fn drop(&mut self) {
+        self.counters
+            .active_instances
+            .fetch_sub(1, Ordering::SeqCst);
+        self.counters
+            .allocated_memory_pages
+            .fetch_sub(self.allocated_pages, Ordering::SeqCst);
     }
 }
 
@@ -1712,6 +1767,8 @@ async fn serve_host() -> Result<()> {
         &manifest_path,
     )));
     let background_workers = Arc::new(BackgroundWorkerManager::default());
+    let route_overrides = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+    let host_load = Arc::new(HostLoadCounters::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
     background_workers.start_for_runtime(
@@ -1719,6 +1776,8 @@ async fn serve_host() -> Result<()> {
         telemetry.clone(),
         Arc::clone(&host_identity),
         Arc::clone(&storage_broker),
+        Arc::clone(&route_overrides),
+        Arc::clone(&host_load),
     );
 
     let state = AppState {
@@ -1733,6 +1792,8 @@ async fn serve_host() -> Result<()> {
         core_store,
         buffered_requests,
         volume_manager: Arc::new(VolumeManager::default()),
+        route_overrides,
+        host_load,
         telemetry,
         tls_manager,
         manifest_path,
@@ -1872,6 +1933,8 @@ impl BackgroundWorkerManager {
         telemetry: TelemetryHandle,
         host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
+        route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+        host_load: Arc<HostLoadCounters>,
     ) {
         let mut new_workers = Vec::new();
         let mut started_workers = 0_u32;
@@ -1903,6 +1966,8 @@ impl BackgroundWorkerManager {
                 Arc::clone(&runtime.concurrency_limits),
                 Arc::clone(&host_identity),
                 Arc::clone(&storage_broker),
+                Arc::clone(&route_overrides),
+                Arc::clone(&host_load),
             )
             .is_err()
             {
@@ -1919,6 +1984,8 @@ impl BackgroundWorkerManager {
             let worker_limits = Arc::clone(&runtime.concurrency_limits);
             let worker_host_identity = Arc::clone(&host_identity);
             let worker_storage_broker = Arc::clone(&storage_broker);
+            let worker_route_overrides = Arc::clone(&route_overrides);
+            let worker_host_load = Arc::clone(&host_load);
             let worker_stop = Arc::clone(&stop_requested);
             let join_handle = tokio::task::spawn_blocking(move || {
                 run_background_tick_loop(
@@ -1928,6 +1995,8 @@ impl BackgroundWorkerManager {
                     worker_limits,
                     worker_host_identity,
                     worker_storage_broker,
+                    worker_route_overrides,
+                    worker_host_load,
                     worker_route,
                     worker_function_name,
                     worker_stop,
@@ -1962,9 +2031,18 @@ impl BackgroundWorkerManager {
         telemetry: TelemetryHandle,
         host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
+        route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+        host_load: Arc<HostLoadCounters>,
     ) {
         self.stop_all().await;
-        self.start_for_runtime(runtime, telemetry, host_identity, storage_broker);
+        self.start_for_runtime(
+            runtime,
+            telemetry,
+            host_identity,
+            storage_broker,
+            route_overrides,
+            host_load,
+        );
     }
 
     async fn stop_all(&self) {
@@ -1999,6 +2077,8 @@ fn run_background_tick_loop(
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
+    route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    host_load: Arc<HostLoadCounters>,
     route: IntegrityRoute,
     function_name: String,
     stop_requested: Arc<AtomicBool>,
@@ -2012,6 +2092,8 @@ fn run_background_tick_loop(
         concurrency_limits,
         host_identity,
         storage_broker,
+        route_overrides,
+        host_load,
     ) {
         Ok(runner) => runner,
         Err(error) => {
@@ -3359,6 +3441,8 @@ async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
             state.telemetry.clone(),
             Arc::clone(&state.host_identity),
             Arc::clone(&state.storage_broker),
+            Arc::clone(&state.route_overrides),
+            Arc::clone(&state.host_load),
         )
         .await;
     let runtime = Arc::new(runtime);
@@ -3627,6 +3711,8 @@ fn prewarm_component_route(
             Arc::clone(&runtime.concurrency_limits),
             Arc::clone(&host_identity),
             Arc::clone(&storage_broker),
+            Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            Arc::new(HostLoadCounters::default()),
         ) {
             Ok(_) => return Ok(()),
             Err(error) if !should_fall_back_from_component_prewarm(&error) => return Err(error),
@@ -3948,7 +4034,7 @@ fn prewarm_system_component_instance(
             "failed to add WASI preview2 functions to prewarm system component linker",
         )
     })?;
-    system_component_bindings::tachyon::mesh::telemetry_reader::add_to_linker::<
+    control_plane_component_bindings::tachyon::mesh::telemetry_reader::add_to_linker::<
         ComponentHostState,
         ComponentHostState,
     >(&mut linker, |state: &mut ComponentHostState| state)
@@ -3958,7 +4044,7 @@ fn prewarm_system_component_instance(
             "failed to add telemetry reader functions to prewarm system component linker",
         )
     })?;
-    system_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
+    control_plane_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
         ComponentHostState,
         ComponentHostState,
     >(&mut linker, |state: &mut ComponentHostState| state)
@@ -3966,6 +4052,26 @@ fn prewarm_system_component_instance(
         guest_execution_error(
             error,
             "failed to add scaling metrics functions to prewarm system component linker",
+        )
+    })?;
+    control_plane_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add outbound HTTP functions to prewarm system component linker",
+        )
+    })?;
+    control_plane_component_bindings::tachyon::mesh::routing_control::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add routing control functions to prewarm system component linker",
         )
     })?;
     system_component_bindings::tachyon::mesh::storage_broker::add_to_linker::<
@@ -3995,6 +4101,13 @@ fn prewarm_system_component_instance(
         )?,
     );
     store.limiter(|state| &mut state.limits);
+    if control_plane_component_bindings::ControlPlaneFaas::instantiate(
+        &mut store, component, &linker,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
     let _ = system_component_bindings::SystemFaasGuest::instantiate(&mut store, component, &linker)
         .map_err(|error| {
             guest_execution_error(
@@ -4713,6 +4826,8 @@ async fn handle_udp_layer4_datagram(
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let request_headers = HeaderMap::new();
     let route_for_execution = route.clone();
+    let route_overrides = Arc::clone(&state.route_overrides);
+    let host_load = Arc::clone(&state.host_load);
     let source = datagram.source;
     let payload = datagram.payload;
     let responses = tokio::task::spawn_blocking(move || {
@@ -4730,6 +4845,8 @@ async fn handle_udp_layer4_datagram(
             telemetry: None,
             concurrency_limits,
             propagated_headers: Vec::new(),
+            route_overrides,
+            host_load,
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
         };
@@ -4792,6 +4909,8 @@ async fn handle_websocket_connection(
     let storage_broker = Arc::clone(&state.storage_broker);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let secret_access = SecretAccess::from_route(&route, &state.secrets_vault);
+    let route_overrides = Arc::clone(&state.route_overrides);
+    let host_load = Arc::clone(&state.host_load);
     let (incoming_tx, incoming_rx) = std::sync::mpsc::channel::<HostWebSocketFrame>();
     let (outgoing_tx, mut outgoing_rx) =
         tokio::sync::mpsc::unbounded_channel::<HostWebSocketFrame>();
@@ -4849,6 +4968,8 @@ async fn handle_websocket_connection(
             telemetry: None,
             concurrency_limits,
             propagated_headers: Vec::new(),
+            route_overrides,
+            host_load,
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
         };
@@ -4934,6 +5055,8 @@ async fn handle_tcp_layer4_connection(
     let storage_broker = Arc::clone(&state.storage_broker);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let telemetry = state.telemetry.clone();
+    let route_overrides = Arc::clone(&state.route_overrides);
+    let host_load = Arc::clone(&state.host_load);
     #[cfg(feature = "ai-inference")]
     let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
@@ -4952,6 +5075,8 @@ async fn handle_tcp_layer4_connection(
             host_identity,
             storage_broker,
             concurrency_limits,
+            route_overrides,
+            host_load,
             #[cfg(feature = "ai-inference")]
             ai_runtime,
         ));
@@ -5033,6 +5158,8 @@ async fn handle_tls_wrapped_tcp_layer4_connection(
                 host_identity,
                 storage_broker,
                 concurrency_limits,
+                Arc::clone(&state.route_overrides),
+                Arc::clone(&state.host_load),
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
             )
@@ -5065,6 +5192,8 @@ fn execute_tcp_layer4_guest(
     host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    host_load: Arc<HostLoadCounters>,
     #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 ) -> std::result::Result<(), ExecutionError> {
     let execution = GuestExecutionContext {
@@ -5079,6 +5208,8 @@ fn execute_tcp_layer4_guest(
         telemetry: None,
         concurrency_limits,
         propagated_headers: Vec::new(),
+        route_overrides,
+        host_load,
         #[cfg(feature = "ai-inference")]
         ai_runtime,
     };
@@ -5236,6 +5367,64 @@ fn guest_response_into_response(result: RouteExecutionResult) -> Response {
     }
 }
 
+fn clone_headers_with_original_route(headers: &HeaderMap, route: &IntegrityRoute) -> HeaderMap {
+    let mut cloned = headers.clone();
+    if !cloned.contains_key(TACHYON_ORIGINAL_ROUTE_HEADER) {
+        if let Ok(value) = HeaderValue::from_str(&route.path) {
+            cloned.insert(TACHYON_ORIGINAL_ROUTE_HEADER, value);
+        }
+    }
+    cloned
+}
+
+async fn forward_request_to_override(
+    http_client: &Client,
+    destination: &str,
+    headers: &HeaderMap,
+    method: &Method,
+    body: &Bytes,
+    hop_limit: HopLimit,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    let mut request = http_client.request(method.clone(), destination);
+    for (name, value) in headers {
+        if name == "host" || name == "content-length" || name == "connection" {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    request = request.header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
+    let response = request.body(body.clone()).send().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("route override forward to `{destination}` failed: {error}"),
+        )
+    })?;
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let response_body = response.bytes().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to read override response body from `{destination}`: {error}"),
+        )
+    })?;
+    let mut built = Response::builder()
+        .status(status)
+        .body(Body::from(response_body))
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to construct override response: {error}"),
+            )
+        })?;
+    for (name, value) in &response_headers {
+        if name == "content-length" || name == "connection" || name == "transfer-encoding" {
+            continue;
+        }
+        built.headers_mut().append(name.clone(), value.clone());
+    }
+    Ok(built)
+}
+
 #[cfg(not(feature = "resiliency"))]
 mod resiliency {
     use super::{execute_route_with_middleware_inner, RouteExecutionResult, RouteInvocation};
@@ -5302,113 +5491,179 @@ async fn faas_handler(
                 .into_response(),
             None,
         ),
-        Some(route) => match select_route_target(&route, &headers) {
-            Err(error) => (
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "failed to resolve route target for `{}`: {error}",
-                        route.path
-                    ),
-                )
-                    .into_response(),
-                None,
-            ),
-            Ok(selected_target) => {
-                #[cfg(feature = "websockets")]
-                {
-                    if selected_target.websocket {
-                        let status = if is_websocket_upgrade_request(&headers) {
-                            StatusCode::BAD_REQUEST
-                        } else {
-                            StatusCode::UPGRADE_REQUIRED
-                        };
-                        match ws {
-                            Some(upgrade) => {
-                                let websocket_state = state.clone();
-                                let websocket_route = route.clone();
-                                let websocket_module = selected_target.module.clone();
-                                let websocket_target = selected_target.module.clone();
-                                (
-                                    upgrade
-                                        .on_upgrade(move |socket| async move {
-                                            if let Err(error) = handle_websocket_connection(
-                                                websocket_state,
-                                                websocket_route,
-                                                websocket_module,
-                                                socket,
-                                            )
-                                            .await
-                                            {
-                                                tracing::warn!(
-                                                    target = %websocket_target,
-                                                    "WebSocket session failed: {error:#}"
-                                                );
-                                            }
-                                        })
-                                        .into_response(),
-                                    None,
-                                )
-                            }
-                            None => (
-                                (
-                                    status,
-                                    format!(
-                                        "route `{}` requires a valid WebSocket upgrade request",
-                                        route.path
-                                    ),
-                                )
-                                    .into_response(),
+        Some(route) => {
+            if let Some(destination) = control_plane_override_destination(
+                state.route_overrides.as_ref(),
+                &route.path,
+                &headers,
+            ) {
+                if destination.starts_with("http://") || destination.starts_with("https://") {
+                    match forward_request_to_override(
+                        &state.http_client,
+                        &destination,
+                        &headers,
+                        &method,
+                        &body,
+                        hop_limit,
+                    )
+                    .await
+                    {
+                        Ok(response) => (response, None),
+                        Err((status, message)) => ((status, message).into_response(), None),
+                    }
+                } else {
+                    let override_path = normalize_route_path(&destination);
+                    match runtime.config.sealed_route(&override_path).cloned() {
+                        Some(override_route) => {
+                            let override_headers = clone_headers_with_original_route(&headers, &route);
+                            match execute_route_with_middleware(
+                                &state,
+                                &runtime,
+                                &override_route,
+                                &override_headers,
+                                &method,
+                                &uri,
+                                &body,
+                                &trailer_fields,
+                                hop_limit,
+                                Some(&trace_id),
+                                sampled_execution,
                                 None,
-                            ),
+                            )
+                            .await
+                            {
+                                Ok(result) => {
+                                    let fuel_consumed = result.fuel_consumed;
+                                    (guest_response_into_response(result), fuel_consumed)
+                                }
+                                Err((status, message)) => {
+                                    ((status, message).into_response(), None)
+                                }
+                            }
                         }
-                    } else if is_websocket_upgrade_request(&headers) {
-                        (
+                        None => (
                             (
-                                StatusCode::BAD_REQUEST,
+                                StatusCode::INTERNAL_SERVER_ERROR,
                                 format!(
-                                    "route `{}` is not configured for WebSocket upgrades",
+                                    "route override for `{}` points to missing route `{override_path}`",
                                     route.path
                                 ),
                             )
                                 .into_response(),
                             None,
-                        )
-                    } else {
-                        match execute_route_with_middleware(
-                            &state,
-                            &runtime,
-                            &route,
-                            &headers,
-                            &method,
-                            &uri,
-                            &body,
-                            &trailer_fields,
-                            hop_limit,
-                            Some(&trace_id),
-                            sampled_execution,
-                            Some(selected_target.module.as_str()),
-                        )
-                        .await
-                        {
-                            Ok(result) => {
-                                let fuel_consumed = result.fuel_consumed;
-                                (guest_response_into_response(result), fuel_consumed)
-                            }
-                            Err((status, message)) => ((status, message).into_response(), None),
-                        }
+                        ),
                     }
                 }
-
-                #[cfg(not(feature = "websockets"))]
-                {
-                    if selected_target.websocket {
-                        let status = if is_websocket_upgrade_request(&headers) {
-                            StatusCode::NOT_IMPLEMENTED
-                        } else {
-                            StatusCode::UPGRADE_REQUIRED
-                        };
+            } else {
+                match select_route_target(&route, &headers) {
+                    Err(error) => (
                         (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "failed to resolve route target for `{}`: {error}",
+                                route.path
+                            ),
+                        )
+                            .into_response(),
+                        None,
+                    ),
+                    Ok(selected_target) => {
+                        #[cfg(feature = "websockets")]
+                        {
+                            if selected_target.websocket {
+                                let status = if is_websocket_upgrade_request(&headers) {
+                                    StatusCode::BAD_REQUEST
+                                } else {
+                                    StatusCode::UPGRADE_REQUIRED
+                                };
+                                match ws {
+                                    Some(upgrade) => {
+                                        let websocket_state = state.clone();
+                                        let websocket_route = route.clone();
+                                        let websocket_module = selected_target.module.clone();
+                                        let websocket_target = selected_target.module.clone();
+                                        (
+                                            upgrade
+                                                .on_upgrade(move |socket| async move {
+                                                    if let Err(error) = handle_websocket_connection(
+                                                        websocket_state,
+                                                        websocket_route,
+                                                        websocket_module,
+                                                        socket,
+                                                    )
+                                                    .await
+                                                    {
+                                                        tracing::warn!(
+                                                            target = %websocket_target,
+                                                            "WebSocket session failed: {error:#}"
+                                                        );
+                                                    }
+                                                })
+                                                .into_response(),
+                                            None,
+                                        )
+                                    }
+                                    None => (
+                                        (
+                                            status,
+                                            format!(
+                                        "route `{}` requires a valid WebSocket upgrade request",
+                                        route.path
+                                    ),
+                                        )
+                                            .into_response(),
+                                        None,
+                                    ),
+                                }
+                            } else if is_websocket_upgrade_request(&headers) {
+                                (
+                                    (
+                                        StatusCode::BAD_REQUEST,
+                                        format!(
+                                            "route `{}` is not configured for WebSocket upgrades",
+                                            route.path
+                                        ),
+                                    )
+                                        .into_response(),
+                                    None,
+                                )
+                            } else {
+                                match execute_route_with_middleware(
+                                    &state,
+                                    &runtime,
+                                    &route,
+                                    &headers,
+                                    &method,
+                                    &uri,
+                                    &body,
+                                    &trailer_fields,
+                                    hop_limit,
+                                    Some(&trace_id),
+                                    sampled_execution,
+                                    Some(selected_target.module.as_str()),
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        let fuel_consumed = result.fuel_consumed;
+                                        (guest_response_into_response(result), fuel_consumed)
+                                    }
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                }
+                            }
+                        }
+
+                        #[cfg(not(feature = "websockets"))]
+                        {
+                            if selected_target.websocket {
+                                let status = if is_websocket_upgrade_request(&headers) {
+                                    StatusCode::NOT_IMPLEMENTED
+                                } else {
+                                    StatusCode::UPGRADE_REQUIRED
+                                };
+                                (
                             (
                                 status,
                                 format!(
@@ -5419,45 +5674,49 @@ async fn faas_handler(
                                 .into_response(),
                             None,
                         )
-                    } else if is_websocket_upgrade_request(&headers) {
-                        (
-                            (
-                                StatusCode::BAD_REQUEST,
-                                format!(
-                                    "route `{}` is not configured for WebSocket upgrades",
-                                    route.path
-                                ),
-                            )
-                                .into_response(),
-                            None,
-                        )
-                    } else {
-                        match execute_route_with_middleware(
-                            &state,
-                            &runtime,
-                            &route,
-                            &headers,
-                            &method,
-                            &uri,
-                            &body,
-                            &trailer_fields,
-                            hop_limit,
-                            Some(&trace_id),
-                            sampled_execution,
-                            Some(selected_target.module.as_str()),
-                        )
-                        .await
-                        {
-                            Ok(result) => {
-                                let fuel_consumed = result.fuel_consumed;
-                                (guest_response_into_response(result), fuel_consumed)
+                            } else if is_websocket_upgrade_request(&headers) {
+                                (
+                                    (
+                                        StatusCode::BAD_REQUEST,
+                                        format!(
+                                            "route `{}` is not configured for WebSocket upgrades",
+                                            route.path
+                                        ),
+                                    )
+                                        .into_response(),
+                                    None,
+                                )
+                            } else {
+                                match execute_route_with_middleware(
+                                    &state,
+                                    &runtime,
+                                    &route,
+                                    &headers,
+                                    &method,
+                                    &uri,
+                                    &body,
+                                    &trailer_fields,
+                                    hop_limit,
+                                    Some(&trace_id),
+                                    sampled_execution,
+                                    Some(selected_target.module.as_str()),
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        let fuel_consumed = result.fuel_consumed;
+                                        (guest_response_into_response(result), fuel_consumed)
+                                    }
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                }
                             }
-                            Err((status, message)) => ((status, message).into_response(), None),
                         }
                     }
                 }
             }
-        },
+        }
     };
 
     telemetry::record_event(
@@ -5740,6 +5999,8 @@ async fn execute_route_request_with_acquired_permit(
     let task_propagated_headers = propagated_headers.clone();
     let task_request_headers = headers.clone();
     let task_host_identity = Arc::clone(&state.host_identity);
+    let task_route_overrides = Arc::clone(&state.route_overrides);
+    let task_host_load = Arc::clone(&state.host_load);
     let task_async_log_sender = state.async_log_sender.clone();
     #[cfg(feature = "ai-inference")]
     let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
@@ -5750,6 +6011,10 @@ async fn execute_route_request_with_acquired_permit(
         body: body.clone(),
         trailers: trailers.clone(),
     };
+    let _host_load_guard = HostLoadGuard::new(
+        Arc::clone(&state.host_load),
+        guest_memory_page_count(request_config.guest_memory_limit_bytes),
+    );
     let result = tokio::task::spawn_blocking(move || {
         execute_guest(
             &engine,
@@ -5768,6 +6033,8 @@ async fn execute_route_request_with_acquired_permit(
                 telemetry: telemetry_context,
                 concurrency_limits,
                 propagated_headers: task_propagated_headers,
+                route_overrides: task_route_overrides,
+                host_load: task_host_load,
                 #[cfg(feature = "ai-inference")]
                 ai_runtime: task_ai_runtime,
             },
@@ -7203,7 +7470,7 @@ fn execute_system_component_guest(
             "failed to add WASI preview2 functions to system component linker",
         )
     })?;
-    system_component_bindings::tachyon::mesh::telemetry_reader::add_to_linker::<
+    control_plane_component_bindings::tachyon::mesh::telemetry_reader::add_to_linker::<
         ComponentHostState,
         ComponentHostState,
     >(&mut linker, |state: &mut ComponentHostState| state)
@@ -7213,7 +7480,7 @@ fn execute_system_component_guest(
             "failed to add telemetry reader functions to system component linker",
         )
     })?;
-    system_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
+    control_plane_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
         ComponentHostState,
         ComponentHostState,
     >(&mut linker, |state: &mut ComponentHostState| state)
@@ -7221,6 +7488,26 @@ fn execute_system_component_guest(
         guest_execution_error(
             error,
             "failed to add scaling metrics functions to system component linker",
+        )
+    })?;
+    control_plane_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add outbound HTTP functions to system component linker",
+        )
+    })?;
+    control_plane_component_bindings::tachyon::mesh::routing_control::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add routing control functions to system component linker",
         )
     })?;
     system_component_bindings::tachyon::mesh::storage_broker::add_to_linker::<
@@ -7249,8 +7536,50 @@ fn execute_system_component_guest(
             execution.propagated_headers.clone(),
         )?,
     );
+    store.data_mut().route_overrides = Arc::clone(&execution.route_overrides);
+    store.data_mut().host_load = Arc::clone(&execution.host_load);
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
+
+    if let Ok(bindings) = control_plane_component_bindings::ControlPlaneFaas::instantiate(
+        &mut store, component, &linker,
+    ) {
+        record_wasm_start(execution.telemetry.as_ref());
+        let response = bindings.tachyon_mesh_handler().call_handle_request(
+            &mut store,
+            &control_plane_component_bindings::exports::tachyon::mesh::handler::Request {
+                method: request.method,
+                uri: request.uri,
+                headers: request.headers,
+                body: request.body.to_vec(),
+                trailers: request.trailers,
+            },
+        );
+        record_wasm_end(execution.telemetry.as_ref());
+        let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
+        let response = response.map_err(|error| {
+            guest_execution_error(
+                error,
+                "control-plane guest component `handle-request` trapped",
+            )
+        })?;
+        let status = StatusCode::from_u16(response.status).map_err(|error| {
+            ExecutionError::Internal(format!(
+                "control-plane guest component returned an invalid HTTP status code `{}`: {error}",
+                response.status
+            ))
+        })?;
+
+        return Ok(GuestExecutionOutcome {
+            output: GuestExecutionOutput::Http(GuestHttpResponse {
+                status,
+                headers: response.headers,
+                body: Bytes::from(response.body),
+                trailers: response.trailers,
+            }),
+            fuel_consumed,
+        });
+    }
 
     let bindings =
         system_component_bindings::SystemFaasGuest::instantiate(&mut store, component, &linker)
@@ -7308,6 +7637,8 @@ impl BackgroundTickRunner {
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
         host_identity: Arc<HostIdentity>,
         storage_broker: Arc<StorageBrokerManager>,
+        route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+        host_load: Arc<HostLoadCounters>,
     ) -> std::result::Result<Self, ExecutionError> {
         let module_path = resolve_guest_module_path(function_name)
             .map_err(ExecutionError::GuestModuleNotFound)?;
@@ -7338,6 +7669,16 @@ impl BackgroundTickRunner {
                 "failed to add scaling metrics functions to background component linker",
             )
         })?;
+        background_component_bindings::tachyon::mesh::telemetry_reader::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(&mut linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to add telemetry reader functions to background component linker",
+            )
+        })?;
         background_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
             ComponentHostState,
             ComponentHostState,
@@ -7346,6 +7687,16 @@ impl BackgroundTickRunner {
             guest_execution_error(
                 error,
                 "failed to add outbound HTTP functions to background component linker",
+            )
+        })?;
+        background_component_bindings::tachyon::mesh::routing_control::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(&mut linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to add routing control functions to background component linker",
             )
         })?;
 
@@ -7364,23 +7715,34 @@ impl BackgroundTickRunner {
                 Vec::new(),
             )?,
         );
+        store.data_mut().route_overrides = route_overrides;
+        store.data_mut().host_load = host_load;
         store.limiter(|state| &mut state.limits);
         store
             .set_fuel(config.guest_fuel_budget)
             .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
 
-        let bindings = background_component_bindings::BackgroundSystemFaas::instantiate(
-            &mut store, &component, &linker,
-        )
-        .map_err(|error| {
-            guest_execution_error(
-                error,
-                format!(
-                    "failed to instantiate background system component from {}",
-                    module_path.display()
-                ),
+        let bindings = if let Ok(bindings) =
+            control_plane_component_bindings::ControlPlaneFaas::instantiate(
+                &mut store, &component, &linker,
+            ) {
+            BackgroundGuestBindings::ControlPlane(bindings)
+        } else {
+            BackgroundGuestBindings::Background(
+                background_component_bindings::BackgroundSystemFaas::instantiate(
+                    &mut store, &component, &linker,
+                )
+                .map_err(|error| {
+                    guest_execution_error(
+                        error,
+                        format!(
+                            "failed to instantiate background system component from {}",
+                            module_path.display()
+                        ),
+                    )
+                })?,
             )
-        })?;
+        };
 
         Ok(Self {
             function_name: function_name.to_owned(),
@@ -7391,11 +7753,18 @@ impl BackgroundTickRunner {
     }
 
     fn tick(&mut self) -> std::result::Result<(), ExecutionError> {
-        self.bindings
-            .call_on_tick(&mut self.store)
-            .map_err(|error| {
-                guest_execution_error(error, "background system guest `on-tick` trapped")
-            })
+        match &self.bindings {
+            BackgroundGuestBindings::Background(bindings) => {
+                bindings.call_on_tick(&mut self.store).map_err(|error| {
+                    guest_execution_error(error, "background system guest `on-tick` trapped")
+                })
+            }
+            BackgroundGuestBindings::ControlPlane(bindings) => {
+                bindings.call_on_tick(&mut self.store).map_err(|error| {
+                    guest_execution_error(error, "control-plane system guest `on-tick` trapped")
+                })
+            }
+        }
     }
 }
 
@@ -9426,6 +9795,8 @@ impl ComponentHostState {
             telemetry,
             concurrency_limits,
             propagated_headers,
+            route_overrides: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            host_load: Arc::new(HostLoadCounters::default()),
             outbound_http_client: reqwest::blocking::Client::new(),
             #[cfg(feature = "ai-inference")]
             ai_runtime: None,
@@ -9494,6 +9865,105 @@ impl ComponentHostState {
             .ok_or_else(|| "AI inference runtime is unavailable for this component".to_owned())?
             .compute_component_prompt(&loaded.alias, &prompt)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ControlPlaneSnapshot {
+    cpu_pressure: u8,
+    ram_pressure: u8,
+    active_tasks: u32,
+    active_instances: u32,
+    allocated_memory_pages: u32,
+}
+
+fn guest_memory_page_count(bytes: usize) -> usize {
+    ((bytes.saturating_add(65_535)) / 65_536).max(1)
+}
+
+fn saturating_percent(value: usize, capacity: usize) -> u8 {
+    if capacity == 0 {
+        return 0;
+    }
+
+    let percent = value.saturating_mul(100) / capacity;
+    percent.min(100) as u8
+}
+
+fn control_plane_snapshot(
+    telemetry: &TelemetryHandle,
+    host_load: &HostLoadCounters,
+    concurrency_limits: &HashMap<String, Arc<RouteExecutionControl>>,
+    runtime_config: &IntegrityConfig,
+) -> ControlPlaneSnapshot {
+    let active_tasks = telemetry::active_requests(telemetry).min(u32::MAX as usize) as u32;
+    let active_instances = host_load.active_instances.load(Ordering::SeqCst);
+    let allocated_memory_pages = host_load.allocated_memory_pages.load(Ordering::SeqCst);
+    let total_capacity = concurrency_limits
+        .values()
+        .map(|control| control.max_concurrency as usize)
+        .sum::<usize>()
+        .max(1);
+    let total_memory_pages = total_capacity
+        .saturating_mul(guest_memory_page_count(
+            runtime_config.guest_memory_limit_bytes,
+        ))
+        .max(1);
+
+    ControlPlaneSnapshot {
+        cpu_pressure: saturating_percent(
+            active_instances.max(active_tasks as usize),
+            total_capacity,
+        ),
+        ram_pressure: saturating_percent(allocated_memory_pages, total_memory_pages),
+        active_tasks,
+        active_instances: active_instances.min(u32::MAX as usize) as u32,
+        allocated_memory_pages: allocated_memory_pages.min(u32::MAX as usize) as u32,
+    }
+}
+
+fn control_plane_override_destination(
+    route_overrides: &ArcSwap<HashMap<String, String>>,
+    route_path: &str,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if headers.contains_key(TACHYON_BUFFER_REPLAY_HEADER) {
+        return None;
+    }
+
+    route_overrides
+        .load()
+        .get(&normalize_route_path(route_path))
+        .cloned()
+}
+
+fn update_control_plane_route_override(
+    route_overrides: &ArcSwap<HashMap<String, String>>,
+    route_path: &str,
+    destination: &str,
+) -> std::result::Result<(), String> {
+    let normalized_route = normalize_route_path(route_path);
+    let normalized_destination = destination.trim();
+    if normalized_destination.is_empty() {
+        return Err("route override destinations must not be empty".to_owned());
+    }
+
+    if !normalized_destination.starts_with('/')
+        && !normalized_destination.starts_with("http://")
+        && !normalized_destination.starts_with("https://")
+    {
+        return Err(format!(
+            "route override `{normalized_destination}` must be an absolute route or URL"
+        ));
+    }
+
+    let mut next = (**route_overrides.load()).clone();
+    if normalized_destination == normalized_route {
+        next.remove(&normalized_route);
+    } else {
+        next.insert(normalized_route, normalized_destination.to_owned());
+    }
+    route_overrides.store(Arc::new(next));
+    Ok(())
 }
 
 fn build_component_wasi_ctx(
@@ -9819,12 +10289,22 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             total_wasm_duration_us,
             total_host_overhead_us,
         } = telemetry::snapshot(&self.telemetry);
+        let control_plane = control_plane_snapshot(
+            &self.telemetry,
+            self.host_load.as_ref(),
+            self.concurrency_limits.as_ref(),
+            &self.runtime_config,
+        );
 
         system_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
             total_requests,
             completed_requests,
             error_requests,
             active_requests,
+            cpu_pressure: control_plane.cpu_pressure,
+            ram_pressure: control_plane.ram_pressure,
+            active_instances: control_plane.active_instances,
+            allocated_memory_pages: control_plane.allocated_memory_pages,
             dropped_events,
             last_status,
             total_duration_us,
@@ -9834,7 +10314,67 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
     }
 }
 
+impl control_plane_component_bindings::tachyon::mesh::telemetry_reader::Host
+    for ComponentHostState
+{
+    fn get_metrics(
+        &mut self,
+    ) -> control_plane_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
+        let snapshot =
+            <Self as system_component_bindings::tachyon::mesh::telemetry_reader::Host>::get_metrics(
+                self,
+            );
+        control_plane_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
+            total_requests: snapshot.total_requests,
+            completed_requests: snapshot.completed_requests,
+            error_requests: snapshot.error_requests,
+            active_requests: snapshot.active_requests,
+            cpu_pressure: snapshot.cpu_pressure,
+            ram_pressure: snapshot.ram_pressure,
+            active_instances: snapshot.active_instances,
+            allocated_memory_pages: snapshot.allocated_memory_pages,
+            dropped_events: snapshot.dropped_events,
+            last_status: snapshot.last_status,
+            total_duration_us: snapshot.total_duration_us,
+            total_wasm_duration_us: snapshot.total_wasm_duration_us,
+            total_host_overhead_us: snapshot.total_host_overhead_us,
+        }
+    }
+}
+
+impl background_component_bindings::tachyon::mesh::telemetry_reader::Host for ComponentHostState {
+    fn get_metrics(
+        &mut self,
+    ) -> background_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
+        let snapshot =
+            <Self as system_component_bindings::tachyon::mesh::telemetry_reader::Host>::get_metrics(
+                self,
+            );
+        background_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
+            total_requests: snapshot.total_requests,
+            completed_requests: snapshot.completed_requests,
+            error_requests: snapshot.error_requests,
+            active_requests: snapshot.active_requests,
+            cpu_pressure: snapshot.cpu_pressure,
+            ram_pressure: snapshot.ram_pressure,
+            active_instances: snapshot.active_instances,
+            allocated_memory_pages: snapshot.allocated_memory_pages,
+            dropped_events: snapshot.dropped_events,
+            last_status: snapshot.last_status,
+            total_duration_us: snapshot.total_duration_us,
+            total_wasm_duration_us: snapshot.total_wasm_duration_us,
+            total_host_overhead_us: snapshot.total_host_overhead_us,
+        }
+    }
+}
+
 impl system_component_bindings::tachyon::mesh::scaling_metrics::Host for ComponentHostState {
+    fn get_pending_queue_size(&mut self, route_path: String) -> u32 {
+        self.pending_queue_size(&route_path)
+    }
+}
+
+impl control_plane_component_bindings::tachyon::mesh::scaling_metrics::Host for ComponentHostState {
     fn get_pending_queue_size(&mut self, route_path: String) -> u32 {
         self.pending_queue_size(&route_path)
     }
@@ -9908,6 +10448,34 @@ impl background_component_bindings::tachyon::mesh::scaling_metrics::Host for Com
     }
 }
 
+impl control_plane_component_bindings::tachyon::mesh::routing_control::Host for ComponentHostState {
+    fn update_target(
+        &mut self,
+        route_path: String,
+        destination: String,
+    ) -> std::result::Result<(), String> {
+        update_control_plane_route_override(
+            self.route_overrides.as_ref(),
+            &route_path,
+            &destination,
+        )
+    }
+}
+
+impl background_component_bindings::tachyon::mesh::routing_control::Host for ComponentHostState {
+    fn update_target(
+        &mut self,
+        route_path: String,
+        destination: String,
+    ) -> std::result::Result<(), String> {
+        update_control_plane_route_override(
+            self.route_overrides.as_ref(),
+            &route_path,
+            &destination,
+        )
+    }
+}
+
 impl background_component_bindings::tachyon::mesh::outbound_http::Host for ComponentHostState {
     fn send_request(
         &mut self,
@@ -9964,6 +10532,31 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
                 status,
                 headers: response_headers,
                 body,
+            },
+        )
+    }
+}
+
+impl control_plane_component_bindings::tachyon::mesh::outbound_http::Host for ComponentHostState {
+    fn send_request(
+        &mut self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> std::result::Result<
+        control_plane_component_bindings::tachyon::mesh::outbound_http::Response,
+        String,
+    > {
+        let response =
+            <Self as background_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
+                self, method, url, headers, body,
+            )?;
+        Ok(
+            control_plane_component_bindings::tachyon::mesh::outbound_http::Response {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
             },
         )
     }
@@ -10328,6 +10921,14 @@ mod tests {
         disconnected_log_sender()
     }
 
+    fn test_route_overrides() -> Arc<ArcSwap<HashMap<String, String>>> {
+        Arc::new(ArcSwap::from_pointee(HashMap::new()))
+    }
+
+    fn test_host_load() -> Arc<HostLoadCounters> {
+        Arc::new(HostLoadCounters::default())
+    }
+
     fn build_test_engine(config: &IntegrityConfig) -> Engine {
         build_engine(config, false).expect("engine should be created")
     }
@@ -10547,6 +11148,8 @@ mod tests {
             core_store,
             buffered_requests,
             volume_manager: Arc::new(VolumeManager::default()),
+            route_overrides: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            host_load: Arc::new(HostLoadCounters::default()),
             telemetry,
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             manifest_path,
@@ -11053,6 +11656,31 @@ mod tests {
         }
     }
 
+    fn system_targeted_route(path: &str, module: &str) -> IntegrityRoute {
+        let mut route = IntegrityRoute::system(path);
+        route.targets = vec![weighted_target(module, 100)];
+        route
+    }
+
+    fn route_env(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn mounted_volume(host_path: &Path, guest_path: &str) -> IntegrityVolume {
+        IntegrityVolume {
+            volume_type: VolumeType::Host,
+            host_path: host_path.display().to_string(),
+            guest_path: guest_path.to_owned(),
+            readonly: false,
+            ttl_seconds: None,
+            idle_timeout: None,
+            eviction_policy: None,
+        }
+    }
+
     fn unique_test_dir(prefix: &str) -> PathBuf {
         let short_prefix: String = prefix
             .chars()
@@ -11448,6 +12076,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                route_overrides: test_route_overrides(),
+                host_load: test_host_load(),
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
             },
@@ -11492,6 +12122,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                route_overrides: test_route_overrides(),
+                host_load: test_host_load(),
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
             },
@@ -11537,6 +12169,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                route_overrides: test_route_overrides(),
+                host_load: test_host_load(),
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
             },
@@ -11592,6 +12226,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                route_overrides: test_route_overrides(),
+                host_load: test_host_load(),
                 ai_runtime,
             },
         )
@@ -11644,6 +12280,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
                 propagated_headers: Vec::new(),
+                route_overrides: test_route_overrides(),
+                host_load: test_host_load(),
                 #[cfg(feature = "ai-inference")]
                 ai_runtime: Arc::clone(&ai_runtime),
             },
@@ -11677,6 +12315,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
                 propagated_headers: Vec::new(),
+                route_overrides: test_route_overrides(),
+                host_load: test_host_load(),
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
             },
@@ -11924,6 +12564,8 @@ mod tests {
             telemetry: None,
             concurrency_limits: build_concurrency_limits(&config),
             propagated_headers: Vec::new(),
+            route_overrides: test_route_overrides(),
+            host_load: test_host_load(),
             #[cfg(feature = "ai-inference")]
             ai_runtime: test_ai_runtime(&config),
         };
@@ -11953,6 +12595,8 @@ mod tests {
             telemetry: None,
             concurrency_limits: build_concurrency_limits(&config),
             propagated_headers: Vec::new(),
+            route_overrides: test_route_overrides(),
+            host_load: test_host_load(),
             #[cfg(feature = "ai-inference")]
             ai_runtime: test_ai_runtime(&config),
         };
@@ -12089,6 +12733,8 @@ mod tests {
             core_store,
             buffered_requests,
             volume_manager: Arc::new(VolumeManager::default()),
+            route_overrides: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            host_load: Arc::new(HostLoadCounters::default()),
             telemetry: telemetry::init_test_telemetry(),
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             manifest_path: core_store_manifest,
@@ -12170,6 +12816,8 @@ mod tests {
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
+                route_overrides: test_route_overrides(),
+                host_load: test_host_load(),
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
             },
@@ -12310,6 +12958,8 @@ mod tests {
                 concurrency_limits,
                 test_host_identity(35),
                 Arc::new(StorageBrokerManager::default()),
+                test_route_overrides(),
+                test_host_load(),
             )
             .expect("background scaler should instantiate");
 
@@ -12430,6 +13080,8 @@ mod tests {
                 build_concurrency_limits(&config),
                 test_host_identity(36),
                 Arc::new(StorageBrokerManager::default()),
+                test_route_overrides(),
+                test_host_load(),
             )
             .expect("SQS connector should instantiate");
             runner.tick().expect("SQS connector tick should succeed");
@@ -12547,6 +13199,8 @@ mod tests {
                 build_concurrency_limits(&config),
                 test_host_identity(37),
                 Arc::new(StorageBrokerManager::default()),
+                test_route_overrides(),
+                test_host_load(),
             )
             .expect("SQS connector should instantiate");
             runner.tick().expect("SQS connector tick should succeed");
@@ -15325,6 +15979,278 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_plane_gossip_redirects_requests_to_a_healthier_peer() {
+        use axum::{
+            body::Bytes as AxumBytes,
+            extract::State,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct PeerCapture {
+            bodies: Vec<String>,
+        }
+
+        async fn gossip_status() -> impl IntoResponse {
+            Json(json!({
+                "total_requests": 0_u64,
+                "completed_requests": 0_u64,
+                "error_requests": 0_u64,
+                "active_requests": 0_u32,
+                "cpu_pressure": 15_u8,
+                "ram_pressure": 10_u8,
+                "active_instances": 1_u32,
+                "allocated_memory_pages": 1_u32,
+                "dropped_events": 0_u64,
+                "last_status": 200_u16,
+                "total_duration_us": 0_u64,
+                "total_wasm_duration_us": 0_u64,
+                "total_host_overhead_us": 0_u64
+            }))
+        }
+
+        async fn peer_target(
+            State(state): State<Arc<Mutex<PeerCapture>>>,
+            body: AxumBytes,
+        ) -> impl IntoResponse {
+            state
+                .lock()
+                .expect("peer capture should not be poisoned")
+                .bodies
+                .push(String::from_utf8_lossy(&body).to_string());
+            (StatusCode::OK, "peer-ok")
+        }
+
+        let peer_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let peer_app = Router::new()
+            .route("/system/gossip", get(gossip_status))
+            .route("/api/guest-example", post(peer_target))
+            .with_state(Arc::clone(&peer_capture));
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let peer_address = peer_listener
+            .local_addr()
+            .expect("peer listener should expose an address");
+        let peer_server = tokio::spawn(async move {
+            axum::serve(peer_listener, peer_app)
+                .await
+                .expect("peer app should stay up");
+        });
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+
+        let mut gossip_route = system_targeted_route("/system/gossip", "gossip");
+        let peer_urls = format!("http://{peer_address}");
+        gossip_route.env = route_env(&[
+            ("STEER_ROUTE", "/api/guest-example"),
+            ("PEER_URLS", peer_urls.as_str()),
+            ("SOFT_LIMIT", "70"),
+            ("RECOVER_LIMIT", "50"),
+            ("SATURATED_LIMIT", "95"),
+            ("BUFFER_ROUTE", "/system/buffer"),
+        ]);
+        let config = IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![
+                targeted_route(
+                    "/api/guest-example",
+                    vec![weighted_target("guest-example", 100)],
+                ),
+                gossip_route.clone(),
+            ],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+        state
+            .host_load
+            .active_instances
+            .store(200, Ordering::SeqCst);
+        let host_app = build_app(state.clone());
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        tokio::task::spawn_blocking({
+            let config = config.clone();
+            let route_overrides = Arc::clone(&state.route_overrides);
+            let host_load = Arc::clone(&state.host_load);
+            let storage_broker = Arc::clone(&state.storage_broker);
+            let telemetry = state.telemetry.clone();
+            let host_identity = Arc::clone(&state.host_identity);
+            move || {
+                let engine = build_test_metered_engine(&config);
+                let mut runner = BackgroundTickRunner::new(
+                    &engine,
+                    &config,
+                    config
+                        .sealed_route("/system/gossip")
+                        .expect("gossip route should be sealed"),
+                    "gossip",
+                    telemetry,
+                    build_concurrency_limits(&config),
+                    host_identity,
+                    storage_broker,
+                    route_overrides,
+                    host_load,
+                )
+                .expect("gossip component should instantiate");
+                runner.tick().expect("gossip tick should succeed");
+            }
+        })
+        .await
+        .expect("gossip task should complete");
+
+        let override_target = state
+            .route_overrides
+            .load()
+            .get("/api/guest-example")
+            .cloned()
+            .expect("gossip should install a route override");
+        assert_eq!(
+            override_target,
+            format!("http://{peer_address}/api/guest-example")
+        );
+
+        let response = Client::new()
+            .post(format!("http://{host_address}/api/guest-example"))
+            .body("overflow-request")
+            .send()
+            .await
+            .expect("host request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("response body should decode"),
+            "peer-ok"
+        );
+
+        let captured = peer_capture
+            .lock()
+            .expect("peer capture should not be poisoned");
+        assert_eq!(captured.bodies, vec!["overflow-request".to_owned()]);
+
+        host_server.abort();
+        peer_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_plane_buffer_persists_and_replays_requests_when_capacity_returns() {
+        let queue_dir = unique_test_dir("tachyon-buffer-queue");
+        let state_dir = unique_test_dir("tachyon-buffer-state");
+        fs::create_dir_all(&queue_dir).expect("buffer queue dir should create");
+        fs::create_dir_all(&state_dir).expect("buffer state dir should create");
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+
+        let mut buffer_route = system_targeted_route("/system/buffer", "buffer");
+        buffer_route.env = route_env(&[
+            ("BUFFER_DIR", "/buffer"),
+            ("RAM_QUEUE_CAPACITY", "1"),
+            ("REPLAY_CPU_LIMIT", "70"),
+            ("REPLAY_RAM_LIMIT", "70"),
+            ("REPLAY_BATCH_SIZE", "4"),
+        ]);
+        buffer_route.volumes = vec![mounted_volume(&queue_dir, "/buffer")];
+
+        let mut user_route = targeted_route(
+            "/api/guest-volume",
+            vec![weighted_target("guest-volume", 100)],
+        );
+        user_route.volumes = vec![mounted_volume(&state_dir, "/app/data")];
+        let config = IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![user_route.clone(), buffer_route.clone()],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+        update_control_plane_route_override(
+            state.route_overrides.as_ref(),
+            "/api/guest-volume",
+            "/system/buffer",
+        )
+        .expect("buffer override should install");
+
+        let host_app = build_app(state.clone());
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        let response = Client::new()
+            .post(format!("http://{host_address}/api/guest-volume"))
+            .body("buffered payload")
+            .send()
+            .await
+            .expect("buffered request should succeed");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let queued_files = fs::read_dir(queue_dir.join("ram"))
+            .expect("ram queue should exist")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(queued_files, 1);
+
+        tokio::task::spawn_blocking({
+            let config = config.clone();
+            let route_overrides = Arc::clone(&state.route_overrides);
+            let host_load = Arc::clone(&state.host_load);
+            let storage_broker = Arc::clone(&state.storage_broker);
+            let telemetry = state.telemetry.clone();
+            let host_identity = Arc::clone(&state.host_identity);
+            move || {
+                let engine = build_test_metered_engine(&config);
+                let mut runner = BackgroundTickRunner::new(
+                    &engine,
+                    &config,
+                    config
+                        .sealed_route("/system/buffer")
+                        .expect("buffer route should be sealed"),
+                    "buffer",
+                    telemetry,
+                    build_concurrency_limits(&config),
+                    host_identity,
+                    storage_broker,
+                    route_overrides,
+                    host_load,
+                )
+                .expect("buffer component should instantiate");
+                runner.tick().expect("buffer tick should succeed");
+            }
+        })
+        .await
+        .expect("buffer replay task should complete");
+
+        let persisted = fs::read_to_string(state_dir.join("state.txt"))
+            .expect("guest-volume should persist replayed payload");
+        assert_eq!(persisted, "buffered payload");
+
+        let remaining = fs::read_dir(queue_dir.join("ram"))
+            .expect("ram queue should still exist")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(remaining, 0);
+
+        host_server.abort();
     }
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
