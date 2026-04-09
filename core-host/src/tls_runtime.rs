@@ -169,6 +169,7 @@ impl TlsManager {
         let host_identity = Arc::clone(&state.host_identity);
         let storage_broker = Arc::clone(&state.storage_broker);
         let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+        let async_log_sender = state.async_log_sender.clone();
         #[cfg(feature = "ai-inference")]
         let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
@@ -182,6 +183,7 @@ impl TlsManager {
                     config,
                     sampled_execution: false,
                     runtime_telemetry,
+                    async_log_sender,
                     secret_access,
                     request_headers,
                     host_identity,
