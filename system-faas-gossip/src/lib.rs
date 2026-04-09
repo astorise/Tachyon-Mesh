@@ -99,6 +99,8 @@ fn evaluate_cluster_pressure() -> Result<(), String> {
                 destination: format!("{}{}", candidate.base_url, steer_route),
                 hot_models: candidate.snapshot.hot_models.clone(),
                 effective_pressure: candidate.snapshot.effective_pressure(),
+                capability_mask: candidate.snapshot.capability_mask,
+                capabilities: candidate.snapshot.capabilities.clone(),
             })
             .collect(),
     })
@@ -145,6 +147,8 @@ fn local_snapshot() -> TelemetrySnapshot {
         ram_pressure: snapshot.ram_pressure,
         active_instances: snapshot.active_instances,
         allocated_memory_pages: snapshot.allocated_memory_pages,
+        capability_mask: snapshot.capability_mask,
+        capabilities: snapshot.capabilities,
         hot_models: snapshot.hot_models,
         dropped_events: snapshot.dropped_events,
         last_status: snapshot.last_status,
@@ -319,6 +323,8 @@ struct RouteOverrideCandidate {
     destination: String,
     hot_models: Vec<String>,
     effective_pressure: u8,
+    capability_mask: u64,
+    capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -331,6 +337,10 @@ struct TelemetrySnapshot {
     ram_pressure: u8,
     active_instances: u32,
     allocated_memory_pages: u32,
+    #[serde(default)]
+    capability_mask: u64,
+    #[serde(default)]
+    capabilities: Vec<String>,
     #[serde(default)]
     hot_models: Vec<String>,
     dropped_events: u64,
@@ -360,6 +370,8 @@ mod tests {
             ram_pressure: ram,
             active_instances: 0,
             allocated_memory_pages: 0,
+            capability_mask: 0,
+            capabilities: Vec::new(),
             hot_models: Vec::new(),
             dropped_events: 0,
             last_status: 0,
@@ -423,5 +435,41 @@ mod tests {
         assert_eq!(ordered.len(), 3);
         assert_eq!(ordered[0].base_url, "http://node-b");
         assert!(ordered.iter().any(|peer| peer.base_url == "http://node-c"));
+    }
+
+    #[test]
+    fn route_override_candidates_carry_capability_metadata() {
+        let snapshot = TelemetrySnapshot {
+            total_requests: 0,
+            completed_requests: 0,
+            error_requests: 0,
+            active_requests: 1,
+            cpu_pressure: 15,
+            ram_pressure: 10,
+            active_instances: 1,
+            allocated_memory_pages: 1,
+            capability_mask: 5,
+            capabilities: vec!["core:wasi".to_owned(), "accel:cuda".to_owned()],
+            hot_models: vec!["llama3".to_owned()],
+            dropped_events: 0,
+            last_status: 200,
+            total_duration_us: 0,
+            total_wasm_duration_us: 0,
+            total_host_overhead_us: 0,
+        };
+        let descriptor = RouteOverrideDescriptor {
+            candidates: vec![RouteOverrideCandidate {
+                destination: "http://node-a/api/guest-ai".to_owned(),
+                hot_models: snapshot.hot_models.clone(),
+                effective_pressure: snapshot.effective_pressure(),
+                capability_mask: snapshot.capability_mask,
+                capabilities: snapshot.capabilities.clone(),
+            }],
+        };
+
+        let encoded = serde_json::to_value(descriptor).expect("descriptor should serialize");
+        assert_eq!(encoded["candidates"][0]["capability_mask"], 5);
+        assert_eq!(encoded["candidates"][0]["capabilities"][0], "core:wasi");
+        assert_eq!(encoded["candidates"][0]["capabilities"][1], "accel:cuda");
     }
 }

@@ -89,6 +89,8 @@ pub struct RouteTarget {
     pub websocket: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_header: Option<HeaderMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1497,6 +1499,60 @@ fn insert_route_target(route: &mut SealedRoute, target: RouteTarget) {
     route.targets.push(target);
 }
 
+fn normalize_route_capabilities(capabilities: Vec<String>, context: &str) -> Result<Vec<String>> {
+    let mut normalized = BTreeSet::new();
+    let source = if capabilities.is_empty() {
+        vec!["core:wasi".to_owned()]
+    } else {
+        capabilities
+    };
+    for capability in source {
+        let trimmed = capability.trim();
+        if trimmed.is_empty() {
+            bail!("{context} must not contain empty capabilities");
+        }
+        let canonical = trimmed.to_ascii_lowercase();
+        if !matches!(
+            canonical.as_str(),
+            "core:wasi"
+                | "legacy:oci"
+                | "accel:cuda"
+                | "accel:openvino"
+                | "accel:tpu"
+                | "net:layer4"
+                | "feature:websockets"
+                | "feature:http3"
+                | "feature:ai-inference"
+                | "os:linux"
+                | "os:windows"
+        ) {
+            bail!("{context} declares unsupported capability `{canonical}`");
+        }
+        normalized.insert(canonical);
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
+    Ok(RouteTarget {
+        module: normalize_target_module(&target.module)?,
+        weight: target.weight,
+        websocket: target.websocket,
+        match_header: target.match_header,
+        requires: normalize_route_capabilities(
+            target.requires,
+            &format!("route target `{}` capabilities", target.module),
+        )?,
+    })
+}
+
+fn normalize_route_targets(targets: Vec<RouteTarget>) -> Result<Vec<RouteTarget>> {
+    targets
+        .into_iter()
+        .map(normalize_route_target)
+        .collect::<Result<Vec<_>>>()
+}
+
 fn insert_route_dependency(
     route: &mut SealedRoute,
     dependency: String,
@@ -1518,6 +1574,9 @@ fn insert_route_dependency(
 }
 
 fn finalize_route(route: SealedRoute) -> Result<SealedRoute> {
+    let mut route = route;
+    route.targets = normalize_route_targets(route.targets)?;
+
     if route.targets.is_empty() && resolve_function_name(&route.path).is_none() {
         bail!(
             "route `{}` does not resolve to a guest function name and must define at least one `--route-target`",
@@ -1685,7 +1744,7 @@ fn parse_secret_route(value: &str) -> Result<(String, Vec<String>)> {
 
 fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
     let (path, target) = value.split_once('=').context(
-        "route targets must use the `/path=MODULE[,weight=80][,header=X-Cohort=beta][,websocket=true]` syntax",
+        "route targets must use the `/path=MODULE[,weight=80][,header=X-Cohort=beta][,websocket=true][,requires=core:wasi+net:layer4]` syntax",
     )?;
 
     let path = path.trim();
@@ -1702,6 +1761,7 @@ fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
     let mut weight = None;
     let mut websocket = None;
     let mut match_header = None;
+    let mut requires = None;
 
     for segment in segments {
         if segment.is_empty() {
@@ -1742,8 +1802,25 @@ fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
             continue;
         }
 
+        if let Some(raw_requires) = segment.strip_prefix("requires=") {
+            if requires.is_some() {
+                bail!("route target `{value}` defines `requires` more than once");
+            }
+            let parsed = raw_requires
+                .split('+')
+                .map(str::trim)
+                .filter(|capability| !capability.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            requires = Some(normalize_route_capabilities(
+                parsed,
+                &format!("route target `{value}` capabilities"),
+            )?);
+            continue;
+        }
+
         bail!(
-            "unsupported route target option `{segment}`; expected `weight=`, `header=` or `websocket=`"
+            "unsupported route target option `{segment}`; expected `weight=`, `header=`, `websocket=` or `requires=`"
         );
     }
 
@@ -1754,6 +1831,7 @@ fn parse_route_target(value: &str) -> Result<(String, RouteTarget)> {
             weight: weight.unwrap_or_else(|| u32::from(match_header.is_none()) * 100),
             websocket: websocket.unwrap_or(false),
             match_header,
+            requires: requires.unwrap_or_else(|| vec!["core:wasi".to_owned()]),
         },
     ))
 }
@@ -2634,12 +2712,14 @@ mod tests {
                         weight: 90,
                         websocket: false,
                         match_header: None,
+                        requires: vec!["core:wasi".to_owned()],
                     },
                     RouteTarget {
                         module: "checkout-v2".to_owned(),
                         weight: 10,
                         websocket: false,
                         match_header: None,
+                        requires: vec!["core:wasi".to_owned()],
                     },
                     RouteTarget {
                         module: "checkout-beta".to_owned(),
@@ -2649,6 +2729,7 @@ mod tests {
                             name: "x-cohort".to_owned(),
                             value: "beta".to_owned(),
                         }),
+                        requires: vec!["core:wasi".to_owned()],
                     },
                 ],
                 resiliency: None,
@@ -2684,7 +2765,32 @@ mod tests {
                 weight: 100,
                 websocket: true,
                 match_header: None,
+                requires: vec!["core:wasi".to_owned()],
             }]
+        );
+    }
+
+    #[test]
+    fn normalize_routes_accepts_capability_requirements_on_targets() {
+        let routes = normalize_routes(
+            vec!["/api/guest-ai".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            vec!["/api/guest-ai=guest-ai,requires=core:wasi+accel:cuda".to_owned()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("capability constrained targets should normalize");
+
+        assert_eq!(
+            routes[0].targets[0].requires,
+            vec!["accel:cuda".to_owned(), "core:wasi".to_owned()]
         );
     }
 
