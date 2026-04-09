@@ -7,3 +7,8 @@ The router SHALL consider hot-model state as a first-class placement signal so l
 - **WHEN** the router evaluates overflow candidates for a latency-sensitive model invocation
 - **THEN** it keeps the request local or selects only peers that already have the target model loaded
 - **AND** avoids sending that request to peers that would need a cold model load
+
+#### Scenario: A matching hot peer exists even if a colder peer looks less busy
+- **WHEN** the router evaluates model-aware overflow candidates for a request that names a specific model alias
+- **THEN** it prefers peers whose advertised hot-model list contains that alias
+- **AND** only forwards to a lower-pressure peer when that peer is also hot for the requested model

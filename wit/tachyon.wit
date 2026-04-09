@@ -56,6 +56,7 @@ interface telemetry-reader {
         ram-pressure: u8,
         active-instances: u32,
         allocated-memory-pages: u32,
+        hot-models: list<string>,
         dropped-events: u64,
         last-status: u16,
         total-duration-us: u64,

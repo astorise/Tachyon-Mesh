@@ -83,7 +83,8 @@ fn evaluate_cluster_pressure() -> Result<(), String> {
         return Ok(());
     }
 
-    let Some(choice) = power_of_two_choices(&healthy_peers) else {
+    let ordered_candidates = ordered_candidates(&healthy_peers);
+    let Some(choice) = ordered_candidates.first() else {
         return Ok(());
     };
 
@@ -91,10 +92,19 @@ fn evaluate_cluster_pressure() -> Result<(), String> {
         return Ok(());
     }
 
-    bindings::tachyon::mesh::routing_control::update_target(
-        &steer_route,
-        &format!("{}{}", choice.base_url, steer_route),
-    )
+    let payload = serde_json::to_string(&RouteOverrideDescriptor {
+        candidates: ordered_candidates
+            .iter()
+            .map(|candidate| RouteOverrideCandidate {
+                destination: format!("{}{}", candidate.base_url, steer_route),
+                hot_models: candidate.snapshot.hot_models.clone(),
+                effective_pressure: candidate.snapshot.effective_pressure(),
+            })
+            .collect(),
+    })
+    .map_err(|error| format!("failed to encode route override descriptor: {error}"))?;
+
+    bindings::tachyon::mesh::routing_control::update_target(&steer_route, &payload)
 }
 
 fn fetch_peer_snapshots() -> Result<Vec<PeerCandidate>, String> {
@@ -135,6 +145,7 @@ fn local_snapshot() -> TelemetrySnapshot {
         ram_pressure: snapshot.ram_pressure,
         active_instances: snapshot.active_instances,
         allocated_memory_pages: snapshot.allocated_memory_pages,
+        hot_models: snapshot.hot_models,
         dropped_events: snapshot.dropped_events,
         last_status: snapshot.last_status,
         total_duration_us: snapshot.total_duration_us,
@@ -155,6 +166,32 @@ fn power_of_two_choices(peers: &[PeerCandidate]) -> Option<&PeerCandidate> {
     let first = &peers[seed % peers.len()];
     let second = &peers[(seed + 1) % peers.len()];
     Some(prefer_healthier_peer(first, second))
+}
+
+fn ordered_candidates(peers: &[PeerCandidate]) -> Vec<&PeerCandidate> {
+    let mut ordered = Vec::new();
+    if let Some(choice) = power_of_two_choices(peers) {
+        ordered.push(choice);
+    }
+
+    let mut remaining = peers.iter().collect::<Vec<_>>();
+    remaining.retain(|peer| {
+        ordered
+            .iter()
+            .all(|selected| selected.base_url != peer.base_url)
+    });
+    remaining.sort_by(|left, right| {
+        left.snapshot
+            .effective_pressure()
+            .cmp(&right.snapshot.effective_pressure())
+            .then_with(|| {
+                left.snapshot
+                    .active_requests
+                    .cmp(&right.snapshot.active_requests)
+            })
+    });
+    ordered.extend(remaining);
+    ordered
 }
 
 fn prefer_healthier_peer<'a>(
@@ -272,6 +309,18 @@ struct PeerCandidate {
     snapshot: TelemetrySnapshot,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct RouteOverrideDescriptor {
+    candidates: Vec<RouteOverrideCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RouteOverrideCandidate {
+    destination: String,
+    hot_models: Vec<String>,
+    effective_pressure: u8,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct TelemetrySnapshot {
     total_requests: u64,
@@ -282,6 +331,8 @@ struct TelemetrySnapshot {
     ram_pressure: u8,
     active_instances: u32,
     allocated_memory_pages: u32,
+    #[serde(default)]
+    hot_models: Vec<String>,
     dropped_events: u64,
     last_status: u16,
     total_duration_us: u64,
@@ -309,6 +360,7 @@ mod tests {
             ram_pressure: ram,
             active_instances: 0,
             allocated_memory_pages: 0,
+            hot_models: Vec::new(),
             dropped_events: 0,
             last_status: 0,
             total_duration_us: 0,
@@ -347,5 +399,29 @@ mod tests {
 
         let choice = power_of_two_choices(&peers).expect("a peer should be selected");
         assert_eq!(choice.base_url, "http://node-b");
+    }
+
+    #[test]
+    fn ordered_candidates_puts_p2c_winner_first_and_preserves_other_peers() {
+        TICK_COUNTER.store(0, Ordering::Relaxed);
+        let peers = vec![
+            PeerCandidate {
+                base_url: "http://node-a".to_owned(),
+                snapshot: snapshot(70, 70, 5),
+            },
+            PeerCandidate {
+                base_url: "http://node-b".to_owned(),
+                snapshot: snapshot(20, 20, 1),
+            },
+            PeerCandidate {
+                base_url: "http://node-c".to_owned(),
+                snapshot: snapshot(30, 30, 2),
+            },
+        ];
+
+        let ordered = ordered_candidates(&peers);
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].base_url, "http://node-b");
+        assert!(ordered.iter().any(|peer| peer.base_url == "http://node-c"));
     }
 }
