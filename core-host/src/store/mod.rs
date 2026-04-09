@@ -368,10 +368,10 @@ mod tests {
             "hibernated"
         );
         assert!(
-            !store
+            store
                 .get(CoreStoreBucket::HibernationState, "route:volume")
                 .expect("hibernation entry lookup should succeed")
-                .is_some(),
+                .is_none(),
             "hibernation entry should be deleted after restore"
         );
     }
