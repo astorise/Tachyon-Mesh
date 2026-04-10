@@ -19,7 +19,10 @@ const BUFFER_ROUTE_ENV: &str = "BUFFER_ROUTE";
 const SOFT_LIMIT_ENV: &str = "SOFT_LIMIT";
 const RECOVER_LIMIT_ENV: &str = "RECOVER_LIMIT";
 const SATURATED_LIMIT_ENV: &str = "SATURATED_LIMIT";
+const TARGET_ACCELERATOR_ENV: &str = "TARGET_ACCELERATOR";
+const TARGET_QOS_ENV: &str = "TARGET_QOS";
 const GOSSIP_PATH_ENV: &str = "GOSSIP_PATH";
+const MESH_QOS_OVERRIDE_PREFIX: &str = "mesh-qos:";
 const DEFAULT_BUFFER_ROUTE: &str = "/system/buffer";
 const DEFAULT_GOSSIP_PATH: &str = "/system/gossip";
 const DEFAULT_SOFT_LIMIT: u8 = 85;
@@ -62,6 +65,19 @@ fn evaluate_cluster_pressure() -> Result<(), String> {
     let saturated_limit = parse_limit(SATURATED_LIMIT_ENV, DEFAULT_SATURATED_LIMIT)?;
     let local = local_snapshot();
     let local_pressure = local.effective_pressure();
+    let peers = fetch_peer_snapshots()?;
+
+    if let Some(profile) = steering_profile_from_env()? {
+        return evaluate_qos_routing(
+            &steer_route,
+            &buffer_route,
+            recover_limit,
+            saturated_limit,
+            &local,
+            &peers,
+            profile,
+        );
+    }
 
     if local_pressure <= recover_limit {
         bindings::tachyon::mesh::routing_control::update_target(&steer_route, &steer_route)?;
@@ -71,8 +87,6 @@ fn evaluate_cluster_pressure() -> Result<(), String> {
     if local_pressure < soft_limit {
         return Ok(());
     }
-
-    let peers = fetch_peer_snapshots()?;
     let healthy_peers = peers
         .into_iter()
         .filter(|peer| peer.snapshot.effective_pressure() < saturated_limit)
@@ -96,7 +110,11 @@ fn evaluate_cluster_pressure() -> Result<(), String> {
         candidates: ordered_candidates
             .iter()
             .map(|candidate| RouteOverrideCandidate {
-                destination: format!("{}{}", candidate.base_url, steer_route),
+                destination: format!(
+                    "{}{}",
+                    candidate.base_url,
+                    route_path_for_override_key(&steer_route)
+                ),
                 hot_models: candidate.snapshot.hot_models.clone(),
                 effective_pressure: candidate.snapshot.effective_pressure(),
                 capability_mask: candidate.snapshot.capability_mask,
@@ -149,6 +167,18 @@ fn local_snapshot() -> TelemetrySnapshot {
         allocated_memory_pages: snapshot.allocated_memory_pages,
         capability_mask: snapshot.capability_mask,
         capabilities: snapshot.capabilities,
+        cpu_rt_load: snapshot.cpu_rt_load,
+        cpu_standard_load: snapshot.cpu_standard_load,
+        cpu_batch_load: snapshot.cpu_batch_load,
+        gpu_rt_load: snapshot.gpu_rt_load,
+        gpu_standard_load: snapshot.gpu_standard_load,
+        gpu_batch_load: snapshot.gpu_batch_load,
+        npu_rt_load: snapshot.npu_rt_load,
+        npu_standard_load: snapshot.npu_standard_load,
+        npu_batch_load: snapshot.npu_batch_load,
+        tpu_rt_load: snapshot.tpu_rt_load,
+        tpu_standard_load: snapshot.tpu_standard_load,
+        tpu_batch_load: snapshot.tpu_batch_load,
         hot_models: snapshot.hot_models,
         dropped_events: snapshot.dropped_events,
         last_status: snapshot.last_status,
@@ -156,6 +186,211 @@ fn local_snapshot() -> TelemetrySnapshot {
         total_wasm_duration_us: snapshot.total_wasm_duration_us,
         total_host_overhead_us: snapshot.total_host_overhead_us,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetAccelerator {
+    Cpu,
+    Gpu,
+    Npu,
+    Tpu,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetQos {
+    RealTime,
+    Standard,
+    Batch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SteeringProfile {
+    accelerator: TargetAccelerator,
+    qos: TargetQos,
+}
+
+fn steering_profile_from_env() -> Result<Option<SteeringProfile>, String> {
+    let Some(accelerator) = std::env::var(TARGET_ACCELERATOR_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let qos = std::env::var(TARGET_QOS_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "standard".to_owned());
+    Ok(Some(SteeringProfile {
+        accelerator: parse_target_accelerator(&accelerator)?,
+        qos: parse_target_qos(&qos)?,
+    }))
+}
+
+fn parse_target_accelerator(value: &str) -> Result<TargetAccelerator, String> {
+    match value {
+        "cpu" => Ok(TargetAccelerator::Cpu),
+        "gpu" => Ok(TargetAccelerator::Gpu),
+        "npu" => Ok(TargetAccelerator::Npu),
+        "tpu" => Ok(TargetAccelerator::Tpu),
+        _ => Err(format!(
+            "unsupported `{TARGET_ACCELERATOR_ENV}` value `{value}`"
+        )),
+    }
+}
+
+fn parse_target_qos(value: &str) -> Result<TargetQos, String> {
+    match value {
+        "realtime" | "real-time" | "real_time" => Ok(TargetQos::RealTime),
+        "standard" => Ok(TargetQos::Standard),
+        "batch" => Ok(TargetQos::Batch),
+        _ => Err(format!("unsupported `{TARGET_QOS_ENV}` value `{value}`")),
+    }
+}
+
+fn queue_load(snapshot: &TelemetrySnapshot, accelerator: TargetAccelerator, qos: TargetQos) -> u32 {
+    match (accelerator, qos) {
+        (TargetAccelerator::Cpu, TargetQos::RealTime) => snapshot.cpu_rt_load,
+        (TargetAccelerator::Cpu, TargetQos::Standard) => snapshot.cpu_standard_load,
+        (TargetAccelerator::Cpu, TargetQos::Batch) => snapshot.cpu_batch_load,
+        (TargetAccelerator::Gpu, TargetQos::RealTime) => snapshot.gpu_rt_load,
+        (TargetAccelerator::Gpu, TargetQos::Standard) => snapshot.gpu_standard_load,
+        (TargetAccelerator::Gpu, TargetQos::Batch) => snapshot.gpu_batch_load,
+        (TargetAccelerator::Npu, TargetQos::RealTime) => snapshot.npu_rt_load,
+        (TargetAccelerator::Npu, TargetQos::Standard) => snapshot.npu_standard_load,
+        (TargetAccelerator::Npu, TargetQos::Batch) => snapshot.npu_batch_load,
+        (TargetAccelerator::Tpu, TargetQos::RealTime) => snapshot.tpu_rt_load,
+        (TargetAccelerator::Tpu, TargetQos::Standard) => snapshot.tpu_standard_load,
+        (TargetAccelerator::Tpu, TargetQos::Batch) => snapshot.tpu_batch_load,
+    }
+}
+
+fn evaluate_qos_routing(
+    steer_route: &str,
+    buffer_route: &str,
+    recover_limit: u8,
+    saturated_limit: u8,
+    local: &TelemetrySnapshot,
+    peers: &[PeerCandidate],
+    profile: SteeringProfile,
+) -> Result<(), String> {
+    let local_load = queue_load(local, profile.accelerator, profile.qos);
+    let healthy_peers = peers
+        .iter()
+        .filter(|peer| peer.snapshot.effective_pressure() < saturated_limit)
+        .collect::<Vec<_>>();
+
+    match profile.qos {
+        TargetQos::RealTime => {
+            if local_load == 0 && local.effective_pressure() <= recover_limit {
+                bindings::tachyon::mesh::routing_control::update_target(steer_route, steer_route)?;
+                return Ok(());
+            }
+
+            let ordered = qos_ordered_candidates(
+                &healthy_peers,
+                profile.accelerator,
+                profile.qos,
+                local_load,
+            );
+
+            if ordered.is_empty() {
+                if local.effective_pressure() >= saturated_limit {
+                    bindings::tachyon::mesh::routing_control::update_target(
+                        steer_route,
+                        buffer_route,
+                    )?;
+                }
+                return Ok(());
+            }
+
+            let payload = serde_json::to_string(&RouteOverrideDescriptor {
+                candidates: ordered
+                    .iter()
+                    .map(|candidate| RouteOverrideCandidate {
+                        destination: format!(
+                            "{}{}",
+                            candidate.base_url,
+                            route_path_for_override_key(steer_route)
+                        ),
+                        hot_models: candidate.snapshot.hot_models.clone(),
+                        effective_pressure: candidate.snapshot.effective_pressure(),
+                        capability_mask: candidate.snapshot.capability_mask,
+                        capabilities: candidate.snapshot.capabilities.clone(),
+                    })
+                    .collect(),
+            })
+            .map_err(|error| format!("failed to encode route override descriptor: {error}"))?;
+            bindings::tachyon::mesh::routing_control::update_target(steer_route, &payload)?;
+        }
+        TargetQos::Batch => {
+            if local_load >= 1000 || local.effective_pressure() >= saturated_limit {
+                bindings::tachyon::mesh::routing_control::update_target(steer_route, buffer_route)?;
+            } else {
+                bindings::tachyon::mesh::routing_control::update_target(steer_route, steer_route)?;
+            }
+        }
+        TargetQos::Standard => {
+            if local_load == 0 && local.effective_pressure() <= recover_limit {
+                bindings::tachyon::mesh::routing_control::update_target(steer_route, steer_route)?;
+                return Ok(());
+            }
+            let ordered = qos_ordered_candidates(
+                &healthy_peers,
+                profile.accelerator,
+                profile.qos,
+                local_load,
+            );
+            if let Some(candidate) = ordered.first() {
+                let payload = serde_json::to_string(&RouteOverrideDescriptor {
+                    candidates: vec![RouteOverrideCandidate {
+                        destination: format!(
+                            "{}{}",
+                            candidate.base_url,
+                            route_path_for_override_key(steer_route)
+                        ),
+                        hot_models: candidate.snapshot.hot_models.clone(),
+                        effective_pressure: candidate.snapshot.effective_pressure(),
+                        capability_mask: candidate.snapshot.capability_mask,
+                        capabilities: candidate.snapshot.capabilities.clone(),
+                    }],
+                })
+                .map_err(|error| format!("failed to encode route override descriptor: {error}"))?;
+                bindings::tachyon::mesh::routing_control::update_target(steer_route, &payload)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn qos_ordered_candidates<'a>(
+    peers: &'a [&'a PeerCandidate],
+    accelerator: TargetAccelerator,
+    qos: TargetQos,
+    local_load: u32,
+) -> Vec<&'a PeerCandidate> {
+    let mut ordered = peers
+        .iter()
+        .copied()
+        .filter(|peer| queue_load(&peer.snapshot, accelerator, qos) < local_load)
+        .collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        queue_load(&left.snapshot, accelerator, qos)
+            .cmp(&queue_load(&right.snapshot, accelerator, qos))
+            .then_with(|| {
+                left.snapshot
+                    .effective_pressure()
+                    .cmp(&right.snapshot.effective_pressure())
+            })
+            .then_with(|| {
+                left.snapshot
+                    .active_requests
+                    .cmp(&right.snapshot.active_requests)
+            })
+    });
+    ordered
 }
 
 fn power_of_two_choices(peers: &[PeerCandidate]) -> Option<&PeerCandidate> {
@@ -248,6 +483,13 @@ fn parse_peer_entries(value: &str, gossip_path: &str) -> Vec<PeerEndpoint> {
 }
 
 fn normalize_route(route: &str) -> Result<String, String> {
+    if let Some(route) = route.strip_prefix(MESH_QOS_OVERRIDE_PREFIX) {
+        return Ok(format!(
+            "{MESH_QOS_OVERRIDE_PREFIX}{}",
+            normalize_route(route)?
+        ));
+    }
+
     let trimmed = route.trim();
     if trimmed.is_empty() {
         return Err("route must not be empty".to_owned());
@@ -257,6 +499,16 @@ fn normalize_route(route: &str) -> Result<String, String> {
     } else {
         format!("/{}", trimmed.trim_end_matches('/'))
     })
+}
+
+fn route_path_for_override_key(route: &str) -> String {
+    route
+        .strip_prefix(MESH_QOS_OVERRIDE_PREFIX)
+        .map(normalize_route)
+        .transpose()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| normalize_route(route).unwrap_or_else(|_| "/".to_owned()))
 }
 
 fn required_env(name: &str) -> Result<String, String> {
@@ -342,6 +594,30 @@ struct TelemetrySnapshot {
     #[serde(default)]
     capabilities: Vec<String>,
     #[serde(default)]
+    cpu_rt_load: u32,
+    #[serde(default)]
+    cpu_standard_load: u32,
+    #[serde(default)]
+    cpu_batch_load: u32,
+    #[serde(default)]
+    gpu_rt_load: u32,
+    #[serde(default)]
+    gpu_standard_load: u32,
+    #[serde(default)]
+    gpu_batch_load: u32,
+    #[serde(default)]
+    npu_rt_load: u32,
+    #[serde(default)]
+    npu_standard_load: u32,
+    #[serde(default)]
+    npu_batch_load: u32,
+    #[serde(default)]
+    tpu_rt_load: u32,
+    #[serde(default)]
+    tpu_standard_load: u32,
+    #[serde(default)]
+    tpu_batch_load: u32,
+    #[serde(default)]
     hot_models: Vec<String>,
     dropped_events: u64,
     last_status: u16,
@@ -372,6 +648,18 @@ mod tests {
             allocated_memory_pages: 0,
             capability_mask: 0,
             capabilities: Vec::new(),
+            cpu_rt_load: 0,
+            cpu_standard_load: 0,
+            cpu_batch_load: 0,
+            gpu_rt_load: 0,
+            gpu_standard_load: 0,
+            gpu_batch_load: 0,
+            npu_rt_load: 0,
+            npu_standard_load: 0,
+            npu_batch_load: 0,
+            tpu_rt_load: 0,
+            tpu_standard_load: 0,
+            tpu_batch_load: 0,
             hot_models: Vec::new(),
             dropped_events: 0,
             last_status: 0,
@@ -450,6 +738,18 @@ mod tests {
             allocated_memory_pages: 1,
             capability_mask: 5,
             capabilities: vec!["core:wasi".to_owned(), "accel:cuda".to_owned()],
+            cpu_rt_load: 0,
+            cpu_standard_load: 0,
+            cpu_batch_load: 0,
+            gpu_rt_load: 0,
+            gpu_standard_load: 0,
+            gpu_batch_load: 0,
+            npu_rt_load: 0,
+            npu_standard_load: 0,
+            npu_batch_load: 0,
+            tpu_rt_load: 0,
+            tpu_standard_load: 0,
+            tpu_batch_load: 0,
             hot_models: vec!["llama3".to_owned()],
             dropped_events: 0,
             last_status: 200,
@@ -471,5 +771,58 @@ mod tests {
         assert_eq!(encoded["candidates"][0]["capability_mask"], 5);
         assert_eq!(encoded["candidates"][0]["capabilities"][0], "core:wasi");
         assert_eq!(encoded["candidates"][0]["capabilities"][1], "accel:cuda");
+    }
+
+    #[test]
+    fn qos_ordered_candidates_prefers_lower_gpu_realtime_backlog() {
+        let peers = [
+            PeerCandidate {
+                base_url: "http://node-a".to_owned(),
+                snapshot: TelemetrySnapshot {
+                    gpu_rt_load: 4,
+                    ..snapshot(40, 20, 4)
+                },
+            },
+            PeerCandidate {
+                base_url: "http://node-b".to_owned(),
+                snapshot: TelemetrySnapshot {
+                    gpu_rt_load: 0,
+                    ..snapshot(30, 20, 2)
+                },
+            },
+            PeerCandidate {
+                base_url: "http://node-c".to_owned(),
+                snapshot: TelemetrySnapshot {
+                    gpu_rt_load: 1,
+                    ..snapshot(10, 10, 1)
+                },
+            },
+        ];
+
+        let peer_refs = peers.iter().collect::<Vec<_>>();
+        let ordered =
+            qos_ordered_candidates(&peer_refs, TargetAccelerator::Gpu, TargetQos::RealTime, 5);
+
+        assert_eq!(ordered[0].base_url, "http://node-b");
+        assert_eq!(ordered[1].base_url, "http://node-c");
+    }
+
+    #[test]
+    fn queue_load_reads_batch_tier_without_mixing_qos() {
+        let snapshot = TelemetrySnapshot {
+            gpu_rt_load: 1,
+            gpu_standard_load: 2,
+            gpu_batch_load: 7,
+            ..snapshot(20, 20, 1)
+        };
+
+        assert_eq!(
+            queue_load(&snapshot, TargetAccelerator::Gpu, TargetQos::Batch),
+            7
+        );
+        assert_eq!(
+            queue_load(&snapshot, TargetAccelerator::Gpu, TargetQos::RealTime),
+            1
+        );
     }
 }
