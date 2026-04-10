@@ -24,6 +24,7 @@ struct StartCallRequest {
 #[derive(Debug, Serialize)]
 struct StartCallResponse {
     bridge_id: String,
+    ip: String,
     port_a: u16,
     port_b: u16,
 }
@@ -54,12 +55,16 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
 
         let body = match serde_json::to_vec(&StartCallResponse {
             bridge_id: allocation.bridge_id,
+            ip: allocation.ip,
             port_a: allocation.port_a,
             port_b: allocation.port_b,
         }) {
             Ok(body) => body,
             Err(error) => {
-                return response(500, format!("failed to encode start call response: {error}"));
+                return response(
+                    500,
+                    format!("failed to encode start call response: {error}"),
+                );
             }
         };
 
@@ -95,5 +100,21 @@ mod tests {
     #[test]
     fn default_timeout_is_30_seconds() {
         assert_eq!(default_timeout_seconds(), 30);
+    }
+
+    #[test]
+    fn start_call_response_serializes_ip_and_ports() {
+        let encoded = serde_json::to_value(StartCallResponse {
+            bridge_id: "bridge-1".to_owned(),
+            ip: "203.0.113.50".to_owned(),
+            port_a: 10_000,
+            port_b: 10_001,
+        })
+        .expect("start call response should serialize");
+
+        assert_eq!(encoded["bridge_id"], "bridge-1");
+        assert_eq!(encoded["ip"], "203.0.113.50");
+        assert_eq!(encoded["port_a"], 10_000);
+        assert_eq!(encoded["port_b"], 10_001);
     }
 }

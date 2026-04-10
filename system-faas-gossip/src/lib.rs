@@ -167,6 +167,10 @@ fn local_snapshot() -> TelemetrySnapshot {
         allocated_memory_pages: snapshot.allocated_memory_pages,
         capability_mask: snapshot.capability_mask,
         capabilities: snapshot.capabilities,
+        active_l4_relays: snapshot.active_l4_relays,
+        l4_throughput_bytes_per_sec: snapshot.l4_throughput_bytes_per_sec,
+        l4_load_score: snapshot.l4_load_score,
+        advertise_ip: snapshot.advertise_ip,
         cpu_rt_load: snapshot.cpu_rt_load,
         cpu_standard_load: snapshot.cpu_standard_load,
         cpu_batch_load: snapshot.cpu_batch_load,
@@ -594,6 +598,14 @@ struct TelemetrySnapshot {
     #[serde(default)]
     capabilities: Vec<String>,
     #[serde(default)]
+    active_l4_relays: u32,
+    #[serde(default)]
+    l4_throughput_bytes_per_sec: u64,
+    #[serde(default)]
+    l4_load_score: u8,
+    #[serde(default)]
+    advertise_ip: String,
+    #[serde(default)]
     cpu_rt_load: u32,
     #[serde(default)]
     cpu_standard_load: u32,
@@ -648,6 +660,10 @@ mod tests {
             allocated_memory_pages: 0,
             capability_mask: 0,
             capabilities: Vec::new(),
+            active_l4_relays: 0,
+            l4_throughput_bytes_per_sec: 0,
+            l4_load_score: 0,
+            advertise_ip: String::new(),
             cpu_rt_load: 0,
             cpu_standard_load: 0,
             cpu_batch_load: 0,
@@ -738,6 +754,10 @@ mod tests {
             allocated_memory_pages: 1,
             capability_mask: 5,
             capabilities: vec!["core:wasi".to_owned(), "accel:cuda".to_owned()],
+            active_l4_relays: 0,
+            l4_throughput_bytes_per_sec: 0,
+            l4_load_score: 0,
+            advertise_ip: String::new(),
             cpu_rt_load: 0,
             cpu_standard_load: 0,
             cpu_batch_load: 0,

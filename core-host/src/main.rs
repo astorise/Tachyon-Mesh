@@ -1839,6 +1839,8 @@ struct IntegrityVolume {
 struct IntegrityConfig {
     host_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    advertise_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tls_address: Option<String>,
     max_stdout_bytes: usize,
     guest_fuel_budget: u64,
@@ -2738,6 +2740,7 @@ struct BridgeManagerInner {
     sessions: Mutex<HashMap<String, BridgeSession>>,
     active_relays: AtomicUsize,
     relayed_bytes: AtomicU64,
+    telemetry: Mutex<BridgeTelemetryState>,
 }
 
 struct BridgeSession {
@@ -2754,19 +2757,40 @@ struct BridgeConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct BridgeAllocation {
     bridge_id: String,
+    #[serde(default)]
+    ip: String,
     port_a: u16,
     port_b: u16,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BridgeTelemetrySnapshot {
+    active_relays: u32,
+    throughput_bytes_per_sec: u64,
+    load_score: u8,
+}
+
+struct BridgeTelemetryState {
+    last_total_bytes: u64,
+    last_sampled_at: Instant,
+    throughput_bytes_per_sec: u64,
+}
+
+impl Default for BridgeTelemetryState {
+    fn default() -> Self {
+        Self {
+            last_total_bytes: 0,
+            last_sampled_at: Instant::now(),
+            throughput_bytes_per_sec: 0,
+        }
+    }
+}
+
 impl BridgeManager {
-    fn create_relay(
-        &self,
-        config: BridgeConfig,
-    ) -> std::result::Result<BridgeAllocation, String> {
+    fn create_relay(&self, config: BridgeConfig) -> std::result::Result<BridgeAllocation, String> {
         let endpoint_a = parse_bridge_endpoint(&config.client_a_addr, "client_a_addr")?;
         let endpoint_b = parse_bridge_endpoint(&config.client_b_addr, "client_b_addr")?;
-        let inactivity_timeout =
-            Duration::from_secs(u64::from(config.timeout_seconds.max(1)));
+        let inactivity_timeout = Duration::from_secs(u64::from(config.timeout_seconds.max(1)));
 
         let socket_a = bind_bridge_socket()?;
         let socket_b = bind_bridge_socket()?;
@@ -2783,9 +2807,15 @@ impl BridgeManager {
         let inner = Arc::clone(&self.inner);
         let cleanup_id = bridge_id.clone();
         let join_handle = tokio::spawn(async move {
-            if let Err(error) =
-                relay_bridge(socket_a, socket_b, endpoint_a, endpoint_b, inactivity_timeout, &inner)
-                    .await
+            if let Err(error) = relay_bridge(
+                socket_a,
+                socket_b,
+                endpoint_a,
+                endpoint_b,
+                inactivity_timeout,
+                &inner,
+            )
+            .await
             {
                 tracing::warn!(bridge_id = %cleanup_id, "dynamic bridge relay exited: {error}");
             }
@@ -2808,6 +2838,7 @@ impl BridgeManager {
 
         Ok(BridgeAllocation {
             bridge_id,
+            ip: String::new(),
             port_a,
             port_b,
         })
@@ -2837,6 +2868,39 @@ impl BridgeManager {
     fn total_relayed_bytes(&self) -> u64 {
         self.inner.relayed_bytes.load(Ordering::SeqCst)
     }
+
+    fn telemetry_snapshot(&self) -> BridgeTelemetrySnapshot {
+        let total_bytes = self.inner.relayed_bytes.load(Ordering::SeqCst);
+        let active_relays = self.inner.active_relays.load(Ordering::SeqCst) as u32;
+        let mut telemetry = self
+            .inner
+            .telemetry
+            .lock()
+            .expect("bridge telemetry state should not be poisoned");
+        let elapsed = telemetry.last_sampled_at.elapsed();
+        if elapsed >= Duration::from_millis(250) {
+            let delta = total_bytes.saturating_sub(telemetry.last_total_bytes);
+            telemetry.throughput_bytes_per_sec = if elapsed.is_zero() {
+                0
+            } else {
+                ((delta as u128 * 1_000_000_000_u128) / elapsed.as_nanos()) as u64
+            };
+            telemetry.last_total_bytes = total_bytes;
+            telemetry.last_sampled_at = Instant::now();
+        }
+
+        BridgeTelemetrySnapshot {
+            active_relays,
+            throughput_bytes_per_sec: telemetry.throughput_bytes_per_sec,
+            load_score: bridge_load_score(active_relays, telemetry.throughput_bytes_per_sec),
+        }
+    }
+}
+
+fn bridge_load_score(active_relays: u32, throughput_bytes_per_sec: u64) -> u8 {
+    let relay_score = active_relays.saturating_mul(25).min(100) as u8;
+    let throughput_score = ((throughput_bytes_per_sec / 50_000).min(100)) as u8;
+    relay_score.max(throughput_score)
 }
 
 fn bind_bridge_socket() -> std::result::Result<tokio::net::UdpSocket, String> {
@@ -9507,6 +9571,7 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
         ));
     }
 
+    config.advertise_ip = normalize_advertise_ip(config.advertise_ip)?;
     config.tls_address = normalize_tls_address(config.tls_address)?;
     config.batch_targets = normalize_batch_targets(config.batch_targets)?;
     config.routes = normalize_config_routes(config.routes, !config.batch_targets.is_empty())?;
@@ -9923,6 +9988,39 @@ fn normalize_tls_address(address: Option<String>) -> Result<Option<String>> {
             Ok(trimmed.to_owned())
         })
         .transpose()
+}
+
+fn normalize_advertise_ip(address: Option<String>) -> Result<Option<String>> {
+    address
+        .map(|address| {
+            let trimmed = address.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: `advertise_ip` must not be empty"
+                ));
+            }
+            trimmed.parse::<IpAddr>().map_err(|error| {
+                anyhow!(
+                    "Integrity Validation Failed: `advertise_ip` must be an IP address: {error}"
+                )
+            })?;
+            Ok(trimmed.to_owned())
+        })
+        .transpose()
+}
+
+fn effective_advertise_ip(config: &IntegrityConfig) -> String {
+    config
+        .advertise_ip
+        .clone()
+        .or_else(|| {
+            config
+                .host_address
+                .parse::<SocketAddr>()
+                .ok()
+                .map(|address| address.ip().to_string())
+        })
+        .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string())
 }
 
 fn normalize_route_name(name: &str, path: &str) -> Result<String> {
@@ -10682,7 +10780,9 @@ impl ComponentHostState {
         config: BridgeConfig,
     ) -> std::result::Result<BridgeAllocation, String> {
         if self.route_role == RouteRole::System && self.route_path == SYSTEM_BRIDGE_ROUTE {
-            return self.bridge_manager.create_relay(config);
+            let mut allocation = self.bridge_manager.create_relay(config)?;
+            allocation.ip = effective_advertise_ip(&self.runtime_config);
+            return Ok(allocation);
         }
 
         let url = rewrite_outbound_http_url("http://mesh/system/bridge", &self.runtime_config);
@@ -10722,8 +10822,9 @@ impl ComponentHostState {
             .delete(&url)
             .header("content-type", "application/json")
             .body(
-                serde_json::to_vec(&serde_json::json!({ "bridge_id": bridge_id }))
-                    .map_err(|error| format!("failed to encode bridge teardown request: {error}"))?,
+                serde_json::to_vec(&serde_json::json!({ "bridge_id": bridge_id })).map_err(
+                    |error| format!("failed to encode bridge teardown request: {error}"),
+                )?,
             )
             .send()
             .map_err(|error| format!("failed to call system bridge teardown: {error}"))?;
@@ -11337,6 +11438,7 @@ impl component_bindings::tachyon::mesh::bridge_controller::Host for ComponentHos
         Ok(
             component_bindings::tachyon::mesh::bridge_controller::BridgeEndpoints {
                 bridge_id: allocation.bridge_id,
+                ip: allocation.ip,
                 port_a: allocation.port_a,
                 port_b: allocation.port_b,
             },
@@ -11364,6 +11466,7 @@ impl system_component_bindings::tachyon::mesh::bridge_controller::Host for Compo
         Ok(
             system_component_bindings::tachyon::mesh::bridge_controller::BridgeEndpoints {
                 bridge_id: allocation.bridge_id,
+                ip: allocation.ip,
                 port_a: allocation.port_a,
                 port_b: allocation.port_b,
             },
@@ -11497,6 +11600,7 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             self.host_capabilities,
             self.accelerator_queue_loads(),
         );
+        let l4 = self.bridge_manager.telemetry_snapshot();
         let hot_models = self.hot_model_aliases();
 
         system_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
@@ -11510,6 +11614,10 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             allocated_memory_pages: control_plane.allocated_memory_pages,
             capability_mask: control_plane.capability_mask,
             capabilities: control_plane.capabilities,
+            active_l4_relays: l4.active_relays,
+            l4_throughput_bytes_per_sec: l4.throughput_bytes_per_sec,
+            l4_load_score: l4.load_score,
+            advertise_ip: effective_advertise_ip(&self.runtime_config),
             cpu_rt_load: control_plane.cpu_rt_load,
             cpu_standard_load: control_plane.cpu_standard_load,
             cpu_batch_load: control_plane.cpu_batch_load,
@@ -11553,6 +11661,10 @@ impl control_plane_component_bindings::tachyon::mesh::telemetry_reader::Host
             allocated_memory_pages: snapshot.allocated_memory_pages,
             capability_mask: snapshot.capability_mask,
             capabilities: snapshot.capabilities,
+            active_l4_relays: snapshot.active_l4_relays,
+            l4_throughput_bytes_per_sec: snapshot.l4_throughput_bytes_per_sec,
+            l4_load_score: snapshot.l4_load_score,
+            advertise_ip: snapshot.advertise_ip,
             cpu_rt_load: snapshot.cpu_rt_load,
             cpu_standard_load: snapshot.cpu_standard_load,
             cpu_batch_load: snapshot.cpu_batch_load,
@@ -11594,6 +11706,10 @@ impl background_component_bindings::tachyon::mesh::telemetry_reader::Host for Co
             allocated_memory_pages: snapshot.allocated_memory_pages,
             capability_mask: snapshot.capability_mask,
             capabilities: snapshot.capabilities,
+            active_l4_relays: snapshot.active_l4_relays,
+            l4_throughput_bytes_per_sec: snapshot.l4_throughput_bytes_per_sec,
+            l4_load_score: snapshot.l4_load_score,
+            advertise_ip: snapshot.advertise_ip,
             cpu_rt_load: snapshot.cpu_rt_load,
             cpu_standard_load: snapshot.cpu_standard_load,
             cpu_batch_load: snapshot.cpu_batch_load,
@@ -11850,6 +11966,7 @@ impl IntegrityConfig {
     fn default_sealed() -> Self {
         Self {
             host_address: DEFAULT_HOST_ADDRESS.to_owned(),
+            advertise_ip: None,
             tls_address: None,
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
@@ -12361,6 +12478,7 @@ mod tests {
 
         IntegrityConfig {
             host_address: DEFAULT_HOST_ADDRESS.to_owned(),
+            advertise_ip: None,
             tls_address: None,
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
@@ -12408,6 +12526,7 @@ mod tests {
 
         IntegrityConfig {
             host_address: host_address.to_string(),
+            advertise_ip: None,
             tls_address: None,
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
@@ -15014,10 +15133,11 @@ mod tests {
             .await
             .expect("client A should send through the bridge");
         let mut received = [0_u8; 16];
-        let (size, source) = tokio::time::timeout(Duration::from_secs(1), client_b.recv_from(&mut received))
-            .await
-            .expect("bridge delivery to client B should not time out")
-            .expect("client B should receive relayed datagram");
+        let (size, source) =
+            tokio::time::timeout(Duration::from_secs(1), client_b.recv_from(&mut received))
+                .await
+                .expect("bridge delivery to client B should not time out")
+                .expect("client B should receive relayed datagram");
         assert_eq!(&received[..size], b"alpha");
         assert_eq!(source.port(), allocation.port_b);
 
@@ -15028,10 +15148,11 @@ mod tests {
             )
             .await
             .expect("client B should send through the bridge");
-        let (size, source) = tokio::time::timeout(Duration::from_secs(1), client_a.recv_from(&mut received))
-            .await
-            .expect("bridge delivery to client A should not time out")
-            .expect("client A should receive relayed datagram");
+        let (size, source) =
+            tokio::time::timeout(Duration::from_secs(1), client_a.recv_from(&mut received))
+                .await
+                .expect("bridge delivery to client A should not time out")
+                .expect("client A should receive relayed datagram");
         assert_eq!(&received[..size], b"beta");
         assert_eq!(source.port(), allocation.port_a);
         assert!(manager.total_relayed_bytes() >= 9);
@@ -15104,6 +15225,7 @@ mod tests {
                     .expect("bridge allocation response should decode")
             })
             .expect("voip gate response body should read");
+        assert_eq!(allocation.ip, Ipv4Addr::LOCALHOST.to_string());
 
         client_a
             .send_to(
@@ -15113,15 +15235,17 @@ mod tests {
             .await
             .expect("client A should send a bridged datagram");
         let mut buffer = [0_u8; 32];
-        let (size, source) = tokio::time::timeout(Duration::from_secs(1), client_b.recv_from(&mut buffer))
-            .await
-            .expect("client B delivery should not time out")
-            .expect("client B should receive bridged datagram");
+        let (size, source) =
+            tokio::time::timeout(Duration::from_secs(1), client_b.recv_from(&mut buffer))
+                .await
+                .expect("client B delivery should not time out")
+                .expect("client B should receive bridged datagram");
         assert_eq!(&buffer[..size], b"hello bridge");
         assert_eq!(source.port(), allocation.port_b);
 
-        let persisted = fs::read_to_string(session_dir.join(format!("{}.json", allocation.bridge_id)))
-            .expect("system bridge should persist the active session");
+        let persisted =
+            fs::read_to_string(session_dir.join(format!("{}.json", allocation.bridge_id)))
+                .expect("system bridge should persist the active session");
         assert!(persisted.contains("\"status\":\"active\""));
         assert_eq!(state.bridge_manager.active_relay_count(), 1);
         state
@@ -15132,6 +15256,221 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn voip_gate_delegates_bridge_to_healthier_peer_when_local_l4_is_saturated() {
+        use axum::{
+            body::Bytes as AxumBytes,
+            extract::State,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct PeerCapture {
+            headers: Vec<Vec<(String, String)>>,
+            bodies: Vec<String>,
+        }
+
+        async fn peer_gossip() -> impl IntoResponse {
+            Json(json!({
+                "total_requests": 0_u64,
+                "completed_requests": 0_u64,
+                "error_requests": 0_u64,
+                "active_requests": 1_u32,
+                "cpu_pressure": 5_u8,
+                "ram_pressure": 5_u8,
+                "active_instances": 1_u32,
+                "allocated_memory_pages": 1_u32,
+                "capability_mask": 0_u64,
+                "capabilities": [],
+                "active_l4_relays": 1_u32,
+                "l4_throughput_bytes_per_sec": 1024_u64,
+                "l4_load_score": 10_u8,
+                "advertise_ip": "203.0.113.50",
+                "cpu_rt_load": 0_u32,
+                "cpu_standard_load": 0_u32,
+                "cpu_batch_load": 0_u32,
+                "gpu_rt_load": 0_u32,
+                "gpu_standard_load": 0_u32,
+                "gpu_batch_load": 0_u32,
+                "npu_rt_load": 0_u32,
+                "npu_standard_load": 0_u32,
+                "npu_batch_load": 0_u32,
+                "tpu_rt_load": 0_u32,
+                "tpu_standard_load": 0_u32,
+                "tpu_batch_load": 0_u32,
+                "hot_models": [],
+                "dropped_events": 0_u64,
+                "last_status": 200_u16,
+                "total_duration_us": 0_u64,
+                "total_wasm_duration_us": 0_u64,
+                "total_host_overhead_us": 0_u64
+            }))
+        }
+
+        async fn peer_bridge(
+            State(state): State<Arc<Mutex<PeerCapture>>>,
+            headers: HeaderMap,
+            body: AxumBytes,
+        ) -> impl IntoResponse {
+            let mut capture = state.lock().expect("peer capture should not be poisoned");
+            capture.headers.push(
+                headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_owned(),
+                            value.to_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect(),
+            );
+            capture
+                .bodies
+                .push(String::from_utf8_lossy(&body).to_string());
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "bridge_id": "peer-bridge-1",
+                    "ip": "203.0.113.50",
+                    "port_a": 31_000_u16,
+                    "port_b": 31_001_u16
+                })),
+            )
+        }
+
+        let peer_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let peer_app = Router::new()
+            .route("/system/gossip", get(peer_gossip))
+            .route("/system/bridge", post(peer_bridge))
+            .with_state(Arc::clone(&peer_capture));
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let peer_address = peer_listener
+            .local_addr()
+            .expect("peer listener should expose an address");
+        let peer_server = tokio::spawn(async move {
+            axum::serve(peer_listener, peer_app)
+                .await
+                .expect("peer app should stay up");
+        });
+
+        let session_dir = unique_test_dir("tachyon-bridge-steering-sessions");
+        fs::create_dir_all(&session_dir).expect("session dir should exist");
+        let client_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client A should bind");
+        let client_b = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client B should bind");
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose a local address");
+
+        let mut bridge_route = system_targeted_route(SYSTEM_BRIDGE_ROUTE, "system-faas-bridge");
+        let peer_urls = format!("http://{peer_address}");
+        bridge_route.env = route_env(&[
+            ("PEER_URLS", peer_urls.as_str()),
+            ("BRIDGE_SOFT_LIMIT", "80"),
+            ("GOSSIP_PATH", "/system/gossip"),
+        ]);
+        bridge_route.volumes = vec![mounted_ram_volume(&session_dir, "/sessions")];
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![
+                targeted_route(
+                    "/api/voip-gate",
+                    vec![weighted_target("guest-voip-gate", 100)],
+                ),
+                bridge_route,
+            ],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("bridge steering config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+
+        let mut local_bridges = Vec::new();
+        for offset in 0..4_u16 {
+            let allocation = state
+                .bridge_manager
+                .create_relay(BridgeConfig {
+                    client_a_addr: format!("127.0.0.1:{}", 20_000 + offset * 2),
+                    client_b_addr: format!("127.0.0.1:{}", 20_001 + offset * 2),
+                    timeout_seconds: 30,
+                })
+                .expect("local saturation relay should allocate");
+            local_bridges.push(allocation.bridge_id);
+        }
+        let local_relay_count = state.bridge_manager.active_relay_count();
+
+        let app = build_app(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(host_listener, app)
+                .await
+                .expect("bridge steering test app should stay up");
+        });
+
+        let allocation = Client::new()
+            .post(format!("http://{host_address}/api/voip-gate"))
+            .header("content-type", "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "client_a_addr": client_a.local_addr().expect("client A address should resolve").to_string(),
+                    "client_b_addr": client_b.local_addr().expect("client B address should resolve").to_string(),
+                    "timeout_seconds": 5
+                }))
+                .expect("voip gate request body should serialize"),
+            )
+            .send()
+            .await
+            .expect("voip gate request should succeed")
+            .error_for_status()
+            .expect("voip gate response should be OK")
+            .bytes()
+            .await
+            .map(|body| {
+                serde_json::from_slice::<BridgeAllocation>(&body)
+                    .expect("bridge allocation response should decode")
+            })
+            .expect("voip gate response body should read");
+
+        assert_eq!(allocation.bridge_id, "peer-bridge-1");
+        assert_eq!(allocation.ip, "203.0.113.50");
+        assert_eq!(allocation.port_a, 31_000);
+        assert_eq!(allocation.port_b, 31_001);
+        assert_eq!(state.bridge_manager.active_relay_count(), local_relay_count);
+
+        let capture = peer_capture
+            .lock()
+            .expect("peer capture should not be poisoned");
+        assert_eq!(capture.bodies.len(), 1);
+        assert!(capture.bodies[0].contains("client_a_addr"));
+        assert!(capture.headers[0].iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-tachyon-bridge-delegated") && value == "true"
+        }));
+        drop(capture);
+
+        for bridge_id in local_bridges {
+            state
+                .bridge_manager
+                .destroy_relay(&bridge_id)
+                .expect("local saturation relay should tear down");
+        }
+
+        server.abort();
+        let _ = server.await;
+        peer_server.abort();
+        let _ = peer_server.await;
         let _ = fs::remove_dir_all(session_dir);
     }
 

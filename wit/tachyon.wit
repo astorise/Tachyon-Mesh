@@ -58,6 +58,10 @@ interface telemetry-reader {
         allocated-memory-pages: u32,
         capability-mask: u64,
         capabilities: list<string>,
+        active-l4-relays: u32,
+        l4-throughput-bytes-per-sec: u64,
+        l4-load-score: u8,
+        advertise-ip: string,
         cpu-rt-load: u32,
         cpu-standard-load: u32,
         cpu-batch-load: u32,
@@ -117,6 +121,7 @@ interface bridge-controller {
 
     record bridge-endpoints {
         bridge-id: string,
+        ip: string,
         port-a: u16,
         port-b: u16,
     }
