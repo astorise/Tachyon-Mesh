@@ -143,6 +143,7 @@ world system-faas-guest {
     import telemetry-reader;
     import scaling-metrics;
     import storage-broker;
+    import outbound-http;
     export handler;
 }
 

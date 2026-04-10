@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     io::BufReader,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -21,6 +22,12 @@ pub(crate) struct CertificateMaterial {
     pub(crate) domain: String,
     pub(crate) certificate_pem: String,
     pub(crate) private_key_pem: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct MtlsGatewayConfig {
+    pub(crate) bind_address: SocketAddr,
+    pub(crate) server_config: Arc<ServerConfig>,
 }
 
 #[derive(Default)]
@@ -299,6 +306,34 @@ impl TlsManager {
     }
 }
 
+pub(crate) fn load_mtls_gateway_config_from_env() -> Result<Option<MtlsGatewayConfig>> {
+    let Some(server_certificate_pem) = std::env::var("TACHYON_MTLS_SERVER_CERT_PEM")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let server_key_pem = required_env("TACHYON_MTLS_SERVER_KEY_PEM")?;
+    let ca_certificate_pem = required_env("TACHYON_MTLS_CA_CERT_PEM")?;
+    let bind_address = std::env::var(crate::TACHYON_MTLS_ADDRESS_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "0.0.0.0:8443".to_owned())
+        .parse()
+        .context("failed to parse TACHYON_MTLS_ADDRESS")?;
+
+    Ok(Some(MtlsGatewayConfig {
+        bind_address,
+        server_config: Arc::new(build_mtls_server_config(
+            &server_certificate_pem,
+            &server_key_pem,
+            &ca_certificate_pem,
+        )?),
+    }))
+}
+
 fn build_server_config(material: &CertificateMaterial) -> Result<ServerConfig> {
     let mut cert_reader = BufReader::new(material.certificate_pem.as_bytes());
     let cert_chain = certs(&mut cert_reader)
@@ -315,6 +350,59 @@ fn build_server_config(material: &CertificateMaterial) -> Result<ServerConfig> {
         .context("failed to construct rustls server config")?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
+}
+
+pub(crate) fn build_mtls_server_config(
+    certificate_pem: &str,
+    private_key_pem: &str,
+    ca_certificate_pem: &str,
+) -> Result<ServerConfig> {
+    let cert_chain = parse_cert_chain(certificate_pem)?;
+    let private_key = parse_private_key(private_key_pem)?;
+    let mut ca_reader = BufReader::new(ca_certificate_pem.as_bytes());
+    let ca_certs = certs(&mut ca_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse client CA PEM")?;
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _) = roots.add_parsable_certificates(ca_certs);
+    if added == 0 {
+        return Err(anyhow!(
+            "client CA PEM did not contain any valid certificates"
+        ));
+    }
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("failed to construct rustls client verifier")?;
+    let mut config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(cert_chain, private_key)
+        .context("failed to construct rustls mTLS server config")?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+fn parse_cert_chain(
+    certificate_pem: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let mut cert_reader = BufReader::new(certificate_pem.as_bytes());
+    certs(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse certificate PEM")
+}
+
+fn parse_private_key(private_key_pem: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let mut key_reader = BufReader::new(private_key_pem.as_bytes());
+    private_key(&mut key_reader)
+        .context("failed to parse private key PEM")?
+        .ok_or_else(|| anyhow!("certificate bundle did not contain a private key"))
+}
+
+fn required_env(name: &str) -> Result<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("missing required environment variable `{name}`"))
 }
 
 fn ensure_known_domain(state: &crate::AppState, domain: &str) -> Result<()> {
