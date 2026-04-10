@@ -40,7 +40,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, Once,
     },
     task::{Context as TaskContext, Poll},
@@ -151,6 +151,7 @@ const DEFAULT_TLS_ADDRESS: &str = "127.0.0.1:3443";
 const ACME_STAGING_MOCK_MODE: &str = "ACME_STAGING_MOCK";
 const CERT_MANAGER_GUEST_CERT_DIR: &str = "/app/certs";
 const SYSTEM_METERING_ROUTE: &str = "/system/metering";
+const SYSTEM_BRIDGE_ROUTE: &str = "/system/bridge";
 const SYSTEM_CERT_MANAGER_ROUTE: &str = "/system/cert-manager";
 const SYSTEM_GATEWAY_ROUTE: &str = "/system/gateway";
 const SYSTEM_LOGGER_ROUTE: &str = "/system/logger";
@@ -297,6 +298,7 @@ struct AppState {
     host_identity: Arc<HostIdentity>,
     uds_fast_path: Arc<UdsFastPathRegistry>,
     storage_broker: Arc<StorageBrokerManager>,
+    bridge_manager: Arc<BridgeManager>,
     core_store: Arc<store::CoreStore>,
     buffered_requests: Arc<BufferedRequestManager>,
     volume_manager: Arc<VolumeManager>,
@@ -599,6 +601,7 @@ struct ComponentHostState {
     request_headers: HeaderMap,
     host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
+    bridge_manager: Arc<BridgeManager>,
     telemetry: TelemetryHandle,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
@@ -607,6 +610,8 @@ struct ComponentHostState {
     host_capabilities: Capabilities,
     host_load: Arc<HostLoadCounters>,
     outbound_http_client: reqwest::blocking::Client,
+    route_path: String,
+    route_role: RouteRole,
     #[cfg(feature = "ai-inference")]
     ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
     #[cfg(feature = "ai-inference")]
@@ -644,6 +649,7 @@ struct GuestExecutionContext {
     request_headers: HeaderMap,
     host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
+    bridge_manager: Arc<BridgeManager>,
     telemetry: Option<GuestTelemetryContext>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     propagated_headers: Vec<PropagatedHeader>,
@@ -1946,6 +1952,7 @@ async fn serve_host() -> Result<()> {
     let host_identity = Arc::new(HostIdentity::generate());
     let uds_fast_path = Arc::new(new_uds_fast_path_registry());
     let storage_broker = Arc::new(StorageBrokerManager::new(Arc::clone(&core_store)));
+    let bridge_manager = Arc::new(BridgeManager::default());
     let buffered_requests = Arc::new(BufferedRequestManager::new(buffered_request_spool_dir(
         &manifest_path,
     )));
@@ -1977,6 +1984,7 @@ async fn serve_host() -> Result<()> {
         host_identity,
         uds_fast_path: Arc::clone(&uds_fast_path),
         storage_broker,
+        bridge_manager,
         core_store,
         buffered_requests,
         volume_manager: Arc::new(VolumeManager::default()),
@@ -2717,6 +2725,186 @@ impl BufferedRequestManager {
             .expect("buffered request state should not be poisoned")
             .disk_queue
             .len()
+    }
+}
+
+#[derive(Clone, Default)]
+struct BridgeManager {
+    inner: Arc<BridgeManagerInner>,
+}
+
+#[derive(Default)]
+struct BridgeManagerInner {
+    sessions: Mutex<HashMap<String, BridgeSession>>,
+    active_relays: AtomicUsize,
+    relayed_bytes: AtomicU64,
+}
+
+struct BridgeSession {
+    abort_handle: tokio::task::AbortHandle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BridgeConfig {
+    client_a_addr: String,
+    client_b_addr: String,
+    timeout_seconds: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BridgeAllocation {
+    bridge_id: String,
+    port_a: u16,
+    port_b: u16,
+}
+
+impl BridgeManager {
+    fn create_relay(
+        &self,
+        config: BridgeConfig,
+    ) -> std::result::Result<BridgeAllocation, String> {
+        let endpoint_a = parse_bridge_endpoint(&config.client_a_addr, "client_a_addr")?;
+        let endpoint_b = parse_bridge_endpoint(&config.client_b_addr, "client_b_addr")?;
+        let inactivity_timeout =
+            Duration::from_secs(u64::from(config.timeout_seconds.max(1)));
+
+        let socket_a = bind_bridge_socket()?;
+        let socket_b = bind_bridge_socket()?;
+        let port_a = socket_a
+            .local_addr()
+            .map_err(|error| format!("failed to resolve bridge port A: {error}"))?
+            .port();
+        let port_b = socket_b
+            .local_addr()
+            .map_err(|error| format!("failed to resolve bridge port B: {error}"))?
+            .port();
+
+        let bridge_id = Uuid::new_v4().to_string();
+        let inner = Arc::clone(&self.inner);
+        let cleanup_id = bridge_id.clone();
+        let join_handle = tokio::spawn(async move {
+            if let Err(error) =
+                relay_bridge(socket_a, socket_b, endpoint_a, endpoint_b, inactivity_timeout, &inner)
+                    .await
+            {
+                tracing::warn!(bridge_id = %cleanup_id, "dynamic bridge relay exited: {error}");
+            }
+            release_bridge_session(&inner, &cleanup_id);
+        });
+
+        let mut sessions = self
+            .inner
+            .sessions
+            .lock()
+            .expect("bridge session registry should not be poisoned");
+        sessions.insert(
+            bridge_id.clone(),
+            BridgeSession {
+                abort_handle: join_handle.abort_handle(),
+            },
+        );
+        drop(sessions);
+        self.inner.active_relays.fetch_add(1, Ordering::SeqCst);
+
+        Ok(BridgeAllocation {
+            bridge_id,
+            port_a,
+            port_b,
+        })
+    }
+
+    fn destroy_relay(&self, bridge_id: &str) -> std::result::Result<(), String> {
+        let session = self
+            .inner
+            .sessions
+            .lock()
+            .expect("bridge session registry should not be poisoned")
+            .remove(bridge_id);
+        let Some(session) = session else {
+            return Err(format!("bridge `{bridge_id}` is not active"));
+        };
+        session.abort_handle.abort();
+        self.inner.active_relays.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn active_relay_count(&self) -> usize {
+        self.inner.active_relays.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn total_relayed_bytes(&self) -> u64 {
+        self.inner.relayed_bytes.load(Ordering::SeqCst)
+    }
+}
+
+fn bind_bridge_socket() -> std::result::Result<tokio::net::UdpSocket, String> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("failed to bind dynamic bridge socket: {error}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to set dynamic bridge socket nonblocking: {error}"))?;
+    tokio::net::UdpSocket::from_std(socket)
+        .map_err(|error| format!("failed to convert dynamic bridge socket to tokio: {error}"))
+}
+
+fn parse_bridge_endpoint(value: &str, label: &str) -> std::result::Result<SocketAddr, String> {
+    value
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("failed to parse `{label}` as socket address: {error}"))
+}
+
+async fn relay_bridge(
+    socket_a: tokio::net::UdpSocket,
+    socket_b: tokio::net::UdpSocket,
+    endpoint_a: SocketAddr,
+    endpoint_b: SocketAddr,
+    inactivity_timeout: Duration,
+    inner: &BridgeManagerInner,
+) -> std::result::Result<(), String> {
+    let mut buffer_a = [0_u8; UDP_LAYER4_MAX_DATAGRAM_SIZE];
+    let mut buffer_b = [0_u8; UDP_LAYER4_MAX_DATAGRAM_SIZE];
+    let mut deadline = tokio::time::Instant::now() + inactivity_timeout;
+
+    loop {
+        let sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(sleep);
+
+        tokio::select! {
+            _ = &mut sleep => return Ok(()),
+            received = socket_a.recv_from(&mut buffer_a) => {
+                let (size, _) = received.map_err(|error| format!("failed to receive bridge packet on port A: {error}"))?;
+                socket_b
+                    .send_to(&buffer_a[..size], endpoint_b)
+                    .await
+                    .map_err(|error| format!("failed to forward bridge packet to endpoint B: {error}"))?;
+                inner.relayed_bytes.fetch_add(size as u64, Ordering::SeqCst);
+                deadline = tokio::time::Instant::now() + inactivity_timeout;
+            }
+            received = socket_b.recv_from(&mut buffer_b) => {
+                let (size, _) = received.map_err(|error| format!("failed to receive bridge packet on port B: {error}"))?;
+                socket_a
+                    .send_to(&buffer_b[..size], endpoint_a)
+                    .await
+                    .map_err(|error| format!("failed to forward bridge packet to endpoint A: {error}"))?;
+                inner.relayed_bytes.fetch_add(size as u64, Ordering::SeqCst);
+                deadline = tokio::time::Instant::now() + inactivity_timeout;
+            }
+        }
+    }
+}
+
+fn release_bridge_session(inner: &BridgeManagerInner, bridge_id: &str) {
+    let removed = inner
+        .sessions
+        .lock()
+        .expect("bridge session registry should not be poisoned")
+        .remove(bridge_id)
+        .is_some();
+    if removed {
+        inner.active_relays.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -4058,6 +4246,16 @@ fn prewarm_http_component_instance(
             "failed to add secrets vault functions to prewarm HTTP component linker",
         )
     })?;
+    component_bindings::tachyon::mesh::bridge_controller::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add bridge controller functions to prewarm HTTP component linker",
+        )
+    })?;
     #[cfg(feature = "ai-inference")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,
@@ -4290,6 +4488,16 @@ fn prewarm_system_component_instance(
         guest_execution_error(
             error,
             "failed to add routing control functions to prewarm system component linker",
+        )
+    })?;
+    system_component_bindings::tachyon::mesh::bridge_controller::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add bridge controller functions to prewarm system component linker",
         )
     })?;
     system_component_bindings::tachyon::mesh::storage_broker::add_to_linker::<
@@ -5199,6 +5407,7 @@ async fn handle_udp_layer4_datagram(
             request_headers,
             host_identity,
             storage_broker,
+            bridge_manager: Arc::clone(&state.bridge_manager),
             telemetry: None,
             concurrency_limits,
             propagated_headers: Vec::new(),
@@ -5322,6 +5531,7 @@ async fn handle_websocket_connection(
             request_headers: HeaderMap::new(),
             host_identity,
             storage_broker,
+            bridge_manager: Arc::clone(&state.bridge_manager),
             telemetry: None,
             concurrency_limits,
             propagated_headers: Vec::new(),
@@ -5562,6 +5772,7 @@ fn execute_tcp_layer4_guest(
         request_headers: HeaderMap::new(),
         host_identity,
         storage_broker,
+        bridge_manager: Arc::new(BridgeManager::default()),
         telemetry: None,
         concurrency_limits,
         propagated_headers: Vec::new(),
@@ -6515,6 +6726,7 @@ async fn execute_route_request_with_acquired_permit(
     let task_host_identity = Arc::clone(&state.host_identity);
     let task_route_overrides = Arc::clone(&state.route_overrides);
     let task_host_load = Arc::clone(&state.host_load);
+    let task_bridge_manager = Arc::clone(&state.bridge_manager);
     let task_async_log_sender = state.async_log_sender.clone();
     #[cfg(feature = "ai-inference")]
     let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
@@ -6544,6 +6756,7 @@ async fn execute_route_request_with_acquired_permit(
                 request_headers: task_request_headers,
                 host_identity: task_host_identity,
                 storage_broker,
+                bridge_manager: task_bridge_manager,
                 telemetry: telemetry_context,
                 concurrency_limits,
                 propagated_headers: task_propagated_headers,
@@ -7599,6 +7812,16 @@ fn execute_component_guest(
             "failed to add secrets vault functions to component linker",
         )
     })?;
+    component_bindings::tachyon::mesh::bridge_controller::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add bridge controller functions to component linker",
+        )
+    })?;
     #[cfg(feature = "ai-inference")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,
@@ -7624,6 +7847,7 @@ fn execute_component_guest(
     {
         store.data_mut().ai_runtime = Some(Arc::clone(&execution.ai_runtime));
     }
+    store.data_mut().bridge_manager = Arc::clone(&execution.bridge_manager);
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
 
@@ -8053,6 +8277,16 @@ fn execute_system_component_guest(
             "failed to add routing control functions to system component linker",
         )
     })?;
+    system_component_bindings::tachyon::mesh::bridge_controller::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add bridge controller functions to system component linker",
+        )
+    })?;
     system_component_bindings::tachyon::mesh::storage_broker::add_to_linker::<
         ComponentHostState,
         ComponentHostState,
@@ -8081,6 +8315,7 @@ fn execute_system_component_guest(
     );
     store.data_mut().route_overrides = Arc::clone(&execution.route_overrides);
     store.data_mut().host_load = Arc::clone(&execution.host_load);
+    store.data_mut().bridge_manager = Arc::clone(&execution.bridge_manager);
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
 
@@ -10362,6 +10597,7 @@ impl ComponentHostState {
             request_headers,
             host_identity,
             storage_broker,
+            bridge_manager: Arc::new(BridgeManager::default()),
             telemetry,
             concurrency_limits,
             propagated_headers,
@@ -10370,6 +10606,8 @@ impl ComponentHostState {
             host_capabilities: Capabilities::detect(),
             host_load: Arc::new(HostLoadCounters::default()),
             outbound_http_client: reqwest::blocking::Client::new(),
+            route_path: route.path.clone(),
+            route_role: route.role,
             #[cfg(feature = "ai-inference")]
             ai_runtime: None,
             #[cfg(feature = "ai-inference")]
@@ -10436,6 +10674,71 @@ impl ComponentHostState {
         #[cfg(not(feature = "ai-inference"))]
         {
             AcceleratorQueueLoads::default()
+        }
+    }
+
+    fn handle_bridge_create(
+        &self,
+        config: BridgeConfig,
+    ) -> std::result::Result<BridgeAllocation, String> {
+        if self.route_role == RouteRole::System && self.route_path == SYSTEM_BRIDGE_ROUTE {
+            return self.bridge_manager.create_relay(config);
+        }
+
+        let url = rewrite_outbound_http_url("http://mesh/system/bridge", &self.runtime_config);
+        let response = self
+            .outbound_http_client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::to_vec(&config)
+                    .map_err(|error| format!("failed to encode bridge config: {error}"))?,
+            )
+            .send()
+            .map_err(|error| format!("failed to call system bridge controller: {error}"))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .map_err(|error| format!("failed to read bridge controller response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "system bridge controller returned HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|error| format!("failed to decode bridge allocation response: {error}"))
+    }
+
+    fn handle_bridge_destroy(&self, bridge_id: &str) -> std::result::Result<(), String> {
+        if self.route_role == RouteRole::System && self.route_path == SYSTEM_BRIDGE_ROUTE {
+            return self.bridge_manager.destroy_relay(bridge_id);
+        }
+
+        let url = rewrite_outbound_http_url("http://mesh/system/bridge", &self.runtime_config);
+        let response = self
+            .outbound_http_client
+            .delete(&url)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({ "bridge_id": bridge_id }))
+                    .map_err(|error| format!("failed to encode bridge teardown request: {error}"))?,
+            )
+            .send()
+            .map_err(|error| format!("failed to call system bridge teardown: {error}"))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status();
+            let body = response
+                .bytes()
+                .map_err(|error| format!("failed to read bridge teardown response: {error}"))?;
+            Err(format!(
+                "system bridge teardown returned HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&body)
+            ))
         }
     }
 
@@ -11015,6 +11318,60 @@ impl websocket_component_bindings::tachyon::mesh::secrets_vault::Host for Compon
                 websocket_component_bindings::tachyon::mesh::secrets_vault::Error::VaultDisabled
             }
         })
+    }
+}
+
+impl component_bindings::tachyon::mesh::bridge_controller::Host for ComponentHostState {
+    fn create_bridge(
+        &mut self,
+        config: component_bindings::tachyon::mesh::bridge_controller::BridgeConfig,
+    ) -> std::result::Result<
+        component_bindings::tachyon::mesh::bridge_controller::BridgeEndpoints,
+        String,
+    > {
+        let allocation = self.handle_bridge_create(BridgeConfig {
+            client_a_addr: config.client_a_addr,
+            client_b_addr: config.client_b_addr,
+            timeout_seconds: config.timeout_seconds,
+        })?;
+        Ok(
+            component_bindings::tachyon::mesh::bridge_controller::BridgeEndpoints {
+                bridge_id: allocation.bridge_id,
+                port_a: allocation.port_a,
+                port_b: allocation.port_b,
+            },
+        )
+    }
+
+    fn destroy_bridge(&mut self, bridge_id: String) -> std::result::Result<(), String> {
+        self.handle_bridge_destroy(&bridge_id)
+    }
+}
+
+impl system_component_bindings::tachyon::mesh::bridge_controller::Host for ComponentHostState {
+    fn create_bridge(
+        &mut self,
+        config: system_component_bindings::tachyon::mesh::bridge_controller::BridgeConfig,
+    ) -> std::result::Result<
+        system_component_bindings::tachyon::mesh::bridge_controller::BridgeEndpoints,
+        String,
+    > {
+        let allocation = self.handle_bridge_create(BridgeConfig {
+            client_a_addr: config.client_a_addr,
+            client_b_addr: config.client_b_addr,
+            timeout_seconds: config.timeout_seconds,
+        })?;
+        Ok(
+            system_component_bindings::tachyon::mesh::bridge_controller::BridgeEndpoints {
+                bridge_id: allocation.bridge_id,
+                port_a: allocation.port_a,
+                port_b: allocation.port_b,
+            },
+        )
+    }
+
+    fn destroy_bridge(&mut self, bridge_id: String) -> std::result::Result<(), String> {
+        self.handle_bridge_destroy(&bridge_id)
     }
 }
 
@@ -12113,6 +12470,7 @@ mod tests {
             host_identity: test_host_identity(21),
             uds_fast_path: Arc::new(new_uds_fast_path_registry()),
             storage_broker: Arc::new(StorageBrokerManager::new(Arc::clone(&core_store))),
+            bridge_manager: Arc::new(BridgeManager::default()),
             core_store,
             buffered_requests,
             volume_manager: Arc::new(VolumeManager::default()),
@@ -12667,6 +13025,18 @@ mod tests {
         }
     }
 
+    fn mounted_ram_volume(host_path: &Path, guest_path: &str) -> IntegrityVolume {
+        IntegrityVolume {
+            volume_type: VolumeType::Ram,
+            host_path: host_path.display().to_string(),
+            guest_path: guest_path.to_owned(),
+            readonly: false,
+            ttl_seconds: None,
+            idle_timeout: None,
+            eviction_policy: None,
+        }
+    }
+
     fn unique_test_dir(prefix: &str) -> PathBuf {
         let short_prefix: String = prefix
             .chars()
@@ -13059,6 +13429,7 @@ mod tests {
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(30),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
+                bridge_manager: Arc::new(BridgeManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
@@ -13105,6 +13476,7 @@ mod tests {
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(31),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
+                bridge_manager: Arc::new(BridgeManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
@@ -13152,6 +13524,7 @@ mod tests {
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(32),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
+                bridge_manager: Arc::new(BridgeManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
@@ -13209,6 +13582,7 @@ mod tests {
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(35),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
+                bridge_manager: Arc::new(BridgeManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
@@ -13263,6 +13637,7 @@ mod tests {
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(32),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
+                bridge_manager: Arc::new(BridgeManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
                 propagated_headers: Vec::new(),
@@ -13298,6 +13673,7 @@ mod tests {
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(33),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
+                bridge_manager: Arc::new(BridgeManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&config),
                 propagated_headers: Vec::new(),
@@ -13547,6 +13923,7 @@ mod tests {
             request_headers: HeaderMap::new(),
             host_identity: test_host_identity(44),
             storage_broker: Arc::new(StorageBrokerManager::default()),
+            bridge_manager: Arc::new(BridgeManager::default()),
             telemetry: None,
             concurrency_limits: build_concurrency_limits(&config),
             propagated_headers: Vec::new(),
@@ -13578,6 +13955,7 @@ mod tests {
             request_headers: HeaderMap::new(),
             host_identity: test_host_identity(45),
             storage_broker: Arc::new(StorageBrokerManager::default()),
+            bridge_manager: Arc::new(BridgeManager::default()),
             telemetry: None,
             concurrency_limits: build_concurrency_limits(&config),
             propagated_headers: Vec::new(),
@@ -13716,6 +14094,7 @@ mod tests {
             host_identity: test_host_identity(22),
             uds_fast_path: Arc::new(new_uds_fast_path_registry()),
             storage_broker: Arc::new(StorageBrokerManager::new(Arc::clone(&core_store))),
+            bridge_manager: Arc::new(BridgeManager::default()),
             core_store,
             buffered_requests,
             volume_manager: Arc::new(VolumeManager::default()),
@@ -13802,6 +14181,7 @@ mod tests {
                 request_headers: HeaderMap::new(),
                 host_identity: test_host_identity(34),
                 storage_broker: Arc::new(StorageBrokerManager::default()),
+                bridge_manager: Arc::new(BridgeManager::default()),
                 telemetry: None,
                 concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
                 propagated_headers: Vec::new(),
@@ -14599,6 +14979,160 @@ mod tests {
             listener.join_handle.abort();
             let _ = listener.join_handle.await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bridge_manager_relays_packets_between_allocated_ports() {
+        let manager = BridgeManager::default();
+        let client_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client A should bind");
+        let client_b = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client B should bind");
+
+        let allocation = manager
+            .create_relay(BridgeConfig {
+                client_a_addr: client_a
+                    .local_addr()
+                    .expect("client A address should resolve")
+                    .to_string(),
+                client_b_addr: client_b
+                    .local_addr()
+                    .expect("client B address should resolve")
+                    .to_string(),
+                timeout_seconds: 5,
+            })
+            .expect("bridge allocation should succeed");
+        assert_eq!(manager.active_relay_count(), 1);
+
+        client_a
+            .send_to(
+                b"alpha",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), allocation.port_a),
+            )
+            .await
+            .expect("client A should send through the bridge");
+        let mut received = [0_u8; 16];
+        let (size, source) = tokio::time::timeout(Duration::from_secs(1), client_b.recv_from(&mut received))
+            .await
+            .expect("bridge delivery to client B should not time out")
+            .expect("client B should receive relayed datagram");
+        assert_eq!(&received[..size], b"alpha");
+        assert_eq!(source.port(), allocation.port_b);
+
+        client_b
+            .send_to(
+                b"beta",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), allocation.port_b),
+            )
+            .await
+            .expect("client B should send through the bridge");
+        let (size, source) = tokio::time::timeout(Duration::from_secs(1), client_a.recv_from(&mut received))
+            .await
+            .expect("bridge delivery to client A should not time out")
+            .expect("client A should receive relayed datagram");
+        assert_eq!(&received[..size], b"beta");
+        assert_eq!(source.port(), allocation.port_a);
+        assert!(manager.total_relayed_bytes() >= 9);
+
+        manager
+            .destroy_relay(&allocation.bridge_id)
+            .expect("bridge teardown should succeed");
+        assert_eq!(manager.active_relay_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn voip_gate_allocates_bridge_via_system_route_and_relays_packets() {
+        let session_dir = unique_test_dir("tachyon-bridge-sessions");
+        fs::create_dir_all(&session_dir).expect("session dir should exist");
+        let client_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client A should bind");
+        let client_b = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client B should bind");
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose a local address");
+
+        let mut bridge_route = system_targeted_route(SYSTEM_BRIDGE_ROUTE, "system-faas-bridge");
+        bridge_route.volumes = vec![mounted_ram_volume(&session_dir, "/sessions")];
+        let config = validate_integrity_config(IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![
+                targeted_route(
+                    "/api/voip-gate",
+                    vec![weighted_target("guest-voip-gate", 100)],
+                ),
+                bridge_route,
+            ],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("bridge config should validate");
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        let app = build_app(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(host_listener, app)
+                .await
+                .expect("bridge test app should stay up");
+        });
+
+        let allocation = Client::new()
+            .post(format!("http://{host_address}/api/voip-gate"))
+            .header("content-type", "application/json")
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "client_a_addr": client_a.local_addr().expect("client A address should resolve").to_string(),
+                    "client_b_addr": client_b.local_addr().expect("client B address should resolve").to_string(),
+                    "timeout_seconds": 5
+                }))
+                .expect("voip gate request body should serialize"),
+            )
+            .send()
+            .await
+            .expect("voip gate request should succeed")
+            .error_for_status()
+            .expect("voip gate response should be OK")
+            .bytes()
+            .await
+            .map(|body| {
+                serde_json::from_slice::<BridgeAllocation>(&body)
+                    .expect("bridge allocation response should decode")
+            })
+            .expect("voip gate response body should read");
+
+        client_a
+            .send_to(
+                b"hello bridge",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), allocation.port_a),
+            )
+            .await
+            .expect("client A should send a bridged datagram");
+        let mut buffer = [0_u8; 32];
+        let (size, source) = tokio::time::timeout(Duration::from_secs(1), client_b.recv_from(&mut buffer))
+            .await
+            .expect("client B delivery should not time out")
+            .expect("client B should receive bridged datagram");
+        assert_eq!(&buffer[..size], b"hello bridge");
+        assert_eq!(source.port(), allocation.port_b);
+
+        let persisted = fs::read_to_string(session_dir.join(format!("{}.json", allocation.bridge_id)))
+            .expect("system bridge should persist the active session");
+        assert!(persisted.contains("\"status\":\"active\""));
+        assert_eq!(state.bridge_manager.active_relay_count(), 1);
+        state
+            .bridge_manager
+            .destroy_relay(&allocation.bridge_id)
+            .expect("bridge teardown should succeed");
+        assert_eq!(state.bridge_manager.active_relay_count(), 0);
+
+        server.abort();
+        let _ = server.await;
+        let _ = fs::remove_dir_all(session_dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

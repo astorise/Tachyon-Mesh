@@ -2325,6 +2325,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-voip-gate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "guest-volume"
 version = "0.1.0"
 dependencies = [
@@ -5459,6 +5468,15 @@ dependencies = [
  "pkg-config",
  "toml 0.8.2",
  "version-compare",
+]
+
+[[package]]
+name = "system-faas-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.46.0",
 ]
 
 [[package]]

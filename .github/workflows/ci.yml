@@ -64,7 +64,9 @@ jobs:
           cargo build -p guest-log-storm --target wasm32-wasip1 --release
           cargo build -p guest-tcp-echo --target wasm32-wasip1 --release
           cargo build -p guest-udp-echo --target wasm32-wasip2 --release
+          cargo build -p guest-voip-gate --target wasm32-wasip2 --release
           cargo build -p guest-volume --target wasm32-wasip2 --release
+          cargo build -p system-faas-bridge --target wasm32-wasip2 --release
           cargo build -p system-faas-cert-manager --target wasm32-wasip2 --release
           cargo build -p system-faas-buffer --target wasm32-wasip2 --release
           cargo build -p system-faas-gc --target wasm32-wasip2 --release
@@ -108,7 +110,9 @@ jobs:
             target/wasm32-wasip1/release/guest_log_storm.wasm
             target/wasm32-wasip1/release/guest_tcp_echo.wasm
             target/wasm32-wasip2/release/guest_udp_echo.wasm
+            target/wasm32-wasip2/release/guest_voip_gate.wasm
             target/wasm32-wasip2/release/guest_volume.wasm
+            target/wasm32-wasip2/release/system_faas_bridge.wasm
             target/wasm32-wasip2/release/system_faas_cert_manager.wasm
             target/wasm32-wasip2/release/buffer.wasm
             target/wasm32-wasip2/release/system_faas_gc.wasm
