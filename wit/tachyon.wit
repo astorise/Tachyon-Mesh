@@ -112,6 +112,17 @@ interface outbound-http {
     send-request: func(method: string, url: string, headers: headers, body: list<u8>) -> result<response, string>;
 }
 
+interface outbox-store {
+    record outbox-event {
+        id: string,
+        content-type: string,
+        body: list<u8>,
+    }
+
+    claim-events: func(db-url: string, table: string, max-events: u32) -> result<list<outbox-event>, string>;
+    ack-event: func(db-url: string, table: string, id: string) -> result<_, string>;
+}
+
 interface bridge-controller {
     record bridge-config {
         client-a-addr: string,
@@ -175,6 +186,7 @@ world background-system-faas {
     import scaling-metrics;
     import telemetry-reader;
     import outbound-http;
+    import outbox-store;
     import routing-control;
     export on-tick: func();
 }
