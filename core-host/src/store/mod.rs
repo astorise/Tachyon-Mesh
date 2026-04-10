@@ -11,6 +11,7 @@ const CWASM_CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cw
 const TLS_CERTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tls_certs");
 const HIBERNATION_STATE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("hibernation_state");
+const DATA_EVENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("data_events");
 
 #[derive(Clone)]
 pub(crate) struct CoreStore {
@@ -22,6 +23,7 @@ pub(crate) enum CoreStoreBucket {
     CwasmCache,
     TlsCerts,
     HibernationState,
+    DataEvents,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +79,9 @@ impl CoreStore {
             write_txn
                 .open_table(HIBERNATION_STATE_TABLE)
                 .context("failed to open hibernation_state table")?;
+            write_txn
+                .open_table(DATA_EVENTS_TABLE)
+                .context("failed to open data_events table")?;
         }
         write_txn
             .commit()
@@ -94,6 +99,7 @@ impl CoreStore {
             CoreStoreBucket::HibernationState => {
                 read_bytes(&read_txn, HIBERNATION_STATE_TABLE, key)
             }
+            CoreStoreBucket::DataEvents => read_bytes(&read_txn, DATA_EVENTS_TABLE, key),
         }
     }
 
@@ -127,6 +133,14 @@ impl CoreStore {
                     table
                         .insert(key, value)
                         .context("failed to insert hibernation state entry")?;
+                }
+                CoreStoreBucket::DataEvents => {
+                    let mut table = write_txn
+                        .open_table(DATA_EVENTS_TABLE)
+                        .context("failed to open data_events table")?;
+                    table
+                        .insert(key, value)
+                        .context("failed to insert data events entry")?;
                 }
             };
         }
@@ -162,6 +176,13 @@ impl CoreStore {
                         .context("failed to open hibernation_state table")?
                         .remove(key)
                         .context("failed to delete hibernation state entry")?;
+                }
+                CoreStoreBucket::DataEvents => {
+                    write_txn
+                        .open_table(DATA_EVENTS_TABLE)
+                        .context("failed to open data_events table")?
+                        .remove(key)
+                        .context("failed to delete data events entry")?;
                 }
             }
         }
