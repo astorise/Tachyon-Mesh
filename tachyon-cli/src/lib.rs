@@ -192,6 +192,8 @@ pub struct SealedBatchTarget {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SealedConfig {
     pub host_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise_ip: Option<String>,
     pub max_stdout_bytes: usize,
     pub guest_fuel_budget: u64,
     pub guest_memory_limit_bytes: usize,
@@ -234,6 +236,7 @@ struct GenerateRequest {
     tcp_ports: Vec<String>,
     udp_ports: Vec<String>,
     volumes: Vec<String>,
+    advertise_ip: Option<String>,
     telemetry_sample_rate: f64,
     memory_mib: u32,
 }
@@ -331,6 +334,7 @@ fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
         tcp_ports: parse_optional_string_args(&subcommand.matches.args, "tcp-port", "tcp-port")?,
         udp_ports: parse_optional_string_args(&subcommand.matches.args, "udp-port", "udp-port")?,
         volumes: parse_optional_string_args(&subcommand.matches.args, "volume", "volume")?,
+        advertise_ip: parse_optional_arg_value(&subcommand.matches.args, "advertise-ip")?,
         telemetry_sample_rate: parse_telemetry_sample_rate_arg(&subcommand.matches.args)?,
         memory_mib: parse_memory_arg(&subcommand.matches.args)?,
     };
@@ -369,6 +373,7 @@ fn parse_generate_request_from_args(
     let mut tcp_ports = Vec::new();
     let mut udp_ports = Vec::new();
     let mut volumes = Vec::new();
+    let mut advertise_ip = None;
     let mut telemetry_sample_rate = DEFAULT_TELEMETRY_SAMPLE_RATE;
     let mut memory_mib = None;
 
@@ -547,6 +552,11 @@ fn parse_generate_request_from_args(
             continue;
         }
 
+        if let Some(value) = arg.strip_prefix("--advertise-ip=") {
+            advertise_ip = Some(parse_non_empty_arg_value("--advertise-ip", value)?);
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix("--telemetry-sample-rate=") {
             telemetry_sample_rate = parse_telemetry_sample_rate_value(value)?;
             continue;
@@ -562,6 +572,14 @@ fn parse_generate_request_from_args(
                 "missing value for `--route-scale`; expected `--route-scale /api/guest-example=1:8`",
             )?;
             route_scales.push(route_scale);
+            continue;
+        }
+
+        if arg == "--advertise-ip" {
+            let value = args.next().context(
+                "missing value for `--advertise-ip`; expected `--advertise-ip 203.0.113.50`",
+            )?;
+            advertise_ip = Some(parse_non_empty_arg_value("--advertise-ip", &value)?);
             continue;
         }
 
@@ -646,6 +664,7 @@ fn parse_generate_request_from_args(
         tcp_ports,
         udp_ports,
         volumes,
+        advertise_ip,
         telemetry_sample_rate,
         memory_mib,
     }))
@@ -714,6 +733,7 @@ impl SealedConfig {
 
         Ok(Self {
             host_address: DEFAULT_HOST_ADDRESS.to_owned(),
+            advertise_ip: request.advertise_ip,
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             guest_fuel_budget: DEFAULT_GUEST_FUEL_BUDGET,
             guest_memory_limit_bytes,
@@ -775,6 +795,34 @@ fn parse_optional_string_args(
             .collect(),
         _ => bail!("`--{name}` must be provided as one or more strings"),
     }
+}
+
+#[cfg(desktop)]
+fn parse_optional_arg_value(
+    args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
+    name: &str,
+) -> Result<Option<String>> {
+    let Some(arg) = args.get(name) else {
+        return Ok(None);
+    };
+
+    let value = match &arg.value {
+        Value::String(value) => value.clone(),
+        _ => bail!("`--{name}` must be provided as a string"),
+    };
+
+    Ok(Some(parse_non_empty_arg_value(
+        &format!("--{name}"),
+        &value,
+    )?))
+}
+
+fn parse_non_empty_arg_value(flag: &str, value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("`{flag}` must not be empty");
+    }
+    Ok(trimmed.to_owned())
 }
 
 #[cfg(desktop)]
@@ -2093,6 +2141,7 @@ mod tests {
             tcp_ports: vec!["2222=faas-a".to_owned()],
             udp_ports: vec!["5353=faas-a".to_owned()],
             volumes: vec!["/api/guest-example=/tmp/tachyon_data:/app/data:ro".to_owned()],
+            advertise_ip: Some("203.0.113.50".to_owned()),
             telemetry_sample_rate: 0.25,
             memory_mib: 64,
         })
@@ -2100,6 +2149,7 @@ mod tests {
 
         assert_eq!(config.guest_fuel_budget, DEFAULT_GUEST_FUEL_BUDGET);
         assert_eq!(config.guest_memory_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.advertise_ip.as_deref(), Some("203.0.113.50"));
         assert_eq!(
             config.layer4,
             SealedLayer4Config {
@@ -2209,6 +2259,8 @@ mod tests {
                 "2222=faas-a",
                 "--udp-port",
                 "5353=faas-a",
+                "--advertise-ip",
+                "203.0.113.50",
                 "--telemetry-sample-rate",
                 "0.5",
                 "--volume",
@@ -2245,6 +2297,7 @@ mod tests {
                 tcp_ports: vec!["2222=faas-a".to_owned()],
                 udp_ports: vec!["5353=faas-a".to_owned()],
                 volumes: vec!["/api/guest-example=C:\\\\tachyon_data:/app/data:rw".to_owned()],
+                advertise_ip: Some("203.0.113.50".to_owned()),
                 telemetry_sample_rate: 0.5,
                 memory_mib: 64,
             }
