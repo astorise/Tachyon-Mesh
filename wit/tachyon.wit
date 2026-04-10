@@ -108,6 +108,23 @@ interface outbound-http {
     send-request: func(method: string, url: string, headers: headers, body: list<u8>) -> result<response, string>;
 }
 
+interface bridge-controller {
+    record bridge-config {
+        client-a-addr: string,
+        client-b-addr: string,
+        timeout-seconds: u32,
+    }
+
+    record bridge-endpoints {
+        bridge-id: string,
+        port-a: u16,
+        port-b: u16,
+    }
+
+    create-bridge: func(config: bridge-config) -> result<bridge-endpoints, string>;
+    destroy-bridge: func(bridge-id: string) -> result<_, string>;
+}
+
 interface routing-control {
     update-target: func(route-path: string, destination: string) -> result<_, string>;
 }
@@ -123,6 +140,7 @@ interface secrets-vault {
 }
 
 world faas-guest {
+    import bridge-controller;
     import secrets-vault;
     export handler;
 }
@@ -140,6 +158,7 @@ world websocket-faas-guest {
 }
 
 world system-faas-guest {
+    import bridge-controller;
     import telemetry-reader;
     import scaling-metrics;
     import storage-broker;

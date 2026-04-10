@@ -254,6 +254,7 @@ impl TlsManager {
         let secret_access = crate::SecretAccess::from_route(&route, &state.secrets_vault);
         let host_identity = Arc::clone(&state.host_identity);
         let storage_broker = Arc::clone(&state.storage_broker);
+        let bridge_manager = Arc::clone(&state.bridge_manager);
         let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
         let route_overrides = Arc::clone(&state.route_overrides);
         let host_load = Arc::clone(&state.host_load);
@@ -276,6 +277,7 @@ impl TlsManager {
                     request_headers,
                     host_identity,
                     storage_broker,
+                    bridge_manager,
                     telemetry: None,
                     concurrency_limits,
                     propagated_headers: Vec::new(),
