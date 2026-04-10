@@ -47,7 +47,7 @@ pub(crate) enum AcceleratorKind {
 impl AcceleratorKind {
     const ALL: [Self; 4] = [Self::Cpu, Self::Gpu, Self::Npu, Self::Tpu];
 
-    fn from_model_device(device: &crate::ModelDevice) -> Self {
+    pub(crate) fn from_model_device(device: &crate::ModelDevice) -> Self {
         match device {
             crate::ModelDevice::Cpu => Self::Cpu,
             crate::ModelDevice::Cuda | crate::ModelDevice::Metal => Self::Gpu,
@@ -135,7 +135,17 @@ pub(crate) struct SchedulerSnapshot {
     pub(crate) requests_processed: usize,
     pub(crate) max_batch_size: usize,
     pub(crate) queued_requests: usize,
+    pub(crate) realtime_queued: usize,
+    pub(crate) standard_queued: usize,
+    pub(crate) batch_queued: usize,
     pub(crate) completed_aliases: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueueTierSnapshot {
+    pub(crate) realtime: u32,
+    pub(crate) standard: u32,
+    pub(crate) batch: u32,
 }
 
 impl AiInferenceRuntime {
@@ -218,12 +228,30 @@ impl AiInferenceRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_queue_depth_for_test(
+        &self,
+        accelerator: AcceleratorKind,
+        qos: RouteQos,
+        depth: usize,
+    ) {
+        if let Some(scheduler) = self.scheduler_for(accelerator) {
+            scheduler.set_queue_depth_for_test(qos, depth);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn model_memory_residency(&self, alias: &str) -> Option<AcceleratorMemoryResidency> {
         self.models.get(alias).map(|model| model.memory_residency)
     }
 
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
         self.schedulers.contains_key(&accelerator)
+    }
+
+    pub(crate) fn queue_tier_snapshot(&self, accelerator: AcceleratorKind) -> QueueTierSnapshot {
+        self.scheduler_for(accelerator)
+            .map(|scheduler| scheduler.queue_tier_snapshot())
+            .unwrap_or_default()
     }
 
     pub(crate) fn load_component_model(
@@ -333,12 +361,15 @@ impl AcceleratorScheduler {
         let (response_tx, response_rx) = mpsc::channel();
         let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
         self.metrics.queued_requests.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_enqueue(model.qos);
+        let qos = model.qos;
         let job = PrioritizedInferenceJob::new(
             model.qos.score(),
             sequence,
             InferenceJob {
                 alias: model.alias.clone(),
                 model,
+                qos,
                 input: input.into(),
                 response_tx,
             },
@@ -356,6 +387,9 @@ impl AcceleratorScheduler {
             requests_processed: self.metrics.requests_processed.load(Ordering::Relaxed),
             max_batch_size: self.metrics.max_batch_size.load(Ordering::Relaxed),
             queued_requests: self.metrics.queued_requests.load(Ordering::Relaxed),
+            realtime_queued: self.metrics.realtime_queued.load(Ordering::Relaxed),
+            standard_queued: self.metrics.standard_queued.load(Ordering::Relaxed),
+            batch_queued: self.metrics.batch_queued.load(Ordering::Relaxed),
             completed_aliases: self
                 .metrics
                 .completed_aliases
@@ -363,6 +397,23 @@ impl AcceleratorScheduler {
                 .expect("scheduler completion log should not be poisoned")
                 .clone(),
         }
+    }
+
+    fn queue_tier_snapshot(&self) -> QueueTierSnapshot {
+        QueueTierSnapshot {
+            realtime: self.metrics.realtime_queued.load(Ordering::Relaxed) as u32,
+            standard: self.metrics.standard_queued.load(Ordering::Relaxed) as u32,
+            batch: self.metrics.batch_queued.load(Ordering::Relaxed) as u32,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_queue_depth_for_test(&self, qos: RouteQos, depth: usize) {
+        queue_counter(&self.metrics, qos).store(depth, Ordering::Relaxed);
+        let total = self.metrics.realtime_queued.load(Ordering::Relaxed)
+            + self.metrics.standard_queued.load(Ordering::Relaxed)
+            + self.metrics.batch_queued.load(Ordering::Relaxed);
+        self.metrics.queued_requests.store(total, Ordering::Relaxed);
     }
 }
 
@@ -372,12 +423,23 @@ struct SchedulerMetrics {
     requests_processed: AtomicUsize,
     max_batch_size: AtomicUsize,
     queued_requests: AtomicUsize,
+    realtime_queued: AtomicUsize,
+    standard_queued: AtomicUsize,
+    batch_queued: AtomicUsize,
     next_sequence: AtomicUsize,
     #[cfg(test)]
     completed_aliases: Mutex<Vec<String>>,
 }
 
 impl SchedulerMetrics {
+    fn record_enqueue(&self, qos: RouteQos) {
+        queue_counter(self, qos).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_dequeue(&self, qos: RouteQos) {
+        queue_counter(self, qos).fetch_sub(1, Ordering::Relaxed);
+    }
+
     fn record_batch(&self, batch: &[InferenceJob]) {
         self.batches_processed.fetch_add(1, Ordering::Relaxed);
         self.requests_processed
@@ -394,9 +456,18 @@ impl SchedulerMetrics {
     }
 }
 
+fn queue_counter(metrics: &SchedulerMetrics, qos: RouteQos) -> &AtomicUsize {
+    match qos {
+        RouteQos::RealTime => &metrics.realtime_queued,
+        RouteQos::Standard => &metrics.standard_queued,
+        RouteQos::Batch => &metrics.batch_queued,
+    }
+}
+
 struct InferenceJob {
     alias: String,
     model: Arc<CandleModel>,
+    qos: RouteQos,
     input: SharedInputTensor,
     response_tx: mpsc::Sender<Result<WasiTensor, BackendError>>,
 }
@@ -478,6 +549,7 @@ fn run_scheduler(
         metrics.record_batch(&batch);
         for (job, result) in batch.into_iter().zip(results.into_iter()) {
             metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+            metrics.record_dequeue(job.qos);
             let _ = job.response_tx.send(result);
         }
         age_waiting_jobs(&mut queued);

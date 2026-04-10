@@ -162,6 +162,7 @@ const TACHYON_COHORT_HEADER: &str = "x-tachyon-cohort";
 const TACHYON_IDENTITY_HEADER: &str = "x-tachyon-identity";
 const TACHYON_ORIGINAL_ROUTE_HEADER: &str = "x-tachyon-original-route";
 const TACHYON_BUFFER_REPLAY_HEADER: &str = "x-tachyon-buffer-replay";
+const MESH_QOS_OVERRIDE_PREFIX: &str = "mesh-qos:";
 const TACHYON_SYSTEM_PUBLIC_KEY_ENV: &str = "TACHYON_SYSTEM_PUBLIC_KEY";
 #[cfg(unix)]
 const TACHYON_DISCOVERY_DIR_ENV: &str = "TACHYON_DISCOVERY_DIR";
@@ -5667,6 +5668,41 @@ fn requested_model_alias(
         })
 }
 
+#[cfg(feature = "ai-inference")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RouteMeshQosProfile {
+    accelerator: ai_inference::AcceleratorKind,
+    qos: RouteQos,
+}
+
+#[cfg(feature = "ai-inference")]
+fn route_mesh_qos_profile(
+    route: &IntegrityRoute,
+    requested_model: Option<&str>,
+) -> Option<RouteMeshQosProfile> {
+    let binding = requested_model
+        .and_then(|alias| {
+            route
+                .models
+                .iter()
+                .find(|binding| binding.alias.eq_ignore_ascii_case(alias))
+        })
+        .or_else(|| route.models.first())?;
+    Some(RouteMeshQosProfile {
+        accelerator: ai_inference::AcceleratorKind::from_model_device(&binding.device),
+        qos: binding.qos,
+    })
+}
+
+#[cfg(feature = "ai-inference")]
+fn should_consult_mesh_qos_override(profile: RouteMeshQosProfile, local_load: u32) -> bool {
+    match profile.qos {
+        RouteQos::RealTime => local_load > 0,
+        RouteQos::Standard => local_load >= 4,
+        RouteQos::Batch => local_load >= 1_000,
+    }
+}
+
 #[cfg(not(feature = "resiliency"))]
 mod resiliency {
     use super::{execute_route_with_middleware_inner, RouteExecutionResult, RouteInvocation};
@@ -5676,6 +5712,78 @@ mod resiliency {
         invocation: RouteInvocation,
     ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
         execute_route_with_middleware_inner(&invocation).await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_route_override(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    trailer_fields: &GuestHttpFields,
+    hop_limit: HopLimit,
+    trace_id: &str,
+    sampled_execution: bool,
+    destination: &str,
+) -> (Response, Option<u64>) {
+    if destination.starts_with("http://") || destination.starts_with("https://") {
+        match forward_request_to_override(
+            &state.http_client,
+            destination,
+            headers,
+            method,
+            body,
+            hop_limit,
+        )
+        .await
+        {
+            Ok(response) => (response, None),
+            Err((status, message)) => ((status, message).into_response(), None),
+        }
+    } else {
+        let override_path = normalize_route_path(destination);
+        match runtime.config.sealed_route(&override_path).cloned() {
+            Some(override_route) => {
+                let override_headers = clone_headers_with_original_route(headers, route);
+                match execute_route_with_middleware(
+                    state,
+                    runtime,
+                    &override_route,
+                    &override_headers,
+                    method,
+                    uri,
+                    body,
+                    trailer_fields,
+                    hop_limit,
+                    Some(trace_id),
+                    sampled_execution,
+                    None,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        let fuel_consumed = result.fuel_consumed;
+                        (guest_response_into_response(result), fuel_consumed)
+                    }
+                    Err((status, message)) => ((status, message).into_response(), None),
+                }
+            }
+            None => (
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "route override for `{}` points to missing route `{override_path}`",
+                        route.path
+                    ),
+                )
+                    .into_response(),
+                None,
+            ),
+        }
     }
 }
 
@@ -5750,73 +5858,61 @@ async fn faas_handler(
                 let required_capabilities =
                     Capabilities::from_mask(selected_target.required_capability_mask);
                 let local_supports_target = state.host_capabilities.supports(required_capabilities);
-
-                if let Some(destination) = control_plane_override_destination(
-                    state.route_overrides.as_ref(),
-                    &state.peer_capabilities,
-                    &route.path,
-                    &headers,
-                    selected_target.required_capability_mask,
+                #[cfg(feature = "ai-inference")]
+                let mesh_qos_destination = route_mesh_qos_profile(
+                    &route,
                     requested_model.as_deref(),
-                ) {
-                    if destination.starts_with("http://") || destination.starts_with("https://") {
-                        match forward_request_to_override(
-                            &state.http_client,
-                            &destination,
+                )
+                .and_then(|profile| {
+                    let tier_snapshot = runtime.ai_runtime.queue_tier_snapshot(profile.accelerator);
+                    let local_queue_depth = match profile.qos {
+                        RouteQos::RealTime => tier_snapshot.realtime,
+                        RouteQos::Standard => tier_snapshot.standard,
+                        RouteQos::Batch => tier_snapshot.batch,
+                    };
+                    should_consult_mesh_qos_override(profile, local_queue_depth).then(|| {
+                        control_plane_override_destination(
+                            state.route_overrides.as_ref(),
+                            &state.peer_capabilities,
+                            &format!(
+                                "{MESH_QOS_OVERRIDE_PREFIX}{}",
+                                normalize_route_path(&route.path)
+                            ),
                             &headers,
-                            &method,
-                            &body,
-                            hop_limit,
+                            selected_target.required_capability_mask,
+                            requested_model.as_deref(),
                         )
-                        .await
-                        {
-                            Ok(response) => (response, None),
-                            Err((status, message)) => ((status, message).into_response(), None),
-                        }
-                    } else {
-                        let override_path = normalize_route_path(&destination);
-                        match runtime.config.sealed_route(&override_path).cloned() {
-                        Some(override_route) => {
-                            let override_headers =
-                                clone_headers_with_original_route(&headers, &route);
-                            match execute_route_with_middleware(
-                                &state,
-                                &runtime,
-                                &override_route,
-                                &override_headers,
-                                &method,
-                                &uri,
-                                &body,
-                                &trailer_fields,
-                                hop_limit,
-                                Some(&trace_id),
-                                sampled_execution,
-                                None,
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let fuel_consumed = result.fuel_consumed;
-                                    (guest_response_into_response(result), fuel_consumed)
-                                }
-                                Err((status, message)) => {
-                                    ((status, message).into_response(), None)
-                                }
-                            }
-                        }
-                        None => (
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!(
-                                    "route override for `{}` points to missing route `{override_path}`",
-                                    route.path
-                                ),
-                            )
-                                .into_response(),
-                            None,
-                        ),
-                    }
-                    }
+                    })?
+                });
+
+                #[cfg(not(feature = "ai-inference"))]
+                let mesh_qos_destination: Option<String> = None;
+
+                if let Some(destination) = mesh_qos_destination.or_else(|| {
+                    control_plane_override_destination(
+                        state.route_overrides.as_ref(),
+                        &state.peer_capabilities,
+                        &route.path,
+                        &headers,
+                        selected_target.required_capability_mask,
+                        requested_model.as_deref(),
+                    )
+                }) {
+                    execute_route_override(
+                        &state,
+                        &runtime,
+                        &route,
+                        &headers,
+                        &method,
+                        &uri,
+                        &body,
+                        &trailer_fields,
+                        hop_limit,
+                        &trace_id,
+                        sampled_execution,
+                        &destination,
+                    )
+                    .await
                 } else if !local_supports_target {
                     let missing = state
                         .host_capabilities
@@ -8623,6 +8719,24 @@ fn normalize_route_path(path: &str) -> String {
     }
 }
 
+fn normalize_route_override_key(route_key: &str) -> String {
+    if let Some(route_path) = route_key.strip_prefix(MESH_QOS_OVERRIDE_PREFIX) {
+        return format!(
+            "{MESH_QOS_OVERRIDE_PREFIX}{}",
+            normalize_route_path(route_path)
+        );
+    }
+
+    normalize_route_path(route_key)
+}
+
+fn route_path_for_override_key(route_key: &str) -> String {
+    route_key
+        .strip_prefix(MESH_QOS_OVERRIDE_PREFIX)
+        .map(normalize_route_path)
+        .unwrap_or_else(|| normalize_route_path(route_key))
+}
+
 fn resolve_guest_module_path(
     function_name: &str,
 ) -> std::result::Result<PathBuf, GuestModuleNotFound> {
@@ -10136,6 +10250,38 @@ impl ComponentHostState {
         }
     }
 
+    fn accelerator_queue_loads(&self) -> AcceleratorQueueLoads {
+        #[cfg(feature = "ai-inference")]
+        {
+            let Some(runtime) = self.ai_runtime.as_ref() else {
+                return AcceleratorQueueLoads::default();
+            };
+            let cpu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Cpu);
+            let gpu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Gpu);
+            let npu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Npu);
+            let tpu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Tpu);
+            AcceleratorQueueLoads {
+                cpu_rt_load: cpu.realtime,
+                cpu_standard_load: cpu.standard,
+                cpu_batch_load: cpu.batch,
+                gpu_rt_load: gpu.realtime,
+                gpu_standard_load: gpu.standard,
+                gpu_batch_load: gpu.batch,
+                npu_rt_load: npu.realtime,
+                npu_standard_load: npu.standard,
+                npu_batch_load: npu.batch,
+                tpu_rt_load: tpu.realtime,
+                tpu_standard_load: tpu.standard,
+                tpu_batch_load: tpu.batch,
+            }
+        }
+
+        #[cfg(not(feature = "ai-inference"))]
+        {
+            AcceleratorQueueLoads::default()
+        }
+    }
+
     #[cfg(feature = "ai-inference")]
     fn load_accelerator_model(
         &mut self,
@@ -10192,6 +10338,34 @@ struct ControlPlaneSnapshot {
     allocated_memory_pages: u32,
     capability_mask: u64,
     capabilities: Vec<String>,
+    cpu_rt_load: u32,
+    cpu_standard_load: u32,
+    cpu_batch_load: u32,
+    gpu_rt_load: u32,
+    gpu_standard_load: u32,
+    gpu_batch_load: u32,
+    npu_rt_load: u32,
+    npu_standard_load: u32,
+    npu_batch_load: u32,
+    tpu_rt_load: u32,
+    tpu_standard_load: u32,
+    tpu_batch_load: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct AcceleratorQueueLoads {
+    cpu_rt_load: u32,
+    cpu_standard_load: u32,
+    cpu_batch_load: u32,
+    gpu_rt_load: u32,
+    gpu_standard_load: u32,
+    gpu_batch_load: u32,
+    npu_rt_load: u32,
+    npu_standard_load: u32,
+    npu_batch_load: u32,
+    tpu_rt_load: u32,
+    tpu_standard_load: u32,
+    tpu_batch_load: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -10232,6 +10406,7 @@ fn control_plane_snapshot(
     concurrency_limits: &HashMap<String, Arc<RouteExecutionControl>>,
     runtime_config: &IntegrityConfig,
     host_capabilities: Capabilities,
+    queue_loads: AcceleratorQueueLoads,
 ) -> ControlPlaneSnapshot {
     let active_tasks = telemetry::active_requests(telemetry).min(u32::MAX as usize) as u32;
     let active_instances = host_load.active_instances.load(Ordering::SeqCst);
@@ -10258,6 +10433,18 @@ fn control_plane_snapshot(
         allocated_memory_pages: allocated_memory_pages.min(u32::MAX as usize) as u32,
         capability_mask: host_capabilities.mask,
         capabilities: host_capabilities.names(),
+        cpu_rt_load: queue_loads.cpu_rt_load,
+        cpu_standard_load: queue_loads.cpu_standard_load,
+        cpu_batch_load: queue_loads.cpu_batch_load,
+        gpu_rt_load: queue_loads.gpu_rt_load,
+        gpu_standard_load: queue_loads.gpu_standard_load,
+        gpu_batch_load: queue_loads.gpu_batch_load,
+        npu_rt_load: queue_loads.npu_rt_load,
+        npu_standard_load: queue_loads.npu_standard_load,
+        npu_batch_load: queue_loads.npu_batch_load,
+        tpu_rt_load: queue_loads.tpu_rt_load,
+        tpu_standard_load: queue_loads.tpu_standard_load,
+        tpu_batch_load: queue_loads.tpu_batch_load,
     }
 }
 
@@ -10275,7 +10462,7 @@ fn control_plane_override_destination(
 
     let raw = route_overrides
         .load()
-        .get(&normalize_route_path(route_path))
+        .get(&normalize_route_override_key(route_path))
         .cloned()?;
 
     if let Ok(descriptor) = serde_json::from_str::<RouteOverrideDescriptor>(&raw) {
@@ -10309,7 +10496,7 @@ fn update_control_plane_route_override(
     route_path: &str,
     destination: &str,
 ) -> std::result::Result<(), String> {
-    let normalized_route = normalize_route_path(route_path);
+    let normalized_route = normalize_route_override_key(route_path);
     let normalized_destination = destination.trim();
     if normalized_destination.is_empty() {
         return Err("route override destinations must not be empty".to_owned());
@@ -10462,7 +10649,7 @@ fn cached_capable_peer_destination(
             (peer.capability_mask & required_capability_mask) == required_capability_mask
         })
         .min_by_key(|(_, peer)| peer.effective_pressure)
-        .map(|(base_url, _)| format!("{base_url}{}", normalize_route_path(route_path)))
+        .map(|(base_url, _)| format!("{base_url}{}", route_path_for_override_key(route_path)))
 }
 
 fn build_component_wasi_ctx(
@@ -10794,6 +10981,7 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             self.concurrency_limits.as_ref(),
             &self.runtime_config,
             self.host_capabilities,
+            self.accelerator_queue_loads(),
         );
         let hot_models = self.hot_model_aliases();
 
@@ -10808,6 +10996,18 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             allocated_memory_pages: control_plane.allocated_memory_pages,
             capability_mask: control_plane.capability_mask,
             capabilities: control_plane.capabilities,
+            cpu_rt_load: control_plane.cpu_rt_load,
+            cpu_standard_load: control_plane.cpu_standard_load,
+            cpu_batch_load: control_plane.cpu_batch_load,
+            gpu_rt_load: control_plane.gpu_rt_load,
+            gpu_standard_load: control_plane.gpu_standard_load,
+            gpu_batch_load: control_plane.gpu_batch_load,
+            npu_rt_load: control_plane.npu_rt_load,
+            npu_standard_load: control_plane.npu_standard_load,
+            npu_batch_load: control_plane.npu_batch_load,
+            tpu_rt_load: control_plane.tpu_rt_load,
+            tpu_standard_load: control_plane.tpu_standard_load,
+            tpu_batch_load: control_plane.tpu_batch_load,
             hot_models,
             dropped_events,
             last_status,
@@ -10839,6 +11039,18 @@ impl control_plane_component_bindings::tachyon::mesh::telemetry_reader::Host
             allocated_memory_pages: snapshot.allocated_memory_pages,
             capability_mask: snapshot.capability_mask,
             capabilities: snapshot.capabilities,
+            cpu_rt_load: snapshot.cpu_rt_load,
+            cpu_standard_load: snapshot.cpu_standard_load,
+            cpu_batch_load: snapshot.cpu_batch_load,
+            gpu_rt_load: snapshot.gpu_rt_load,
+            gpu_standard_load: snapshot.gpu_standard_load,
+            gpu_batch_load: snapshot.gpu_batch_load,
+            npu_rt_load: snapshot.npu_rt_load,
+            npu_standard_load: snapshot.npu_standard_load,
+            npu_batch_load: snapshot.npu_batch_load,
+            tpu_rt_load: snapshot.tpu_rt_load,
+            tpu_standard_load: snapshot.tpu_standard_load,
+            tpu_batch_load: snapshot.tpu_batch_load,
             hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
@@ -10868,6 +11080,18 @@ impl background_component_bindings::tachyon::mesh::telemetry_reader::Host for Co
             allocated_memory_pages: snapshot.allocated_memory_pages,
             capability_mask: snapshot.capability_mask,
             capabilities: snapshot.capabilities,
+            cpu_rt_load: snapshot.cpu_rt_load,
+            cpu_standard_load: snapshot.cpu_standard_load,
+            cpu_batch_load: snapshot.cpu_batch_load,
+            gpu_rt_load: snapshot.gpu_rt_load,
+            gpu_standard_load: snapshot.gpu_standard_load,
+            gpu_batch_load: snapshot.gpu_batch_load,
+            npu_rt_load: snapshot.npu_rt_load,
+            npu_standard_load: snapshot.npu_standard_load,
+            npu_batch_load: snapshot.npu_batch_load,
+            tpu_rt_load: snapshot.tpu_rt_load,
+            tpu_standard_load: snapshot.tpu_standard_load,
+            tpu_batch_load: snapshot.tpu_batch_load,
             hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
@@ -17240,6 +17464,228 @@ mod tests {
         assert!(body.contains("accel:cuda"));
 
         host_server.abort();
+    }
+
+    #[cfg(feature = "ai-inference")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
+        use axum::{
+            body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post, Router,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct PeerCapture {
+            bodies: Vec<String>,
+        }
+
+        async fn peer_target(
+            State(state): State<Arc<Mutex<PeerCapture>>>,
+            body: AxumBytes,
+        ) -> impl IntoResponse {
+            state
+                .lock()
+                .expect("peer capture should not be poisoned")
+                .bodies
+                .push(String::from_utf8_lossy(&body).to_string());
+            (StatusCode::OK, "peer-realtime")
+        }
+
+        let peer_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let peer_app = Router::new()
+            .route("/api/guest-ai", post(peer_target))
+            .with_state(Arc::clone(&peer_capture));
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let peer_address = peer_listener
+            .local_addr()
+            .expect("peer listener should expose an address");
+        let peer_server = tokio::spawn(async move {
+            axum::serve(peer_listener, peer_app)
+                .await
+                .expect("peer app should stay up");
+        });
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+
+        let mut route =
+            targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
+        route.models = vec![
+            IntegrityModelBinding {
+                alias: "gpu-live-chat".to_owned(),
+                path: "/models/gpu-live-chat.gguf".to_owned(),
+                device: ModelDevice::Cuda,
+                qos: RouteQos::RealTime,
+            },
+            IntegrityModelBinding {
+                alias: "gpu-batch".to_owned(),
+                path: "/models/gpu-batch.gguf".to_owned(),
+                device: ModelDevice::Cuda,
+                qos: RouteQos::Batch,
+            },
+        ];
+        let config = IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        state.runtime.load().ai_runtime.set_queue_depth_for_test(
+            ai_inference::AcceleratorKind::Gpu,
+            RouteQos::RealTime,
+            2,
+        );
+        update_control_plane_route_override(
+            state.route_overrides.as_ref(),
+            &state.peer_capabilities,
+            &format!("{MESH_QOS_OVERRIDE_PREFIX}/api/guest-ai"),
+            &format!("http://{peer_address}/api/guest-ai"),
+        )
+        .expect("mesh qos override should install");
+
+        let host_app = build_app(state);
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        let response = Client::new()
+            .post(format!("http://{host_address}/api/guest-ai"))
+            .header("x-tachyon-model", "gpu-live-chat")
+            .body("realtime-request")
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("response body should decode"),
+            "peer-realtime"
+        );
+        let peer_capture = peer_capture
+            .lock()
+            .expect("peer capture should not be poisoned");
+        assert_eq!(peer_capture.bodies, vec!["realtime-request".to_owned()]);
+
+        host_server.abort();
+        peer_server.abort();
+    }
+
+    #[cfg(feature = "ai-inference")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold() {
+        use axum::{
+            body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post, Router,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct PeerCapture {
+            bodies: Vec<String>,
+        }
+
+        async fn peer_target(
+            State(state): State<Arc<Mutex<PeerCapture>>>,
+            body: AxumBytes,
+        ) -> impl IntoResponse {
+            state
+                .lock()
+                .expect("peer capture should not be poisoned")
+                .bodies
+                .push(String::from_utf8_lossy(&body).to_string());
+            (StatusCode::OK, "peer-batch")
+        }
+
+        let peer_capture = Arc::new(Mutex::new(PeerCapture::default()));
+        let peer_app = Router::new()
+            .route("/api/guest-ai", post(peer_target))
+            .with_state(Arc::clone(&peer_capture));
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let peer_address = peer_listener
+            .local_addr()
+            .expect("peer listener should expose an address");
+        let peer_server = tokio::spawn(async move {
+            axum::serve(peer_listener, peer_app)
+                .await
+                .expect("peer app should stay up");
+        });
+
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("host listener should bind");
+        let host_address = host_listener
+            .local_addr()
+            .expect("host listener should expose an address");
+
+        let mut route =
+            targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
+        route.models = vec![
+            IntegrityModelBinding {
+                alias: "gpu-live-chat".to_owned(),
+                path: "/models/gpu-live-chat.gguf".to_owned(),
+                device: ModelDevice::Cuda,
+                qos: RouteQos::RealTime,
+            },
+            IntegrityModelBinding {
+                alias: "gpu-batch".to_owned(),
+                path: "/models/gpu-batch.gguf".to_owned(),
+                device: ModelDevice::Cuda,
+                qos: RouteQos::Batch,
+            },
+        ];
+        let config = IntegrityConfig {
+            host_address: host_address.to_string(),
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        };
+        let state = build_test_state(config, telemetry::init_test_telemetry());
+        state.runtime.load().ai_runtime.set_queue_depth_for_test(
+            ai_inference::AcceleratorKind::Gpu,
+            RouteQos::Batch,
+            32,
+        );
+        update_control_plane_route_override(
+            state.route_overrides.as_ref(),
+            &state.peer_capabilities,
+            &format!("{MESH_QOS_OVERRIDE_PREFIX}/api/guest-ai"),
+            &format!("http://{peer_address}/api/guest-ai"),
+        )
+        .expect("mesh qos override should install");
+
+        let host_app = build_app(state);
+        let host_server = tokio::spawn(async move {
+            axum::serve(host_listener, host_app)
+                .await
+                .expect("host app should stay up");
+        });
+
+        let response = Client::new()
+            .post(format!("http://{host_address}/api/guest-ai"))
+            .header("x-tachyon-model", "gpu-batch")
+            .body("batch-request")
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("response body should decode"),
+            expected_guest_example_body("FaaS received: batch-request")
+        );
+        let peer_capture = peer_capture
+            .lock()
+            .expect("peer capture should not be poisoned");
+        assert!(peer_capture.bodies.is_empty());
+
+        host_server.abort();
+        peer_server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
