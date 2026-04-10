@@ -16,6 +16,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::{Frame, SizeHint};
+use hyper::service::service_fn;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as HyperConnectionBuilder,
@@ -32,6 +33,7 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    convert::Infallible,
     fmt, fs,
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -150,6 +152,7 @@ const ACME_STAGING_MOCK_MODE: &str = "ACME_STAGING_MOCK";
 const CERT_MANAGER_GUEST_CERT_DIR: &str = "/app/certs";
 const SYSTEM_METERING_ROUTE: &str = "/system/metering";
 const SYSTEM_CERT_MANAGER_ROUTE: &str = "/system/cert-manager";
+const SYSTEM_GATEWAY_ROUTE: &str = "/system/gateway";
 const SYSTEM_LOGGER_ROUTE: &str = "/system/logger";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
@@ -164,6 +167,7 @@ const TACHYON_ORIGINAL_ROUTE_HEADER: &str = "x-tachyon-original-route";
 const TACHYON_BUFFER_REPLAY_HEADER: &str = "x-tachyon-buffer-replay";
 const MESH_QOS_OVERRIDE_PREFIX: &str = "mesh-qos:";
 const TACHYON_SYSTEM_PUBLIC_KEY_ENV: &str = "TACHYON_SYSTEM_PUBLIC_KEY";
+const TACHYON_MTLS_ADDRESS_ENV: &str = "TACHYON_MTLS_ADDRESS";
 #[cfg(unix)]
 const TACHYON_DISCOVERY_DIR_ENV: &str = "TACHYON_DISCOVERY_DIR";
 const LOG_QUEUE_CAPACITY: usize = 64_000;
@@ -302,6 +306,7 @@ struct AppState {
     host_load: Arc<HostLoadCounters>,
     telemetry: TelemetryHandle,
     tls_manager: Arc<tls_runtime::TlsManager>,
+    mtls_gateway: Option<Arc<tls_runtime::MtlsGatewayConfig>>,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     manifest_path: PathBuf,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -508,6 +513,12 @@ struct UdpLayer4ListenerHandle {
 }
 
 struct HttpsListenerHandle {
+    #[cfg_attr(not(test), allow(dead_code))]
+    local_addr: SocketAddr,
+    join_handle: tokio::task::JoinHandle<()>,
+}
+
+struct MtlsGatewayListenerHandle {
     #[cfg_attr(not(test), allow(dead_code))]
     local_addr: SocketAddr,
     join_handle: tokio::task::JoinHandle<()>,
@@ -1944,6 +1955,7 @@ async fn serve_host() -> Result<()> {
     let host_capabilities = Capabilities::detect();
     let host_load = Arc::new(HostLoadCounters::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
+    let mtls_gateway = tls_runtime::load_mtls_gateway_config_from_env()?;
     let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
     background_workers.start_for_runtime(
         &runtime,
@@ -1974,6 +1986,7 @@ async fn serve_host() -> Result<()> {
         host_load,
         telemetry,
         tls_manager,
+        mtls_gateway: mtls_gateway.map(Arc::new),
         manifest_path,
         background_workers: Arc::clone(&background_workers),
     };
@@ -1993,6 +2006,7 @@ async fn serve_host() -> Result<()> {
     spawn_pressure_monitor(state.clone());
     let app = build_app(state.clone());
     let https_listener = start_https_listener(state.clone(), app.clone()).await?;
+    let mtls_listener = start_mtls_gateway_listener(state.clone()).await?;
     let http3_listener = start_http3_listener(state.clone(), app.clone()).await?;
     let udp_layer4_listeners = start_udp_layer4_listeners(state.clone()).await?;
     let tcp_layer4_listeners = start_tcp_layer4_listeners(state).await?;
@@ -2019,6 +2033,10 @@ async fn serve_host() -> Result<()> {
         let _ = server.await;
     }
     if let Some(listener) = https_listener {
+        listener.join_handle.abort();
+        let _ = listener.join_handle.await;
+    }
+    if let Some(listener) = mtls_listener {
         listener.join_handle.abort();
         let _ = listener.join_handle.await;
     }
@@ -4762,6 +4780,145 @@ async fn handle_https_connection(
         .serve_connection_with_upgrades(TokioIo::new(tls_stream), TowerToHyperService::new(app))
         .await
         .map_err(|error| anyhow!("HTTPS connection exited unexpectedly: {error}"))
+}
+
+async fn start_mtls_gateway_listener(state: AppState) -> Result<Option<MtlsGatewayListenerHandle>> {
+    let Some(config) = state.mtls_gateway.as_ref().cloned() else {
+        return Ok(None);
+    };
+    let runtime = state.runtime.load_full();
+    if runtime.config.sealed_route(SYSTEM_GATEWAY_ROUTE).is_none() {
+        return Ok(None);
+    }
+
+    let listener = tokio::net::TcpListener::bind(config.bind_address)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to bind mTLS gateway listener on {}",
+                config.bind_address
+            )
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read mTLS gateway listener local address")?;
+
+    let join_handle = tokio::spawn(async move {
+        loop {
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::warn!("mTLS gateway listener accept failed: {error}");
+                    continue;
+                }
+            };
+            let connection_state = state.clone();
+            let server_config = Arc::clone(&config.server_config);
+            tokio::spawn(async move {
+                if let Err(error) =
+                    handle_mtls_gateway_connection(connection_state, server_config, stream).await
+                {
+                    tracing::warn!(remote = %peer_addr, "mTLS gateway connection failed: {error:#}");
+                }
+            });
+        }
+    });
+
+    Ok(Some(MtlsGatewayListenerHandle {
+        local_addr,
+        join_handle,
+    }))
+}
+
+async fn handle_mtls_gateway_connection(
+    state: AppState,
+    server_config: Arc<tokio_rustls::rustls::ServerConfig>,
+    stream: tokio::net::TcpStream,
+) -> Result<()> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+    let tls_stream = acceptor
+        .accept(stream)
+        .await
+        .context("failed to complete mTLS handshake")?;
+
+    HyperConnectionBuilder::new(TokioExecutor::new())
+        .serve_connection_with_upgrades(
+            TokioIo::new(tls_stream),
+            service_fn(move |request| {
+                let state = state.clone();
+                async move {
+                    Ok::<_, Infallible>(dispatch_mtls_gateway_request(state, request).await)
+                }
+            }),
+        )
+        .await
+        .map_err(|error| anyhow!("mTLS gateway connection exited unexpectedly: {error}"))
+}
+
+async fn dispatch_mtls_gateway_request(
+    state: AppState,
+    request: hyper::Request<hyper::body::Incoming>,
+) -> Response {
+    let runtime = state.runtime.load_full();
+    let Some(route) = runtime.config.sealed_route(SYSTEM_GATEWAY_ROUTE).cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sealed manifest does not define `/system/gateway`",
+        )
+            .into_response();
+    };
+
+    let (parts, body) = request.into_parts();
+    let original_route = parts
+        .uri
+        .path_and_query()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| parts.uri.path().to_owned());
+    let body = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read mTLS request body: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let mut headers = parts.headers;
+    let original_route_value = match HeaderValue::from_str(&original_route) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid original route header value `{original_route}`: {error}"),
+            )
+                .into_response();
+        }
+    };
+    headers.insert(TACHYON_ORIGINAL_ROUTE_HEADER, original_route_value);
+
+    let gateway_uri = Uri::from_static(SYSTEM_GATEWAY_ROUTE);
+    let trailers = GuestHttpFields::new();
+    let trace_id = Uuid::new_v4().to_string();
+    match execute_route_with_middleware(
+        &state,
+        &runtime,
+        &route,
+        &headers,
+        &parts.method,
+        &gateway_uri,
+        &body,
+        &trailers,
+        HopLimit(DEFAULT_HOP_LIMIT),
+        Some(&trace_id),
+        false,
+        None,
+    )
+    .await
+    {
+        Ok(result) => guest_response_into_response(result),
+        Err((status, message)) => (status, message).into_response(),
+    }
 }
 
 #[cfg(feature = "http3")]
@@ -11575,8 +11732,13 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use http_body_util::{BodyExt, Full};
     use prost::Message;
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose, SanType,
+    };
     use std::{
         fs,
+        net::{IpAddr, Ipv4Addr},
         path::{Path, PathBuf},
         sync::Arc,
     };
@@ -11619,6 +11781,61 @@ mod tests {
             "{payload} | env: missing | secret: {}",
             expected_secret_status()
         )
+    }
+
+    struct MtlsTestMaterial {
+        ca_pem: String,
+        server_cert_pem: String,
+        server_key_pem: String,
+        client_cert_pem: String,
+        client_key_pem: String,
+    }
+
+    fn generate_mtls_test_material() -> MtlsTestMaterial {
+        let ca_key = KeyPair::generate().expect("CA key should generate");
+        let mut ca_params =
+            CertificateParams::new(vec!["tachyon-mtls-ca".to_owned()]).expect("CA params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .expect("CA certificate should self-sign");
+
+        let server_key = KeyPair::generate().expect("server key should generate");
+        let mut server_params =
+            CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+        server_params
+            .subject_alt_names
+            .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        server_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .expect("server certificate should sign");
+
+        let client_key = KeyPair::generate().expect("client key should generate");
+        let mut client_params =
+            CertificateParams::new(vec!["tachyon-client".to_owned()]).expect("client params");
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_cert, &ca_key)
+            .expect("client certificate should sign");
+
+        MtlsTestMaterial {
+            ca_pem: ca_cert.pem(),
+            server_cert_pem: server_cert.pem(),
+            server_key_pem: server_key.serialize_pem(),
+            client_cert_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+        }
     }
 
     fn encode_test_grpc_message<T>(message: &T) -> Vec<u8>
@@ -11905,6 +12122,7 @@ mod tests {
             host_load: Arc::new(HostLoadCounters::default()),
             telemetry,
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
+            mtls_gateway: None,
             manifest_path,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         };
@@ -13507,6 +13725,7 @@ mod tests {
             host_load: Arc::new(HostLoadCounters::default()),
             telemetry: telemetry::init_test_telemetry(),
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
+            mtls_gateway: None,
             manifest_path: core_store_manifest,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         };
@@ -14437,6 +14656,95 @@ mod tests {
         listener.join_handle.abort();
         let _ = listener.join_handle.await;
         let _ = fs::remove_dir_all(cert_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mtls_gateway_rejects_missing_client_cert_and_forwards_authorized_requests() {
+        init_host_tracing();
+
+        let mtls = generate_mtls_test_material();
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP listener should bind");
+        let http_address = http_listener
+            .local_addr()
+            .expect("HTTP listener should expose a local address");
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = http_address.to_string();
+        let mut gateway_route = IntegrityRoute::system(SYSTEM_GATEWAY_ROUTE);
+        gateway_route.targets = vec![weighted_target("system-faas-gateway", 100)];
+        config.routes.push(gateway_route);
+        let config =
+            validate_integrity_config(config).expect("mTLS gateway config should validate");
+        let mut state = build_test_state(config, telemetry::init_test_telemetry());
+        state.mtls_gateway = Some(Arc::new(tls_runtime::MtlsGatewayConfig {
+            bind_address: "127.0.0.1:0"
+                .parse()
+                .expect("mTLS bind address should parse"),
+            server_config: Arc::new(
+                tls_runtime::build_mtls_server_config(
+                    &mtls.server_cert_pem,
+                    &mtls.server_key_pem,
+                    &mtls.ca_pem,
+                )
+                .expect("mTLS server config should build"),
+            ),
+        }));
+
+        let app = build_app(state.clone());
+        let http_server = tokio::spawn(async move {
+            axum::serve(http_listener, app)
+                .await
+                .expect("HTTP app should stay up");
+        });
+        let listener = start_mtls_gateway_listener(state.clone())
+            .await
+            .expect("mTLS gateway listener should start")
+            .expect("mTLS gateway listener should be enabled");
+        let gateway_addr = listener.local_addr;
+        let url = format!(
+            "https://localhost:{}/api/guest-example",
+            gateway_addr.port()
+        );
+
+        let unauthorized = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("unauthorized reqwest client should build")
+            .get(&url)
+            .send()
+            .await;
+        assert!(
+            unauthorized.is_err(),
+            "mTLS gateway should reject requests without a client certificate"
+        );
+
+        let client_identity = reqwest::Identity::from_pem(
+            format!("{}{}", mtls.client_cert_pem, mtls.client_key_pem).as_bytes(),
+        )
+        .expect("client identity should load");
+        let authorized = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .identity(client_identity)
+            .build()
+            .expect("authorized reqwest client should build")
+            .get(&url)
+            .send()
+            .await
+            .expect("authorized mTLS request should succeed");
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert_eq!(
+            authorized
+                .text()
+                .await
+                .expect("authorized response should decode"),
+            expected_guest_example_body("FaaS received an empty payload")
+        );
+
+        listener.join_handle.abort();
+        let _ = listener.join_handle.await;
+        http_server.abort();
+        let _ = http_server.await;
     }
 
     #[cfg(feature = "http3")]

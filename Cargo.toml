@@ -20,6 +20,7 @@ members = [
     "system-faas-k8s-scaler",
     "system-faas-keda",
     "system-faas-logger",
+    "system-faas-gateway",
     "system-faas-cert-manager",
     "system-faas-gc",
     "system-faas-gossip",

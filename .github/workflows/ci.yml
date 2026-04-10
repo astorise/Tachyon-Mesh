@@ -68,6 +68,7 @@ jobs:
           cargo build -p system-faas-cert-manager --target wasm32-wasip2 --release
           cargo build -p system-faas-buffer --target wasm32-wasip2 --release
           cargo build -p system-faas-gc --target wasm32-wasip2 --release
+          cargo build -p system-faas-gateway --target wasm32-wasip2 --release
           cargo build -p system-faas-gossip --target wasm32-wasip2 --release
           cargo build -p system-faas-keda --target wasm32-wasip2 --release
           cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
@@ -111,6 +112,7 @@ jobs:
             target/wasm32-wasip2/release/system_faas_cert_manager.wasm
             target/wasm32-wasip2/release/buffer.wasm
             target/wasm32-wasip2/release/system_faas_gc.wasm
+            target/wasm32-wasip2/release/system_faas_gateway.wasm
             target/wasm32-wasip2/release/gossip.wasm
             target/wasm32-wasip2/release/k8s_scaler.wasm
             target/wasm32-wasip2/release/system_faas_logger.wasm

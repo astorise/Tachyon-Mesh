@@ -776,6 +776,7 @@ dependencies = [
  "prost",
  "quinn",
  "rand 0.8.5",
+ "rcgen",
  "redb",
  "reqwest 0.12.28",
  "rustls-pemfile",
@@ -5476,6 +5477,13 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "system-faas-gateway"
+version = "0.1.0"
+dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
