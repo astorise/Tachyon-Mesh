@@ -13,7 +13,9 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "cli": {
