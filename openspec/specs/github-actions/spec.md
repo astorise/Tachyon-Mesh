@@ -43,8 +43,14 @@ The CI workflow SHALL upload the primary release-oriented outputs so contributor
 - **AND** it uploads the release `tachyon-cli` binary as an artifact
 - **AND** it uploads the release `guest-example` WASM module as an artifact
 
-### Requirement: The repository publishes Tachyon desktop release bundles from a tag-driven multi-OS workflow
-The repository SHALL define a GitHub Actions release workflow at `.github/workflows/release.yml` that only runs when a semantic-version tag matching `v*` is pushed, builds the Tauri desktop application on Linux, macOS, and Windows runners, and publishes the resulting bundles to a draft GitHub Release.
+### Requirement: The repository builds Tachyon desktop bundles on every push and publishes release bundles on version tags
+The repository SHALL define a GitHub Actions release workflow at `.github/workflows/release.yml` that builds the Tauri desktop application on Linux, macOS, and Windows runners for every push, uploads the resulting bundles as workflow artifacts on branch pushes, and publishes the resulting bundles to a draft GitHub Release when a semantic-version tag matching `v*` is pushed.
+
+#### Scenario: A branch push triggers downloadable desktop workflow artifacts
+- **WHEN** a contributor pushes a commit to any branch
+- **THEN** GitHub Actions starts the desktop workflow automatically
+- **AND** the workflow fans out across `ubuntu-22.04`, `macos-latest`, and `windows-latest`
+- **AND** the generated Tauri bundles are uploaded as GitHub Actions workflow artifacts
 
 #### Scenario: A release tag triggers a draft desktop release
 - **WHEN** a maintainer pushes a tag such as `v1.0.0`
@@ -77,11 +83,11 @@ The `tachyon-cli` Tauri configuration SHALL enable bundling so the release workf
 - **AND** updater artifacts are enabled using the supported Tauri v2 configuration for updater bundles
 
 ### Requirement: The release workflow uses the official Tauri GitHub Action against the monorepo subproject
-The release workflow SHALL use `tauri-apps/tauri-action@v0` with `projectPath: tachyon-cli`, pass `GITHUB_TOKEN`, and create a draft release populated with the platform bundles generated for each runner.
+The release workflow SHALL use `tauri-apps/tauri-action@v0` with `projectPath: tachyon-cli`, pass `GITHUB_TOKEN`, upload workflow artifacts on ordinary pushes, and create a draft release populated with the platform bundles generated for each runner on semantic-version tags.
 
 #### Scenario: Tauri artifacts are uploaded from the subproject path
 - **WHEN** the release job invokes the Tauri GitHub Action
 - **THEN** it uses the `tachyon-cli` project path instead of the repository root
 - **AND** it receives `GITHUB_TOKEN` from `${{ secrets.GITHUB_TOKEN }}`
-- **AND** it uploads the generated release artifacts to a GitHub Release draft
-
+- **AND** it uploads workflow artifacts on branch pushes
+- **AND** it uploads the generated release artifacts to a GitHub Release draft on version tags
