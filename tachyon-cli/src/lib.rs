@@ -261,6 +261,11 @@ pub fn run() {
     }
 }
 
+#[tauri::command]
+fn get_engine_status() -> String {
+    "42".to_owned()
+}
+
 fn run_inner() -> Result<()> {
     if let Some(request) = parse_generate_request_from_args(std::env::args().skip(1))? {
         let manifest_path = generate_manifest(request)?;
@@ -271,14 +276,8 @@ fn run_inner() -> Result<()> {
     #[cfg(desktop)]
     {
         tauri::Builder::default()
-            .setup(
-                |app| -> std::result::Result<(), Box<dyn std::error::Error>> {
-                    app.handle().plugin(tauri_plugin_cli::init())?;
-                    handle_cli(app)?;
-                    app.handle().exit(0);
-                    Ok(())
-                },
-            )
+            .plugin(tauri_plugin_cli::init())
+            .invoke_handler(tauri::generate_handler![get_engine_status])
             .run(tauri::generate_context!())
             .map_err(|error| anyhow!("tachyon-cli runtime failed: {error}"))?;
 
@@ -289,59 +288,6 @@ fn run_inner() -> Result<()> {
     {
         bail!("tachyon-cli is only supported on desktop targets");
     }
-}
-
-#[cfg(desktop)]
-fn handle_cli<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<()> {
-    use tauri_plugin_cli::CliExt;
-
-    let matches = app
-        .cli()
-        .matches()
-        .context("failed to parse Tauri CLI arguments")?;
-    let subcommand = matches
-        .subcommand
-        .context("expected `generate` subcommand, for example `tachyon-cli generate --route /api/guest-example --system-route /metrics --memory 64`")?;
-
-    if subcommand.name != "generate" {
-        bail!(
-            "unsupported subcommand `{}`; expected `generate`",
-            subcommand.name
-        );
-    }
-
-    let request = GenerateRequest {
-        user_routes: parse_optional_routes_arg(&subcommand.matches.args, "route")?,
-        system_routes: parse_optional_routes_arg(&subcommand.matches.args, "system-route")?,
-        secret_routes: parse_optional_routes_arg(&subcommand.matches.args, "secret-route")?,
-        batch_targets: parse_optional_routes_arg(&subcommand.matches.args, "batch-target")?,
-        batch_target_envs: parse_optional_routes_arg(&subcommand.matches.args, "batch-target-env")?,
-        batch_target_volumes: parse_optional_routes_arg(
-            &subcommand.matches.args,
-            "batch-target-volume",
-        )?,
-        route_targets: parse_optional_routes_arg(&subcommand.matches.args, "route-target")?,
-        route_names: parse_optional_routes_arg(&subcommand.matches.args, "route-name")?,
-        route_versions: parse_optional_routes_arg(&subcommand.matches.args, "route-version")?,
-        route_dependencies: parse_optional_routes_arg(
-            &subcommand.matches.args,
-            "route-dependency",
-        )?,
-        route_credentials: parse_optional_routes_arg(&subcommand.matches.args, "route-credential")?,
-        route_middlewares: parse_optional_routes_arg(&subcommand.matches.args, "route-middleware")?,
-        route_envs: parse_optional_routes_arg(&subcommand.matches.args, "route-env")?,
-        route_scales: parse_optional_routes_arg(&subcommand.matches.args, "route-scale")?,
-        tcp_ports: parse_optional_string_args(&subcommand.matches.args, "tcp-port", "tcp-port")?,
-        udp_ports: parse_optional_string_args(&subcommand.matches.args, "udp-port", "udp-port")?,
-        volumes: parse_optional_string_args(&subcommand.matches.args, "volume", "volume")?,
-        advertise_ip: parse_optional_arg_value(&subcommand.matches.args, "advertise-ip")?,
-        telemetry_sample_rate: parse_telemetry_sample_rate_arg(&subcommand.matches.args)?,
-        memory_mib: parse_memory_arg(&subcommand.matches.args)?,
-    };
-
-    let manifest_path = generate_manifest(request)?;
-    println!("wrote integrity manifest to {}", manifest_path.display());
-    Ok(())
 }
 
 fn parse_generate_request_from_args(
@@ -765,14 +711,6 @@ fn parse_required_routes_arg(
 }
 
 #[cfg(desktop)]
-fn parse_optional_routes_arg(
-    args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
-    name: &str,
-) -> Result<Vec<String>> {
-    parse_optional_string_args(args, name, "route")
-}
-
-#[cfg(desktop)]
 fn parse_optional_string_args(
     args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
     name: &str,
@@ -797,66 +735,12 @@ fn parse_optional_string_args(
     }
 }
 
-#[cfg(desktop)]
-fn parse_optional_arg_value(
-    args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
-    name: &str,
-) -> Result<Option<String>> {
-    let Some(arg) = args.get(name) else {
-        return Ok(None);
-    };
-
-    let value = match &arg.value {
-        Value::String(value) => value.clone(),
-        _ => bail!("`--{name}` must be provided as a string"),
-    };
-
-    Ok(Some(parse_non_empty_arg_value(
-        &format!("--{name}"),
-        &value,
-    )?))
-}
-
 fn parse_non_empty_arg_value(flag: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         bail!("`{flag}` must not be empty");
     }
     Ok(trimmed.to_owned())
-}
-
-#[cfg(desktop)]
-fn parse_memory_arg(
-    args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
-) -> Result<u32> {
-    let arg = args
-        .get("memory")
-        .context("missing required `--memory` argument")?;
-
-    let value = match &arg.value {
-        Value::String(value) => value.clone(),
-        Value::Number(value) => value.to_string(),
-        _ => bail!("`--memory` must be provided as a number in MiB"),
-    };
-
-    parse_memory_value(&value)
-}
-
-#[cfg(desktop)]
-fn parse_telemetry_sample_rate_arg(
-    args: &std::collections::HashMap<String, tauri_plugin_cli::ArgData>,
-) -> Result<f64> {
-    let Some(arg) = args.get("telemetry-sample-rate") else {
-        return Ok(DEFAULT_TELEMETRY_SAMPLE_RATE);
-    };
-
-    let value = match &arg.value {
-        Value::String(value) => value.clone(),
-        Value::Number(value) => value.to_string(),
-        _ => bail!("`--telemetry-sample-rate` must be provided as a number between 0.0 and 1.0"),
-    };
-
-    parse_telemetry_sample_rate_value(&value)
 }
 
 fn parse_memory_value(value: &str) -> Result<u32> {
