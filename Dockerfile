@@ -56,10 +56,10 @@ RUN curl -fsSL -o /tmp/tinygo.tar.gz https://github.com/tinygo-org/tinygo/releas
     && ln -s /usr/local/tinygo/bin/tinygo /usr/local/bin/tinygo \
     && rm /tmp/tinygo.tar.gz
 
-WORKDIR /workspace/guest-go
+WORKDIR /workspace/examples/guest-go
 
-COPY guest-go/go.mod ./
-COPY guest-go/main.go ./
+COPY examples/guest-go/go.mod ./
+COPY examples/guest-go/main.go ./
 
 RUN mkdir -p /workspace/guest-modules \
     && tinygo build -o /workspace/guest-modules/guest_go.wasm -target=wasip1 .
@@ -80,12 +80,12 @@ RUN curl -fsSL -o /tmp/javy.gz https://github.com/bytecodealliance/javy/releases
     && install -m 0755 /tmp/javy /usr/local/bin/javy \
     && rm /tmp/javy
 
-WORKDIR /workspace/guest-js
+WORKDIR /workspace/examples/guest-js
 
-COPY guest-js/index.js ./
+COPY examples/guest-js/index.js ./
 
 RUN mkdir -p /workspace/guest-modules \
-    && javy build /workspace/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
+    && javy build /workspace/examples/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
 
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS dotnet-builder
 
@@ -105,25 +105,25 @@ RUN curl -fsSL -o /tmp/wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/r
     && tar -C /opt -xzf /tmp/wasi-sdk.tar.gz \
     && rm /tmp/wasi-sdk.tar.gz
 
-WORKDIR /workspace/guest-csharp
+WORKDIR /workspace/examples/guest-csharp
 
-COPY guest-csharp/guest-csharp.csproj ./
-COPY guest-csharp/Program.cs ./
+COPY examples/guest-csharp/guest-csharp.csproj ./
+COPY examples/guest-csharp/Program.cs ./
 
 RUN mkdir -p /workspace/guest-modules \
     && dotnet publish guest-csharp.csproj -c Release \
-    && cp -r /workspace/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/. /workspace/guest-modules/
+    && cp -r /workspace/examples/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/. /workspace/guest-modules/
 
 FROM maven:3.9.11-eclipse-temurin-17 AS java-builder
 
-WORKDIR /workspace/guest-java
+WORKDIR /workspace/examples/guest-java
 
-COPY guest-java/pom.xml ./
-COPY guest-java/src ./src
+COPY examples/guest-java/pom.xml ./
+COPY examples/guest-java/src ./src
 
 RUN mkdir -p /workspace/guest-modules \
     && mvn -B --no-transfer-progress -e clean package \
-    && cp /workspace/guest-java/target/teavm-wasi/guest_java.wasm /workspace/guest-modules/guest_java.wasm
+    && cp /workspace/examples/guest-java/target/teavm-wasi/guest_java.wasm /workspace/guest-modules/guest_java.wasm
 
 FROM scratch AS legacy-runtime
 
