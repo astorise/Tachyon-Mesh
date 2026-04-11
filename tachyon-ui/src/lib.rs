@@ -262,8 +262,10 @@ pub fn run() {
 }
 
 #[tauri::command]
-fn get_engine_status() -> String {
-    "42".to_owned()
+async fn get_engine_status() -> std::result::Result<String, String> {
+    tachyon_client::get_engine_status()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn run_inner() -> Result<()> {
@@ -279,14 +281,14 @@ fn run_inner() -> Result<()> {
             .plugin(tauri_plugin_cli::init())
             .invoke_handler(tauri::generate_handler![get_engine_status])
             .run(tauri::generate_context!())
-            .map_err(|error| anyhow!("tachyon-cli runtime failed: {error}"))?;
+            .map_err(|error| anyhow!("tachyon-ui runtime failed: {error}"))?;
 
         Ok(())
     }
 
     #[cfg(not(desktop))]
     {
-        bail!("tachyon-cli is only supported on desktop targets");
+        bail!("tachyon-ui is only supported on desktop targets");
     }
 }
 
@@ -1920,7 +1922,7 @@ fn resolve_function_name(path: &str) -> Option<&str> {
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("tachyon-cli should live directly under the workspace root")
+        .expect("tachyon-ui should live directly under the workspace root")
         .to_path_buf()
 }
 

@@ -46,7 +46,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: tachyon-cli/package-lock.json
+          cache-dependency-path: tachyon-ui/package-lock.json
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -72,7 +72,7 @@ jobs:
             patchelf
 
       - name: Install frontend dependencies
-        working-directory: ./tachyon-cli
+        working-directory: ./tachyon-ui
         run: npm install
 
       - name: Build Tauri bundles for push artifacts
@@ -81,7 +81,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: tachyon-cli
+          projectPath: tachyon-ui
           args: ${{ matrix.args }}
 
       - name: Publish Tauri bundles for version tags
@@ -90,7 +90,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: tachyon-cli
+          projectPath: tachyon-ui
           tagName: ${{ github.ref_name }}
           releaseName: Tachyon Desktop v__VERSION__
           releaseBody: See the assets to download and install this version.

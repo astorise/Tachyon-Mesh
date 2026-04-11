@@ -34,8 +34,7 @@ document.addEventListener('DOMContentLoaded', () => {
     gsap.fromTo(refreshBtn, { scale: 0.95 }, { scale: 1, duration: 0.2, ease: 'bounce.out' });
 
     try {
-      // NOTE FOR CODEX: Ensure a tauri command named 'get_engine_status' exists in src-tauri/src/main.rs
-      // It should return a string or number representing active sandboxes.
+      // NOTE FOR CODEX: Keep get_engine_status wired through the shared tachyon-client layer.
       const response = await invoke('get_engine_status');
       
       if (activeFaaS) {
