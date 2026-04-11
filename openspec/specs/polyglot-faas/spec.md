@@ -9,10 +9,10 @@ The repository SHALL include Go, JavaScript, C#, and Java guest examples that co
 #### Scenario: Container build emits polyglot guest modules
 - **WHEN** a developer or CI job runs `docker build -t tachyon-mesh:test .`
 - **THEN** the builder stage installs TinyGo, Javy, .NET 8 WASI tooling, and Maven/OpenJDK
-- **AND** `guest-go/main.go` is compiled into `guest_go.wasm`
-- **AND** `guest-js/index.js` is compiled into `guest_js.wasm`
-- **AND** `guest-csharp/Program.cs` is published into `guest_csharp.wasm`
-- **AND** `guest-java/src/main/java/com/tachyonmesh/guestjava/Main.java` is compiled into `guest_java.wasm`
+- **AND** `examples/guest-go/main.go` is compiled into `guest_go.wasm`
+- **AND** `examples/guest-js/index.js` is compiled into `guest_js.wasm`
+- **AND** `examples/guest-csharp/Program.cs` is published into `guest_csharp.wasm`
+- **AND** `examples/guest-java/src/main/java/com/tachyonmesh/guestjava/Main.java` is compiled into `guest_java.wasm`
 - **AND** the runtime image includes all four modules under `/app/guest-modules`
 
 ### Requirement: Integration workflow exercises polyglot guest routes

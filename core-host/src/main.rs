@@ -84,21 +84,21 @@ mod tls_runtime;
 
 mod component_bindings {
     wasmtime::component::bindgen!({
-        path: "../wit",
+        path: "../wit/tachyon.wit",
         world: "faas-guest",
     });
 }
 
 mod system_component_bindings {
     wasmtime::component::bindgen!({
-        path: "../wit",
+        path: "../wit/tachyon.wit",
         world: "system-faas-guest",
     });
 }
 
 mod udp_component_bindings {
     wasmtime::component::bindgen!({
-        path: "../wit",
+        path: "../wit/tachyon.wit",
         world: "udp-faas-guest",
     });
 }
@@ -106,21 +106,21 @@ mod udp_component_bindings {
 #[cfg(feature = "websockets")]
 mod websocket_component_bindings {
     wasmtime::component::bindgen!({
-        path: "../wit",
+        path: "../wit/tachyon.wit",
         world: "websocket-faas-guest",
     });
 }
 
 mod background_component_bindings {
     wasmtime::component::bindgen!({
-        path: "../wit",
+        path: "../wit/tachyon.wit",
         world: "background-system-faas",
     });
 }
 
 mod control_plane_component_bindings {
     wasmtime::component::bindgen!({
-        path: "../wit",
+        path: "../wit/tachyon.wit",
         world: "control-plane-faas",
     });
 }
@@ -128,7 +128,7 @@ mod control_plane_component_bindings {
 #[cfg(feature = "ai-inference")]
 mod accelerator_component_bindings {
     wasmtime::component::bindgen!({
-        path: "../wit-accelerator",
+        path: "../wit/accelerator",
         world: "host",
     });
 }
