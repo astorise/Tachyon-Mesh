@@ -18,21 +18,31 @@ jobs:
           - platform: ubuntu-22.04
             rust_targets: ""
             args: --bundles appimage,deb
+            artifact_name: tachyon-desktop-linux
+            artifact_path: |
+              target/release/bundle/appimage/*.AppImage
+              target/release/bundle/deb/*.deb
           - platform: macos-latest
             rust_targets: aarch64-apple-darwin
             args: --target aarch64-apple-darwin --bundles dmg
+            artifact_name: tachyon-desktop-macos
+            artifact_path: |
+              target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+              target/release/bundle/dmg/*.dmg
           - platform: windows-latest
             rust_targets: ""
             args: --bundles msi,nsis
+            artifact_name: tachyon-desktop-windows
+            artifact_path: |
+              target/release/bundle/msi/*.msi
+              target/release/bundle/nsis/*.exe
     runs-on: ${{ matrix.platform }}
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -72,7 +82,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: tachyon-cli
-          uploadWorkflowArtifacts: true
           args: ${{ matrix.args }}
 
       - name: Publish Tauri bundles for version tags
@@ -88,5 +97,12 @@ jobs:
           releaseDraft: true
           prerelease: false
           releaseAssetNamePattern: tachyon-studio_[version]_[arch][ext]
-          uploadWorkflowArtifacts: true
           args: ${{ matrix.args }}
+
+      - name: Upload desktop bundles
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+          path: ${{ matrix.artifact_path }}
