@@ -2,10 +2,22 @@
   "name": "tachyon-cli",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
     "tauri": "tauri"
   },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "gsap": "^3.13.0"
+  },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0"
+    "@tauri-apps/cli": "^2.10.1",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.7"
   }
 }
