@@ -8,16 +8,7 @@ build = "build.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-anyhow = "1"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-hex = "0.4"
-rand_core = { version = "0.6", features = ["getrandom"] }
-semver = "1.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
 tachyon-client = { path = "../tachyon-client" }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-cli = "2.4.1"
