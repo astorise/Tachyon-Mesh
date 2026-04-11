@@ -37,7 +37,6 @@ RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p guest-loop --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-ui --release
-RUN ./target/release/tachyon-ui generate --route /api/guest-call-legacy --route /api/guest-csharp --route /api/guest-example --route /api/guest-go --route /api/guest-java --route /api/guest-js --route /api/guest-loop --system-route /metrics --memory 64
 RUN cargo build -p core-host --target x86_64-unknown-linux-musl --release
 
 FROM ubuntu:24.04 AS tinygo-builder
