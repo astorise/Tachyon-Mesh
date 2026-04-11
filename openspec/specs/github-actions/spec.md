@@ -73,14 +73,14 @@ The release workflow SHALL provision Node.js, the Rust toolchain, and platform-s
 - **THEN** it installs the stable Rust toolchain
 - **AND** it adds the `aarch64-apple-darwin` Rust target before building the Tauri bundle
 
-### Requirement: The Tauri project is configured to emit desktop bundles and updater artifacts
+### Requirement: The Tauri project is configured to emit desktop bundles
 The `tachyon-cli` Tauri configuration SHALL enable bundling so the release workflow can build desktop installers on every supported operating system.
 
 #### Scenario: Bundling is enabled for the desktop release pipeline
 - **WHEN** the Tauri configuration is loaded from `tachyon-cli/tauri.conf.json`
 - **THEN** `bundle.active` is enabled
 - **AND** the configuration declares desktop bundle targets
-- **AND** updater artifacts are enabled using the supported Tauri v2 configuration for updater bundles
+- **AND** the configuration avoids updater-only bundle settings until the updater plugin is configured
 
 ### Requirement: The release workflow uses the official Tauri GitHub Action against the monorepo subproject
 The release workflow SHALL use `tauri-apps/tauri-action@v0` with `projectPath: tachyon-cli`, pass `GITHUB_TOKEN`, upload workflow artifacts on ordinary pushes, and create a draft release populated with the platform bundles generated for each runner on semantic-version tags.
