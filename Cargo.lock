@@ -5604,7 +5604,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "tachyon-cli"
+name = "tachyon-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "tachyon-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tachyon-client",
+ "tokio",
+]
+
+[[package]]
+name = "tachyon-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -5615,6 +5635,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tachyon-client",
  "tauri",
  "tauri-build",
  "tauri-plugin-cli",

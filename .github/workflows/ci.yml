@@ -93,8 +93,8 @@ jobs:
       - name: Build core-host in release mode
         run: cargo build -p core-host --release
 
-      - name: Build tachyon-cli in release mode
-        run: cargo build -p tachyon-cli --release
+      - name: Build tachyon-ui in release mode
+        run: cargo build -p tachyon-ui --release
 
       - name: Upload CI build artifacts
         uses: actions/upload-artifact@v7
@@ -104,7 +104,7 @@ jobs:
           path: |
             integrity.lock
             target/release/core-host
-            target/release/tachyon-cli
+            target/release/tachyon-ui
             target/wasm32-wasip1/release/guest_ai.wasm
             target/wasm32-wasip2/release/guest_example.wasm
             target/wasm32-wasip2/release/guest_flaky.wasm

@@ -1,0 +1,10 @@
+[package]
+name = "tachyon-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+tachyon-client = { path = "../tachyon-client" }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread"] }

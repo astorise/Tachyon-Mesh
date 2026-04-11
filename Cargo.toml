@@ -31,7 +31,9 @@ members = [
     "systems/system-faas-buffer",
     "systems/system-faas-s3-proxy",
     "systems/system-faas-sqs",
-    "tachyon-cli",
+    "tachyon-client",
+    "tachyon-ui",
+    "tachyon-mcp",
     "turboquant-sys",
 ]
 resolver = "2"
