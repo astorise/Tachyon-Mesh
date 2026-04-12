@@ -1,8 +1,5 @@
-# tauri-configurator Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change tauri-configurator. Update Purpose after archive.
-## Requirements
 ### Requirement: Tachyon desktop UI is built through a Vite frontend pipeline
 The `tachyon-ui` desktop application SHALL build its frontend through a Vite-based toolchain rooted in the `tachyon-ui` directory and SHALL preserve the injected Tailwind CSS and GSAP frontend assets inside that flattened crate layout.
 
@@ -13,17 +10,6 @@ The `tachyon-ui` desktop application SHALL build its frontend through a Vite-bas
 - **AND** the frontend styling entry point is `tachyon-ui/src/style.css`
 - **AND** `tachyon-ui/package.json` includes Vite, Tailwind CSS, and GSAP for that frontend bundle
 
-### Requirement: Tauri v2 routes desktop builds through Vite commands
-The `tachyon-ui/tauri.conf.json` configuration SHALL use the Tauri v2 build keys required to run the Vite development server and production build pipeline, and SHALL resolve packaged frontend assets from the crate-local `dist` directory.
-
-#### Scenario: Tauri launches the Vite toolchain from the desktop crate
-- **WHEN** Tauri reads `tachyon-ui/tauri.conf.json`
-- **THEN** `build.beforeDevCommand` is `npm run dev`
-- **AND** `build.beforeBuildCommand` is `npm run build`
-- **AND** `build.devUrl` is `http://localhost:5173`
-- **AND** `build.frontendDist` points to `dist`
-- **AND** the resolved frontend asset directory stays inside the `tachyon-ui` crate
-
 ### Requirement: The desktop frontend can invoke a Rust status command
 The `tachyon-ui` Rust backend SHALL expose a Tauri command named `get_engine_status`, bootstrap directly through `tauri::Builder`, and delegate the status query to `tachyon-client`.
 
@@ -32,14 +18,6 @@ The `tachyon-ui` Rust backend SHALL expose a Tauri command named `get_engine_sta
 - **THEN** the desktop runtime dispatches the command through `tauri::generate_handler!`
 - **AND** the Rust implementation awaits `tachyon_client::get_engine_status()`
 - **AND** no CLI-only startup path is evaluated before the desktop window is initialized
-
-### Requirement: The desktop frontend can invoke shared client status queries
-The `tachyon-ui` Rust backend SHALL delegate status queries to the shared `tachyon-client` library instead of embedding duplicated lockfile reading logic in the Tauri wrapper.
-
-#### Scenario: The frontend requests the engine status
-- **WHEN** the frontend invokes `get_engine_status`
-- **THEN** the Tauri command awaits `tachyon_client::get_engine_status()`
-- **AND** the returned payload comes from the shared client layer
 
 ### Requirement: The desktop wrapper launches without evaluating CLI startup arguments
 The `tachyon-ui` project SHALL bootstrap the Tauri runtime immediately on startup and SHALL NOT inspect `std::env::args`, `clap`, or any equivalent CLI parser before the desktop webview is created.
@@ -57,6 +35,22 @@ The `tachyon-ui` project SHALL NOT retain Tauri CLI plugin wiring or desktop con
 - **THEN** the configuration does not declare a `plugins.cli` manifest-generation section
 - **AND** the desktop Rust entrypoint does not register `tauri_plugin_cli`
 
+## REMOVED Requirements
+
+### Requirement: Tauri configurator supports headless manifest generation from the CLI
+**Reason**: The repository no longer ships a `tachyon-cli` workspace crate, and the desktop project has been reduced to a pure GUI wrapper.
+**Migration**: Treat manifest creation as dedicated external tooling and feed `core-host` a valid signed `integrity.lock`.
+
+### Requirement: CLI mode seals route SemVer metadata
+**Reason**: The removed `tachyon-cli` manifest-generation path no longer exists in the workspace.
+**Migration**: Encode SemVer metadata in the signed `integrity.lock` supplied to the host by dedicated manifest tooling.
+
+### Requirement: Tauri configurator supports headless manifest generation from the desktop wrapper
+**Reason**: `tachyon-ui` no longer owns manifest sealing and starts directly in desktop mode.
+**Migration**: Use dedicated manifest tooling before launching the desktop wrapper or building `core-host`.
+
+## ADDED Requirements
+
 ### Requirement: The desktop wrapper keeps a clean-slate Rust dependency surface
 The `tachyon-ui` Rust crate SHALL depend only on the shared `tachyon-client` library plus the Tauri runtime and build crates needed for desktop bootstrap, and SHALL NOT pull in legacy CLI or manifest-generation dependencies.
 
@@ -65,4 +59,3 @@ The `tachyon-ui` Rust crate SHALL depend only on the shared `tachyon-client` lib
 - **THEN** the runtime dependencies include `tachyon-client` and `tauri`
 - **AND** the build dependencies include `tauri-build`
 - **AND** the crate does not depend on `clap` or manifest-signing crates
-
