@@ -10,7 +10,19 @@
     "frontendDist": "dist"
   },
   "app": {
-    "windows": [],
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tachyon UI",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1100,
+        "minHeight": 720,
+        "resizable": true,
+        "visible": true,
+        "center": true
+      }
+    ],
     "security": {
       "csp": null
     }
