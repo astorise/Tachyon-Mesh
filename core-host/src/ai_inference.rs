@@ -547,7 +547,7 @@ fn run_scheduler(
 
         let results = process_batch(accelerator, &batch);
         metrics.record_batch(&batch);
-        for (job, result) in batch.into_iter().zip(results.into_iter()) {
+        for (job, result) in batch.into_iter().zip(results) {
             metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
             metrics.record_dequeue(job.qos);
             let _ = job.response_tx.send(result);
