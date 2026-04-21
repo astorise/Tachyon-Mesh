@@ -23,7 +23,7 @@ use hyper_util::{
     server::conn::auto::Builder as HyperConnectionBuilder,
     service::TowerToHyperService,
 };
-use rand::Rng;
+use rand::RngExt;
 use reqwest::Client;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -1294,8 +1294,9 @@ impl UdsFastPathRegistry {
             return candidates.pop();
         }
 
-        let first_index = rand::thread_rng().gen_range(0..candidates.len());
-        let mut second_index = rand::thread_rng().gen_range(0..candidates.len() - 1);
+        let mut rng = rand::rng();
+        let first_index = rng.random_range(0..candidates.len());
+        let mut second_index = rng.random_range(0..candidates.len() - 1);
         if second_index >= first_index {
             second_index += 1;
         }
@@ -4750,11 +4751,11 @@ fn build_app(state: AppState) -> Router {
             post(model_broker::init_upload_handler),
         )
         .route(
-            "/admin/models/upload/:upload_id",
+            "/admin/models/upload/{upload_id}",
             put(model_broker::upload_chunk_handler),
         )
         .route(
-            "/admin/models/commit/:upload_id",
+            "/admin/models/commit/{upload_id}",
             post(model_broker::commit_upload_handler),
         )
         .route_layer(axum::middleware::from_fn_with_state(
@@ -4786,7 +4787,7 @@ fn build_app(state: AppState) -> Router {
 }
 
 fn should_sample_telemetry(sample_rate: f64) -> bool {
-    sample_rate > 0.0 && rand::thread_rng().gen_bool(sample_rate.clamp(0.0, 1.0))
+    sample_rate > 0.0 && rand::rng().random_bool(sample_rate.clamp(0.0, 1.0))
 }
 
 fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -4800,7 +4801,7 @@ fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 
 fn generate_traceparent() -> String {
     let trace_id = Uuid::new_v4().simple().to_string();
-    let span_id = format!("{:016x}", rand::thread_rng().gen::<u64>());
+    let span_id = format!("{:016x}", rand::rng().random::<u64>());
     format!("00-{trace_id}-{span_id}-01")
 }
 
@@ -6263,7 +6264,10 @@ async fn execute_route_override(
 async fn faas_handler(
     State(state): State<AppState>,
     Extension(hop_limit): Extension<HopLimit>,
-    #[cfg(feature = "websockets")] ws: Option<WebSocketUpgrade>,
+    #[cfg(feature = "websockets")] ws: Result<
+        WebSocketUpgrade,
+        axum::extract::ws::rejection::WebSocketUpgradeRejection,
+    >,
     request: Request,
 ) -> Response {
     let (parts, body) = request.into_parts();
@@ -6412,7 +6416,8 @@ async fn faas_handler(
                                 StatusCode::UPGRADE_REQUIRED
                             };
                             match ws {
-                                Some(upgrade) => {
+                                Ok(upgrade) => {
+                                    let upgrade: WebSocketUpgrade = upgrade;
                                     let websocket_state = state.clone();
                                     let websocket_route = route.clone();
                                     let websocket_module = selected_target.module.clone();
@@ -6438,7 +6443,7 @@ async fn faas_handler(
                                         None,
                                     )
                                 }
-                                None => (
+                                Err(_) => (
                                     (
                                         status,
                                         format!(
@@ -7200,7 +7205,7 @@ fn select_route_target_with_roll(
     if total_weight > 0 {
         let draw = match random_roll {
             Some(roll) => roll % total_weight,
-            None => rand::thread_rng().gen_range(0..total_weight),
+            None => rand::rng().random_range(0..total_weight),
         };
         let mut cumulative_weight = 0_u64;
         for target in &route.targets {
@@ -8273,10 +8278,10 @@ fn websocket_message_to_host_frame(message: AxumWebSocketMessage) -> HostWebSock
 #[cfg(feature = "websockets")]
 fn host_frame_to_websocket_message(frame: HostWebSocketFrame) -> AxumWebSocketMessage {
     match frame {
-        HostWebSocketFrame::Text(text) => AxumWebSocketMessage::Text(text),
-        HostWebSocketFrame::Binary(bytes) => AxumWebSocketMessage::Binary(bytes),
-        HostWebSocketFrame::Ping(bytes) => AxumWebSocketMessage::Ping(bytes),
-        HostWebSocketFrame::Pong(bytes) => AxumWebSocketMessage::Pong(bytes),
+        HostWebSocketFrame::Text(text) => AxumWebSocketMessage::Text(text.into()),
+        HostWebSocketFrame::Binary(bytes) => AxumWebSocketMessage::Binary(bytes.into()),
+        HostWebSocketFrame::Ping(bytes) => AxumWebSocketMessage::Ping(bytes.into()),
+        HostWebSocketFrame::Pong(bytes) => AxumWebSocketMessage::Pong(bytes.into()),
         HostWebSocketFrame::Close => AxumWebSocketMessage::Close(None),
     }
 }
@@ -14998,7 +15003,7 @@ mod tests {
 
         let s3_state = Arc::new(Mutex::new(MockS3State::default()));
         let s3_app = Router::new()
-            .route("/bucket/:key", put(put_object))
+            .route("/bucket/{key}", put(put_object))
             .with_state(Arc::clone(&s3_state));
         let s3_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -16437,7 +16442,7 @@ mod tests {
         assert!(matches!(text_frame, Message::Text(text) if text == "hello"));
 
         client
-            .send(Message::Binary(vec![1_u8, 2, 3]))
+            .send(Message::Binary(vec![1_u8, 2, 3].into()))
             .await
             .expect("WebSocket client should send binary frame");
         let binary_frame = client
@@ -16445,7 +16450,7 @@ mod tests {
             .await
             .expect("WebSocket server should respond to binary frame")
             .expect("WebSocket frame should be valid");
-        assert!(matches!(binary_frame, Message::Binary(bytes) if bytes == vec![1_u8, 2, 3]));
+        assert!(matches!(binary_frame, Message::Binary(bytes) if bytes.as_ref() == [1_u8, 2, 3]));
 
         client
             .close(None)
