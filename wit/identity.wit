@@ -1,0 +1,23 @@
+package tachyon:identity;
+
+interface auth {
+    record claims {
+        subject: string,
+        roles: list<string>,
+    }
+
+    variant auth-error {
+        expired,
+        invalid-signature,
+        missing-roles,
+        internal-error(string),
+    }
+
+    verify-token: func(token: string, required-roles: list<string>) -> result<claims, auth-error>;
+    generate-recovery-codes: func(username: string) -> result<list<string>, string>;
+    consume-recovery-code: func(username: string, code: string) -> result<string, string>;
+}
+
+world auth-guest {
+    export auth;
+}
