@@ -8,6 +8,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::from_fn,
     response::{IntoResponse, Response},
+    routing::{get, post, put},
     Extension, Router,
 };
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -71,7 +72,10 @@ use wasmtime_wasi_nn::witx::WasiNnCtx;
 
 #[cfg(feature = "ai-inference")]
 mod ai_inference;
+mod asset_registry;
+mod auth;
 mod data_events;
+mod model_broker;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
 #[cfg(feature = "resiliency")]
@@ -310,6 +314,8 @@ struct AppState {
     telemetry: TelemetryHandle,
     tls_manager: Arc<tls_runtime::TlsManager>,
     mtls_gateway: Option<Arc<tls_runtime::MtlsGatewayConfig>>,
+    auth_manager: Arc<auth::AuthManager>,
+    model_broker: Arc<model_broker::ModelBroker>,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     manifest_path: PathBuf,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -1952,6 +1958,7 @@ async fn serve_host() -> Result<()> {
         telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
     let runtime = build_runtime_state(verify_integrity()?)?;
     let core_store = open_core_store_for_manifest(&manifest_path).await?;
+    asset_registry::configure_asset_registry(Arc::clone(&core_store), &manifest_path)?;
     let host_identity = Arc::new(HostIdentity::generate());
     let uds_fast_path = Arc::new(new_uds_fast_path_registry());
     let storage_broker = Arc::new(StorageBrokerManager::new(Arc::clone(&core_store)));
@@ -1966,6 +1973,8 @@ async fn serve_host() -> Result<()> {
     let host_load = Arc::new(HostLoadCounters::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     let mtls_gateway = tls_runtime::load_mtls_gateway_config_from_env()?;
+    let auth_manager = Arc::new(auth::AuthManager::new(&manifest_path)?);
+    let model_broker = Arc::new(model_broker::ModelBroker::new(&manifest_path)?);
     let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
     background_workers.start_for_runtime(
         &runtime,
@@ -1998,6 +2007,8 @@ async fn serve_host() -> Result<()> {
         telemetry,
         tls_manager,
         mtls_gateway: mtls_gateway.map(Arc::new),
+        auth_manager,
+        model_broker,
         manifest_path,
         background_workers: Arc::clone(&background_workers),
     };
@@ -4727,7 +4738,36 @@ fn integrity_manifest_path() -> PathBuf {
 }
 
 fn build_app(state: AppState) -> Router {
+    let admin_routes = Router::new()
+        .route("/admin/status", get(auth::admin_status_handler))
+        .route(
+            "/admin/security/recovery-codes",
+            post(auth::generate_recovery_codes_handler),
+        )
+        .route("/admin/assets", post(asset_registry::upload_asset_handler))
+        .route(
+            "/admin/models/init",
+            post(model_broker::init_upload_handler),
+        )
+        .route(
+            "/admin/models/upload/:upload_id",
+            put(model_broker::upload_chunk_handler),
+        )
+        .route(
+            "/admin/models/commit/:upload_id",
+            post(model_broker::commit_upload_handler),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::admin_auth_middleware,
+        ));
+
     let app = Router::new()
+        .merge(admin_routes)
+        .route(
+            "/auth/recovery/consume",
+            post(auth::consume_recovery_code_handler),
+        )
         .fallback(faas_handler)
         .layer(from_fn(hop_limit_middleware));
 
@@ -9207,6 +9247,11 @@ fn route_path_for_override_key(route_key: &str) -> String {
 fn resolve_guest_module_path(
     function_name: &str,
 ) -> std::result::Result<PathBuf, GuestModuleNotFound> {
+    if asset_registry::is_asset_uri(function_name) {
+        return asset_registry::materialize_asset_uri(function_name)
+            .map_err(|error| GuestModuleNotFound::new(function_name, error.to_string()));
+    }
+
     let candidates = guest_module_candidate_paths(function_name);
     let candidate_strings = candidates
         .iter()
@@ -12638,6 +12683,8 @@ mod tests {
             store::CoreStore::open(&core_store_path(&manifest_path))
                 .expect("test core store should open"),
         );
+        asset_registry::configure_asset_registry(Arc::clone(&core_store), &manifest_path)
+            .expect("test asset registry should initialize");
         let state = AppState {
             runtime: Arc::new(ArcSwap::from_pointee(build_test_runtime(config))),
             draining_runtimes: Arc::new(Mutex::new(Vec::new())),
@@ -12658,6 +12705,14 @@ mod tests {
             telemetry,
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             mtls_gateway: None,
+            auth_manager: Arc::new(
+                auth::AuthManager::new(&manifest_path)
+                    .expect("test auth manager should initialize"),
+            ),
+            model_broker: Arc::new(
+                model_broker::ModelBroker::new(&manifest_path)
+                    .expect("test model broker should initialize"),
+            ),
             manifest_path,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         };
@@ -14262,6 +14317,8 @@ mod tests {
             store::CoreStore::open(&core_store_path(&core_store_manifest))
                 .expect("test core store should open"),
         );
+        asset_registry::configure_asset_registry(Arc::clone(&core_store), &core_store_manifest)
+            .expect("test asset registry should initialize");
         let state = AppState {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             draining_runtimes: Arc::new(Mutex::new(Vec::new())),
@@ -14282,6 +14339,14 @@ mod tests {
             telemetry: telemetry::init_test_telemetry(),
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             mtls_gateway: None,
+            auth_manager: Arc::new(
+                auth::AuthManager::new(&core_store_manifest)
+                    .expect("test auth manager should initialize"),
+            ),
+            model_broker: Arc::new(
+                model_broker::ModelBroker::new(&core_store_manifest)
+                    .expect("test model broker should initialize"),
+            ),
             manifest_path: core_store_manifest,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         };
@@ -15965,6 +16030,7 @@ mod tests {
         )
         .expect("client identity should load");
         let authorized = reqwest::Client::builder()
+            .use_rustls_tls()
             .danger_accept_invalid_certs(true)
             .identity(client_identity)
             .build()
