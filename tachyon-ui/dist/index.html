@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tachyon Studio</title>
-  <script type="module" crossorigin src="./assets/index-C_RYfF2a.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-FBI5-BY-.css">
+  <title>Tachyon Studio</title>
+  <script type="module" crossorigin src="./assets/index-CGBM33bz.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-CDuy6FjW.css">
 </head>
 <body class="bg-slate-950 text-slate-300 font-sans antialiased overflow-hidden flex h-screen">
 
@@ -15,10 +15,11 @@
       <h1 class="text-xl font-bold text-white tracking-wider">TACHYON<span class="text-cyan-400">MESH</span></h1>
     </div>
     <nav class="flex-1 p-4 space-y-2">
-      <a href="#" class="block px-4 py-2 rounded-md bg-slate-800 text-cyan-400 font-medium">Dashboard</a>
-      <a href="#" class="block px-4 py-2 rounded-md hover:bg-slate-800/50 transition-colors">Mesh Topology</a>
-      <a href="#" class="block px-4 py-2 rounded-md hover:bg-slate-800/50 transition-colors">FaaS Deployments</a>
-      <a href="#" class="block px-4 py-2 rounded-md hover:bg-slate-800/50 transition-colors">Capabilities</a>
+      <a href="#" data-view="dashboard" class="nav-link block px-4 py-2 rounded-md bg-slate-800 text-cyan-400 font-medium transition-colors">Dashboard</a>
+      <a href="#" data-view="topology" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Mesh Topology</a>
+      <a href="#" data-view="deployments" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">FaaS Deployments</a>
+      <a href="#" data-view="identity" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Identity</a>
+      <a href="#" data-view="ai-broker" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">AI Broker</a>
     </nav>
     <div class="p-4 border-t border-slate-800 text-xs text-slate-500">
       v1.0.0-core
@@ -27,7 +28,10 @@
 
   <main class="flex-1 flex flex-col h-screen relative">
     <header class="header h-16 border-b border-slate-800 flex items-center justify-between px-8 bg-slate-900/50 backdrop-blur-md">
-      <h2 class="text-lg font-semibold text-white">Local Node Status</h2>
+      <div>
+        <h2 id="header-title" class="text-lg font-semibold text-white">Local Node Status</h2>
+        <p id="header-subtitle" class="text-xs text-slate-500">Observe the connected control plane and shared runtime workflows.</p>
+      </div>
       <div class="flex items-center space-x-4">
         <span class="text-sm text-slate-400 font-mono" id="node-id">node-edge-waiting...</span>
         <button id="refresh-btn" class="px-4 py-1.5 bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 rounded shadow-[0_0_15px_rgba(34,211,238,0.15)] hover:bg-cyan-500/20 transition-all text-sm font-medium">
@@ -37,39 +41,229 @@
     </header>
 
     <div class="p-8 overflow-y-auto">
-      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        
-        <div class="stagger-card bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-lg">
-          <div class="flex justify-between items-start mb-4">
-            <h3 class="text-slate-400 font-medium">Wasm Engine</h3>
-            <span class="px-2 py-1 bg-emerald-500/10 text-emerald-400 text-xs rounded border border-emerald-500/20">Online</span>
+      <div id="view-dashboard" class="space-y-6">
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div class="stagger-card bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-lg">
+            <div class="flex justify-between items-start mb-4">
+              <h3 class="text-slate-400 font-medium">Wasm Engine</h3>
+              <span class="px-2 py-1 bg-emerald-500/10 text-emerald-400 text-xs rounded border border-emerald-500/20">Online</span>
+            </div>
+            <div class="text-3xl font-light text-white mb-1" id="active-faas">0</div>
+            <div class="text-sm text-slate-500">Active runtime status</div>
           </div>
-          <div class="text-3xl font-light text-white mb-1" id="active-faas">0</div>
-          <div class="text-sm text-slate-500">Active WASM sandboxes</div>
+
+          <div class="stagger-card bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-lg">
+            <div class="flex justify-between items-start mb-4">
+              <h3 class="text-slate-400 font-medium">Batch Targets</h3>
+              <span class="px-2 py-1 bg-amber-500/10 text-amber-400 text-xs rounded border border-amber-500/20">Queued</span>
+            </div>
+            <div class="text-3xl font-light text-white mb-1" id="peer-count">0</div>
+            <div class="text-sm text-slate-500">Shared control workflows available</div>
+          </div>
+
+          <div class="stagger-card bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-lg">
+            <div class="flex justify-between items-start mb-4">
+              <h3 class="text-slate-400 font-medium">Hardware Features</h3>
+            </div>
+            <div class="flex flex-wrap gap-2" id="caps-container">
+              <span class="px-2 py-1 bg-slate-800 text-slate-300 text-xs rounded border border-slate-700">core:wasi</span>
+              <span class="px-2 py-1 bg-slate-800 text-slate-300 text-xs rounded border border-slate-700">net:layer4</span>
+            </div>
+          </div>
         </div>
 
-        <div class="stagger-card bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-lg">
-          <div class="flex justify-between items-start mb-4">
-            <h3 class="text-slate-400 font-medium">Gossip Peers</h3>
-            <span class="px-2 py-1 bg-amber-500/10 text-amber-400 text-xs rounded border border-amber-500/20">Syncing</span>
+        <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
+          <div class="flex items-center justify-between gap-4 mb-4">
+            <div>
+              <h3 class="text-lg font-semibold text-white">Control Plane Overview</h3>
+              <p class="text-sm text-slate-500">Switch across Mesh, FaaS, Identity, and AI panels from the sidebar without leaving the active node session.</p>
+            </div>
+            <span class="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-300">Studio</span>
           </div>
-          <div class="text-3xl font-light text-white mb-1" id="peer-count">0</div>
-          <div class="text-sm text-slate-500">Connected L4 routes</div>
+          <div class="grid gap-4 md:grid-cols-2">
+            <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+              <h4 class="text-sm font-semibold text-white mb-2">Mesh Topology</h4>
+              <p class="text-sm text-slate-500">Read the live route snapshot derived from the sealed manifest and the authenticated client profile.</p>
+            </div>
+            <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+              <h4 class="text-sm font-semibold text-white mb-2">Deployment Surfaces</h4>
+              <p class="text-sm text-slate-500">Push `.wasm` assets, inspect identity posture, and stream large models from dedicated views.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="view-topology" class="hidden space-y-6">
+        <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
+          <div class="flex items-center justify-between gap-4 mb-6">
+            <div>
+              <h3 class="text-lg font-semibold text-white">Mesh Topology Snapshot</h3>
+              <p class="text-sm text-slate-500">Resolved from the shared `tachyon-client` state and the sealed route manifest.</p>
+            </div>
+            <button id="refresh-topology-btn" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg transition-all text-sm font-medium">
+              Refresh Topology
+            </button>
+          </div>
+          <div class="grid gap-4 md:grid-cols-3 mb-6">
+            <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+              <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Source</div>
+              <div id="mesh-graph-source" class="text-sm font-mono text-cyan-300 break-all">workspace://local</div>
+            </div>
+            <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+              <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Status</div>
+              <div id="mesh-graph-status" class="text-sm font-mono text-white">status=unknown</div>
+            </div>
+            <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+              <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Routes</div>
+              <div id="mesh-route-count" class="text-3xl font-light text-white">0</div>
+            </div>
+          </div>
+          <div id="mesh-route-list" class="grid gap-4 md:grid-cols-2">
+          </div>
         </div>
 
-        <div class="stagger-card bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-lg">
-          <div class="flex justify-between items-start mb-4">
-            <h3 class="text-slate-400 font-medium">Hardware Features</h3>
-          </div>
-          <div class="flex flex-wrap gap-2" id="caps-container">
-            <span class="px-2 py-1 bg-slate-800 text-slate-300 text-xs rounded border border-slate-700">core:wasi</span>
-            <span class="px-2 py-1 bg-slate-800 text-slate-300 text-xs rounded border border-slate-700">net:layer4</span>
+        <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
+          <h3 class="text-lg font-semibold text-white mb-4">Batch Targets</h3>
+          <div id="mesh-batch-list" class="grid gap-3 md:grid-cols-2">
           </div>
         </div>
+      </div>
 
+      <div id="view-deployments" class="hidden space-y-6">
+        <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
+          <div class="flex items-center justify-between gap-4 mb-4">
+            <div>
+              <h3 class="text-lg font-semibold text-white">Deployment Manager (Ready)</h3>
+              <p class="text-sm text-slate-500">Push sealed WebAssembly assets directly into the embedded mesh registry.</p>
+            </div>
+            <span class="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-300">Admin</span>
+          </div>
+          <div class="flex flex-col gap-4 md:flex-row md:items-center">
+            <input type="file" id="asset-upload" accept=".wasm" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-cyan-500/10 file:text-cyan-400 hover:file:bg-cyan-500/20" />
+            <button id="asset-upload-btn" class="px-4 py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white font-medium rounded-lg shadow-[0_0_15px_rgba(34,211,238,0.18)] transition-all whitespace-nowrap">
+              Push Asset to Mesh
+            </button>
+          </div>
+          <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm font-mono text-slate-300" id="asset-upload-result">
+            Awaiting asset upload.
+          </div>
+        </div>
+      </div>
+
+      <div id="view-identity" class="hidden space-y-6">
+        <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
+          <div class="flex items-center justify-between gap-4 mb-6">
+            <div>
+              <h3 class="text-lg font-semibold text-white">Identity Management</h3>
+              <p class="text-sm text-slate-500">Track the active administrative principal and the recovery-code onboarding posture for this endpoint.</p>
+            </div>
+            <button id="identity-mfa-btn" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition-all text-sm font-medium">
+              Continue Security Setup
+            </button>
+          </div>
+          <div class="grid gap-6 lg:grid-cols-2">
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-6">
+              <h4 class="text-sm font-semibold text-white mb-4">Administrative Users</h4>
+              <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                  <thead class="text-left text-slate-500">
+                    <tr>
+                      <th class="pb-3 font-medium">User</th>
+                      <th class="pb-3 font-medium">Roles</th>
+                      <th class="pb-3 font-medium">State</th>
+                    </tr>
+                  </thead>
+                  <tbody id="identity-user-rows" class="text-slate-300">
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-6 space-y-4">
+              <div>
+                <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Connected Endpoint</div>
+                <div id="identity-connection-source" class="text-sm font-mono text-cyan-300 break-all">workspace://local</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">MFA Posture</div>
+                <div id="identity-mfa-status" class="text-sm text-white">Onboarding required</div>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Recovery Bundle</div>
+                <div id="identity-recovery-status" class="text-sm text-slate-300">Pending download acknowledgement</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="view-ai-broker" class="hidden space-y-6">
+        <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
+          <div class="flex items-center justify-between gap-4 mb-4">
+            <div>
+              <h3 class="text-lg font-semibold text-white">Large Model Broker</h3>
+              <p class="text-sm text-slate-500">Stream multi-megabyte model files directly to `tachyon_data/models` without buffering them in RAM.</p>
+            </div>
+            <span class="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-300">D2D</span>
+          </div>
+          <div class="flex flex-col gap-4 md:flex-row md:items-center">
+            <input type="file" id="model-upload" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-emerald-500/10 file:text-emerald-300 hover:file:bg-emerald-500/20" />
+            <button id="model-upload-btn" class="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-lg shadow-[0_0_15px_rgba(16,185,129,0.18)] transition-all whitespace-nowrap">
+              Stream Model to Disk
+            </button>
+          </div>
+          <div class="mt-4 h-2 w-full overflow-hidden rounded-full bg-slate-950/80">
+            <div id="model-progress" class="h-2 w-0 bg-emerald-400"></div>
+          </div>
+          <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm font-mono text-slate-300" id="model-upload-result">
+            Awaiting model upload.
+          </div>
+        </div>
       </div>
     </div>
   </main>
-
+
+  <div id="first-run-modal" class="hidden absolute inset-0 z-40 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center">
+      <div class="bg-slate-900 border border-slate-800 p-8 rounded-2xl shadow-2xl w-full max-w-2xl">
+          <div id="qr-step">
+              <h3 class="text-xl font-bold text-cyan-300">Security Onboarding</h3>
+              <p class="text-sm text-slate-400 mt-2 mb-4">Register your authenticator application before finalizing the admin session.</p>
+              <div class="rounded-2xl border border-dashed border-slate-700 bg-slate-950/70 p-8 text-center mb-4">
+                  <div class="mx-auto mb-3 flex h-32 w-32 items-center justify-center rounded-2xl border border-slate-800 bg-slate-900 text-xs uppercase tracking-[0.3em] text-slate-500">
+                      QR Placeholder
+                  </div>
+                  <p class="text-sm text-slate-500">Scan the bootstrap QR code from your authenticator app, then continue to the recovery-code step.</p>
+              </div>
+              <button id="show-recovery-codes-btn" class="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-medium py-2.5 rounded-lg shadow-[0_0_15px_rgba(34,211,238,0.3)] transition-all">
+                  Continue to Recovery Codes
+              </button>
+          </div>
+          <div id="recovery-codes-step" class="hidden">
+              <h3 class="text-xl font-bold text-red-400">Save Your Recovery Codes</h3>
+              <p class="text-sm text-slate-400 mb-4">If you lose your 2FA device, these codes are your ONLY way to access Tachyon.</p>
+              <div id="codes-container" class="bg-slate-950 p-4 rounded font-mono text-sm text-slate-300 grid grid-cols-2 gap-2 mb-4 select-all">
+              </div>
+              <button id="download-codes-btn" class="w-full bg-slate-800 border border-slate-700 hover:bg-slate-700 text-white font-medium py-2 rounded">
+                  Download .txt
+              </button>
+              <button id="confirm-saved-btn" class="w-full mt-2 bg-red-600/20 border border-red-500 hover:bg-red-600/40 text-red-400 font-medium py-2 rounded transition-all disabled:opacity-40 disabled:cursor-not-allowed" disabled>
+                  I have securely saved these codes
+              </button>
+          </div>
+          <div id="onboarding-error" class="hidden text-red-400 text-xs text-center mt-4">Unable to complete security onboarding.</div>
+      </div>
+  </div>
+
+  <div id="connection-overlay" class="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex items-center justify-center">
+      <div class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-md shadow-2xl">
+          <h2 class="text-white text-2xl font-bold mb-4">Initialisation Tachyon</h2>
+          <input type="text" id="node-url" placeholder="https://..." class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 font-mono text-sm" />
+          <input type="password" id="node-token" placeholder="Admin Token" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 font-mono text-sm" />
+          <div class="text-xs text-slate-500 mb-4">mTLS Profile (.pem) required for Zero-Trust</div>
+          <input type="file" id="mtls-file" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-cyan-500/10 file:text-cyan-400 mb-4" />
+          <button id="connect-btn" class="w-full bg-cyan-600 hover:bg-cyan-500 transition-colors py-3 rounded-xl text-white font-bold">Establish Connection</button>
+          <div id="conn-error" class="text-red-400 text-xs hidden text-center mt-4">Connection failed.</div>
+      </div>
+  </div>
+
 </body>
 </html>
