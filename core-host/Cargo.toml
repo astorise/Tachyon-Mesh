@@ -17,7 +17,7 @@ websockets = ["axum/ws", "dep:futures-util"]
 anyhow = "1"
 async-trait = "0.1"
 arc-swap = "1.7"
-axum = "0.7"
+axum = "0.8"
 bytes = "1.5"
 candle-core = { version = "0.9.2", optional = true }
 candle-nn = { version = "0.9.2", optional = true }
