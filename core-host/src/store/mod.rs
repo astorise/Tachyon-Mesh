@@ -12,7 +12,6 @@ const TLS_CERTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tls_
 const HIBERNATION_STATE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("hibernation_state");
 const DATA_EVENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("data_events");
-const ASSET_REGISTRY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("asset_registry");
 
 #[derive(Clone)]
 pub(crate) struct CoreStore {
@@ -25,7 +24,6 @@ pub(crate) enum CoreStoreBucket {
     TlsCerts,
     HibernationState,
     DataEvents,
-    AssetRegistry,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,9 +82,6 @@ impl CoreStore {
             write_txn
                 .open_table(DATA_EVENTS_TABLE)
                 .context("failed to open data_events table")?;
-            write_txn
-                .open_table(ASSET_REGISTRY_TABLE)
-                .context("failed to open asset_registry table")?;
         }
         write_txn
             .commit()
@@ -105,7 +100,6 @@ impl CoreStore {
                 read_bytes(&read_txn, HIBERNATION_STATE_TABLE, key)
             }
             CoreStoreBucket::DataEvents => read_bytes(&read_txn, DATA_EVENTS_TABLE, key),
-            CoreStoreBucket::AssetRegistry => read_bytes(&read_txn, ASSET_REGISTRY_TABLE, key),
         }
     }
 
@@ -148,14 +142,6 @@ impl CoreStore {
                         .insert(key, value)
                         .context("failed to insert data events entry")?;
                 }
-                CoreStoreBucket::AssetRegistry => {
-                    let mut table = write_txn
-                        .open_table(ASSET_REGISTRY_TABLE)
-                        .context("failed to open asset_registry table")?;
-                    table
-                        .insert(key, value)
-                        .context("failed to insert asset registry entry")?;
-                }
             };
         }
         write_txn
@@ -197,13 +183,6 @@ impl CoreStore {
                         .context("failed to open data_events table")?
                         .remove(key)
                         .context("failed to delete data events entry")?;
-                }
-                CoreStoreBucket::AssetRegistry => {
-                    write_txn
-                        .open_table(ASSET_REGISTRY_TABLE)
-                        .context("failed to open asset_registry table")?
-                        .remove(key)
-                        .context("failed to delete asset registry entry")?;
                 }
             }
         }

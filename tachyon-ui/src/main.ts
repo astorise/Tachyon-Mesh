@@ -10,7 +10,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const nodeUrl = document.getElementById('node-url') as HTMLInputElement | null;
   const nodeToken = document.getElementById('node-token') as HTMLInputElement | null;
   const mtlsFile = document.getElementById('mtls-file') as HTMLInputElement | null;
-  const connectSubmitBtn = document.getElementById('connect-submit-btn') as HTMLButtonElement | null;
+  const connectSubmitBtn = document.getElementById('connect-btn') as HTMLButtonElement | null;
   const connectionError = document.getElementById('conn-error');
   const qrStep = document.getElementById('qr-step');
   const recoveryCodesStep = document.getElementById('recovery-codes-step');
@@ -189,7 +189,7 @@ document.addEventListener('DOMContentLoaded', () => {
       showConnectionError(String(error));
     } finally {
       connectSubmitBtn.disabled = false;
-      connectSubmitBtn.textContent = 'Initialize Connection';
+      connectSubmitBtn.textContent = 'Établir la connexion';
     }
   };
 
