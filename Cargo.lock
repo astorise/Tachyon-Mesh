@@ -5898,9 +5898,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-faas-model-broker"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "system-faas-prom"
 version = "0.1.0"
 dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "system-faas-registry"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
  "wit-bindgen 0.57.1",
 ]
 

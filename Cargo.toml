@@ -29,6 +29,8 @@ members = [
     "systems/system-faas-gc",
     "systems/system-faas-gossip",
     "systems/system-faas-prom",
+    "systems/system-faas-registry",
+    "systems/system-faas-model-broker",
     "systems/system-faas-buffer",
     "systems/system-faas-s3-proxy",
     "systems/system-faas-sqs",
