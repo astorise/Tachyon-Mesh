@@ -183,7 +183,7 @@ fn issue_self_signed_certificate(domain: &str) -> Result<CertificateBundle, Stri
         Ok(CertificateBundle {
             domain: domain.to_owned(),
             certificate_pem: certified.cert.pem(),
-            private_key_pem: certified.key_pair.serialize_pem(),
+            private_key_pem: certified.signing_key.serialize_pem(),
         })
     }
 }

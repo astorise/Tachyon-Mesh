@@ -58,6 +58,6 @@ serde_json = "1"
 
 [dev-dependencies]
 prost = "0.14"
-rcgen = "0.13"
+rcgen = "0.14"
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
