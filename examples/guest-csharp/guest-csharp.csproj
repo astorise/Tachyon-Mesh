@@ -6,7 +6,9 @@
     <RootNamespace>GuestCSharp</RootNamespace>
     <RuntimeIdentifier>wasi-wasm</RuntimeIdentifier>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <PublishSelfContained>true</PublishSelfContained>
     <PublishTrimmed>true</PublishTrimmed>
+    <UseAppHost>false</UseAppHost>
     <WasmSingleFileBundle>true</WasmSingleFileBundle>
   </PropertyGroup>
 </Project>
