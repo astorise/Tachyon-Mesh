@@ -117,7 +117,13 @@ async fn handle_http3_request(
         .await
         .context("failed to decode HTTP/3 request")?;
     let (parts, _) = request.into_parts();
-    if let Some(response) = authorize_http3_admin_request(&state, &parts.uri, &parts.headers).await
+    if let Some(response) = crate::auth::authorize_admin_headers(
+        &state,
+        parts.method.as_str(),
+        parts.uri.path(),
+        &parts.headers,
+    )
+    .await
     {
         return send_http3_response(stream, response).await;
     }
@@ -144,38 +150,6 @@ async fn handle_http3_request(
         .await
         .map_err(|error| anyhow!("HTTP/3 router dispatch failed: {error}"))?;
     send_http3_response(stream, response).await
-}
-
-async fn authorize_http3_admin_request(
-    state: &crate::AppState,
-    uri: &axum::http::Uri,
-    headers: &HeaderMap,
-) -> Option<Response> {
-    if !uri.path().starts_with("/admin/") {
-        return None;
-    }
-
-    let token = match crate::auth::bearer_token(headers) {
-        Ok(token) => token,
-        Err(error) => return Some(error.into_response()),
-    };
-    let auth_manager = Arc::clone(&state.auth_manager);
-    let engine = state.runtime.load().engine.clone();
-
-    match tokio::task::spawn_blocking(move || {
-        auth_manager.verify_token(&engine, &token, &["admin"])
-    })
-    .await
-    {
-        Ok(Ok(_)) => None,
-        Ok(Err(error)) => Some(error.into_response()),
-        Err(error) => Some(
-            crate::auth::AuthFailure::Internal(format!(
-                "failed to join HTTP/3 auth verification task: {error}"
-            ))
-            .into_response(),
-        ),
-    }
 }
 
 async fn send_http3_response(

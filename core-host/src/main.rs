@@ -4740,6 +4740,11 @@ fn build_app(state: AppState) -> Router {
             "/admin/security/recovery-codes",
             post(auth::generate_recovery_codes_handler),
         )
+        .route(
+            "/admin/security/2fa/regenerate",
+            post(auth::regenerate_account_security_handler),
+        )
+        .route("/admin/security/pats", post(auth::issue_pat_handler))
         .route("/admin/assets", post(system_storage::upload_asset_handler))
         .route(
             "/admin/models/init",
