@@ -70,6 +70,24 @@ struct CommitModelUploadResponse {
     model_path: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshGraphSnapshot {
+    pub source: String,
+    pub status: String,
+    pub routes: Vec<MeshRouteSummary>,
+    pub batch_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshRouteSummary {
+    pub path: String,
+    pub name: String,
+    pub role: String,
+    pub target_count: usize,
+}
+
 fn connection_state() -> &'static RwLock<Option<InstanceConfig>> {
     CONNECTION_STATE.get_or_init(|| RwLock::new(None))
 }
@@ -95,6 +113,42 @@ pub async fn get_engine_status() -> Result<String> {
 
     let raw_lockfile = read_lockfile().await?;
     parse_engine_status(&raw_lockfile)
+}
+
+pub async fn get_mesh_graph() -> Result<MeshGraphSnapshot> {
+    let raw_lockfile = read_lockfile().await?;
+    let manifest: IntegrityManifest =
+        serde_json::from_str(&raw_lockfile).context("failed to parse integrity.lock manifest")?;
+    let sealed_config: SealedConfig = serde_json::from_str(&manifest.config_payload)
+        .context("failed to parse sealed config payload")?;
+    let current = current_connection();
+    let source = current
+        .as_ref()
+        .map(|config| config.url.clone())
+        .unwrap_or_else(|| "workspace://local".to_owned());
+    let status = if let Some(config) = current.as_ref() {
+        match fetch_remote_status(config).await {
+            Ok(status) => status,
+            Err(_) => parse_engine_status(&raw_lockfile)?,
+        }
+    } else {
+        parse_engine_status(&raw_lockfile)?
+    };
+
+    Ok(MeshGraphSnapshot {
+        source,
+        status,
+        routes: sealed_config
+            .routes
+            .iter()
+            .filter_map(parse_route_summary)
+            .collect(),
+        batch_targets: sealed_config
+            .batch_targets
+            .iter()
+            .filter_map(batch_target_name)
+            .collect(),
+    })
 }
 
 pub async fn set_connection(
@@ -329,6 +383,39 @@ fn parse_engine_status(raw_lockfile: &str) -> Result<String> {
     ))
 }
 
+fn parse_route_summary(route: &serde_json::Value) -> Option<MeshRouteSummary> {
+    let path = route.get("path")?.as_str()?.to_owned();
+    let name = route
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| path.trim_start_matches('/'))
+        .to_owned();
+    let role = route
+        .get("role")
+        .and_then(|value| value.as_str())
+        .unwrap_or("user")
+        .to_owned();
+    let target_count = route
+        .get("targets")
+        .and_then(|value| value.as_array())
+        .map(|targets| targets.len().max(1))
+        .unwrap_or(1);
+
+    Some(MeshRouteSummary {
+        path,
+        name,
+        role,
+        target_count,
+    })
+}
+
+fn batch_target_name(batch_target: &serde_json::Value) -> Option<String> {
+    batch_target
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
 async fn fetch_remote_status(config: &InstanceConfig) -> Result<String> {
     let client = build_http_client(config)?;
     let response = client
@@ -358,7 +445,7 @@ fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
         .with_context(|| format!("invalid Tachyon node URL `{}`", config.url))?;
     let mut builder = reqwest::Client::builder();
 
-    if is_loopback_url(&url) {
+    if allows_insecure_local_tls(&url) {
         builder = builder.danger_accept_invalid_certs(true);
     }
 
@@ -385,11 +472,13 @@ fn build_admin_url(base_url: &str, path: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-fn is_loopback_url(url: &reqwest::Url) -> bool {
+fn allows_insecure_local_tls(url: &reqwest::Url) -> bool {
     matches!(
         url.host_str(),
         Some("127.0.0.1") | Some("localhost") | Some("::1")
-    )
+    ) || url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("home-lab-k3s.wsl") || host.ends_with(".wsl"))
 }
 
 fn validate_connection_config(config: &InstanceConfig) -> Result<()> {
@@ -431,6 +520,7 @@ async fn hash_file_sha256(file_path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_engine_status_summarizes_routes_and_batches() {
@@ -449,5 +539,46 @@ mod tests {
             .expect("admin URL should build");
 
         assert_eq!(url, "https://127.0.0.1:4000/admin/status");
+    }
+
+    #[test]
+    fn allows_insecure_tls_for_loopback_and_homelab_wsl_hosts() {
+        let loopback = reqwest::Url::parse("https://127.0.0.1:4000").expect("loopback URL");
+        let homelab = reqwest::Url::parse("https://home-lab-k3s.wsl").expect("homelab URL");
+        let nested = reqwest::Url::parse("https://edge.home-lab-k3s.wsl").expect("nested URL");
+
+        assert!(allows_insecure_local_tls(&loopback));
+        assert!(allows_insecure_local_tls(&homelab));
+        assert!(allows_insecure_local_tls(&nested));
+    }
+
+    #[test]
+    fn denies_insecure_tls_for_non_local_hosts() {
+        let public = reqwest::Url::parse("https://example.com").expect("public URL");
+
+        assert!(!allows_insecure_local_tls(&public));
+    }
+
+    #[test]
+    fn route_summary_defaults_to_single_target() {
+        let route = json!({
+            "path": "/api/demo",
+            "role": "system",
+            "name": "demo"
+        });
+
+        let summary = parse_route_summary(&route).expect("route summary should parse");
+
+        assert_eq!(summary.path, "/api/demo");
+        assert_eq!(summary.name, "demo");
+        assert_eq!(summary.role, "system");
+        assert_eq!(summary.target_count, 1);
+    }
+
+    #[test]
+    fn batch_target_name_extracts_name() {
+        let batch_target = json!({ "name": "gc-job" });
+
+        assert_eq!(batch_target_name(&batch_target), Some("gc-job".to_owned()));
     }
 }

@@ -59,7 +59,7 @@ pub(crate) enum AuthFailure {
 }
 
 impl AuthFailure {
-    fn into_response(self) -> Response {
+    pub(crate) fn into_response(self) -> Response {
         match self {
             Self::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message).into_response(),
             Self::Forbidden(message) => (StatusCode::FORBIDDEN, message).into_response(),
@@ -326,7 +326,7 @@ impl wasmtime::component::HasData for AuthComponentState {
     type Data<'a> = &'a mut Self;
 }
 
-fn bearer_token(headers: &HeaderMap) -> Result<String, AuthFailure> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Result<String, AuthFailure> {
     let value = headers
         .get(AUTHORIZATION)
         .ok_or_else(|| AuthFailure::Unauthorized("missing Authorization header".to_owned()))?;
