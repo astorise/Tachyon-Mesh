@@ -116,11 +116,17 @@ RUN mkdir -p /workspace/guest-modules \
     && dotnet publish guest-csharp.csproj -c Release \
     && artifact_dir=/workspace/examples/guest-csharp/bin/Release/net8.0/wasi-wasm \
     && if [ -d "${artifact_dir}/AppBundle" ]; then \
-        cp -r "${artifact_dir}/AppBundle/." /workspace/guest-modules/; \
+        publish_root="${artifact_dir}/AppBundle"; \
       elif [ -d "${artifact_dir}/publish" ]; then \
-        cp -r "${artifact_dir}/publish/." /workspace/guest-modules/; \
+        publish_root="${artifact_dir}/publish"; \
       else \
         echo "missing WASI publish output under ${artifact_dir}" >&2; \
+        exit 1; \
+      fi \
+    && cp -r "${publish_root}/." /workspace/guest-modules/ \
+    && if [ ! -f /workspace/guest-modules/guest_csharp.wasm ]; then \
+        echo "missing guest_csharp.wasm in ${publish_root}" >&2; \
+        find "${publish_root}" -maxdepth 2 -type f | sort >&2; \
         exit 1; \
       fi
 
