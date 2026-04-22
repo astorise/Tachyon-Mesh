@@ -116,7 +116,7 @@ RUN mkdir -p /workspace/guest-modules \
     && dotnet publish guest-csharp.csproj -c Release \
     && cp -r /workspace/examples/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/. /workspace/guest-modules/
 
-FROM maven:3.9.14-eclipse-temurin-17 AS java-builder
+FROM maven:3.9.15-eclipse-temurin-17 AS java-builder
 
 WORKDIR /workspace/examples/guest-java
 
