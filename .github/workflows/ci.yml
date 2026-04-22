@@ -77,8 +77,10 @@ jobs:
           cargo build -p system-faas-keda --target wasm32-wasip2 --release
           cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
           cargo build -p system-faas-logger --target wasm32-wasip2 --release
+          cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
           cargo build -p system-faas-metering --target wasm32-wasip2 --release
           cargo build -p system-faas-prom --target wasm32-wasip2 --release
+          cargo build -p system-faas-registry --target wasm32-wasip2 --release
           cargo build -p system-faas-s3-proxy --target wasm32-wasip2 --release
           cargo build -p system-faas-sqs --target wasm32-wasip2 --release
           cargo build -p system-faas-storage-broker --target wasm32-wasip2 --release
@@ -125,8 +127,10 @@ jobs:
             target/wasm32-wasip2/release/gossip.wasm
             target/wasm32-wasip2/release/k8s_scaler.wasm
             target/wasm32-wasip2/release/system_faas_logger.wasm
+            target/wasm32-wasip2/release/system_faas_model_broker.wasm
             target/wasm32-wasip2/release/metering.wasm
             target/wasm32-wasip2/release/metrics.wasm
+            target/wasm32-wasip2/release/system_faas_registry.wasm
             target/wasm32-wasip2/release/scaling.wasm
             target/wasm32-wasip2/release/system_faas_s3_proxy.wasm
             target/wasm32-wasip2/release/system_faas_sqs.wasm

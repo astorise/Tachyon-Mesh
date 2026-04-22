@@ -13,6 +13,13 @@ async fn get_engine_status() -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn get_mesh_graph() -> Result<tachyon_client::MeshGraphSnapshot, String> {
+    tachyon_client::get_mesh_graph()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn connect_to_node(
     url: String,
     token: String,
@@ -55,6 +62,7 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_engine_status,
+            get_mesh_graph,
             connect_to_node,
             generate_recovery_codes,
             push_asset,
