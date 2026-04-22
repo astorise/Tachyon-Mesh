@@ -9,6 +9,8 @@ use tokio::io::AsyncReadExt;
 
 const ADMIN_STATUS_PATH: &str = "/admin/status";
 const ADMIN_RECOVERY_CODES_PATH: &str = "/admin/security/recovery-codes";
+const ADMIN_ACCOUNT_SECURITY_PATH: &str = "/admin/security/2fa/regenerate";
+const ADMIN_PAT_PATH: &str = "/admin/security/pats";
 const ADMIN_ASSET_UPLOAD_PATH: &str = "/admin/assets";
 const EXPECTED_HASH_HEADER: &str = "x-tachyon-expected-sha256";
 const ADMIN_MODEL_INIT_PATH: &str = "/admin/models/init";
@@ -42,6 +44,18 @@ struct SealedConfig {
 #[derive(Debug, Deserialize)]
 struct RecoveryCodeResponse {
     codes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct IssuePatRequest<'a> {
+    name: &'a str,
+    scopes: &'a [String],
+    ttl_days: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssuePatResponse {
+    token: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,6 +214,72 @@ pub async fn generate_recovery_codes(username: &str) -> Result<Vec<String>> {
     let payload: RecoveryCodeResponse =
         serde_json::from_slice(&body).context("failed to decode recovery-code response payload")?;
     Ok(payload.codes)
+}
+
+pub async fn regenerate_account_security() -> Result<Vec<String>> {
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_admin_url(&config.url, ADMIN_ACCOUNT_SECURITY_PATH)?)
+        .bearer_auth(&config.token)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach Tachyon node at {}", config.url))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read account-security response body")?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "account security regeneration failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    let payload: RecoveryCodeResponse = serde_json::from_slice(&body)
+        .context("failed to decode account-security response payload")?;
+    Ok(payload.codes)
+}
+
+pub async fn generate_pat(name: &str, scopes: &[String], ttl_days: u32) -> Result<String> {
+    if name.trim().is_empty() {
+        anyhow::bail!("PAT name must not be empty");
+    }
+    if scopes.is_empty() {
+        anyhow::bail!("PAT scopes must not be empty");
+    }
+
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_admin_url(&config.url, ADMIN_PAT_PATH)?)
+        .bearer_auth(&config.token)
+        .json(&IssuePatRequest {
+            name: name.trim(),
+            scopes,
+            ttl_days,
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to reach Tachyon node at {}", config.url))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read PAT response body")?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "PAT issuance failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    let payload: IssuePatResponse =
+        serde_json::from_slice(&body).context("failed to decode PAT response payload")?;
+    Ok(payload.token)
 }
 
 pub async fn push_asset(file_path: &str) -> Result<String> {

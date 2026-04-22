@@ -16,9 +16,10 @@
     <nav class="flex-1 p-4 space-y-2">
       <a href="#" data-view="dashboard" class="nav-link block px-4 py-2 rounded-md bg-slate-800 text-cyan-400 font-medium transition-colors">Dashboard</a>
       <a href="#" data-view="topology" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Mesh Topology</a>
-      <a href="#" data-view="deployments" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">FaaS Deployments</a>
+      <a href="#" data-view="registry" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Asset Registry</a>
       <a href="#" data-view="identity" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Identity</a>
-      <a href="#" data-view="ai-broker" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">AI Broker</a>
+      <a href="#" data-view="account" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">My Account</a>
+      <a href="#" data-view="broker" class="nav-link block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Model Broker</a>
     </nav>
     <div class="p-4 border-t border-slate-800 text-xs text-slate-500">
       v1.0.0-core
@@ -40,7 +41,7 @@
     </header>
 
     <div class="p-8 overflow-y-auto">
-      <div id="view-dashboard" class="space-y-6">
+      <div id="view-dashboard" class="view-container space-y-6">
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           <div class="stagger-card bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-lg">
             <div class="flex justify-between items-start mb-4">
@@ -92,7 +93,7 @@
         </div>
       </div>
 
-      <div id="view-topology" class="hidden space-y-6">
+      <div id="view-topology" class="view-container hidden space-y-6">
         <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
           <div class="flex items-center justify-between gap-4 mb-6">
             <div>
@@ -128,11 +129,11 @@
         </div>
       </div>
 
-      <div id="view-deployments" class="hidden space-y-6">
+      <div id="view-registry" class="view-container hidden space-y-6">
         <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
           <div class="flex items-center justify-between gap-4 mb-4">
             <div>
-              <h3 class="text-lg font-semibold text-white">Deployment Manager (Ready)</h3>
+              <h3 class="text-lg font-semibold text-white">Asset Registry</h3>
               <p class="text-sm text-slate-500">Push sealed WebAssembly assets directly into the embedded mesh registry.</p>
             </div>
             <span class="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-300">Admin</span>
@@ -149,7 +150,7 @@
         </div>
       </div>
 
-      <div id="view-identity" class="hidden space-y-6">
+      <div id="view-identity" class="view-container hidden space-y-6">
         <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
           <div class="flex items-center justify-between gap-4 mb-6">
             <div>
@@ -195,11 +196,44 @@
         </div>
       </div>
 
-      <div id="view-ai-broker" class="hidden space-y-6">
+      <div id="view-account" class="view-container hidden space-y-6">
+        <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
+          <div class="flex items-center justify-between gap-4 mb-6">
+            <div>
+              <h3 class="text-lg font-semibold text-white">Account &amp; Security</h3>
+              <p class="text-sm text-slate-500">Issue short-lived automation tokens and rotate your personal recovery bundle for the active endpoint.</p>
+            </div>
+            <div class="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs font-medium text-cyan-300" id="account-connection-source">workspace://local</div>
+          </div>
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div class="bg-slate-950 border border-slate-800 rounded-xl p-6">
+              <h4 class="text-lg font-semibold text-cyan-400 mb-2">Personal Access Tokens</h4>
+              <p class="text-sm text-slate-500 mb-4">Generate scoped tokens for CI/CD automation and operational tooling.</p>
+              <input type="text" id="pat-name" placeholder="Token Name (e.g. GitHub Actions)" class="w-full bg-slate-900 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm" />
+              <input type="text" id="pat-scopes" placeholder="Scopes: deploy:wasm,read:nodes" class="w-full bg-slate-900 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm font-mono" />
+              <select id="pat-ttl" class="w-full bg-slate-900 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm">
+                <option value="7">7 days</option>
+                <option value="30" selected>30 days</option>
+                <option value="90">90 days</option>
+              </select>
+              <button id="btn-generate-pat" class="px-4 py-2 bg-cyan-600 text-white rounded-lg font-medium text-sm w-full hover:bg-cyan-500 transition-colors">Generate Token</button>
+              <div id="pat-result" class="hidden mt-4 p-3 bg-slate-900 border border-emerald-500/30 text-emerald-400 font-mono text-xs break-all rounded-lg"></div>
+            </div>
+            <div class="bg-slate-950 border border-slate-800 rounded-xl p-6">
+              <h4 class="text-lg font-semibold text-red-400 mb-2">Emergency Operations</h4>
+              <p class="text-sm text-slate-500 mb-4">Rotate the recovery bundle bound to the current administrative identity. Existing saved codes are invalidated immediately.</p>
+              <button id="btn-regen-2fa" class="px-4 py-2 bg-red-500/10 border border-red-500/30 text-red-400 rounded-lg font-medium text-sm hover:bg-red-500/20 transition-colors w-full">Regenerate Recovery Bundle</button>
+              <div id="account-security-result" class="hidden mt-4 p-3 bg-slate-900 border border-slate-700 text-slate-300 font-mono text-xs whitespace-pre-wrap break-words rounded-lg"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="view-broker" class="view-container hidden space-y-6">
         <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
           <div class="flex items-center justify-between gap-4 mb-4">
             <div>
-              <h3 class="text-lg font-semibold text-white">Large Model Broker</h3>
+              <h3 class="text-lg font-semibold text-white">Model Broker</h3>
               <p class="text-sm text-slate-500">Stream multi-megabyte model files directly to `tachyon_data/models` without buffering them in RAM.</p>
             </div>
             <span class="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-300">D2D</span>
