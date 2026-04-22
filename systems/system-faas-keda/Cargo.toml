@@ -8,4 +8,4 @@ name = "scaling"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.46"
+wit-bindgen = "0.57"
