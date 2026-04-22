@@ -445,7 +445,7 @@ fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
         .with_context(|| format!("invalid Tachyon node URL `{}`", config.url))?;
     let mut builder = reqwest::Client::builder();
 
-    if is_loopback_url(&url) {
+    if allows_insecure_local_tls(&url) {
         builder = builder.danger_accept_invalid_certs(true);
     }
 
@@ -472,11 +472,13 @@ fn build_admin_url(base_url: &str, path: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-fn is_loopback_url(url: &reqwest::Url) -> bool {
+fn allows_insecure_local_tls(url: &reqwest::Url) -> bool {
     matches!(
         url.host_str(),
         Some("127.0.0.1") | Some("localhost") | Some("::1")
-    )
+    ) || url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("home-lab-k3s.wsl") || host.ends_with(".wsl"))
 }
 
 fn validate_connection_config(config: &InstanceConfig) -> Result<()> {
@@ -537,6 +539,24 @@ mod tests {
             .expect("admin URL should build");
 
         assert_eq!(url, "https://127.0.0.1:4000/admin/status");
+    }
+
+    #[test]
+    fn allows_insecure_tls_for_loopback_and_homelab_wsl_hosts() {
+        let loopback = reqwest::Url::parse("https://127.0.0.1:4000").expect("loopback URL");
+        let homelab = reqwest::Url::parse("https://home-lab-k3s.wsl").expect("homelab URL");
+        let nested = reqwest::Url::parse("https://edge.home-lab-k3s.wsl").expect("nested URL");
+
+        assert!(allows_insecure_local_tls(&loopback));
+        assert!(allows_insecure_local_tls(&homelab));
+        assert!(allows_insecure_local_tls(&nested));
+    }
+
+    #[test]
+    fn denies_insecure_tls_for_non_local_hosts() {
+        let public = reqwest::Url::parse("https://example.com").expect("public URL");
+
+        assert!(!allows_insecure_local_tls(&public));
     }
 
     #[test]
