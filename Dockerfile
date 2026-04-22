@@ -89,18 +89,24 @@ COPY examples/guest-js/index.js ./
 RUN mkdir -p /workspace/guest-modules \
     && javy build /workspace/examples/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
 
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS dotnet-builder
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS dotnet-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG WASI_SDK_VERSION=20.0
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
+ENV DOTNET_ROOT=/opt/dotnet8
+ENV PATH="${DOTNET_ROOT}:${PATH}"
 ENV WASI_SDK_PATH=/opt/wasi-sdk-${WASI_SDK_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* 
+
+RUN curl -fsSL -o /tmp/dotnet-install.sh https://dot.net/v1/dotnet-install.sh \
+    && bash /tmp/dotnet-install.sh --channel 8.0 --install-dir "${DOTNET_ROOT}" \
+    && rm /tmp/dotnet-install.sh
 
 RUN dotnet workload install wasi-experimental
 RUN curl -fsSL -o /tmp/wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-20/wasi-sdk-${WASI_SDK_VERSION}-linux.tar.gz \
@@ -114,7 +120,21 @@ COPY examples/guest-csharp/Program.cs ./
 
 RUN mkdir -p /workspace/guest-modules \
     && dotnet publish guest-csharp.csproj -c Release \
-    && cp -r /workspace/examples/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/. /workspace/guest-modules/
+    && artifact_dir=/workspace/examples/guest-csharp/bin/Release/net8.0/wasi-wasm \
+    && if [ -d "${artifact_dir}/AppBundle" ]; then \
+        publish_root="${artifact_dir}/AppBundle"; \
+      elif [ -d "${artifact_dir}/publish" ]; then \
+        publish_root="${artifact_dir}/publish"; \
+      else \
+        echo "missing WASI publish output under ${artifact_dir}" >&2; \
+        exit 1; \
+      fi \
+    && cp -r "${publish_root}/." /workspace/guest-modules/ \
+    && if [ ! -f /workspace/guest-modules/guest_csharp.wasm ]; then \
+        echo "missing guest_csharp.wasm in ${publish_root}" >&2; \
+        find "${publish_root}" -maxdepth 2 -type f | sort >&2; \
+        exit 1; \
+      fi
 
 FROM maven:3.9.15-eclipse-temurin-17 AS java-builder
 
