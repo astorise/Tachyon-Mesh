@@ -12,7 +12,10 @@ mod bindings {
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bindings::exports::tachyon::identity::authn::{AuthnError, IdentityPayload};
 use hmac::{Hmac, KeyInit, Mac};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{
+    distr::{Alphanumeric, SampleString},
+    Rng,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -383,23 +386,17 @@ fn normalize_scopes(scopes: Vec<String>) -> Vec<String> {
 }
 
 fn generate_pat_token() -> String {
-    let suffix = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(PAT_TOKEN_CHARS)
-        .map(char::from)
-        .map(|character| character.to_ascii_lowercase())
-        .collect::<String>();
+    let suffix = Alphanumeric
+        .sample_string(&mut rand::rng(), PAT_TOKEN_CHARS)
+        .to_ascii_lowercase();
     format!("{PAT_PREFIX}{suffix}")
 }
 
 fn generate_recovery_code() -> String {
     let chunk = || {
-        rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(5)
-            .map(char::from)
-            .map(|character| character.to_ascii_uppercase())
-            .collect::<String>()
+        Alphanumeric
+            .sample_string(&mut rand::rng(), 5)
+            .to_ascii_uppercase()
     };
 
     format!("TCHN-{}-{}", chunk(), chunk())
@@ -506,7 +503,7 @@ mod tests {
     fn with_temp_state_dir<T>(test: impl FnOnce() -> T) -> T {
         let temp_dir = std::env::temp_dir().join(format!(
             "tachyon-authn-test-{}",
-            rand::thread_rng().gen::<u64>()
+            rand::rng().random::<u64>()
         ));
         fs::create_dir_all(&temp_dir).expect("temporary auth state directory should exist");
         std::env::set_var(AUTH_STATE_DIR_ENV, &temp_dir);
