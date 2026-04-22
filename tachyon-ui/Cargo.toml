@@ -11,4 +11,4 @@ tauri-build = { version = "2", features = [] }
 tachyon-client = { path = "../tachyon-client" }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["custom-protocol"] }
