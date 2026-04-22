@@ -1,0 +1,19 @@
+package tachyon:identity;
+
+interface authz {
+    record identity-payload {
+        subject: string,
+        roles: list<string>,
+        scopes: list<string>,
+    }
+
+    variant authz-error {
+        internal-error(string),
+    }
+
+    evaluate-policy: func(identity: identity-payload, action: string, resource-path: string) -> result<bool, authz-error>;
+}
+
+world authz-guest {
+    export authz;
+}

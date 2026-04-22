@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import gsap from "gsap";
 
-type ViewName = "dashboard" | "topology" | "deployments" | "identity" | "ai-broker";
+type ViewName = "dashboard" | "topology" | "registry" | "identity" | "account" | "broker";
 
 type MeshRouteSummary = {
   path: string;
@@ -46,6 +46,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const modelUploadBtn = document.getElementById("model-upload-btn") as HTMLButtonElement | null;
   const modelUploadResult = document.getElementById("model-upload-result");
   const modelProgress = document.getElementById("model-progress");
+  const viewContainers = document.querySelectorAll(".view-container");
   const navLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>(".nav-link[data-view]"));
   const refreshTopologyBtn = document.getElementById("refresh-topology-btn") as HTMLButtonElement | null;
   const meshGraphSource = document.getElementById("mesh-graph-source");
@@ -58,6 +59,14 @@ document.addEventListener("DOMContentLoaded", () => {
   const identityMfaStatus = document.getElementById("identity-mfa-status");
   const identityRecoveryStatus = document.getElementById("identity-recovery-status");
   const identityMfaBtn = document.getElementById("identity-mfa-btn") as HTMLButtonElement | null;
+  const accountConnectionSource = document.getElementById("account-connection-source");
+  const patNameInput = document.getElementById("pat-name") as HTMLInputElement | null;
+  const patScopesInput = document.getElementById("pat-scopes") as HTMLInputElement | null;
+  const patTtlInput = document.getElementById("pat-ttl") as HTMLSelectElement | null;
+  const patGenerateBtn = document.getElementById("btn-generate-pat") as HTMLButtonElement | null;
+  const patResult = document.getElementById("pat-result");
+  const regen2faBtn = document.getElementById("btn-regen-2fa") as HTMLButtonElement | null;
+  const accountSecurityResult = document.getElementById("account-security-result");
 
   let downloadedRecoveryCodes = false;
   let recoveryCodes: string[] = [];
@@ -66,9 +75,10 @@ document.addEventListener("DOMContentLoaded", () => {
   const viewPanels: Record<ViewName, HTMLElement | null> = {
     dashboard: document.getElementById("view-dashboard"),
     topology: document.getElementById("view-topology"),
-    deployments: document.getElementById("view-deployments"),
+    registry: document.getElementById("view-registry"),
     identity: document.getElementById("view-identity"),
-    "ai-broker": document.getElementById("view-ai-broker"),
+    account: document.getElementById("view-account"),
+    broker: document.getElementById("view-broker"),
   };
 
   const viewMetadata: Record<ViewName, { title: string; subtitle: string }> = {
@@ -80,16 +90,20 @@ document.addEventListener("DOMContentLoaded", () => {
       title: "Mesh Topology",
       subtitle: "Inspect the sealed route graph and batch surfaces for the active node profile.",
     },
-    deployments: {
-      title: "FaaS Deployments",
+    registry: {
+      title: "Asset Registry",
       subtitle: "Publish WebAssembly assets directly into the embedded mesh registry.",
     },
     identity: {
       title: "Identity",
       subtitle: "Review the administrative principal and security onboarding posture.",
     },
-    "ai-broker": {
-      title: "AI Model Broker",
+    account: {
+      title: "My Account",
+      subtitle: "Manage personal automation tokens and rotate emergency recovery material.",
+    },
+    broker: {
+      title: "Model Broker",
       subtitle: "Stream large model artifacts into disk-backed storage without RAM spikes.",
     },
   };
@@ -222,6 +236,22 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
+  const renderAccountView = () => {
+    const endpoint = nodeUrl?.value.trim() || "workspace://local";
+    if (accountConnectionSource) {
+      accountConnectionSource.textContent = endpoint;
+    }
+  };
+
+  const renderAccountMessage = (target: HTMLElement | null, message: string, className: string) => {
+    if (!target) {
+      return;
+    }
+    target.textContent = message;
+    target.className = className;
+    target.classList.remove("hidden");
+  };
+
   const renderMeshGraph = (snapshot: MeshGraphSnapshot) => {
     if (meshGraphSource) {
       meshGraphSource.textContent = snapshot.source;
@@ -335,6 +365,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if (view === "identity") {
       renderIdentityView();
     }
+    if (view === "account") {
+      renderAccountView();
+    }
   };
 
   const showFirstRunModal = async () => {
@@ -372,6 +405,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     firstRunModal.classList.add("hidden");
     renderIdentityView();
+    renderAccountView();
   };
 
   const renderRecoveryCodes = (codes: string[]) => {
@@ -420,6 +454,7 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       updateConnectionBadge();
       renderIdentityView();
+      renderAccountView();
       void refreshMeshTopology();
 
       if (overlay) {
@@ -510,6 +545,92 @@ document.addEventListener("DOMContentLoaded", () => {
 
   identityMfaBtn?.addEventListener("click", () => {
     void showFirstRunModal();
+  });
+
+  patGenerateBtn?.addEventListener("click", async () => {
+    const name = patNameInput?.value.trim() ?? "";
+    const scopes = (patScopesInput?.value ?? "")
+      .split(",")
+      .map((scope) => scope.trim())
+      .filter(Boolean);
+    const ttlDays = Number(patTtlInput?.value ?? "30");
+
+    if (!name) {
+      renderAccountMessage(
+        patResult,
+        "PAT name must not be empty.",
+        "mt-4 p-3 bg-slate-900 border border-red-500/30 text-red-400 font-mono text-xs break-all rounded-lg",
+      );
+      return;
+    }
+    if (scopes.length === 0) {
+      renderAccountMessage(
+        patResult,
+        "Provide at least one PAT scope.",
+        "mt-4 p-3 bg-slate-900 border border-red-500/30 text-red-400 font-mono text-xs break-all rounded-lg",
+      );
+      return;
+    }
+
+    patGenerateBtn.disabled = true;
+    patGenerateBtn.textContent = "Generating...";
+    renderAccountMessage(
+      patResult,
+      "Issuing scoped PAT...",
+      "mt-4 p-3 bg-slate-900 border border-slate-700 text-slate-300 font-mono text-xs break-all rounded-lg",
+    );
+
+    try {
+      const token = await invoke<string>("generate_pat", {
+        name,
+        scopes,
+        ttlDays,
+      });
+      renderAccountMessage(
+        patResult,
+        token,
+        "mt-4 p-3 bg-slate-900 border border-emerald-500/30 text-emerald-400 font-mono text-xs break-all rounded-lg",
+      );
+    } catch (error) {
+      console.error("PAT generation error:", error);
+      renderAccountMessage(
+        patResult,
+        String(error),
+        "mt-4 p-3 bg-slate-900 border border-red-500/30 text-red-400 font-mono text-xs break-all rounded-lg",
+      );
+    } finally {
+      patGenerateBtn.disabled = false;
+      patGenerateBtn.textContent = "Generate Token";
+    }
+  });
+
+  regen2faBtn?.addEventListener("click", async () => {
+    regen2faBtn.disabled = true;
+    regen2faBtn.textContent = "Regenerating...";
+    renderAccountMessage(
+      accountSecurityResult,
+      "Rotating recovery bundle...",
+      "mt-4 p-3 bg-slate-900 border border-slate-700 text-slate-300 font-mono text-xs whitespace-pre-wrap break-words rounded-lg",
+    );
+
+    try {
+      const codes = await invoke<string[]>("regenerate_account_security");
+      renderAccountMessage(
+        accountSecurityResult,
+        codes.join("\n"),
+        "mt-4 p-3 bg-slate-900 border border-emerald-500/30 text-emerald-300 font-mono text-xs whitespace-pre-wrap break-words rounded-lg",
+      );
+    } catch (error) {
+      console.error("Account security regeneration error:", error);
+      renderAccountMessage(
+        accountSecurityResult,
+        String(error),
+        "mt-4 p-3 bg-slate-900 border border-red-500/30 text-red-400 font-mono text-xs whitespace-pre-wrap break-words rounded-lg",
+      );
+    } finally {
+      regen2faBtn.disabled = false;
+      regen2faBtn.textContent = "Regenerate Recovery Bundle";
+    }
   });
 
   navLinks.forEach((link) => {
@@ -641,22 +762,27 @@ document.addEventListener("DOMContentLoaded", () => {
   nodeUrl?.addEventListener("input", () => {
     updateConnectionBadge();
     renderIdentityView();
+    renderAccountView();
   });
 
   nodeToken?.addEventListener("input", () => {
     renderIdentityView();
+    renderAccountView();
   });
 
   updateConnectionBadge();
   updateHeaderForView(activeView);
   updateNavigationState(activeView);
   renderIdentityView();
+  renderAccountView();
   void refreshMeshTopology();
   console.info("[tachyon-ui] navigation routing enabled", {
+    viewCount: viewContainers.length,
     dashboard: "view-dashboard",
     topology: "view-topology",
-    deployments: "view-deployments",
+    registry: "view-registry",
     identity: "view-identity",
-    aiBroker: "view-ai-broker",
+    account: "view-account",
+    broker: "view-broker",
   });
 });
