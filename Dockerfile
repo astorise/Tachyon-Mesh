@@ -95,12 +95,18 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG WASI_SDK_VERSION=20.0
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
+ENV DOTNET_ROOT=/opt/dotnet8
+ENV PATH="${DOTNET_ROOT}:${PATH}"
 ENV WASI_SDK_PATH=/opt/wasi-sdk-${WASI_SDK_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* 
+
+RUN curl -fsSL -o /tmp/dotnet-install.sh https://dot.net/v1/dotnet-install.sh \
+    && bash /tmp/dotnet-install.sh --channel 8.0 --install-dir "${DOTNET_ROOT}" \
+    && rm /tmp/dotnet-install.sh
 
 RUN dotnet workload install wasi-experimental
 RUN curl -fsSL -o /tmp/wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-20/wasi-sdk-${WASI_SDK_VERSION}-linux.tar.gz \
