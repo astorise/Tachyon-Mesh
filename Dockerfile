@@ -114,7 +114,15 @@ COPY examples/guest-csharp/Program.cs ./
 
 RUN mkdir -p /workspace/guest-modules \
     && dotnet publish guest-csharp.csproj -c Release \
-    && cp -r /workspace/examples/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/. /workspace/guest-modules/
+    && artifact_dir=/workspace/examples/guest-csharp/bin/Release/net8.0/wasi-wasm \
+    && if [ -d "${artifact_dir}/AppBundle" ]; then \
+        cp -r "${artifact_dir}/AppBundle/." /workspace/guest-modules/; \
+      elif [ -d "${artifact_dir}/publish" ]; then \
+        cp -r "${artifact_dir}/publish/." /workspace/guest-modules/; \
+      else \
+        echo "missing WASI publish output under ${artifact_dir}" >&2; \
+        exit 1; \
+      fi
 
 FROM maven:3.9.15-eclipse-temurin-17 AS java-builder
 
