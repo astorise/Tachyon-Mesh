@@ -12,10 +12,7 @@ mod bindings {
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bindings::exports::tachyon::identity::authn::{AuthnError, IdentityPayload};
 use hmac::{Hmac, KeyInit, Mac};
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    Rng,
-};
+use rand::distr::{Alphanumeric, SampleString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
