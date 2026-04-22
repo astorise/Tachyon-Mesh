@@ -8,6 +8,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::from_fn,
     response::{IntoResponse, Response},
+    routing::{get, post, put},
     Extension, Router,
 };
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -22,7 +23,7 @@ use hyper_util::{
     server::conn::auto::Builder as HyperConnectionBuilder,
     service::TowerToHyperService,
 };
-use rand::Rng;
+use rand::RngExt;
 use reqwest::Client;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -71,6 +72,7 @@ use wasmtime_wasi_nn::witx::WasiNnCtx;
 
 #[cfg(feature = "ai-inference")]
 mod ai_inference;
+mod auth;
 mod data_events;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
@@ -79,6 +81,7 @@ mod resiliency;
 #[cfg(feature = "http3")]
 mod server_h3;
 mod store;
+mod system_storage;
 mod telemetry;
 mod tls_runtime;
 
@@ -310,6 +313,7 @@ struct AppState {
     telemetry: TelemetryHandle,
     tls_manager: Arc<tls_runtime::TlsManager>,
     mtls_gateway: Option<Arc<tls_runtime::MtlsGatewayConfig>>,
+    auth_manager: Arc<auth::AuthManager>,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     manifest_path: PathBuf,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -1288,8 +1292,9 @@ impl UdsFastPathRegistry {
             return candidates.pop();
         }
 
-        let first_index = rand::thread_rng().gen_range(0..candidates.len());
-        let mut second_index = rand::thread_rng().gen_range(0..candidates.len() - 1);
+        let mut rng = rand::rng();
+        let first_index = rng.random_range(0..candidates.len());
+        let mut second_index = rng.random_range(0..candidates.len() - 1);
         if second_index >= first_index {
             second_index += 1;
         }
@@ -1966,6 +1971,7 @@ async fn serve_host() -> Result<()> {
     let host_load = Arc::new(HostLoadCounters::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     let mtls_gateway = tls_runtime::load_mtls_gateway_config_from_env()?;
+    let auth_manager = Arc::new(auth::AuthManager::new(&manifest_path)?);
     let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
     background_workers.start_for_runtime(
         &runtime,
@@ -1998,6 +2004,7 @@ async fn serve_host() -> Result<()> {
         telemetry,
         tls_manager,
         mtls_gateway: mtls_gateway.map(Arc::new),
+        auth_manager,
         manifest_path,
         background_workers: Arc::clone(&background_workers),
     };
@@ -4727,7 +4734,36 @@ fn integrity_manifest_path() -> PathBuf {
 }
 
 fn build_app(state: AppState) -> Router {
+    let admin_routes = Router::new()
+        .route("/admin/status", get(auth::admin_status_handler))
+        .route(
+            "/admin/security/recovery-codes",
+            post(auth::generate_recovery_codes_handler),
+        )
+        .route("/admin/assets", post(system_storage::upload_asset_handler))
+        .route(
+            "/admin/models/init",
+            post(system_storage::init_upload_handler),
+        )
+        .route(
+            "/admin/models/upload/{upload_id}",
+            put(system_storage::upload_chunk_handler),
+        )
+        .route(
+            "/admin/models/commit/{upload_id}",
+            post(system_storage::commit_upload_handler),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::admin_auth_middleware,
+        ));
+
     let app = Router::new()
+        .merge(admin_routes)
+        .route(
+            "/auth/recovery/consume",
+            post(auth::consume_recovery_code_handler),
+        )
         .fallback(faas_handler)
         .layer(from_fn(hop_limit_middleware));
 
@@ -4746,7 +4782,7 @@ fn build_app(state: AppState) -> Router {
 }
 
 fn should_sample_telemetry(sample_rate: f64) -> bool {
-    sample_rate > 0.0 && rand::thread_rng().gen_bool(sample_rate.clamp(0.0, 1.0))
+    sample_rate > 0.0 && rand::rng().random_bool(sample_rate.clamp(0.0, 1.0))
 }
 
 fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -4760,7 +4796,7 @@ fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 
 fn generate_traceparent() -> String {
     let trace_id = Uuid::new_v4().simple().to_string();
-    let span_id = format!("{:016x}", rand::thread_rng().gen::<u64>());
+    let span_id = format!("{:016x}", rand::rng().random::<u64>());
     format!("00-{trace_id}-{span_id}-01")
 }
 
@@ -6223,7 +6259,10 @@ async fn execute_route_override(
 async fn faas_handler(
     State(state): State<AppState>,
     Extension(hop_limit): Extension<HopLimit>,
-    #[cfg(feature = "websockets")] ws: Option<WebSocketUpgrade>,
+    #[cfg(feature = "websockets")] ws: Result<
+        WebSocketUpgrade,
+        axum::extract::ws::rejection::WebSocketUpgradeRejection,
+    >,
     request: Request,
 ) -> Response {
     let (parts, body) = request.into_parts();
@@ -6372,7 +6411,8 @@ async fn faas_handler(
                                 StatusCode::UPGRADE_REQUIRED
                             };
                             match ws {
-                                Some(upgrade) => {
+                                Ok(upgrade) => {
+                                    let upgrade: WebSocketUpgrade = upgrade;
                                     let websocket_state = state.clone();
                                     let websocket_route = route.clone();
                                     let websocket_module = selected_target.module.clone();
@@ -6398,7 +6438,7 @@ async fn faas_handler(
                                         None,
                                     )
                                 }
-                                None => (
+                                Err(_) => (
                                     (
                                         status,
                                         format!(
@@ -7160,7 +7200,7 @@ fn select_route_target_with_roll(
     if total_weight > 0 {
         let draw = match random_roll {
             Some(roll) => roll % total_weight,
-            None => rand::thread_rng().gen_range(0..total_weight),
+            None => rand::rng().random_range(0..total_weight),
         };
         let mut cumulative_weight = 0_u64;
         for target in &route.targets {
@@ -8233,10 +8273,10 @@ fn websocket_message_to_host_frame(message: AxumWebSocketMessage) -> HostWebSock
 #[cfg(feature = "websockets")]
 fn host_frame_to_websocket_message(frame: HostWebSocketFrame) -> AxumWebSocketMessage {
     match frame {
-        HostWebSocketFrame::Text(text) => AxumWebSocketMessage::Text(text),
-        HostWebSocketFrame::Binary(bytes) => AxumWebSocketMessage::Binary(bytes),
-        HostWebSocketFrame::Ping(bytes) => AxumWebSocketMessage::Ping(bytes),
-        HostWebSocketFrame::Pong(bytes) => AxumWebSocketMessage::Pong(bytes),
+        HostWebSocketFrame::Text(text) => AxumWebSocketMessage::Text(text.into()),
+        HostWebSocketFrame::Binary(bytes) => AxumWebSocketMessage::Binary(bytes.into()),
+        HostWebSocketFrame::Ping(bytes) => AxumWebSocketMessage::Ping(bytes.into()),
+        HostWebSocketFrame::Pong(bytes) => AxumWebSocketMessage::Pong(bytes.into()),
         HostWebSocketFrame::Close => AxumWebSocketMessage::Close(None),
     }
 }
@@ -9207,6 +9247,11 @@ fn route_path_for_override_key(route_key: &str) -> String {
 fn resolve_guest_module_path(
     function_name: &str,
 ) -> std::result::Result<PathBuf, GuestModuleNotFound> {
+    if system_storage::is_asset_uri(function_name) {
+        return system_storage::resolve_asset_uri(&integrity_manifest_path(), function_name)
+            .map_err(|error| GuestModuleNotFound::new(function_name, error.to_string()));
+    }
+
     let candidates = guest_module_candidate_paths(function_name);
     let candidate_strings = candidates
         .iter()
@@ -12658,6 +12703,10 @@ mod tests {
             telemetry,
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             mtls_gateway: None,
+            auth_manager: Arc::new(
+                auth::AuthManager::new(&manifest_path)
+                    .expect("test auth manager should initialize"),
+            ),
             manifest_path,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         };
@@ -14282,6 +14331,10 @@ mod tests {
             telemetry: telemetry::init_test_telemetry(),
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             mtls_gateway: None,
+            auth_manager: Arc::new(
+                auth::AuthManager::new(&core_store_manifest)
+                    .expect("test auth manager should initialize"),
+            ),
             manifest_path: core_store_manifest,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         };
@@ -14933,7 +14986,7 @@ mod tests {
 
         let s3_state = Arc::new(Mutex::new(MockS3State::default()));
         let s3_app = Router::new()
-            .route("/bucket/:key", put(put_object))
+            .route("/bucket/{key}", put(put_object))
             .with_state(Arc::clone(&s3_state));
         let s3_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -15965,6 +16018,7 @@ mod tests {
         )
         .expect("client identity should load");
         let authorized = reqwest::Client::builder()
+            .use_rustls_tls()
             .danger_accept_invalid_certs(true)
             .identity(client_identity)
             .build()
@@ -16371,7 +16425,7 @@ mod tests {
         assert!(matches!(text_frame, Message::Text(text) if text == "hello"));
 
         client
-            .send(Message::Binary(vec![1_u8, 2, 3]))
+            .send(Message::Binary(vec![1_u8, 2, 3].into()))
             .await
             .expect("WebSocket client should send binary frame");
         let binary_frame = client
@@ -16379,7 +16433,7 @@ mod tests {
             .await
             .expect("WebSocket server should respond to binary frame")
             .expect("WebSocket frame should be valid");
-        assert!(matches!(binary_frame, Message::Binary(bytes) if bytes == vec![1_u8, 2, 3]));
+        assert!(matches!(binary_frame, Message::Binary(bytes) if bytes.as_ref() == [1_u8, 2, 3]));
 
         client
             .close(None)
