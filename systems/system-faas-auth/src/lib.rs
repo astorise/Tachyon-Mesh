@@ -201,7 +201,11 @@ fn normalize_username(username: &str) -> Result<String, String> {
 }
 
 fn generate_recovery_code() -> String {
-    let chunk = || Alphanumeric.sample_string(&mut rand::rng(), 5).to_ascii_uppercase();
+    let chunk = || {
+        Alphanumeric
+            .sample_string(&mut rand::rng(), 5)
+            .to_ascii_uppercase()
+    };
 
     format!("TCHN-{}-{}", chunk(), chunk())
 }
