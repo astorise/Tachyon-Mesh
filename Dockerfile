@@ -29,9 +29,12 @@ COPY . .
 
 RUN cargo build -p guest-example --target wasm32-wasip2 --release
 RUN cargo build -p guest-volume --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-auth --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-registry --target wasm32-wasip2 --release
 RUN cargo build -p guest-ai --target wasm32-wasip1 --release
 RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p guest-loop --target wasm32-wasip1 --release
@@ -113,7 +116,7 @@ RUN mkdir -p /workspace/guest-modules \
     && dotnet publish guest-csharp.csproj -c Release \
     && cp -r /workspace/examples/guest-csharp/bin/Release/net8.0/wasi-wasm/AppBundle/. /workspace/guest-modules/
 
-FROM maven:3.9.14-eclipse-temurin-17 AS java-builder
+FROM maven:3.9.15-eclipse-temurin-17 AS java-builder
 
 WORKDIR /workspace/examples/guest-java
 
@@ -141,9 +144,12 @@ WORKDIR /app
 COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_volume.wasm /app/guest-modules/guest_volume.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_auth.wasm /app/guest-modules/system_faas_auth.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/k8s_scaler.wasm /app/guest-modules/k8s_scaler.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /app/guest-modules/metrics.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_model_broker.wasm /app/guest-modules/system_faas_model_broker.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_registry.wasm /app/guest-modules/system_faas_registry.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_ai.wasm /app/guest-modules/guest_ai.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_loop.wasm /app/guest-modules/guest_loop.wasm
