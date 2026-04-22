@@ -12310,7 +12310,7 @@ mod tests {
     use http_body_util::{BodyExt, Full};
     use prost::Message;
     use rcgen::{
-        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
         KeyUsagePurpose, SanType,
     };
     use std::{
@@ -12381,6 +12381,7 @@ mod tests {
         let ca_cert = ca_params
             .self_signed(&ca_key)
             .expect("CA certificate should self-sign");
+        let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
 
         let server_key = KeyPair::generate().expect("server key should generate");
         let mut server_params =
@@ -12394,7 +12395,7 @@ mod tests {
             KeyUsagePurpose::KeyEncipherment,
         ];
         let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
+            .signed_by(&server_key, &ca_issuer)
             .expect("server certificate should sign");
 
         let client_key = KeyPair::generate().expect("client key should generate");
@@ -12403,7 +12404,7 @@ mod tests {
         client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         let client_cert = client_params
-            .signed_by(&client_key, &ca_cert, &ca_key)
+            .signed_by(&client_key, &ca_issuer)
             .expect("client certificate should sign");
 
         MtlsTestMaterial {
