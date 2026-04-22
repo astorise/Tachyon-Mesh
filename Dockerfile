@@ -152,7 +152,10 @@ FROM scratch AS legacy-runtime
 
 WORKDIR /app
 
+COPY --from=rust-builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/legacy-mock /app/legacy-mock
+
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 8081
 
@@ -162,6 +165,7 @@ FROM scratch AS runtime
 
 WORKDIR /app
 
+COPY --from=rust-builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_volume.wasm /app/guest-modules/guest_volume.wasm
@@ -179,6 +183,8 @@ COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-mod
 COPY --from=javy-builder /workspace/guest-modules/guest_js.wasm /app/guest-modules/guest_js.wasm
 COPY --from=dotnet-builder /workspace/guest-modules/. /app/guest-modules/
 COPY --from=java-builder /workspace/guest-modules/guest_java.wasm /app/guest-modules/guest_java.wasm
+
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 8080
 
