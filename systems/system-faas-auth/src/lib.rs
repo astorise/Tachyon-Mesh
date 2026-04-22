@@ -12,7 +12,7 @@ mod bindings {
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bindings::exports::tachyon::identity::auth::{AuthError, Claims};
 use hmac::{Hmac, Mac};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::distr::{Alphanumeric, SampleString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -201,14 +201,7 @@ fn normalize_username(username: &str) -> Result<String, String> {
 }
 
 fn generate_recovery_code() -> String {
-    let chunk = || {
-        rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(5)
-            .map(char::from)
-            .map(|character| character.to_ascii_uppercase())
-            .collect::<String>()
-    };
+    let chunk = || Alphanumeric.sample_string(&mut rand::rng(), 5).to_ascii_uppercase();
 
     format!("TCHN-{}-{}", chunk(), chunk())
 }
