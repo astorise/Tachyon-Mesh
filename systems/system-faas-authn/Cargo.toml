@@ -1,5 +1,5 @@
 [package]
-name = "system-faas-auth"
+name = "system-faas-authn"
 version = "0.1.0"
 edition = "2021"
 

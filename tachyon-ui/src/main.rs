@@ -39,6 +39,20 @@ async fn generate_recovery_codes(username: String) -> Result<Vec<String>, String
 }
 
 #[tauri::command]
+async fn regenerate_account_security() -> Result<Vec<String>, String> {
+    tachyon_client::regenerate_account_security()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn generate_pat(name: String, scopes: Vec<String>, ttl_days: u32) -> Result<String, String> {
+    tachyon_client::generate_pat(&name, &scopes, ttl_days)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn push_asset(path: String, bytes: Option<Vec<u8>>) -> Result<String, String> {
     let result = if let Some(bytes) = bytes {
         tachyon_client::push_asset_bytes(&path, &bytes).await
@@ -65,6 +79,8 @@ fn main() {
             get_mesh_graph,
             connect_to_node,
             generate_recovery_codes,
+            regenerate_account_security,
+            generate_pat,
             push_asset,
             push_large_model
         ])

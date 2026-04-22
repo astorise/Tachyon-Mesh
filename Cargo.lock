@@ -5960,7 +5960,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-faas-auth"
+name = "system-faas-authn"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
@@ -5970,6 +5970,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "system-faas-authz"
+version = "0.1.0"
+dependencies = [
  "wit-bindgen 0.57.1",
 ]
 

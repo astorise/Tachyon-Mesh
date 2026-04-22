@@ -29,7 +29,8 @@ COPY . .
 
 RUN cargo build -p guest-example --target wasm32-wasip2 --release
 RUN cargo build -p guest-volume --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-auth --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-authn --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-authz --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
@@ -164,7 +165,8 @@ WORKDIR /app
 COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_volume.wasm /app/guest-modules/guest_volume.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_auth.wasm /app/guest-modules/system_faas_auth.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_authn.wasm /app/guest-modules/system_faas_authn.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_authz.wasm /app/guest-modules/system_faas_authz.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/k8s_scaler.wasm /app/guest-modules/k8s_scaler.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /app/guest-modules/metrics.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm

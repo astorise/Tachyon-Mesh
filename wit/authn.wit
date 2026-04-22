@@ -1,0 +1,24 @@
+package tachyon:identity;
+
+interface authn {
+    record identity-payload {
+        subject: string,
+        roles: list<string>,
+        scopes: list<string>,
+    }
+
+    variant authn-error {
+        expired,
+        invalid-credential,
+        internal-error(string),
+    }
+
+    validate-token: func(token: string) -> result<identity-payload, authn-error>;
+    issue-pat: func(subject: string, name: string, scopes: list<string>, ttl-days: u32) -> result<string, string>;
+    generate-recovery-codes: func(username: string) -> result<list<string>, string>;
+    consume-recovery-code: func(username: string, code: string) -> result<string, string>;
+}
+
+world authn-guest {
+    export authn;
+}
