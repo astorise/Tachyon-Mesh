@@ -496,6 +496,7 @@ fn sanitize_filename(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngExt as _;
 
     fn with_temp_state_dir<T>(test: impl FnOnce() -> T) -> T {
         let temp_dir = std::env::temp_dir().join(format!(

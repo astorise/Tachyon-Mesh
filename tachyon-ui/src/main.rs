@@ -3,7 +3,17 @@
     windows_subsystem = "windows"
 )]
 
+use serde::Deserialize;
 use tauri::Emitter;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthnLoginPayload {
+    url: String,
+    username: String,
+    password: String,
+    cert: Option<Vec<u8>>,
+}
 
 #[tauri::command]
 async fn get_engine_status() -> Result<String, String> {
@@ -27,6 +37,34 @@ async fn connect_to_node(
 ) -> Result<String, String> {
     tachyon_client::set_connection(url, token, cert).await?;
     tachyon_client::get_engine_status()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn authn_login(
+    payload: AuthnLoginPayload,
+) -> Result<tachyon_client::AuthLoginResponse, String> {
+    tachyon_client::authn_login(
+        &payload.url,
+        &payload.username,
+        &payload.password,
+        payload.cert,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn iam_list_users() -> Result<Vec<tachyon_client::IamUserSummary>, String> {
+    tachyon_client::iam_list_users()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn iam_regen_mfa(username: String) -> Result<Vec<String>, String> {
+    tachyon_client::iam_regen_mfa(&username)
         .await
         .map_err(|error| error.to_string())
 }
@@ -78,6 +116,9 @@ fn main() {
             get_engine_status,
             get_mesh_graph,
             connect_to_node,
+            authn_login,
+            iam_list_users,
+            iam_regen_mfa,
             generate_recovery_codes,
             regenerate_account_security,
             generate_pat,

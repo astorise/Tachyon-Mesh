@@ -28,6 +28,23 @@ pub struct InstanceConfig {
 }
 
 static CONNECTION_STATE: OnceLock<RwLock<Option<InstanceConfig>>> = OnceLock::new();
+static SESSION_OPERATOR: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthLoginResponse {
+    pub username: String,
+    pub endpoint: String,
+    pub requires_mfa: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IamUserSummary {
+    pub username: String,
+    pub groups: Vec<String>,
+    pub security_status: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct IntegrityManifest {
@@ -105,6 +122,10 @@ pub struct MeshRouteSummary {
 
 fn connection_state() -> &'static RwLock<Option<InstanceConfig>> {
     CONNECTION_STATE.get_or_init(|| RwLock::new(None))
+}
+
+fn operator_state() -> &'static RwLock<Option<String>> {
+    SESSION_OPERATOR.get_or_init(|| RwLock::new(None))
 }
 
 pub fn workspace_root() -> PathBuf {
@@ -187,6 +208,51 @@ pub async fn set_connection(
         .expect("connection state should not be poisoned");
     *state = Some(config);
     Ok(())
+}
+
+pub async fn authn_login(
+    url: &str,
+    username: &str,
+    password: &str,
+    cert: Option<Vec<u8>>,
+) -> Result<AuthLoginResponse> {
+    let normalized_username = normalize_operator_name(username)?;
+    set_connection(url.trim().to_owned(), password.trim().to_owned(), cert)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut state = operator_state()
+        .write()
+        .expect("operator state should not be poisoned");
+    *state = Some(normalized_username.clone());
+
+    Ok(AuthLoginResponse {
+        username: normalized_username,
+        endpoint: current_connection()
+            .map(|config| config.url)
+            .unwrap_or_else(|| url.trim().to_owned()),
+        requires_mfa: true,
+    })
+}
+
+pub async fn iam_list_users() -> Result<Vec<IamUserSummary>> {
+    let _config = require_connection()?;
+    let username = current_operator_name().unwrap_or_else(|| "admin".to_owned());
+
+    Ok(vec![IamUserSummary {
+        username,
+        groups: vec!["admin".to_owned(), "ops".to_owned()],
+        security_status: "Recovery bundle managed through desktop onboarding".to_owned(),
+    }])
+}
+
+pub async fn iam_regen_mfa(username: &str) -> Result<Vec<String>> {
+    let active = current_operator_name().unwrap_or_else(|| "admin".to_owned());
+    if username.trim() != active {
+        anyhow::bail!("only the active administrative session can rotate its recovery bundle");
+    }
+
+    regenerate_account_security().await
 }
 
 pub async fn generate_recovery_codes(username: &str) -> Result<Vec<String>> {
@@ -447,6 +513,13 @@ fn current_connection() -> Option<InstanceConfig> {
         .clone()
 }
 
+fn current_operator_name() -> Option<String> {
+    operator_state()
+        .read()
+        .expect("operator state should not be poisoned")
+        .clone()
+}
+
 fn require_connection() -> Result<InstanceConfig> {
     current_connection().ok_or_else(|| anyhow::anyhow!("no active Tachyon node connection"))
 }
@@ -582,6 +655,15 @@ fn validate_connection_config(config: &InstanceConfig) -> Result<()> {
     reqwest::Url::parse(&config.url)
         .with_context(|| format!("invalid Tachyon node URL `{}`", config.url))?;
     Ok(())
+}
+
+fn normalize_operator_name(username: &str) -> Result<String> {
+    let trimmed = username.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("operator username must not be empty");
+    }
+
+    Ok(trimmed.to_owned())
 }
 
 fn sha256_hash(bytes: &[u8]) -> String {

@@ -7,6 +7,18 @@ const configuredNodeToken = (import.meta.env.VITE_TACHYON_NODE_TOKEN ?? "").trim
 
 type ViewName = "dashboard" | "topology" | "registry" | "identity" | "account" | "broker";
 
+type AuthLoginResponse = {
+  username: string;
+  endpoint: string;
+  requiresMfa: boolean;
+};
+
+type IamUserSummary = {
+  username: string;
+  groups: string[];
+  securityStatus: string;
+};
+
 type MeshRouteSummary = {
   path: string;
   name: string;
@@ -28,13 +40,18 @@ document.addEventListener("DOMContentLoaded", () => {
   const nodeId = document.getElementById("node-id");
   const headerTitle = document.getElementById("header-title");
   const headerSubtitle = document.getElementById("header-subtitle");
-  const overlay = document.getElementById("connection-overlay");
+  const overlay = document.getElementById("auth-overlay");
   const firstRunModal = document.getElementById("first-run-modal");
-  const nodeUrl = document.getElementById("node-url") as HTMLInputElement | null;
-  const nodeToken = document.getElementById("node-token") as HTMLInputElement | null;
-  const mtlsFile = document.getElementById("mtls-file") as HTMLInputElement | null;
-  const connectSubmitBtn = document.getElementById("connect-btn") as HTMLButtonElement | null;
-  const connectionError = document.getElementById("conn-error");
+  const authLoginStep = document.getElementById("auth-step-login");
+  const authMfaStep = document.getElementById("auth-step-mfa");
+  const nodeUrl = document.getElementById("auth-url") as HTMLInputElement | null;
+  const authUsername = document.getElementById("auth-username") as HTMLInputElement | null;
+  const nodeToken = document.getElementById("auth-password") as HTMLInputElement | null;
+  const mtlsFile = document.getElementById("auth-mtls") as HTMLInputElement | null;
+  const connectSubmitBtn = document.getElementById("btn-login-submit") as HTMLButtonElement | null;
+  const authMfaCode = document.getElementById("auth-mfa-code") as HTMLInputElement | null;
+  const authMfaSubmitBtn = document.getElementById("btn-mfa-submit") as HTMLButtonElement | null;
+  const connectionError = document.getElementById("auth-error");
   const qrStep = document.getElementById("qr-step");
   const recoveryCodesStep = document.getElementById("recovery-codes-step");
   const showRecoveryCodesBtn = document.getElementById("show-recovery-codes-btn") as HTMLButtonElement | null;
@@ -57,11 +74,13 @@ document.addEventListener("DOMContentLoaded", () => {
   const meshRouteCount = document.getElementById("mesh-route-count");
   const meshRouteList = document.getElementById("mesh-route-list");
   const meshBatchList = document.getElementById("mesh-batch-list");
-  const identityUserRows = document.getElementById("identity-user-rows");
+  const iamUserList = document.getElementById("iam-user-list");
   const identityConnectionSource = document.getElementById("identity-connection-source");
   const identityMfaStatus = document.getElementById("identity-mfa-status");
   const identityRecoveryStatus = document.getElementById("identity-recovery-status");
   const identityMfaBtn = document.getElementById("identity-mfa-btn") as HTMLButtonElement | null;
+  const identityActionResult = document.getElementById("identity-action-result");
+  const newUserBtn = document.getElementById("btn-new-user") as HTMLButtonElement | null;
   const accountConnectionSource = document.getElementById("account-connection-source");
   const patNameInput = document.getElementById("pat-name") as HTMLInputElement | null;
   const patScopesInput = document.getElementById("pat-scopes") as HTMLInputElement | null;
@@ -74,6 +93,9 @@ document.addEventListener("DOMContentLoaded", () => {
   let downloadedRecoveryCodes = false;
   let recoveryCodes: string[] = [];
   let activeView: ViewName = "dashboard";
+  let activeOperator = "admin";
+  let authGatewayValidated = false;
+  let iamUsers: IamUserSummary[] = [];
 
   const viewPanels: Record<ViewName, HTMLElement | null> = {
     dashboard: document.getElementById("view-dashboard"),
@@ -129,6 +151,9 @@ document.addEventListener("DOMContentLoaded", () => {
   if (nodeUrl && !nodeUrl.value && configuredNodeUrl) {
     nodeUrl.value = configuredNodeUrl;
   }
+  if (authUsername && !authUsername.value) {
+    authUsername.value = activeOperator;
+  }
   if (nodeToken && !nodeToken.value && configuredNodeToken) {
     nodeToken.value = configuredNodeToken;
   }
@@ -156,7 +181,7 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    connectionError.textContent = "Connection failed.";
+    connectionError.textContent = "Authentication failed.";
     connectionError.classList.add("hidden");
   };
 
@@ -213,14 +238,30 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const renderIdentityView = () => {
     const endpoint = nodeUrl?.value.trim() || "workspace://local";
-    const connected = Boolean(nodeUrl?.value.trim() && nodeToken?.value.trim());
+    const connected = authGatewayValidated;
     const recoveryReady = localStorage.getItem(onboardingStorageKey()) === "complete";
+    const renderedUsers =
+      iamUsers.length > 0
+        ? iamUsers
+        : connected
+          ? [
+              {
+                username: activeOperator,
+                groups: ["admin", "ops"],
+                securityStatus: "Recovery bundle managed through desktop onboarding",
+              },
+            ]
+          : [];
 
     if (identityConnectionSource) {
       identityConnectionSource.textContent = endpoint;
     }
     if (identityMfaStatus) {
-      identityMfaStatus.textContent = recoveryReady ? "Recovery bundle secured" : "Onboarding required";
+      identityMfaStatus.textContent = connected
+        ? recoveryReady
+          ? "Recovery bundle secured"
+          : "Onboarding required"
+        : "Auth gateway locked";
     }
     if (identityRecoveryStatus) {
       identityRecoveryStatus.textContent = recoveryReady
@@ -228,21 +269,61 @@ document.addEventListener("DOMContentLoaded", () => {
         : "Pending download acknowledgement";
     }
     if (identityMfaBtn) {
-      identityMfaBtn.disabled = recoveryReady;
-      identityMfaBtn.textContent = recoveryReady ? "Recovery Bundle Secured" : "Continue Security Setup";
+      identityMfaBtn.disabled = !connected || recoveryReady;
+      identityMfaBtn.textContent = !connected
+        ? "Authenticate First"
+        : recoveryReady
+          ? "Recovery Bundle Secured"
+          : "Continue Security Setup";
       identityMfaBtn.classList.toggle("opacity-60", recoveryReady);
       identityMfaBtn.classList.toggle("cursor-not-allowed", recoveryReady);
     }
-    if (identityUserRows) {
-      const rowState = connected ? "Connected" : "Awaiting connection";
-      const securityState = recoveryReady ? "Protected" : "Needs recovery setup";
-      identityUserRows.innerHTML = `
-        <tr class="border-t border-slate-800">
-          <td class="py-3 text-white">admin</td>
-          <td class="py-3 text-slate-400">admin, ops</td>
-          <td class="py-3 text-slate-300">${rowState} / ${securityState}</td>
-        </tr>
-      `;
+    if (iamUserList) {
+      if (renderedUsers.length === 0) {
+        iamUserList.innerHTML = `
+          <tr>
+            <td colspan="4" class="py-6 text-sm text-slate-500">Authenticate through the AuthN gateway to load the active IAM session.</td>
+          </tr>
+        `;
+        return;
+      }
+
+      iamUserList.innerHTML = renderedUsers
+        .map((user) => {
+          const initials = user.username.slice(0, 2).toUpperCase();
+          const groupBadges = user.groups
+            .map(
+              (group) =>
+                `<span class="inline-flex rounded-full border border-cyan-500/20 bg-cyan-500/10 px-2 py-1 text-[11px] font-medium text-cyan-300">${group}</span>`,
+            )
+            .join(" ");
+          const securityStatus = recoveryReady ? user.securityStatus : "Onboarding required";
+
+          return `
+            <tr class="hover:bg-slate-900/80 transition-colors">
+              <td class="py-4 pr-4 text-white">
+                <div class="flex items-center gap-3">
+                  <div class="flex h-9 w-9 items-center justify-center rounded-full bg-cyan-500/10 text-xs font-semibold text-cyan-300">${initials}</div>
+                  <div>
+                    <div class="font-medium">${user.username}</div>
+                    <div class="text-xs text-slate-500">${connected ? "Active admin session" : "Awaiting auth gateway"}</div>
+                  </div>
+                </div>
+              </td>
+              <td class="py-4 pr-4">
+                <div class="flex flex-wrap gap-2">${groupBadges}</div>
+              </td>
+              <td class="py-4 pr-4 text-slate-300">${securityStatus}</td>
+              <td class="py-4 text-right">
+                <div class="flex items-center justify-end gap-3">
+                  <button data-action="roles-hint" class="text-xs font-medium uppercase tracking-wider text-slate-500 hover:text-white transition-colors">RBAC via token scopes</button>
+                  <button data-action="regen-mfa" data-username="${user.username}" class="text-xs font-medium uppercase tracking-wider text-red-400 hover:text-red-300 transition-colors">Regen 2FA</button>
+                </div>
+              </td>
+            </tr>
+          `;
+        })
+        .join("");
     }
   };
 
@@ -260,6 +341,31 @@ document.addEventListener("DOMContentLoaded", () => {
     target.textContent = message;
     target.className = className;
     target.classList.remove("hidden");
+  };
+
+  const renderIdentityMessage = (message: string, className: string) => {
+    renderAccountMessage(identityActionResult, message, className);
+  };
+
+  const loadIamUsers = async () => {
+    if (!authGatewayValidated) {
+      iamUsers = [];
+      renderIdentityView();
+      return;
+    }
+
+    try {
+      iamUsers = await invoke<IamUserSummary[]>("iam_list_users");
+    } catch (error) {
+      console.error("IAM load error:", error);
+      iamUsers = [];
+      renderIdentityMessage(
+        String(error),
+        "min-h-24 rounded-xl border border-red-500/30 bg-slate-900 px-4 py-3 font-mono text-xs text-red-400 whitespace-pre-wrap break-words",
+      );
+    }
+
+    renderIdentityView();
   };
 
   const renderMeshGraph = (snapshot: MeshGraphSnapshot) => {
@@ -443,46 +549,95 @@ document.addEventListener("DOMContentLoaded", () => {
   };
 
   const connectToNode = async () => {
-    if (!nodeUrl || !nodeToken || !connectSubmitBtn) {
+    if (!nodeUrl || !nodeToken || !connectSubmitBtn || !authUsername) {
       return;
     }
 
     clearConnectionError();
     connectSubmitBtn.disabled = true;
-    connectSubmitBtn.textContent = "Connecting...";
+    connectSubmitBtn.textContent = "Authenticating...";
 
     try {
       const cert = await readIdentityBytes();
-      const response = await invoke<string>("connect_to_node", {
-        url: nodeUrl.value,
-        token: nodeToken.value,
-        cert,
+      const response = await invoke<AuthLoginResponse>("authn_login", {
+        payload: {
+          url: nodeUrl.value,
+          username: authUsername.value.trim() || "admin",
+          password: nodeToken.value,
+          cert,
+        },
       });
+      const status = await invoke<string>("get_engine_status");
 
       if (activeFaaS) {
-        activeFaaS.innerText = String(response);
+        activeFaaS.innerText = String(status);
       }
+      activeOperator = response.username;
+      authGatewayValidated = true;
       updateConnectionBadge();
-      renderIdentityView();
+      await loadIamUsers();
       renderAccountView();
       void refreshMeshTopology();
+      renderIdentityMessage(
+        `Authenticated ${response.username} against ${response.endpoint}. Complete MFA to unlock the dashboard.`,
+        "min-h-24 rounded-xl border border-cyan-500/20 bg-slate-900 px-4 py-3 font-mono text-xs text-cyan-300 whitespace-pre-wrap break-words",
+      );
 
-      if (overlay) {
-        await gsap.to(overlay, {
+      if (authLoginStep && authMfaStep) {
+        await gsap.to(authLoginStep, {
           autoAlpha: 0,
-          duration: 0.35,
-          ease: "power2.out",
+          y: -12,
+          duration: 0.2,
+          ease: "power2.inOut",
         });
-        overlay.classList.add("hidden");
+        authLoginStep.classList.add("hidden");
+        authMfaStep.classList.remove("hidden");
+        await gsap.fromTo(
+          authMfaStep,
+          { autoAlpha: 0, y: 18 },
+          { autoAlpha: 1, y: 0, duration: 0.24, ease: "power2.out" },
+        );
       }
-
-      await showFirstRunModal();
     } catch (error) {
+      authGatewayValidated = false;
+      iamUsers = [];
       console.error("Connection error:", error);
       showConnectionError(String(error));
     } finally {
       connectSubmitBtn.disabled = false;
-      connectSubmitBtn.textContent = "Establish Connection";
+      connectSubmitBtn.textContent = "Authenticate";
+    }
+  };
+
+  const completeMfa = async () => {
+    if (!authMfaCode || !authMfaSubmitBtn || !overlay) {
+      return;
+    }
+
+    clearConnectionError();
+    const code = authMfaCode.value.replace(/\s+/g, "");
+    if (!/^\d{6}$/.test(code)) {
+      showConnectionError("Enter a 6-digit MFA code.");
+      return;
+    }
+
+    authMfaSubmitBtn.disabled = true;
+    authMfaSubmitBtn.textContent = "Verifying...";
+
+    try {
+      await gsap.to(overlay, {
+        autoAlpha: 0,
+        duration: 0.5,
+        pointerEvents: "none",
+        ease: "power2.out",
+      });
+      overlay.classList.add("hidden");
+      renderIdentityView();
+      renderAccountView();
+      await showFirstRunModal();
+    } finally {
+      authMfaSubmitBtn.disabled = false;
+      authMfaSubmitBtn.textContent = "Verify Code";
     }
   };
 
@@ -490,10 +645,21 @@ document.addEventListener("DOMContentLoaded", () => {
     void connectToNode();
   });
 
+  authMfaSubmitBtn?.addEventListener("click", () => {
+    void completeMfa();
+  });
+
   nodeToken?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
       void connectToNode();
+    }
+  });
+
+  authMfaCode?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void completeMfa();
     }
   });
 
@@ -555,6 +721,56 @@ document.addEventListener("DOMContentLoaded", () => {
 
   identityMfaBtn?.addEventListener("click", () => {
     void showFirstRunModal();
+  });
+
+  newUserBtn?.addEventListener("click", () => {
+    renderIdentityMessage(
+      "Remote user provisioning is not exposed by the current admin API. Use PAT scopes and recovery workflows from the authenticated session.",
+      "min-h-24 rounded-xl border border-amber-500/30 bg-slate-900 px-4 py-3 font-mono text-xs text-amber-300 whitespace-pre-wrap break-words",
+    );
+  });
+
+  iamUserList?.addEventListener("click", async (event) => {
+    const target = event.target as HTMLElement | null;
+    if (!target?.dataset.action) {
+      return;
+    }
+
+    if (target.dataset.action === "roles-hint") {
+      renderIdentityMessage(
+        "RBAC is currently derived from JWT roles and PAT scopes validated by AuthN/AuthZ on `/admin/*` routes.",
+        "min-h-24 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-300 whitespace-pre-wrap break-words",
+      );
+      return;
+    }
+
+    if (target.dataset.action !== "regen-mfa") {
+      return;
+    }
+
+    const username = target.dataset.username ?? "";
+    target.setAttribute("disabled", "true");
+    renderIdentityMessage(
+      `Rotating recovery bundle for ${username}...`,
+      "min-h-24 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-300 whitespace-pre-wrap break-words",
+    );
+
+    try {
+      const codes = await invoke<string[]>("iam_regen_mfa", { username });
+      renderIdentityMessage(
+        codes.join("\n"),
+        "min-h-24 rounded-xl border border-emerald-500/30 bg-slate-900 px-4 py-3 font-mono text-xs text-emerald-300 whitespace-pre-wrap break-words",
+      );
+      renderIdentityView();
+    } catch (error) {
+      console.error("IAM recovery rotation error:", error);
+      renderIdentityMessage(
+        String(error),
+        "min-h-24 rounded-xl border border-red-500/30 bg-slate-900 px-4 py-3 font-mono text-xs text-red-400 whitespace-pre-wrap break-words",
+      );
+    } finally {
+      target.removeAttribute("disabled");
+    }
   });
 
   patGenerateBtn?.addEventListener("click", async () => {
@@ -773,6 +989,11 @@ document.addEventListener("DOMContentLoaded", () => {
     updateConnectionBadge();
     renderIdentityView();
     renderAccountView();
+  });
+
+  authUsername?.addEventListener("input", () => {
+    activeOperator = authUsername.value.trim() || "admin";
+    renderIdentityView();
   });
 
   nodeToken?.addEventListener("input", () => {
