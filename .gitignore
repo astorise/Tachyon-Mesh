@@ -3,6 +3,9 @@
 **/bin/*
 **/obj/*
 *.log
+**/.env.local
+**/.env.*.local
+tachyon-ui/dist/
 .codex-tmp/*
 .vscode/*
 

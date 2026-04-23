@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import gsap from "gsap";
 
+const configuredNodeUrl = (import.meta.env.VITE_TACHYON_NODE_URL ?? "").trim();
+const configuredNodeToken = (import.meta.env.VITE_TACHYON_NODE_TOKEN ?? "").trim();
+
 type ViewName = "dashboard" | "topology" | "registry" | "identity" | "account" | "broker";
 
 type MeshRouteSummary = {
@@ -122,6 +125,13 @@ document.addEventListener("DOMContentLoaded", () => {
       },
       "-=0.2",
     );
+
+  if (nodeUrl && !nodeUrl.value && configuredNodeUrl) {
+    nodeUrl.value = configuredNodeUrl;
+  }
+  if (nodeToken && !nodeToken.value && configuredNodeToken) {
+    nodeToken.value = configuredNodeToken;
+  }
 
   gsap.to(".pulse-dot", {
     opacity: 0.4,
