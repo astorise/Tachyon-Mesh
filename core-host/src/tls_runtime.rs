@@ -337,6 +337,7 @@ pub(crate) fn load_mtls_gateway_config_from_env() -> Result<Option<MtlsGatewayCo
 }
 
 fn build_server_config(material: &CertificateMaterial) -> Result<ServerConfig> {
+    crate::ensure_rustls_crypto_provider();
     let mut cert_reader = BufReader::new(material.certificate_pem.as_bytes());
     let cert_chain = certs(&mut cert_reader)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -359,6 +360,7 @@ pub(crate) fn build_mtls_server_config(
     private_key_pem: &str,
     ca_certificate_pem: &str,
 ) -> Result<ServerConfig> {
+    crate::ensure_rustls_crypto_provider();
     let cert_chain = parse_cert_chain(certificate_pem)?;
     let private_key = parse_private_key(private_key_pem)?;
     let mut ca_reader = BufReader::new(ca_certificate_pem.as_bytes());

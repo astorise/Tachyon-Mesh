@@ -1928,6 +1928,7 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     init_host_tracing();
+    ensure_rustls_crypto_provider();
     let cli = HostCli::parse();
     match cli.command.unwrap_or(HostCommand::Serve) {
         HostCommand::Serve => serve_host().await,
@@ -9536,11 +9537,20 @@ fn init_host_tracing() {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {
+        ensure_rustls_crypto_provider();
         let _ = tracing_subscriber::fmt()
             .with_ansi(false)
             .without_time()
             .with_target(true)
             .try_init();
+    });
+}
+
+pub(crate) fn ensure_rustls_crypto_provider() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     });
 }
 
@@ -19410,6 +19420,7 @@ mod tests {
 
     #[test]
     fn blocking_reqwest_client_initializes_with_default_tls_provider() {
+        ensure_rustls_crypto_provider();
         let _client = reqwest::blocking::Client::new();
     }
 }
