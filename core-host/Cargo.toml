@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
+ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower"]
 mtls = []
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
@@ -32,6 +32,7 @@ hex = "0.4"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio", "http1", "http2"] }
+ort = { version = "=2.0.0-rc.10", optional = true, default-features = false }
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }

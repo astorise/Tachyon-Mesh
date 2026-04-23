@@ -154,42 +154,56 @@
         <div class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-lg">
           <div class="flex items-center justify-between gap-4 mb-6">
             <div>
-              <h3 class="text-lg font-semibold text-white">Identity Management</h3>
-              <p class="text-sm text-slate-500">Track the active administrative principal and the recovery-code onboarding posture for this endpoint.</p>
+              <h3 class="text-lg font-semibold text-white">Identity &amp; Access (IAM)</h3>
+              <p class="text-sm text-slate-500">Review the active administrative session, endpoint posture, and supported security actions.</p>
             </div>
-            <button id="identity-mfa-btn" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition-all text-sm font-medium">
-              Continue Security Setup
+            <button id="btn-new-user" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg transition-all text-sm font-medium">
+              Provisioning API Pending
             </button>
           </div>
-          <div class="grid gap-6 lg:grid-cols-2">
+          <div class="grid gap-6 xl:grid-cols-[2fr_1fr]">
             <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-6">
-              <h4 class="text-sm font-semibold text-white mb-4">Administrative Users</h4>
+              <div class="flex items-center justify-between gap-4 mb-4">
+                <h4 class="text-sm font-semibold text-white">Administrative Users</h4>
+                <button id="identity-mfa-btn" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition-all text-sm font-medium">
+                  Continue Security Setup
+                </button>
+              </div>
               <div class="overflow-x-auto">
-                <table class="w-full text-sm">
-                  <thead class="text-left text-slate-500">
+                <table class="w-full text-sm text-left text-slate-300">
+                  <thead class="border-b border-slate-800 text-slate-500">
                     <tr>
                       <th class="pb-3 font-medium">User</th>
-                      <th class="pb-3 font-medium">Roles</th>
-                      <th class="pb-3 font-medium">State</th>
+                      <th class="pb-3 font-medium">Groups</th>
+                      <th class="pb-3 font-medium">Security Status</th>
+                      <th class="pb-3 font-medium text-right">Actions</th>
                     </tr>
                   </thead>
-                  <tbody id="identity-user-rows" class="text-slate-300">
+                  <tbody id="iam-user-list" class="divide-y divide-slate-800/70">
                   </tbody>
                 </table>
               </div>
             </div>
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-6 space-y-4">
-              <div>
-                <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Connected Endpoint</div>
-                <div id="identity-connection-source" class="text-sm font-mono text-cyan-300 break-all">workspace://local</div>
+            <div class="space-y-4">
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-6 space-y-4">
+                <div>
+                  <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Connected Endpoint</div>
+                  <div id="identity-connection-source" class="text-sm font-mono text-cyan-300 break-all">workspace://local</div>
+                </div>
+                <div>
+                  <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">MFA Posture</div>
+                  <div id="identity-mfa-status" class="text-sm text-white">Auth gateway locked</div>
+                </div>
+                <div>
+                  <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Recovery Bundle</div>
+                  <div id="identity-recovery-status" class="text-sm text-slate-300">Pending download acknowledgement</div>
+                </div>
               </div>
-              <div>
-                <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">MFA Posture</div>
-                <div id="identity-mfa-status" class="text-sm text-white">Onboarding required</div>
-              </div>
-              <div>
-                <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Recovery Bundle</div>
-                <div id="identity-recovery-status" class="text-sm text-slate-300">Pending download acknowledgement</div>
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-6">
+                <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Action Output</div>
+                <div id="identity-action-result" class="min-h-24 rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-300 whitespace-pre-wrap break-words">
+                  IAM actions will render their response here.
+                </div>
               </div>
             </div>
           </div>
@@ -286,15 +300,30 @@
       </div>
   </div>
 
-  <div id="connection-overlay" class="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex items-center justify-center">
-      <div class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-md shadow-2xl">
-          <h2 class="text-white text-2xl font-bold mb-4">Initialisation Tachyon</h2>
-          <input type="text" id="node-url" placeholder="https://..." class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 font-mono text-sm" />
-          <input type="password" id="node-token" placeholder="Admin Token" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 font-mono text-sm" />
-          <div class="text-xs text-slate-500 mb-4">mTLS Profile (.pem) required for Zero-Trust</div>
-          <input type="file" id="mtls-file" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-cyan-500/10 file:text-cyan-400 mb-4" />
-          <button id="connect-btn" class="w-full bg-cyan-600 hover:bg-cyan-500 transition-colors py-3 rounded-xl text-white font-bold">Establish Connection</button>
-          <div id="conn-error" class="text-red-400 text-xs hidden text-center mt-4">Connection failed.</div>
+  <div id="auth-overlay" class="fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center">
+      <div class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-md shadow-2xl relative overflow-hidden">
+          <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-600 to-blue-500"></div>
+          <h2 class="text-white text-2xl font-bold mb-1">Tachyon AuthN</h2>
+          <p class="text-slate-400 text-sm mb-6">Zero-Trust Control Plane Access</p>
+
+          <div id="auth-step-login">
+              <input type="text" id="auth-url" placeholder="Mesh Node URL (https://...)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm font-mono" />
+              <input type="text" id="auth-username" placeholder="Username (or 'admin' for bootstrap)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm" />
+              <input type="password" id="auth-password" placeholder="Password or Bootstrap Token" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm" />
+              <div class="text-xs text-slate-500 mb-2 mt-4 font-semibold uppercase tracking-wider">mTLS Identity Profile</div>
+              <input type="file" id="auth-mtls" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-cyan-500/10 file:text-cyan-400 mb-6 cursor-pointer hover:file:bg-cyan-500/20" />
+              <button id="btn-login-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)]">Authenticate</button>
+          </div>
+
+          <div id="auth-step-mfa" class="hidden">
+              <p class="text-slate-300 text-sm mb-4 text-center">Enter the 6-digit code from your Authenticator app.</p>
+              <input type="text" id="auth-mfa-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 mb-6 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
+              <button id="btn-mfa-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Verify Code</button>
+          </div>
+
+          <div id="auth-error" class="hidden mt-4 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 text-center">
+              Authentication failed.
+          </div>
       </div>
   </div>
 
