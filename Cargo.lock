@@ -8057,9 +8057,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-wasi"
-version = "42.0.2"
+version = "44.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e144a12c39adabd2ce1f7b52bd12a60286d3010044ed0d1c2ae52e35fd6f5ce"
+checksum = "83f5109b4fd619b9796b9c9901de59d83e3575cd1226c1a36d1901371f43db28"
 dependencies = [
  "async-trait",
  "bitflags 2.11.1",
@@ -8079,23 +8079,23 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "wasmtime 42.0.2",
+ "wasmtime 44.0.0",
  "wasmtime-wasi-io",
- "wiggle 42.0.2",
+ "wiggle 44.0.0",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "wasmtime-wasi-io"
-version = "42.0.2"
+version = "44.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "609666ef67a53449ea6c1c529541a8af24f3b109d9f627255c0b848c58b824b0"
+checksum = "74ebe14c586e98d2fdc32c76ca0005ef28348e98ed737e776d378b3b0cc2afd0"
 dependencies = [
  "async-trait",
  "bytes",
  "futures",
  "tracing",
- "wasmtime 42.0.2",
+ "wasmtime 44.0.0",
 ]
 
 [[package]]
@@ -8108,8 +8108,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "walkdir",
- "wasmtime 44.0.0",
- "wiggle 44.0.0",
+ "wasmtime 42.0.2",
+ "wiggle 42.0.2",
 ]
 
 [[package]]
