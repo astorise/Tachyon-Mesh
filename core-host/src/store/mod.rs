@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,

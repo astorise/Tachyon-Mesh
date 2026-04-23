@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    net::IpAddr,
     path::PathBuf,
     sync::{OnceLock, RwLock},
 };
@@ -553,12 +554,22 @@ fn build_admin_url(base_url: &str, path: &str) -> Result<String> {
 }
 
 fn allows_insecure_local_tls(url: &reqwest::Url) -> bool {
-    matches!(
-        url.host_str(),
-        Some("127.0.0.1") | Some("localhost") | Some("::1")
-    ) || url
-        .host_str()
-        .is_some_and(|host| host.eq_ignore_ascii_case("home-lab-k3s.wsl") || host.ends_with(".wsl"))
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    if host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("home-lab-k3s.wsl")
+        || host.ends_with(".wsl")
+    {
+        return true;
+    }
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 fn validate_connection_config(config: &InstanceConfig) -> Result<()> {
@@ -626,10 +637,13 @@ mod tests {
         let loopback = reqwest::Url::parse("https://127.0.0.1:4000").expect("loopback URL");
         let homelab = reqwest::Url::parse("https://home-lab-k3s.wsl").expect("homelab URL");
         let nested = reqwest::Url::parse("https://edge.home-lab-k3s.wsl").expect("nested URL");
+        let wsl_private_ip =
+            reqwest::Url::parse("https://172.18.194.89:20001").expect("WSL private IP URL");
 
         assert!(allows_insecure_local_tls(&loopback));
         assert!(allows_insecure_local_tls(&homelab));
         assert!(allows_insecure_local_tls(&nested));
+        assert!(allows_insecure_local_tls(&wsl_private_ip));
     }
 
     #[test]
