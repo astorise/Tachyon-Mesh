@@ -8100,9 +8100,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-wasi-nn"
-version = "42.0.2"
+version = "44.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92a6255ef3b6746681e9ad945b49ce1c353df7c260f2c246c6892189d3631819"
+checksum = "a354445b50d4e19ae287b78fe0e406f3edf8ed4fa13b65f3ea1297689e1e7c14"
 dependencies = [
  "ort",
  "thiserror 2.0.18",
