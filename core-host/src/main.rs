@@ -19407,6 +19407,11 @@ mod tests {
 
         host_server.abort();
     }
+
+    #[test]
+    fn blocking_reqwest_client_initializes_with_default_tls_provider() {
+        let _client = reqwest::blocking::Client::new();
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
