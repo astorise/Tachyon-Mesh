@@ -8081,7 +8081,7 @@ dependencies = [
  "url",
  "wasmtime 42.0.2",
  "wasmtime-wasi-io",
- "wiggle",
+ "wiggle 42.0.2",
  "windows-sys 0.61.2",
 ]
 
@@ -8100,16 +8100,16 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-wasi-nn"
-version = "42.0.2"
+version = "44.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92a6255ef3b6746681e9ad945b49ce1c353df7c260f2c246c6892189d3631819"
+checksum = "a354445b50d4e19ae287b78fe0e406f3edf8ed4fa13b65f3ea1297689e1e7c14"
 dependencies = [
  "ort",
  "thiserror 2.0.18",
  "tracing",
  "walkdir",
- "wasmtime 42.0.2",
- "wiggle",
+ "wasmtime 44.0.0",
+ "wiggle 44.0.0",
 ]
 
 [[package]]
@@ -8275,7 +8275,21 @@ dependencies = [
  "tracing",
  "wasmtime 42.0.2",
  "wasmtime-environ 42.0.2",
- "wiggle-macro",
+ "wiggle-macro 42.0.2",
+]
+
+[[package]]
+name = "wiggle"
+version = "44.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89cff414ef7dce0cc1cf8a033ff80d3f38e3987c37e3efeec7926ecb5ffaaae6"
+dependencies = [
+ "bitflags 2.11.1",
+ "thiserror 2.0.18",
+ "tracing",
+ "wasmtime 44.0.0",
+ "wasmtime-environ 44.0.0",
+ "wiggle-macro 44.0.0",
 ]
 
 [[package]]
@@ -8293,6 +8307,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wiggle-generate"
+version = "44.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf9dc7272b151a9616a2699e7f94ea1d4ae253b47b63a79fbc8f38e2cca5fa6"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "wasmtime-environ 44.0.0",
+ "witx",
+]
+
+[[package]]
 name = "wiggle-macro"
 version = "42.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8301,7 +8329,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
- "wiggle-generate",
+ "wiggle-generate 42.0.2",
+]
+
+[[package]]
+name = "wiggle-macro"
+version = "44.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa7c29fcf738630cba4e35f1805da5e42dde20ee9809ee9202b0648ae671602f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "wiggle-generate 44.0.0",
 ]
 
 [[package]]
