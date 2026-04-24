@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import gsap from "gsap";
+import QRCode from "qrcode";
 
 const configuredNodeUrl = (import.meta.env.VITE_TACHYON_NODE_URL ?? "").trim();
 const configuredNodeToken = (import.meta.env.VITE_TACHYON_NODE_TOKEN ?? "").trim();
@@ -11,6 +12,22 @@ type AuthLoginResponse = {
   username: string;
   endpoint: string;
   requiresMfa: boolean;
+};
+
+type RegistrationTokenClaims = {
+  subject: string;
+  roles: string[];
+  scopes: string[];
+  expiresAt: number;
+};
+
+type StagedSignupSession = {
+  sessionId: string;
+  username: string;
+  provisioningUri: string;
+  roles: string[];
+  scopes: string[];
+  expiresAt: number;
 };
 
 type IamUserSummary = {
@@ -44,13 +61,38 @@ document.addEventListener("DOMContentLoaded", () => {
   const firstRunModal = document.getElementById("first-run-modal");
   const authLoginStep = document.getElementById("auth-step-login");
   const authMfaStep = document.getElementById("auth-step-mfa");
+  const signupTokenStep = document.getElementById("auth-step-signup-token");
+  const signupProfileStep = document.getElementById("auth-step-signup-profile");
+  const signupTotpStep = document.getElementById("auth-step-signup-totp");
   const nodeUrl = document.getElementById("auth-url") as HTMLInputElement | null;
   const authUsername = document.getElementById("auth-username") as HTMLInputElement | null;
   const nodeToken = document.getElementById("auth-password") as HTMLInputElement | null;
   const mtlsFile = document.getElementById("auth-mtls") as HTMLInputElement | null;
   const connectSubmitBtn = document.getElementById("btn-login-submit") as HTMLButtonElement | null;
+  const openSignupBtn = document.getElementById("btn-open-signup") as HTMLButtonElement | null;
+  const backToLoginBtn = document.getElementById("btn-back-to-login") as HTMLButtonElement | null;
   const authMfaCode = document.getElementById("auth-mfa-code") as HTMLInputElement | null;
   const authMfaSubmitBtn = document.getElementById("btn-mfa-submit") as HTMLButtonElement | null;
+  const signupTokenInput = document.getElementById("signup-token") as HTMLInputElement | null;
+  const signupTokenBackBtn = document.getElementById("btn-signup-token-back") as HTMLButtonElement | null;
+  const signupTokenSubmitBtn = document.getElementById("btn-signup-token-submit") as HTMLButtonElement | null;
+  const signupFirstName = document.getElementById("signup-first-name") as HTMLInputElement | null;
+  const signupLastName = document.getElementById("signup-last-name") as HTMLInputElement | null;
+  const signupUsername = document.getElementById("signup-username") as HTMLInputElement | null;
+  const signupPassword = document.getElementById("signup-password") as HTMLInputElement | null;
+  const signupProfileBackBtn = document.getElementById("btn-signup-profile-back") as HTMLButtonElement | null;
+  const signupProfileSubmitBtn = document.getElementById("btn-signup-profile-submit") as HTMLButtonElement | null;
+  const signupTokenSubject = document.getElementById("signup-token-subject");
+  const signupTokenRoles = document.getElementById("signup-token-roles");
+  const signupTokenScopes = document.getElementById("signup-token-scopes");
+  const signupTokenExpiry = document.getElementById("signup-token-expiry");
+  const signupTotpQr = document.getElementById("signup-totp-qr");
+  const signupSessionId = document.getElementById("signup-session-id");
+  const signupManualSecret = document.getElementById("signup-manual-secret");
+  const signupSessionExpiry = document.getElementById("signup-session-expiry");
+  const signupTotpCode = document.getElementById("signup-totp-code") as HTMLInputElement | null;
+  const signupTotpBackBtn = document.getElementById("btn-signup-totp-back") as HTMLButtonElement | null;
+  const signupTotpSubmitBtn = document.getElementById("btn-signup-totp-submit") as HTMLButtonElement | null;
   const connectionError = document.getElementById("auth-error");
   const qrStep = document.getElementById("qr-step");
   const recoveryCodesStep = document.getElementById("recovery-codes-step");
@@ -96,6 +138,9 @@ document.addEventListener("DOMContentLoaded", () => {
   let activeOperator = "admin";
   let authGatewayValidated = false;
   let iamUsers: IamUserSummary[] = [];
+  let activeAuthStep: "login" | "mfa" | "signup-token" | "signup-profile" | "signup-totp" = "login";
+  let signupClaims: RegistrationTokenClaims | null = null;
+  let stagedSignup: StagedSignupSession | null = null;
 
   const viewPanels: Record<ViewName, HTMLElement | null> = {
     dashboard: document.getElementById("view-dashboard"),
@@ -183,6 +228,176 @@ document.addEventListener("DOMContentLoaded", () => {
 
     connectionError.textContent = "Authentication failed.";
     connectionError.classList.add("hidden");
+  };
+
+  const authSteps = {
+    login: authLoginStep,
+    mfa: authMfaStep,
+    "signup-token": signupTokenStep,
+    "signup-profile": signupProfileStep,
+    "signup-totp": signupTotpStep,
+  } as const;
+
+  const formatUnixTimestamp = (value: number) =>
+    new Date(value * 1000).toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+  const renderBadgeList = (
+    target: HTMLElement | null,
+    values: string[],
+    emptyMessage: string,
+    tone: "cyan" | "slate" = "cyan",
+  ) => {
+    if (!target) {
+      return;
+    }
+
+    if (values.length === 0) {
+      target.textContent = emptyMessage;
+      target.className = "text-xs text-slate-400";
+      return;
+    }
+
+    const palette =
+      tone === "cyan"
+        ? "border-cyan-500/20 bg-cyan-500/10 text-cyan-300"
+        : "border-slate-700 bg-slate-900 text-slate-300";
+    target.innerHTML = values
+      .map(
+        (value) =>
+          `<span class="inline-flex rounded-full border px-2 py-1 text-[11px] font-medium ${palette}">${value}</span>`,
+      )
+      .join("");
+    target.className = "flex flex-wrap gap-2";
+  };
+
+  const extractProvisioningSecret = (provisioningUri: string) => {
+    try {
+      const parsed = new URL(provisioningUri);
+      return parsed.searchParams.get("secret") || provisioningUri;
+    } catch {
+      return provisioningUri;
+    }
+  };
+
+  const switchAuthStep = async (
+    nextStep: "login" | "mfa" | "signup-token" | "signup-profile" | "signup-totp",
+  ) => {
+    const currentPanel = authSteps[activeAuthStep];
+    const nextPanel = authSteps[nextStep];
+    if (!nextPanel || currentPanel === nextPanel) {
+      activeAuthStep = nextStep;
+      return;
+    }
+
+    clearConnectionError();
+    if (currentPanel) {
+      await gsap.to(currentPanel, {
+        autoAlpha: 0,
+        y: -12,
+        duration: 0.2,
+        ease: "power2.inOut",
+      });
+      currentPanel.classList.add("hidden");
+      gsap.set(currentPanel, { clearProps: "all" });
+    }
+
+    nextPanel.classList.remove("hidden");
+    await gsap.fromTo(
+      nextPanel,
+      { autoAlpha: 0, y: 18 },
+      { autoAlpha: 1, y: 0, duration: 0.24, ease: "power2.out" },
+    );
+    activeAuthStep = nextStep;
+  };
+
+  const resetSignupFlow = () => {
+    signupClaims = null;
+    stagedSignup = null;
+    if (signupTokenInput) {
+      signupTokenInput.value = "";
+    }
+    if (signupFirstName) {
+      signupFirstName.value = "";
+    }
+    if (signupLastName) {
+      signupLastName.value = "";
+    }
+    if (signupUsername) {
+      signupUsername.value = authUsername?.value.trim() || "";
+    }
+    if (signupPassword) {
+      signupPassword.value = "";
+    }
+    if (signupTotpCode) {
+      signupTotpCode.value = "";
+    }
+    if (signupTokenSubject) {
+      signupTokenSubject.textContent = "Awaiting token validation";
+    }
+    renderBadgeList(signupTokenRoles, [], "No roles loaded yet.");
+    renderBadgeList(signupTokenScopes, [], "No scopes loaded yet.", "slate");
+    if (signupTokenExpiry) {
+      signupTokenExpiry.textContent = "Unknown";
+    }
+    if (signupTotpQr) {
+      signupTotpQr.innerHTML = "Waiting for staged enrollment.";
+      signupTotpQr.className =
+        "flex min-h-72 items-center justify-center rounded-2xl border border-dashed border-slate-700 bg-slate-900 p-6 text-slate-500";
+    }
+    if (signupSessionId) {
+      signupSessionId.textContent = "Pending";
+    }
+    if (signupManualSecret) {
+      signupManualSecret.textContent = "Scan the QR code when available.";
+    }
+    if (signupSessionExpiry) {
+      signupSessionExpiry.textContent = "Unknown";
+    }
+  };
+
+  const renderSignupClaims = (claims: RegistrationTokenClaims) => {
+    if (signupTokenSubject) {
+      signupTokenSubject.textContent = claims.subject;
+    }
+    renderBadgeList(signupTokenRoles, claims.roles, "No roles assigned.");
+    renderBadgeList(signupTokenScopes, claims.scopes, "No scopes assigned.", "slate");
+    if (signupTokenExpiry) {
+      signupTokenExpiry.textContent = formatUnixTimestamp(claims.expiresAt);
+    }
+  };
+
+  const renderStagedSignup = async (session: StagedSignupSession) => {
+    if (signupSessionId) {
+      signupSessionId.textContent = session.sessionId;
+    }
+    if (signupManualSecret) {
+      signupManualSecret.textContent = extractProvisioningSecret(session.provisioningUri);
+    }
+    if (signupSessionExpiry) {
+      signupSessionExpiry.textContent = formatUnixTimestamp(session.expiresAt);
+    }
+    if (!signupTotpQr) {
+      return;
+    }
+
+    const svg = await QRCode.toString(session.provisioningUri, {
+      type: "svg",
+      margin: 1,
+      width: 256,
+      color: {
+        dark: "#e2e8f0",
+        light: "#0f172a",
+      },
+    });
+    signupTotpQr.innerHTML = svg;
+    signupTotpQr.className =
+      "flex min-h-72 items-center justify-center rounded-2xl border border-slate-700 bg-slate-900 p-4";
   };
 
   const showOnboardingError = (message: string) => {
@@ -548,6 +763,20 @@ document.addEventListener("DOMContentLoaded", () => {
     return Array.from(new Uint8Array(buffer));
   };
 
+  const hideAuthOverlay = async () => {
+    if (!overlay) {
+      return;
+    }
+
+    await gsap.to(overlay, {
+      autoAlpha: 0,
+      duration: 0.5,
+      pointerEvents: "none",
+      ease: "power2.out",
+    });
+    overlay.classList.add("hidden");
+  };
+
   const connectToNode = async () => {
     if (!nodeUrl || !nodeToken || !connectSubmitBtn || !authUsername) {
       return;
@@ -583,20 +812,11 @@ document.addEventListener("DOMContentLoaded", () => {
         "min-h-24 rounded-xl border border-cyan-500/20 bg-slate-900 px-4 py-3 font-mono text-xs text-cyan-300 whitespace-pre-wrap break-words",
       );
 
-      if (authLoginStep && authMfaStep) {
-        await gsap.to(authLoginStep, {
-          autoAlpha: 0,
-          y: -12,
-          duration: 0.2,
-          ease: "power2.inOut",
-        });
-        authLoginStep.classList.add("hidden");
-        authMfaStep.classList.remove("hidden");
-        await gsap.fromTo(
-          authMfaStep,
-          { autoAlpha: 0, y: 18 },
-          { autoAlpha: 1, y: 0, duration: 0.24, ease: "power2.out" },
-        );
+      if (response.requiresMfa) {
+        await switchAuthStep("mfa");
+      } else {
+        await hideAuthOverlay();
+        await showFirstRunModal();
       }
     } catch (error) {
       authGatewayValidated = false;
@@ -610,7 +830,7 @@ document.addEventListener("DOMContentLoaded", () => {
   };
 
   const completeMfa = async () => {
-    if (!authMfaCode || !authMfaSubmitBtn || !overlay) {
+    if (!authMfaCode || !authMfaSubmitBtn) {
       return;
     }
 
@@ -625,13 +845,7 @@ document.addEventListener("DOMContentLoaded", () => {
     authMfaSubmitBtn.textContent = "Verifying...";
 
     try {
-      await gsap.to(overlay, {
-        autoAlpha: 0,
-        duration: 0.5,
-        pointerEvents: "none",
-        ease: "power2.out",
-      });
-      overlay.classList.add("hidden");
+      await hideAuthOverlay();
       renderIdentityView();
       renderAccountView();
       await showFirstRunModal();
@@ -641,12 +855,178 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
+  const openSignupFlow = async () => {
+    resetSignupFlow();
+    await switchAuthStep("signup-token");
+  };
+
+  const validateSignupToken = async () => {
+    if (!nodeUrl || !signupTokenInput || !signupTokenSubmitBtn) {
+      return;
+    }
+
+    clearConnectionError();
+    signupTokenSubmitBtn.disabled = true;
+    signupTokenSubmitBtn.textContent = "Validating...";
+
+    try {
+      const cert = await readIdentityBytes();
+      const claims = await invoke<RegistrationTokenClaims>("validate_signup_token", {
+        payload: {
+          url: nodeUrl.value,
+          token: signupTokenInput.value,
+          cert,
+        },
+      });
+      signupClaims = claims;
+      if (signupUsername && !signupUsername.value.trim()) {
+        signupUsername.value = authUsername?.value.trim() || "";
+      }
+      renderSignupClaims(claims);
+      await switchAuthStep("signup-profile");
+    } catch (error) {
+      console.error("Signup token validation error:", error);
+      showConnectionError(String(error));
+    } finally {
+      signupTokenSubmitBtn.disabled = false;
+      signupTokenSubmitBtn.textContent = "Validate Invite";
+    }
+  };
+
+  const stageSignupAccount = async () => {
+    if (
+      !nodeUrl ||
+      !signupTokenInput ||
+      !signupFirstName ||
+      !signupLastName ||
+      !signupUsername ||
+      !signupPassword ||
+      !signupProfileSubmitBtn
+    ) {
+      return;
+    }
+
+    clearConnectionError();
+    signupProfileSubmitBtn.disabled = true;
+    signupProfileSubmitBtn.textContent = "Staging...";
+
+    try {
+      const cert = await readIdentityBytes();
+      const session = await invoke<StagedSignupSession>("stage_signup", {
+        payload: {
+          url: nodeUrl.value,
+          token: signupTokenInput.value,
+          firstName: signupFirstName.value,
+          lastName: signupLastName.value,
+          username: signupUsername.value,
+          password: signupPassword.value,
+          cert,
+        },
+      });
+      stagedSignup = session;
+      await renderStagedSignup(session);
+      await switchAuthStep("signup-totp");
+    } catch (error) {
+      console.error("Signup staging error:", error);
+      showConnectionError(String(error));
+    } finally {
+      signupProfileSubmitBtn.disabled = false;
+      signupProfileSubmitBtn.textContent = "Stage Account";
+    }
+  };
+
+  const finalizeSignup = async () => {
+    if (!nodeUrl || !stagedSignup || !signupTotpCode || !signupTotpSubmitBtn) {
+      return;
+    }
+
+    clearConnectionError();
+    const code = signupTotpCode.value.replace(/\s+/g, "");
+    if (!/^\d{6}$/.test(code)) {
+      showConnectionError("Enter the first 6-digit TOTP code from your authenticator app.");
+      return;
+    }
+
+    signupTotpSubmitBtn.disabled = true;
+    signupTotpSubmitBtn.textContent = "Finalizing...";
+
+    try {
+      const cert = await readIdentityBytes();
+      const response = await invoke<AuthLoginResponse>("finalize_signup", {
+        payload: {
+          url: nodeUrl.value,
+          sessionId: stagedSignup.sessionId,
+          totpCode: code,
+          cert,
+        },
+      });
+      const status = await invoke<string>("get_engine_status");
+
+      if (activeFaaS) {
+        activeFaaS.innerText = String(status);
+      }
+      activeOperator = response.username;
+      authGatewayValidated = true;
+      if (authUsername) {
+        authUsername.value = response.username;
+      }
+      updateConnectionBadge();
+      await loadIamUsers();
+      renderAccountView();
+      renderIdentityMessage(
+        `Enrollment completed for ${response.username}. The dashboard is unlocked and recovery codes must now be saved for ${response.endpoint}.`,
+        "min-h-24 rounded-xl border border-emerald-500/30 bg-slate-900 px-4 py-3 font-mono text-xs text-emerald-300 whitespace-pre-wrap break-words",
+      );
+      void refreshMeshTopology();
+      await hideAuthOverlay();
+      await showFirstRunModal();
+    } catch (error) {
+      console.error("Signup finalization error:", error);
+      showConnectionError(String(error));
+    } finally {
+      signupTotpSubmitBtn.disabled = false;
+      signupTotpSubmitBtn.textContent = "Finalize Enrollment";
+    }
+  };
+
   connectSubmitBtn?.addEventListener("click", () => {
     void connectToNode();
   });
 
+  openSignupBtn?.addEventListener("click", () => {
+    void openSignupFlow();
+  });
+
+  backToLoginBtn?.addEventListener("click", () => {
+    void switchAuthStep("login");
+  });
+
   authMfaSubmitBtn?.addEventListener("click", () => {
     void completeMfa();
+  });
+
+  signupTokenBackBtn?.addEventListener("click", () => {
+    void switchAuthStep("login");
+  });
+
+  signupTokenSubmitBtn?.addEventListener("click", () => {
+    void validateSignupToken();
+  });
+
+  signupProfileBackBtn?.addEventListener("click", () => {
+    void switchAuthStep("signup-token");
+  });
+
+  signupProfileSubmitBtn?.addEventListener("click", () => {
+    void stageSignupAccount();
+  });
+
+  signupTotpBackBtn?.addEventListener("click", () => {
+    void switchAuthStep("signup-profile");
+  });
+
+  signupTotpSubmitBtn?.addEventListener("click", () => {
+    void finalizeSignup();
   });
 
   nodeToken?.addEventListener("keydown", (event) => {
@@ -663,6 +1043,27 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  signupTokenInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void validateSignupToken();
+    }
+  });
+
+  signupPassword?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void stageSignupAccount();
+    }
+  });
+
+  signupTotpCode?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void finalizeSignup();
+    }
+  });
+
   showRecoveryCodesBtn?.addEventListener("click", async () => {
     clearOnboardingError();
     showRecoveryCodesBtn.disabled = true;
@@ -670,7 +1071,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     try {
       recoveryCodes = await invoke<string[]>("generate_recovery_codes", {
-        username: "admin",
+        username: activeOperator,
       });
       renderRecoveryCodes(recoveryCodes);
       qrStep?.classList.add("hidden");
@@ -993,6 +1394,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
   authUsername?.addEventListener("input", () => {
     activeOperator = authUsername.value.trim() || "admin";
+    if (signupUsername && !signupUsername.value.trim()) {
+      signupUsername.value = activeOperator;
+    }
     renderIdentityView();
   });
 
@@ -1004,6 +1408,7 @@ document.addEventListener("DOMContentLoaded", () => {
   updateConnectionBadge();
   updateHeaderForView(activeView);
   updateNavigationState(activeView);
+  resetSignupFlow();
   renderIdentityView();
   renderAccountView();
   void refreshMeshTopology();

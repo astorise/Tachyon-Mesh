@@ -301,7 +301,7 @@
   </div>
 
   <div id="auth-overlay" class="fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center">
-      <div class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-md shadow-2xl relative overflow-hidden">
+      <div class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-2xl shadow-2xl relative overflow-hidden">
           <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-600 to-blue-500"></div>
           <h2 class="text-white text-2xl font-bold mb-1">Tachyon AuthN</h2>
           <p class="text-slate-400 text-sm mb-6">Zero-Trust Control Plane Access</p>
@@ -312,13 +312,101 @@
               <input type="password" id="auth-password" placeholder="Password or Bootstrap Token" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm" />
               <div class="text-xs text-slate-500 mb-2 mt-4 font-semibold uppercase tracking-wider">mTLS Identity Profile</div>
               <input type="file" id="auth-mtls" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-cyan-500/10 file:text-cyan-400 mb-6 cursor-pointer hover:file:bg-cyan-500/20" />
-              <button id="btn-login-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)]">Authenticate</button>
+              <div class="grid gap-3 md:grid-cols-2">
+                  <button id="btn-login-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)]">Authenticate</button>
+                  <button id="btn-open-signup" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Register with Invite Token</button>
+              </div>
           </div>
 
           <div id="auth-step-mfa" class="hidden">
               <p class="text-slate-300 text-sm mb-4 text-center">Enter the 6-digit code from your Authenticator app.</p>
               <input type="text" id="auth-mfa-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 mb-6 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
-              <button id="btn-mfa-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Verify Code</button>
+              <div class="grid gap-3 md:grid-cols-2">
+                  <button id="btn-back-to-login" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back</button>
+                  <button id="btn-mfa-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Verify Code</button>
+              </div>
+          </div>
+
+          <div id="auth-step-signup-token" class="hidden">
+              <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 mb-4 text-sm text-cyan-200">
+                  Validate a 24-hour invite token before creating the admin profile.
+              </div>
+              <input type="password" id="signup-token" placeholder="Paste invite token" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-4 text-sm font-mono" />
+              <div class="grid gap-3 md:grid-cols-2">
+                  <button id="btn-signup-token-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back to Login</button>
+                  <button id="btn-signup-token-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Validate Invite</button>
+              </div>
+          </div>
+
+          <div id="auth-step-signup-profile" class="hidden">
+              <div class="grid gap-6 lg:grid-cols-[1.25fr_0.75fr]">
+                  <div>
+                      <div class="grid gap-3 md:grid-cols-2 mb-3">
+                          <input type="text" id="signup-first-name" placeholder="First Name" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+                          <input type="text" id="signup-last-name" placeholder="Last Name" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+                      </div>
+                      <input type="text" id="signup-username" placeholder="Username" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm" />
+                      <input type="password" id="signup-password" placeholder="Password (8+ characters)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white mb-3 text-sm" />
+                      <p class="text-xs text-slate-500 mb-4">The account stays inactive until the first valid TOTP code is verified.</p>
+                      <div class="grid gap-3 md:grid-cols-2">
+                          <button id="btn-signup-profile-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back</button>
+                          <button id="btn-signup-profile-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Stage Account</button>
+                      </div>
+                  </div>
+                  <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5 space-y-4">
+                      <div>
+                          <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Invite Subject</div>
+                          <div id="signup-token-subject" class="text-sm font-mono text-cyan-300 break-all">Awaiting token validation</div>
+                      </div>
+                      <div>
+                          <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Roles</div>
+                          <div id="signup-token-roles" class="flex flex-wrap gap-2 text-xs text-slate-400">No roles loaded yet.</div>
+                      </div>
+                      <div>
+                          <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Scopes</div>
+                          <div id="signup-token-scopes" class="flex flex-wrap gap-2 text-xs text-slate-400">No scopes loaded yet.</div>
+                      </div>
+                      <div>
+                          <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Expires</div>
+                          <div id="signup-token-expiry" class="text-sm text-white">Unknown</div>
+                      </div>
+                  </div>
+              </div>
+          </div>
+
+          <div id="auth-step-signup-totp" class="hidden">
+              <div class="grid gap-6 lg:grid-cols-[0.95fr_1.05fr]">
+                  <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5">
+                      <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Authenticator QR</div>
+                      <div id="signup-totp-qr" class="flex min-h-72 items-center justify-center rounded-2xl border border-dashed border-slate-700 bg-slate-900 p-6 text-slate-500">
+                          Waiting for staged enrollment.
+                      </div>
+                  </div>
+                  <div class="space-y-4">
+                      <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5 space-y-4">
+                          <div>
+                              <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Session</div>
+                              <div id="signup-session-id" class="text-sm font-mono text-cyan-300 break-all">Pending</div>
+                          </div>
+                          <div>
+                              <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Manual Secret</div>
+                              <div id="signup-manual-secret" class="text-sm font-mono text-white break-all">Scan the QR code when available.</div>
+                          </div>
+                          <div>
+                              <div class="text-xs uppercase tracking-[0.2em] text-slate-500 mb-2">Expires</div>
+                              <div id="signup-session-expiry" class="text-sm text-white">Unknown</div>
+                          </div>
+                      </div>
+                      <div>
+                          <p class="text-sm text-slate-300 mb-3">Enter the first 6-digit code from your authenticator app to activate the account and unlock the dashboard.</p>
+                          <input type="text" id="signup-totp-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 mb-4 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
+                          <div class="grid gap-3 md:grid-cols-2">
+                              <button id="btn-signup-totp-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back</button>
+                              <button id="btn-signup-totp-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Finalize Enrollment</button>
+                          </div>
+                      </div>
+                  </div>
+              </div>
           </div>
 
           <div id="auth-error" class="hidden mt-4 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 text-center">

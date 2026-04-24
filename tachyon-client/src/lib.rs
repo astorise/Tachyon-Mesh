@@ -13,6 +13,9 @@ const ADMIN_RECOVERY_CODES_PATH: &str = "/admin/security/recovery-codes";
 const ADMIN_ACCOUNT_SECURITY_PATH: &str = "/admin/security/2fa/regenerate";
 const ADMIN_PAT_PATH: &str = "/admin/security/pats";
 const ADMIN_ASSET_UPLOAD_PATH: &str = "/admin/assets";
+const AUTH_SIGNUP_VALIDATE_PATH: &str = "/auth/signup/validate-token";
+const AUTH_SIGNUP_STAGE_PATH: &str = "/auth/signup/stage";
+const AUTH_SIGNUP_FINALIZE_PATH: &str = "/auth/signup/finalize";
 const EXPECTED_HASH_HEADER: &str = "x-tachyon-expected-sha256";
 const ADMIN_MODEL_INIT_PATH: &str = "/admin/models/init";
 const ADMIN_MODEL_UPLOAD_PATH: &str = "/admin/models/upload";
@@ -36,6 +39,26 @@ pub struct AuthLoginResponse {
     pub username: String,
     pub endpoint: String,
     pub requires_mfa: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrationTokenClaims {
+    pub subject: String,
+    pub roles: Vec<String>,
+    pub scopes: Vec<String>,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedSignupSession {
+    pub session_id: String,
+    pub username: String,
+    pub provisioning_uri: String,
+    pub roles: Vec<String>,
+    pub scopes: Vec<String>,
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,6 +102,36 @@ struct IssuePatResponse {
 #[derive(Debug, Serialize)]
 struct RecoveryCodeRequest<'a> {
     username: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidateRegistrationTokenRequest<'a> {
+    token: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StageSignupRequest<'a> {
+    token: &'a str,
+    first_name: &'a str,
+    last_name: &'a str,
+    username: &'a str,
+    password: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalizeEnrollmentRequest<'a> {
+    session_id: &'a str,
+    totp_code: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalizeEnrollmentResponse {
+    token: String,
+    username: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +288,124 @@ pub async fn authn_login(
     })
 }
 
+pub async fn validate_registration_token(
+    url: &str,
+    token: &str,
+    cert: Option<Vec<u8>>,
+) -> Result<RegistrationTokenClaims> {
+    let config = public_connection_config(url, cert);
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_endpoint_url(&config.url, AUTH_SIGNUP_VALIDATE_PATH)?)
+        .json(&ValidateRegistrationTokenRequest {
+            token: token.trim(),
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to reach Tachyon node at {}", config.url))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read registration-token response body")?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "registration token validation failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    serde_json::from_slice(&body).context("failed to decode registration-token response payload")
+}
+
+pub async fn stage_signup(
+    url: &str,
+    token: &str,
+    first_name: &str,
+    last_name: &str,
+    username: &str,
+    password: &str,
+    cert: Option<Vec<u8>>,
+) -> Result<StagedSignupSession> {
+    let config = public_connection_config(url, cert);
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_endpoint_url(&config.url, AUTH_SIGNUP_STAGE_PATH)?)
+        .json(&StageSignupRequest {
+            token: token.trim(),
+            first_name: first_name.trim(),
+            last_name: last_name.trim(),
+            username: username.trim(),
+            password,
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to reach Tachyon node at {}", config.url))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read signup staging response body")?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "signup staging failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    serde_json::from_slice(&body).context("failed to decode signup staging response payload")
+}
+
+pub async fn finalize_enrollment(
+    url: &str,
+    session_id: &str,
+    totp_code: &str,
+    cert: Option<Vec<u8>>,
+) -> Result<AuthLoginResponse> {
+    let config = public_connection_config(url, cert.clone());
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_endpoint_url(&config.url, AUTH_SIGNUP_FINALIZE_PATH)?)
+        .json(&FinalizeEnrollmentRequest {
+            session_id: session_id.trim(),
+            totp_code: totp_code.trim(),
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to reach Tachyon node at {}", config.url))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read enrollment-finalize response body")?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "enrollment finalization failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    let payload: FinalizeEnrollmentResponse = serde_json::from_slice(&body)
+        .context("failed to decode enrollment-finalize response payload")?;
+    set_connection(config.url.clone(), payload.token, cert)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut operator = operator_state()
+        .write()
+        .expect("operator state should not be poisoned");
+    *operator = Some(payload.username.clone());
+
+    Ok(AuthLoginResponse {
+        username: payload.username,
+        endpoint: config.url,
+        requires_mfa: false,
+    })
+}
+
 pub async fn iam_list_users() -> Result<Vec<IamUserSummary>> {
     let _config = require_connection()?;
     let username = current_operator_name().unwrap_or_else(|| "admin".to_owned());
@@ -259,7 +430,7 @@ pub async fn generate_recovery_codes(username: &str) -> Result<Vec<String>> {
     let config = require_connection()?;
     let client = build_http_client(&config)?;
     let response = client
-        .post(build_admin_url(&config.url, ADMIN_RECOVERY_CODES_PATH)?)
+        .post(build_endpoint_url(&config.url, ADMIN_RECOVERY_CODES_PATH)?)
         .bearer_auth(&config.token)
         .json(&RecoveryCodeRequest { username })
         .send()
@@ -287,7 +458,10 @@ pub async fn regenerate_account_security() -> Result<Vec<String>> {
     let config = require_connection()?;
     let client = build_http_client(&config)?;
     let response = client
-        .post(build_admin_url(&config.url, ADMIN_ACCOUNT_SECURITY_PATH)?)
+        .post(build_endpoint_url(
+            &config.url,
+            ADMIN_ACCOUNT_SECURITY_PATH,
+        )?)
         .bearer_auth(&config.token)
         .send()
         .await
@@ -321,7 +495,7 @@ pub async fn generate_pat(name: &str, scopes: &[String], ttl_days: u32) -> Resul
     let config = require_connection()?;
     let client = build_http_client(&config)?;
     let response = client
-        .post(build_admin_url(&config.url, ADMIN_PAT_PATH)?)
+        .post(build_endpoint_url(&config.url, ADMIN_PAT_PATH)?)
         .bearer_auth(&config.token)
         .json(&IssuePatRequest {
             name: name.trim(),
@@ -365,7 +539,7 @@ pub async fn push_asset_bytes(path: &str, bytes: &[u8]) -> Result<String> {
     let client = build_http_client(&config)?;
     let expected_hash = sha256_hash(bytes);
     let response = client
-        .post(build_admin_url(&config.url, ADMIN_ASSET_UPLOAD_PATH)?)
+        .post(build_endpoint_url(&config.url, ADMIN_ASSET_UPLOAD_PATH)?)
         .bearer_auth(&config.token)
         .header(EXPECTED_HASH_HEADER, &expected_hash)
         .header(reqwest::header::CONTENT_TYPE, "application/wasm")
@@ -411,7 +585,7 @@ where
     let config = require_connection()?;
     let client = build_http_client(&config)?;
     let init_response = client
-        .post(build_admin_url(&config.url, ADMIN_MODEL_INIT_PATH)?)
+        .post(build_endpoint_url(&config.url, ADMIN_MODEL_INIT_PATH)?)
         .bearer_auth(&config.token)
         .json(&InitModelUploadRequest {
             expected_hash: &expected_hash,
@@ -452,7 +626,7 @@ where
 
         let upload_url = format!(
             "{}/{}?part={part}",
-            build_admin_url(&config.url, ADMIN_MODEL_UPLOAD_PATH)?,
+            build_endpoint_url(&config.url, ADMIN_MODEL_UPLOAD_PATH)?,
             init_payload.upload_id
         );
         let response = client
@@ -479,7 +653,7 @@ where
 
     let commit_url = format!(
         "{}/{}",
-        build_admin_url(&config.url, ADMIN_MODEL_COMMIT_PATH)?,
+        build_endpoint_url(&config.url, ADMIN_MODEL_COMMIT_PATH)?,
         init_payload.upload_id
     );
     let commit_response = client
@@ -573,7 +747,7 @@ fn batch_target_name(batch_target: &serde_json::Value) -> Option<String> {
 async fn fetch_remote_status(config: &InstanceConfig) -> Result<String> {
     let client = build_http_client(config)?;
     let response = client
-        .get(build_admin_url(&config.url, ADMIN_STATUS_PATH)?)
+        .get(build_endpoint_url(&config.url, ADMIN_STATUS_PATH)?)
         .bearer_auth(&config.token)
         .send()
         .await
@@ -618,12 +792,21 @@ fn parse_identity(identity_bytes: &[u8]) -> Result<reqwest::Identity> {
         .context("failed to parse mTLS identity bundle as PEM or PKCS#12")
 }
 
-fn build_admin_url(base_url: &str, path: &str) -> Result<String> {
+fn build_endpoint_url(base_url: &str, path: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(base_url)
         .with_context(|| format!("invalid Tachyon node URL `{base_url}`"))?;
     url.set_path(path);
     url.set_query(None);
     Ok(url.to_string())
+}
+
+fn public_connection_config(url: &str, cert: Option<Vec<u8>>) -> InstanceConfig {
+    InstanceConfig {
+        url: url.trim().to_owned(),
+        token: String::new(),
+        mtls_cert: cert,
+        mtls_key: None,
+    }
 }
 
 fn allows_insecure_local_tls(url: &reqwest::Url) -> bool {
@@ -708,7 +891,7 @@ mod tests {
 
     #[test]
     fn admin_url_reuses_origin_and_overrides_path() {
-        let url = build_admin_url("https://127.0.0.1:4000/ui?stale=1", "/admin/status")
+        let url = build_endpoint_url("https://127.0.0.1:4000/ui?stale=1", "/admin/status")
             .expect("admin URL should build");
 
         assert_eq!(url, "https://127.0.0.1:4000/admin/status");

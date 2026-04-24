@@ -39,7 +39,11 @@ const JWT_SECRET_ENV: &str = "TACHYON_AUTH_JWT_SECRET";
 const AUTH_STATE_DIR_ENV: &str = "TACHYON_AUTH_STATE_DIR";
 const DEFAULT_PAT_TTL_DAYS: u32 = 30;
 
-use authn_bindings::exports::tachyon::identity::authn::AuthnError;
+use authn_bindings::exports::tachyon::identity::authn::{
+    AuthSession as AuthnSession, AuthnError,
+    RegistrationTokenClaims as AuthnRegistrationTokenClaims, SignupProfile as AuthnSignupProfile,
+    StagedUserSession as AuthnStagedUserSession,
+};
 use authz_bindings::exports::tachyon::identity::authz::AuthzError;
 
 #[derive(Clone, Debug)]
@@ -82,6 +86,58 @@ impl AuthFailure {
 #[derive(Debug, Deserialize)]
 pub(crate) struct RecoveryCodeRequest {
     username: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ValidateRegistrationTokenRequest {
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RegistrationTokenClaimsResponse {
+    subject: String,
+    roles: Vec<String>,
+    scopes: Vec<String>,
+    expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StageSignupRequest {
+    token: String,
+    first_name: String,
+    last_name: String,
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StagedUserSessionResponse {
+    session_id: String,
+    username: String,
+    provisioning_uri: String,
+    roles: Vec<String>,
+    scopes: Vec<String>,
+    expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FinalizeEnrollmentRequest {
+    session_id: String,
+    totp_code: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FinalizeEnrollmentResponse {
+    token: String,
+    username: String,
+    roles: Vec<String>,
+    scopes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +225,65 @@ impl AuthManager {
                 anyhow!("authn component trapped while generating recovery codes: {error}")
             })?
             .map_err(|error| anyhow!(error))
+    }
+
+    pub(crate) fn validate_registration_token(
+        &self,
+        engine: &Engine,
+        token: &str,
+    ) -> Result<RegistrationTokenClaimsResponse> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let claims = bindings
+            .tachyon_identity_authn()
+            .call_validate_registration_token(&mut store, token)
+            .map_err(|error| {
+                anyhow!("authn component trapped while validating registration token: {error}")
+            })?
+            .map_err(|error| anyhow!(error))?;
+
+        Ok(map_registration_claims(claims))
+    }
+
+    pub(crate) fn stage_user(
+        &self,
+        engine: &Engine,
+        request: StageSignupRequest,
+    ) -> Result<StagedUserSessionResponse> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let session = bindings
+            .tachyon_identity_authn()
+            .call_stage_user(
+                &mut store,
+                &request.token,
+                &AuthnSignupProfile {
+                    first_name: request.first_name,
+                    last_name: request.last_name,
+                    username: request.username,
+                    password: request.password,
+                },
+            )
+            .map_err(|error| anyhow!("authn component trapped while staging user: {error}"))?
+            .map_err(|error| anyhow!(error))?;
+
+        Ok(map_staged_user_session(session))
+    }
+
+    pub(crate) fn finalize_enrollment(
+        &self,
+        engine: &Engine,
+        session_id: &str,
+        totp_code: &str,
+    ) -> Result<FinalizeEnrollmentResponse> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let session = bindings
+            .tachyon_identity_authn()
+            .call_finalize_enrollment(&mut store, session_id, totp_code)
+            .map_err(|error| {
+                anyhow!("authn component trapped while finalizing enrollment: {error}")
+            })?
+            .map_err(|error| anyhow!(error))?;
+
+        Ok(map_auth_session(session))
     }
 
     pub(crate) fn consume_recovery_code(
@@ -432,6 +547,76 @@ pub(crate) async fn generate_recovery_codes_handler(
     Ok(Json(RecoveryCodeResponse { codes }))
 }
 
+pub(crate) async fn validate_registration_token_handler(
+    State(state): State<crate::AppState>,
+    Json(payload): Json<ValidateRegistrationTokenRequest>,
+) -> Result<Json<RegistrationTokenClaimsResponse>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let token = payload.token;
+
+    let claims = tokio::task::spawn_blocking(move || {
+        auth_manager.validate_registration_token(&engine, &token)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to join registration token validation task: {error}"),
+        )
+            .into_response()
+    })?
+    .map_err(string_error_to_response)?;
+
+    Ok(Json(claims))
+}
+
+pub(crate) async fn stage_signup_handler(
+    State(state): State<crate::AppState>,
+    Json(payload): Json<StageSignupRequest>,
+) -> Result<Json<StagedUserSessionResponse>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+
+    let session = tokio::task::spawn_blocking(move || auth_manager.stage_user(&engine, payload))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to join signup staging task: {error}"),
+            )
+                .into_response()
+        })?
+        .map_err(string_error_to_response)?;
+
+    Ok(Json(session))
+}
+
+pub(crate) async fn finalize_enrollment_handler(
+    State(state): State<crate::AppState>,
+    Json(payload): Json<FinalizeEnrollmentRequest>,
+) -> Result<Json<FinalizeEnrollmentResponse>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let session_id = payload.session_id;
+    let totp_code = payload.totp_code;
+
+    let session = tokio::task::spawn_blocking(move || {
+        auth_manager.finalize_enrollment(&engine, &session_id, &totp_code)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to join enrollment finalization task: {error}"),
+        )
+            .into_response()
+    })?
+    .map_err(string_error_to_response)?;
+
+    Ok(Json(session))
+}
+
 pub(crate) async fn regenerate_account_security_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -557,11 +742,44 @@ fn map_authz_error(error: AuthzError) -> AuthFailure {
     }
 }
 
+fn map_registration_claims(
+    claims: AuthnRegistrationTokenClaims,
+) -> RegistrationTokenClaimsResponse {
+    RegistrationTokenClaimsResponse {
+        subject: claims.subject,
+        roles: claims.roles,
+        scopes: claims.scopes,
+        expires_at: claims.expires_at,
+    }
+}
+
+fn map_staged_user_session(session: AuthnStagedUserSession) -> StagedUserSessionResponse {
+    StagedUserSessionResponse {
+        session_id: session.session_id,
+        username: session.username,
+        provisioning_uri: session.provisioning_uri,
+        roles: session.roles,
+        scopes: session.scopes,
+        expires_at: session.expires_at,
+    }
+}
+
+fn map_auth_session(session: AuthnSession) -> FinalizeEnrollmentResponse {
+    FinalizeEnrollmentResponse {
+        token: session.token,
+        username: session.username,
+        roles: session.roles,
+        scopes: session.scopes,
+    }
+}
+
 fn string_error_to_response(error: anyhow::Error) -> Response {
     let message = error.to_string();
     let status = if message.contains("must not be empty")
         || message.contains("must match")
         || message.contains("invalid")
+        || message.contains("expired")
+        || message.contains("already")
         || message.contains("between 1 and")
     {
         StatusCode::BAD_REQUEST

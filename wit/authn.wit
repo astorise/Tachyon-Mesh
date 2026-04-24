@@ -7,6 +7,36 @@ interface authn {
         scopes: list<string>,
     }
 
+    record registration-token-claims {
+        subject: string,
+        roles: list<string>,
+        scopes: list<string>,
+        expires-at: u64,
+    }
+
+    record signup-profile {
+        first-name: string,
+        last-name: string,
+        username: string,
+        password: string,
+    }
+
+    record staged-user-session {
+        session-id: string,
+        username: string,
+        provisioning-uri: string,
+        roles: list<string>,
+        scopes: list<string>,
+        expires-at: u64,
+    }
+
+    record auth-session {
+        token: string,
+        username: string,
+        roles: list<string>,
+        scopes: list<string>,
+    }
+
     variant authn-error {
         expired,
         invalid-credential,
@@ -14,6 +44,9 @@ interface authn {
     }
 
     validate-token: func(token: string) -> result<identity-payload, authn-error>;
+    validate-registration-token: func(token: string) -> result<registration-token-claims, string>;
+    stage-user: func(token: string, profile: signup-profile) -> result<staged-user-session, string>;
+    finalize-enrollment: func(session-id: string, totp-code: string) -> result<auth-session, string>;
     issue-pat: func(subject: string, name: string, scopes: list<string>, ttl-days: u32) -> result<string, string>;
     generate-recovery-codes: func(username: string) -> result<list<string>, string>;
     consume-recovery-code: func(username: string, code: string) -> result<string, string>;
