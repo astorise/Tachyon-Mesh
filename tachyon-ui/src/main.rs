@@ -15,6 +15,35 @@ struct AuthnLoginPayload {
     cert: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignupValidatePayload {
+    url: String,
+    token: String,
+    cert: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignupStagePayload {
+    url: String,
+    token: String,
+    first_name: String,
+    last_name: String,
+    username: String,
+    password: String,
+    cert: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignupFinalizePayload {
+    url: String,
+    session_id: String,
+    totp_code: String,
+    cert: Option<Vec<u8>>,
+}
+
 #[tauri::command]
 async fn get_engine_status() -> Result<String, String> {
     tachyon_client::get_engine_status()
@@ -49,6 +78,46 @@ async fn authn_login(
         &payload.url,
         &payload.username,
         &payload.password,
+        payload.cert,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn validate_signup_token(
+    payload: SignupValidatePayload,
+) -> Result<tachyon_client::RegistrationTokenClaims, String> {
+    tachyon_client::validate_registration_token(&payload.url, &payload.token, payload.cert)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn stage_signup(
+    payload: SignupStagePayload,
+) -> Result<tachyon_client::StagedSignupSession, String> {
+    tachyon_client::stage_signup(
+        &payload.url,
+        &payload.token,
+        &payload.first_name,
+        &payload.last_name,
+        &payload.username,
+        &payload.password,
+        payload.cert,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn finalize_signup(
+    payload: SignupFinalizePayload,
+) -> Result<tachyon_client::AuthLoginResponse, String> {
+    tachyon_client::finalize_enrollment(
+        &payload.url,
+        &payload.session_id,
+        &payload.totp_code,
         payload.cert,
     )
     .await
@@ -117,6 +186,9 @@ fn main() {
             get_mesh_graph,
             connect_to_node,
             authn_login,
+            validate_signup_token,
+            stage_signup,
+            finalize_signup,
             iam_list_users,
             iam_regen_mfa,
             generate_recovery_codes,

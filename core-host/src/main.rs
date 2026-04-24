@@ -4767,6 +4767,15 @@ fn build_app(state: AppState) -> Router {
     let app = Router::new()
         .merge(admin_routes)
         .route(
+            "/auth/signup/validate-token",
+            post(auth::validate_registration_token_handler),
+        )
+        .route("/auth/signup/stage", post(auth::stage_signup_handler))
+        .route(
+            "/auth/signup/finalize",
+            post(auth::finalize_enrollment_handler),
+        )
+        .route(
             "/auth/recovery/consume",
             post(auth::consume_recovery_code_handler),
         )
