@@ -6,6 +6,7 @@ use axum::{
     Router,
 };
 use reqwest::Client;
+use std::sync::Once;
 
 const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:8081";
 
@@ -13,6 +14,19 @@ const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:8081";
 struct AppState {
     faas_url: String,
     http_client: Client,
+}
+
+fn ensure_rustls_crypto_provider() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn build_http_client() -> Client {
+    ensure_rustls_crypto_provider();
+    Client::new()
 }
 
 #[tokio::main]
@@ -29,7 +43,7 @@ async fn main() -> Result<()> {
         .route("/call-faas", post(call_faas))
         .with_state(AppState {
             faas_url,
-            http_client: Client::new(),
+            http_client: build_http_client(),
         });
 
     axum::serve(listener, app)
@@ -70,4 +84,14 @@ async fn call_faas(State(state): State<AppState>) -> Result<String, (StatusCode,
             ),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_http_client;
+
+    #[test]
+    fn reqwest_client_initializes_with_default_tls_provider() {
+        let _client = build_http_client();
+    }
 }
