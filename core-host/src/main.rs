@@ -42,7 +42,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex, Once,
+        Arc, Condvar, Mutex, Once, OnceLock,
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime},
@@ -661,6 +661,21 @@ struct GuestExecutionContext {
     host_load: Arc<HostLoadCounters>,
     #[cfg(feature = "ai-inference")]
     ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+}
+
+static BLOCKING_OUTBOUND_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+fn blocking_outbound_http_client() -> reqwest::blocking::Client {
+    BLOCKING_OUTBOUND_HTTP_CLIENT
+        .get_or_init(|| {
+            std::thread::Builder::new()
+                .name("tachyon-blocking-http-init".to_owned())
+                .spawn(reqwest::blocking::Client::new)
+                .expect("blocking outbound HTTP client init thread should start")
+                .join()
+                .expect("blocking outbound HTTP client init thread should succeed")
+        })
+        .clone()
 }
 
 struct BackgroundTickRunner {
@@ -11216,7 +11231,7 @@ impl ComponentHostState {
             peer_capabilities: Arc::new(Mutex::new(HashMap::new())),
             host_capabilities: Capabilities::detect(),
             host_load: Arc::new(HostLoadCounters::default()),
-            outbound_http_client: reqwest::blocking::Client::new(),
+            outbound_http_client: blocking_outbound_http_client(),
             route_path: route.path.clone(),
             route_role: route.role,
             #[cfg(feature = "ai-inference")]
@@ -20190,7 +20205,7 @@ mod tests {
     #[test]
     fn blocking_reqwest_client_initializes_with_default_tls_provider() {
         ensure_rustls_crypto_provider();
-        let _client = reqwest::blocking::Client::new();
+        let _client = blocking_outbound_http_client();
     }
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
