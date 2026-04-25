@@ -1,4 +1,4 @@
-const LEGACY_PING_URL: &str = "http://legacy-service:8081/ping";
+const LEGACY_PING_URL: &str = "http://mesh/legacy-service/ping";
 
 #[no_mangle]
 pub extern "C" fn faas_entry() {
