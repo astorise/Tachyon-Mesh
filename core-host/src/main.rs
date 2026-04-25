@@ -10136,12 +10136,22 @@ fn normalize_external_resource_target(resource_name: &str, target: &str) -> Resu
                 .parse::<IpAddr>()
                 .ok()
                 .is_some_and(|ip| ip.is_loopback()));
-    if parsed.scheme() != "https" && !loopback_http {
+    let cluster_local_http = parsed.scheme() == "http" && is_cluster_local_service_host(host);
+    if parsed.scheme() != "https" && !loopback_http && !cluster_local_http {
         return Err(anyhow!(
-            "Integrity Validation Failed: external resource `{resource_name}` target must use HTTPS unless it points at localhost for tests"
+            "Integrity Validation Failed: external resource `{resource_name}` target must use HTTPS unless it points at localhost for tests or a cluster-local service"
         ));
     }
     Ok(parsed.to_string())
+}
+
+fn is_cluster_local_service_host(host: &str) -> bool {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    !normalized.is_empty()
+        && !normalized.eq("localhost")
+        && (!normalized.contains('.')
+            || normalized.ends_with(".svc")
+            || normalized.ends_with(".svc.cluster.local"))
 }
 
 fn normalize_resource_methods(resource_name: &str, methods: Vec<String>) -> Result<Vec<String>> {
@@ -14252,7 +14262,7 @@ mod tests {
             response,
             GuestExecutionOutcome {
                 output: GuestExecutionOutput::LegacyStdout(Bytes::from(
-                    "MESH_FETCH:http://legacy-service:8081/ping\n"
+                    "MESH_FETCH:http://mesh/legacy-service/ping\n"
                 )),
                 fuel_consumed: None,
             }
@@ -17045,11 +17055,11 @@ mod tests {
 
     #[test]
     fn extract_mesh_fetch_url_recognizes_bridge_command() {
-        let stdout = Bytes::from("MESH_FETCH:http://legacy-service:8081/ping\n");
+        let stdout = Bytes::from("MESH_FETCH:http://mesh/legacy-service/ping\n");
 
         assert_eq!(
             extract_mesh_fetch_url(&stdout),
-            Some("http://legacy-service:8081/ping")
+            Some("http://mesh/legacy-service/ping")
         );
     }
 
@@ -18204,6 +18214,50 @@ mod tests {
     }
 
     #[test]
+    fn validate_integrity_config_accepts_http_cluster_local_external_resource() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![versioned_route("/api/checkout", "checkout", "1.0.0")];
+        config.resources = BTreeMap::from([(
+            "legacy-service".to_owned(),
+            IntegrityResource::External {
+                target: "http://legacy-service:8081".to_owned(),
+                allowed_methods: vec!["GET".to_owned()],
+            },
+        )]);
+
+        let config =
+            validate_integrity_config(config).expect("cluster-local HTTP resource should validate");
+
+        assert_eq!(
+            config.resources.get("legacy-service"),
+            Some(&IntegrityResource::External {
+                target: "http://legacy-service:8081/".to_owned(),
+                allowed_methods: vec!["GET".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_public_http_external_resource() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![versioned_route("/api/checkout", "checkout", "1.0.0")];
+        config.resources = BTreeMap::from([(
+            "payment-gateway".to_owned(),
+            IntegrityResource::External {
+                target: "http://api.example.com/v1".to_owned(),
+                allowed_methods: vec!["GET".to_owned()],
+            },
+        )]);
+
+        let error = validate_integrity_config(config)
+            .expect_err("public HTTP external resources should be rejected");
+
+        assert!(error.to_string().contains(
+            "must use HTTPS unless it points at localhost for tests or a cluster-local service"
+        ));
+    }
+
+    #[test]
     fn validate_integrity_config_accepts_system_connector_dependencies() {
         let host_address = DEFAULT_HOST_ADDRESS
             .parse::<SocketAddr>()
@@ -19052,6 +19106,32 @@ mod tests {
         assert!(config.sealed_route("/api/guest-loop").is_some());
         assert!(config.sealed_route("/api/guest-csharp").is_some());
         assert!(config.sealed_route("/api/guest-java").is_some());
+    }
+
+    #[test]
+    fn embedded_integrity_payload_allows_legacy_service_resource_alias() {
+        let config = serde_json::from_str::<IntegrityConfig>(EMBEDDED_CONFIG_PAYLOAD)
+            .expect("embedded payload should deserialize into an integrity config");
+        let config = validate_integrity_config(config).expect("embedded config should validate");
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route("/api/guest-call-legacy")
+            .expect("legacy route should remain sealed");
+
+        assert_eq!(
+            resolve_outbound_http_target(
+                &config,
+                &route_registry,
+                caller_route,
+                &reqwest::Method::GET,
+                "http://mesh/legacy-service/ping",
+            )
+            .expect("legacy service alias should resolve"),
+            ResolvedOutboundTarget {
+                url: "http://legacy-service:8081/ping".to_owned(),
+                kind: OutboundTargetKind::External,
+            }
+        );
     }
 
     #[test]
