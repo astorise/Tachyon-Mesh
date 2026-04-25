@@ -35,12 +35,10 @@ The workspace SHALL treat `integrity.lock` as the signed source of truth for eac
 - **AND** the runtime preserves the normalized route path
 - **AND** the runtime loads the declared service identity and dependency constraints from the signed manifest
 
-#### Scenario: Host loads an older sealed manifest without SemVer route metadata
-- **WHEN** `core-host` starts with a sealed manifest whose route entries omit `name`, `version`, and `dependencies`
-- **THEN** integrity validation still succeeds
-- **AND** the host defaults `name` from the route path
-- **AND** the host defaults `version` to `0.0.0`
-- **AND** the host defaults the dependency map to empty
+#### Scenario: Host rejects a sealed manifest whose route SemVer metadata is incomplete
+- **WHEN** `core-host` starts with a sealed manifest whose route entry omits `version` or `dependencies`
+- **THEN** integrity validation fails with `ERR_INTEGRITY_SCHEMA_VIOLATION`
+- **AND** the host aborts startup before binding the HTTP server
 
 ### Requirement: Host rejects ambiguous or invalid sealed route metadata
 `core-host` SHALL normalize sealed route paths, reject duplicates, and refuse to start if any sealed route metadata is invalid.
@@ -49,4 +47,3 @@ The workspace SHALL treat `integrity.lock` as the signed source of truth for eac
 - **WHEN** the embedded configuration payload contains the same normalized route more than once
 - **THEN** `core-host` fails integrity validation before serving traffic
 - **AND** the error reports that the sealed route metadata is ambiguous
-
