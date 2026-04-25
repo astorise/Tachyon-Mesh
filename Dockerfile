@@ -54,7 +54,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     golang-go \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL -o /tmp/tinygo.tar.gz https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo${TINYGO_VERSION}.linux-amd64.tar.gz \
+RUN curl --fail --show-error --silent --location --retry 5 --retry-delay 2 --retry-all-errors \
+      -o /tmp/tinygo.tar.gz \
+      https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo${TINYGO_VERSION}.linux-amd64.tar.gz \
     && tar -C /usr/local -xzf /tmp/tinygo.tar.gz \
     && ln -s /usr/local/tinygo/bin/tinygo /usr/local/bin/tinygo \
     && rm /tmp/tinygo.tar.gz
