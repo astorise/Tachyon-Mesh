@@ -3331,6 +3331,7 @@ dependencies = [
  "anyhow",
  "axum",
  "reqwest",
+ "rustls",
  "tokio",
 ]
 
