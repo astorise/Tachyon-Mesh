@@ -17,8 +17,8 @@ use bindings::exports::tachyon::identity::authn::{
 use hmac::{Hmac, KeyInit, Mac};
 use rand::distr::{Alphanumeric, SampleString};
 use serde::{Deserialize, Serialize};
-use sha1::{Digest as _, Sha1};
-use sha2::{Digest as _, Sha256};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::{
     env, fs,
     path::PathBuf,

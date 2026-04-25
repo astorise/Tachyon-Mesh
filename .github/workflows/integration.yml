@@ -1,7 +1,12 @@
 name: k3d-integration
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -39,8 +44,8 @@ jobs:
       - name: Deploy workload
         run: |
           kubectl apply -f manifests/deploy.yaml
-          kubectl wait --for=condition=available --timeout=180s deployment/tachyon-host
-          kubectl wait --for=condition=available --timeout=180s deployment/legacy-deployment
+          kubectl rollout status deployment/tachyon-host --timeout=300s
+          kubectl rollout status deployment/legacy-deployment --timeout=300s
 
       - name: Verify hybrid mesh traffic matrix
         run: |
@@ -114,7 +119,9 @@ jobs:
       - name: Show diagnostics on failure
         if: failure()
         run: |
+          k3d cluster list || true
           kubectl get pods -o wide || true
+          kubectl get events --sort-by=.lastTimestamp || true
           kubectl describe deployment/tachyon-host || true
           kubectl describe deployment/legacy-deployment || true
           kubectl describe pod -l app=tachyon-host || true
@@ -123,3 +130,7 @@ jobs:
           kubectl logs deployment/legacy-deployment || true
           cat /tmp/tachyon-port-forward.log || true
           cat /tmp/legacy-port-forward.log || true
+
+      - name: Delete k3d cluster
+        if: always()
+        run: k3d cluster delete tachyon-mesh || true
