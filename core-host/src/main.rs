@@ -1835,6 +1835,21 @@ struct IntegrityVolume {
     eviction_policy: Option<VolumeEvictionPolicy>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum IntegrityResource {
+    Internal {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version_constraint: Option<String>,
+    },
+    External {
+        target: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowed_methods: Vec<String>,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct IntegrityConfig {
     host_address: String,
@@ -1855,7 +1870,21 @@ struct IntegrityConfig {
     telemetry_sample_rate: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     batch_targets: Vec<IntegrityBatchTarget>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    resources: BTreeMap<String, IntegrityResource>,
     routes: Vec<IntegrityRoute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OutboundTargetKind {
+    Internal,
+    External,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedOutboundTarget {
+    url: String,
+    kind: OutboundTargetKind,
 }
 
 #[derive(Clone, Debug)]
@@ -7005,8 +7034,15 @@ async fn resolve_mesh_response(
     let Some(target) = extract_mesh_fetch_url(&response.body) else {
         return Ok(response);
     };
-    let url = resolve_mesh_fetch_target(config, route_registry, caller_route, target)?;
-    let inject_identity = is_internal_mesh_target(target);
+    let resolved_target = resolve_outbound_http_target(
+        config,
+        route_registry,
+        caller_route,
+        &reqwest::Method::GET,
+        target,
+    )?;
+    let url = rewrite_outbound_http_url(&resolved_target.url, config);
+    let inject_identity = resolved_target.kind.is_internal();
     let identity_token = if inject_identity {
         Some(
             host_identity
@@ -7020,6 +7056,7 @@ async fn resolve_mesh_response(
         http_client,
         uds_fast_path,
         &url,
+        &resolved_target.kind,
         hop_limit,
         propagated_headers,
         identity_token.as_deref(),
@@ -7048,10 +7085,15 @@ async fn resolve_mesh_response(
 
 fn apply_mesh_fetch_headers(
     mut request: reqwest::RequestBuilder,
+    target_kind: &OutboundTargetKind,
     hop_limit: HopLimit,
     propagated_headers: &[PropagatedHeader],
     identity_token: Option<&str>,
 ) -> reqwest::RequestBuilder {
+    if !target_kind.is_internal() {
+        return request;
+    }
+
     request = request.header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
     for header in propagated_headers
         .iter()
@@ -7070,6 +7112,7 @@ async fn send_mesh_fetch_request(
     http_client: &Client,
     _uds_fast_path: &UdsFastPathRegistry,
     url: &str,
+    target_kind: &OutboundTargetKind,
     hop_limit: HopLimit,
     propagated_headers: &[PropagatedHeader],
     identity_token: Option<&str>,
@@ -7087,6 +7130,7 @@ async fn send_mesh_fetch_request(
             })?;
         let request = apply_mesh_fetch_headers(
             uds_client.get(url),
+            target_kind,
             hop_limit,
             propagated_headers,
             identity_token,
@@ -7106,6 +7150,7 @@ async fn send_mesh_fetch_request(
 
     apply_mesh_fetch_headers(
         http_client.get(url),
+        target_kind,
         hop_limit,
         propagated_headers,
         identity_token,
@@ -7122,18 +7167,6 @@ fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
         .strip_prefix("MESH_FETCH:")
         .map(str::trim)
         .filter(|url| !url.is_empty())
-}
-
-fn is_internal_mesh_target(target: &str) -> bool {
-    if target.starts_with('/') {
-        return true;
-    }
-
-    (target.starts_with("http://") || target.starts_with("https://"))
-        && reqwest::Url::parse(target)
-            .ok()
-            .and_then(|url| url.host_str().map(is_internal_mesh_host))
-            .unwrap_or(false)
 }
 
 fn select_route_module(
@@ -7317,56 +7350,21 @@ fn resolve_incoming_hop_limit(headers: &HeaderMap) -> std::result::Result<HopLim
     }
 }
 
+#[cfg(test)]
 fn resolve_mesh_fetch_target(
     config: &IntegrityConfig,
     route_registry: &RouteRegistry,
     caller_route: &IntegrityRoute,
     target: &str,
 ) -> std::result::Result<String, String> {
-    if target.starts_with('/') {
-        return Ok(format!("{}{}", internal_mesh_base_url(config)?, target));
-    }
-
-    if target.starts_with("http://") || target.starts_with("https://") {
-        let url = reqwest::Url::parse(target)
-            .map_err(|error| format!("mesh fetch target `{target}` is not a valid URL: {error}"))?;
-
-        if !url.host_str().is_some_and(is_internal_mesh_host) {
-            return Ok(target.to_owned());
-        }
-
-        let normalized_path = normalize_route_path(url.path());
-        let base_url = internal_mesh_base_url(config)?;
-        if route_registry.by_path.contains_key(&normalized_path) {
-            return Ok(format!(
-                "{base_url}{}",
-                append_query(&normalized_path, url.query())
-            ));
-        }
-
-        let dependency_segments = url
-            .path_segments()
-            .into_iter()
-            .flatten()
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        if dependency_segments.len() != 1 {
-            return Err(format!(
-                "internal mesh target `{target}` must identify a sealed route path or a single dependency name"
-            ));
-        }
-        let dependency_name = dependency_segments[0];
-        let resolved_route =
-            route_registry.resolve_dependency_route(&caller_route.path, dependency_name)?;
-        return Ok(format!(
-            "{base_url}{}",
-            append_query(&resolved_route.path, url.query())
-        ));
-    }
-
-    Err(format!(
-        "mesh fetch target `{target}` must be an absolute URL or an absolute route path"
-    ))
+    resolve_outbound_http_target(
+        config,
+        route_registry,
+        caller_route,
+        &reqwest::Method::GET,
+        target,
+    )
+    .map(|resolved| resolved.url)
 }
 
 fn is_internal_mesh_host(host: &str) -> bool {
@@ -7378,6 +7376,216 @@ fn append_query(path: &str, query: Option<&str>) -> String {
         Some(query) if !query.is_empty() => format!("{path}?{query}"),
         _ => path.to_owned(),
     }
+}
+
+impl OutboundTargetKind {
+    fn is_internal(&self) -> bool {
+        matches!(self, Self::Internal)
+    }
+}
+
+fn resolve_outbound_http_target(
+    config: &IntegrityConfig,
+    route_registry: &RouteRegistry,
+    caller_route: &IntegrityRoute,
+    method: &reqwest::Method,
+    target: &str,
+) -> std::result::Result<ResolvedOutboundTarget, String> {
+    if target.starts_with('/') {
+        return Ok(ResolvedOutboundTarget {
+            url: format!("{}{}", internal_mesh_base_url(config)?, target),
+            kind: OutboundTargetKind::Internal,
+        });
+    }
+
+    if !(target.starts_with("http://") || target.starts_with("https://")) {
+        return Err(format!(
+            "mesh fetch target `{target}` must be an absolute URL or an absolute route path"
+        ));
+    }
+
+    let url = reqwest::Url::parse(target)
+        .map_err(|error| format!("mesh fetch target `{target}` is not a valid URL: {error}"))?;
+    if !url.host_str().is_some_and(is_internal_mesh_host) {
+        return resolve_direct_external_target(caller_route, target);
+    }
+
+    let normalized_path = normalize_route_path(url.path());
+    let base_url = internal_mesh_base_url(config)?;
+    if route_registry.by_path.contains_key(&normalized_path) {
+        return Ok(ResolvedOutboundTarget {
+            url: format!("{base_url}{}", append_query(&normalized_path, url.query())),
+            kind: OutboundTargetKind::Internal,
+        });
+    }
+
+    let path_segments = url
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let Some(first_segment) = path_segments.first().copied() else {
+        return Err(format!(
+            "internal mesh target `{target}` must identify a sealed route path, resource alias, or a single dependency name"
+        ));
+    };
+    let suffix = url
+        .path()
+        .strip_prefix(&format!("/{first_segment}"))
+        .unwrap_or_default();
+    if let Some(resource) = config.resources.get(first_segment) {
+        return resolve_resource_alias(
+            config,
+            route_registry,
+            resource,
+            first_segment,
+            suffix,
+            url.query(),
+            method,
+        );
+    }
+
+    if path_segments.len() != 1 {
+        return Err(format!(
+            "internal mesh target `{target}` must identify a sealed route path, resource alias, or a single dependency name"
+        ));
+    }
+    let dependency_name = path_segments[0];
+    let resolved_route =
+        route_registry.resolve_dependency_route(&caller_route.path, dependency_name)?;
+    Ok(ResolvedOutboundTarget {
+        url: format!(
+            "{base_url}{}",
+            append_query(&resolved_route.path, url.query())
+        ),
+        kind: OutboundTargetKind::Internal,
+    })
+}
+
+fn resolve_direct_external_target(
+    caller_route: &IntegrityRoute,
+    target: &str,
+) -> std::result::Result<ResolvedOutboundTarget, String> {
+    if caller_route.role == RouteRole::System {
+        return Ok(ResolvedOutboundTarget {
+            url: target.to_owned(),
+            kind: OutboundTargetKind::External,
+        });
+    }
+
+    Err(format!(
+        "route `{}` is not allowed to call raw external URLs; seal an external resource alias in `integrity.lock` and use `http://mesh/<alias>` instead",
+        caller_route.path
+    ))
+}
+
+fn resolve_resource_alias(
+    config: &IntegrityConfig,
+    route_registry: &RouteRegistry,
+    resource: &IntegrityResource,
+    resource_name: &str,
+    suffix: &str,
+    query: Option<&str>,
+    method: &reqwest::Method,
+) -> std::result::Result<ResolvedOutboundTarget, String> {
+    match resource {
+        IntegrityResource::Internal {
+            target,
+            version_constraint,
+        } => {
+            let base_path = resolve_internal_resource_target(
+                route_registry,
+                target,
+                version_constraint.as_deref(),
+            )?;
+            Ok(ResolvedOutboundTarget {
+                url: format!(
+                    "{}{}",
+                    internal_mesh_base_url(config)?,
+                    append_query(&join_resource_path(&base_path, suffix), query)
+                ),
+                kind: OutboundTargetKind::Internal,
+            })
+        }
+        IntegrityResource::External {
+            target,
+            allowed_methods,
+        } => {
+            if !allowed_methods
+                .iter()
+                .any(|allowed| allowed == method.as_str())
+            {
+                return Err(format!(
+                    "sealed external resource `{resource_name}` does not allow HTTP method `{}`",
+                    method.as_str()
+                ));
+            }
+            Ok(ResolvedOutboundTarget {
+                url: join_external_resource_url(target, suffix, query)?,
+                kind: OutboundTargetKind::External,
+            })
+        }
+    }
+}
+
+fn resolve_internal_resource_target(
+    route_registry: &RouteRegistry,
+    target: &str,
+    version_constraint: Option<&str>,
+) -> std::result::Result<String, String> {
+    if target.starts_with('/') {
+        let normalized = normalize_route_path(target);
+        let route = route_registry.by_path.get(&normalized).ok_or_else(|| {
+            format!("sealed resource target `{normalized}` does not match any sealed route")
+        })?;
+        if let Some(requirement) = version_constraint {
+            let parsed = VersionReq::parse(requirement).map_err(|error| {
+                format!("sealed resource version constraint `{requirement}` is invalid: {error}")
+            })?;
+            if !parsed.matches(&route.version) {
+                return Err(format!(
+                    "sealed resource target `{normalized}` does not satisfy version constraint `{requirement}`"
+                ));
+            }
+        }
+        return Ok(normalized);
+    }
+
+    let route_name = normalize_service_name(target)
+        .map_err(|error| format!("sealed resource target `{target}` is invalid: {error}"))?;
+    let route = if let Some(requirement) = version_constraint {
+        let parsed = VersionReq::parse(requirement).map_err(|error| {
+            format!("sealed resource version constraint `{requirement}` is invalid: {error}")
+        })?;
+        route_registry.resolve_named_route_matching(&route_name, &parsed)?
+    } else {
+        route_registry.resolve_named_route(&route_name)?
+    };
+    Ok(route.path.clone())
+}
+
+fn join_resource_path(base_path: &str, suffix: &str) -> String {
+    if suffix.is_empty() || suffix == "/" {
+        return base_path.to_owned();
+    }
+    format!("{}{}", base_path.trim_end_matches('/'), suffix)
+}
+
+fn join_external_resource_url(
+    base_url: &str,
+    suffix: &str,
+    query: Option<&str>,
+) -> std::result::Result<String, String> {
+    let mut url = reqwest::Url::parse(base_url).map_err(|error| {
+        format!("sealed external resource target `{base_url}` is not a valid URL: {error}")
+    })?;
+    let merged_path = join_resource_path(url.path(), suffix);
+    url.set_path(&merged_path);
+    if let Some(query) = query {
+        url.set_query(Some(query));
+    }
+    Ok(url.to_string())
 }
 
 fn internal_mesh_base_url(config: &IntegrityConfig) -> std::result::Result<String, String> {
@@ -7548,6 +7756,23 @@ impl RouteRegistry {
             .and_then(|routes| routes.first())
             .ok_or_else(|| {
                 format!("route middleware `{route_name}` does not match any sealed route name")
+            })
+    }
+
+    fn resolve_named_route_matching(
+        &self,
+        route_name: &str,
+        requirement: &VersionReq,
+    ) -> std::result::Result<&ResolvedRoute, String> {
+        self.by_name
+            .get(route_name)
+            .into_iter()
+            .flatten()
+            .find(|candidate| requirement.matches(&candidate.version))
+            .ok_or_else(|| {
+                format!(
+                    "sealed resource `{route_name}` requires a route matching `{requirement}`, but no compatible version was loaded"
+                )
             })
     }
 
@@ -9673,6 +9898,7 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
     config.batch_targets = normalize_batch_targets(config.batch_targets)?;
     config.routes = normalize_config_routes(config.routes, !config.batch_targets.is_empty())?;
     let route_registry = RouteRegistry::build(&config)?;
+    config.resources = normalize_resources(config.resources, &config.routes, &route_registry)?;
     config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
     Ok(config)
 }
@@ -9737,6 +9963,196 @@ fn normalize_layer4_config(
     layer4.tcp = normalize_tcp_bindings(layer4.tcp, route_registry)?;
     layer4.udp = normalize_udp_bindings(layer4.udp, route_registry)?;
     Ok(layer4)
+}
+
+fn normalize_resources(
+    resources: BTreeMap<String, IntegrityResource>,
+    routes: &[IntegrityRoute],
+    route_registry: &RouteRegistry,
+) -> Result<BTreeMap<String, IntegrityResource>> {
+    let reserved_names = routes
+        .iter()
+        .map(|route| route.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut normalized = BTreeMap::new();
+
+    for (name, resource) in resources {
+        let normalized_name = normalize_service_name(&name).map_err(|error| {
+            anyhow!(
+                "Integrity Validation Failed: resource `{name}` has an invalid logical name: {error}"
+            )
+        })?;
+        if reserved_names.contains(&normalized_name) {
+            return Err(anyhow!(
+                "Integrity Validation Failed: resource `{normalized_name}` conflicts with a sealed route name"
+            ));
+        }
+
+        let normalized_resource =
+            normalize_resource_definition(resource, &normalized_name, route_registry)?;
+        if normalized
+            .insert(normalized_name.clone(), normalized_resource)
+            .is_some()
+        {
+            return Err(anyhow!(
+                "Integrity Validation Failed: resource `{normalized_name}` is defined more than once"
+            ));
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_resource_definition(
+    resource: IntegrityResource,
+    resource_name: &str,
+    route_registry: &RouteRegistry,
+) -> Result<IntegrityResource> {
+    match resource {
+        IntegrityResource::Internal {
+            target,
+            version_constraint,
+        } => {
+            let normalized_constraint = version_constraint
+                .map(|constraint| {
+                    VersionReq::parse(constraint.trim()).map(|parsed| parsed.to_string()).map_err(
+                        |_| {
+                            anyhow!(
+                                "Integrity Validation Failed: resource `{resource_name}` has an invalid `version_constraint`"
+                            )
+                        },
+                    )
+                })
+                .transpose()?;
+            let normalized_target = normalize_internal_resource_reference(
+                resource_name,
+                &target,
+                normalized_constraint.as_deref(),
+                route_registry,
+            )?;
+            Ok(IntegrityResource::Internal {
+                target: normalized_target,
+                version_constraint: normalized_constraint,
+            })
+        }
+        IntegrityResource::External {
+            target,
+            allowed_methods,
+        } => {
+            let normalized_target = normalize_external_resource_target(resource_name, &target)?;
+            Ok(IntegrityResource::External {
+                target: normalized_target,
+                allowed_methods: normalize_resource_methods(resource_name, allowed_methods)?,
+            })
+        }
+    }
+}
+
+fn normalize_internal_resource_reference(
+    resource_name: &str,
+    target: &str,
+    version_constraint: Option<&str>,
+    route_registry: &RouteRegistry,
+) -> Result<String> {
+    if target.trim().is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: internal resource `{resource_name}` must include a non-empty `target`"
+        ));
+    }
+
+    if target.trim_start().starts_with('/') {
+        let normalized_path = normalize_route_path(target);
+        let route = route_registry.by_path.get(&normalized_path).ok_or_else(|| {
+            anyhow!(
+                "Integrity Validation Failed: internal resource `{resource_name}` target `{normalized_path}` does not match any sealed route"
+            )
+        })?;
+        if let Some(requirement) = version_constraint {
+            let parsed = VersionReq::parse(requirement).map_err(|_| {
+                anyhow!(
+                    "Integrity Validation Failed: resource `{resource_name}` has an invalid `version_constraint`"
+                )
+            })?;
+            if !parsed.matches(&route.version) {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: internal resource `{resource_name}` target `{normalized_path}` does not satisfy `{requirement}`"
+                ));
+            }
+        }
+        return Ok(normalized_path);
+    }
+
+    let normalized_name = normalize_service_name(target).map_err(|error| {
+        anyhow!(
+            "Integrity Validation Failed: internal resource `{resource_name}` target `{target}` is invalid: {error}"
+        )
+    })?;
+    if let Some(requirement) = version_constraint {
+        let parsed = VersionReq::parse(requirement).map_err(|_| {
+            anyhow!(
+                "Integrity Validation Failed: resource `{resource_name}` has an invalid `version_constraint`"
+            )
+        })?;
+        route_registry
+            .resolve_named_route_matching(&normalized_name, &parsed)
+            .map_err(|error| anyhow!("Integrity Validation Failed: {error}"))?;
+    } else {
+        route_registry
+            .resolve_named_route(&normalized_name)
+            .map_err(|error| anyhow!("Integrity Validation Failed: {error}"))?;
+    }
+    Ok(normalized_name)
+}
+
+fn normalize_external_resource_target(resource_name: &str, target: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(target.trim()).map_err(|error| {
+        anyhow!(
+            "Integrity Validation Failed: external resource `{resource_name}` target is not a valid URL: {error}"
+        )
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        anyhow!(
+            "Integrity Validation Failed: external resource `{resource_name}` target must include a host"
+        )
+    })?;
+    let loopback_http = parsed.scheme() == "http"
+        && (host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .ok()
+                .is_some_and(|ip| ip.is_loopback()));
+    if parsed.scheme() != "https" && !loopback_http {
+        return Err(anyhow!(
+            "Integrity Validation Failed: external resource `{resource_name}` target must use HTTPS unless it points at localhost for tests"
+        ));
+    }
+    Ok(parsed.to_string())
+}
+
+fn normalize_resource_methods(resource_name: &str, methods: Vec<String>) -> Result<Vec<String>> {
+    let normalized = methods
+        .into_iter()
+        .map(|method| {
+            let uppercase = method.trim().to_ascii_uppercase();
+            if uppercase.is_empty() {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: external resource `{resource_name}` must not declare empty HTTP methods"
+                ));
+            }
+            Method::from_bytes(uppercase.as_bytes()).map_err(|error| {
+                anyhow!(
+                    "Integrity Validation Failed: external resource `{resource_name}` has an invalid HTTP method `{uppercase}`: {error}"
+                )
+            })?;
+            Ok(uppercase)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if normalized.is_empty() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: external resource `{resource_name}` must declare at least one allowed HTTP method"
+        ));
+    }
+    Ok(normalized.into_iter().collect())
 }
 
 fn normalize_tcp_bindings(
@@ -11952,7 +12368,25 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
     > {
         let method = reqwest::Method::from_bytes(method.trim().as_bytes())
             .map_err(|error| format!("invalid outbound HTTP method `{method}`: {error}"))?;
-        let url = rewrite_outbound_http_url(&url, &self.runtime_config);
+        let route_registry = RouteRegistry::build(&self.runtime_config)
+            .map_err(|error| format!("failed to build sealed route registry: {error:#}"))?;
+        let caller_route = self
+            .runtime_config
+            .sealed_route(&self.route_path)
+            .ok_or_else(|| {
+                format!(
+                    "sealed caller route `{}` is not present in `integrity.lock`",
+                    self.route_path
+                )
+            })?;
+        let resolved_target = resolve_outbound_http_target(
+            &self.runtime_config,
+            &route_registry,
+            caller_route,
+            &method,
+            &url,
+        )?;
+        let url = rewrite_outbound_http_url(&resolved_target.url, &self.runtime_config);
 
         tracing::info!(
             method = %method,
@@ -11962,11 +12396,10 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
         );
 
         let mut request = self.outbound_http_client.request(method, &url);
-        for (name, value) in headers {
+        for (name, value) in
+            filtered_outbound_http_headers(headers, &self.propagated_headers, &resolved_target.kind)
+        {
             request = request.header(&name, &value);
-        }
-        for header in &self.propagated_headers {
-            request = request.header(&header.name, &header.value);
         }
         let response = request
             .body(body)
@@ -12098,6 +12531,47 @@ fn rewrite_outbound_http_url(url: &str, runtime_config: &IntegrityConfig) -> Str
     }
 }
 
+fn filtered_outbound_http_headers(
+    headers: Vec<(String, String)>,
+    propagated_headers: &[PropagatedHeader],
+    target_kind: &OutboundTargetKind,
+) -> Vec<(String, String)> {
+    let mut filtered = headers;
+    if target_kind.is_internal() {
+        filtered.extend(
+            propagated_headers
+                .iter()
+                .map(|header| (header.name.clone(), header.value.clone())),
+        );
+        return filtered;
+    }
+
+    filtered.retain(|(name, _)| allow_external_outbound_header(name));
+    filtered
+}
+
+fn allow_external_outbound_header(name: &str) -> bool {
+    ![
+        HOP_LIMIT_HEADER,
+        COHORT_HEADER,
+        TACHYON_COHORT_HEADER,
+        TACHYON_IDENTITY_HEADER,
+        TACHYON_ORIGINAL_ROUTE_HEADER,
+        TACHYON_BUFFER_REPLAY_HEADER,
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ]
+    .iter()
+    .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+}
+
 fn loopback_ip_for(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -12119,6 +12593,7 @@ impl IntegrityConfig {
             layer4: IntegrityLayer4Config::default(),
             telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
             batch_targets: Vec::new(),
+            resources: BTreeMap::new(),
             routes: vec![
                 IntegrityRoute::user_with_secrets(DEFAULT_ROUTE, &["DB_PASS"]),
                 IntegrityRoute::system(DEFAULT_SYSTEM_ROUTE),
@@ -12632,6 +13107,7 @@ mod tests {
             layer4: IntegrityLayer4Config::default(),
             telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
             batch_targets: Vec::new(),
+            resources: BTreeMap::new(),
             routes,
         }
     }
@@ -12680,6 +13156,7 @@ mod tests {
             layer4: IntegrityLayer4Config::default(),
             telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
             batch_targets: Vec::new(),
+            resources: BTreeMap::new(),
             routes: vec![target_route, connector_route],
         }
     }
@@ -16715,6 +17192,198 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_mesh_fetch_target_resolves_internal_resource_aliases() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = "0.0.0.0:8080".to_owned();
+        config.routes = vec![
+            versioned_route("/api/checkout", "checkout", "1.0.0"),
+            versioned_route("/api/inventory", "inventory", "1.2.3"),
+        ];
+        config.resources = BTreeMap::from([(
+            "inventory-api".to_owned(),
+            IntegrityResource::Internal {
+                target: "inventory".to_owned(),
+                version_constraint: Some("^1.2".to_owned()),
+            },
+        )]);
+        let config = validate_integrity_config(config).expect("config should validate");
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route("/api/checkout")
+            .expect("caller route should remain sealed");
+
+        assert_eq!(
+            resolve_mesh_fetch_target(
+                &config,
+                &route_registry,
+                caller_route,
+                "http://mesh/inventory-api/items?expand=1",
+            )
+            .expect("internal resource alias should resolve"),
+            "http://127.0.0.1:8080/api/inventory/items?expand=1"
+        );
+    }
+
+    #[test]
+    fn resolve_outbound_http_target_resolves_external_resource_aliases() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.host_address = "0.0.0.0:8080".to_owned();
+        config.routes = vec![versioned_route("/api/checkout", "checkout", "1.0.0")];
+        config.resources = BTreeMap::from([(
+            "payment-gateway".to_owned(),
+            IntegrityResource::External {
+                target: "https://api.example.com/v1".to_owned(),
+                allowed_methods: vec!["POST".to_owned()],
+            },
+        )]);
+        let config = validate_integrity_config(config).expect("config should validate");
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route("/api/checkout")
+            .expect("caller route should remain sealed");
+
+        assert_eq!(
+            resolve_outbound_http_target(
+                &config,
+                &route_registry,
+                caller_route,
+                &reqwest::Method::POST,
+                "http://mesh/payment-gateway/charges?expand=1",
+            )
+            .expect("external resource alias should resolve"),
+            ResolvedOutboundTarget {
+                url: "https://api.example.com/v1/charges?expand=1".to_owned(),
+                kind: OutboundTargetKind::External,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_outbound_http_target_switches_when_resource_manifest_changes() {
+        let routes = vec![
+            versioned_route("/api/checkout", "checkout", "1.0.0"),
+            versioned_route("/api/service-b", "service-b", "2.1.0"),
+        ];
+        let caller_path = "/api/checkout";
+        let resource_name = "service-b-alias";
+
+        let external_config = validate_integrity_config(IntegrityConfig {
+            host_address: "0.0.0.0:8080".to_owned(),
+            routes: routes.clone(),
+            resources: BTreeMap::from([(
+                resource_name.to_owned(),
+                IntegrityResource::External {
+                    target: "https://api.example.com/v1/service-b".to_owned(),
+                    allowed_methods: vec!["GET".to_owned()],
+                },
+            )]),
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("external config should validate");
+        let external_registry =
+            RouteRegistry::build(&external_config).expect("route registry should build");
+        let caller_route = external_config
+            .sealed_route(caller_path)
+            .expect("caller route should remain sealed");
+        assert_eq!(
+            resolve_outbound_http_target(
+                &external_config,
+                &external_registry,
+                caller_route,
+                &reqwest::Method::GET,
+                &format!("http://mesh/{resource_name}/health"),
+            )
+            .expect("external target should resolve")
+            .url,
+            "https://api.example.com/v1/service-b/health"
+        );
+
+        let internal_config = validate_integrity_config(IntegrityConfig {
+            host_address: "0.0.0.0:8080".to_owned(),
+            routes,
+            resources: BTreeMap::from([(
+                resource_name.to_owned(),
+                IntegrityResource::Internal {
+                    target: "service-b".to_owned(),
+                    version_constraint: Some("^2.0".to_owned()),
+                },
+            )]),
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("internal config should validate");
+        let internal_registry =
+            RouteRegistry::build(&internal_config).expect("route registry should build");
+        let caller_route = internal_config
+            .sealed_route(caller_path)
+            .expect("caller route should remain sealed");
+        assert_eq!(
+            resolve_outbound_http_target(
+                &internal_config,
+                &internal_registry,
+                caller_route,
+                &reqwest::Method::GET,
+                &format!("http://mesh/{resource_name}/health"),
+            )
+            .expect("internal target should resolve"),
+            ResolvedOutboundTarget {
+                url: "http://127.0.0.1:8080/api/service-b/health".to_owned(),
+                kind: OutboundTargetKind::Internal,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_outbound_http_target_blocks_raw_external_urls_for_user_routes() {
+        let config = IntegrityConfig::default_sealed();
+        let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+        let caller_route = config
+            .sealed_route(DEFAULT_ROUTE)
+            .expect("default route should remain sealed");
+
+        let error = resolve_outbound_http_target(
+            &config,
+            &route_registry,
+            caller_route,
+            &reqwest::Method::GET,
+            "https://api.example.com/v1/ping",
+        )
+        .expect_err("raw external egress should be rejected for user routes");
+
+        assert!(error.contains("not allowed to call raw external URLs"));
+    }
+
+    #[test]
+    fn filtered_outbound_http_headers_strips_internal_mesh_headers_for_external_targets() {
+        let filtered = filtered_outbound_http_headers(
+            vec![
+                (HOP_LIMIT_HEADER.to_owned(), "3".to_owned()),
+                (
+                    TACHYON_IDENTITY_HEADER.to_owned(),
+                    "Bearer secret".to_owned(),
+                ),
+                (
+                    "authorization".to_owned(),
+                    "Bearer partner-token".to_owned(),
+                ),
+                ("host".to_owned(), "mesh".to_owned()),
+            ],
+            &[PropagatedHeader {
+                name: COHORT_HEADER.to_owned(),
+                value: "beta".to_owned(),
+            }],
+            &OutboundTargetKind::External,
+        );
+
+        assert_eq!(
+            filtered,
+            vec![(
+                "authorization".to_owned(),
+                "Bearer partner-token".to_owned(),
+            )]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_mesh_response_forwards_propagated_cohort_headers() {
         use axum::{extract::State, routing::get, Router};
@@ -16856,7 +17525,17 @@ mod tests {
                 .expect("mock server should stay healthy");
         });
 
-        let config = IntegrityConfig::default_sealed();
+        let config = validate_integrity_config(IntegrityConfig {
+            resources: BTreeMap::from([(
+                "external-ping".to_owned(),
+                IntegrityResource::External {
+                    target: format!("http://{address}"),
+                    allowed_methods: vec!["GET".to_owned()],
+                },
+            )]),
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("config should validate");
         let route_registry = RouteRegistry::build(&config).expect("route registry should build");
         let caller_route = config
             .sealed_route(DEFAULT_ROUTE)
@@ -16871,7 +17550,7 @@ mod tests {
             &new_uds_fast_path_registry(),
             HopLimit(DEFAULT_HOP_LIMIT),
             &[],
-            GuestHttpResponse::new(StatusCode::OK, format!("MESH_FETCH:http://{address}/ping")),
+            GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:http://mesh/external-ping/ping"),
         )
         .await
         .expect("external mesh fetch should succeed");
@@ -17467,6 +18146,46 @@ mod tests {
             .expect_err("unsatisfied dependency graph should fail validation");
 
         assert!(error.to_string().contains("requires faas-b matching ^2.0"));
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_resource_names_that_conflict_with_routes() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![versioned_route("/api/checkout", "checkout", "1.0.0")];
+        config.resources = BTreeMap::from([(
+            "checkout".to_owned(),
+            IntegrityResource::External {
+                target: "https://api.example.com/v1".to_owned(),
+                allowed_methods: vec!["GET".to_owned()],
+            },
+        )]);
+
+        let error = validate_integrity_config(config)
+            .expect_err("resource names that shadow routes should fail validation");
+
+        assert!(error
+            .to_string()
+            .contains("conflicts with a sealed route name"));
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_external_resources_without_allowed_methods() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![versioned_route("/api/checkout", "checkout", "1.0.0")];
+        config.resources = BTreeMap::from([(
+            "payment-gateway".to_owned(),
+            IntegrityResource::External {
+                target: "https://api.example.com/v1".to_owned(),
+                allowed_methods: Vec::new(),
+            },
+        )]);
+
+        let error = validate_integrity_config(config)
+            .expect_err("external resources must declare an allow-list");
+
+        assert!(error
+            .to_string()
+            .contains("must declare at least one allowed HTTP method"));
     }
 
     #[test]
