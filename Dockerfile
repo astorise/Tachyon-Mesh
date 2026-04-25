@@ -1,4 +1,4 @@
-FROM ubuntu:26.04 AS rust-builder
+FROM ubuntu:24.04 AS rust-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -43,7 +43,7 @@ RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-ui --release
 RUN cargo build -p core-host --target x86_64-unknown-linux-musl --release
 
-FROM ubuntu:26.04 AS tinygo-builder
+FROM ubuntu:24.04 AS tinygo-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TINYGO_VERSION=0.40.1
@@ -69,7 +69,7 @@ COPY examples/guest-go/main.go ./
 RUN mkdir -p /workspace/guest-modules \
     && tinygo build -o /workspace/guest-modules/guest_go.wasm -target=wasip1 .
 
-FROM ubuntu:26.04 AS javy-builder
+FROM ubuntu:24.04 AS javy-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG JAVY_VERSION=8.1.0
