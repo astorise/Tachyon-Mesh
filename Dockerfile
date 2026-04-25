@@ -90,7 +90,7 @@ COPY examples/guest-js/index.js ./
 RUN mkdir -p /workspace/guest-modules \
     && javy build /workspace/examples/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
 
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS dotnet-builder
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS dotnet-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG WASI_SDK_VERSION=20.0
