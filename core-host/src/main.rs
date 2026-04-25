@@ -180,6 +180,7 @@ const LOG_BATCH_SIZE: usize = 1_000;
 const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD: usize = 32;
 const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
+#[cfg(test)]
 const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 const DEFAULT_TELEMETRY_SAMPLE_RATE: f64 = 0.0;
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
@@ -221,11 +222,13 @@ const POOLING_INSTANCE_METADATA_BYTES: usize = 1 << 20;
 const POOLING_MAX_CORE_INSTANCES_PER_COMPONENT: u32 = 50;
 const POOLING_MAX_MEMORIES_PER_COMPONENT: u32 = 8;
 const POOLING_MAX_TABLES_PER_COMPONENT: u32 = 8;
+const ERR_INTEGRITY_SCHEMA_VIOLATION: &str = "ERR_INTEGRITY_SCHEMA_VIOLATION";
 
 fn default_max_concurrency() -> u32 {
     DEFAULT_ROUTE_MAX_CONCURRENCY
 }
 
+#[cfg(test)]
 fn default_route_version() -> String {
     DEFAULT_ROUTE_VERSION.to_owned()
 }
@@ -270,10 +273,6 @@ async fn open_core_store_for_manifest(manifest_path: &Path) -> Result<Arc<store:
 
 fn forbidden_error(message: &str) -> String {
     format!("forbidden:{message}")
-}
-
-fn is_default_route_version(version: &String) -> bool {
-    version == DEFAULT_ROUTE_VERSION
 }
 
 fn default_volume_type() -> VolumeType {
@@ -1770,12 +1769,7 @@ struct IntegrityRoute {
     role: RouteRole,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     name: String,
-    #[serde(
-        default = "default_route_version",
-        skip_serializing_if = "is_default_route_version"
-    )]
     version: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dependencies: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     requires_credentials: Vec<String>,
@@ -9564,14 +9558,29 @@ pub(crate) fn ensure_rustls_crypto_provider() {
 }
 
 fn verify_integrity() -> Result<IntegrityConfig> {
-    let config = verify_integrity_payload(
+    match verify_integrity_payload(
         EMBEDDED_CONFIG_PAYLOAD,
         EMBEDDED_PUBLIC_KEY,
         EMBEDDED_SIGNATURE,
         "embedded sealed configuration",
-    )?;
-    tracing::info!("integrity verification passed");
-    Ok(config)
+    ) {
+        Ok(config) => {
+            tracing::info!("integrity verification passed");
+            Ok(config)
+        }
+        Err(error) => {
+            if is_integrity_schema_violation(&error) {
+                tracing::error!(
+                    code = ERR_INTEGRITY_SCHEMA_VIOLATION,
+                    error = %error,
+                    "integrity manifest violates the required schema"
+                );
+                panic!("{ERR_INTEGRITY_SCHEMA_VIOLATION}: {error:#}");
+            }
+
+            Err(error)
+        }
+    }
 }
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -9602,8 +9611,16 @@ fn verify_integrity_payload(
 ) -> Result<IntegrityConfig> {
     verify_integrity_signature(payload, public_key_hex, signature_hex)?;
     let config = serde_json::from_str::<IntegrityConfig>(payload)
-        .with_context(|| format!("failed to parse {source}"))?;
+        .map_err(|error| integrity_schema_violation(source, error))?;
     validate_integrity_config(config)
+}
+
+fn integrity_schema_violation(source: &str, error: serde_json::Error) -> anyhow::Error {
+    anyhow!("{ERR_INTEGRITY_SCHEMA_VIOLATION}: failed to parse {source}: {error}")
+}
+
+fn is_integrity_schema_violation(error: &anyhow::Error) -> bool {
+    error.to_string().contains(ERR_INTEGRITY_SCHEMA_VIOLATION)
 }
 
 fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityConfig> {
@@ -17306,7 +17323,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_integrity_config_defaults_route_scaling_for_older_payloads() {
+    fn validate_integrity_config_defaults_route_scaling_when_scaling_fields_are_omitted() {
         let config = serde_json::from_str::<IntegrityConfig>(
             r#"{
                 "host_address":"0.0.0.0:8080",
@@ -17314,11 +17331,11 @@ mod tests {
                 "guest_fuel_budget":500000000,
                 "guest_memory_limit_bytes":52428800,
                 "resource_limit_response":"Execution trapped: Resource limit exceeded",
-                "routes":[{"path":"/api/guest-example","role":"user"}]
+                "routes":[{"path":"/api/guest-example","role":"user","version":"0.0.0","dependencies":{}}]
             }"#,
         )
-        .expect("legacy payload should deserialize");
-        let config = validate_integrity_config(config).expect("legacy payload should validate");
+        .expect("payload should deserialize");
+        let config = validate_integrity_config(config).expect("payload should validate");
         let route = config
             .sealed_route("/api/guest-example")
             .expect("route should remain sealed");
@@ -17331,6 +17348,30 @@ mod tests {
         assert_eq!(route.min_instances, 0);
         assert_eq!(route.max_concurrency, DEFAULT_ROUTE_MAX_CONCURRENCY);
         assert!(route.volumes.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_INTEGRITY_SCHEMA_VIOLATION")]
+    fn verify_integrity_payload_panics_with_schema_violation_when_version_is_missing() {
+        let payload = r#"{
+            "host_address":"0.0.0.0:8080",
+            "max_stdout_bytes":65536,
+            "guest_fuel_budget":500000000,
+            "guest_memory_limit_bytes":52428800,
+            "resource_limit_response":"Execution trapped: Resource limit exceeded",
+            "routes":[{"path":"/api/guest-example","role":"user","dependencies":{}}]
+        }"#;
+        let signing_key = SigningKey::from_bytes(&[21_u8; 32]);
+        let signature = signing_key.sign(&Sha256::digest(payload.as_bytes()));
+        let error = verify_integrity_payload(
+            payload,
+            &hex::encode(signing_key.verifying_key().to_bytes()),
+            &hex::encode(signature.to_bytes()),
+            "test payload",
+        )
+        .expect_err("payload missing version should fail strict schema validation");
+
+        panic!("{error:#}");
     }
 
     #[test]
