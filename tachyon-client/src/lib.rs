@@ -80,6 +80,8 @@ struct SealedConfig {
     routes: Vec<serde_json::Value>,
     #[serde(default)]
     batch_targets: Vec<serde_json::Value>,
+    #[serde(default)]
+    resources: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +175,34 @@ pub struct MeshRouteSummary {
     pub target_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshResource {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub target: String,
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_constraint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshResourceInput {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub target: String,
+    #[serde(default)]
+    pub allowed_methods: Option<Vec<String>>,
+    #[serde(default)]
+    pub version_constraint: Option<String>,
+}
+
 fn connection_state() -> &'static RwLock<Option<InstanceConfig>> {
     CONNECTION_STATE.get_or_init(|| RwLock::new(None))
 }
@@ -238,6 +268,245 @@ pub async fn get_mesh_graph() -> Result<MeshGraphSnapshot> {
             .filter_map(batch_target_name)
             .collect(),
     })
+}
+
+const OVERLAY_FILE_NAME: &str = "tachyon.resources.json";
+
+fn overlay_path() -> PathBuf {
+    workspace_root().join(OVERLAY_FILE_NAME)
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ResourceOverlayFile {
+    #[serde(default)]
+    resources: Vec<MeshResource>,
+}
+
+async fn read_overlay_file() -> Result<ResourceOverlayFile> {
+    let path = overlay_path();
+    match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => {
+            if raw.trim().is_empty() {
+                return Ok(ResourceOverlayFile::default());
+            }
+            serde_json::from_str(&raw)
+                .with_context(|| format!("failed to parse overlay file `{}`", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ResourceOverlayFile::default())
+        }
+        Err(error) => {
+            Err(anyhow::Error::from(error).context(format!("failed to read `{}`", path.display())))
+        }
+    }
+}
+
+async fn write_overlay_file(overlay: &ResourceOverlayFile) -> Result<()> {
+    let path = overlay_path();
+    let tmp = path.with_extension("json.tmp");
+    let serialized =
+        serde_json::to_vec_pretty(overlay).context("failed to serialize resource overlay")?;
+    tokio::fs::write(&tmp, &serialized)
+        .await
+        .with_context(|| format!("failed to write overlay tmp file `{}`", tmp.display()))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .with_context(|| format!("failed to commit overlay file `{}`", path.display()))?;
+    Ok(())
+}
+
+fn parse_sealed_resource(name: &str, value: &serde_json::Value) -> Option<MeshResource> {
+    let kind = value.get("type").and_then(|v| v.as_str())?.to_owned();
+    let target = value.get("target").and_then(|v| v.as_str())?.to_owned();
+    let allowed_methods = value
+        .get("allowed_methods")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let version_constraint = value
+        .get("version_constraint")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    Some(MeshResource {
+        name: name.to_owned(),
+        kind,
+        target,
+        pending: false,
+        allowed_methods,
+        version_constraint,
+    })
+}
+
+fn validate_resource_input(input: &MeshResourceInput) -> Result<MeshResource> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        anyhow::bail!("resource name must not be empty");
+    }
+    let kind = input.kind.trim().to_lowercase();
+    if kind != "internal" && kind != "external" {
+        anyhow::bail!("resource type must be either `internal` or `external`");
+    }
+    let target = input.target.trim();
+    if target.is_empty() {
+        anyhow::bail!("resource target must not be empty");
+    }
+
+    let mut allowed_methods: Vec<String> = Vec::new();
+    let mut version_constraint: Option<String> = None;
+
+    if kind == "external" {
+        validate_external_target(name, target)?;
+        if let Some(methods) = input.allowed_methods.clone() {
+            for method in methods {
+                let upper = method.trim().to_ascii_uppercase();
+                if upper.is_empty() {
+                    anyhow::bail!("external resource `{name}` must not declare empty HTTP methods");
+                }
+                if !upper
+                    .chars()
+                    .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+                {
+                    anyhow::bail!(
+                        "external resource `{name}` has an invalid HTTP method `{upper}`"
+                    );
+                }
+                if !allowed_methods.contains(&upper) {
+                    allowed_methods.push(upper);
+                }
+            }
+        }
+    } else if let Some(constraint) = input.version_constraint.clone() {
+        let trimmed = constraint.trim();
+        if !trimmed.is_empty() {
+            version_constraint = Some(trimmed.to_owned());
+        }
+    }
+
+    Ok(MeshResource {
+        name: name.to_owned(),
+        kind,
+        target: target.to_owned(),
+        pending: true,
+        allowed_methods,
+        version_constraint,
+    })
+}
+
+fn validate_external_target(name: &str, target: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(target.trim())
+        .with_context(|| format!("external resource `{name}` target is not a valid URL"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("external resource `{name}` target must include a host"))?;
+
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+
+    let host_lower = host.to_ascii_lowercase();
+    let loopback_http = parsed.scheme() == "http"
+        && (host_lower == "localhost"
+            || host_lower
+                .parse::<IpAddr>()
+                .ok()
+                .is_some_and(|ip| ip.is_loopback()));
+    let cluster_local_http =
+        parsed.scheme() == "http" && is_cluster_local_service_host(&host_lower);
+
+    if !loopback_http && !cluster_local_http {
+        anyhow::bail!(
+            "external resource `{name}` target must use HTTPS unless it points at localhost or a cluster-local *.svc service"
+        );
+    }
+    Ok(())
+}
+
+fn is_cluster_local_service_host(host: &str) -> bool {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    !normalized.is_empty()
+        && normalized != "localhost"
+        && (!normalized.contains('.')
+            || normalized.ends_with(".svc")
+            || normalized.ends_with(".svc.cluster.local"))
+}
+
+pub async fn read_resources() -> Result<Vec<MeshResource>> {
+    let mut by_name: std::collections::BTreeMap<String, MeshResource> =
+        std::collections::BTreeMap::new();
+
+    let lockfile_path = workspace_root().join("integrity.lock");
+    match tokio::fs::read_to_string(&lockfile_path).await {
+        Ok(raw_lockfile) => {
+            let manifest: IntegrityManifest = serde_json::from_str(&raw_lockfile)
+                .context("failed to parse integrity.lock manifest")?;
+            let sealed: SealedConfig = serde_json::from_str(&manifest.config_payload)
+                .context("failed to parse sealed config payload")?;
+            for (name, value) in sealed.resources {
+                if let Some(resource) = parse_sealed_resource(&name, &value) {
+                    by_name.insert(name, resource);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Lockfile missing on a fresh workspace — overlay alone is enough to render.
+        }
+        Err(error) => {
+            return Err(anyhow::Error::from(error)
+                .context(format!("failed to read {}", lockfile_path.display())));
+        }
+    }
+
+    let overlay = read_overlay_file().await?;
+    for entry in overlay.resources {
+        by_name.insert(
+            entry.name.clone(),
+            MeshResource {
+                pending: true,
+                ..entry
+            },
+        );
+    }
+
+    Ok(by_name.into_values().collect())
+}
+
+pub async fn upsert_overlay_resource(input: MeshResourceInput) -> Result<MeshResource> {
+    let resource = validate_resource_input(&input)?;
+    let mut overlay = read_overlay_file().await?;
+    if let Some(existing) = overlay
+        .resources
+        .iter_mut()
+        .find(|entry| entry.name == resource.name)
+    {
+        *existing = resource.clone();
+    } else {
+        overlay.resources.push(resource.clone());
+    }
+    overlay.resources.sort_by(|a, b| a.name.cmp(&b.name));
+    write_overlay_file(&overlay).await?;
+    Ok(resource)
+}
+
+pub async fn remove_overlay_resource(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("resource name must not be empty");
+    }
+    let mut overlay = read_overlay_file().await?;
+    let original_len = overlay.resources.len();
+    overlay.resources.retain(|entry| entry.name != trimmed);
+    if overlay.resources.len() == original_len {
+        anyhow::bail!(
+            "resource `{trimmed}` is not in the workspace overlay; sealed entries require a CLI re-seal of integrity.lock to remove"
+        );
+    }
+    write_overlay_file(&overlay).await?;
+    Ok(())
 }
 
 pub async fn set_connection(
@@ -939,5 +1208,82 @@ mod tests {
         let batch_target = json!({ "name": "gc-job" });
 
         assert_eq!(batch_target_name(&batch_target), Some("gc-job".to_owned()));
+    }
+
+    #[test]
+    fn parse_sealed_external_resource() {
+        let value = json!({
+            "type": "external",
+            "target": "https://api.example.com",
+            "allowed_methods": ["GET", "POST"],
+        });
+        let resource = parse_sealed_resource("example", &value).expect("resource should parse");
+        assert_eq!(resource.name, "example");
+        assert_eq!(resource.kind, "external");
+        assert_eq!(resource.target, "https://api.example.com");
+        assert_eq!(resource.allowed_methods, vec!["GET", "POST"]);
+        assert!(!resource.pending);
+        assert!(resource.version_constraint.is_none());
+    }
+
+    #[test]
+    fn parse_sealed_internal_resource() {
+        let value = json!({
+            "type": "internal",
+            "target": "wasm://local",
+            "version_constraint": "^1.0",
+        });
+        let resource = parse_sealed_resource("local", &value).expect("resource should parse");
+        assert_eq!(resource.kind, "internal");
+        assert_eq!(resource.version_constraint.as_deref(), Some("^1.0"));
+        assert!(resource.allowed_methods.is_empty());
+    }
+
+    #[test]
+    fn validate_external_target_rejects_plain_http() {
+        let result = validate_external_target("github", "http://api.github.com");
+        assert!(result.is_err(), "plain http public hosts must be rejected");
+    }
+
+    #[test]
+    fn validate_external_target_accepts_https() {
+        validate_external_target("github", "https://api.github.com").expect("https accepted");
+    }
+
+    #[test]
+    fn validate_external_target_accepts_localhost_http() {
+        validate_external_target("local", "http://localhost:9000").expect("loopback accepted");
+    }
+
+    #[test]
+    fn validate_external_target_accepts_cluster_local_http() {
+        validate_external_target("svc", "http://my-svc.namespace.svc.cluster.local")
+            .expect("cluster-local accepted");
+    }
+
+    #[test]
+    fn validate_resource_input_rejects_empty_name() {
+        let input = MeshResourceInput {
+            name: "  ".to_owned(),
+            kind: "external".to_owned(),
+            target: "https://api.example.com".to_owned(),
+            allowed_methods: None,
+            version_constraint: None,
+        };
+        assert!(validate_resource_input(&input).is_err());
+    }
+
+    #[test]
+    fn validate_resource_input_normalizes_methods() {
+        let input = MeshResourceInput {
+            name: "stripe".to_owned(),
+            kind: "external".to_owned(),
+            target: "https://api.stripe.com".to_owned(),
+            allowed_methods: Some(vec!["get".to_owned(), "POST".to_owned(), "get".to_owned()]),
+            version_constraint: None,
+        };
+        let resource = validate_resource_input(&input).expect("input is valid");
+        assert_eq!(resource.allowed_methods, vec!["GET", "POST"]);
+        assert!(resource.pending);
     }
 }

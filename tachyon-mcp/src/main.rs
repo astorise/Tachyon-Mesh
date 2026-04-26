@@ -86,6 +86,36 @@ async fn handle_line(line: &str) -> Result<Option<Value>> {
                         "type": "object",
                         "properties": {}
                     }
+                },
+                {
+                    "name": "tachyon_list_resources",
+                    "description": "List logical mesh resources (sealed in integrity.lock plus pending overlay entries) so an AI can discover existing internal IPC aliases and external HTTPS egress targets.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "tachyon_register_resource",
+                    "description": "Register a new mesh resource into the workspace overlay (tachyon.resources.json). The entry is persisted as `pending` and requires a CLI re-seal to take effect inside integrity.lock.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["name", "type", "target"],
+                        "properties": {
+                            "name": { "type": "string", "description": "Logical alias used inside the mesh, e.g. `stripe-api`." },
+                            "type": { "type": "string", "enum": ["internal", "external"] },
+                            "target": { "type": "string", "description": "For external: HTTPS URL (or http:// for loopback / *.svc cluster-local). For internal: IPC URI like `wasm://module`." },
+                            "allowedMethods": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "External-only: list of allowed HTTP methods such as [\"GET\", \"POST\"]."
+                            },
+                            "versionConstraint": {
+                                "type": "string",
+                                "description": "Internal-only: semver constraint such as `^1.2.0`."
+                            }
+                        }
+                    }
                 }
             ]
         }),
@@ -132,6 +162,41 @@ async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
                     {
                         "type": "text",
                         "text": lockfile
+                    }
+                ]
+            }))
+        }
+        "tachyon_list_resources" => {
+            let resources = tachyon_client::read_resources().await?;
+            let body =
+                serde_json::to_string_pretty(&resources).context("failed to encode resources")?;
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": body
+                    }
+                ]
+            }))
+        }
+        "tachyon_register_resource" => {
+            let arguments = params
+                .and_then(|value| value.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let input: tachyon_client::MeshResourceInput =
+                serde_json::from_value(arguments).context("invalid resource input payload")?;
+            let resource = tachyon_client::upsert_overlay_resource(input).await?;
+            let body = serde_json::to_string_pretty(&resource)
+                .context("failed to encode registered resource")?;
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": format!(
+                            "Registered `{name}` in workspace overlay. Pending CLI re-seal of integrity.lock to take effect.\n\n{body}",
+                            name = resource.name,
+                        )
                     }
                 ]
             }))

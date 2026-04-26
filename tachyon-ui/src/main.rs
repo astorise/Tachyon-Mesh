@@ -179,6 +179,29 @@ async fn push_large_model(app: tauri::AppHandle, path: String) -> Result<String,
     .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn get_resources() -> Result<Vec<tachyon_client::MeshResource>, String> {
+    tachyon_client::read_resources()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn save_resource(
+    resource: tachyon_client::MeshResourceInput,
+) -> Result<tachyon_client::MeshResource, String> {
+    tachyon_client::upsert_overlay_resource(resource)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_resource(name: String) -> Result<(), String> {
+    tachyon_client::remove_overlay_resource(&name)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -195,7 +218,10 @@ fn main() {
             regenerate_account_security,
             generate_pat,
             push_asset,
-            push_large_model
+            push_large_model,
+            get_resources,
+            save_resource,
+            delete_resource
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

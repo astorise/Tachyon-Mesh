@@ -6,7 +6,26 @@ import QRCode from "qrcode";
 const configuredNodeUrl = (import.meta.env.VITE_TACHYON_NODE_URL ?? "").trim();
 const configuredNodeToken = (import.meta.env.VITE_TACHYON_NODE_TOKEN ?? "").trim();
 
-type ViewName = "dashboard" | "topology" | "registry" | "identity" | "account" | "broker";
+type ViewName = "dashboard" | "topology" | "registry" | "identity" | "account" | "resources" | "broker";
+
+type MeshResourceKind = "internal" | "external";
+
+type MeshResource = {
+  name: string;
+  type: MeshResourceKind;
+  target: string;
+  pending: boolean;
+  allowedMethods?: string[];
+  versionConstraint?: string;
+};
+
+type MeshResourceInput = {
+  name: string;
+  type: MeshResourceKind;
+  target: string;
+  allowedMethods?: string[];
+  versionConstraint?: string;
+};
 
 type AuthLoginResponse = {
   username: string;
@@ -80,6 +99,8 @@ document.addEventListener("DOMContentLoaded", () => {
   const signupLastName = document.getElementById("signup-last-name") as HTMLInputElement | null;
   const signupUsername = document.getElementById("signup-username") as HTMLInputElement | null;
   const signupPassword = document.getElementById("signup-password") as HTMLInputElement | null;
+  const signupConfirmPassword = document.getElementById("signup-confirm-password") as HTMLInputElement | null;
+  const signupPasswordError = document.getElementById("signup-password-error");
   const signupProfileBackBtn = document.getElementById("btn-signup-profile-back") as HTMLButtonElement | null;
   const signupProfileSubmitBtn = document.getElementById("btn-signup-profile-submit") as HTMLButtonElement | null;
   const signupTokenSubject = document.getElementById("signup-token-subject");
@@ -131,6 +152,29 @@ document.addEventListener("DOMContentLoaded", () => {
   const patResult = document.getElementById("pat-result");
   const regen2faBtn = document.getElementById("btn-regen-2fa") as HTMLButtonElement | null;
   const accountSecurityResult = document.getElementById("account-security-result");
+  const resourceTableBody = document.getElementById("resource-table-body");
+  const resourceEmptyState = document.getElementById("resource-empty-state");
+  const resourceActionResult = document.getElementById("resource-action-result");
+  const resourceSearchInput = document.getElementById("resource-search") as HTMLInputElement | null;
+  const resourceFilterButtons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>(".resource-filter[data-resource-filter]"),
+  );
+  const refreshResourcesBtn = document.getElementById("btn-refresh-resources") as HTMLButtonElement | null;
+  const addResourceBtn = document.getElementById("btn-add-resource") as HTMLButtonElement | null;
+  const resourceEditorModal = document.getElementById("resource-editor-modal");
+  const resourceEditorTitle = document.getElementById("resource-editor-title");
+  const resourceNameInput = document.getElementById("resource-name") as HTMLInputElement | null;
+  const resourceTargetInput = document.getElementById("resource-target") as HTMLInputElement | null;
+  const resourceAllowedMethodsInput = document.getElementById("resource-allowed-methods") as HTMLInputElement | null;
+  const resourceVersionConstraintInput = document.getElementById("resource-version-constraint") as HTMLInputElement | null;
+  const resourceExternalExtra = document.getElementById("resource-external-extra");
+  const resourceInternalExtra = document.getElementById("resource-internal-extra");
+  const resourceEditorError = document.getElementById("resource-editor-error");
+  const resourceCancelBtn = document.getElementById("btn-resource-cancel") as HTMLButtonElement | null;
+  const resourceSaveBtn = document.getElementById("btn-resource-save") as HTMLButtonElement | null;
+  const resourceTypeRadios = Array.from(
+    document.querySelectorAll<HTMLInputElement>("input[name='resource-type']"),
+  );
 
   let downloadedRecoveryCodes = false;
   let recoveryCodes: string[] = [];
@@ -141,6 +185,10 @@ document.addEventListener("DOMContentLoaded", () => {
   let activeAuthStep: "login" | "mfa" | "signup-token" | "signup-profile" | "signup-totp" = "login";
   let signupClaims: RegistrationTokenClaims | null = null;
   let stagedSignup: StagedSignupSession | null = null;
+  let meshResources: MeshResource[] = [];
+  let resourceFilter: "all" | MeshResourceKind = "all";
+  let resourceEditorMode: "create" | "edit" = "create";
+  let resourceEditorOriginalName: string | null = null;
 
   const viewPanels: Record<ViewName, HTMLElement | null> = {
     dashboard: document.getElementById("view-dashboard"),
@@ -148,6 +196,7 @@ document.addEventListener("DOMContentLoaded", () => {
     registry: document.getElementById("view-registry"),
     identity: document.getElementById("view-identity"),
     account: document.getElementById("view-account"),
+    resources: document.getElementById("view-resources"),
     broker: document.getElementById("view-broker"),
   };
 
@@ -175,6 +224,10 @@ document.addEventListener("DOMContentLoaded", () => {
     broker: {
       title: "Model Broker",
       subtitle: "Stream large model artifacts into disk-backed storage without RAM spikes.",
+    },
+    resources: {
+      title: "Resource Catalog",
+      subtitle: "Visualize and edit logical mesh resources (internal IPC aliases and external HTTPS targets).",
     },
   };
 
@@ -285,6 +338,93 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
+  const formatUsername = (first: string, last: string): string => {
+    const stripDiacritics = (value: string) =>
+      value
+        .normalize("NFD")
+        .replace(/[̀-ͯ]/g, "")
+        .toLowerCase();
+    const sanitize = (value: string) =>
+      stripDiacritics(value)
+        .replace(/\s+/g, ".")
+        .replace(/[^a-z0-9._-]/g, "");
+    const a = sanitize(first);
+    const b = sanitize(last);
+    if (!a && !b) {
+      return "";
+    }
+    if (!a) {
+      return b;
+    }
+    if (!b) {
+      return a;
+    }
+    return `${a}.${b}`;
+  };
+
+  const recomputeSignupUsername = () => {
+    if (!signupUsername) {
+      return;
+    }
+    const computed = formatUsername(
+      signupFirstName?.value ?? "",
+      signupLastName?.value ?? "",
+    );
+    signupUsername.value = computed;
+  };
+
+  const refreshSignupValidation = () => {
+    if (!signupProfileSubmitBtn) {
+      return;
+    }
+    const password = signupPassword?.value ?? "";
+    const confirm = signupConfirmPassword?.value ?? "";
+    const username = signupUsername?.value ?? "";
+    const tooShort = password.length > 0 && password.length < 8;
+    const mismatched = password.length > 0 && confirm.length > 0 && password !== confirm;
+
+    if (signupPasswordError) {
+      if (tooShort) {
+        signupPasswordError.textContent = "Password must be at least 8 characters.";
+        signupPasswordError.classList.remove("hidden");
+      } else if (mismatched) {
+        signupPasswordError.textContent = "Passwords do not match.";
+        signupPasswordError.classList.remove("hidden");
+      } else {
+        signupPasswordError.textContent = "";
+        signupPasswordError.classList.add("hidden");
+      }
+    }
+
+    const ready =
+      username.length > 0 &&
+      password.length >= 8 &&
+      password === confirm;
+    signupProfileSubmitBtn.disabled = !ready;
+  };
+
+  const togglePasswordVisibility = (button: HTMLElement) => {
+    const targetId = button.dataset.passwordToggle;
+    if (!targetId) {
+      return;
+    }
+    const input = document.getElementById(targetId) as HTMLInputElement | null;
+    if (!input) {
+      return;
+    }
+    const eye = button.querySelector<SVGElement>(".password-eye");
+    const eyeOff = button.querySelector<SVGElement>(".password-eye-off");
+    if (input.type === "password") {
+      input.type = "text";
+      eye?.classList.add("hidden");
+      eyeOff?.classList.remove("hidden");
+    } else {
+      input.type = "password";
+      eye?.classList.remove("hidden");
+      eyeOff?.classList.add("hidden");
+    }
+  };
+
   const switchAuthStep = async (
     nextStep: "login" | "mfa" | "signup-token" | "signup-profile" | "signup-totp",
   ) => {
@@ -329,14 +469,22 @@ document.addEventListener("DOMContentLoaded", () => {
       signupLastName.value = "";
     }
     if (signupUsername) {
-      signupUsername.value = authUsername?.value.trim() || "";
+      signupUsername.value = "";
     }
     if (signupPassword) {
       signupPassword.value = "";
     }
+    if (signupConfirmPassword) {
+      signupConfirmPassword.value = "";
+    }
+    if (signupPasswordError) {
+      signupPasswordError.classList.add("hidden");
+      signupPasswordError.textContent = "";
+    }
     if (signupTotpCode) {
       signupTotpCode.value = "";
     }
+    refreshSignupValidation();
     if (signupTokenSubject) {
       signupTokenSubject.textContent = "Awaiting token validation";
     }
@@ -549,6 +697,244 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
+  const escapeHtml = (value: string): string =>
+    value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+  const showResourceActionResult = (message: string, tone: "ok" | "err" | "info" = "info") => {
+    if (!resourceActionResult) {
+      return;
+    }
+    const palette =
+      tone === "ok"
+        ? "border-emerald-500/30 text-emerald-300"
+        : tone === "err"
+          ? "border-red-500/30 text-red-400"
+          : "border-slate-700 text-slate-300";
+    resourceActionResult.className = `mt-4 p-3 bg-slate-900 border ${palette} font-mono text-xs whitespace-pre-wrap break-words rounded-lg`;
+    resourceActionResult.textContent = message;
+    resourceActionResult.classList.remove("hidden");
+  };
+
+  const renderResourceCatalog = () => {
+    if (!resourceTableBody) {
+      return;
+    }
+    const search = (resourceSearchInput?.value ?? "").trim().toLowerCase();
+    const rows = meshResources.filter((resource) => {
+      if (resourceFilter !== "all" && resource.type !== resourceFilter) {
+        return false;
+      }
+      if (!search) {
+        return true;
+      }
+      return (
+        resource.name.toLowerCase().includes(search) ||
+        resource.target.toLowerCase().includes(search)
+      );
+    });
+
+    if (rows.length === 0) {
+      resourceTableBody.innerHTML = "";
+      resourceEmptyState?.classList.remove("hidden");
+      return;
+    }
+    resourceEmptyState?.classList.add("hidden");
+
+    resourceTableBody.innerHTML = rows
+      .map((resource) => {
+        const typePalette =
+          resource.type === "internal"
+            ? "border-cyan-500/30 bg-cyan-500/10 text-cyan-300"
+            : "border-blue-500/30 bg-blue-500/10 text-blue-300";
+        const pendingBadge = resource.pending
+          ? `<span title="Requires CLI re-seal of integrity.lock to take effect" class="ml-2 inline-flex items-center rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">Pending seal</span>`
+          : "";
+        const detail =
+          resource.type === "external"
+            ? `Methods: ${(resource.allowedMethods ?? []).join(", ") || "any"}`
+            : resource.versionConstraint
+              ? `Version: ${escapeHtml(resource.versionConstraint)}`
+              : "—";
+        const safeName = escapeHtml(resource.name);
+        return `
+          <tr class="resource-row hover:bg-slate-900/70 transition-colors">
+            <td class="px-4 py-3 font-mono text-cyan-200">${safeName}${pendingBadge}</td>
+            <td class="px-4 py-3"><span class="inline-flex rounded-full border ${typePalette} px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider">${resource.type}</span></td>
+            <td class="px-4 py-3 font-mono text-slate-300 break-all">${escapeHtml(resource.target)}</td>
+            <td class="px-4 py-3 text-slate-400">${detail}</td>
+            <td class="px-4 py-3 text-right">
+              <button data-action="resource-edit" data-name="${safeName}" class="text-xs font-medium uppercase tracking-wider text-slate-400 hover:text-cyan-300 transition-colors mr-3">Edit</button>
+              <button data-action="resource-delete" data-name="${safeName}" class="text-xs font-medium uppercase tracking-wider text-red-400 hover:text-red-300 transition-colors">Delete</button>
+            </td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    gsap.from(".resource-row", {
+      autoAlpha: 0,
+      y: 8,
+      duration: 0.25,
+      stagger: 0.04,
+      ease: "power2.out",
+    });
+  };
+
+  const loadResources = async () => {
+    try {
+      const data = await invoke<MeshResource[]>("get_resources");
+      meshResources = (data ?? []).map((entry) => ({
+        ...entry,
+        allowedMethods: entry.allowedMethods ?? [],
+      }));
+      renderResourceCatalog();
+    } catch (error) {
+      console.error("Resource catalog load error:", error);
+      meshResources = [];
+      renderResourceCatalog();
+      showResourceActionResult(String(error), "err");
+    }
+  };
+
+  const updateResourceEditorTypeUI = () => {
+    const selected = resourceTypeRadios.find((radio) => radio.checked)?.value ?? "external";
+    if (selected === "external") {
+      resourceExternalExtra?.classList.remove("hidden");
+      resourceInternalExtra?.classList.add("hidden");
+    } else {
+      resourceExternalExtra?.classList.add("hidden");
+      resourceInternalExtra?.classList.remove("hidden");
+    }
+  };
+
+  const openResourceEditor = (resource: MeshResource | null) => {
+    if (!resourceEditorModal) {
+      return;
+    }
+    resourceEditorMode = resource ? "edit" : "create";
+    resourceEditorOriginalName = resource?.name ?? null;
+    if (resourceEditorTitle) {
+      resourceEditorTitle.textContent = resource ? `Edit ${resource.name}` : "Add Mesh Resource";
+    }
+    if (resourceNameInput) {
+      resourceNameInput.value = resource?.name ?? "";
+      resourceNameInput.disabled = Boolean(resource);
+    }
+    if (resourceTargetInput) {
+      resourceTargetInput.value = resource?.target ?? "";
+    }
+    if (resourceAllowedMethodsInput) {
+      resourceAllowedMethodsInput.value = (resource?.allowedMethods ?? []).join(", ");
+    }
+    if (resourceVersionConstraintInput) {
+      resourceVersionConstraintInput.value = resource?.versionConstraint ?? "";
+    }
+    resourceTypeRadios.forEach((radio) => {
+      radio.checked = radio.value === (resource?.type ?? "external");
+    });
+    if (resourceEditorError) {
+      resourceEditorError.classList.add("hidden");
+      resourceEditorError.textContent = "";
+    }
+    updateResourceEditorTypeUI();
+    resourceEditorModal.classList.remove("hidden");
+    gsap.fromTo(
+      resourceEditorModal,
+      { autoAlpha: 0 },
+      { autoAlpha: 1, duration: 0.18, ease: "power2.out" },
+    );
+  };
+
+  const closeResourceEditor = () => {
+    if (!resourceEditorModal) {
+      return;
+    }
+    resourceEditorModal.classList.add("hidden");
+    gsap.set(resourceEditorModal, { clearProps: "all" });
+  };
+
+  const saveResource = async () => {
+    if (!resourceNameInput || !resourceTargetInput || !resourceSaveBtn) {
+      return;
+    }
+    const name = resourceNameInput.value.trim();
+    const target = resourceTargetInput.value.trim();
+    const type = (resourceTypeRadios.find((radio) => radio.checked)?.value ?? "external") as MeshResourceKind;
+    const allowedMethods =
+      type === "external"
+        ? (resourceAllowedMethodsInput?.value ?? "")
+            .split(",")
+            .map((value) => value.trim().toUpperCase())
+            .filter(Boolean)
+        : undefined;
+    const versionConstraint =
+      type === "internal" ? resourceVersionConstraintInput?.value.trim() || undefined : undefined;
+
+    if (!name) {
+      if (resourceEditorError) {
+        resourceEditorError.textContent = "Resource name must not be empty.";
+        resourceEditorError.classList.remove("hidden");
+      }
+      return;
+    }
+    if (!target) {
+      if (resourceEditorError) {
+        resourceEditorError.textContent = "Target must not be empty.";
+        resourceEditorError.classList.remove("hidden");
+      }
+      return;
+    }
+    if (type === "external" && !/^https:\/\//i.test(target) && !/\.svc(\.cluster\.local)?(:|$|\/)/i.test(target)) {
+      if (resourceEditorError) {
+        resourceEditorError.textContent = "External target must be an HTTPS URL or a cluster-local *.svc address.";
+        resourceEditorError.classList.remove("hidden");
+      }
+      return;
+    }
+
+    resourceSaveBtn.disabled = true;
+    resourceSaveBtn.textContent = "Saving...";
+    try {
+      const payload: MeshResourceInput = { name, type, target, allowedMethods, versionConstraint };
+      await invoke("save_resource", { resource: payload });
+      closeResourceEditor();
+      showResourceActionResult(
+        `Saved ${name} (pending CLI re-seal to promote into integrity.lock).`,
+        "ok",
+      );
+      await loadResources();
+    } catch (error) {
+      console.error("Resource save error:", error);
+      if (resourceEditorError) {
+        resourceEditorError.textContent = String(error);
+        resourceEditorError.classList.remove("hidden");
+      }
+    } finally {
+      resourceSaveBtn.disabled = false;
+      resourceSaveBtn.textContent = "Save";
+      resourceEditorOriginalName = null;
+    }
+  };
+
+  const deleteResource = async (name: string) => {
+    if (!confirm(`Delete resource "${name}"? Sealed entries cannot be removed without a CLI re-seal.`)) {
+      return;
+    }
+    try {
+      await invoke("delete_resource", { name });
+      showResourceActionResult(`Removed ${name} from the workspace overlay.`, "ok");
+      await loadResources();
+    } catch (error) {
+      console.error("Resource delete error:", error);
+      showResourceActionResult(String(error), "err");
+    }
+  };
+
   const renderAccountMessage = (target: HTMLElement | null, message: string, className: string) => {
     if (!target) {
       return;
@@ -698,6 +1084,9 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     if (view === "account") {
       renderAccountView();
+    }
+    if (view === "resources") {
+      void loadResources();
     }
   };
 
@@ -879,9 +1268,7 @@ document.addEventListener("DOMContentLoaded", () => {
         },
       });
       signupClaims = claims;
-      if (signupUsername && !signupUsername.value.trim()) {
-        signupUsername.value = authUsername?.value.trim() || "";
-      }
+      recomputeSignupUsername();
       renderSignupClaims(claims);
       await switchAuthStep("signup-profile");
     } catch (error) {
@@ -1055,6 +1442,35 @@ document.addEventListener("DOMContentLoaded", () => {
       event.preventDefault();
       void stageSignupAccount();
     }
+  });
+
+  signupConfirmPassword?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void stageSignupAccount();
+    }
+  });
+
+  signupFirstName?.addEventListener("input", () => {
+    recomputeSignupUsername();
+    refreshSignupValidation();
+  });
+  signupLastName?.addEventListener("input", () => {
+    recomputeSignupUsername();
+    refreshSignupValidation();
+  });
+  signupPassword?.addEventListener("input", () => {
+    refreshSignupValidation();
+  });
+  signupConfirmPassword?.addEventListener("input", () => {
+    refreshSignupValidation();
+  });
+
+  document.querySelectorAll<HTMLButtonElement>(".password-toggle").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      togglePasswordVisibility(button);
+    });
   });
 
   signupTotpCode?.addEventListener("keydown", (event) => {
@@ -1364,6 +1780,61 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  refreshResourcesBtn?.addEventListener("click", () => {
+    void loadResources();
+  });
+
+  addResourceBtn?.addEventListener("click", () => {
+    openResourceEditor(null);
+  });
+
+  resourceCancelBtn?.addEventListener("click", () => {
+    closeResourceEditor();
+  });
+
+  resourceSaveBtn?.addEventListener("click", () => {
+    void saveResource();
+  });
+
+  resourceTypeRadios.forEach((radio) => {
+    radio.addEventListener("change", updateResourceEditorTypeUI);
+  });
+
+  resourceSearchInput?.addEventListener("input", () => {
+    renderResourceCatalog();
+  });
+
+  resourceFilterButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const value = (button.dataset.resourceFilter ?? "all") as "all" | MeshResourceKind;
+      resourceFilter = value;
+      resourceFilterButtons.forEach((other) => {
+        const active = other === button;
+        other.classList.toggle("border-cyan-500/40", active);
+        other.classList.toggle("bg-cyan-500/10", active);
+        other.classList.toggle("text-cyan-300", active);
+        other.classList.toggle("border-slate-700", !active);
+        other.classList.toggle("text-slate-400", !active);
+      });
+      renderResourceCatalog();
+    });
+  });
+
+  resourceTableBody?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement | null;
+    const action = target?.dataset.action;
+    const name = target?.dataset.name;
+    if (!action || !name) {
+      return;
+    }
+    if (action === "resource-edit") {
+      const resource = meshResources.find((entry) => entry.name === name) ?? null;
+      openResourceEditor(resource);
+    } else if (action === "resource-delete") {
+      void deleteResource(name);
+    }
+  });
+
   refreshBtn?.addEventListener("click", async () => {
     gsap.fromTo(refreshBtn, { scale: 0.95 }, { scale: 1, duration: 0.2, ease: "bounce.out" });
 
@@ -1394,9 +1865,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   authUsername?.addEventListener("input", () => {
     activeOperator = authUsername.value.trim() || "admin";
-    if (signupUsername && !signupUsername.value.trim()) {
-      signupUsername.value = activeOperator;
-    }
     renderIdentityView();
   });
 
@@ -1419,6 +1887,7 @@ document.addEventListener("DOMContentLoaded", () => {
     registry: "view-registry",
     identity: "view-identity",
     account: "view-account",
+    resources: "view-resources",
     broker: "view-broker",
   });
 });
