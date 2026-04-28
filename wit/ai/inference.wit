@@ -1,0 +1,31 @@
+package tachyon:mesh;
+
+/// Inference interface that accepts an optional per-call LoRA adapter. The default
+/// path (no adapter) matches the existing inference behaviour exactly.
+interface inference {
+    record inference-request {
+        /// Foundation model alias as declared in the route's `models`.
+        model: string,
+        /// Tokenised or text-mode prompt; encoding is up to the model.
+        prompt: list<u8>,
+        /// Optional tenant-specific LoRA adapter to overlay on top of the foundation
+        /// model for this single call. When `none`, the foundation model is used as-is.
+        adapter-id: option<string>,
+        /// Maximum tokens to generate.
+        max-tokens: u32,
+        /// Sampling temperature (0.0-2.0).
+        temperature: f32,
+    }
+
+    record inference-response {
+        output: list<u8>,
+        prompt-tokens: u32,
+        completion-tokens: u32,
+        /// Total accelerator-side fuel consumed (host stamps this for metering).
+        fuel-consumed: u64,
+    }
+
+    /// Run a single inference call. The host honours `adapter-id` by hot-applying the
+    /// adapter weights via Candle, then removing the overlay before returning.
+    infer: func(req: inference-request) -> result<inference-response, string>;
+}
