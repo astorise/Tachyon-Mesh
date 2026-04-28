@@ -34,9 +34,7 @@ pub(super) struct BoundedRateLimiter {
 impl BoundedRateLimiter {
     fn new(quota: Quota, max_entries: u64) -> Self {
         Self {
-            cache: Cache::builder()
-                .max_capacity(max_entries)
-                .build(),
+            cache: Cache::builder().max_capacity(max_entries).build(),
             quota,
         }
     }

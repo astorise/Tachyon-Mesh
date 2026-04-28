@@ -89,9 +89,8 @@ fn build_quinn_server_config(
     let mut tls_config = config.clone();
     tls_config.max_early_data_size = u32::MAX;
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
-    let mut server = quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(tls_config)?,
-    ));
+    let mut server =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
@@ -163,8 +162,7 @@ async fn handle_http3_request(
     // host's memory footprint independent of the inbound body size — chunks flow
     // through a small bounded channel rather than being concatenated into RAM.
     let (send, recv) = stream.split();
-    let (chunk_tx, chunk_rx) =
-        tokio::sync::mpsc::channel::<io::Result<Bytes>>(BODY_CHANNEL_DEPTH);
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(BODY_CHANNEL_DEPTH);
 
     tokio::spawn(pump_request_body(recv, chunk_tx));
 
