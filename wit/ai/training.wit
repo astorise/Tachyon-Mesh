@@ -1,0 +1,56 @@
+package tachyon:mesh;
+
+/// Submission interface for asynchronous on-Edge LoRA fine-tuning. The host enqueues
+/// jobs into the low-priority lane of `system-faas-buffer` so the inference critical
+/// path's latency budget is unaffected.
+interface training {
+    /// Adapter rank — keep small (4-32) on Edge nodes.
+    type rank = u32;
+
+    /// Maximum optimisation steps before the trainer must hand back the GPU.
+    type step-budget = u32;
+
+    record dataset-handle {
+        /// Local volume reference — guests don't hand the host raw bytes.
+        volume-alias: string,
+        /// Path inside the volume.
+        path: string,
+        /// Optional split spec (e.g. "train[:90%]").
+        split: option<string>,
+    }
+
+    record training-job {
+        /// Foundation model alias as declared in the route's `models`.
+        base-model: string,
+        /// Where to read training samples from.
+        dataset: dataset-handle,
+        /// LoRA rank.
+        rank: rank,
+        /// Hard upper bound on optimisation steps.
+        max-steps: step-budget,
+        /// Deterministic seed (optional).
+        seed: option<u64>,
+    }
+
+    /// Returned to the guest immediately on submission.
+    record job-id {
+        value: string,
+    }
+
+    variant job-status {
+        /// Queued in the low-priority lane.
+        queued,
+        /// Running; reports current step and total.
+        running(tuple<u32, u32>),
+        /// Completed; carries the broker path of the resulting `.safetensors`.
+        completed(string),
+        /// Failed; carries a human-readable message.
+        failed(string),
+    }
+
+    /// Submit a fine-tuning job. Always non-blocking.
+    submit-training-job: func(job: training-job) -> result<job-id, string>;
+
+    /// Poll the status of a job. Cheap; safe to call from the inference path.
+    get-training-status: func(id: job-id) -> result<job-status, string>;
+}

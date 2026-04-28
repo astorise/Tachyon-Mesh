@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -12,6 +12,21 @@ const TLS_CERTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tls_
 const HIBERNATION_STATE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("hibernation_state");
 const DATA_EVENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("data_events");
+/// Per-tenant HNSW vector index blobs. Key: `<tenant>/<index-name>`.
+const VECTOR_INDICES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vector_indices");
+/// Out-of-band AuthZ cache invalidation events. Producer: `system-faas-authz`.
+/// Consumer: the `core-host` background subscriber that evicts the in-process
+/// RBAC cache. Key: monotonic event id (zero-padded so range scans are ordered).
+const AUTHZ_PURGE_OUTBOX_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("authz_purge_outbox");
+/// Edge-to-cloud Change Data Capture outbox. Producer: the host's storage write
+/// path for resources flagged `sync_to_cloud: true`. Consumer: `system-faas-cdc`.
+/// Key: monotonic event id.
+const DATA_MUTATION_OUTBOX_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("data_mutation_outbox");
+/// Out-of-band fuel-metering events emitted post-execution. Producer: `core-host`.
+/// Consumer: `system-faas-metering`. Key: monotonic event id.
+const METERING_OUTBOX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metering_outbox");
 
 #[derive(Clone)]
 pub(crate) struct CoreStore {
@@ -24,6 +39,16 @@ pub(crate) enum CoreStoreBucket {
     TlsCerts,
     HibernationState,
     DataEvents,
+    // Wired by follow-up changes (HNSW vector RAG / authz cache invalidation /
+    // edge-to-cloud CDC sync). Schema lives here so the redb file is forward-
+    // compatible — no migration is needed when those changes land.
+    #[allow(dead_code)]
+    VectorIndices,
+    #[allow(dead_code)]
+    AuthzPurgeOutbox,
+    #[allow(dead_code)]
+    DataMutationOutbox,
+    MeteringOutbox,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,6 +107,18 @@ impl CoreStore {
             write_txn
                 .open_table(DATA_EVENTS_TABLE)
                 .context("failed to open data_events table")?;
+            write_txn
+                .open_table(VECTOR_INDICES_TABLE)
+                .context("failed to open vector_indices table")?;
+            write_txn
+                .open_table(AUTHZ_PURGE_OUTBOX_TABLE)
+                .context("failed to open authz_purge_outbox table")?;
+            write_txn
+                .open_table(DATA_MUTATION_OUTBOX_TABLE)
+                .context("failed to open data_mutation_outbox table")?;
+            write_txn
+                .open_table(METERING_OUTBOX_TABLE)
+                .context("failed to open metering_outbox table")?;
         }
         write_txn
             .commit()
@@ -100,6 +137,14 @@ impl CoreStore {
                 read_bytes(&read_txn, HIBERNATION_STATE_TABLE, key)
             }
             CoreStoreBucket::DataEvents => read_bytes(&read_txn, DATA_EVENTS_TABLE, key),
+            CoreStoreBucket::VectorIndices => read_bytes(&read_txn, VECTOR_INDICES_TABLE, key),
+            CoreStoreBucket::AuthzPurgeOutbox => {
+                read_bytes(&read_txn, AUTHZ_PURGE_OUTBOX_TABLE, key)
+            }
+            CoreStoreBucket::DataMutationOutbox => {
+                read_bytes(&read_txn, DATA_MUTATION_OUTBOX_TABLE, key)
+            }
+            CoreStoreBucket::MeteringOutbox => read_bytes(&read_txn, METERING_OUTBOX_TABLE, key),
         }
     }
 
@@ -141,6 +186,38 @@ impl CoreStore {
                     table
                         .insert(key, value)
                         .context("failed to insert data events entry")?;
+                }
+                CoreStoreBucket::VectorIndices => {
+                    let mut table = write_txn
+                        .open_table(VECTOR_INDICES_TABLE)
+                        .context("failed to open vector_indices table")?;
+                    table
+                        .insert(key, value)
+                        .context("failed to insert vector index entry")?;
+                }
+                CoreStoreBucket::AuthzPurgeOutbox => {
+                    let mut table = write_txn
+                        .open_table(AUTHZ_PURGE_OUTBOX_TABLE)
+                        .context("failed to open authz_purge_outbox table")?;
+                    table
+                        .insert(key, value)
+                        .context("failed to insert authz purge outbox entry")?;
+                }
+                CoreStoreBucket::DataMutationOutbox => {
+                    let mut table = write_txn
+                        .open_table(DATA_MUTATION_OUTBOX_TABLE)
+                        .context("failed to open data_mutation_outbox table")?;
+                    table
+                        .insert(key, value)
+                        .context("failed to insert data mutation outbox entry")?;
+                }
+                CoreStoreBucket::MeteringOutbox => {
+                    let mut table = write_txn
+                        .open_table(METERING_OUTBOX_TABLE)
+                        .context("failed to open metering_outbox table")?;
+                    table
+                        .insert(key, value)
+                        .context("failed to insert metering outbox entry")?;
                 }
             };
         }
@@ -184,11 +261,103 @@ impl CoreStore {
                         .remove(key)
                         .context("failed to delete data events entry")?;
                 }
+                CoreStoreBucket::VectorIndices => {
+                    write_txn
+                        .open_table(VECTOR_INDICES_TABLE)
+                        .context("failed to open vector_indices table")?
+                        .remove(key)
+                        .context("failed to delete vector index entry")?;
+                }
+                CoreStoreBucket::AuthzPurgeOutbox => {
+                    write_txn
+                        .open_table(AUTHZ_PURGE_OUTBOX_TABLE)
+                        .context("failed to open authz_purge_outbox table")?
+                        .remove(key)
+                        .context("failed to delete authz purge outbox entry")?;
+                }
+                CoreStoreBucket::DataMutationOutbox => {
+                    write_txn
+                        .open_table(DATA_MUTATION_OUTBOX_TABLE)
+                        .context("failed to open data_mutation_outbox table")?
+                        .remove(key)
+                        .context("failed to delete data mutation outbox entry")?;
+                }
+                CoreStoreBucket::MeteringOutbox => {
+                    write_txn
+                        .open_table(METERING_OUTBOX_TABLE)
+                        .context("failed to open metering_outbox table")?
+                        .remove(key)
+                        .context("failed to delete metering outbox entry")?;
+                }
             }
         }
         write_txn
             .commit()
             .context("failed to commit core store delete transaction")
+    }
+
+    /// Append a new event to one of the outbox-style tables. The key is generated
+    /// monotonically from the wall clock so a range scan returns events in
+    /// approximate insertion order. Producers don't need to coordinate; the worst
+    /// collision case is a single re-try on the same nanosecond, which we resolve
+    /// with a numeric suffix.
+    pub(crate) fn append_outbox(&self, bucket: CoreStoreBucket, payload: &[u8]) -> Result<String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut suffix: u32 = 0;
+        loop {
+            // 22-digit decimal nanosecond + 4-digit suffix sorts as bytes the same
+            // way it sorts as a number, so a range scan is in insertion order.
+            let key = format!("{nanos:022}-{suffix:04}");
+            if self.get(bucket, &key)?.is_none() {
+                self.put(bucket, &key, payload)?;
+                return Ok(key);
+            }
+            suffix = suffix
+                .checked_add(1)
+                .context("outbox key suffix overflow")?;
+        }
+    }
+
+    /// Drain up to `limit` rows from one of the outbox-style tables in insertion
+    /// order. Each yielded row is `(key, payload)`; the caller is expected to call
+    /// `delete(bucket, key)` once it has durably handled the row, matching the
+    /// at-least-once delivery semantics the proposals call out.
+    #[allow(dead_code)]
+    pub(crate) fn peek_outbox(
+        &self,
+        bucket: CoreStoreBucket,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let table = match bucket {
+            CoreStoreBucket::AuthzPurgeOutbox => AUTHZ_PURGE_OUTBOX_TABLE,
+            CoreStoreBucket::DataMutationOutbox => DATA_MUTATION_OUTBOX_TABLE,
+            CoreStoreBucket::MeteringOutbox => METERING_OUTBOX_TABLE,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "peek_outbox is only valid for outbox-style buckets; got {other:?}"
+                ));
+            }
+        };
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("failed to begin outbox read transaction")?;
+        let table = read_txn
+            .open_table(table)
+            .context("failed to open outbox table for peek")?;
+        let mut out = Vec::with_capacity(limit);
+        for entry in table.iter().context("failed to iterate outbox")? {
+            let (key, value) = entry.context("failed to read outbox entry")?;
+            out.push((key.value().to_owned(), value.value().to_vec()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn snapshot_directory(&self, key: &str, source: &Path) -> Result<()> {

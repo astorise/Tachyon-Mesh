@@ -1,0 +1,27 @@
+package tachyon:mesh;
+
+/// Event payload for AuthZ cache invalidation. `system-faas-authz` writes one of
+/// these into the `authz_purge_outbox` table whenever it processes a mutation that
+/// affects authorization decisions. The `core-host` background subscriber drains the
+/// table and evicts the matching keys from its in-process RBAC cache.
+interface authz-purge {
+    variant purge-kind {
+        /// A specific Personal Access Token was revoked.
+        token,
+        /// A user's role assignment changed.
+        role,
+        /// A user was banned or otherwise globally suspended.
+        user-ban,
+    }
+
+    record purge-event {
+        kind: purge-kind,
+        /// Hex-encoded SHA-256 of the affected token. Empty for non-token kinds.
+        token-hash: string,
+        /// Affected user (subject) identifier. Empty for token-scoped events that
+        /// don't need to enumerate the subject.
+        user-id: string,
+        /// Producer timestamp (ms since epoch) for ordering and TTL diagnostics.
+        ts-ms: u64,
+    }
+}

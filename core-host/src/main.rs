@@ -1808,6 +1808,68 @@ struct IntegrityRoute {
     max_concurrency: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     volumes: Vec<IntegrityVolume>,
+    /// Routes flagged here mirror data writes to a cloud endpoint via the existing
+    /// `system-faas-cdc` outbox path. Off by default; opting in adds an asynchronous
+    /// post-write event emit but no synchronous latency.
+    #[serde(default, skip_serializing_if = "is_false")]
+    sync_to_cloud: bool,
+    /// Route runs inside a hardware Trusted Execution Environment when true. The host
+    /// dispatches via `IntegrityConfig::tee_backend` instead of the pooled engine.
+    #[serde(default, skip_serializing_if = "is_false")]
+    requires_tee: bool,
+    /// Route may overflow to peer nodes via `system-faas-mesh-overlay` when the local
+    /// accelerator or worker pool is saturated.
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_overflow: bool,
+    /// Opt-in distributed rate-limiting policy enforced via `system-faas-dist-limiter`.
+    /// When `None`, only the local LRU rate limiter applies (the host fails open on a
+    /// distributed limiter outage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    distributed_rate_limit: Option<DistributedRateLimitConfig>,
+    /// Tenant-specific LoRA adapter to apply on top of the route's foundation model
+    /// at inference time. Per-call overrides may be passed via the inference WIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adapter_id: Option<String>,
+}
+
+impl Default for IntegrityRoute {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            role: RouteRole::User,
+            name: String::new(),
+            version: "0.0.0".to_owned(),
+            dependencies: BTreeMap::new(),
+            requires_credentials: Vec::new(),
+            middleware: None,
+            env: BTreeMap::new(),
+            allowed_secrets: Vec::new(),
+            targets: Vec::new(),
+            resiliency: None,
+            models: Vec::new(),
+            domains: Vec::new(),
+            min_instances: 0,
+            max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
+            volumes: Vec::new(),
+            sync_to_cloud: false,
+            requires_tee: false,
+            allow_overflow: false,
+            distributed_rate_limit: None,
+            adapter_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct DistributedRateLimitConfig {
+    /// Per-IP request count permitted across the entire mesh within `window_seconds`.
+    threshold: u32,
+    #[serde(default = "default_dist_rate_limit_window")]
+    window_seconds: u32,
+}
+
+fn default_dist_rate_limit_window() -> u32 {
+    60
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1848,6 +1910,26 @@ struct IntegrityVolume {
     idle_timeout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     eviction_policy: Option<VolumeEvictionPolicy>,
+    /// Route writes to this volume are paged through `system-faas-tde` for AES-256-GCM
+    /// encryption at rest. Off by default to preserve native disk speed for routes
+    /// that don't need TDE.
+    #[serde(default, skip_serializing_if = "is_false")]
+    encrypted: bool,
+}
+
+impl Default for IntegrityVolume {
+    fn default() -> Self {
+        Self {
+            volume_type: VolumeType::Host,
+            host_path: String::new(),
+            guest_path: String::new(),
+            readonly: false,
+            ttl_seconds: None,
+            idle_timeout: None,
+            eviction_policy: None,
+            encrypted: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1888,6 +1970,67 @@ struct IntegrityConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     resources: BTreeMap<String, IntegrityResource>,
     routes: Vec<IntegrityRoute>,
+    /// Monotonically increasing version stamp used by the multi-master config sync
+    /// path: a node receives a `ConfigUpdateEvent` and pulls the manifest from the
+    /// origin only when the advertised version is higher than the local one.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    config_version: u64,
+    /// Outbound endpoint a freshly booted, unenrolled node uses to wait for a PIN
+    /// approval from an active mesh node. Optional — clusters that pre-seed
+    /// credentials don't need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrollment_endpoint: Option<String>,
+    /// Cloud endpoint that `system-faas-cdc` POSTs to when draining the
+    /// data-mutation outbox. Optional — air-gapped deployments leave it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_sync_endpoint: Option<String>,
+    /// TEE delegation backend used by routes flagged `requires_tee`. Optional —
+    /// without it, a manifest with TEE-flagged routes is rejected by validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tee_backend: Option<TeeBackendConfig>,
+    /// Hard cap on memory used by the Wasmtime instance pool. Optional — when unset,
+    /// the existing `PoolingAllocationConfig` defaults apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instance_pool_max_memory_bytes: Option<usize>,
+}
+
+impl Default for IntegrityConfig {
+    fn default() -> Self {
+        Self {
+            host_address: String::new(),
+            advertise_ip: None,
+            tls_address: None,
+            max_stdout_bytes: 0,
+            guest_fuel_budget: 0,
+            guest_memory_limit_bytes: 0,
+            resource_limit_response: String::new(),
+            layer4: IntegrityLayer4Config::default(),
+            telemetry_sample_rate: DEFAULT_TELEMETRY_SAMPLE_RATE,
+            batch_targets: Vec::new(),
+            resources: BTreeMap::new(),
+            routes: Vec::new(),
+            config_version: 0,
+            enrollment_endpoint: None,
+            cloud_sync_endpoint: None,
+            tee_backend: None,
+            instance_pool_max_memory_bytes: None,
+        }
+    }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum TeeBackendConfig {
+    /// In-process hardened wasmtime backend with mlocked memory and a self-attested
+    /// JWT carrying the host identity. Available on every host; security guarantees
+    /// match the host kernel.
+    LocalEnclave,
+    /// Real Enarx backend. Requires the `enarx` Cargo feature and SGX/SEV-SNP HW.
+    Enarx { keep_endpoint: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5007,11 +5150,52 @@ fn spawn_metering_exporter(state: AppState, mut receiver: mpsc::Receiver<String>
                 }
             }
 
-            if let Err(error) = export_metering_batch(&state, batch).await {
-                tracing::warn!("telemetry metering export failed: {error}");
+            // Durably stash each record in the metering outbox before attempting the
+            // HTTP export. If the host crashes between here and the export, the records
+            // are recoverable on the next boot. On successful export, the entries are
+            // removed; on failure, they remain and a later sweep can retry.
+            //
+            // This is the implementation of the `async-zero-blocking-metering` change:
+            // the request critical path remains untouched (the original `mpsc` emit was
+            // already async), but the durability story is now an explicit outbox table
+            // rather than an in-memory channel that vanishes on a crash.
+            let outbox_keys = persist_metering_batch(&state, &batch);
+
+            match export_metering_batch(&state, batch).await {
+                Ok(()) => {
+                    for key in outbox_keys {
+                        if let Err(error) = state
+                            .core_store
+                            .delete(store::CoreStoreBucket::MeteringOutbox, &key)
+                        {
+                            tracing::warn!("metering outbox cleanup for `{key}` failed: {error:#}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "telemetry metering export failed; outbox entries retained: {error}",
+                    );
+                }
             }
         }
     });
+}
+
+fn persist_metering_batch(state: &AppState, batch: &[String]) -> Vec<String> {
+    let mut keys = Vec::with_capacity(batch.len());
+    for record in batch {
+        match state
+            .core_store
+            .append_outbox(store::CoreStoreBucket::MeteringOutbox, record.as_bytes())
+        {
+            Ok(key) => keys.push(key),
+            Err(error) => {
+                tracing::warn!("metering outbox persist failed: {error:#}");
+            }
+        }
+    }
+    keys
 }
 
 fn spawn_async_log_exporter(state: AppState, mut receiver: mpsc::Receiver<AsyncLogEntry>) {
@@ -9039,7 +9223,13 @@ fn execute_legacy_guest(
         )?))
         .stdout(stdout_capture.clone())
         .stderr(stderr_capture);
-    add_route_environment(&mut wasi, route, execution.host_identity.as_ref())?;
+    let traceparent = trace_context_for_request(&execution.request_headers);
+    add_route_environment_with_trace(
+        &mut wasi,
+        route,
+        execution.host_identity.as_ref(),
+        Some(&traceparent),
+    )?;
 
     if let Some(module_dir) = module_path.parent() {
         wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
@@ -9103,7 +9293,13 @@ fn execute_legacy_guest_with_stdio(
 ) -> std::result::Result<(), ExecutionError> {
     let linker = build_linker(engine)?;
     let mut wasi = WasiCtxBuilder::new();
-    add_route_environment(&mut wasi, route, execution.host_identity.as_ref())?;
+    let traceparent = trace_context_for_request(&execution.request_headers);
+    add_route_environment_with_trace(
+        &mut wasi,
+        route,
+        execution.host_identity.as_ref(),
+        Some(&traceparent),
+    )?;
     wasi.arg(legacy_guest_program_name(module_path))
         .stdin(stdin)
         .stdout(stdout);
@@ -10399,6 +10595,11 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
         volumes: normalize_route_volumes(route.volumes, route.role, &normalized)?,
+        sync_to_cloud: route.sync_to_cloud,
+        requires_tee: route.requires_tee,
+        allow_overflow: route.allow_overflow,
+        distributed_rate_limit: route.distributed_rate_limit,
+        adapter_id: route.adapter_id,
     })
 }
 
@@ -10902,6 +11103,7 @@ fn validate_route_volume(
         ttl_seconds: volume.ttl_seconds,
         idle_timeout,
         eviction_policy: volume.eviction_policy,
+        encrypted: volume.encrypted,
     })
 }
 
@@ -11863,8 +12065,22 @@ fn add_route_environment(
     route: &IntegrityRoute,
     host_identity: &HostIdentity,
 ) -> std::result::Result<(), ExecutionError> {
+    add_route_environment_with_trace(wasi, route, host_identity, None)
+}
+
+fn add_route_environment_with_trace(
+    wasi: &mut WasiCtxBuilder,
+    route: &IntegrityRoute,
+    host_identity: &HostIdentity,
+    traceparent: Option<&str>,
+) -> std::result::Result<(), ExecutionError> {
     for (name, value) in system_runtime_environment(route, host_identity) {
         wasi.env(&name, &value);
+    }
+    if let Some(tp) = traceparent {
+        // W3C Trace Context propagation. Guests opt in by reading `TRACEPARENT` from
+        // their environment (the `faas-sdk` logger / metrics macros do so transparently).
+        wasi.env(TACHYON_TRACEPARENT_ENV, tp);
     }
     Ok(())
 }
@@ -11885,6 +12101,43 @@ fn system_runtime_environment(
         ));
     }
     env
+}
+
+/// Standard W3C Trace Context environment variable name. Guests read it via WASI to
+/// obtain the active trace context for the request they are servicing.
+const TACHYON_TRACEPARENT_ENV: &str = "TRACEPARENT";
+
+/// Honor the inbound `traceparent` header if it is well-formed per the W3C Trace
+/// Context spec, otherwise mint a fresh one via the existing `generate_traceparent`
+/// so every request that reaches the host gets a globally identifiable trace id.
+pub(crate) fn trace_context_for_request(headers: &HeaderMap) -> String {
+    if let Some(value) = headers.get("traceparent") {
+        if let Ok(s) = value.to_str() {
+            if is_valid_w3c_traceparent(s) {
+                return s.to_owned();
+            }
+        }
+    }
+    generate_traceparent()
+}
+
+fn is_valid_w3c_traceparent(value: &str) -> bool {
+    // Format: VERSION-TRACE_ID-PARENT_ID-FLAGS, hex; widths 2-32-16-2.
+    let parts: Vec<&str> = value.split('-').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let widths = [2usize, 32, 16, 2];
+    for (part, width) in parts.iter().zip(widths.iter()) {
+        if part.len() != *width || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    // Forbid the reserved all-zero trace and span ids.
+    if parts[1].chars().all(|c| c == '0') || parts[2].chars().all(|c| c == '0') {
+        return false;
+    }
+    true
 }
 
 fn preopen_route_volumes(
@@ -12716,6 +12969,8 @@ impl IntegrityConfig {
                 IntegrityRoute::user_with_secrets(DEFAULT_ROUTE, &["DB_PASS"]),
                 IntegrityRoute::system(DEFAULT_SYSTEM_ROUTE),
             ],
+
+            ..Default::default()
         }
     }
 
@@ -12759,6 +13014,8 @@ impl IntegrityRoute {
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
+
+            ..Default::default()
         }
     }
 
@@ -12781,6 +13038,8 @@ impl IntegrityRoute {
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
+
+            ..Default::default()
         }
     }
 
@@ -12806,6 +13065,8 @@ impl IntegrityRoute {
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
+
+            ..Default::default()
         }
     }
 }
@@ -13227,6 +13488,8 @@ mod tests {
             batch_targets: Vec::new(),
             resources: BTreeMap::new(),
             routes,
+
+            ..Default::default()
         }
     }
 
@@ -13276,6 +13539,8 @@ mod tests {
             batch_targets: Vec::new(),
             resources: BTreeMap::new(),
             routes: vec![target_route, connector_route],
+
+            ..Default::default()
         }
     }
 
@@ -13295,6 +13560,8 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
         }
     }
@@ -13389,7 +13656,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }
     }
 
@@ -13418,7 +13689,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }
     }
 
@@ -13555,7 +13830,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }
     }
 
@@ -13590,7 +13869,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }
     }
 
@@ -13625,7 +13908,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }
     }
 
@@ -13660,7 +13947,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }
     }
 
@@ -13682,6 +13973,8 @@ mod tests {
             min_instances: 0,
             max_concurrency,
             volumes: Vec::new(),
+
+            ..Default::default()
         }
     }
 
@@ -13703,6 +13996,8 @@ mod tests {
             min_instances: 0,
             max_concurrency,
             volumes: Vec::new(),
+
+            ..Default::default()
         }
     }
 
@@ -13747,7 +14042,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: Some("50ms".to_owned()),
                 eviction_policy: Some(VolumeEvictionPolicy::Hibernate),
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }
     }
 
@@ -13776,7 +14075,11 @@ mod tests {
                 ttl_seconds: Some(ttl_seconds),
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }
     }
 
@@ -13885,6 +14188,8 @@ mod tests {
             ttl_seconds: None,
             idle_timeout: None,
             eviction_policy: None,
+
+            ..Default::default()
         }
     }
 
@@ -13897,6 +14202,8 @@ mod tests {
             ttl_seconds: None,
             idle_timeout: None,
             eviction_policy: None,
+
+            ..Default::default()
         }
     }
 
@@ -13988,6 +14295,43 @@ mod tests {
             ]
         );
         assert!(user_env.is_empty());
+    }
+
+    #[test]
+    fn trace_context_honors_well_formed_inbound_traceparent() {
+        let mut headers = HeaderMap::new();
+        let inbound = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_str(inbound).expect("traceparent value is valid ASCII"),
+        );
+        assert_eq!(trace_context_for_request(&headers), inbound);
+    }
+
+    #[test]
+    fn trace_context_rejects_malformed_inbound_and_mints_fresh() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("not a valid traceparent"),
+        );
+        let value = trace_context_for_request(&headers);
+        assert!(
+            is_valid_w3c_traceparent(&value),
+            "minted traceparent must be a valid W3C value, got `{value}`"
+        );
+    }
+
+    #[test]
+    fn trace_context_mints_fresh_when_header_absent() {
+        let value = trace_context_for_request(&HeaderMap::new());
+        assert!(
+            is_valid_w3c_traceparent(&value),
+            "minted traceparent must be valid, got `{value}`"
+        );
+        // Smoke-check that two consecutive mints differ — a sanity check on entropy.
+        let other = trace_context_for_request(&HeaderMap::new());
+        assert_ne!(value, other);
     }
 
     #[test]
@@ -18584,7 +18928,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }];
 
         let config = validate_integrity_config(config).expect("volume config should validate");
@@ -18602,6 +18950,8 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }]
         );
     }
@@ -18633,7 +18983,11 @@ mod tests {
                 ttl_seconds: None,
                 idle_timeout: None,
                 eviction_policy: None,
+
+                ..Default::default()
             }],
+
+            ..Default::default()
         }];
 
         let error = validate_integrity_config(config)
@@ -19037,6 +19391,8 @@ mod tests {
             min_instances: 0,
             max_concurrency: 0,
             volumes: Vec::new(),
+
+            ..Default::default()
         }];
 
         let error = validate_integrity_config(config)

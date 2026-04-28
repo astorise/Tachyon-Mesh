@@ -1,0 +1,31 @@
+package tachyon:mesh;
+
+/// Event payload for the edge-to-cloud Change Data Capture (CDC) pipeline. The host
+/// writes one of these to `data_mutation_outbox` after a successful local write to a
+/// resource flagged `sync_to_cloud: true`. `system-faas-cdc` drains the table and
+/// POSTs batches to `IntegrityConfig::cloud_sync_endpoint`.
+interface data-mutation {
+    variant op {
+        /// A new key was inserted.
+        insert,
+        /// An existing key was updated.
+        update,
+        /// A key was deleted.
+        delete,
+    }
+
+    record mutation-event {
+        /// Resource alias as declared in `IntegrityConfig::resources`.
+        resource: string,
+        /// Tenant-scoped key (or path within the resource).
+        key: string,
+        /// Mutation kind.
+        op: op,
+        /// Hex-encoded SHA-256 of the new payload, or the empty string for deletes.
+        /// Sending the hash (not the full payload) keeps event size bounded; the CDC
+        /// FaaS reads the actual bytes from local storage when it's ready to upload.
+        payload-hash: string,
+        /// Producer timestamp (ms since epoch).
+        ts-ms: u64,
+    }
+}

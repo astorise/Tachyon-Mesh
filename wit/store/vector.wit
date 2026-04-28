@@ -1,0 +1,53 @@
+package tachyon:mesh;
+
+/// Embedded vector store interface. The host backs this with an HNSW
+/// (Hierarchical Navigable Small World) index persisted in the embedded redb
+/// store. Modules that don't import this interface incur zero overhead.
+interface vector {
+    /// Identifier for a tenant's index. Indices are scoped per-tenant, so two
+    /// tenants using the same `index-name` see different graphs.
+    type index-name = string;
+
+    /// Dense f32 vector. Length must match the index's declared dimensionality.
+    type embedding = list<f32>;
+
+    record index-spec {
+        name: index-name,
+        /// Vector dimension (e.g. 384, 768, 1024).
+        dim: u32,
+        /// HNSW M parameter (graph degree). Reasonable default: 16.
+        m: u32,
+        /// HNSW ef-construction. Reasonable default: 200.
+        ef-construction: u32,
+    }
+
+    record document {
+        id: string,
+        embedding: embedding,
+        /// Optional opaque payload returned alongside matches.
+        payload: option<list<u8>>,
+    }
+
+    record search-match {
+        id: string,
+        /// Similarity score in [0, 1] for cosine, or distance for L2 — the index
+        /// declares which metric it uses; this carries the raw value.
+        score: f32,
+        payload: option<list<u8>>,
+    }
+
+    /// Create an index for the calling tenant. Idempotent — calling on an existing
+    /// index returns success without recreating.
+    create-index: func(spec: index-spec) -> result<_, string>;
+
+    /// Insert or replace one or more documents. Insertions update the HNSW graph
+    /// and are persisted to disk before returning success.
+    upsert: func(name: index-name, docs: list<document>) -> result<_, string>;
+
+    /// Approximate-nearest-neighbour search. `k` is bounded server-side to a
+    /// reasonable max (default 100) to prevent runaway response sizes.
+    search: func(name: index-name, query: embedding, k: u32) -> result<list<search-match>, string>;
+
+    /// Remove a document by id. Returns `false` if the id was not present.
+    remove: func(name: index-name, id: string) -> result<bool, string>;
+}
