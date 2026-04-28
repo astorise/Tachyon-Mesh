@@ -2057,6 +2057,7 @@ async fn serve_host() -> Result<()> {
     spawn_metering_exporter(state.clone(), export_receiver);
     spawn_async_log_exporter(state.clone(), async_log_receiver);
     spawn_reload_watcher(state.clone());
+    spawn_manifest_file_watcher(state.clone());
     spawn_draining_runtime_reaper(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     spawn_buffered_request_replayer(state.clone());
@@ -3723,6 +3724,97 @@ fn spawn_reload_watcher(state: AppState) {
 
 #[cfg(not(unix))]
 fn spawn_reload_watcher(_state: AppState) {}
+
+const MANIFEST_FILE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Spawn a file watcher that triggers a hot reload whenever the integrity manifest is
+/// modified or atomically replaced on disk. Many editors and CI/CD tools save the file
+/// by writing a temp file and renaming it over the original, so the watcher is set up
+/// against the manifest's parent directory and filters by filename rather than watching
+/// the inode directly.
+///
+/// Triggers are coalesced over a short debounce window so that a flurry of OS events
+/// (typical of atomic-rename saves) results in a single reload attempt. Validation
+/// errors are absorbed by the existing `reload_runtime_from_disk` path, which logs and
+/// keeps the previous runtime active.
+fn spawn_manifest_file_watcher(state: AppState) {
+    let manifest_path = state.manifest_path.clone();
+    let Some(parent) = manifest_path.parent().map(Path::to_path_buf) else {
+        tracing::warn!(
+            manifest = %manifest_path.display(),
+            "skipping manifest file watcher: manifest has no parent directory",
+        );
+        return;
+    };
+    let Some(target_filename) = manifest_path.file_name().map(|name| name.to_os_string()) else {
+        tracing::warn!(
+            manifest = %manifest_path.display(),
+            "skipping manifest file watcher: manifest path lacks a final component",
+        );
+        return;
+    };
+
+    let (event_tx, mut event_rx) = mpsc::channel::<()>(8);
+
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        match res {
+            Ok(event) => {
+                let touches_manifest = event
+                    .paths
+                    .iter()
+                    .any(|path| path.file_name() == Some(target_filename.as_os_str()));
+                if !touches_manifest {
+                    return;
+                }
+                // Use try_send so a flood of OS events cannot back-pressure the
+                // notify worker thread; we only need to know "something changed".
+                let _ = event_tx.try_send(());
+            }
+            Err(error) => {
+                tracing::warn!("manifest file watcher error: {error}");
+            }
+        }
+    });
+
+    let mut watcher = match watcher {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            tracing::warn!(
+                manifest = %manifest_path.display(),
+                "failed to initialize manifest file watcher: {error}",
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = notify::Watcher::watch(&mut watcher, &parent, notify::RecursiveMode::NonRecursive)
+    {
+        tracing::warn!(
+            directory = %parent.display(),
+            "failed to start watching manifest directory: {error}",
+        );
+        return;
+    }
+
+    tokio::spawn(async move {
+        // Keep the watcher alive for the lifetime of the task. Dropping it would
+        // unsubscribe from the OS event source.
+        let _watcher_guard = watcher;
+
+        while event_rx.recv().await.is_some() {
+            // Debounce: drain any pile-up of events that arrived during the wait.
+            tokio::time::sleep(MANIFEST_FILE_WATCHER_DEBOUNCE).await;
+            while event_rx.try_recv().is_ok() {}
+
+            if let Err(error) = reload_runtime_from_disk(&state).await {
+                tracing::error!(
+                    manifest = %state.manifest_path.display(),
+                    "manifest file watcher: hot reload failed (previous runtime preserved): {error:#}",
+                );
+            }
+        }
+    });
+}
 
 fn spawn_volume_gc_sweeper(state: AppState) {
     tokio::spawn(async move {

@@ -27,6 +27,7 @@ futures-util = { version = "0.3", optional = true }
 forwarded-header-value = { version = "0.1", optional = true }
 governor = { version = "0.10", optional = true }
 moka = { version = "0.12", optional = true, features = ["sync"] }
+notify = { version = "6.1", default-features = false, features = ["macos_kqueue"] }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 hex = "0.4"
