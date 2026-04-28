@@ -8,7 +8,7 @@ default = []
 ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower"]
 mtls = []
-rate-limit = ["dep:governor", "dep:forwarded-header-value"]
+rate-limit = ["dep:governor", "dep:forwarded-header-value", "dep:moka"]
 resiliency = ["dep:tower"]
 secrets-vault = []
 websockets = ["axum/ws", "dep:futures-util"]
@@ -26,6 +26,7 @@ ed25519-dalek = "2"
 futures-util = { version = "0.3", optional = true }
 forwarded-header-value = { version = "0.1", optional = true }
 governor = { version = "0.10", optional = true }
+moka = { version = "0.12", optional = true, features = ["sync"] }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 hex = "0.4"
