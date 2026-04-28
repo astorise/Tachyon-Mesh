@@ -22,6 +22,7 @@ const MODEL_CHUNK_BYTES: usize = 5 * 1024 * 1024;
 const INIT_PATH: &str = "/admin/models/init";
 const UPLOAD_PREFIX: &str = "/admin/models/upload/";
 const COMMIT_PREFIX: &str = "/admin/models/commit/";
+const ABORT_PREFIX: &str = "/admin/models/abort/";
 
 struct Component;
 
@@ -66,6 +67,11 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
         {
             commit_upload(&req.uri)
                 .and_then(|model_path| response_json(200, &CommitUploadResponse { model_path }))
+        } else if (req.method.eq_ignore_ascii_case("POST")
+            || req.method.eq_ignore_ascii_case("DELETE"))
+            && route_path(&req.uri).starts_with(ABORT_PREFIX)
+        {
+            abort_upload(&req.uri).map(|_| response(204, ""))
         } else {
             Ok(response(405, "Method Not Allowed"))
         };
@@ -160,6 +166,10 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     let staging_path = staging_path(&upload_id);
     let computed_hash = hash_file(&staging_path)?;
     if computed_hash != pending.expected_hash {
+        // Hash mismatch means the staged content is unusable. Delete the .part and the
+        // metadata so the upload slot is freed and the broker never accidentally
+        // promotes a corrupted file to the final model name.
+        cleanup_staging(&upload_id);
         return Err(format!(
             "model upload `{upload_id}` hash mismatch: expected `{}`, computed `{computed_hash}`",
             pending.expected_hash
@@ -196,6 +206,25 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     }
 
     Ok(model_path.to_string_lossy().to_string())
+}
+
+/// Explicit client-driven cleanup for an in-progress upload. The broker is request-driven
+/// (a Wasm guest) and cannot observe a peer disconnect mid-stream, so the orchestrator
+/// (or admin tooling) signals an abort with `POST /admin/models/abort/{upload_id}` and
+/// the broker drops the `.part` and the metadata file.
+fn abort_upload(uri: &str) -> Result<(), String> {
+    ensure_dirs()?;
+    let upload_id = upload_id_from_uri(uri, ABORT_PREFIX)?;
+    cleanup_staging(&upload_id);
+    Ok(())
+}
+
+/// Best-effort removal of the `.part` and metadata for `upload_id`. Errors are
+/// swallowed: the worst case is that `system-faas-gc` reaps the orphan via its
+/// generic TTL sweep on a later tick, which is the documented fallback.
+fn cleanup_staging(upload_id: &str) {
+    let _ = fs::remove_file(staging_path(upload_id));
+    let _ = fs::remove_file(metadata_path(upload_id));
 }
 
 fn ensure_dirs() -> Result<(), String> {
@@ -368,5 +397,20 @@ mod tests {
             query_u64("/admin/models/upload/abc?part=4", "part").expect("part query should parse");
 
         assert_eq!(part, 4);
+    }
+
+    #[test]
+    fn abort_extracts_upload_id() {
+        let upload_id = upload_id_from_uri("/admin/models/abort/some-id", ABORT_PREFIX)
+            .expect("abort path should parse");
+        assert_eq!(upload_id, "some-id");
+    }
+
+    #[test]
+    fn cleanup_staging_is_idempotent_on_missing_files() {
+        // Calling cleanup against a never-initialized upload must not panic, since
+        // it is also invoked from the hash-mismatch error path where the staging
+        // file may already be gone (e.g. concurrent gc).
+        cleanup_staging("upload-that-never-existed");
     }
 }
