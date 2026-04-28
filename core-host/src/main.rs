@@ -3787,7 +3787,8 @@ fn spawn_manifest_file_watcher(state: AppState) {
         }
     };
 
-    if let Err(error) = notify::Watcher::watch(&mut watcher, &parent, notify::RecursiveMode::NonRecursive)
+    if let Err(error) =
+        notify::Watcher::watch(&mut watcher, &parent, notify::RecursiveMode::NonRecursive)
     {
         tracing::warn!(
             directory = %parent.display(),
