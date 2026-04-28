@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = []
 ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
-http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower"]
+http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
 mtls = []
 rate-limit = ["dep:governor", "dep:forwarded-header-value", "dep:moka"]
 resiliency = ["dep:tower"]
@@ -45,6 +45,7 @@ serde_json = "1"
 sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-stream = { version = "0.1", optional = true }
 tower = { version = "0.5", optional = true, features = ["retry", "timeout", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
