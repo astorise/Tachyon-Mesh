@@ -194,9 +194,7 @@ async fn pump_request_body<S>(
             }
             Ok(None) => return,
             Err(error) => {
-                let _ = tx
-                    .send(Err(io::Error::new(io::ErrorKind::Other, error.to_string())))
-                    .await;
+                let _ = tx.send(Err(io::Error::other(error.to_string()))).await;
                 return;
             }
         }
@@ -249,20 +247,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn quic_transport_config_caps_are_applied() {
-        // We cannot easily inspect the resulting quinn::ServerConfig without a real TLS
-        // handshake, so instead we re-derive what the quinn TransportConfig builder is
-        // told and assert the constants match the spec'd safety bounds. This keeps the
-        // limits visible in code review and prevents an accidental regression that
-        // silently uses quinn's defaults.
-        assert_eq!(QUIC_MAX_IDLE_TIMEOUT.as_secs(), 30);
-        assert_eq!(QUIC_MAX_CONCURRENT_BIDI_STREAMS, 256);
-        assert_eq!(QUIC_MAX_CONCURRENT_UNI_STREAMS, 100);
-        assert_eq!(QUIC_KEEPALIVE_INTERVAL.as_secs(), 15);
-        // The body channel depth is small (constant memory), independent of body size.
-        assert!(BODY_CHANNEL_DEPTH <= 32);
+        // We cannot easily inspect the resulting `quinn::ServerConfig` without a real
+        // TLS handshake, so instead we pin the safety constants the builder is told to
+        // use. The compile-time assertions document the spec'd bounds and surface in
+        // code review if a future edit silently regresses to quinn's defaults.
+        assert_eq!(super::QUIC_MAX_IDLE_TIMEOUT.as_secs(), 30);
+        assert_eq!(super::QUIC_MAX_CONCURRENT_BIDI_STREAMS, 256);
+        assert_eq!(super::QUIC_MAX_CONCURRENT_UNI_STREAMS, 100);
+        assert_eq!(super::QUIC_KEEPALIVE_INTERVAL.as_secs(), 15);
+        // The body channel depth must stay small (constant memory), independent of the
+        // request body's total size — the whole point of the streaming bridge.
+        assert!(super::BODY_CHANNEL_DEPTH <= 32);
     }
 }
