@@ -10,3 +10,9 @@ tachyon-ui/dist/
 .vscode/*
 
 artifacts/*
+
+# Local runtime artifacts; never committed.
+tachyon.db
+tachyon.db-*
+buffered-requests/
+.claude/settings.local.json
