@@ -62,6 +62,7 @@ type MeshRouteSummary = {
   name: string;
   role: string;
   targetCount: number;
+  requiresTee: boolean;
 };
 
 type MeshGraphSnapshot = {
@@ -1021,13 +1022,23 @@ document.addEventListener("DOMContentLoaded", () => {
         snapshot.routes.forEach((route) => {
           const card = document.createElement("div");
           card.className = "rounded-xl border border-slate-800 bg-slate-950/70 p-4";
+          const confidentialChecked = route.requiresTee ? "checked" : "";
+          const confidentialTone = route.requiresTee
+            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+            : "border-slate-700 bg-slate-900 text-slate-500";
           card.innerHTML = `
             <div class="flex items-center justify-between gap-4 mb-3">
               <div class="text-sm font-semibold text-white">${route.name}</div>
               <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">${route.role}</span>
             </div>
             <div class="text-xs font-mono text-cyan-300 break-all mb-2">${route.path}</div>
-            <div class="text-xs text-slate-500">Targets: ${route.targetCount}</div>
+            <div class="flex items-center justify-between gap-3">
+              <div class="text-xs text-slate-500">Targets: ${route.targetCount}</div>
+              <label class="inline-flex items-center gap-2 rounded-full border ${confidentialTone} px-2 py-1 text-[11px] font-semibold uppercase">
+                <input type="checkbox" ${confidentialChecked} disabled class="h-3.5 w-3.5 accent-emerald-400" aria-label="Confidential Computing" />
+                Confidential Computing
+              </label>
+            </div>
           `;
           meshRouteList.appendChild(card);
         });

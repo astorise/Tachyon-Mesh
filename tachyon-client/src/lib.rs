@@ -173,6 +173,7 @@ pub struct MeshRouteSummary {
     pub name: String,
     pub role: String,
     pub target_count: usize,
+    pub requires_tee: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -997,12 +998,17 @@ fn parse_route_summary(route: &serde_json::Value) -> Option<MeshRouteSummary> {
         .and_then(|value| value.as_array())
         .map(|targets| targets.len().max(1))
         .unwrap_or(1);
+    let requires_tee = route
+        .get("requires_tee")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
 
     Some(MeshRouteSummary {
         path,
         name,
         role,
         target_count,
+        requires_tee,
     })
 }
 
@@ -1201,6 +1207,20 @@ mod tests {
         assert_eq!(summary.name, "demo");
         assert_eq!(summary.role, "system");
         assert_eq!(summary.target_count, 1);
+        assert!(!summary.requires_tee);
+    }
+
+    #[test]
+    fn route_summary_marks_confidential_routes() {
+        let route = json!({
+            "path": "/api/secure",
+            "requires_tee": true,
+            "targets": [{ "module": "secure" }]
+        });
+
+        let summary = parse_route_summary(&route).expect("route summary should parse");
+
+        assert!(summary.requires_tee);
     }
 
     #[test]
