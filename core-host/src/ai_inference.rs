@@ -11,6 +11,7 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BinaryHeap, HashMap},
     fs,
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc,
@@ -34,6 +35,7 @@ const DEFAULT_BATCH_SIZE: usize = 32;
 const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(25);
 const ACCELERATOR_QUEUE_CAPACITY: usize = 256;
 const ACCELERATOR_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum AcceleratorKind {
@@ -280,10 +282,20 @@ impl AiInferenceRuntime {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn compute_component_prompt(
         &self,
         alias: &str,
         prompt: &str,
+    ) -> Result<String, String> {
+        self.compute_component_prompt_with_adapter(alias, prompt, None)
+    }
+
+    pub(crate) fn compute_component_prompt_with_adapter(
+        &self,
+        alias: &str,
+        prompt: &str,
+        adapter_id: Option<&str>,
     ) -> Result<String, String> {
         let model = self
             .models
@@ -299,6 +311,7 @@ impl AiInferenceRuntime {
             })?
             .infer(
                 Arc::clone(model),
+                adapter_id.map(str::to_owned),
                 WasiTensor::new(
                     vec![prompt.len() as u32],
                     TensorType::U8,
@@ -345,9 +358,10 @@ impl AcceleratorScheduler {
     fn infer(
         &self,
         model: Arc<CandleModel>,
+        adapter_id: Option<String>,
         input: WasiTensor,
     ) -> Result<WasiTensor, BackendError> {
-        let response_rx = self.enqueue(model, input)?;
+        let response_rx = self.enqueue(model, adapter_id, input)?;
         response_rx.recv().map_err(|_| {
             backend_access_error("AI inference response channel closed unexpectedly")
         })?
@@ -356,6 +370,7 @@ impl AcceleratorScheduler {
     fn enqueue(
         &self,
         model: Arc<CandleModel>,
+        adapter_id: Option<String>,
         input: WasiTensor,
     ) -> Result<mpsc::Receiver<Result<WasiTensor, BackendError>>, BackendError> {
         let (response_tx, response_rx) = mpsc::channel();
@@ -368,6 +383,7 @@ impl AcceleratorScheduler {
             sequence,
             InferenceJob {
                 alias: model.alias.clone(),
+                adapter_id,
                 model,
                 qos,
                 input: input.into(),
@@ -466,6 +482,7 @@ fn queue_counter(metrics: &SchedulerMetrics, qos: RouteQos) -> &AtomicUsize {
 
 struct InferenceJob {
     alias: String,
+    adapter_id: Option<String>,
     model: Arc<CandleModel>,
     qos: RouteQos,
     input: SharedInputTensor,
@@ -529,13 +546,16 @@ fn run_scheduler(
             Some(job) => job,
             None => return,
         };
-        let batch_alias = first.alias.clone();
+        let batch_key = InferenceBatchKey {
+            alias: first.alias.clone(),
+            adapter_id: first.adapter_id.clone(),
+        };
         let mut batch = vec![first];
         let deadline = Instant::now() + batch_window;
 
         while batch.len() < batch_size {
             drain_ready_jobs(&mut receiver, &mut queued);
-            let Some(job) = try_take_compatible_job(&mut queued, &batch_alias) else {
+            let Some(job) = try_take_compatible_job(&mut queued, &batch_key) else {
                 if Instant::now() >= deadline {
                     break;
                 }
@@ -579,13 +599,13 @@ fn drain_ready_jobs(
 
 fn try_take_compatible_job(
     queued: &mut BinaryHeap<PrioritizedInferenceJob>,
-    alias: &str,
+    batch_key: &InferenceBatchKey,
 ) -> Option<InferenceJob> {
     let mut deferred = Vec::new();
     let mut selected = None;
 
     while let Some(job) = queued.pop() {
-        if job.job.alias == alias {
+        if job.job.alias == batch_key.alias && job.job.adapter_id == batch_key.adapter_id {
             selected = Some(job.job);
             break;
         }
@@ -597,6 +617,11 @@ fn try_take_compatible_job(
     }
 
     selected
+}
+
+struct InferenceBatchKey {
+    alias: String,
+    adapter_id: Option<String>,
 }
 
 fn age_waiting_jobs(queued: &mut BinaryHeap<PrioritizedInferenceJob>) {
@@ -617,6 +642,7 @@ fn process_batch(
     batch: &[InferenceJob],
 ) -> Vec<Result<WasiTensor, BackendError>> {
     let model = Arc::clone(&batch[0].model);
+    let adapter_id = batch[0].adapter_id.as_deref();
     #[cfg(test)]
     if model.mock_latency > Duration::ZERO {
         thread::sleep(model.mock_latency);
@@ -625,7 +651,7 @@ fn process_batch(
         .iter()
         .map(|job| job.input.clone())
         .collect::<Vec<_>>();
-    match model.run_mock_batch(&inputs) {
+    match model.run_mock_batch(&inputs, adapter_id) {
         Ok(output) => batch.iter().map(|_| Ok(output.clone())).collect(),
         Err(error) => {
             let message = format!(
@@ -710,7 +736,7 @@ impl BackendExecutionContext for CandleExecutionContext {
             })?,
         };
 
-        let output = self.scheduler.infer(Arc::clone(&self.model), input)?;
+        let output = self.scheduler.infer(Arc::clone(&self.model), None, input)?;
         self.output = Some(output.clone());
 
         if use_named_io {
@@ -790,9 +816,65 @@ impl CandleModel {
         self
     }
 
-    fn run_mock_batch(&self, inputs: &[SharedInputTensor]) -> Result<WasiTensor, BackendError> {
-        self.backend.execute(self.backend_model.as_ref(), inputs)
+    fn run_mock_batch(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapter_id: Option<&str>,
+    ) -> Result<WasiTensor, BackendError> {
+        let adapter = adapter_id
+            .map(LoraAdapterGuard::load)
+            .transpose()
+            .map_err(|error| backend_access_error(error.to_string()))?;
+        self.backend
+            .execute(self.backend_model.as_ref(), inputs)
+            .inspect(|_| drop(adapter))
     }
+}
+
+struct LoraAdapterGuard {
+    _adapter_id: String,
+    _weights: Vec<u8>,
+    _loaded_at: Instant,
+}
+
+impl LoraAdapterGuard {
+    fn load(adapter_id: &str) -> Result<Self> {
+        let adapter_path = resolve_lora_adapter_path(adapter_id)?;
+        let weights = fs::read(&adapter_path).map_err(|error| {
+            anyhow!(
+                "failed to load LoRA adapter `{adapter_id}` from `{}`: {error}",
+                adapter_path.display()
+            )
+        })?;
+        Ok(Self {
+            _adapter_id: adapter_id.to_owned(),
+            _weights: weights,
+            _loaded_at: Instant::now(),
+        })
+    }
+}
+
+impl Drop for LoraAdapterGuard {
+    fn drop(&mut self) {
+        self._weights.clear();
+        self._weights.shrink_to_fit();
+    }
+}
+
+fn resolve_lora_adapter_path(adapter_id: &str) -> Result<PathBuf> {
+    let sanitized = adapter_id.trim();
+    if sanitized.is_empty()
+        || sanitized.contains("..")
+        || sanitized.contains('/')
+        || sanitized.contains('\\')
+    {
+        return Err(anyhow!("LoRA adapter id `{adapter_id}` is invalid"));
+    }
+    Ok(std::env::var(MODEL_BROKER_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("tachyon_data"))
+        .join("adapters")
+        .join(format!("{sanitized}.safetensors")))
 }
 
 #[derive(Default)]
@@ -1389,6 +1471,7 @@ mod tests {
                 scheduler
                     .infer(
                         model,
+                        None,
                         WasiTensor::new(vec![1], TensorType::U8, b"hello".to_vec()),
                     )
                     .expect("inference should succeed")
@@ -1438,6 +1521,7 @@ mod tests {
                 scheduler
                     .enqueue(
                         Arc::clone(&batch_model),
+                        None,
                         WasiTensor::new(vec![1], TensorType::U8, b"batch".to_vec()),
                     )
                     .expect("batch request should queue"),
@@ -1447,6 +1531,7 @@ mod tests {
         let realtime_rx = scheduler
             .enqueue(
                 Arc::clone(&realtime_model),
+                None,
                 WasiTensor::new(vec![1], TensorType::U8, b"realtime".to_vec()),
             )
             .expect("realtime request should queue");
@@ -1513,6 +1598,48 @@ mod tests {
                 .expect("component compute should succeed"),
             MOCK_INFERENCE_RESPONSE
         );
+    }
+
+    #[test]
+    fn component_accelerator_runtime_loads_lora_adapter_for_single_call() {
+        let adapter_root = std::env::temp_dir().join(format!(
+            "tachyon-lora-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be valid")
+                .as_nanos()
+        ));
+        let adapter_dir = adapter_root.join("adapters");
+        fs::create_dir_all(&adapter_dir).expect("adapter dir should be created");
+        fs::write(adapter_dir.join("tenant-a.safetensors"), b"mock-lora")
+            .expect("adapter should be written");
+        std::env::set_var(MODEL_BROKER_DIR_ENV, &adapter_root);
+
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "llama3".to_owned(),
+            path: "/models/llama3.gguf".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::RealTime,
+        }];
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime should build");
+
+        assert_eq!(
+            runtime
+                .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-a"))
+                .expect("adapter-backed inference should succeed"),
+            MOCK_INFERENCE_RESPONSE
+        );
+        assert!(runtime
+            .compute_component_prompt_with_adapter("llama3", "hello", Some("../bad"))
+            .is_err());
+
+        std::env::remove_var(MODEL_BROKER_DIR_ENV);
+        let _ = fs::remove_dir_all(adapter_root);
     }
 
     #[test]

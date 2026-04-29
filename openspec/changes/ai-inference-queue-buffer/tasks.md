@@ -1,7 +1,7 @@
 # Implementation Tasks
 
 ## Phase 1: Queue Integration
-- [ ] Ensure `system-faas-buffer` exposes standard queue operations (`push`, `pop`, `ack`) via IPC.
+- [x] Ensure `system-faas-buffer` exposes standard queue operations (`push`, `pop`, `ack`) via IPC.
 - [ ] Update the `core-host` API router to intercept AI generation requests and route them to the buffer.
 - [ ] Implement the `202 Accepted` response logic returning a generated `job_id`.
 

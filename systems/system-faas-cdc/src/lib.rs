@@ -12,6 +12,7 @@ mod bindings {
 const DB_URL_ENV: &str = "DB_URL";
 const OUTBOX_TABLE_ENV: &str = "OUTBOX_TABLE";
 const TARGET_ROUTE_ENV: &str = "TARGET_ROUTE";
+const HEALTH_ROUTE_ENV: &str = "HEALTH_ROUTE";
 const BATCH_SIZE_ENV: &str = "BATCH_SIZE";
 const DEFAULT_BATCH_SIZE: u32 = 16;
 
@@ -29,6 +30,17 @@ fn poll_once() -> Result<(), String> {
     let db_url = required_env(DB_URL_ENV)?;
     let outbox_table = required_env(OUTBOX_TABLE_ENV)?;
     let target_route = normalize_target_route(&required_env(TARGET_ROUTE_ENV)?)?;
+    if let Some(health_route) = optional_route_env(HEALTH_ROUTE_ENV)? {
+        let response = bindings::tachyon::mesh::outbound_http::send_request(
+            "GET",
+            &format!("http://mesh{health_route}"),
+            &[],
+            &[],
+        )?;
+        if response.status >= 500 {
+            return Ok(());
+        }
+    }
     let batch_size = parse_batch_size();
     let events =
         bindings::tachyon::mesh::outbox_store::claim_events(&db_url, &outbox_table, batch_size)?;
@@ -47,6 +59,19 @@ fn poll_once() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn optional_route_env(name: &str) -> Result<Option<String>, String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| normalize_target_route(&value))
+        .transpose()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn retry_delay_ms(failures: u32) -> u64 {
+    let exponent = failures.min(5);
+    (1000_u64).saturating_mul(1_u64 << exponent).min(30_000)
 }
 
 fn required_env(name: &str) -> Result<String, String> {
@@ -120,5 +145,13 @@ mod tests {
             content_type_headers("application/json"),
             vec![("content-type".to_owned(), "application/json".to_owned())]
         );
+    }
+
+    #[test]
+    fn retry_delay_caps_at_thirty_seconds() {
+        assert_eq!(retry_delay_ms(0), 1000);
+        assert_eq!(retry_delay_ms(1), 2000);
+        assert_eq!(retry_delay_ms(4), 16_000);
+        assert_eq!(retry_delay_ms(9), 30_000);
     }
 }

@@ -1,12 +1,12 @@
 # Implementation Tasks
 
 ## Phase 1: Distributed Limiter FaaS
-- [ ] Bootstrap `systems/system-faas-dist-limiter`.
-- [ ] Implement a simplified CRDT counter (or use a crate like `rust-crdt`).
-- [ ] Integrate with `system-faas-gossip` IPC to send/receive state updates.
+- [x] Bootstrap `systems/system-faas-dist-limiter`.
+- [x] Implement a simplified CRDT counter (or use a crate like `rust-crdt`).
+- [x] Integrate with `system-faas-gossip` IPC to send/receive state updates.
 
 ## Phase 2: Core Host Integration
-- [ ] Update `IntegrityRoute` struct to support the `distributed_rate_limit` boolean flag.
+- [x] Update `IntegrityRoute` struct to support the `distributed_rate_limit` boolean flag.
 - [ ] In the HTTP/3 request pipeline, inject a call to the distributed limiter FaaS if the flag is enabled for the matched route.
 
 ## Phase 3: Resilience (Fail-Open)

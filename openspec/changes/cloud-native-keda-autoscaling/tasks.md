@@ -1,12 +1,12 @@
 # Implementation Tasks
 
 ## Phase 1: Metrics Extraction
-- [ ] Update `system-faas-buffer` to track the current queue depth in a thread-safe, low-latency counter.
-- [ ] Expose an internal IPC endpoint `get_queue_depth()`.
+- [x] Update `system-faas-buffer` to track the current queue depth in a thread-safe, low-latency counter.
+- [x] Expose an internal IPC endpoint `get_queue_depth()`.
 
 ## Phase 2: KEDA gRPC Implementation
-- [ ] In `systems/system-faas-keda`, implement the gRPC services required by the KEDA External Scaler specification.
-- [ ] Link this module to the internal `system-faas-buffer` to retrieve real-time metrics.
+- [x] In `systems/system-faas-keda`, implement the gRPC services required by the KEDA External Scaler specification.
+- [x] Link this module to the internal `system-faas-buffer` to retrieve real-time metrics.
 
 ## Phase 3: Integration with Custom Scaling
 - [ ] Update the `core-host` custom scaling logic to balance between:

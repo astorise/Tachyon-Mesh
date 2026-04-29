@@ -1,7 +1,9 @@
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import gsap from "gsap";
 import QRCode from "qrcode";
+
+import { mountNetworkStatus } from "./components/NetworkStatus";
+import { resilientInvoke as invoke } from "./utils/network";
 
 const configuredNodeUrl = (import.meta.env.VITE_TACHYON_NODE_URL ?? "").trim();
 const configuredNodeToken = (import.meta.env.VITE_TACHYON_NODE_TOKEN ?? "").trim();
@@ -76,6 +78,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const nodeId = document.getElementById("node-id");
   const headerTitle = document.getElementById("header-title");
   const headerSubtitle = document.getElementById("header-subtitle");
+  const header = document.querySelector<HTMLElement>(".header");
   const overlay = document.getElementById("auth-overlay");
   const firstRunModal = document.getElementById("first-run-modal");
   const authLoginStep = document.getElementById("auth-step-login");
@@ -245,6 +248,10 @@ document.addEventListener("DOMContentLoaded", () => {
       },
       "-=0.2",
     );
+
+  if (header) {
+    mountNetworkStatus(header);
+  }
 
   if (nodeUrl && !nodeUrl.value && configuredNodeUrl) {
     nodeUrl.value = configuredNodeUrl;
@@ -899,10 +906,24 @@ document.addEventListener("DOMContentLoaded", () => {
 
     resourceSaveBtn.disabled = true;
     resourceSaveBtn.textContent = "Saving...";
+    const previousResources = [...meshResources];
+    const payload: MeshResourceInput = { name, type, target, allowedMethods, versionConstraint };
+    const optimisticResource: MeshResource = {
+      name,
+      type,
+      target,
+      pending: true,
+      allowedMethods: allowedMethods ?? [],
+      versionConstraint,
+    };
+    meshResources =
+      resourceEditorMode === "edit"
+        ? meshResources.map((resource) => (resource.name === name ? optimisticResource : resource))
+        : [...meshResources.filter((resource) => resource.name !== name), optimisticResource];
+    renderResourceCatalog();
+    closeResourceEditor();
     try {
-      const payload: MeshResourceInput = { name, type, target, allowedMethods, versionConstraint };
       await invoke("save_resource", { resource: payload });
-      closeResourceEditor();
       showResourceActionResult(
         `Saved ${name} (pending CLI re-seal to promote into integrity.lock).`,
         "ok",
@@ -910,6 +931,8 @@ document.addEventListener("DOMContentLoaded", () => {
       await loadResources();
     } catch (error) {
       console.error("Resource save error:", error);
+      meshResources = previousResources;
+      renderResourceCatalog();
       if (resourceEditorError) {
         resourceEditorError.textContent = String(error);
         resourceEditorError.classList.remove("hidden");
@@ -925,12 +948,17 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!confirm(`Delete resource "${name}"? Sealed entries cannot be removed without a CLI re-seal.`)) {
       return;
     }
+    const previousResources = [...meshResources];
+    meshResources = meshResources.filter((resource) => resource.name !== name);
+    renderResourceCatalog();
     try {
       await invoke("delete_resource", { name });
       showResourceActionResult(`Removed ${name} from the workspace overlay.`, "ok");
       await loadResources();
     } catch (error) {
       console.error("Resource delete error:", error);
+      meshResources = previousResources;
+      renderResourceCatalog();
       showResourceActionResult(String(error), "err");
     }
   };
