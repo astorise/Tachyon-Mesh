@@ -160,6 +160,7 @@ const SYSTEM_BRIDGE_ROUTE: &str = "/system/bridge";
 const SYSTEM_CERT_MANAGER_ROUTE: &str = "/system/cert-manager";
 const SYSTEM_GATEWAY_ROUTE: &str = "/system/gateway";
 const SYSTEM_LOGGER_ROUTE: &str = "/system/logger";
+const SYSTEM_DIST_LIMITER_ROUTE: &str = "/system/dist-limiter";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
@@ -216,6 +217,8 @@ const DEFAULT_DISCOVERY_DIR: &str = "/tmp/tachyon/peers";
 const ROUTE_CONCURRENCY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const ROUTE_CONCURRENCY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+const DISTRIBUTED_RATE_LIMIT_TIMEOUT: Duration = Duration::from_millis(5);
+static DISTRIBUTED_RATE_LIMIT_BYPASS_TOTAL: AtomicU64 = AtomicU64::new(0);
 const POOLING_CORE_INSTANCES_MULTIPLIER: u32 = 8;
 const POOLING_MEMORIES_MULTIPLIER: u32 = 2;
 const POOLING_TABLES_MULTIPLIER: u32 = 2;
@@ -5255,6 +5258,138 @@ fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+async fn enforce_distributed_rate_limit(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+) -> Option<(StatusCode, String)> {
+    let Some(policy) = route.distributed_rate_limit.as_ref() else {
+        return None;
+    };
+    let Some(limiter_route) = runtime
+        .config
+        .sealed_route(SYSTEM_DIST_LIMITER_ROUTE)
+        .cloned()
+    else {
+        record_distributed_rate_limit_bypass(&route.path, "system route missing");
+        return None;
+    };
+
+    let key = distributed_rate_limit_key(headers);
+    let body = match serde_json::to_vec(&serde_json::json!({
+        "key": key,
+        "threshold": policy.threshold,
+        "window_seconds": policy.window_seconds,
+    })) {
+        Ok(body) => Bytes::from(body),
+        Err(error) => {
+            record_distributed_rate_limit_bypass(&route.path, &format!("encode failed: {error}"));
+            return None;
+        }
+    };
+    let method = Method::POST;
+    let uri = Uri::from_static("/system/dist-limiter/check");
+    let limiter_headers = HeaderMap::new();
+    let trailers = Vec::new();
+
+    let result = tokio::time::timeout(
+        DISTRIBUTED_RATE_LIMIT_TIMEOUT,
+        Box::pin(execute_route_with_middleware(
+            state,
+            runtime,
+            &limiter_route,
+            &limiter_headers,
+            &method,
+            &uri,
+            &body,
+            &trailers,
+            HopLimit(DEFAULT_HOP_LIMIT),
+            None,
+            false,
+            None,
+        )),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(result)) => distributed_rate_limit_decision(route, result.response),
+        Ok(Err((status, message))) => {
+            record_distributed_rate_limit_bypass(
+                &route.path,
+                &format!("limiter route failed with {status}: {message}"),
+            );
+            None
+        }
+        Err(_) => {
+            record_distributed_rate_limit_bypass(&route.path, "timeout");
+            None
+        }
+    }
+}
+
+fn distributed_rate_limit_decision(
+    route: &IntegrityRoute,
+    response: GuestHttpResponse,
+) -> Option<(StatusCode, String)> {
+    if !response.status.is_success() {
+        record_distributed_rate_limit_bypass(
+            &route.path,
+            &format!("limiter returned HTTP {}", response.status),
+        );
+        return None;
+    }
+
+    let value = match serde_json::from_slice::<Value>(&response.body) {
+        Ok(value) => value,
+        Err(error) => {
+            record_distributed_rate_limit_bypass(
+                &route.path,
+                &format!("invalid limiter response: {error}"),
+            );
+            return None;
+        }
+    };
+
+    if value
+        .get("allowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        None
+    } else {
+        Some((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("distributed rate limit exceeded for route `{}`", route.path),
+        ))
+    }
+}
+
+fn distributed_rate_limit_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+fn record_distributed_rate_limit_bypass(route_path: &str, reason: &str) {
+    DISTRIBUTED_RATE_LIMIT_BYPASS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        route = %route_path,
+        reason,
+        "distributed rate limiter bypassed; falling back to local limiter"
+    );
+}
+
+#[cfg(test)]
+fn distributed_rate_limit_bypass_total() -> u64 {
+    DISTRIBUTED_RATE_LIMIT_BYPASS_TOTAL.load(Ordering::Relaxed)
+}
+
 fn generate_traceparent() -> String {
     let trace_id = Uuid::new_v4().simple().to_string();
     let span_id = format!("{:016x}", rand::rng().random::<u64>());
@@ -7236,6 +7371,9 @@ async fn execute_route_request(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("system route `{}` shed under load", route.path),
         ));
+    }
+    if let Some(rejection) = enforce_distributed_rate_limit(state, runtime, route, headers).await {
+        return Err(rejection);
     }
     let selected_module = selected_module
         .map(str::to_owned)
@@ -19902,6 +20040,48 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot request writable direct host mounts"));
+    }
+
+    #[test]
+    fn distributed_rate_limit_key_uses_first_forwarded_for_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.10, 198.51.100.20"
+                .parse()
+                .expect("header should parse"),
+        );
+
+        assert_eq!(distributed_rate_limit_key(&headers), "203.0.113.10");
+    }
+
+    #[test]
+    fn distributed_rate_limit_decision_rejects_denied_response() {
+        let mut route = IntegrityRoute::user("/api/protected");
+        route.distributed_rate_limit = Some(DistributedRateLimitConfig {
+            threshold: 100,
+            window_seconds: 60,
+        });
+        let response = GuestHttpResponse::new(
+            StatusCode::OK,
+            Bytes::from_static(br#"{"allowed":false,"total":101}"#),
+        );
+
+        let rejection =
+            distributed_rate_limit_decision(&route, response).expect("request should be rejected");
+
+        assert_eq!(rejection.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(rejection.1.contains("/api/protected"));
+    }
+
+    #[test]
+    fn distributed_rate_limit_bypasses_invalid_response_with_metric() {
+        let route = IntegrityRoute::user("/api/protected");
+        let before = distributed_rate_limit_bypass_total();
+        let response = GuestHttpResponse::new(StatusCode::OK, Bytes::from_static(b"not-json"));
+
+        assert!(distributed_rate_limit_decision(&route, response).is_none());
+        assert_eq!(distributed_rate_limit_bypass_total(), before + 1);
     }
 
     #[test]
