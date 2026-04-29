@@ -1593,6 +1593,7 @@ struct StorageBrokerWriteRequest {
     host_target: PathBuf,
     mode: StorageWriteMode,
     body: Vec<u8>,
+    sync_to_cloud: bool,
 }
 
 #[derive(Debug)]
@@ -2587,12 +2588,19 @@ impl StorageBrokerManager {
         body: Vec<u8>,
     ) -> std::result::Result<(), String> {
         let resolved = resolve_storage_write_target(route, path)?;
-        self.enqueue_write_target(route.path.clone(), resolved, mode, body)
+        self.enqueue_write_target(
+            route.path.clone(),
+            route.sync_to_cloud,
+            resolved,
+            mode,
+            body,
+        )
     }
 
     fn enqueue_write_target(
         &self,
         route_path: String,
+        sync_to_cloud: bool,
         resolved: ResolvedStorageWriteTarget,
         mode: StorageWriteMode,
         body: Vec<u8>,
@@ -2604,6 +2612,7 @@ impl StorageBrokerManager {
             host_target: resolved.host_target,
             mode,
             body,
+            sync_to_cloud,
         }))
     }
 
@@ -2724,6 +2733,16 @@ impl StorageVolumeQueue {
                             host_target = %request.host_target.display(),
                             "storage broker write failed: {error}"
                         );
+                    } else if request.sync_to_cloud {
+                        if let Err(error) = emit_storage_mutation_event(&self.core_store, &request)
+                        {
+                            tracing::warn!(
+                                route = %request.route_path,
+                                guest_path = %request.guest_path,
+                                host_target = %request.host_target.display(),
+                                "storage broker CDC event emit failed: {error:#}"
+                            );
+                        }
                     }
                 }
                 StorageBrokerOperation::Snapshot(request) => {
@@ -3737,6 +3756,32 @@ fn process_storage_write_request(request: &StorageBrokerWriteRequest) -> Result<
             })
         }
     }
+}
+
+fn emit_storage_mutation_event(
+    core_store: &store::CoreStore,
+    request: &StorageBrokerWriteRequest,
+) -> Result<String> {
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("system clock is set before the Unix epoch")?
+        .as_millis();
+    let value_hash = format!("sha256:{}", hex::encode(Sha256::digest(&request.body)));
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "event": "tachyon.data.mutation",
+        "route_path": request.route_path,
+        "resource": request.guest_path,
+        "operation": match request.mode {
+            StorageWriteMode::Overwrite => "overwrite",
+            StorageWriteMode::Append => "append",
+        },
+        "value_hash": value_hash,
+        "value_bytes": request.body.len(),
+        "timestamp_unix_ms": timestamp_unix_ms,
+    }))
+    .context("failed to serialize CDC mutation event")?;
+
+    core_store.append_outbox(store::CoreStoreBucket::DataMutationOutbox, &payload)
 }
 
 fn process_storage_snapshot_request(
@@ -13160,8 +13205,13 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
             &path,
         )?;
 
-        self.storage_broker
-            .enqueue_write_target(route.path, resolved, mode, body)
+        self.storage_broker.enqueue_write_target(
+            route.path,
+            route.sync_to_cloud,
+            resolved,
+            mode,
+            body,
+        )
     }
 
     fn snapshot_volume(
@@ -20044,6 +20094,70 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(volume_dir);
+    }
+
+    #[test]
+    fn storage_broker_emits_cdc_event_after_sync_enabled_write() {
+        let volume_dir = unique_test_dir("tachyon-cdc-write");
+        let store_path = unique_test_dir("tachyon-cdc-store").join("tachyon.db");
+        let core_store = Arc::new(store::CoreStore::open(&store_path).expect("store should open"));
+        let broker = StorageBrokerManager::new(Arc::clone(&core_store));
+        let mut route = storage_broker_test_route(&volume_dir);
+
+        broker
+            .enqueue_write_for_route(
+                &route,
+                "/app/data/local.txt",
+                StorageWriteMode::Overwrite,
+                b"local-only".to_vec(),
+            )
+            .expect("non CDC write should be accepted");
+        assert!(
+            broker.wait_for_volume_idle(&volume_dir, Duration::from_secs(5)),
+            "broker queue should drain"
+        );
+        assert!(
+            core_store
+                .peek_outbox(store::CoreStoreBucket::DataMutationOutbox, 10)
+                .expect("outbox should be readable")
+                .is_empty(),
+            "non opt-in route should not emit CDC events"
+        );
+
+        route.sync_to_cloud = true;
+        broker
+            .enqueue_write_for_route(
+                &route,
+                "/app/data/state.txt",
+                StorageWriteMode::Append,
+                b"replicate-me".to_vec(),
+            )
+            .expect("CDC write should be accepted");
+        assert!(
+            broker.wait_for_volume_idle(&volume_dir, Duration::from_secs(5)),
+            "broker queue should drain"
+        );
+
+        let events = core_store
+            .peek_outbox(store::CoreStoreBucket::DataMutationOutbox, 10)
+            .expect("outbox should be readable");
+        assert_eq!(events.len(), 1);
+        let payload: Value =
+            serde_json::from_slice(&events[0].1).expect("CDC event should be JSON");
+        assert_eq!(payload["event"], "tachyon.data.mutation");
+        assert_eq!(payload["route_path"], route.path);
+        assert_eq!(payload["resource"], "/app/data/state.txt");
+        assert_eq!(payload["operation"], "append");
+        assert_eq!(payload["value_bytes"], 12);
+        assert_eq!(
+            payload["value_hash"],
+            format!("sha256:{}", hex::encode(Sha256::digest(b"replicate-me")))
+        );
+
+        let _ = fs::remove_dir_all(volume_dir);
+        if let Some(parent) = store_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 
     #[tokio::test]
