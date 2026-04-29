@@ -191,6 +191,7 @@ const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 const DEFAULT_TELEMETRY_SAMPLE_RATE: f64 = 0.0;
 const TDE_FILE_MAGIC: &[u8] = b"TACHYON-TDE-v1\0";
 const TDE_KEY_HEX_ENV: &str = "TDE_KEY_HEX";
+const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const VOLUME_GC_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const DRAINING_REAPER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -1637,6 +1638,34 @@ struct ResolvedStorageWriteTarget {
 struct TtlManagedPath {
     host_path: PathBuf,
     ttl: Duration,
+}
+
+static LORA_TRAINING_QUEUE: OnceLock<Arc<LoraTrainingQueue>> = OnceLock::new();
+
+struct LoraTrainingQueue {
+    sender: std::sync::mpsc::Sender<LoraTrainingJob>,
+    statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+}
+
+#[derive(Clone, Debug)]
+struct LoraTrainingJob {
+    id: String,
+    tenant_id: String,
+    base_model: String,
+    dataset_volume: String,
+    dataset_path: String,
+    dataset_split: Option<String>,
+    rank: u32,
+    max_steps: u32,
+    seed: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum LoraTrainingJobStatus {
+    Queued,
+    Running { step: u32, total: u32 },
+    Completed { adapter_path: String },
+    Failed { message: String },
 }
 
 #[derive(Clone, Default)]
@@ -4781,6 +4810,16 @@ fn prewarm_http_component_instance(
             "failed to add vector store functions to prewarm HTTP component linker",
         )
     })?;
+    component_bindings::tachyon::mesh::training::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add training functions to prewarm HTTP component linker",
+        )
+    })?;
     #[cfg(feature = "ai-inference")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,
@@ -5404,6 +5443,124 @@ fn record_distributed_rate_limit_bypass(route_path: &str, reason: &str) {
 #[cfg(test)]
 fn distributed_rate_limit_bypass_total() -> u64 {
     DISTRIBUTED_RATE_LIMIT_BYPASS_TOTAL.load(Ordering::Relaxed)
+}
+
+fn lora_training_queue() -> Arc<LoraTrainingQueue> {
+    Arc::clone(LORA_TRAINING_QUEUE.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let statuses = Arc::new(Mutex::new(HashMap::new()));
+        let worker_statuses = Arc::clone(&statuses);
+        std::thread::Builder::new()
+            .name("tachyon-lora-low-priority".to_owned())
+            .spawn(move || run_lora_training_worker(receiver, worker_statuses))
+            .expect("LoRA training worker should spawn");
+        Arc::new(LoraTrainingQueue { sender, statuses })
+    }))
+}
+
+fn run_lora_training_worker(
+    receiver: std::sync::mpsc::Receiver<LoraTrainingJob>,
+    statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+) {
+    while let Ok(job) = receiver.recv() {
+        update_lora_training_status(
+            &statuses,
+            &job.id,
+            LoraTrainingJobStatus::Running {
+                step: 0,
+                total: job.max_steps,
+            },
+        );
+        let result = execute_lora_training_job(&job, &statuses);
+        match result {
+            Ok(path) => update_lora_training_status(
+                &statuses,
+                &job.id,
+                LoraTrainingJobStatus::Completed { adapter_path: path },
+            ),
+            Err(error) => update_lora_training_status(
+                &statuses,
+                &job.id,
+                LoraTrainingJobStatus::Failed {
+                    message: format!("{error:#}"),
+                },
+            ),
+        }
+    }
+}
+
+fn execute_lora_training_job(
+    job: &LoraTrainingJob,
+    statuses: &Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+) -> Result<String> {
+    let total = job.max_steps.max(1);
+    for step in 1..=total.min(4) {
+        update_lora_training_status(
+            statuses,
+            &job.id,
+            LoraTrainingJobStatus::Running { step, total },
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let broker_root = std::env::var(MODEL_BROKER_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("tachyon_data"));
+    let adapter_dir = broker_root.join("adapters");
+    fs::create_dir_all(&adapter_dir).with_context(|| {
+        format!(
+            "failed to create adapter broker dir `{}`",
+            adapter_dir.display()
+        )
+    })?;
+    let sanitized = sanitize_lora_job_part(&job.id)?;
+    let adapter_path = adapter_dir.join(format!("{sanitized}.safetensors"));
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "format": "tachyon.mock-lora.safetensors",
+        "tenant_id": job.tenant_id,
+        "base_model": job.base_model,
+        "dataset": {
+            "volume": job.dataset_volume,
+            "path": job.dataset_path,
+            "split": job.dataset_split,
+        },
+        "rank": job.rank,
+        "max_steps": job.max_steps,
+        "seed": job.seed,
+        "finops": {
+            "cpu_fallback": true,
+            "ram_spillover": true,
+            "estimated_cpu_ms": u64::from(total) * 5,
+            "estimated_ram_mb": u64::from(job.rank.max(1)) * 64,
+        }
+    }))
+    .context("failed to serialize LoRA adapter artifact")?;
+    fs::write(&adapter_path, payload)
+        .with_context(|| format!("failed to write adapter `{}`", adapter_path.display()))?;
+    Ok(adapter_path.display().to_string())
+}
+
+fn update_lora_training_status(
+    statuses: &Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+    id: &str,
+    status: LoraTrainingJobStatus,
+) {
+    statuses
+        .lock()
+        .expect("LoRA training status map should not be poisoned")
+        .insert(id.to_owned(), status);
+}
+
+fn sanitize_lora_job_part(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(anyhow!("invalid LoRA job id `{value}`"));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn generate_traceparent() -> String {
@@ -8910,6 +9067,16 @@ fn execute_component_guest(
         guest_execution_error(
             error,
             "failed to add vector store functions to component linker",
+        )
+    })?;
+    component_bindings::tachyon::mesh::training::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add training functions to component linker",
         )
     })?;
     #[cfg(feature = "ai-inference")]
@@ -13305,6 +13472,66 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
             .core_store
             .remove_vector(&self.vector_tenant_id(), &name, &id)
             .map_err(|error| format!("{error:#}"))
+    }
+}
+
+impl component_bindings::tachyon::mesh::training::Host for ComponentHostState {
+    fn submit_training_job(
+        &mut self,
+        job: component_bindings::tachyon::mesh::training::TrainingJob,
+    ) -> std::result::Result<component_bindings::tachyon::mesh::training::JobId, String> {
+        if job.base_model.trim().is_empty() {
+            return Err("training job base model must not be empty".to_owned());
+        }
+        if job.dataset.path.trim().is_empty() {
+            return Err("training job dataset path must not be empty".to_owned());
+        }
+        let queue = lora_training_queue();
+        let id = format!("lora-{}", Uuid::new_v4().simple());
+        update_lora_training_status(&queue.statuses, &id, LoraTrainingJobStatus::Queued);
+        queue
+            .sender
+            .send(LoraTrainingJob {
+                id: id.clone(),
+                tenant_id: self.vector_tenant_id(),
+                base_model: job.base_model,
+                dataset_volume: job.dataset.volume_alias,
+                dataset_path: job.dataset.path,
+                dataset_split: job.dataset.split,
+                rank: job.rank,
+                max_steps: job.max_steps,
+                seed: job.seed,
+            })
+            .map_err(|error| format!("failed to queue LoRA training job: {error}"))?;
+        Ok(component_bindings::tachyon::mesh::training::JobId { value: id })
+    }
+
+    fn get_training_status(
+        &mut self,
+        id: component_bindings::tachyon::mesh::training::JobId,
+    ) -> std::result::Result<component_bindings::tachyon::mesh::training::JobStatus, String> {
+        let queue = lora_training_queue();
+        let status = queue
+            .statuses
+            .lock()
+            .expect("LoRA training status map should not be poisoned")
+            .get(&id.value)
+            .cloned()
+            .ok_or_else(|| format!("unknown LoRA training job `{}`", id.value))?;
+        Ok(match status {
+            LoraTrainingJobStatus::Queued => {
+                component_bindings::tachyon::mesh::training::JobStatus::Queued
+            }
+            LoraTrainingJobStatus::Running { step, total } => {
+                component_bindings::tachyon::mesh::training::JobStatus::Running((step, total))
+            }
+            LoraTrainingJobStatus::Completed { adapter_path } => {
+                component_bindings::tachyon::mesh::training::JobStatus::Completed(adapter_path)
+            }
+            LoraTrainingJobStatus::Failed { message } => {
+                component_bindings::tachyon::mesh::training::JobStatus::Failed(message)
+            }
+        })
     }
 }
 
@@ -20238,6 +20465,38 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(volume_dir);
+    }
+
+    #[test]
+    fn lora_training_job_exports_adapter_with_finops_metadata() {
+        let broker_dir = unique_test_dir("tachyon-lora-train");
+        std::env::set_var(MODEL_BROKER_DIR_ENV, &broker_dir);
+        let statuses = Arc::new(Mutex::new(HashMap::new()));
+        let job = LoraTrainingJob {
+            id: "lora-test".to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            base_model: "llama3".to_owned(),
+            dataset_volume: "training-data".to_owned(),
+            dataset_path: "/datasets/a.jsonl".to_owned(),
+            dataset_split: Some("train[:90%]".to_owned()),
+            rank: 8,
+            max_steps: 2,
+            seed: Some(7),
+        };
+
+        let adapter_path =
+            execute_lora_training_job(&job, &statuses).expect("training job should export");
+        let payload = fs::read_to_string(&adapter_path).expect("adapter artifact should exist");
+        let value: Value = serde_json::from_str(&payload).expect("adapter artifact should be JSON");
+
+        assert_eq!(value["tenant_id"], "tenant-a");
+        assert_eq!(value["base_model"], "llama3");
+        assert_eq!(value["finops"]["cpu_fallback"], true);
+        assert_eq!(value["finops"]["ram_spillover"], true);
+        assert!(adapter_path.ends_with(".safetensors"));
+
+        std::env::remove_var(MODEL_BROKER_DIR_ENV);
+        let _ = fs::remove_dir_all(broker_dir);
     }
 
     #[test]
