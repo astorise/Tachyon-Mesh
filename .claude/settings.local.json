@@ -23,6 +23,9 @@
       "PowerShell(Get-Command k3d, kubectl, helm, docker, k3s -ErrorAction SilentlyContinue | Select-Object Name, Source; Write-Output \"---\"; Get-ChildItem \"C:\\\\Program Files\\\\Rancher Desktop\" -ErrorAction SilentlyContinue | Select-Object -First 5; Write-Output \"---\"; Test-Path \"$env:USERPROFILE\\\\.kube\\\\config\")",
       "PowerShell(Get-Content \"$env:USERPROFILE\\\\.kube\\\\config\" | Select-String -Pattern \"server:|name:|current-context:\" | Select-Object -First 20)",
       "Read(//c/Program Files/tachyon-ui/**)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\astor\\.claude\\plans"
     ]
   }
 }

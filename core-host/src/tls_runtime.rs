@@ -285,6 +285,7 @@ impl TlsManager {
                     host_load,
                     #[cfg(feature = "ai-inference")]
                     ai_runtime,
+                    instance_pool: None,
                 },
             )
         })
