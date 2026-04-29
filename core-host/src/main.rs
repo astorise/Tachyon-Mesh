@@ -5120,6 +5120,7 @@ fn integrity_manifest_path() -> PathBuf {
 fn build_app(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/status", get(auth::admin_status_handler))
+        .route("/admin/manifest", post(admin_manifest_update_handler))
         .route(
             "/admin/security/recovery-codes",
             post(auth::generate_recovery_codes_handler),
@@ -10300,6 +10301,134 @@ fn is_integrity_schema_violation(error: &anyhow::Error) -> bool {
     error.to_string().contains(ERR_INTEGRITY_SCHEMA_VIOLATION)
 }
 
+/// Cluster-wide configuration update event written to `config_update_outbox`
+/// whenever a node accepts a signed manifest via `POST /admin/manifest`. The
+/// gossip bridge (still TODO — Session C wiring) reads from this table and
+/// broadcasts to peers, who then pull the new manifest from `origin_node_id`
+/// over the secure overlay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ConfigUpdateEvent {
+    pub version: u64,
+    pub checksum: String,
+    pub origin_node_id: String,
+    pub ts_ms: u64,
+}
+
+/// `POST /admin/manifest` body: the same `IntegrityManifest` shape as the
+/// on-disk file (so admin tooling can hand the file's bytes through unchanged).
+/// The payload's signature is verified against the same trust root as the
+/// embedded boot manifest. Updates are accepted only when the new
+/// `config_version` is strictly greater than the running one — a defense
+/// against rollback / replay across the cluster.
+pub(crate) async fn admin_manifest_update_handler(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    let manifest: IntegrityManifest = match serde_json::from_slice(&body) {
+        Ok(m) => m,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("failed to decode manifest payload: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    // Verify signature + parse + validate the embedded config. This rejects
+    // unsigned / tampered submissions before we touch disk.
+    let new_config = match verify_integrity_payload(
+        &manifest.config_payload,
+        &manifest.public_key,
+        &manifest.signature,
+        "admin manifest submission",
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("manifest signature verification failed: {error:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    let current_version = state.runtime.load().config.config_version;
+    if new_config.config_version <= current_version {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "manifest config_version {} is not strictly greater than current {}",
+                new_config.config_version, current_version
+            ),
+        )
+            .into_response();
+    }
+
+    // Atomic write: stage to a tempfile, fsync, rename. The notify-based
+    // watcher (Wave 1) sees the rename and triggers `reload_runtime_from_disk`.
+    let manifest_path = state.manifest_path.clone();
+    let payload_bytes = body.to_vec();
+    let write_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let staging = manifest_path.with_extension("lock.tmp");
+        fs::write(&staging, &payload_bytes)?;
+        fs::rename(&staging, &manifest_path)?;
+        Ok(())
+    })
+    .await;
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to persist manifest: {error}"),
+            )
+                .into_response();
+        }
+        Err(join_error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("manifest write task failed: {join_error}"),
+            )
+                .into_response();
+        }
+    }
+
+    // Emit a gossip update event for peers.
+    use sha2::Digest;
+    let checksum = format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(manifest.config_payload.as_bytes()))
+    );
+    let ts_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let event = ConfigUpdateEvent {
+        version: new_config.config_version,
+        checksum,
+        origin_node_id: state.host_identity.public_key_hex.clone(),
+        ts_ms,
+    };
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        if let Err(error) = state
+            .core_store
+            .append_outbox(store::CoreStoreBucket::ConfigUpdateOutbox, &payload)
+        {
+            tracing::warn!("manifest accepted but config_update_outbox append failed: {error:#}");
+        }
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        format!(
+            "manifest accepted, config_version={}",
+            new_config.config_version
+        ),
+    )
+        .into_response()
+}
+
 fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityConfig> {
     if config.host_address.trim().is_empty() {
         return Err(anyhow!(
@@ -14555,6 +14684,90 @@ mod tests {
             ]
         );
         assert!(user_env.is_empty());
+    }
+
+    fn signed_manifest_for(config: &IntegrityConfig, signing_key: &SigningKey) -> Vec<u8> {
+        let payload = canonical_config_payload(config).expect("payload should serialize");
+        let signature = signing_key.sign(&Sha256::digest(payload.as_bytes()));
+        let manifest = IntegrityManifest {
+            config_payload: payload,
+            public_key: hex::encode(signing_key.verifying_key().to_bytes()),
+            signature: hex::encode(signature.to_bytes()),
+        };
+        serde_json::to_vec(&manifest).expect("manifest should serialize")
+    }
+
+    #[tokio::test]
+    async fn admin_manifest_update_accepts_higher_version_and_emits_outbox_event() {
+        let mut current = IntegrityConfig::default_sealed();
+        current.config_version = 1;
+        let telemetry = telemetry::init_test_telemetry();
+        let state = build_test_state(current.clone(), telemetry);
+
+        let mut next = current.clone();
+        next.config_version = 7;
+        let signing_key = SigningKey::from_bytes(&[42_u8; 32]);
+        let body = Bytes::from(signed_manifest_for(&next, &signing_key));
+
+        let response = admin_manifest_update_handler(State(state.clone()), body).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        // The outbox should now hold exactly one event for the new version.
+        let rows = state
+            .core_store
+            .peek_outbox(store::CoreStoreBucket::ConfigUpdateOutbox, 16)
+            .expect("peek outbox");
+        assert_eq!(rows.len(), 1);
+        let event: ConfigUpdateEvent =
+            serde_json::from_slice(&rows[0].1).expect("event payload parses");
+        assert_eq!(event.version, 7);
+        assert_eq!(event.origin_node_id, state.host_identity.public_key_hex);
+        assert!(event.checksum.starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn admin_manifest_update_rejects_rollback() {
+        let mut current = IntegrityConfig::default_sealed();
+        current.config_version = 9;
+        let telemetry = telemetry::init_test_telemetry();
+        let state = build_test_state(current.clone(), telemetry);
+
+        let mut older = current.clone();
+        older.config_version = 5;
+        let signing_key = SigningKey::from_bytes(&[42_u8; 32]);
+        let body = Bytes::from(signed_manifest_for(&older, &signing_key));
+
+        let response = admin_manifest_update_handler(State(state.clone()), body).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Outbox stays empty on rejection.
+        let rows = state
+            .core_store
+            .peek_outbox(store::CoreStoreBucket::ConfigUpdateOutbox, 16)
+            .expect("peek outbox");
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_manifest_update_rejects_tampered_signature() {
+        let mut current = IntegrityConfig::default_sealed();
+        current.config_version = 1;
+        let telemetry = telemetry::init_test_telemetry();
+        let state = build_test_state(current.clone(), telemetry);
+
+        let mut next = current.clone();
+        next.config_version = 7;
+        let signing_key = SigningKey::from_bytes(&[42_u8; 32]);
+        let mut bytes = signed_manifest_for(&next, &signing_key);
+        // Flip a byte inside the JSON payload — signature no longer matches.
+        let pos = bytes
+            .iter()
+            .position(|b| *b == b'1')
+            .expect("contains a '1'");
+        bytes[pos] = b'2';
+        let response =
+            admin_manifest_update_handler(State(state.clone()), Bytes::from(bytes)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

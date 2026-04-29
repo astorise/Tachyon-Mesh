@@ -27,6 +27,12 @@ const DATA_MUTATION_OUTBOX_TABLE: TableDefinition<&str, &[u8]> =
 /// Out-of-band fuel-metering events emitted post-execution. Producer: `core-host`.
 /// Consumer: `system-faas-metering`. Key: monotonic event id.
 const METERING_OUTBOX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metering_outbox");
+/// Cluster-wide configuration update events emitted by `POST /admin/manifest`.
+/// Producer: `core-host` after a signed manifest is accepted. Consumer: the
+/// gossip-bridge which broadcasts `ConfigUpdateEvent` so peers can pull the
+/// new manifest. Key: monotonic event id.
+const CONFIG_UPDATE_OUTBOX_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("config_update_outbox");
 
 #[derive(Clone)]
 pub(crate) struct CoreStore {
@@ -49,6 +55,7 @@ pub(crate) enum CoreStoreBucket {
     #[allow(dead_code)]
     DataMutationOutbox,
     MeteringOutbox,
+    ConfigUpdateOutbox,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,6 +126,9 @@ impl CoreStore {
             write_txn
                 .open_table(METERING_OUTBOX_TABLE)
                 .context("failed to open metering_outbox table")?;
+            write_txn
+                .open_table(CONFIG_UPDATE_OUTBOX_TABLE)
+                .context("failed to open config_update_outbox table")?;
         }
         write_txn
             .commit()
@@ -145,6 +155,9 @@ impl CoreStore {
                 read_bytes(&read_txn, DATA_MUTATION_OUTBOX_TABLE, key)
             }
             CoreStoreBucket::MeteringOutbox => read_bytes(&read_txn, METERING_OUTBOX_TABLE, key),
+            CoreStoreBucket::ConfigUpdateOutbox => {
+                read_bytes(&read_txn, CONFIG_UPDATE_OUTBOX_TABLE, key)
+            }
         }
     }
 
@@ -219,6 +232,14 @@ impl CoreStore {
                         .insert(key, value)
                         .context("failed to insert metering outbox entry")?;
                 }
+                CoreStoreBucket::ConfigUpdateOutbox => {
+                    let mut table = write_txn
+                        .open_table(CONFIG_UPDATE_OUTBOX_TABLE)
+                        .context("failed to open config_update_outbox table")?;
+                    table
+                        .insert(key, value)
+                        .context("failed to insert config update outbox entry")?;
+                }
             };
         }
         write_txn
@@ -289,6 +310,13 @@ impl CoreStore {
                         .remove(key)
                         .context("failed to delete metering outbox entry")?;
                 }
+                CoreStoreBucket::ConfigUpdateOutbox => {
+                    write_txn
+                        .open_table(CONFIG_UPDATE_OUTBOX_TABLE)
+                        .context("failed to open config_update_outbox table")?
+                        .remove(key)
+                        .context("failed to delete config update outbox entry")?;
+                }
             }
         }
         write_txn
@@ -336,6 +364,7 @@ impl CoreStore {
             CoreStoreBucket::AuthzPurgeOutbox => AUTHZ_PURGE_OUTBOX_TABLE,
             CoreStoreBucket::DataMutationOutbox => DATA_MUTATION_OUTBOX_TABLE,
             CoreStoreBucket::MeteringOutbox => METERING_OUTBOX_TABLE,
+            CoreStoreBucket::ConfigUpdateOutbox => CONFIG_UPDATE_OUTBOX_TABLE,
             other => {
                 return Err(anyhow::anyhow!(
                     "peek_outbox is only valid for outbox-style buckets; got {other:?}"
