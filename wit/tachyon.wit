@@ -118,6 +118,39 @@ interface vector {
     remove: func(name: index-name, id: string) -> result<bool, string>;
 }
 
+interface training {
+    type rank = u32;
+    type step-budget = u32;
+
+    record dataset-handle {
+        volume-alias: string,
+        path: string,
+        split: option<string>,
+    }
+
+    record training-job {
+        base-model: string,
+        dataset: dataset-handle,
+        rank: rank,
+        max-steps: step-budget,
+        seed: option<u64>,
+    }
+
+    record job-id {
+        value: string,
+    }
+
+    variant job-status {
+        queued,
+        running(tuple<u32, u32>),
+        completed(string),
+        failed(string),
+    }
+
+    submit-training-job: func(job: training-job) -> result<job-id, string>;
+    get-training-status: func(id: job-id) -> result<job-status, string>;
+}
+
 interface storage-broker {
     enum write-mode {
         overwrite,
@@ -188,6 +221,7 @@ world faas-guest {
     import bridge-controller;
     import secrets-vault;
     import vector;
+    import training;
     export handler;
 }
 
