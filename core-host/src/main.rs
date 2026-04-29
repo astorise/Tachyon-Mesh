@@ -4771,6 +4771,16 @@ fn prewarm_http_component_instance(
             "failed to add bridge controller functions to prewarm HTTP component linker",
         )
     })?;
+    component_bindings::tachyon::mesh::vector::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add vector store functions to prewarm HTTP component linker",
+        )
+    })?;
     #[cfg(feature = "ai-inference")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,
@@ -8892,6 +8902,16 @@ fn execute_component_guest(
             "failed to add bridge controller functions to component linker",
         )
     })?;
+    component_bindings::tachyon::mesh::vector::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add vector store functions to component linker",
+        )
+    })?;
     #[cfg(feature = "ai-inference")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,
@@ -12248,6 +12268,17 @@ impl ComponentHostState {
             .unwrap_or_default()
     }
 
+    fn vector_tenant_id(&self) -> String {
+        self.request_headers
+            .get("x-tachyon-tenant")
+            .or_else(|| self.request_headers.get("x-tenant-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&self.route_path)
+            .to_owned()
+    }
+
     fn hot_model_aliases(&self) -> Vec<String> {
         #[cfg(feature = "ai-inference")]
         {
@@ -13205,6 +13236,75 @@ impl system_component_bindings::tachyon::mesh::bridge_controller::Host for Compo
 
     fn destroy_bridge(&mut self, bridge_id: String) -> std::result::Result<(), String> {
         self.handle_bridge_destroy(&bridge_id)
+    }
+}
+
+impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
+    fn create_index(
+        &mut self,
+        spec: component_bindings::tachyon::mesh::vector::IndexSpec,
+    ) -> std::result::Result<(), String> {
+        self.storage_broker
+            .core_store
+            .create_vector_index(
+                &self.vector_tenant_id(),
+                &spec.name,
+                spec.dim as usize,
+                spec.m,
+                spec.ef_construction,
+            )
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn upsert(
+        &mut self,
+        name: String,
+        docs: Vec<component_bindings::tachyon::mesh::vector::Document>,
+    ) -> std::result::Result<(), String> {
+        let docs = docs
+            .into_iter()
+            .map(|doc| store::VectorDocument {
+                id: doc.id,
+                embedding: doc.embedding,
+                payload: doc.payload,
+            })
+            .collect();
+        self.storage_broker
+            .core_store
+            .upsert_vectors(&self.vector_tenant_id(), &name, docs)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn search(
+        &mut self,
+        name: String,
+        query: Vec<f32>,
+        k: u32,
+    ) -> std::result::Result<Vec<component_bindings::tachyon::mesh::vector::SearchMatch>, String>
+    {
+        self.storage_broker
+            .core_store
+            .search_vectors(&self.vector_tenant_id(), &name, &query, k as usize)
+            .map(|matches| {
+                matches
+                    .into_iter()
+                    .map(
+                        |item| component_bindings::tachyon::mesh::vector::SearchMatch {
+                            id: item.id,
+                            score: item.score,
+                            payload: item.payload,
+                        },
+                    )
+                    .collect()
+            })
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn remove(&mut self, name: String, id: String) -> std::result::Result<bool, String> {
+        self.storage_broker
+            .core_store
+            .remove_vector(&self.vector_tenant_id(), &name, &id)
+            .map_err(|error| format!("{error:#}"))
     }
 }
 
