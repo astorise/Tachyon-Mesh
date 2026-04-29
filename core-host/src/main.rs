@@ -74,6 +74,7 @@ use wasmtime_wasi_nn::witx::WasiNnCtx;
 mod ai_inference;
 mod auth;
 mod data_events;
+mod node_enrollment;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
 #[cfg(feature = "resiliency")]
@@ -313,6 +314,7 @@ struct AppState {
     tls_manager: Arc<tls_runtime::TlsManager>,
     mtls_gateway: Option<Arc<tls_runtime::MtlsGatewayConfig>>,
     auth_manager: Arc<auth::AuthManager>,
+    enrollment_manager: Arc<node_enrollment::EnrollmentManager>,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     manifest_path: PathBuf,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -2201,6 +2203,7 @@ async fn serve_host() -> Result<()> {
         tls_manager,
         mtls_gateway: mtls_gateway.map(Arc::new),
         auth_manager,
+        enrollment_manager: Arc::new(node_enrollment::EnrollmentManager::new()),
         manifest_path,
         background_workers: Arc::clone(&background_workers),
     };
@@ -5121,6 +5124,18 @@ fn build_app(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/status", get(auth::admin_status_handler))
         .route("/admin/manifest", post(admin_manifest_update_handler))
+        .route(
+            "/admin/enrollment/start",
+            post(admin_enrollment_start_handler),
+        )
+        .route(
+            "/admin/enrollment/approve",
+            post(admin_enrollment_approve_handler),
+        )
+        .route(
+            "/admin/enrollment/poll/{session_id}",
+            get(admin_enrollment_poll_handler),
+        )
         .route(
             "/admin/security/recovery-codes",
             post(auth::generate_recovery_codes_handler),
@@ -10301,6 +10316,99 @@ fn is_integrity_schema_violation(error: &anyhow::Error) -> bool {
     error.to_string().contains(ERR_INTEGRITY_SCHEMA_VIOLATION)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminEnrollmentStartRequest {
+    node_public_key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminEnrollmentStartResponse {
+    session_id: String,
+    pin: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminEnrollmentApproveRequest {
+    session_id: String,
+    pin: String,
+    /// Hex-encoded signed certificate the operator-side node minted for the
+    /// new device. The signing happens upstream of this endpoint (e.g. via the
+    /// existing `auth_manager` token-signing or a dedicated cluster-CA tool);
+    /// this handler just stages the bytes for the unenrolled node to fetch.
+    signed_certificate_hex: String,
+}
+
+/// `POST /admin/enrollment/start` — begin a node enrollment session. Caller is
+/// the unenrolled node's outbound channel (via the active node's HTTP
+/// gateway); body carries the new node's hex-encoded ed25519 public key.
+/// Returns the session id + the human-readable PIN the operator must enter
+/// in Tachyon Studio to approve the enrollment.
+pub(crate) async fn admin_enrollment_start_handler(
+    State(state): State<AppState>,
+    axum::Json(payload): axum::Json<AdminEnrollmentStartRequest>,
+) -> Response {
+    let node_pubkey = payload.node_public_key.trim().to_owned();
+    if node_pubkey.is_empty() {
+        return (StatusCode::BAD_REQUEST, "nodePublicKey is required").into_response();
+    }
+    let session = state.enrollment_manager.start_session(node_pubkey);
+    let body = AdminEnrollmentStartResponse {
+        session_id: session.session_id,
+        pin: session.pin,
+    };
+    (StatusCode::CREATED, axum::Json(body)).into_response()
+}
+
+/// `POST /admin/enrollment/approve` — operator-driven approval entered via
+/// Tachyon Studio. Validates the PIN against the recorded session and stages
+/// the signed certificate bytes for the unenrolled node's next poll.
+pub(crate) async fn admin_enrollment_approve_handler(
+    State(state): State<AppState>,
+    axum::Json(payload): axum::Json<AdminEnrollmentApproveRequest>,
+) -> Response {
+    let cert_bytes = match hex::decode(&payload.signed_certificate_hex) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("signedCertificateHex must be valid hex: {error}"),
+            )
+                .into_response();
+        }
+    };
+    match state
+        .enrollment_manager
+        .approve(&payload.session_id, &payload.pin, cert_bytes)
+    {
+        Ok(()) => (StatusCode::ACCEPTED, "enrollment approved").into_response(),
+        Err(reason) => {
+            // PIN mismatch / unknown / already-finalized are all caller errors.
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+    }
+}
+
+/// `GET /admin/enrollment/poll/{session_id}` — invoked by the unenrolled node's
+/// long-poll. Returns 204 No Content while pending, 200 with the signed cert
+/// bytes (hex) once the operator has approved, 410 Gone after rejection.
+pub(crate) async fn admin_enrollment_poll_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Response {
+    match state.enrollment_manager.poll_outcome(&session_id) {
+        None => StatusCode::NO_CONTENT.into_response(),
+        Some(node_enrollment::EnrollmentOutcome::Approved { signed_certificate }) => {
+            (StatusCode::OK, hex::encode(signed_certificate)).into_response()
+        }
+        Some(node_enrollment::EnrollmentOutcome::Rejected { reason }) => {
+            (StatusCode::GONE, reason).into_response()
+        }
+    }
+}
+
 /// Cluster-wide configuration update event written to `config_update_outbox`
 /// whenever a node accepts a signed manifest via `POST /admin/manifest`. The
 /// gossip bridge (still TODO — Session C wiring) reads from this table and
@@ -14000,6 +14108,7 @@ mod tests {
                 auth::AuthManager::new(&manifest_path)
                     .expect("test auth manager should initialize"),
             ),
+            enrollment_manager: Arc::new(node_enrollment::EnrollmentManager::new()),
             manifest_path,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         };
@@ -14746,6 +14855,68 @@ mod tests {
             .peek_outbox(store::CoreStoreBucket::ConfigUpdateOutbox, 16)
             .expect("peek outbox");
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enrollment_start_then_approve_then_poll_round_trips() {
+        let telemetry = telemetry::init_test_telemetry();
+        let state = build_test_state(IntegrityConfig::default_sealed(), telemetry);
+
+        let start = admin_enrollment_start_handler(
+            State(state.clone()),
+            axum::Json(AdminEnrollmentStartRequest {
+                node_public_key: "deadbeef".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(start.status(), StatusCode::CREATED);
+        let body_bytes = axum::body::to_bytes(start.into_body(), 16 * 1024)
+            .await
+            .expect("body collects");
+        let start_body: AdminEnrollmentStartResponse =
+            serde_json::from_slice(&body_bytes).expect("response is JSON");
+
+        // Wrong PIN — caller error.
+        let bad = admin_enrollment_approve_handler(
+            State(state.clone()),
+            axum::Json(AdminEnrollmentApproveRequest {
+                session_id: start_body.session_id.clone(),
+                pin: "BAD-PIN".to_owned(),
+                signed_certificate_hex: "01020304".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        // Right PIN — accepted.
+        let approve = admin_enrollment_approve_handler(
+            State(state.clone()),
+            axum::Json(AdminEnrollmentApproveRequest {
+                session_id: start_body.session_id.clone(),
+                pin: start_body.pin.clone(),
+                signed_certificate_hex: "01020304".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(approve.status(), StatusCode::ACCEPTED);
+
+        // Pending node polls and gets the cert; subsequent polls return None
+        // because the session is consumed.
+        let poll = admin_enrollment_poll_handler(
+            State(state.clone()),
+            axum::extract::Path(start_body.session_id.clone()),
+        )
+        .await;
+        assert_eq!(poll.status(), StatusCode::OK);
+        let cert_bytes = axum::body::to_bytes(poll.into_body(), 1024).await.unwrap();
+        assert_eq!(cert_bytes.as_ref(), b"01020304");
+
+        let poll_again = admin_enrollment_poll_handler(
+            State(state.clone()),
+            axum::extract::Path(start_body.session_id),
+        )
+        .await;
+        assert_eq!(poll_again.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -15803,6 +15974,7 @@ mod tests {
                 auth::AuthManager::new(&core_store_manifest)
                     .expect("test auth manager should initialize"),
             ),
+            enrollment_manager: Arc::new(node_enrollment::EnrollmentManager::new()),
             manifest_path: core_store_manifest,
             background_workers: Arc::new(BackgroundWorkerManager::default()),
         };
