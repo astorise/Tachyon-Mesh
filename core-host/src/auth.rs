@@ -53,12 +53,107 @@ pub(crate) struct AuthClaims {
     pub(crate) scopes: Vec<String>,
 }
 
+/// In-process cache of full authn+authz decisions, keyed by SHA-256(token) plus the
+/// (method, path) the caller wanted to access. Hashing the token keeps the raw
+/// secret out of the cache key space — a memory dump exposes only the digest.
+///
+/// Bounded to 16 384 entries so a token-spoofing flood cannot OOM the host. Time-
+/// to-idle of 5 minutes is well below the typical PAT lifetime; mutations issued
+/// via `system-faas-authz` invalidate matching entries through the
+/// `authz_purge_outbox` table, so the steady-state worst case is "5 minutes of
+/// stale access" only when the host is also network-partitioned from its own
+/// outbox storage, which is impossible by construction (redb is in-process).
+#[derive(Clone)]
+pub(crate) struct AuthDecisionCache {
+    inner: moka::sync::Cache<AuthDecisionKey, AuthDecision>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AuthDecisionKey {
+    token_hash: [u8; 32],
+    method: String,
+    path: String,
+}
+
+#[derive(Clone, Debug)]
+struct AuthDecision {
+    claims: AuthClaims,
+}
+
+impl AuthDecisionCache {
+    pub(crate) fn new() -> Self {
+        use std::time::Duration;
+        Self {
+            inner: moka::sync::Cache::builder()
+                .max_capacity(16_384)
+                .time_to_idle(Duration::from_secs(300))
+                .support_invalidation_closures()
+                .build(),
+        }
+    }
+
+    fn key(token: &str, method: &str, path: &str) -> AuthDecisionKey {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(token.as_bytes());
+        let mut token_hash = [0u8; 32];
+        token_hash.copy_from_slice(digest.as_slice());
+        AuthDecisionKey {
+            token_hash,
+            method: method.to_owned(),
+            path: path.to_owned(),
+        }
+    }
+
+    fn get(&self, token: &str, method: &str, path: &str) -> Option<AuthClaims> {
+        self.inner
+            .get(&Self::key(token, method, path))
+            .map(|d| d.claims)
+    }
+
+    fn put(&self, token: &str, method: &str, path: &str, claims: AuthClaims) {
+        self.inner
+            .insert(Self::key(token, method, path), AuthDecision { claims });
+    }
+
+    /// Invalidate every cached entry that derived from the given token. Called from
+    /// the authz purge subscriber after a token revoke / role change / user ban.
+    pub(crate) fn invalidate_token(&self, token_hash: &[u8; 32]) {
+        let target = *token_hash;
+        self.inner.invalidate_entries_if(move |key, _| {
+            key.token_hash == target
+        }).expect("invalidate_entries_if registers a predicate; failure here would mean moka was misconfigured");
+    }
+
+    /// Invalidate every cached entry whose claims include the given subject. Used
+    /// for role-update / ban events that arrive without a specific token hash.
+    pub(crate) fn invalidate_subject(&self, subject: &str) {
+        let owned = subject.to_owned();
+        self.inner.invalidate_entries_if(move |_, decision| {
+            decision.claims.subject == owned
+        }).expect("invalidate_entries_if registers a predicate; failure here would mean moka was misconfigured");
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.inner.run_pending_tasks();
+        self.inner.entry_count()
+    }
+}
+
+impl Default for AuthDecisionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AuthManager {
     authn_module_name: String,
     authz_module_name: String,
     state_dir: PathBuf,
     jwt_secret: String,
+    decision_cache: AuthDecisionCache,
 }
 
 struct AuthComponentState {
@@ -197,7 +292,14 @@ impl AuthManager {
             state_dir,
             jwt_secret: std::env::var(JWT_SECRET_ENV)
                 .unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_owned()),
+            decision_cache: AuthDecisionCache::new(),
         })
+    }
+
+    /// Expose the in-process decision cache so the host's `authz_purge_outbox`
+    /// subscriber can invalidate entries on token revocations / role updates / bans.
+    pub(crate) fn decision_cache(&self) -> &AuthDecisionCache {
+        &self.decision_cache
     }
 
     pub(crate) fn authorize_request(
@@ -207,8 +309,15 @@ impl AuthManager {
         method: &str,
         path: &str,
     ) -> Result<AuthClaims, AuthFailure> {
+        if let Some(cached) = self.decision_cache.get(token, method, path) {
+            return Ok(cached);
+        }
         let claims = self.authenticate(engine, token)?;
         self.authorize(engine, &claims, method, path)?;
+        // Only positive decisions are cached. A `Forbidden` outcome is left out so a
+        // subsequent role change that *grants* access takes effect immediately
+        // without waiting for an authz_purge_outbox round-trip.
+        self.decision_cache.put(token, method, path, claims.clone());
         Ok(claims)
     }
 
@@ -445,6 +554,63 @@ impl AuthManager {
             .map_err(|error| anyhow!("failed to instantiate authz component: {error}"))?;
         Ok((store, bindings))
     }
+}
+
+/// Event payload written into the `authz_purge_outbox` redb table. Producers
+/// (`system-faas-authz` mutation paths) emit one of these whenever a token is
+/// revoked, a role assignment changes, or a user is banned. The host's
+/// background subscriber drains the table and evicts the matching entries from
+/// the in-process `AuthDecisionCache`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum AuthzPurgeEvent {
+    /// A specific Personal Access Token was revoked. `token_hash` is the hex of the
+    /// SHA-256 of the raw token; the producer is responsible for hashing it before
+    /// emitting so the raw token never ends up on disk.
+    Token { token_hash: String, ts_ms: u64 },
+    /// A user's role assignment changed; invalidate every cache entry whose claims
+    /// list this subject.
+    Role { user_id: String, ts_ms: u64 },
+    /// A user was banned or globally suspended; same eviction shape as `Role` but
+    /// surfaces the kind to the audit log distinctly.
+    UserBan { user_id: String, ts_ms: u64 },
+}
+
+impl AuthzPurgeEvent {
+    /// Helper used by `system-faas-authz` mutation paths (and by tests) to
+    /// serialize and durably append a purge event. The redb append returns the
+    /// monotonic key; on host crash the row survives and is replayed on next boot.
+    #[allow(dead_code)]
+    pub(crate) fn enqueue(&self, store: &crate::store::CoreStore) -> Result<String> {
+        let payload = serde_json::to_vec(self).context("failed to serialize authz purge event")?;
+        store
+            .append_outbox(crate::store::CoreStoreBucket::AuthzPurgeOutbox, &payload)
+            .context("failed to append authz purge event to outbox")
+    }
+}
+
+/// Apply a purge event to the in-process cache. Pure function so it's easy to
+/// unit-test independent of the redb-backed driver loop.
+pub(crate) fn apply_authz_purge(cache: &AuthDecisionCache, event: &AuthzPurgeEvent) -> Result<()> {
+    match event {
+        AuthzPurgeEvent::Token { token_hash, .. } => {
+            let bytes = hex::decode(token_hash)
+                .context("authz purge event token_hash must be hex-encoded")?;
+            if bytes.len() != 32 {
+                anyhow::bail!(
+                    "authz purge event token_hash must decode to 32 bytes; got {}",
+                    bytes.len()
+                );
+            }
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(&bytes);
+            cache.invalidate_token(&buf);
+        }
+        AuthzPurgeEvent::Role { user_id, .. } | AuthzPurgeEvent::UserBan { user_id, .. } => {
+            cache.invalidate_subject(user_id);
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -788,4 +954,131 @@ fn string_error_to_response(error: anyhow::Error) -> Response {
     };
 
     (status, message).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::CoreStore;
+
+    fn fresh_claims(subject: &str, roles: &[&str]) -> AuthClaims {
+        AuthClaims {
+            subject: subject.to_owned(),
+            roles: roles.iter().map(|r| (*r).to_owned()).collect(),
+            scopes: Vec::new(),
+        }
+    }
+
+    fn token_hash_hex(token: &str) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(token.as_bytes());
+        hex::encode(digest)
+    }
+
+    #[test]
+    fn cache_round_trips_token_method_path_decision() {
+        let cache = AuthDecisionCache::new();
+        let claims = fresh_claims("alice", &["admin"]);
+        cache.put("tok-1", "GET", "/api/x", claims.clone());
+        let got = cache.get("tok-1", "GET", "/api/x").expect("cached");
+        assert_eq!(got.subject, "alice");
+        // Different method/path is a cache miss.
+        assert!(cache.get("tok-1", "POST", "/api/x").is_none());
+        assert!(cache.get("tok-1", "GET", "/api/y").is_none());
+    }
+
+    #[test]
+    fn invalidate_token_evicts_only_matching_entries() {
+        let cache = AuthDecisionCache::new();
+        cache.put("tok-1", "GET", "/api/x", fresh_claims("alice", &["admin"]));
+        cache.put("tok-2", "GET", "/api/x", fresh_claims("bob", &["user"]));
+
+        let target_hash = {
+            use sha2::Digest;
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(sha2::Sha256::digest(b"tok-1").as_slice());
+            buf
+        };
+        cache.invalidate_token(&target_hash);
+
+        // Wait for moka's lazy invalidation queue to drain.
+        cache.inner.run_pending_tasks();
+        assert!(cache.get("tok-1", "GET", "/api/x").is_none());
+        assert!(cache.get("tok-2", "GET", "/api/x").is_some());
+    }
+
+    #[test]
+    fn invalidate_subject_evicts_every_token_for_user() {
+        let cache = AuthDecisionCache::new();
+        cache.put("tok-a1", "GET", "/api/x", fresh_claims("alice", &["admin"]));
+        cache.put("tok-a2", "POST", "/api/y", fresh_claims("alice", &["user"]));
+        cache.put("tok-b1", "GET", "/api/x", fresh_claims("bob", &["user"]));
+
+        cache.invalidate_subject("alice");
+        cache.inner.run_pending_tasks();
+
+        assert!(cache.get("tok-a1", "GET", "/api/x").is_none());
+        assert!(cache.get("tok-a2", "POST", "/api/y").is_none());
+        // Bob's entry untouched.
+        assert!(cache.get("tok-b1", "GET", "/api/x").is_some());
+    }
+
+    #[test]
+    fn enqueue_round_trips_through_outbox_and_apply_evicts() {
+        let dir = tempdir();
+        let db_path = dir.path().join("auth-cache-test.redb");
+        let store = CoreStore::open(&db_path).expect("redb open");
+        let cache = AuthDecisionCache::new();
+        cache.put(
+            "tok-rev",
+            "GET",
+            "/api/x",
+            fresh_claims("carol", &["admin"]),
+        );
+        assert!(cache.get("tok-rev", "GET", "/api/x").is_some());
+
+        let event = AuthzPurgeEvent::Token {
+            token_hash: token_hash_hex("tok-rev"),
+            ts_ms: 1_700_000_000_000,
+        };
+        event.enqueue(&store).expect("enqueue");
+
+        let rows = store
+            .peek_outbox(crate::store::CoreStoreBucket::AuthzPurgeOutbox, 16)
+            .expect("peek");
+        assert_eq!(rows.len(), 1);
+        let parsed: AuthzPurgeEvent =
+            serde_json::from_slice(&rows[0].1).expect("payload parses back");
+        assert_eq!(parsed, event);
+
+        apply_authz_purge(&cache, &parsed).expect("apply");
+        cache.inner.run_pending_tasks();
+        assert!(cache.get("tok-rev", "GET", "/api/x").is_none());
+    }
+
+    // Tiny inline tempdir helper. Keeps the test file from pulling in `tempfile`.
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+    fn tempdir() -> TempDir {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("core-host-auth-test-{pid}-{nanos}"));
+        std::fs::create_dir_all(&path).expect("create tempdir");
+        TempDir { path }
+    }
 }
