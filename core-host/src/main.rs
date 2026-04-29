@@ -10446,6 +10446,20 @@ impl RouteExecutionControl {
             .min(u32::MAX as usize) as u32
     }
 
+    fn keda_pending_queue_size(&self) -> u32 {
+        let pending = self.pending_queue_size();
+        if pending == 0 {
+            return 0;
+        }
+
+        let active = self.active_requests.load(Ordering::Relaxed);
+        if active < self.max_concurrency as usize {
+            return pending;
+        }
+
+        pending.saturating_add(self.max_concurrency)
+    }
+
     fn record_prewarm_success(&self) {
         self.prewarmed_instances.fetch_add(1, Ordering::SeqCst);
     }
@@ -12212,7 +12226,7 @@ impl ComponentHostState {
     fn pending_queue_size(&self, route_path: &str) -> u32 {
         self.concurrency_limits
             .get(&normalize_route_path(route_path))
-            .map(|control| control.pending_queue_size())
+            .map(|control| control.keda_pending_queue_size())
             .unwrap_or_default()
     }
 
@@ -20082,6 +20096,24 @@ mod tests {
 
         assert!(distributed_rate_limit_decision(&route, response).is_none());
         assert_eq!(distributed_rate_limit_bypass_total(), before + 1);
+    }
+
+    #[test]
+    fn keda_pending_signal_prefers_internal_capacity_before_scale_out() {
+        let control = RouteExecutionControl::from_limits(0, 4);
+        control.pending_waiters.store(3, Ordering::SeqCst);
+        control.active_requests.store(2, Ordering::SeqCst);
+
+        assert_eq!(control.keda_pending_queue_size(), 3);
+    }
+
+    #[test]
+    fn keda_pending_signal_boosts_when_route_is_saturated() {
+        let control = RouteExecutionControl::from_limits(0, 4);
+        control.pending_waiters.store(3, Ordering::SeqCst);
+        control.active_requests.store(4, Ordering::SeqCst);
+
+        assert_eq!(control.keda_pending_queue_size(), 7);
     }
 
     #[test]
