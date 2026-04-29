@@ -63,6 +63,7 @@ type MeshRouteSummary = {
   role: string;
   targetCount: number;
   requiresTee: boolean;
+  encryptedVolumeCount: number;
 };
 
 type MeshGraphSnapshot = {
@@ -1026,6 +1027,10 @@ document.addEventListener("DOMContentLoaded", () => {
           const confidentialTone = route.requiresTee
             ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
             : "border-slate-700 bg-slate-900 text-slate-500";
+          const encryptedChecked = route.encryptedVolumeCount > 0 ? "checked" : "";
+          const encryptedTone = route.encryptedVolumeCount > 0
+            ? "border-cyan-500/30 bg-cyan-500/10 text-cyan-300"
+            : "border-slate-700 bg-slate-900 text-slate-500";
           card.innerHTML = `
             <div class="flex items-center justify-between gap-4 mb-3">
               <div class="text-sm font-semibold text-white">${route.name}</div>
@@ -1034,10 +1039,16 @@ document.addEventListener("DOMContentLoaded", () => {
             <div class="text-xs font-mono text-cyan-300 break-all mb-2">${route.path}</div>
             <div class="flex items-center justify-between gap-3">
               <div class="text-xs text-slate-500">Targets: ${route.targetCount}</div>
-              <label class="inline-flex items-center gap-2 rounded-full border ${confidentialTone} px-2 py-1 text-[11px] font-semibold uppercase">
-                <input type="checkbox" ${confidentialChecked} disabled class="h-3.5 w-3.5 accent-emerald-400" aria-label="Confidential Computing" />
-                Confidential Computing
-              </label>
+              <div class="flex flex-wrap justify-end gap-2">
+                <label class="inline-flex items-center gap-2 rounded-full border ${encryptedTone} px-2 py-1 text-[11px] font-semibold uppercase">
+                  <input type="checkbox" ${encryptedChecked} disabled class="h-3.5 w-3.5 accent-cyan-400" aria-label="Encrypted Volumes" />
+                  Encrypted Volumes
+                </label>
+                <label class="inline-flex items-center gap-2 rounded-full border ${confidentialTone} px-2 py-1 text-[11px] font-semibold uppercase">
+                  <input type="checkbox" ${confidentialChecked} disabled class="h-3.5 w-3.5 accent-emerald-400" aria-label="Confidential Computing" />
+                  Confidential Computing
+                </label>
+              </div>
             </div>
           `;
           meshRouteList.appendChild(card);

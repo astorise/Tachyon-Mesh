@@ -935,6 +935,7 @@ dependencies = [
 name = "core-host"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arc-swap",
  "async-trait",
