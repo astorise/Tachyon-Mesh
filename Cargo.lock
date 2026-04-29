@@ -2664,6 +2664,13 @@ name = "guest-malicious"
 version = "0.1.0"
 
 [[package]]
+name = "guest-rag-vector"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "guest-tcp-echo"
 version = "0.1.0"
 

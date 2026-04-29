@@ -89,6 +89,35 @@ interface scaling-metrics {
     get-pending-queue-size: func(route-path: string) -> u32;
 }
 
+interface vector {
+    type index-name = string;
+    type embedding = list<f32>;
+
+    record index-spec {
+        name: index-name,
+        dim: u32,
+        m: u32,
+        ef-construction: u32,
+    }
+
+    record document {
+        id: string,
+        embedding: embedding,
+        payload: option<list<u8>>,
+    }
+
+    record search-match {
+        id: string,
+        score: f32,
+        payload: option<list<u8>>,
+    }
+
+    create-index: func(spec: index-spec) -> result<_, string>;
+    upsert: func(name: index-name, docs: list<document>) -> result<_, string>;
+    search: func(name: index-name, query: embedding, k: u32) -> result<list<search-match>, string>;
+    remove: func(name: index-name, id: string) -> result<bool, string>;
+}
+
 interface storage-broker {
     enum write-mode {
         overwrite,
@@ -158,6 +187,7 @@ interface secrets-vault {
 world faas-guest {
     import bridge-controller;
     import secrets-vault;
+    import vector;
     export handler;
 }
 

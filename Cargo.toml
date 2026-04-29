@@ -10,6 +10,7 @@ members = [
     "examples/guest-log-storm",
     "examples/guest-loop",
     "examples/guest-malicious",
+    "examples/guest-rag-vector",
     "examples/guest-tcp-echo",
     "examples/guest-websocket-echo",
     "examples/guest-udp-echo",
