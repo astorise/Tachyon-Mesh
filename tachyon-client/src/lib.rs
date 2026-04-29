@@ -174,6 +174,7 @@ pub struct MeshRouteSummary {
     pub role: String,
     pub target_count: usize,
     pub requires_tee: bool,
+    pub encrypted_volume_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1002,6 +1003,21 @@ fn parse_route_summary(route: &serde_json::Value) -> Option<MeshRouteSummary> {
         .get("requires_tee")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let encrypted_volume_count = route
+        .get("volumes")
+        .and_then(|value| value.as_array())
+        .map(|volumes| {
+            volumes
+                .iter()
+                .filter(|volume| {
+                    volume
+                        .get("encrypted")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0);
 
     Some(MeshRouteSummary {
         path,
@@ -1009,6 +1025,7 @@ fn parse_route_summary(route: &serde_json::Value) -> Option<MeshRouteSummary> {
         role,
         target_count,
         requires_tee,
+        encrypted_volume_count,
     })
 }
 
@@ -1208,6 +1225,7 @@ mod tests {
         assert_eq!(summary.role, "system");
         assert_eq!(summary.target_count, 1);
         assert!(!summary.requires_tee);
+        assert_eq!(summary.encrypted_volume_count, 0);
     }
 
     #[test]
@@ -1215,12 +1233,17 @@ mod tests {
         let route = json!({
             "path": "/api/secure",
             "requires_tee": true,
-            "targets": [{ "module": "secure" }]
+            "targets": [{ "module": "secure" }],
+            "volumes": [
+                { "host_path": "/tmp/plain", "guest_path": "/plain" },
+                { "host_path": "/tmp/secure", "guest_path": "/secure", "encrypted": true }
+            ]
         });
 
         let summary = parse_route_summary(&route).expect("route summary should parse");
 
         assert!(summary.requires_tee);
+        assert_eq!(summary.encrypted_volume_count, 1);
     }
 
     #[test]

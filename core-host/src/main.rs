@@ -1,3 +1,7 @@
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 #[cfg(feature = "websockets")]
@@ -185,6 +189,8 @@ const DEFAULT_ROUTE_MAX_CONCURRENCY: u32 = 100;
 #[cfg(test)]
 const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 const DEFAULT_TELEMETRY_SAMPLE_RATE: f64 = 0.0;
+const TDE_FILE_MAGIC: &[u8] = b"TACHYON-TDE-v1\0";
+const TDE_KEY_HEX_ENV: &str = "TDE_KEY_HEX";
 const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
 const VOLUME_GC_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const DRAINING_REAPER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -7518,6 +7524,12 @@ async fn execute_route_request_with_acquired_permit(
         .acquire_route_volumes(route, Arc::clone(&state.storage_broker))
         .await
         .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    prepare_encrypted_route_volumes(route).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.into_response(&runtime.config).1,
+        )
+    })?;
     let _permit = permit;
     let active_request_guard = semaphore.begin_request();
     let propagated_headers = extract_propagated_headers(&headers);
@@ -7597,6 +7609,12 @@ async fn execute_route_request_with_acquired_permit(
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("guest execution task failed: {error}"),
+        )
+    })?;
+    seal_encrypted_route_volumes(route).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.into_response(&runtime.config).1,
         )
     })?;
 
@@ -12908,6 +12926,127 @@ fn preopen_batch_target_volumes(
 
 fn encrypted_volume_host_path(host_path: &str) -> PathBuf {
     PathBuf::from(host_path).join(".tachyon-tde")
+}
+
+fn prepare_encrypted_route_volumes(
+    route: &IntegrityRoute,
+) -> std::result::Result<(), ExecutionError> {
+    for volume in route.volumes.iter().filter(|volume| volume.encrypted) {
+        transform_encrypted_volume_files(&encrypted_volume_host_path(&volume.host_path), false)
+            .map_err(|error| {
+                ExecutionError::Internal(format!(
+                    "failed to decrypt encrypted volume `{}` for route `{}`: {error:#}",
+                    volume.host_path, route.path
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn seal_encrypted_route_volumes(route: &IntegrityRoute) -> std::result::Result<(), ExecutionError> {
+    for volume in route.volumes.iter().filter(|volume| volume.encrypted) {
+        transform_encrypted_volume_files(&encrypted_volume_host_path(&volume.host_path), true)
+            .map_err(|error| {
+                ExecutionError::Internal(format!(
+                    "failed to encrypt encrypted volume `{}` for route `{}`: {error:#}",
+                    volume.host_path, route.path
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn transform_encrypted_volume_files(root: &Path, encrypt: bool) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("failed to read encrypted volume `{}`", root.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect encrypted volume entry under `{}`",
+                root.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            transform_encrypted_volume_files(&path, encrypt)?;
+        } else if path.is_file() {
+            transform_tde_file(&path, encrypt)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn transform_tde_file(path: &Path, encrypt: bool) -> Result<()> {
+    let body =
+        fs::read(path).with_context(|| format!("failed to read TDE file `{}`", path.display()))?;
+    let transformed = if encrypt {
+        encrypt_tde_file_body(&body)
+    } else {
+        decrypt_tde_file_body(&body)
+    }?;
+    if transformed != body {
+        fs::write(path, transformed)
+            .with_context(|| format!("failed to write TDE file `{}`", path.display()))?;
+    }
+    Ok(())
+}
+
+fn encrypt_tde_file_body(plaintext: &[u8]) -> Result<Vec<u8>> {
+    if plaintext.starts_with(TDE_FILE_MAGIC) {
+        return Ok(plaintext.to_vec());
+    }
+
+    let mut nonce = [0_u8; 12];
+    nonce[4..].copy_from_slice(&rand::rng().random::<u64>().to_be_bytes());
+    let ciphertext = tde_cipher()
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .map_err(|_| anyhow!("failed to encrypt TDE file body"))?;
+    let mut out = Vec::with_capacity(TDE_FILE_MAGIC.len() + nonce.len() + ciphertext.len());
+    out.extend_from_slice(TDE_FILE_MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn decrypt_tde_file_body(body: &[u8]) -> Result<Vec<u8>> {
+    let Some(rest) = body.strip_prefix(TDE_FILE_MAGIC) else {
+        return Ok(body.to_vec());
+    };
+    if rest.len() < 12 {
+        return Err(anyhow!("TDE file body is missing nonce"));
+    }
+    let (nonce, ciphertext) = rest.split_at(12);
+    tde_cipher()
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| anyhow!("failed to decrypt TDE file body"))
+}
+
+fn tde_cipher() -> Aes256Gcm {
+    Aes256Gcm::new((&tde_key_bytes()).into())
+}
+
+fn tde_key_bytes() -> [u8; 32] {
+    std::env::var(TDE_KEY_HEX_ENV)
+        .ok()
+        .and_then(|value| decode_tde_key_hex(value.trim()).ok())
+        .unwrap_or([0x42; 32])
+}
+
+fn decode_tde_key_hex(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(anyhow!("TDE key must be 64 hexadecimal characters"));
+    }
+    let mut out = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let pair = std::str::from_utf8(chunk).context("TDE key must be UTF-8 hex")?;
+        out[index] = u8::from_str_radix(pair, 16).context("TDE key must be hexadecimal")?;
+    }
+    Ok(out)
 }
 
 fn volume_dir_perms(readonly: bool) -> DirPerms {
@@ -19975,6 +20114,30 @@ mod tests {
             encrypted_volume_host_path(&volume.host_path),
             PathBuf::from("/tmp/tachyon_sensitive").join(".tachyon-tde")
         );
+    }
+
+    #[test]
+    fn encrypted_volume_seal_hides_plaintext_and_prepare_restores_it() {
+        let volume_dir = unique_test_dir("tachyon-tde-volume");
+        let mut route = storage_broker_test_route(&volume_dir);
+        route.volumes[0].encrypted = true;
+        let encrypted_root = encrypted_volume_host_path(&route.volumes[0].host_path);
+        fs::create_dir_all(&encrypted_root).expect("encrypted root should exist");
+        let file_path = encrypted_root.join("state.txt");
+        fs::write(&file_path, b"patient-record: secret").expect("plaintext should be written");
+
+        seal_encrypted_route_volumes(&route).expect("volume should seal");
+        let sealed = fs::read(&file_path).expect("sealed file should be readable");
+        assert!(sealed.starts_with(TDE_FILE_MAGIC));
+        assert!(!String::from_utf8_lossy(&sealed).contains("patient-record"));
+
+        prepare_encrypted_route_volumes(&route).expect("volume should prepare");
+        assert_eq!(
+            fs::read(&file_path).expect("prepared file should be readable"),
+            b"patient-record: secret"
+        );
+
+        let _ = fs::remove_dir_all(volume_dir);
     }
 
     #[test]
