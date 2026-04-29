@@ -2201,6 +2201,7 @@ async fn serve_host() -> Result<()> {
     spawn_async_log_exporter(state.clone(), async_log_receiver);
     spawn_reload_watcher(state.clone());
     spawn_manifest_file_watcher(state.clone());
+    spawn_authz_purge_subscriber(state.clone());
     spawn_draining_runtime_reaper(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     spawn_buffered_request_replayer(state.clone());
@@ -3955,6 +3956,78 @@ fn spawn_manifest_file_watcher(state: AppState) {
                     manifest = %state.manifest_path.display(),
                     "manifest file watcher: hot reload failed (previous runtime preserved): {error:#}",
                 );
+            }
+        }
+    });
+}
+
+/// How often the authz-purge subscriber polls the outbox. 250 ms keeps revocation
+/// latency well under one second while costing essentially nothing — the table is
+/// usually empty, in which case the txn returns immediately with no rows.
+const AUTHZ_PURGE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Maximum events drained in a single poll tick. A larger batch is fine (we just
+/// pop them all into the cache predicate) but bounding it keeps the txn short
+/// and avoids starving other readers under a sudden burst of revocations.
+const AUTHZ_PURGE_BATCH_LIMIT: usize = 64;
+
+/// Drain the `authz_purge_outbox` table on a steady cadence, evict matching
+/// entries from the in-process `AuthDecisionCache`, and delete the row only after
+/// the eviction succeeds. The combined effect is at-most-five-minute (cache TTL)
+/// worst-case stale access in the absence of revocations, and sub-second
+/// revocation propagation in the presence of them.
+fn spawn_authz_purge_subscriber(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(AUTHZ_PURGE_POLL_INTERVAL);
+        loop {
+            interval.tick().await;
+            let core_store = Arc::clone(&state.core_store);
+            let cache = state.auth_manager.decision_cache().clone();
+            let drain_result = tokio::task::spawn_blocking(move || -> Result<usize> {
+                let rows = core_store
+                    .peek_outbox(store::CoreStoreBucket::AuthzPurgeOutbox, AUTHZ_PURGE_BATCH_LIMIT)
+                    .context("failed to peek authz purge outbox")?;
+                let mut applied = 0usize;
+                for (key, payload) in rows {
+                    match serde_json::from_slice::<auth::AuthzPurgeEvent>(&payload) {
+                        Ok(event) => {
+                            if let Err(error) = auth::apply_authz_purge(&cache, &event) {
+                                tracing::warn!(
+                                    "authz purge event `{key}` ignored due to apply failure: {error:#}"
+                                );
+                            } else {
+                                applied += 1;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "authz purge event `{key}` ignored due to parse failure: {error:#}"
+                            );
+                        }
+                    }
+                    if let Err(error) =
+                        core_store.delete(store::CoreStoreBucket::AuthzPurgeOutbox, &key)
+                    {
+                        tracing::warn!(
+                            "authz purge outbox cleanup for `{key}` failed: {error:#}"
+                        );
+                    }
+                }
+                Ok(applied)
+            })
+            .await;
+
+            match drain_result {
+                Ok(Ok(0)) => {} // Common case: no events to apply.
+                Ok(Ok(n)) => {
+                    tracing::debug!("authz purge subscriber applied {n} event(s)");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!("authz purge subscriber drain failed: {error:#}");
+                }
+                Err(error) => {
+                    tracing::warn!("authz purge subscriber task join failed: {error}");
+                }
             }
         }
     });
