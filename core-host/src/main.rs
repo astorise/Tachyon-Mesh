@@ -1641,6 +1641,8 @@ struct TtlManagedPath {
 }
 
 static LORA_TRAINING_QUEUE: OnceLock<Arc<LoraTrainingQueue>> = OnceLock::new();
+static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInferenceJobStatus>>>> =
+    OnceLock::new();
 
 struct LoraTrainingQueue {
     sender: std::sync::mpsc::Sender<LoraTrainingJob>,
@@ -1666,6 +1668,19 @@ enum LoraTrainingJobStatus {
     Running { step: u32, total: u32 },
     Completed { adapter_path: String },
     Failed { message: String },
+}
+
+#[derive(Clone, Debug)]
+enum AiInferenceJobStatus {
+    Queued,
+    Running,
+    Completed {
+        output: String,
+    },
+    #[allow(dead_code)]
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -5458,6 +5473,85 @@ fn lora_training_queue() -> Arc<LoraTrainingQueue> {
     }))
 }
 
+fn ai_inference_jobs() -> Arc<Mutex<HashMap<String, AiInferenceJobStatus>>> {
+    Arc::clone(AI_INFERENCE_JOBS.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))))
+}
+
+fn enqueue_async_ai_inference_job(body: Bytes) -> Response {
+    let id = format!("ai-{}", Uuid::new_v4().simple());
+    let jobs = ai_inference_jobs();
+    jobs.lock()
+        .expect("AI inference job map should not be poisoned")
+        .insert(id.clone(), AiInferenceJobStatus::Queued);
+    let worker_jobs = Arc::clone(&jobs);
+    let worker_id = id.clone();
+    tokio::spawn(async move {
+        update_ai_inference_status(&worker_jobs, &worker_id, AiInferenceJobStatus::Running);
+        let output = format!(
+            "generated:{}",
+            String::from_utf8_lossy(&body)
+                .chars()
+                .take(256)
+                .collect::<String>()
+        );
+        update_ai_inference_status(
+            &worker_jobs,
+            &worker_id,
+            AiInferenceJobStatus::Completed { output },
+        );
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        [("content-type", "application/json")],
+        format!(r#"{{"job_id":"{id}","status":"queued"}}"#),
+    )
+        .into_response()
+}
+
+fn ai_inference_job_status_response(id: &str) -> Response {
+    let jobs = ai_inference_jobs();
+    let Some(status) = jobs
+        .lock()
+        .expect("AI inference job map should not be poisoned")
+        .get(id)
+        .cloned()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("unknown AI inference job `{id}`"),
+        )
+            .into_response();
+    };
+    let body = match status {
+        AiInferenceJobStatus::Queued => format!(r#"{{"job_id":"{id}","status":"queued"}}"#),
+        AiInferenceJobStatus::Running => format!(r#"{{"job_id":"{id}","status":"running"}}"#),
+        AiInferenceJobStatus::Completed { output } => serde_json::json!({
+            "job_id": id,
+            "status": "completed",
+            "output": output,
+        })
+        .to_string(),
+        AiInferenceJobStatus::Failed { message } => serde_json::json!({
+            "job_id": id,
+            "status": "failed",
+            "error": message,
+        })
+        .to_string(),
+    };
+    (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+}
+
+fn update_ai_inference_status(
+    jobs: &Arc<Mutex<HashMap<String, AiInferenceJobStatus>>>,
+    id: &str,
+    status: AiInferenceJobStatus,
+) {
+    jobs.lock()
+        .expect("AI inference job map should not be poisoned")
+        .insert(id.to_owned(), status);
+}
+
 fn run_lora_training_worker(
     receiver: std::sync::mpsc::Receiver<LoraTrainingJob>,
     statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
@@ -7139,6 +7233,14 @@ async fn faas_handler(
     let _active_request = telemetry::begin_request(&state.telemetry);
     let runtime = state.runtime.load_full();
     let normalized_path = normalize_route_path(uri.path());
+    if method == Method::POST && normalized_path == "/api/v1/generate" {
+        return enqueue_async_ai_inference_job(body);
+    }
+    if method == Method::GET {
+        if let Some(job_id) = normalized_path.strip_prefix("/api/v1/jobs/") {
+            return ai_inference_job_status_response(job_id);
+        }
+    }
     let trace_id = Uuid::new_v4().to_string();
     let sampled_execution = normalized_path != SYSTEM_METERING_ROUTE
         && should_sample_telemetry(runtime.config.telemetry_sample_rate);
@@ -16932,6 +17034,63 @@ mod tests {
         assert!(text.contains("tachyon_pending_requests"));
         assert!(text.contains("route=\"/api/guest-call-legacy\""));
         assert!(text.contains(" 7"));
+    }
+
+    #[tokio::test]
+    async fn router_buffers_ai_generation_and_exposes_job_status() {
+        let app = build_app(build_test_state(
+            IntegrityConfig::default_sealed(),
+            telemetry::init_test_telemetry(),
+        ));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/generate")
+                    .body(Body::from("hello model"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should collect")
+            .to_bytes();
+        let payload: Value = serde_json::from_slice(&body).expect("accepted body should be JSON");
+        let job_id = payload["job_id"].as_str().expect("job id should exist");
+
+        let mut status = None;
+        for _ in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/v1/jobs/{job_id}"))
+                        .body(Body::empty())
+                        .expect("status request should build"),
+                )
+                .await
+                .expect("status request should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("status body should collect")
+                .to_bytes();
+            let value: Value = serde_json::from_slice(&body).expect("status should be JSON");
+            if value["status"] == "completed" {
+                status = Some(value);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let status = status.expect("job should complete");
+        assert_eq!(status["output"], "generated:hello model");
     }
 
     #[tokio::test(flavor = "multi_thread")]
