@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
     sync::{OnceLock, RwLock},
 };
+use sysinfo::System;
 use tokio::io::AsyncReadExt;
 
 const ADMIN_STATUS_PATH: &str = "/admin/status";
@@ -205,6 +206,40 @@ pub struct MeshResourceInput {
     pub version_constraint: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardwareStatus {
+    pub total_ram_mb: u64,
+    pub available_ram_mb: u64,
+    pub accelerators: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardwarePolicy {
+    #[serde(default)]
+    pub accelerators: Vec<String>,
+    #[serde(default)]
+    pub min_ram_mb: Option<u64>,
+    #[serde(default)]
+    pub min_ram_gb: Option<u64>,
+    #[serde(default)]
+    pub min_vram_mb: Option<u64>,
+    #[serde(default)]
+    pub qos_class: Option<String>,
+    #[serde(default)]
+    pub admission_strategy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardwareValidation {
+    pub approved: bool,
+    pub reason: String,
+    pub available_ram_mb: u64,
+    pub required_ram_mb: u64,
+}
+
 fn connection_state() -> &'static RwLock<Option<InstanceConfig>> {
     CONNECTION_STATE.get_or_init(|| RwLock::new(None))
 }
@@ -234,6 +269,55 @@ pub async fn get_engine_status() -> Result<String> {
 
     let raw_lockfile = read_lockfile().await?;
     parse_engine_status(&raw_lockfile)
+}
+
+pub fn read_local_hardware_status() -> HardwareStatus {
+    let mut system = System::new();
+    system.refresh_memory();
+    let mut accelerators = vec!["cpu".to_owned()];
+    if std::env::var_os("CUDA_VISIBLE_DEVICES").is_some() {
+        accelerators.push("gpu".to_owned());
+    }
+    HardwareStatus {
+        total_ram_mb: system.total_memory() / 1024 / 1024,
+        available_ram_mb: system.available_memory() / 1024 / 1024,
+        accelerators,
+    }
+}
+
+pub fn validate_hardware_policy(policy: &HardwarePolicy) -> HardwareValidation {
+    let status = read_local_hardware_status();
+    let required_ram_mb = policy
+        .min_ram_mb
+        .unwrap_or(0)
+        .max(policy.min_ram_gb.unwrap_or(0).saturating_mul(1024));
+    let missing_accelerator = policy
+        .accelerators
+        .iter()
+        .find(|accelerator| {
+            !status
+                .accelerators
+                .iter()
+                .any(|available| available.eq_ignore_ascii_case(accelerator))
+        })
+        .cloned();
+    let approved = required_ram_mb <= status.available_ram_mb && missing_accelerator.is_none();
+    let reason = if let Some(accelerator) = missing_accelerator {
+        format!("accelerator `{accelerator}` is not available on this node")
+    } else if required_ram_mb > status.available_ram_mb {
+        format!(
+            "requires {required_ram_mb} MiB RAM but only {} MiB are available",
+            status.available_ram_mb
+        )
+    } else {
+        "hardware policy is admissible on this node".to_owned()
+    };
+    HardwareValidation {
+        approved,
+        reason,
+        available_ram_mb: status.available_ram_mb,
+        required_ram_mb,
+    }
 }
 
 pub async fn get_mesh_graph() -> Result<MeshGraphSnapshot> {

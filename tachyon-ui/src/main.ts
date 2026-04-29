@@ -73,6 +73,27 @@ type MeshGraphSnapshot = {
   batchTargets: string[];
 };
 
+type HardwareStatus = {
+  totalRamMb: number;
+  availableRamMb: number;
+  accelerators: string[];
+};
+
+type HardwarePolicy = {
+  accelerators: string[];
+  minRamMb: number;
+  minVramMb: number;
+  qosClass: "realtime" | "batch" | "background";
+  admissionStrategy: "fail_fast" | "mesh_retry";
+};
+
+type HardwareValidation = {
+  approved: boolean;
+  reason: string;
+  availableRamMb: number;
+  requiredRamMb: number;
+};
+
 document.addEventListener("DOMContentLoaded", () => {
   const refreshBtn = document.getElementById("refresh-btn");
   const activeFaaS = document.getElementById("active-faas");
@@ -130,10 +151,19 @@ document.addEventListener("DOMContentLoaded", () => {
   const assetUploadInput = document.getElementById("asset-upload") as HTMLInputElement | null;
   const assetUploadBtn = document.getElementById("asset-upload-btn") as HTMLButtonElement | null;
   const assetUploadResult = document.getElementById("asset-upload-result");
+  const hardwareMinRamInput = document.getElementById("hardware-min-ram") as HTMLInputElement | null;
+  const hardwareMinVramInput = document.getElementById("hardware-min-vram") as HTMLInputElement | null;
+  const hardwareAcceleratorSelect = document.getElementById("hardware-accelerator") as HTMLSelectElement | null;
+  const hardwareQosSelect = document.getElementById("hardware-qos") as HTMLSelectElement | null;
+  const hardwareAdmissionSelect = document.getElementById("hardware-admission") as HTMLSelectElement | null;
+  const hardwareRefreshBtn = document.getElementById("hardware-refresh-btn") as HTMLButtonElement | null;
+  const hardwareValidateBtn = document.getElementById("hardware-validate-btn") as HTMLButtonElement | null;
+  const hardwarePolicyOutput = document.getElementById("hardware-policy-output");
   const modelUploadInput = document.getElementById("model-upload") as HTMLInputElement | null;
   const modelUploadBtn = document.getElementById("model-upload-btn") as HTMLButtonElement | null;
   const modelUploadResult = document.getElementById("model-upload-result");
   const modelProgress = document.getElementById("model-progress");
+  const pressureAlert = document.getElementById("pressure-alert");
   const viewContainers = document.querySelectorAll(".view-container");
   const navLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>(".nav-link[data-view]"));
   const refreshTopologyBtn = document.getElementById("refresh-topology-btn") as HTMLButtonElement | null;
@@ -729,6 +759,48 @@ document.addEventListener("DOMContentLoaded", () => {
     resourceActionResult.classList.remove("hidden");
   };
 
+  const currentHardwarePolicy = (): HardwarePolicy => ({
+    accelerators: [hardwareAcceleratorSelect?.value || "cpu"],
+    minRamMb: Number(hardwareMinRamInput?.value || 0),
+    minVramMb: Number(hardwareMinVramInput?.value || 0),
+    qosClass: ((hardwareQosSelect?.value || "batch") as HardwarePolicy["qosClass"]),
+    admissionStrategy: ((hardwareAdmissionSelect?.value || "fail_fast") as HardwarePolicy["admissionStrategy"]),
+  });
+
+  const renderHardwareOutput = (title: string, payload: unknown) => {
+    if (!hardwarePolicyOutput) {
+      return;
+    }
+    hardwarePolicyOutput.textContent = `${title}\n${JSON.stringify(payload, null, 2)}`;
+  };
+
+  const refreshHardwareStatus = async () => {
+    if (!hardwarePolicyOutput) {
+      return;
+    }
+    hardwarePolicyOutput.textContent = "Reading local hardware status...";
+    try {
+      const status = await invoke<HardwareStatus>("get_hardware_status");
+      renderHardwareOutput("Local hardware status", status);
+    } catch (error) {
+      hardwarePolicyOutput.textContent = `Hardware status failed: ${String(error)}`;
+    }
+  };
+
+  const validateHardwarePolicy = async () => {
+    if (!hardwarePolicyOutput) {
+      return;
+    }
+    const policy = currentHardwarePolicy();
+    hardwarePolicyOutput.textContent = "Validating hardware policy...";
+    try {
+      const validation = await invoke<HardwareValidation>("validate_hardware_policy", { policy });
+      renderHardwareOutput("Hardware policy validation", { policy, validation });
+    } catch (error) {
+      hardwarePolicyOutput.textContent = `Hardware validation failed: ${String(error)}`;
+    }
+  };
+
   const renderResourceCatalog = () => {
     if (!resourceTableBody) {
       return;
@@ -1137,6 +1209,9 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     if (view === "resources") {
       void loadResources();
+    }
+    if (view === "registry") {
+      void refreshHardwareStatus();
     }
   };
 
@@ -1774,6 +1849,14 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  hardwareRefreshBtn?.addEventListener("click", () => {
+    void refreshHardwareStatus();
+  });
+
+  hardwareValidateBtn?.addEventListener("click", () => {
+    void validateHardwarePolicy();
+  });
+
   void listen<number>("upload_progress", (event) => {
     if (!modelProgress) {
       return;
@@ -1785,6 +1868,26 @@ document.addEventListener("DOMContentLoaded", () => {
       duration: 0.2,
       ease: "power1.out",
     });
+  });
+
+  const renderPressureAlert = (payload: unknown) => {
+    if (!pressureAlert) {
+      return;
+    }
+    const message =
+      typeof payload === "string"
+        ? payload
+        : `Async workload pressure detected: ${JSON.stringify(payload)}`;
+    pressureAlert.textContent = message;
+    pressureAlert.classList.remove("hidden");
+  };
+
+  void listen("system-faas-buffer:pressure", (event) => {
+    renderPressureAlert(event.payload);
+  });
+
+  void listen("tachyon.notify.pressure", (event) => {
+    renderPressureAlert(event.payload);
   });
 
   modelUploadBtn?.addEventListener("click", async () => {
