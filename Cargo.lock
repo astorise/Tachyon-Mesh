@@ -7077,9 +7077,6 @@ dependencies = [
 [[package]]
 name = "turboquant-sys"
 version = "0.1.0"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "typed-path"

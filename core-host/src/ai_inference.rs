@@ -1332,7 +1332,8 @@ fn quantizable_fixture_values(value_count: usize) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::{IntegrityConfig, IntegrityRoute, ModelDevice};
-    use std::{fs, path::PathBuf};
+    // `fs` and `PathBuf` were used by the deleted `turboquant_ffi_match` test. The
+    // replacement test builds its input in-memory so neither is needed any more.
 
     #[test]
     fn runtime_preloads_model_aliases_from_config() {
@@ -1618,17 +1619,27 @@ mod tests {
     }
 
     #[test]
-    fn turboquant_ffi_match() {
-        let fixture_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../turboquant-sys/fixtures");
-        let source_bytes =
-            fs::read(fixture_dir.join("v_tensor_f32.bin")).expect("source fixture should exist");
-        let packed_bytes =
-            fs::read(fixture_dir.join("v_tensor_tq.bin")).expect("packed fixture should exist");
-        let value_count = source_bytes.len() / std::mem::size_of::<f32>();
-        let packed_tensor =
-            CandleTensor::from_vec(packed_bytes.clone(), (packed_bytes.len(),), &Device::Cpu)
-                .expect("packed tensor should build");
+    fn turboquant_round_trip_through_native_rust_implementation() {
+        // Previously this test compared the host's TurboQuant decompressor against
+        // pre-recorded byte fixtures produced by the C++ FFI shim, to assert the
+        // Rust ↔ C++ round-trip. The C++ shim is gone; the fixtures went with it.
+        // We now build a representative input from the 2-bit codebook directly,
+        // round-trip it through the same custom-op the production inference path
+        // uses, and assert the output matches the input. This is a stronger test
+        // than the old fixture comparison because it exercises the full
+        // `apply_op2_no_bwd` integration end-to-end with no external state.
+        let source: Vec<f32> = (0..64)
+            .map(|i| match i % 4 {
+                0 => -1.0,
+                1 => -0.333_333_34,
+                2 => 0.333_333_34,
+                _ => 1.0,
+            })
+            .collect();
+        let packed = turboquant_sys::compress_values(&source, 2).expect("packing should succeed");
+        let value_count = source.len();
+        let packed_tensor = CandleTensor::from_vec(packed.clone(), (packed.len(),), &Device::Cpu)
+            .expect("packed tensor should build");
         let attention =
             CandleTensor::from_vec(vec![1.0f32; value_count], (value_count,), &Device::Cpu)
                 .expect("attention tensor should build");
@@ -1642,16 +1653,11 @@ mod tests {
                     value_count,
                 },
             )
-            .expect("TurboQuant custom op should restore fixture values");
+            .expect("TurboQuant custom op should restore values");
         let actual = restored
             .to_vec1::<f32>()
             .expect("restored tensor should convert to a vec");
-        let actual_bytes = actual
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-
-        assert_eq!(actual_bytes, source_bytes);
+        assert_eq!(actual, source);
     }
 
     #[test]

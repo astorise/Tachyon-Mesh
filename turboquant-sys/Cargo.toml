@@ -2,8 +2,10 @@
 name = "turboquant-sys"
 version = "0.1.0"
 edition = "2021"
-links = "turboquant_native"
-build = "build.rs"
 
-[build-dependencies]
-cc = "1"
+# This crate's name is preserved from when it was a thin Rust wrapper around a
+# C++ implementation linked via `turboquant_native`. The implementation is now
+# pure Rust (see openspec change `turboquant-native-rust-migration`); the crate
+# could be renamed to `turboquant`, but leaving the name avoids touching every
+# caller. The `links =` and `build =` keys, plus the `cc` build dep, are gone
+# along with the C++ shim.
