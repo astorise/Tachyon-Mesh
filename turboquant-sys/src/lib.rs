@@ -112,7 +112,7 @@ pub fn compress_values(input: &[f32], bits: u8) -> Result<Vec<u8>, TurboQuantErr
             let intra_byte = target_bit % 8;
             // Each codebook is a power of two with at most 3 bits, so the AND-mask
             // and shift cannot overflow `u8`.
-            output[target_byte] |= (((code >> bit) & 1) << intra_byte) as u8;
+            output[target_byte] |= ((code >> bit) & 1) << intra_byte;
         }
         bit_index += bits as usize;
     }
