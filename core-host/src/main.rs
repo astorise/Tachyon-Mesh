@@ -1086,6 +1086,30 @@ struct ResiliencyConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum FaaSRuntime {
+    Wasm {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    Microvm {
+        image: String,
+        #[serde(default = "default_microvm_vcpus")]
+        vcpus: u8,
+        #[serde(default = "default_microvm_memory_mb")]
+        memory_mb: u32,
+    },
+}
+
+fn default_microvm_vcpus() -> u8 {
+    1
+}
+
+fn default_microvm_memory_mb() -> u32 {
+    256
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct RouteTarget {
     module: String,
     #[serde(default)]
@@ -1880,6 +1904,10 @@ struct IntegrityRoute {
     max_concurrency: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     volumes: Vec<IntegrityVolume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_policy: Option<ResourcePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<FaaSRuntime>,
     /// Routes flagged here mirror data writes to a cloud endpoint via the existing
     /// `system-faas-cdc` outbox path. Off by default; opting in adds an asynchronous
     /// post-write event emit but no synchronous latency.
@@ -1923,6 +1951,8 @@ impl Default for IntegrityRoute {
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
             volumes: Vec::new(),
+            resource_policy: None,
+            runtime: None,
             sync_to_cloud: false,
             requires_tee: false,
             allow_overflow: false,
@@ -1930,6 +1960,35 @@ impl Default for IntegrityRoute {
             adapter_id: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AdmissionStrategy {
+    FailFast,
+    MeshRetry,
+}
+
+impl Default for AdmissionStrategy {
+    fn default() -> Self {
+        Self::FailFast
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+struct ResourcePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_ram_gb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_ram_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_vram_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_default_admission_strategy")]
+    admission_strategy: AdmissionStrategy,
+}
+
+fn is_default_admission_strategy(strategy: &AdmissionStrategy) -> bool {
+    *strategy == AdmissionStrategy::FailFast
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -7124,11 +7183,18 @@ fn should_consult_mesh_qos_override(profile: RouteMeshQosProfile, local_load: u3
 mod resiliency {
     use super::{execute_route_with_middleware_inner, RouteExecutionResult, RouteInvocation};
     use axum::http::StatusCode;
+    use sysinfo::System;
 
     pub(crate) async fn execute_route_with_resiliency(
         invocation: RouteInvocation,
     ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
         execute_route_with_middleware_inner(&invocation).await
+    }
+
+    pub(crate) fn available_system_ram_bytes() -> u64 {
+        let mut system = System::new();
+        system.refresh_memory();
+        system.available_memory()
     }
 }
 
@@ -7658,6 +7724,20 @@ async fn execute_route_request(
                 .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
         })?;
 
+    if let Some(rejection) = enforce_resource_admission(
+        state,
+        route,
+        headers,
+        method,
+        body,
+        hop_limit,
+        runtime,
+    )
+    .await?
+    {
+        return Ok(rejection);
+    }
+
     let semaphore = runtime
         .concurrency_limits
         .get(&route.path)
@@ -7771,6 +7851,92 @@ async fn execute_route_request(
     }
 }
 
+async fn enforce_resource_admission(
+    state: &AppState,
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+    method: &Method,
+    body: &Bytes,
+    hop_limit: HopLimit,
+    runtime: &Arc<RuntimeState>,
+) -> std::result::Result<Option<RouteExecutionResult>, (StatusCode, String)> {
+    let Some(policy) = route.resource_policy.as_ref() else {
+        return Ok(None);
+    };
+    let required_ram_bytes = policy.required_ram_bytes();
+    if required_ram_bytes == 0 {
+        return Ok(None);
+    }
+    let available_ram = resiliency::available_system_ram_bytes();
+    if available_ram >= required_ram_bytes {
+        return Ok(None);
+    }
+
+    if policy.admission_strategy == AdmissionStrategy::MeshRetry {
+        let requested_model = requested_model_alias(route, headers, body);
+        let target = select_route_target(route, headers)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        if let Some(destination) = control_plane_override_destination(
+            state.route_overrides.as_ref(),
+            &state.peer_capabilities,
+            &route.path,
+            headers,
+            target.required_capability_mask,
+            requested_model.as_deref(),
+        ) {
+            let response = forward_request_to_override_as_guest_response(
+                &state.http_client,
+                &destination,
+                headers,
+                method,
+                body,
+                hop_limit,
+            )
+            .await?;
+            return Ok(Some(RouteExecutionResult {
+                response,
+                fuel_consumed: None,
+                completion_guard: None,
+            }));
+        }
+    }
+
+    let mut response = GuestHttpResponse::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "route `{}` requires {} bytes of available RAM but only {} bytes are available",
+            route.path, required_ram_bytes, available_ram
+        ),
+    );
+    response.headers.push((
+        "x-tachyon-reason".to_owned(),
+        "Insufficient-Cluster-Resources".to_owned(),
+    ));
+    let _ = runtime;
+    Ok(Some(RouteExecutionResult {
+        response,
+        fuel_consumed: None,
+        completion_guard: None,
+    }))
+}
+
+impl ResourcePolicy {
+    fn required_ram_bytes(&self) -> u64 {
+        let from_gb = self
+            .min_ram_gb
+            .unwrap_or(0)
+            .saturating_mul(1024)
+            .saturating_mul(1024)
+            .saturating_mul(1024);
+        let from_mb = self
+            .min_ram_mb
+            .unwrap_or(0)
+            .saturating_mul(1024)
+            .saturating_mul(1024);
+        from_gb.max(from_mb)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_route_request_with_acquired_permit(
     state: &AppState,
@@ -7801,6 +7967,29 @@ async fn execute_route_request_with_acquired_permit(
     })?;
     let _permit = permit;
     let active_request_guard = semaphore.begin_request();
+    if let Some(FaaSRuntime::Microvm {
+        image,
+        vcpus,
+        memory_mb,
+    }) = route.runtime.as_ref()
+    {
+        let mut response = GuestHttpResponse::new(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "route `{}` is configured for MicroVM image `{image}` ({vcpus} vCPU, {memory_mb} MiB), but the SmolVM runner is not enabled in this host build",
+                route.path
+            ),
+        );
+        response.headers.push((
+            "x-tachyon-runtime".to_owned(),
+            "microvm".to_owned(),
+        ));
+        return Ok(RouteExecutionResult {
+            response,
+            fuel_consumed: None,
+            completion_guard: Some(active_request_guard.into_response_guard()),
+        });
+    }
     let propagated_headers = extract_propagated_headers(&headers);
     let engine = if sampled_execution {
         runtime.metered_engine.clone()
@@ -11569,12 +11758,50 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
         volumes: normalize_route_volumes(route.volumes, route.role, &normalized)?,
+        resource_policy: route.resource_policy,
+        runtime: normalize_route_runtime(route.runtime, &normalized)?,
         sync_to_cloud: route.sync_to_cloud,
         requires_tee: route.requires_tee,
         allow_overflow: route.allow_overflow,
         distributed_rate_limit: route.distributed_rate_limit,
         adapter_id: route.adapter_id,
     })
+}
+
+fn normalize_route_runtime(
+    runtime: Option<FaaSRuntime>,
+    route_path: &str,
+) -> Result<Option<FaaSRuntime>> {
+    match runtime {
+        Some(FaaSRuntime::Microvm {
+            image,
+            vcpus,
+            memory_mb,
+        }) => {
+            let image = image.trim().to_owned();
+            if image.is_empty() {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{route_path}` microvm runtime requires a non-empty image"
+                ));
+            }
+            if vcpus == 0 {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{route_path}` microvm runtime requires at least one vCPU"
+                ));
+            }
+            if memory_mb < 64 {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{route_path}` microvm runtime requires at least 64 MiB memory"
+                ));
+            }
+            Ok(Some(FaaSRuntime::Microvm {
+                image,
+                vcpus,
+                memory_mb,
+            }))
+        }
+        other => Ok(other),
+    }
 }
 
 fn validate_integrity_batch_target(target: IntegrityBatchTarget) -> Result<IntegrityBatchTarget> {

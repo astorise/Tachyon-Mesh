@@ -148,6 +148,48 @@
           <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm font-mono text-slate-300" id="asset-upload-result">
             Awaiting asset upload.
           </div>
+          <div class="mt-6 border-t border-slate-800 pt-5">
+            <div class="flex items-center justify-between gap-4 mb-4">
+              <div>
+                <h4 class="text-sm font-semibold text-white">Hardware Policy</h4>
+                <p class="text-sm text-slate-500">Attach resource constraints to the next FaaS manifest.</p>
+              </div>
+              <button id="hardware-refresh-btn" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-medium rounded-lg border border-slate-700 transition-all">Refresh</button>
+            </div>
+            <div class="grid gap-3 md:grid-cols-5">
+              <label class="text-xs text-slate-400">RAM MiB
+                <input id="hardware-min-ram" type="number" min="0" step="128" value="512" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm" />
+              </label>
+              <label class="text-xs text-slate-400">VRAM MiB
+                <input id="hardware-min-vram" type="number" min="0" step="128" value="0" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm" />
+              </label>
+              <label class="text-xs text-slate-400">Accelerator
+                <select id="hardware-accelerator" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm">
+                  <option value="cpu">CPU</option>
+                  <option value="gpu">GPU</option>
+                  <option value="npu">NPU</option>
+                  <option value="tpu">TPU</option>
+                </select>
+              </label>
+              <label class="text-xs text-slate-400">QoS
+                <select id="hardware-qos" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm">
+                  <option value="batch">Batch</option>
+                  <option value="realtime">Realtime</option>
+                  <option value="background">Background</option>
+                </select>
+              </label>
+              <label class="text-xs text-slate-400">Admission
+                <select id="hardware-admission" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm">
+                  <option value="fail_fast">Fail Fast</option>
+                  <option value="mesh_retry">Mesh Retry</option>
+                </select>
+              </label>
+            </div>
+            <div class="mt-4 flex flex-col gap-3 md:flex-row md:items-start">
+              <button id="hardware-validate-btn" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-bold rounded-lg transition-all">Validate Policy</button>
+              <pre id="hardware-policy-output" class="min-h-20 flex-1 rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-xs text-slate-300 whitespace-pre-wrap break-words">Hardware status pending.</pre>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -336,6 +378,9 @@
           </div>
           <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm font-mono text-slate-300" id="model-upload-result">
             Awaiting model upload.
+          </div>
+          <div id="pressure-alert" class="hidden mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            Async workload pressure detected.
           </div>
         </div>
       </div>

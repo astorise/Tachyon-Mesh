@@ -66,9 +66,44 @@ async fn handle_line(line: &str) -> Result<Option<Value>> {
                 "version": env!("CARGO_PKG_VERSION")
             },
             "capabilities": {
-                "tools": {}
+                "tools": {},
+                "resources": {}
             }
         }),
+        "resources/list" => json!({
+            "resources": [
+                {
+                    "uri": "hardware://local/status",
+                    "name": "Local hardware status",
+                    "description": "Current local RAM and accelerator availability for sizing Tachyon FaaS manifests.",
+                    "mimeType": "application/json"
+                }
+            ]
+        }),
+        "resources/read" => {
+            let uri = request
+                .get("params")
+                .and_then(|value| value.get("uri"))
+                .and_then(Value::as_str)
+                .context("missing resource uri")?;
+            if uri != "hardware://local/status" {
+                return Ok(Some(error_response(
+                    id,
+                    -32602,
+                    &format!("unsupported resource `{uri}`"),
+                )));
+            }
+            let status = tachyon_client::read_local_hardware_status();
+            json!({
+                "contents": [
+                    {
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": serde_json::to_string_pretty(&status)?
+                    }
+                ]
+            })
+        }
         "tools/list" => json!({
             "tools": [
                 {
@@ -114,6 +149,32 @@ async fn handle_line(line: &str) -> Result<Option<Value>> {
                                 "type": "string",
                                 "description": "Internal-only: semver constraint such as `^1.2.0`."
                             }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_hardware_status",
+                    "description": "Return local RAM and accelerator availability for sizing Tachyon FaaS manifests.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "validate_faas_capabilities",
+                    "description": "Validate a draft FaaS hardware policy against the current local node capacity.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "accelerators": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "minRamMb": { "type": "integer", "minimum": 0 },
+                            "minRamGb": { "type": "integer", "minimum": 0 },
+                            "minVramMb": { "type": "integer", "minimum": 0 },
+                            "qosClass": { "type": "string", "enum": ["realtime", "batch", "background"] },
+                            "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"] }
                         }
                     }
                 }
@@ -197,6 +258,38 @@ async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
                             "Registered `{name}` in workspace overlay. Pending CLI re-seal of integrity.lock to take effect.\n\n{body}",
                             name = resource.name,
                         )
+                    }
+                ]
+            }))
+        }
+        "tachyon_hardware_status" => {
+            let status = tachyon_client::read_local_hardware_status();
+            let body =
+                serde_json::to_string_pretty(&status).context("failed to encode hardware status")?;
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": body
+                    }
+                ]
+            }))
+        }
+        "validate_faas_capabilities" => {
+            let arguments = params
+                .and_then(|value| value.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let policy: tachyon_client::HardwarePolicy =
+                serde_json::from_value(arguments).context("invalid hardware policy payload")?;
+            let validation = tachyon_client::validate_hardware_policy(&policy);
+            let body = serde_json::to_string_pretty(&validation)
+                .context("failed to encode capability validation")?;
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": body
                     }
                 ]
             }))

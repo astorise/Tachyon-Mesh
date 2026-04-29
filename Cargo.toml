@@ -35,6 +35,7 @@ members = [
     "systems/system-faas-registry",
     "systems/system-faas-model-broker",
     "systems/system-faas-mesh-overlay",
+    "systems/system-faas-microvm-runner",
     "systems/system-faas-buffer",
     "systems/system-faas-s3-proxy",
     "systems/system-faas-sqs",

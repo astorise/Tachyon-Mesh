@@ -187,6 +187,18 @@ async fn get_resources() -> Result<Vec<tachyon_client::MeshResource>, String> {
 }
 
 #[tauri::command]
+async fn get_hardware_status() -> Result<tachyon_client::HardwareStatus, String> {
+    Ok(tachyon_client::read_local_hardware_status())
+}
+
+#[tauri::command]
+async fn validate_hardware_policy(
+    policy: tachyon_client::HardwarePolicy,
+) -> Result<tachyon_client::HardwareValidation, String> {
+    Ok(tachyon_client::validate_hardware_policy(&policy))
+}
+
+#[tauri::command]
 async fn save_resource(
     resource: tachyon_client::MeshResourceInput,
 ) -> Result<tachyon_client::MeshResource, String> {
@@ -220,6 +232,8 @@ fn main() {
             push_asset,
             push_large_model,
             get_resources,
+            get_hardware_status,
+            validate_hardware_policy,
             save_resource,
             delete_resource
         ])

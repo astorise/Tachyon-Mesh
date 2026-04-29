@@ -6,6 +6,7 @@ use super::{
 };
 use axum::http::StatusCode;
 use std::{collections::BTreeSet, future, time::Duration};
+use sysinfo::System;
 use tower::util::ServiceExt;
 use tower::{
     retry::{Policy, RetryLayer},
@@ -13,6 +14,12 @@ use tower::{
     timeout::{error::Elapsed, TimeoutLayer},
     BoxError, Layer,
 };
+
+pub(crate) fn available_system_ram_bytes() -> u64 {
+    let mut system = System::new();
+    system.refresh_memory();
+    system.available_memory()
+}
 
 #[derive(Clone, Debug)]
 struct StatusRetryPolicy {
