@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::Ordering,
     fs,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -69,6 +70,35 @@ struct DirectoryEntry {
     kind: DirectoryEntryKind,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     body: Vec<u8>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct VectorDocument {
+    pub(crate) id: String,
+    pub(crate) embedding: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) payload: Option<Vec<u8>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct VectorSearchMatch {
+    pub(crate) id: String,
+    pub(crate) score: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) payload: Option<Vec<u8>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VectorIndex {
+    dim: usize,
+    #[serde(default)]
+    m: u32,
+    #[serde(default)]
+    ef_construction: u32,
+    documents: Vec<VectorDocument>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -406,6 +436,163 @@ impl CoreStore {
         self.delete(CoreStoreBucket::HibernationState, key)?;
         Ok(true)
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn create_vector_index(
+        &self,
+        tenant_id: &str,
+        index_name: &str,
+        dim: usize,
+        m: u32,
+        ef_construction: u32,
+    ) -> Result<()> {
+        let key = vector_index_key(tenant_id, index_name)?;
+        if self.get(CoreStoreBucket::VectorIndices, &key)?.is_some() {
+            return Ok(());
+        }
+        let index = VectorIndex {
+            dim,
+            m,
+            ef_construction,
+            documents: Vec::new(),
+        };
+        self.put(
+            CoreStoreBucket::VectorIndices,
+            &key,
+            &serde_json::to_vec(&index).context("failed to serialize vector index")?,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn upsert_vectors(
+        &self,
+        tenant_id: &str,
+        index_name: &str,
+        docs: Vec<VectorDocument>,
+    ) -> Result<()> {
+        let key = vector_index_key(tenant_id, index_name)?;
+        let mut index = self.load_vector_index(&key)?;
+        for doc in docs {
+            validate_vector_dim(index.dim, &doc.embedding)?;
+            if let Some(existing) = index.documents.iter_mut().find(|entry| entry.id == doc.id) {
+                *existing = doc;
+            } else {
+                index.documents.push(doc);
+            }
+        }
+        self.put(
+            CoreStoreBucket::VectorIndices,
+            &key,
+            &serde_json::to_vec(&index).context("failed to serialize vector index")?,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn search_vectors(
+        &self,
+        tenant_id: &str,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<VectorSearchMatch>> {
+        let key = vector_index_key(tenant_id, index_name)?;
+        let index = self.load_vector_index(&key)?;
+        validate_vector_dim(index.dim, query)?;
+        let mut matches = index
+            .documents
+            .iter()
+            .map(|doc| VectorSearchMatch {
+                id: doc.id.clone(),
+                score: cosine_similarity(&doc.embedding, query),
+                payload: doc.payload.clone(),
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+        });
+        matches.truncate(k.min(100));
+        Ok(matches)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn remove_vector(
+        &self,
+        tenant_id: &str,
+        index_name: &str,
+        id: &str,
+    ) -> Result<bool> {
+        let key = vector_index_key(tenant_id, index_name)?;
+        let mut index = self.load_vector_index(&key)?;
+        let before = index.documents.len();
+        index.documents.retain(|doc| doc.id != id);
+        let removed = index.documents.len() != before;
+        if removed {
+            self.put(
+                CoreStoreBucket::VectorIndices,
+                &key,
+                &serde_json::to_vec(&index).context("failed to serialize vector index")?,
+            )?;
+        }
+        Ok(removed)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn load_vector_index(&self, key: &str) -> Result<VectorIndex> {
+        let Some(payload) = self.get(CoreStoreBucket::VectorIndices, key)? else {
+            anyhow::bail!("vector index `{key}` does not exist");
+        };
+        serde_json::from_slice(&payload).context("failed to deserialize vector index")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn vector_index_key(tenant_id: &str, index_name: &str) -> Result<String> {
+    let tenant = sanitize_vector_key_part(tenant_id, "tenant id")?;
+    let index = sanitize_vector_key_part(index_name, "index name")?;
+    Ok(format!("{tenant}/{index}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn sanitize_vector_key_part(value: &str, label: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+    {
+        anyhow::bail!("invalid vector {label} `{value}`");
+    }
+    Ok(trimmed.to_owned())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_vector_dim(expected: usize, embedding: &[f32]) -> Result<()> {
+    if expected == 0 || embedding.len() != expected {
+        anyhow::bail!(
+            "vector dimension mismatch: expected {expected}, got {}",
+            embedding.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    for (left, right) in left.iter().zip(right.iter()) {
+        dot += left * right;
+        left_norm += left * left;
+        right_norm += right * right;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return 0.0;
+    }
+    dot / (left_norm.sqrt() * right_norm.sqrt())
 }
 
 fn read_bytes(
@@ -593,5 +780,46 @@ mod tests {
                 .is_none(),
             "hibernation entry should be deleted after restore"
         );
+    }
+
+    #[test]
+    fn vector_index_upserts_searches_and_removes_documents() {
+        let store = open_test_store();
+        store
+            .create_vector_index("tenant-a", "kb", 3, 16, 200)
+            .expect("vector index should be created");
+        store
+            .upsert_vectors(
+                "tenant-a",
+                "kb",
+                vec![
+                    VectorDocument {
+                        id: "doc-a".to_owned(),
+                        embedding: vec![1.0, 0.0, 0.0],
+                        payload: Some(b"alpha".to_vec()),
+                    },
+                    VectorDocument {
+                        id: "doc-b".to_owned(),
+                        embedding: vec![0.0, 1.0, 0.0],
+                        payload: Some(b"beta".to_vec()),
+                    },
+                ],
+            )
+            .expect("vectors should upsert");
+
+        let matches = store
+            .search_vectors("tenant-a", "kb", &[0.9, 0.1, 0.0], 1)
+            .expect("vector search should succeed");
+        assert_eq!(matches[0].id, "doc-a");
+        assert_eq!(matches[0].payload.as_deref(), Some(&b"alpha"[..]));
+
+        assert!(store
+            .remove_vector("tenant-a", "kb", "doc-a")
+            .expect("vector remove should succeed"));
+        let matches = store
+            .search_vectors("tenant-a", "kb", &[0.9, 0.1, 0.0], 5)
+            .expect("vector search should succeed after delete");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "doc-b");
     }
 }

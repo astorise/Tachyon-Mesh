@@ -632,6 +632,8 @@ struct ComponentHostState {
     #[cfg(feature = "ai-inference")]
     allowed_model_aliases: BTreeSet<String>,
     #[cfg(feature = "ai-inference")]
+    adapter_id: Option<String>,
+    #[cfg(feature = "ai-inference")]
     accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
     #[cfg(feature = "ai-inference")]
     next_accelerator_model_id: u32,
@@ -6555,6 +6557,44 @@ async fn forward_request_to_override(
     Ok(built)
 }
 
+async fn forward_request_to_override_as_guest_response(
+    http_client: &Client,
+    destination: &str,
+    headers: &HeaderMap,
+    method: &Method,
+    body: &Bytes,
+    hop_limit: HopLimit,
+) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    let mut request = http_client.request(method.clone(), destination);
+    for (name, value) in headers {
+        if name == "host" || name == "content-length" || name == "connection" {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    request = request.header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
+    let response = request.body(body.clone()).send().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("mesh-overlay forward to `{destination}` failed: {error}"),
+        )
+    })?;
+    let status = response.status();
+    let headers = header_map_to_guest_fields(response.headers());
+    let body = response.bytes().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to read mesh-overlay response body from `{destination}`: {error}"),
+        )
+    })?;
+    Ok(GuestHttpResponse {
+        status,
+        headers,
+        body,
+        trailers: Vec::new(),
+    })
+}
+
 fn requested_model_alias(
     route: &IntegrityRoute,
     headers: &HeaderMap,
@@ -7195,6 +7235,35 @@ async fn execute_route_request(
             format!("route `{}` is currently unavailable", route.path),
         )),
         Err(RoutePermitError::TimedOut) => {
+            if route.allow_overflow {
+                let requested_model = requested_model_alias(route, headers, body);
+                if let Some(destination) = control_plane_override_destination(
+                    state.route_overrides.as_ref(),
+                    &state.peer_capabilities,
+                    &route.path,
+                    headers,
+                    select_route_target(route, headers)
+                        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+                        .required_capability_mask,
+                    requested_model.as_deref(),
+                ) {
+                    let response = forward_request_to_override_as_guest_response(
+                        &state.http_client,
+                        &destination,
+                        headers,
+                        method,
+                        body,
+                        hop_limit,
+                    )
+                    .await?;
+                    return Ok(RouteExecutionResult {
+                        response,
+                        fuel_consumed: None,
+                        completion_guard: None,
+                    });
+                }
+            }
+
             let (receiver, buffered_tier) = state
                 .buffered_requests
                 .enqueue(BufferedRouteRequest {
@@ -7295,6 +7364,7 @@ async fn execute_route_request_with_acquired_permit(
     let task_bridge_manager = Arc::clone(&state.bridge_manager);
     let task_async_log_sender = state.async_log_sender.clone();
     let task_instance_pool = Arc::clone(&runtime.instance_pool);
+    let route_requires_tee = route.requires_tee;
     #[cfg(feature = "ai-inference")]
     let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
     let guest_request = GuestRequest {
@@ -7331,7 +7401,11 @@ async fn execute_route_request_with_acquired_permit(
                 host_load: task_host_load,
                 #[cfg(feature = "ai-inference")]
                 ai_runtime: task_ai_runtime,
-                instance_pool: Some(task_instance_pool),
+                instance_pool: if route_requires_tee {
+                    None
+                } else {
+                    Some(task_instance_pool)
+                },
             },
         )
     })
@@ -10586,10 +10660,21 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
     config.tls_address = normalize_tls_address(config.tls_address)?;
     config.batch_targets = normalize_batch_targets(config.batch_targets)?;
     config.routes = normalize_config_routes(config.routes, !config.batch_targets.is_empty())?;
+    validate_tee_requirements(&config)?;
     let route_registry = RouteRegistry::build(&config)?;
     config.resources = normalize_resources(config.resources, &config.routes, &route_registry)?;
     config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
     Ok(config)
+}
+
+fn validate_tee_requirements(config: &IntegrityConfig) -> Result<()> {
+    if config.routes.iter().any(|route| route.requires_tee) && config.tee_backend.is_none() {
+        return Err(anyhow!(
+            "Integrity Validation Failed: routes with `requires_tee: true` require `tee_backend` to be configured"
+        ));
+    }
+
+    Ok(())
 }
 
 fn normalize_config_routes(
@@ -11933,6 +12018,8 @@ impl ComponentHostState {
                 .map(|binding| binding.alias.clone())
                 .collect(),
             #[cfg(feature = "ai-inference")]
+            adapter_id: route.adapter_id.clone(),
+            #[cfg(feature = "ai-inference")]
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
@@ -12104,7 +12191,11 @@ impl ComponentHostState {
         self.ai_runtime
             .as_ref()
             .ok_or_else(|| "AI inference runtime is unavailable for this component".to_owned())?
-            .compute_component_prompt(&loaded.alias, &prompt)
+            .compute_component_prompt_with_adapter(
+                &loaded.alias,
+                &prompt,
+                self.adapter_id.as_deref(),
+            )
     }
 }
 
@@ -12538,8 +12629,22 @@ fn preopen_route_volumes(
                 ))
             })?;
         }
+        let host_path = if volume.encrypted {
+            encrypted_volume_host_path(&volume.host_path)
+        } else {
+            PathBuf::from(&volume.host_path)
+        };
+        if volume.encrypted {
+            fs::create_dir_all(&host_path).map_err(|error| {
+                ExecutionError::Internal(format!(
+                    "failed to initialize encrypted volume `{}` for route `{}`: {error}",
+                    host_path.display(),
+                    route.path
+                ))
+            })?;
+        }
         wasi.preopened_dir(
-            &volume.host_path,
+            &host_path,
             &volume.guest_path,
             volume_dir_perms(volume.readonly),
             volume_file_perms(volume.readonly),
@@ -12547,7 +12652,9 @@ fn preopen_route_volumes(
         .map_err(|error| {
             ExecutionError::Internal(format!(
                 "failed to preopen volume `{}` for route `{}` at guest path `{}`: {error}",
-                volume.host_path, route.path, volume.guest_path
+                host_path.display(),
+                route.path,
+                volume.guest_path
             ))
         })?;
     }
@@ -12568,9 +12675,23 @@ fn preopen_batch_target_volumes(
                 )
             })?;
         }
+        let host_path = if volume.encrypted {
+            encrypted_volume_host_path(&volume.host_path)
+        } else {
+            PathBuf::from(&volume.host_path)
+        };
+        if volume.encrypted {
+            fs::create_dir_all(&host_path).with_context(|| {
+                format!(
+                    "failed to initialize encrypted volume `{}` for batch target `{}`",
+                    host_path.display(),
+                    target.name
+                )
+            })?;
+        }
 
         wasi.preopened_dir(
-            &volume.host_path,
+            &host_path,
             &volume.guest_path,
             volume_dir_perms(volume.readonly),
             volume_file_perms(volume.readonly),
@@ -12578,7 +12699,7 @@ fn preopen_batch_target_volumes(
         .map_err(|error| {
             anyhow!(
                 "failed to preopen volume `{}` for batch target `{}` at guest path `{}`: {error}",
-                volume.host_path,
+                host_path.display(),
                 target.name,
                 volume.guest_path
             )
@@ -12586,6 +12707,10 @@ fn preopen_batch_target_volumes(
     }
 
     Ok(())
+}
+
+fn encrypted_volume_host_path(host_path: &str) -> PathBuf {
+    PathBuf::from(host_path).join(".tachyon-tde")
 }
 
 fn volume_dir_perms(readonly: bool) -> DirPerms {
@@ -19613,6 +19738,77 @@ mod tests {
 
                 ..Default::default()
             }]
+        );
+    }
+
+    #[test]
+    fn validate_integrity_config_preserves_encrypted_volume_flag() {
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes = vec![IntegrityRoute {
+            path: "/system/tde-consumer".to_owned(),
+            role: RouteRole::System,
+            name: "system-faas-logger".to_owned(),
+            version: default_route_version(),
+            dependencies: BTreeMap::new(),
+            volumes: vec![IntegrityVolume {
+                volume_type: VolumeType::Host,
+                host_path: "/tmp/tachyon_sensitive".to_owned(),
+                guest_path: "/secure".to_owned(),
+                readonly: false,
+                encrypted: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        let config =
+            validate_integrity_config(config).expect("encrypted volume config should validate");
+        let volume = &config
+            .sealed_route("/system/tde-consumer")
+            .expect("route should remain sealed")
+            .volumes[0];
+
+        assert!(volume.encrypted);
+        assert_eq!(
+            encrypted_volume_host_path(&volume.host_path),
+            PathBuf::from("/tmp/tachyon_sensitive").join(".tachyon-tde")
+        );
+    }
+
+    #[test]
+    fn validate_integrity_config_rejects_tee_route_without_backend() {
+        let mut route = IntegrityRoute::user("/api/guest-example");
+        route.requires_tee = true;
+        let config = IntegrityConfig {
+            routes: vec![route],
+            tee_backend: None,
+            ..IntegrityConfig::default_sealed()
+        };
+
+        let error = validate_integrity_config(config)
+            .expect_err("TEE routes must require an explicit backend");
+
+        assert!(error
+            .to_string()
+            .contains("routes with `requires_tee: true` require `tee_backend`"));
+    }
+
+    #[test]
+    fn validate_integrity_config_accepts_tee_route_with_backend() {
+        let mut route = IntegrityRoute::user("/api/guest-example");
+        route.requires_tee = true;
+        let config = IntegrityConfig {
+            routes: vec![route],
+            tee_backend: Some(TeeBackendConfig::LocalEnclave),
+            ..IntegrityConfig::default_sealed()
+        };
+
+        let config = validate_integrity_config(config).expect("TEE backend should validate");
+        assert!(
+            config
+                .sealed_route("/api/guest-example")
+                .expect("TEE route should remain sealed")
+                .requires_tee
         );
     }
 

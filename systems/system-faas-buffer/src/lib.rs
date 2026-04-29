@@ -47,6 +47,46 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
     fn handle_request(
         req: bindings::exports::tachyon::mesh::handler::Request,
     ) -> bindings::exports::tachyon::mesh::handler::Response {
+        let route = normalize_route(&req.uri).unwrap_or_else(|_| "/".to_owned());
+        if req.method.eq_ignore_ascii_case("GET") && route == "/queue_depth" {
+            return response(
+                200,
+                queue_depth().to_string().into_bytes(),
+                &[("content-type", "text/plain; charset=utf-8")],
+            );
+        }
+        if req.method.eq_ignore_ascii_case("POST") && route == "/push" {
+            return match enqueue_request(req) {
+                Ok(queue_file) => response(
+                    202,
+                    format!(r#"{{"job_id":"{queue_file}","status":"queued"}}"#).into_bytes(),
+                    &[("content-type", "application/json")],
+                ),
+                Err(error) => response(500, error.into_bytes(), &[]),
+            };
+        }
+        if req.method.eq_ignore_ascii_case("POST") && route == "/pop" {
+            return match pop_request() {
+                Ok(Some((id, body))) => response(
+                    200,
+                    body,
+                    &[
+                        ("content-type", "application/json"),
+                        ("x-tachyon-job-id", &id),
+                    ],
+                ),
+                Ok(None) => response(204, Vec::new(), &[]),
+                Err(error) => response(500, error.into_bytes(), &[]),
+            };
+        }
+        if req.method.eq_ignore_ascii_case("POST") && route.starts_with("/ack/") {
+            let id = route.trim_start_matches("/ack/");
+            return match ack_request(id) {
+                Ok(true) => response(204, Vec::new(), &[]),
+                Ok(false) => response(404, b"unknown job id".to_vec(), &[]),
+                Err(error) => response(500, error.into_bytes(), &[]),
+            };
+        }
         match enqueue_request(req) {
             Ok(queue_file) => response(
                 202,
@@ -56,6 +96,37 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             Err(error) => response(500, error.into_bytes(), &[]),
         }
     }
+}
+
+fn queue_depth() -> usize {
+    queued_files(&buffer_root())
+        .map(|files| files.len())
+        .unwrap_or(0)
+}
+
+fn pop_request() -> Result<Option<(String, Vec<u8>)>, String> {
+    let Some(path) = queued_files(&buffer_root())?.into_iter().next() else {
+        return Ok(None);
+    };
+    let id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "queued file name is invalid".to_owned())?
+        .to_owned();
+    let body = fs::read(&path).map_err(|error| format!("failed to read queued job: {error}"))?;
+    Ok(Some((id, body)))
+}
+
+fn ack_request(id: &str) -> Result<bool, String> {
+    for queue_name in ["ram", "disk"] {
+        let path = buffer_root().join(queue_name).join(id);
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("failed to ack queued job `{id}`: {error}"))?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn enqueue_request(
