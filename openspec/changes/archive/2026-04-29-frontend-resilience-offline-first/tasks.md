@@ -15,6 +15,6 @@
 - [x] Ensure a rollback mechanism exists in the `catch` block of the mutation.
 
 ## Phase 4: Validation
-- [ ] **Test Disconnect:** Run the UI, manually kill the `core-host` process. Verify the UI switches to "Reconnecting" and does not freeze.
-- [ ] **Test Backoff:** Watch the network tab / console logs to verify the delay between reconnection attempts doubles each time.
-- [ ] **Test Reconnect:** Restart the `core-host`. Verify the UI automatically detects the connection, turns green, and fetches fresh data.
+- [x] **Test Disconnect:** Run the UI, manually kill the `core-host` process. Verify the UI switches to "Reconnecting" and does not freeze.
+- [x] **Test Backoff:** Watch the network tab / console logs to verify the delay between reconnection attempts doubles each time.
+- [x] **Test Reconnect:** Restart the `core-host`. Verify the UI automatically detects the connection, turns green, and fetches fresh data.
