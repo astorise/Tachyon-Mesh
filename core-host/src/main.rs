@@ -4331,10 +4331,19 @@ async fn shutdown_signal() {
 /// runaway manifest from blowing up host RSS.
 const INSTANCE_POOL_DEFAULT_CAPACITY: u64 = 256;
 
+/// Idle threshold after which a warm `Arc<Module>` entry is evicted from the
+/// in-memory pool. The next request for the module pays a cwasm-cache thaw (read
+/// the precompiled bytes from redb + `Module::deserialize`) — significantly
+/// faster than a fresh JIT compile, so this approximates the hibernation /
+/// scale-to-zero pattern called out by `wasm-ram-hibernation` without giving up
+/// the warm-start latency for actively-used modules.
+const INSTANCE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeState> {
     let instance_pool = Arc::new(
         moka::sync::Cache::builder()
             .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
+            .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
             .build(),
     );
     Ok(RuntimeState {
@@ -13546,6 +13555,35 @@ mod tests {
     }
 
     #[test]
+    fn instance_pool_evicts_idle_entries_for_hibernation() {
+        // The production pool sets `time_to_idle = 5 minutes`. Re-build a tiny pool
+        // here with a sub-second idle window so the eviction is observable inside
+        // a unit test, then confirm the entry is gone after the window elapses.
+        // This is the host-side half of the `wasm-ram-hibernation` change: an
+        // idle module's `Arc<Module>` is dropped from RAM, and the next request
+        // pays a cwasm thaw (from redb) instead of a full JIT compile.
+        let pool: moka::sync::Cache<std::path::PathBuf, Arc<wasmtime::Module>> =
+            moka::sync::Cache::builder()
+                .max_capacity(8)
+                .time_to_idle(Duration::from_millis(50))
+                .build();
+        let module_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let runtime = build_test_runtime(IntegrityConfig::default_sealed());
+        let module = wasmtime::Module::new(&runtime.engine, module_bytes).expect("module");
+        let path = std::path::PathBuf::from("/dummy/idle-test.wasm");
+        pool.insert(path.clone(), Arc::new(module));
+        pool.run_pending_tasks();
+        assert_eq!(pool.entry_count(), 1);
+
+        std::thread::sleep(Duration::from_millis(150));
+        pool.run_pending_tasks();
+        assert!(
+            pool.get(&path).is_none(),
+            "idle entry must be evicted past time_to_idle"
+        );
+    }
+
+    #[test]
     fn instance_pool_hits_short_circuit_redb_lookup() {
         // The pool's contract: when a path is present, `resolve_legacy_guest_module_with_pool`
         // returns the cached module without going through `load_module_with_core_store`
@@ -15510,7 +15548,12 @@ mod tests {
                 DEFAULT_ROUTE.to_owned(),
                 Arc::new(RouteExecutionControl::from_limits(0, 0)),
             )])),
-            instance_pool: Arc::new(moka::sync::Cache::new(INSTANCE_POOL_DEFAULT_CAPACITY)),
+            instance_pool: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
+                    .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
+                    .build(),
+            ),
             #[cfg(feature = "ai-inference")]
             ai_runtime: test_ai_runtime(&config),
             config,
