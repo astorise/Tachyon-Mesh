@@ -1,0 +1,60 @@
+name: Publish SDKs
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-sdks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install SDK generators
+        run: |
+          cargo install wit-bindgen-cli --locked
+          npm install --global @bytecodealliance/jco
+          pipx install poetry
+
+      - name: Generate Rust SDK
+        run: |
+          wit-bindgen rust sdk/wit --out-dir sdk/rust/src/generated
+          cargo package --manifest-path sdk/rust/Cargo.toml
+
+      - name: Generate JavaScript SDK
+        run: |
+          cd sdk/js
+          npm ci || npm install
+          npm run build
+
+      - name: Build Python SDK
+        run: |
+          cd sdk/python
+          poetry build
+
+      - name: Check Go SDK
+        run: |
+          cd sdk/go
+          go mod tidy
+
+      - name: Publish Rust SDK
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: cargo publish --manifest-path sdk/rust/Cargo.toml --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Publish JavaScript SDK
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm publish --prefix sdk/js --access public --//registry.npmjs.org/:_authToken="${{ secrets.NPM_TOKEN }}"
+
+      - name: Publish Python SDK
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: poetry publish --directory sdk/python --username __token__ --password "${{ secrets.PYPI_TOKEN }}"

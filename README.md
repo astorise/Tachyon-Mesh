@@ -63,7 +63,7 @@ Tachyon Mesh drops the heavy containers and bloated network proxies. It runs a s
 ### 2. Build the Guest Function
 Write your FaaS logic using our lightweight SDK:
 ```rust
-use faas_sdk::faas_handler;
+use tachyon_faas_sdk::faas_handler;
 
 #[faas_handler]
 pub fn process_data() {
@@ -82,6 +82,8 @@ Create or refresh `integrity.lock` from the Tachyon Studio desktop configurator,
 test -s integrity.lock
 export TACHYON_INTEGRITY_MANIFEST="$PWD/integrity.lock"
 ```
+
+Official SDKs are generated from `sdk/wit/tachyon.wit` and published as `tachyon-faas-sdk` for Rust, `@tachyon-mesh/sdk` for JavaScript/TypeScript, `tachyon-sdk` for Python, and `github.com/tachyon-mesh/sdk-go` for Go.
 
 ### 4. Run the Host
 The host validates the sealed `integrity.lock` manifest and binds to your local port, ready to serve requests directly to the WASM modules.

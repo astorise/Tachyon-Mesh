@@ -1,0 +1,17 @@
+{
+  "name": "@tachyon-mesh/sdk",
+  "version": "1.0.0",
+  "description": "Official JavaScript and TypeScript SDK bindings for Tachyon Mesh FaaS guests",
+  "type": "module",
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "generate": "jco transpile ../wit -o src --name tachyon-sdk",
+    "build": "npm run generate"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "^1.13.0"
+  }
+}

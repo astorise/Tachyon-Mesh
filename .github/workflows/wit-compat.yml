@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "wit/**/*.wit"
+      - "sdk/wit/**/*.wit"
       - ".github/workflows/wit-compat.yml"
 
 jobs:
@@ -27,7 +28,7 @@ jobs:
               echo "::error file=$wit::first line must declare a semver package, for example: package tachyon:mesh@1.0.0;"
               missing=1
             fi
-          done < <(find wit -name '*.wit' -print | sort)
+          done < <(find wit sdk/wit -name '*.wit' -print | sort)
           exit "$missing"
 
       - name: Validate changed WIT packages against main
@@ -37,7 +38,7 @@ jobs:
           base_ref="${{ github.base_ref || 'main' }}"
           git fetch --no-tags origin "$base_ref"
 
-          mapfile -t changed_wits < <(git diff --name-only "origin/$base_ref"...HEAD -- 'wit/**/*.wit' | sort)
+          mapfile -t changed_wits < <(git diff --name-only "origin/$base_ref"...HEAD -- 'wit/**/*.wit' 'sdk/wit/**/*.wit' | sort)
           if [ "${#changed_wits[@]}" -eq 0 ]; then
             echo "No WIT files changed."
             exit 0
@@ -47,11 +48,14 @@ jobs:
           trap 'rm -rf "$tmp"' EXIT
           mkdir -p "$tmp/base"
           git archive "origin/$base_ref" wit | tar -x -C "$tmp/base"
+          if git cat-file -e "origin/$base_ref:sdk/wit" 2>/dev/null; then
+            git archive "origin/$base_ref" sdk/wit | tar -x -C "$tmp/base"
+          fi
 
           for wit in "${changed_wits[@]}"; do
             package_input="$wit"
             package_dir="$(dirname "$wit")"
-            if [ "$package_dir" != "wit" ]; then
+            if [ "$package_dir" != "wit" ] && [ "$package_dir" != "sdk/wit" ]; then
               package_input="$package_dir"
             fi
 

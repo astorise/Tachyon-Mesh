@@ -1,0 +1,13 @@
+[tool.poetry]
+name = "tachyon-sdk"
+version = "1.0.0"
+description = "Official Python SDK bindings for Tachyon Mesh FaaS guests"
+authors = ["Tachyon Mesh Maintainers"]
+packages = [{ include = "tachyon_sdk" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"

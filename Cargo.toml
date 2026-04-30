@@ -47,6 +47,7 @@ members = [
     "systems/system-faas-sqs",
     "systems/system-faas-tde",
     "systems/system-faas-tee-runtime",
+    "sdk/rust",
     "tachyon-client",
     "tachyon-ui",
     "tachyon-mcp",
