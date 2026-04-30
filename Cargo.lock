@@ -969,6 +969,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sysinfo",
+ "system-faas-enrollment",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -6249,6 +6250,19 @@ dependencies = [
  "serde",
  "serde_json",
  "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "system-faas-enrollment"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.10.1",
+ "reqwest",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

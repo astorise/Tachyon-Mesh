@@ -1,0 +1,13 @@
+[package]
+name = "system-faas-enrollment"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+ed25519-dalek = "2"
+hex = "0.4"
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["fs", "time"] }

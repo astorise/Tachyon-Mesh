@@ -9,6 +9,8 @@ use std::{
 };
 
 const CWASM_CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cwasm_cache");
+const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metadata");
+const CWASM_ENGINE_HASH_KEY: &str = "cwasm_engine_hash";
 const TLS_CERTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tls_certs");
 const HIBERNATION_STATE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("hibernation_state");
@@ -133,6 +135,9 @@ impl CoreStore {
             .context("failed to begin core store initialization transaction")?;
         {
             write_txn
+                .open_table(METADATA_TABLE)
+                .context("failed to open metadata table")?;
+            write_txn
                 .open_table(CWASM_CACHE_TABLE)
                 .context("failed to open cwasm_cache table")?;
             write_txn
@@ -163,6 +168,48 @@ impl CoreStore {
         write_txn
             .commit()
             .context("failed to commit core store initialization transaction")
+    }
+
+    pub(crate) fn secure_cwasm_cache_bootstrap(&self, current_engine_hash: &str) -> Result<bool> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("failed to begin cwasm cache bootstrap transaction")?;
+        let mut purged = false;
+        {
+            let mut metadata = write_txn
+                .open_table(METADATA_TABLE)
+                .context("failed to open metadata table")?;
+            let stored_hash = metadata
+                .get(CWASM_ENGINE_HASH_KEY)
+                .context("failed to read cwasm engine hash metadata")?
+                .map(|value| value.value().to_owned());
+
+            if let Some(stored_hash) = stored_hash {
+                if stored_hash != current_engine_hash {
+                    drop(metadata);
+                    tracing::warn!(
+                        "Purging stale Cwasm cache: Wasmtime engine compatibility hash changed"
+                    );
+                    let _ = write_txn.delete_table(CWASM_CACHE_TABLE);
+                    write_txn
+                        .open_table(CWASM_CACHE_TABLE)
+                        .context("failed to recreate cwasm_cache table")?;
+                    metadata = write_txn
+                        .open_table(METADATA_TABLE)
+                        .context("failed to reopen metadata table")?;
+                    purged = true;
+                }
+            }
+
+            metadata
+                .insert(CWASM_ENGINE_HASH_KEY, current_engine_hash)
+                .context("failed to persist cwasm engine hash metadata")?;
+        }
+        write_txn
+            .commit()
+            .context("failed to commit cwasm cache bootstrap transaction")?;
+        Ok(purged)
     }
 
     pub(crate) fn get(&self, bucket: CoreStoreBucket, key: &str) -> Result<Option<Vec<u8>>> {
