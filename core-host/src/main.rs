@@ -78,14 +78,21 @@ use wasmtime_wasi_nn::witx::WasiNnCtx;
 #[cfg(feature = "ai-inference")]
 mod ai_inference;
 mod auth;
+mod core_error;
 mod data_events;
+mod identity;
+mod mesh;
+mod network;
 mod node_enrollment;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
 #[cfg(feature = "resiliency")]
 mod resiliency;
+mod runtime;
 #[cfg(feature = "http3")]
 mod server_h3;
+mod state;
+mod storage;
 mod store;
 mod system_storage;
 mod telemetry;
@@ -14811,6 +14818,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use ed25519_dalek::{Signer, SigningKey};
     use http_body_util::{BodyExt, Full};
+    use proptest::prelude::*;
     use prost::Message;
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -14861,6 +14869,39 @@ mod tests {
             "{payload} | env: missing | secret: {}",
             expected_secret_status()
         )
+    }
+
+    proptest! {
+        #[test]
+        fn l7_route_normalization_is_stable(input in "[a-zA-Z0-9/_-]{0,64}") {
+            let normalized = normalize_route_path(&input);
+            prop_assert!(normalized.starts_with('/'));
+            if normalized.len() > 1 {
+                prop_assert!(!normalized.ends_with('/'));
+            }
+            prop_assert_eq!(normalize_route_path(&normalized), normalized);
+        }
+    }
+
+    #[test]
+    fn l4_bind_address_preserves_host_and_sets_port() {
+        let bind = layer4_bind_address("127.0.0.1:8080", 9443)
+            .expect("valid layer4 bind address should parse");
+        assert_eq!(bind.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(bind.port(), 9443);
+    }
+
+    #[test]
+    fn l7_domain_route_lookup_uses_normalized_domains() {
+        let mut route = IntegrityRoute::user("/api/domain");
+        route.domains.push("example.com".to_owned());
+        let mut config = IntegrityConfig::default_sealed();
+        config.routes.push(route);
+
+        let resolved = config
+            .route_for_domain("EXAMPLE.COM")
+            .expect("normalized domain should resolve route");
+        assert_eq!(resolved.path, "/api/domain");
     }
 
     struct MtlsTestMaterial {
