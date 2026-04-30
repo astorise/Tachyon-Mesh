@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    fs,
+    path::{Component as PathComponent, Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,6 +18,7 @@ mod bindings {
 }
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const NODE_ID_ENV: &str = "NODE_ID";
 const PEER_URLS_ENV: &str = "PEER_URLS";
@@ -28,6 +31,10 @@ const DEFAULT_ROUTE_PATH: &str = "/api/generate";
 const AUTH_HEADER: &str = "x-tachyon-overlay-auth";
 const PEER_ID_HEADER: &str = "x-tachyon-peer-id";
 const REQUEST_ROUTE_HEADER: &str = "x-tachyon-request-route";
+const MANIFEST_PATH_ENV: &str = "TACHYON_INTEGRITY_MANIFEST";
+const MODULE_ROOT_ENV: &str = "TACHYON_MODULE_ROOT";
+const DEFAULT_MANIFEST_PATH: &str = "integrity.lock";
+const DEFAULT_MODULE_ROOT: &str = "guest-modules";
 
 static ROUTING_TABLE: OnceLock<Mutex<RoutingTable>> = OnceLock::new();
 
@@ -54,8 +61,151 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             ("POST", "/heartbeat") => receive_heartbeat(req),
             ("POST", "/get_best_peer") => get_best_peer(req),
             ("POST", "/forward_request") => forward_request(req),
+            ("GET", "/config/manifest") => serve_manifest(req),
+            ("POST", "/config/module") => serve_module(req),
+            ("POST", "/config/update") => pull_config_update(req),
             _ => response(404, b"unknown mesh-overlay endpoint".to_vec(), &[]),
         }
+    }
+}
+
+fn serve_manifest(
+    req: bindings::exports::tachyon::mesh::handler::Request,
+) -> bindings::exports::tachyon::mesh::handler::Response {
+    if let Err(error) = authorize_peer(&req.headers) {
+        return response(401, error.into_bytes(), &[]);
+    }
+    let path = env_or_default(MANIFEST_PATH_ENV, DEFAULT_MANIFEST_PATH);
+    match fs::read(&path) {
+        Ok(body) => response(200, body, &[("content-type", "application/json")]),
+        Err(error) => response(
+            404,
+            format!("failed to read manifest `{path}`: {error}").into_bytes(),
+            &[],
+        ),
+    }
+}
+
+fn serve_module(
+    req: bindings::exports::tachyon::mesh::handler::Request,
+) -> bindings::exports::tachyon::mesh::handler::Response {
+    if let Err(error) = authorize_peer(&req.headers) {
+        return response(401, error.into_bytes(), &[]);
+    }
+    let request = match serde_json::from_slice::<ModuleFetchRequest>(&req.body) {
+        Ok(request) => request,
+        Err(error) => {
+            return response(
+                400,
+                format!("invalid module fetch request: {error}").into_bytes(),
+                &[],
+            )
+        }
+    };
+    let root = PathBuf::from(env_or_default(MODULE_ROOT_ENV, DEFAULT_MODULE_ROOT));
+    let path = match safe_child_path(&root, &request.path) {
+        Ok(path) => path,
+        Err(error) => return response(400, error.into_bytes(), &[]),
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return response(
+                404,
+                format!("failed to read module `{}`: {error}", path.display()).into_bytes(),
+                &[],
+            )
+        }
+    };
+    if let Some(expected) = request.expected_sha256.as_deref() {
+        let actual = sha256_hex(&bytes);
+        if !expected.eq_ignore_ascii_case(&actual) {
+            return response(
+                409,
+                format!("module checksum mismatch: expected {expected}, got {actual}")
+                    .into_bytes(),
+                &[],
+            );
+        }
+    }
+    response(200, bytes, &[("content-type", "application/wasm")])
+}
+
+fn pull_config_update(
+    req: bindings::exports::tachyon::mesh::handler::Request,
+) -> bindings::exports::tachyon::mesh::handler::Response {
+    if let Err(error) = authorize_peer(&req.headers) {
+        return response(401, error.into_bytes(), &[]);
+    }
+    let event = match serde_json::from_slice::<ConfigUpdateEvent>(&req.body) {
+        Ok(event) => event,
+        Err(error) => {
+            return response(
+                400,
+                format!("invalid config update event: {error}").into_bytes(),
+                &[],
+            )
+        }
+    };
+    let local_version = std::env::var("TACHYON_CONFIG_VERSION")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if event.version <= local_version {
+        return response(204, Vec::new(), &[]);
+    }
+    let Some(peer) = table()
+        .lock()
+        .expect("mesh overlay routing table should not be poisoned")
+        .peer(&event.origin_node_id)
+    else {
+        return response(
+            404,
+            format!("origin peer `{}` is unknown", event.origin_node_id).into_bytes(),
+            &[],
+        );
+    };
+    let url = format!(
+        "{}{}/config/manifest",
+        peer.base_url.trim_end_matches('/'),
+        env_or_default(OVERLAY_PATH_ENV, DEFAULT_OVERLAY_PATH)
+    );
+    let remote =
+        match bindings::tachyon::mesh::outbound_http::send_request("GET", &url, &auth_headers(), &[])
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                return response(
+                    502,
+                    format!("failed to pull manifest from `{url}`: {error}").into_bytes(),
+                    &[],
+                )
+            }
+        };
+    if remote.status >= 400 {
+        return response(
+            remote.status,
+            format!("origin manifest provider returned {}", remote.status).into_bytes(),
+            &[],
+        );
+    }
+    let expected = event.checksum.strip_prefix("sha256:").unwrap_or(&event.checksum);
+    let actual = sha256_hex(&remote.body);
+    if !expected.eq_ignore_ascii_case(&actual) {
+        return response(
+            409,
+            format!("manifest checksum mismatch: expected {expected}, got {actual}").into_bytes(),
+            &[],
+        );
+    }
+    let path = env_or_default(MANIFEST_PATH_ENV, DEFAULT_MANIFEST_PATH);
+    match fs::write(&path, &remote.body) {
+        Ok(()) => response(202, b"manifest pulled".to_vec(), &[]),
+        Err(error) => response(
+            500,
+            format!("failed to persist pulled manifest `{path}`: {error}").into_bytes(),
+            &[],
+        ),
     }
 }
 
@@ -315,6 +465,25 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn safe_child_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
+    let requested = Path::new(requested);
+    if requested.is_absolute() {
+        return Err("module path must be relative".to_owned());
+    }
+    let mut path = root.to_path_buf();
+    for component in requested.components() {
+        match component {
+            PathComponent::Normal(part) => path.push(part),
+            _ => return Err("module path must not contain traversal".to_owned()),
+        }
+    }
+    Ok(path)
+}
+
 fn json_response<T: Serialize>(
     status: u16,
     value: &T,
@@ -471,4 +640,42 @@ struct RouteOverrideCandidate {
     effective_pressure: u8,
     capability_mask: u64,
     capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ModuleFetchRequest {
+    path: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ConfigUpdateEvent {
+    version: u64,
+    checksum: String,
+    origin_node_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_child_path_rejects_traversal() {
+        let root = Path::new("guest-modules");
+        assert!(safe_child_path(root, "../secret.wasm").is_err());
+        assert!(safe_child_path(root, "/absolute.wasm").is_err());
+        assert_eq!(
+            safe_child_path(root, "tenant/module.wasm").expect("relative child"),
+            root.join("tenant").join("module.wasm")
+        );
+    }
+
+    #[test]
+    fn checksum_matches_known_sha256() {
+        assert_eq!(
+            sha256_hex(b"tachyon"),
+            "3114fffb82765fc3811b4ad6eb7422bc8e15a30d75f30d54dee2efee561bde14"
+        );
+    }
 }
