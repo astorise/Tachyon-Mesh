@@ -1,0 +1,4 @@
+- [x] Add the `fips` and `ring` feature flags to `core-host/Cargo.toml`.
+- [x] Refactor `tls_runtime.rs` to use conditional compilation (`#[cfg]`) for the crypto provider setup.
+- [x] Ensure the FIPS feature strictly enforces a subset of allowed cipher suites during the TLS handshake.
+- [x] Add a CI job: `cargo test --features fips` to ensure the FIPS backend compiles and passes all network tests.
