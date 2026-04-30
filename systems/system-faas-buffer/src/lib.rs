@@ -29,6 +29,7 @@ const DEFAULT_BUFFER_DIR: &str = "/buffer";
 const DEFAULT_RAM_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_REPLAY_CPU_LIMIT: u8 = 65;
 const DEFAULT_REPLAY_RAM_LIMIT: u8 = 65;
+const DEFAULT_ACCEPT_RAM_LIMIT: u8 = 90;
 const DEFAULT_REPLAY_BATCH_SIZE: usize = 8;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -56,6 +57,9 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             );
         }
         if req.method.eq_ignore_ascii_case("POST") && route == "/push" {
+            if !accepts_new_requests() {
+                return response(503, b"memory pressure is critical".to_vec(), &[]);
+            }
             return match enqueue_request(req) {
                 Ok(queue_file) => response(
                     202,
@@ -87,6 +91,9 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
                 Err(error) => response(500, error.into_bytes(), &[]),
             };
         }
+        if !accepts_new_requests() {
+            return response(503, b"memory pressure is critical".to_vec(), &[]);
+        }
         match enqueue_request(req) {
             Ok(queue_file) => response(
                 202,
@@ -96,6 +103,15 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             Err(error) => response(500, error.into_bytes(), &[]),
         }
     }
+}
+
+fn accepts_new_requests() -> bool {
+    let snapshot = bindings::tachyon::mesh::telemetry_reader::get_metrics();
+    accepts_new_requests_at_ram_pressure(snapshot.ram_pressure)
+}
+
+fn accepts_new_requests_at_ram_pressure(ram_pressure: u8) -> bool {
+    ram_pressure < parse_u8_env("ACCEPT_RAM_LIMIT", DEFAULT_ACCEPT_RAM_LIMIT)
 }
 
 fn queue_depth() -> usize {
@@ -399,6 +415,12 @@ mod tests {
             request_priority(&[("x-priority".to_owned(), "HIGH".to_owned())]),
             RequestPriority::High
         );
+    }
+
+    #[test]
+    fn rejects_new_requests_at_critical_ram_pressure() {
+        assert!(accepts_new_requests_at_ram_pressure(89));
+        assert!(!accepts_new_requests_at_ram_pressure(90));
     }
 
     #[test]

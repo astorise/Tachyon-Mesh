@@ -84,6 +84,7 @@ mod core_error;
 mod data_events;
 mod error;
 mod identity;
+mod memory_governor;
 mod mesh;
 mod network;
 mod node_enrollment;
@@ -335,6 +336,7 @@ struct AppState {
     peer_capabilities: PeerCapabilityCache,
     host_capabilities: Capabilities,
     host_load: Arc<HostLoadCounters>,
+    memory_governor: Arc<memory_governor::MemoryGovernor>,
     telemetry: TelemetryHandle,
     tls_manager: Arc<tls_runtime::TlsManager>,
     mtls_gateway: Option<Arc<tls_runtime::MtlsGatewayConfig>>,
@@ -2278,6 +2280,7 @@ async fn serve_host() -> Result<()> {
     let (export_sender, export_receiver) = mpsc::channel(TELEMETRY_EXPORT_QUEUE_CAPACITY);
     let telemetry =
         telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
+    let memory_governor = Arc::new(memory_governor::MemoryGovernor::from_system_memory());
     let runtime = build_runtime_state(verify_integrity()?)?;
     if maybe_run_bootstrap_mode(&runtime.config).await? {
         return Ok(());
@@ -2328,6 +2331,7 @@ async fn serve_host() -> Result<()> {
         peer_capabilities,
         host_capabilities,
         host_load,
+        memory_governor,
         telemetry,
         tls_manager,
         mtls_gateway: mtls_gateway.map(Arc::new),
@@ -2351,6 +2355,7 @@ async fn serve_host() -> Result<()> {
     spawn_draining_runtime_reaper(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     spawn_buffered_request_replayer(state.clone());
+    spawn_global_memory_governor(state.clone());
     spawn_pressure_monitor(state.clone());
     let app = build_app(state.clone());
     let https_listener = start_https_listener(state.clone(), app.clone()).await?;
@@ -4318,6 +4323,20 @@ fn spawn_buffered_request_replayer(state: AppState) {
                 state.buffered_requests.complete(buffered, result);
             }
         }
+    });
+}
+
+fn spawn_global_memory_governor(state: AppState) {
+    let governor = Arc::clone(&state.memory_governor);
+    let runtime = Arc::clone(&state.runtime);
+    memory_governor::spawn_memory_governor(governor, move |pressure| {
+        let active_runtime = runtime.load();
+        active_runtime.instance_pool.invalidate_all();
+        active_runtime.instance_pool.run_pending_tasks();
+        tracing::warn!(
+            ?pressure,
+            "global memory governor evicted warm instance pool entries"
+        );
     });
 }
 
@@ -7863,6 +7882,16 @@ async fn execute_route_request(
                         completion_guard: None,
                     });
                 }
+            }
+
+            if state.memory_governor.pressure() == memory_governor::MemoryPressure::Critical {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "route `{}` is saturated and global memory pressure is critical",
+                        route.path
+                    ),
+                ));
             }
 
             let (receiver, buffered_tier) = state
@@ -15466,6 +15495,7 @@ mod tests {
             peer_capabilities: Arc::new(Mutex::new(HashMap::new())),
             host_capabilities: Capabilities::detect(),
             host_load: Arc::new(HostLoadCounters::default()),
+            memory_governor: Arc::new(memory_governor::MemoryGovernor::new(1_000, 75, 90)),
             telemetry,
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             mtls_gateway: None,
@@ -17334,6 +17364,7 @@ mod tests {
             peer_capabilities: Arc::new(Mutex::new(HashMap::new())),
             host_capabilities: Capabilities::detect(),
             host_load: Arc::new(HostLoadCounters::default()),
+            memory_governor: Arc::new(memory_governor::MemoryGovernor::new(1_000, 75, 90)),
             telemetry: telemetry::init_test_telemetry(),
             tls_manager: Arc::new(tls_runtime::TlsManager::default()),
             mtls_gateway: None,
