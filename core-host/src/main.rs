@@ -15171,6 +15171,21 @@ mod tests {
     }
 
     #[test]
+    fn cwasm_cache_deserializes_same_engine_component() {
+        let runtime = build_test_runtime(IntegrityConfig::default_sealed());
+        let component =
+            Component::new(&runtime.engine, "(component)").expect("test component should compile");
+        let compiled = component
+            .serialize()
+            .expect("test component should serialize to cwasm bytes");
+        // SAFETY: this test deserializes bytes produced by the same Wasmtime
+        // engine instance immediately above, matching the cwasm cache invariant.
+        let restored = unsafe { Component::deserialize(&runtime.engine, &compiled) }
+            .expect("same-engine cwasm component should deserialize");
+        drop(restored);
+    }
+
+    #[test]
     fn instance_pool_hits_short_circuit_redb_lookup() {
         // The pool's contract: when a path is present, `resolve_legacy_guest_module_with_pool`
         // returns the cached module without going through `load_module_with_core_store`
