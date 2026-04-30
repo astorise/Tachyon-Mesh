@@ -970,6 +970,7 @@ dependencies = [
  "sha2 0.11.0",
  "sysinfo",
  "system-faas-enrollment",
+ "system-faas-microvm-runner",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -5920,6 +5921,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51d44cfb396c3caf6fbfd0ab422af02631b69ddd96d2eff0b0f0724f9024051b"
 
 [[package]]
+name = "smolvm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6334,6 +6344,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "smolvm",
  "tokio",
 ]
 

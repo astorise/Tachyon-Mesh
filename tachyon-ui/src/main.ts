@@ -87,6 +87,10 @@ type HardwarePolicy = {
   admissionStrategy: "fail_fast" | "mesh_retry";
 };
 
+type FaaSRuntimePolicy =
+  | { type: "wasm" }
+  | { type: "microvm"; image: string; vcpus: number; memoryMb: number };
+
 type HardwareValidation = {
   approved: boolean;
   reason: string;
@@ -153,6 +157,9 @@ document.addEventListener("DOMContentLoaded", () => {
   const assetUploadResult = document.getElementById("asset-upload-result");
   const hardwareMinRamInput = document.getElementById("hardware-min-ram") as HTMLInputElement | null;
   const hardwareMinVramInput = document.getElementById("hardware-min-vram") as HTMLInputElement | null;
+  const hardwareRuntimeSelect = document.getElementById("hardware-runtime") as HTMLSelectElement | null;
+  const hardwareMicrovmVcpusInput = document.getElementById("hardware-microvm-vcpus") as HTMLInputElement | null;
+  const hardwareMicrovmImageInput = document.getElementById("hardware-microvm-image") as HTMLInputElement | null;
   const hardwareAcceleratorSelect = document.getElementById("hardware-accelerator") as HTMLSelectElement | null;
   const hardwareQosSelect = document.getElementById("hardware-qos") as HTMLSelectElement | null;
   const hardwareAdmissionSelect = document.getElementById("hardware-admission") as HTMLSelectElement | null;
@@ -767,6 +774,18 @@ document.addEventListener("DOMContentLoaded", () => {
     admissionStrategy: ((hardwareAdmissionSelect?.value || "fail_fast") as HardwarePolicy["admissionStrategy"]),
   });
 
+  const currentRuntimePolicy = (): FaaSRuntimePolicy => {
+    if ((hardwareRuntimeSelect?.value || "wasm") !== "microvm") {
+      return { type: "wasm" };
+    }
+    return {
+      type: "microvm",
+      image: hardwareMicrovmImageInput?.value.trim() || "guest.smolmachine",
+      vcpus: Math.max(1, Number(hardwareMicrovmVcpusInput?.value || 1)),
+      memoryMb: Math.max(64, Number(hardwareMinRamInput?.value || 256)),
+    };
+  };
+
   const renderHardwareOutput = (title: string, payload: unknown) => {
     if (!hardwarePolicyOutput) {
       return;
@@ -795,7 +814,11 @@ document.addEventListener("DOMContentLoaded", () => {
     hardwarePolicyOutput.textContent = "Validating hardware policy...";
     try {
       const validation = await invoke<HardwareValidation>("validate_hardware_policy", { policy });
-      renderHardwareOutput("Hardware policy validation", { policy, validation });
+      renderHardwareOutput("Hardware policy validation", {
+        runtime: currentRuntimePolicy(),
+        policy,
+        validation,
+      });
     } catch (error) {
       hardwarePolicyOutput.textContent = `Hardware validation failed: ${String(error)}`;
     }
