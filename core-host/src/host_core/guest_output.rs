@@ -1,4 +1,9 @@
-fn guest_execution_error(error: wasmtime::Error, context: impl Into<String>) -> ExecutionError {
+use super::*;
+
+pub(crate) fn guest_execution_error(
+    error: wasmtime::Error,
+    context: impl Into<String>,
+) -> ExecutionError {
     let error = error.context(context.into());
 
     if let Some(kind) = classify_resource_limit(&error) {
@@ -11,7 +16,7 @@ fn guest_execution_error(error: wasmtime::Error, context: impl Into<String>) -> 
     ExecutionError::Internal(format!("{error:#}"))
 }
 
-fn classify_resource_limit(error: &wasmtime::Error) -> Option<ResourceLimitKind> {
+pub(crate) fn classify_resource_limit(error: &wasmtime::Error) -> Option<ResourceLimitKind> {
     if let Some(limit) = error.downcast_ref::<ResourceLimitTrap>() {
         return Some(limit.kind);
     }
@@ -24,7 +29,7 @@ fn classify_resource_limit(error: &wasmtime::Error) -> Option<ResourceLimitKind>
 }
 
 #[cfg(test)]
-fn split_guest_stdout(function_name: &str, stdout: Bytes) -> Bytes {
+pub(crate) fn split_guest_stdout(function_name: &str, stdout: Bytes) -> Bytes {
     let output = String::from_utf8_lossy(&stdout);
     let mut response = String::new();
 
@@ -42,16 +47,16 @@ fn split_guest_stdout(function_name: &str, stdout: Bytes) -> Bytes {
     Bytes::from(response)
 }
 
-fn trim_line_endings(segment: &str) -> &str {
+pub(crate) fn trim_line_endings(segment: &str) -> &str {
     let trimmed = segment.strip_suffix('\n').unwrap_or(segment);
     trimmed.strip_suffix('\r').unwrap_or(trimmed)
 }
 
-fn parse_guest_log_line(line: &str) -> Option<GuestLogRecord> {
+pub(crate) fn parse_guest_log_line(line: &str) -> Option<GuestLogRecord> {
     serde_json::from_str::<GuestLogRecord>(line).ok()
 }
 
-fn flush_async_guest_output(state: &mut AsyncGuestOutputState) {
+pub(crate) fn flush_async_guest_output(state: &mut AsyncGuestOutputState) {
     if state.pending.is_empty() {
         return;
     }
@@ -60,7 +65,7 @@ fn flush_async_guest_output(state: &mut AsyncGuestOutputState) {
     handle_async_guest_segment(state, &segment);
 }
 
-fn handle_async_guest_segment(state: &mut AsyncGuestOutputState, segment: &[u8]) {
+pub(crate) fn handle_async_guest_segment(state: &mut AsyncGuestOutputState, segment: &[u8]) {
     let text = String::from_utf8_lossy(segment);
     let line = trim_line_endings(&text);
     if line.is_empty() {
@@ -82,7 +87,7 @@ fn handle_async_guest_segment(state: &mut AsyncGuestOutputState, segment: &[u8])
     }
 }
 
-fn append_async_guest_response(state: &mut AsyncGuestOutputState, segment: &[u8]) {
+pub(crate) fn append_async_guest_response(state: &mut AsyncGuestOutputState, segment: &[u8]) {
     if state.response_overflowed {
         return;
     }
@@ -93,7 +98,7 @@ fn append_async_guest_response(state: &mut AsyncGuestOutputState, segment: &[u8]
     }
 }
 
-fn enqueue_structured_guest_log(state: &AsyncGuestOutputState, record: GuestLogRecord) {
+pub(crate) fn enqueue_structured_guest_log(state: &AsyncGuestOutputState, record: GuestLogRecord) {
     let message = record
         .fields
         .get("message")
@@ -109,7 +114,7 @@ fn enqueue_structured_guest_log(state: &AsyncGuestOutputState, record: GuestLogR
     );
 }
 
-fn enqueue_raw_guest_log(state: &AsyncGuestOutputState, message: String) {
+pub(crate) fn enqueue_raw_guest_log(state: &AsyncGuestOutputState, message: String) {
     let level = match state.stream_type {
         Some(GuestLogStreamType::Stderr) => "error",
         _ => "info",
@@ -117,7 +122,7 @@ fn enqueue_raw_guest_log(state: &AsyncGuestOutputState, message: String) {
     enqueue_async_guest_log(state, level.to_owned(), message, None, None);
 }
 
-fn enqueue_async_guest_log(
+pub(crate) fn enqueue_async_guest_log(
     state: &AsyncGuestOutputState,
     level: String,
     message: String,
@@ -147,7 +152,7 @@ fn enqueue_async_guest_log(
 }
 
 #[cfg(test)]
-fn forward_guest_log(function_name: &str, record: GuestLogRecord) {
+pub(crate) fn forward_guest_log(function_name: &str, record: GuestLogRecord) {
     let level = record.level.to_ascii_uppercase();
     let target = record.target.unwrap_or_else(|| "guest".to_owned());
     let message = record

@@ -1,6 +1,8 @@
+use super::*;
+
 impl IntegrityConfig {
     #[cfg(test)]
-    fn default_sealed() -> Self {
+    pub(crate) fn default_sealed() -> Self {
         Self {
             host_address: DEFAULT_HOST_ADDRESS.to_owned(),
             advertise_ip: None,
@@ -22,12 +24,12 @@ impl IntegrityConfig {
         }
     }
 
-    fn sealed_route(&self, path: &str) -> Option<&IntegrityRoute> {
+    pub(crate) fn sealed_route(&self, path: &str) -> Option<&IntegrityRoute> {
         let normalized = normalize_route_path(path);
         self.routes.iter().find(|route| route.path == normalized)
     }
 
-    fn route_for_domain(&self, domain: &str) -> Option<&IntegrityRoute> {
+    pub(crate) fn route_for_domain(&self, domain: &str) -> Option<&IntegrityRoute> {
         let normalized = tls_runtime::normalize_domain(domain).ok()?;
         self.routes.iter().find(|route| {
             route
@@ -37,14 +39,14 @@ impl IntegrityConfig {
         })
     }
 
-    fn has_custom_domains(&self) -> bool {
+    pub(crate) fn has_custom_domains(&self) -> bool {
         self.routes.iter().any(|route| !route.domains.is_empty())
     }
 }
 
 impl IntegrityRoute {
     #[cfg(test)]
-    fn user(path: &str) -> Self {
+    pub(crate) fn user(path: &str) -> Self {
         Self {
             path: path.to_owned(),
             role: RouteRole::User,
@@ -68,7 +70,7 @@ impl IntegrityRoute {
     }
 
     #[cfg(test)]
-    fn system(path: &str) -> Self {
+    pub(crate) fn system(path: &str) -> Self {
         Self {
             path: path.to_owned(),
             role: RouteRole::System,
@@ -92,7 +94,7 @@ impl IntegrityRoute {
     }
 
     #[cfg(test)]
-    fn user_with_secrets(path: &str, allowed_secrets: &[&str]) -> Self {
+    pub(crate) fn user_with_secrets(path: &str, allowed_secrets: &[&str]) -> Self {
         Self {
             path: path.to_owned(),
             role: RouteRole::User,
@@ -120,13 +122,13 @@ impl IntegrityRoute {
 }
 
 impl IntegrityVolume {
-    fn is_hibernation_capable(&self) -> bool {
+    pub(crate) fn is_hibernation_capable(&self) -> bool {
         self.volume_type == VolumeType::Ram
             && self.eviction_policy == Some(VolumeEvictionPolicy::Hibernate)
             && self.idle_timeout.is_some()
     }
 
-    fn parsed_idle_timeout(&self) -> Result<Option<Duration>> {
+    pub(crate) fn parsed_idle_timeout(&self) -> Result<Option<Duration>> {
         self.idle_timeout
             .as_deref()
             .map(parse_hibernation_duration)
@@ -135,7 +137,7 @@ impl IntegrityVolume {
 }
 
 impl GuestResourceLimiter {
-    fn new(max_memory_bytes: usize) -> Self {
+    pub(crate) fn new(max_memory_bytes: usize) -> Self {
         Self { max_memory_bytes }
     }
 }
@@ -186,7 +188,7 @@ impl fmt::Display for ResourceLimitTrap {
 impl std::error::Error for ResourceLimitTrap {}
 
 impl GuestModuleNotFound {
-    fn new(function_name: &str, candidate_paths: String) -> Self {
+    pub(crate) fn new(function_name: &str, candidate_paths: String) -> Self {
         Self {
             function_name: function_name.to_owned(),
             candidate_paths,
@@ -221,7 +223,7 @@ impl fmt::Display for ExecutionError {
 impl std::error::Error for ExecutionError {}
 
 impl ExecutionError {
-    fn into_response(self, config: &IntegrityConfig) -> (StatusCode, String) {
+    pub(crate) fn into_response(self, config: &IntegrityConfig) -> (StatusCode, String) {
         match self {
             Self::GuestModuleNotFound(error) => (StatusCode::NOT_FOUND, error.to_string()),
             Self::ResourceLimitExceeded { .. } => (
@@ -232,7 +234,7 @@ impl ExecutionError {
         }
     }
 
-    fn log_if_needed(&self, function_name: &str) {
+    pub(crate) fn log_if_needed(&self, function_name: &str) {
         match self {
             Self::ResourceLimitExceeded { kind, detail } => {
                 eprintln!("warning: guest `{function_name}` exceeded its {kind} quota: {detail}");

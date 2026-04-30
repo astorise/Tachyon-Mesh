@@ -1,7 +1,9 @@
+use super::*;
+
 #[cfg(unix)]
 impl UdsFastPathRegistry {
     #[cfg(test)]
-    fn with_discovery_dir(path: PathBuf) -> Self {
+    pub(crate) fn with_discovery_dir(path: PathBuf) -> Self {
         let registry = Self::default();
         *registry
             .discovery_dir_override
@@ -10,7 +12,7 @@ impl UdsFastPathRegistry {
         registry
     }
 
-    fn discovery_dir(&self) -> PathBuf {
+    pub(crate) fn discovery_dir(&self) -> PathBuf {
         if let Some(path) = self
             .discovery_dir_override
             .lock()
@@ -25,7 +27,7 @@ impl UdsFastPathRegistry {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DISCOVERY_DIR))
     }
 
-    fn bind_local_listener(&self, config: &IntegrityConfig) -> Result<UnixListener> {
+    pub(crate) fn bind_local_listener(&self, config: &IntegrityConfig) -> Result<UnixListener> {
         let discovery_dir = self.discovery_dir();
         fs::create_dir_all(&discovery_dir).with_context(|| {
             format!(
@@ -97,7 +99,7 @@ impl UdsFastPathRegistry {
         Ok(listener)
     }
 
-    fn discover_peer_for_url(&self, url: &str) -> Option<DiscoveredUdsPeer> {
+    pub(crate) fn discover_peer_for_url(&self, url: &str) -> Option<DiscoveredUdsPeer> {
         let host = reqwest::Url::parse(url).ok()?.host_str()?.to_owned();
         let now_unix_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -137,7 +139,7 @@ impl UdsFastPathRegistry {
         Some(preferred.clone())
     }
 
-    fn active_peer_count(&self) -> usize {
+    pub(crate) fn active_peer_count(&self) -> usize {
         let peers = self.refresh_peers();
         let local_host = self
             .local_endpoint
@@ -157,7 +159,7 @@ impl UdsFastPathRegistry {
             .count()
     }
 
-    fn write_local_pressure_state(
+    pub(crate) fn write_local_pressure_state(
         &self,
         pressure_state: PeerPressureState,
         updated_at_unix_ms: u64,
@@ -204,7 +206,7 @@ impl UdsFastPathRegistry {
         Ok(())
     }
 
-    fn note_connect_failure(&self, peer: &DiscoveredUdsPeer) {
+    pub(crate) fn note_connect_failure(&self, peer: &DiscoveredUdsPeer) {
         self.peers
             .lock()
             .expect("UDS peer cache should not be poisoned")
@@ -214,7 +216,7 @@ impl UdsFastPathRegistry {
         }
     }
 
-    fn refresh_peers(&self) -> HashMap<String, DiscoveredUdsPeer> {
+    pub(crate) fn refresh_peers(&self) -> HashMap<String, DiscoveredUdsPeer> {
         let discovery_dir = self.discovery_dir();
         let mut discovered = HashMap::new();
         let entries = match fs::read_dir(&discovery_dir) {
@@ -296,15 +298,15 @@ impl Drop for UdsFastPathRegistry {
 impl UdsFastPathRegistry {
     #[cfg(test)]
     #[allow(dead_code)]
-    fn with_discovery_dir(_path: PathBuf) -> Self {
+    pub(crate) fn with_discovery_dir(_path: PathBuf) -> Self {
         Self
     }
 
-    fn active_peer_count(&self) -> usize {
+    pub(crate) fn active_peer_count(&self) -> usize {
         0
     }
 
-    fn write_local_pressure_state(
+    pub(crate) fn write_local_pressure_state(
         &self,
         _pressure_state: PeerPressureState,
         _updated_at_unix_ms: u64,

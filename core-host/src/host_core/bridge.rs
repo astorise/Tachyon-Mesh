@@ -1,47 +1,49 @@
+use super::*;
+
 #[derive(Clone, Default)]
-struct BridgeManager {
-    inner: Arc<BridgeManagerInner>,
+pub(crate) struct BridgeManager {
+    pub(crate) inner: Arc<BridgeManagerInner>,
 }
 
 #[derive(Default)]
-struct BridgeManagerInner {
-    sessions: Mutex<HashMap<String, BridgeSession>>,
-    active_relays: AtomicUsize,
-    relayed_bytes: AtomicU64,
-    telemetry: Mutex<BridgeTelemetryState>,
+pub(crate) struct BridgeManagerInner {
+    pub(crate) sessions: Mutex<HashMap<String, BridgeSession>>,
+    pub(crate) active_relays: AtomicUsize,
+    pub(crate) relayed_bytes: AtomicU64,
+    pub(crate) telemetry: Mutex<BridgeTelemetryState>,
 }
 
-struct BridgeSession {
-    abort_handle: tokio::task::AbortHandle,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct BridgeConfig {
-    client_a_addr: String,
-    client_b_addr: String,
-    timeout_seconds: u32,
+pub(crate) struct BridgeSession {
+    pub(crate) abort_handle: tokio::task::AbortHandle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct BridgeAllocation {
-    bridge_id: String,
+pub(crate) struct BridgeConfig {
+    pub(crate) client_a_addr: String,
+    pub(crate) client_b_addr: String,
+    pub(crate) timeout_seconds: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BridgeAllocation {
+    pub(crate) bridge_id: String,
     #[serde(default)]
-    ip: String,
-    port_a: u16,
-    port_b: u16,
+    pub(crate) ip: String,
+    pub(crate) port_a: u16,
+    pub(crate) port_b: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct BridgeTelemetrySnapshot {
-    active_relays: u32,
-    throughput_bytes_per_sec: u64,
-    load_score: u8,
+pub(crate) struct BridgeTelemetrySnapshot {
+    pub(crate) active_relays: u32,
+    pub(crate) throughput_bytes_per_sec: u64,
+    pub(crate) load_score: u8,
 }
 
-struct BridgeTelemetryState {
-    last_total_bytes: u64,
-    last_sampled_at: Instant,
-    throughput_bytes_per_sec: u64,
+pub(crate) struct BridgeTelemetryState {
+    pub(crate) last_total_bytes: u64,
+    pub(crate) last_sampled_at: Instant,
+    pub(crate) throughput_bytes_per_sec: u64,
 }
 
 impl Default for BridgeTelemetryState {
@@ -55,7 +57,10 @@ impl Default for BridgeTelemetryState {
 }
 
 impl BridgeManager {
-    fn create_relay(&self, config: BridgeConfig) -> std::result::Result<BridgeAllocation, String> {
+    pub(crate) fn create_relay(
+        &self,
+        config: BridgeConfig,
+    ) -> std::result::Result<BridgeAllocation, String> {
         let endpoint_a = parse_bridge_endpoint(&config.client_a_addr, "client_a_addr")?;
         let endpoint_b = parse_bridge_endpoint(&config.client_b_addr, "client_b_addr")?;
         let inactivity_timeout = Duration::from_secs(u64::from(config.timeout_seconds.max(1)));
@@ -112,7 +117,7 @@ impl BridgeManager {
         })
     }
 
-    fn destroy_relay(&self, bridge_id: &str) -> std::result::Result<(), String> {
+    pub(crate) fn destroy_relay(&self, bridge_id: &str) -> std::result::Result<(), String> {
         let session = self
             .inner
             .sessions
@@ -128,16 +133,16 @@ impl BridgeManager {
     }
 
     #[cfg(test)]
-    fn active_relay_count(&self) -> usize {
+    pub(crate) fn active_relay_count(&self) -> usize {
         self.inner.active_relays.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
-    fn total_relayed_bytes(&self) -> u64 {
+    pub(crate) fn total_relayed_bytes(&self) -> u64 {
         self.inner.relayed_bytes.load(Ordering::SeqCst)
     }
 
-    fn telemetry_snapshot(&self) -> BridgeTelemetrySnapshot {
+    pub(crate) fn telemetry_snapshot(&self) -> BridgeTelemetrySnapshot {
         let total_bytes = self.inner.relayed_bytes.load(Ordering::SeqCst);
         let active_relays = self.inner.active_relays.load(Ordering::SeqCst) as u32;
         let mut telemetry = self
@@ -165,13 +170,13 @@ impl BridgeManager {
     }
 }
 
-fn bridge_load_score(active_relays: u32, throughput_bytes_per_sec: u64) -> u8 {
+pub(crate) fn bridge_load_score(active_relays: u32, throughput_bytes_per_sec: u64) -> u8 {
     let relay_score = active_relays.saturating_mul(25).min(100) as u8;
     let throughput_score = ((throughput_bytes_per_sec / 50_000).min(100)) as u8;
     relay_score.max(throughput_score)
 }
 
-fn bind_bridge_socket() -> std::result::Result<tokio::net::UdpSocket, String> {
+pub(crate) fn bind_bridge_socket() -> std::result::Result<tokio::net::UdpSocket, String> {
     let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("failed to bind dynamic bridge socket: {error}"))?;
     socket
@@ -181,14 +186,17 @@ fn bind_bridge_socket() -> std::result::Result<tokio::net::UdpSocket, String> {
         .map_err(|error| format!("failed to convert dynamic bridge socket to tokio: {error}"))
 }
 
-fn parse_bridge_endpoint(value: &str, label: &str) -> std::result::Result<SocketAddr, String> {
+pub(crate) fn parse_bridge_endpoint(
+    value: &str,
+    label: &str,
+) -> std::result::Result<SocketAddr, String> {
     value
         .trim()
         .parse::<SocketAddr>()
         .map_err(|error| format!("failed to parse `{label}` as socket address: {error}"))
 }
 
-async fn relay_bridge(
+pub(crate) async fn relay_bridge(
     socket_a: tokio::net::UdpSocket,
     socket_b: tokio::net::UdpSocket,
     endpoint_a: SocketAddr,
@@ -228,7 +236,7 @@ async fn relay_bridge(
     }
 }
 
-fn release_bridge_session(inner: &BridgeManagerInner, bridge_id: &str) {
+pub(crate) fn release_bridge_session(inner: &BridgeManagerInner, bridge_id: &str) {
     let removed = inner
         .sessions
         .lock()

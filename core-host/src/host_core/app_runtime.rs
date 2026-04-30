@@ -1,10 +1,12 @@
-fn integrity_manifest_path() -> PathBuf {
+use super::*;
+
+pub(crate) fn integrity_manifest_path() -> PathBuf {
     std::env::var_os(INTEGRITY_MANIFEST_PATH_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("integrity.lock"))
 }
 
-fn build_app(state: AppState) -> Router {
+pub(crate) fn build_app(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/status", get(auth::admin_status_handler))
         .route("/admin/manifest", post(admin_manifest_update_handler))
@@ -79,11 +81,11 @@ fn build_app(state: AppState) -> Router {
     app.with_state(state)
 }
 
-fn should_sample_telemetry(sample_rate: f64) -> bool {
+pub(crate) fn should_sample_telemetry(sample_rate: f64) -> bool {
     sample_rate > 0.0 && rand::rng().random_bool(sample_rate.clamp(0.0, 1.0))
 }
 
-fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+pub(crate) fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.saturating_add(right)),
         (Some(left), None) => Some(left),
@@ -92,7 +94,7 @@ fn merge_fuel_samples(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
-async fn enforce_distributed_rate_limit(
+pub(crate) async fn enforce_distributed_rate_limit(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
     route: &IntegrityRoute,
@@ -163,7 +165,7 @@ async fn enforce_distributed_rate_limit(
     }
 }
 
-fn distributed_rate_limit_decision(
+pub(crate) fn distributed_rate_limit_decision(
     route: &IntegrityRoute,
     response: GuestHttpResponse,
 ) -> Option<(StatusCode, String)> {
@@ -200,7 +202,7 @@ fn distributed_rate_limit_decision(
     }
 }
 
-fn distributed_rate_limit_key(
+pub(crate) fn distributed_rate_limit_key(
     policy: &DistributedRateLimitConfig,
     headers: &HeaderMap,
     host_identity: &HostIdentity,
@@ -237,7 +239,7 @@ fn distributed_rate_limit_key(
     }
 }
 
-fn record_distributed_rate_limit_bypass(route_path: &str, reason: &str) {
+pub(crate) fn record_distributed_rate_limit_bypass(route_path: &str, reason: &str) {
     DISTRIBUTED_RATE_LIMIT_BYPASS_TOTAL.fetch_add(1, Ordering::Relaxed);
     tracing::warn!(
         route = %route_path,
@@ -247,11 +249,11 @@ fn record_distributed_rate_limit_bypass(route_path: &str, reason: &str) {
 }
 
 #[cfg(test)]
-fn distributed_rate_limit_bypass_total() -> u64 {
+pub(crate) fn distributed_rate_limit_bypass_total() -> u64 {
     DISTRIBUTED_RATE_LIMIT_BYPASS_TOTAL.load(Ordering::Relaxed)
 }
 
-fn lora_training_queue() -> Arc<LoraTrainingQueue> {
+pub(crate) fn lora_training_queue() -> Arc<LoraTrainingQueue> {
     Arc::clone(LORA_TRAINING_QUEUE.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel();
         let statuses = Arc::new(Mutex::new(HashMap::new()));
@@ -264,11 +266,11 @@ fn lora_training_queue() -> Arc<LoraTrainingQueue> {
     }))
 }
 
-fn ai_inference_jobs() -> Arc<Mutex<HashMap<String, AiInferenceJobStatus>>> {
+pub(crate) fn ai_inference_jobs() -> Arc<Mutex<HashMap<String, AiInferenceJobStatus>>> {
     Arc::clone(AI_INFERENCE_JOBS.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))))
 }
 
-fn enqueue_async_ai_inference_job(body: Bytes) -> Response {
+pub(crate) fn enqueue_async_ai_inference_job(body: Bytes) -> Response {
     let id = format!("ai-{}", Uuid::new_v4().simple());
     let jobs = ai_inference_jobs();
     jobs.lock()
@@ -300,7 +302,7 @@ fn enqueue_async_ai_inference_job(body: Bytes) -> Response {
         .into_response()
 }
 
-fn ai_inference_job_status_response(id: &str) -> Response {
+pub(crate) fn ai_inference_job_status_response(id: &str) -> Response {
     let jobs = ai_inference_jobs();
     let Some(status) = jobs
         .lock()
@@ -333,7 +335,7 @@ fn ai_inference_job_status_response(id: &str) -> Response {
     (StatusCode::OK, [("content-type", "application/json")], body).into_response()
 }
 
-fn update_ai_inference_status(
+pub(crate) fn update_ai_inference_status(
     jobs: &Arc<Mutex<HashMap<String, AiInferenceJobStatus>>>,
     id: &str,
     status: AiInferenceJobStatus,
@@ -343,7 +345,7 @@ fn update_ai_inference_status(
         .insert(id.to_owned(), status);
 }
 
-fn run_lora_training_worker(
+pub(crate) fn run_lora_training_worker(
     receiver: std::sync::mpsc::Receiver<LoraTrainingJob>,
     statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
 ) {
@@ -374,7 +376,7 @@ fn run_lora_training_worker(
     }
 }
 
-fn execute_lora_training_job(
+pub(crate) fn execute_lora_training_job(
     job: &LoraTrainingJob,
     statuses: &Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
 ) -> Result<String> {
@@ -425,7 +427,7 @@ fn execute_lora_training_job(
     Ok(adapter_path.display().to_string())
 }
 
-fn update_lora_training_status(
+pub(crate) fn update_lora_training_status(
     statuses: &Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
     id: &str,
     status: LoraTrainingJobStatus,
@@ -436,7 +438,7 @@ fn update_lora_training_status(
         .insert(id.to_owned(), status);
 }
 
-fn sanitize_lora_job_part(value: &str) -> Result<String> {
+pub(crate) fn sanitize_lora_job_part(value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty()
         || !trimmed
@@ -448,13 +450,13 @@ fn sanitize_lora_job_part(value: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
-fn generate_traceparent() -> String {
+pub(crate) fn generate_traceparent() -> String {
     let trace_id = Uuid::new_v4().simple().to_string();
     let span_id = format!("{:016x}", rand::rng().random::<u64>());
     format!("00-{trace_id}-{span_id}-01")
 }
 
-fn encode_metering_batch(batch: Vec<String>) -> Bytes {
+pub(crate) fn encode_metering_batch(batch: Vec<String>) -> Bytes {
     let mut payload = batch.join("\n");
     if !payload.is_empty() {
         payload.push('\n');
@@ -462,7 +464,7 @@ fn encode_metering_batch(batch: Vec<String>) -> Bytes {
     Bytes::from(payload)
 }
 
-async fn export_metering_batch(
+pub(crate) async fn export_metering_batch(
     state: &AppState,
     batch: Vec<String>,
 ) -> std::result::Result<(), String> {
@@ -503,7 +505,7 @@ async fn export_metering_batch(
     }
 }
 
-fn spawn_metering_exporter(state: AppState, mut receiver: mpsc::Receiver<String>) {
+pub(crate) fn spawn_metering_exporter(state: AppState, mut receiver: mpsc::Receiver<String>) {
     tokio::spawn(async move {
         while let Some(first_record) = receiver.recv().await {
             let mut batch = vec![first_record];
@@ -547,7 +549,7 @@ fn spawn_metering_exporter(state: AppState, mut receiver: mpsc::Receiver<String>
     });
 }
 
-fn persist_metering_batch(state: &AppState, batch: &[String]) -> Vec<String> {
+pub(crate) fn persist_metering_batch(state: &AppState, batch: &[String]) -> Vec<String> {
     let mut keys = Vec::with_capacity(batch.len());
     for record in batch {
         match state
@@ -563,7 +565,10 @@ fn persist_metering_batch(state: &AppState, batch: &[String]) -> Vec<String> {
     keys
 }
 
-fn spawn_async_log_exporter(state: AppState, mut receiver: mpsc::Receiver<AsyncLogEntry>) {
+pub(crate) fn spawn_async_log_exporter(
+    state: AppState,
+    mut receiver: mpsc::Receiver<AsyncLogEntry>,
+) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -584,7 +589,7 @@ fn spawn_async_log_exporter(state: AppState, mut receiver: mpsc::Receiver<AsyncL
     });
 }
 
-async fn export_log_batch(
+pub(crate) async fn export_log_batch(
     state: &AppState,
     batch: Vec<AsyncLogEntry>,
 ) -> std::result::Result<(), String> {
@@ -626,7 +631,7 @@ async fn export_log_batch(
     }
 }
 
-async fn hop_limit_middleware(
+pub(crate) async fn hop_limit_middleware(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -642,7 +647,7 @@ async fn hop_limit_middleware(
     next.run(req).await
 }
 
-async fn custom_domain_routing_middleware(
+pub(crate) async fn custom_domain_routing_middleware(
     State(state): State<AppState>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -669,7 +674,7 @@ async fn custom_domain_routing_middleware(
     next.run(req).await
 }
 
-fn route_domain_request_path(route: &IntegrityRoute, uri: &Uri) -> String {
+pub(crate) fn route_domain_request_path(route: &IntegrityRoute, uri: &Uri) -> String {
     let original_path = normalize_route_path(uri.path());
     let path = if original_path == "/" {
         route.path.clone()
@@ -683,14 +688,14 @@ fn route_domain_request_path(route: &IntegrityRoute, uri: &Uri) -> String {
     }
 }
 
-fn request_host(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn request_host(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("host")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.split(':').next().unwrap_or(value))
 }
 
-fn header_map_to_guest_fields(headers: &HeaderMap) -> GuestHttpFields {
+pub(crate) fn header_map_to_guest_fields(headers: &HeaderMap) -> GuestHttpFields {
     headers
         .iter()
         .map(|(name, value)| {
@@ -703,7 +708,7 @@ fn header_map_to_guest_fields(headers: &HeaderMap) -> GuestHttpFields {
         .collect()
 }
 
-fn guest_fields_to_header_map(
+pub(crate) fn guest_fields_to_header_map(
     fields: &GuestHttpFields,
     label: &str,
 ) -> std::result::Result<HeaderMap, String> {
@@ -712,7 +717,7 @@ fn guest_fields_to_header_map(
     Ok(headers)
 }
 
-fn insert_guest_fields(
+pub(crate) fn insert_guest_fields(
     target: &mut HeaderMap,
     fields: &GuestHttpFields,
     label: &str,
@@ -729,7 +734,7 @@ fn insert_guest_fields(
     Ok(())
 }
 
-fn build_guest_response(
+pub(crate) fn build_guest_response(
     response: GuestHttpResponse,
     completion_guard: Option<RouteResponseGuard>,
 ) -> std::result::Result<Response, String> {
@@ -756,14 +761,17 @@ fn build_guest_response(
     Ok(built)
 }
 
-fn guest_response_into_response(result: RouteExecutionResult) -> Response {
+pub(crate) fn guest_response_into_response(result: RouteExecutionResult) -> Response {
     match build_guest_response(result.response, result.completion_guard) {
         Ok(response) => response,
         Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
     }
 }
 
-fn clone_headers_with_original_route(headers: &HeaderMap, route: &IntegrityRoute) -> HeaderMap {
+pub(crate) fn clone_headers_with_original_route(
+    headers: &HeaderMap,
+    route: &IntegrityRoute,
+) -> HeaderMap {
     let mut cloned = headers.clone();
     if !cloned.contains_key(TACHYON_ORIGINAL_ROUTE_HEADER) {
         if let Ok(value) = HeaderValue::from_str(&route.path) {
@@ -773,7 +781,7 @@ fn clone_headers_with_original_route(headers: &HeaderMap, route: &IntegrityRoute
     cloned
 }
 
-async fn forward_request_to_override(
+pub(crate) async fn forward_request_to_override(
     http_client: &Client,
     destination: &str,
     headers: &HeaderMap,
@@ -821,7 +829,7 @@ async fn forward_request_to_override(
     Ok(built)
 }
 
-async fn forward_request_to_override_as_guest_response(
+pub(crate) async fn forward_request_to_override_as_guest_response(
     http_client: &Client,
     destination: &str,
     headers: &HeaderMap,
@@ -859,7 +867,7 @@ async fn forward_request_to_override_as_guest_response(
     })
 }
 
-fn requested_model_alias(
+pub(crate) fn requested_model_alias(
     route: &IntegrityRoute,
     headers: &HeaderMap,
     body: &Bytes,
@@ -904,13 +912,13 @@ fn requested_model_alias(
 
 #[cfg(feature = "ai-inference")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RouteMeshQosProfile {
-    accelerator: ai_inference::AcceleratorKind,
-    qos: RouteQos,
+pub(crate) struct RouteMeshQosProfile {
+    pub(crate) accelerator: ai_inference::AcceleratorKind,
+    pub(crate) qos: RouteQos,
 }
 
 #[cfg(feature = "ai-inference")]
-fn route_mesh_qos_profile(
+pub(crate) fn route_mesh_qos_profile(
     route: &IntegrityRoute,
     requested_model: Option<&str>,
 ) -> Option<RouteMeshQosProfile> {
@@ -929,7 +937,10 @@ fn route_mesh_qos_profile(
 }
 
 #[cfg(feature = "ai-inference")]
-fn should_consult_mesh_qos_override(profile: RouteMeshQosProfile, local_load: u32) -> bool {
+pub(crate) fn should_consult_mesh_qos_override(
+    profile: RouteMeshQosProfile,
+    local_load: u32,
+) -> bool {
     match profile.qos {
         RouteQos::RealTime => local_load > 0,
         RouteQos::Standard => local_load >= 4,
@@ -957,7 +968,7 @@ mod resiliency {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_route_override(
+pub(crate) async fn execute_route_override(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
     route: &IntegrityRoute,
@@ -1028,14 +1039,14 @@ async fn execute_route_override(
     }
 }
 
-async fn faas_handler(
+pub(crate) async fn faas_handler(
     State(state): State<AppState>,
     Extension(hop_limit): Extension<HopLimit>,
     #[cfg(feature = "websockets")] ws: Result<
         WebSocketUpgrade,
         axum::extract::ws::rejection::WebSocketUpgradeRejection,
     >,
-    request: Request,
+    request: AxumRequest,
 ) -> Response {
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
@@ -1343,7 +1354,7 @@ async fn faas_handler(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_route_with_middleware(
+pub(crate) async fn execute_route_with_middleware(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
     route: &IntegrityRoute,
@@ -1463,7 +1474,7 @@ pub(crate) async fn execute_route_with_middleware_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_shadow_traffic_task(
+pub(crate) fn spawn_shadow_traffic_task(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
     route: &IntegrityRoute,
@@ -1540,13 +1551,13 @@ fn spawn_shadow_traffic_task(
     });
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_route_request(
+pub(crate) async fn execute_route_request(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
     route: &IntegrityRoute,
@@ -1706,7 +1717,7 @@ async fn execute_route_request(
     }
 }
 
-async fn enforce_resource_admission(
+pub(crate) async fn enforce_resource_admission(
     state: &AppState,
     route: &IntegrityRoute,
     headers: &HeaderMap,
@@ -1776,7 +1787,7 @@ async fn enforce_resource_admission(
 }
 
 impl ResourcePolicy {
-    fn required_ram_bytes(&self) -> u64 {
+    pub(crate) fn required_ram_bytes(&self) -> u64 {
         let from_gb = self
             .min_ram_gb
             .unwrap_or(0)
@@ -1793,7 +1804,7 @@ impl ResourcePolicy {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_route_request_with_acquired_permit(
+pub(crate) async fn execute_route_request_with_acquired_permit(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
     route: &IntegrityRoute,
@@ -2018,7 +2029,7 @@ async fn execute_route_request_with_acquired_permit(
     })
 }
 
-async fn execute_buffered_route_request(
+pub(crate) async fn execute_buffered_route_request(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
     route: &IntegrityRoute,
@@ -2059,7 +2070,7 @@ async fn execute_buffered_route_request(
     .await
 }
 
-async fn acquire_route_permit(
+pub(crate) async fn acquire_route_permit(
     control: Arc<RouteExecutionControl>,
 ) -> std::result::Result<OwnedSemaphorePermit, RoutePermitError> {
     match Arc::clone(&control.semaphore).try_acquire_owned() {
@@ -2084,7 +2095,7 @@ async fn acquire_route_permit(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn resolve_mesh_response(
+pub(crate) async fn resolve_mesh_response(
     http_client: &Client,
     config: &IntegrityConfig,
     route_registry: &RouteRegistry,
@@ -2147,7 +2158,7 @@ async fn resolve_mesh_response(
     }
 }
 
-fn apply_mesh_fetch_headers(
+pub(crate) fn apply_mesh_fetch_headers(
     mut request: reqwest::RequestBuilder,
     target_kind: &OutboundTargetKind,
     hop_limit: HopLimit,
@@ -2172,7 +2183,7 @@ fn apply_mesh_fetch_headers(
     request
 }
 
-async fn send_mesh_fetch_request(
+pub(crate) async fn send_mesh_fetch_request(
     http_client: &Client,
     _uds_fast_path: &UdsFastPathRegistry,
     url: &str,
@@ -2224,7 +2235,7 @@ async fn send_mesh_fetch_request(
     .map_err(|error| format!("mesh fetch to `{url}` failed: {error}"))
 }
 
-fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
+pub(crate) fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
     std::str::from_utf8(stdout)
         .ok()?
         .trim()
@@ -2233,14 +2244,16 @@ fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
         .filter(|url| !url.is_empty())
 }
 
-fn select_route_module(
+pub(crate) fn select_route_module(
     route: &IntegrityRoute,
     headers: &HeaderMap,
 ) -> std::result::Result<String, String> {
     select_route_target_with_roll(route, headers, None).map(|target| target.module)
 }
 
-fn select_stream_route_module(route: &IntegrityRoute) -> std::result::Result<String, String> {
+pub(crate) fn select_stream_route_module(
+    route: &IntegrityRoute,
+) -> std::result::Result<String, String> {
     if route.targets.is_empty() {
         return Ok(route.name.clone());
     }
@@ -2250,14 +2263,14 @@ fn select_stream_route_module(route: &IntegrityRoute) -> std::result::Result<Str
         .or_else(|_| Ok(route.name.clone()))
 }
 
-fn select_route_target(
+pub(crate) fn select_route_target(
     route: &IntegrityRoute,
     headers: &HeaderMap,
 ) -> std::result::Result<SelectedRouteTarget, String> {
     select_route_target_with_roll(route, headers, None)
 }
 
-fn select_route_target_with_roll(
+pub(crate) fn select_route_target_with_roll(
     route: &IntegrityRoute,
     headers: &HeaderMap,
     random_roll: Option<u64>,
@@ -2349,7 +2362,7 @@ fn select_route_target_with_roll(
         })
 }
 
-fn request_header_matches(headers: &HeaderMap, matcher: &HeaderMatch) -> bool {
+pub(crate) fn request_header_matches(headers: &HeaderMap, matcher: &HeaderMatch) -> bool {
     headers
         .get(matcher.name.as_str())
         .and_then(|value| value.to_str().ok())
@@ -2357,7 +2370,7 @@ fn request_header_matches(headers: &HeaderMap, matcher: &HeaderMatch) -> bool {
         .is_some_and(|value| value == matcher.value)
 }
 
-fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {
+pub(crate) fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {
     let connection_upgrade = headers
         .get("connection")
         .and_then(|value| value.to_str().ok())
@@ -2377,7 +2390,7 @@ fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {
     connection_upgrade && websocket_upgrade
 }
 
-fn extract_propagated_headers(headers: &HeaderMap) -> Vec<PropagatedHeader> {
+pub(crate) fn extract_propagated_headers(headers: &HeaderMap) -> Vec<PropagatedHeader> {
     let Some(value) = headers
         .get(TACHYON_COHORT_HEADER)
         .or_else(|| headers.get(COHORT_HEADER))
@@ -2400,7 +2413,7 @@ fn extract_propagated_headers(headers: &HeaderMap) -> Vec<PropagatedHeader> {
     ]
 }
 
-fn resolve_incoming_hop_limit(headers: &HeaderMap) -> std::result::Result<HopLimit, ()> {
+pub(crate) fn resolve_incoming_hop_limit(headers: &HeaderMap) -> std::result::Result<HopLimit, ()> {
     let hop_limit = headers
         .get(HOP_LIMIT_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -2415,7 +2428,7 @@ fn resolve_incoming_hop_limit(headers: &HeaderMap) -> std::result::Result<HopLim
 }
 
 #[cfg(test)]
-fn resolve_mesh_fetch_target(
+pub(crate) fn resolve_mesh_fetch_target(
     config: &IntegrityConfig,
     route_registry: &RouteRegistry,
     caller_route: &IntegrityRoute,
@@ -2431,11 +2444,11 @@ fn resolve_mesh_fetch_target(
     .map(|resolved| resolved.url)
 }
 
-fn is_internal_mesh_host(host: &str) -> bool {
+pub(crate) fn is_internal_mesh_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("tachyon") || host.eq_ignore_ascii_case("mesh")
 }
 
-fn append_query(path: &str, query: Option<&str>) -> String {
+pub(crate) fn append_query(path: &str, query: Option<&str>) -> String {
     match query {
         Some(query) if !query.is_empty() => format!("{path}?{query}"),
         _ => path.to_owned(),
@@ -2443,12 +2456,12 @@ fn append_query(path: &str, query: Option<&str>) -> String {
 }
 
 impl OutboundTargetKind {
-    fn is_internal(&self) -> bool {
+    pub(crate) fn is_internal(&self) -> bool {
         matches!(self, Self::Internal)
     }
 }
 
-fn resolve_outbound_http_target(
+pub(crate) fn resolve_outbound_http_target(
     config: &IntegrityConfig,
     route_registry: &RouteRegistry,
     caller_route: &IntegrityRoute,
@@ -2527,7 +2540,7 @@ fn resolve_outbound_http_target(
     })
 }
 
-fn resolve_direct_external_target(
+pub(crate) fn resolve_direct_external_target(
     caller_route: &IntegrityRoute,
     target: &str,
 ) -> std::result::Result<ResolvedOutboundTarget, String> {
@@ -2544,7 +2557,7 @@ fn resolve_direct_external_target(
     ))
 }
 
-fn resolve_resource_alias(
+pub(crate) fn resolve_resource_alias(
     config: &IntegrityConfig,
     route_registry: &RouteRegistry,
     resource: &IntegrityResource,
@@ -2593,7 +2606,7 @@ fn resolve_resource_alias(
     }
 }
 
-fn resolve_internal_resource_target(
+pub(crate) fn resolve_internal_resource_target(
     route_registry: &RouteRegistry,
     target: &str,
     version_constraint: Option<&str>,
@@ -2629,14 +2642,14 @@ fn resolve_internal_resource_target(
     Ok(route.path.clone())
 }
 
-fn join_resource_path(base_path: &str, suffix: &str) -> String {
+pub(crate) fn join_resource_path(base_path: &str, suffix: &str) -> String {
     if suffix.is_empty() || suffix == "/" {
         return base_path.to_owned();
     }
     format!("{}{}", base_path.trim_end_matches('/'), suffix)
 }
 
-fn join_external_resource_url(
+pub(crate) fn join_external_resource_url(
     base_url: &str,
     suffix: &str,
     query: Option<&str>,
@@ -2652,7 +2665,9 @@ fn join_external_resource_url(
     Ok(url.to_string())
 }
 
-fn internal_mesh_base_url(config: &IntegrityConfig) -> std::result::Result<String, String> {
+pub(crate) fn internal_mesh_base_url(
+    config: &IntegrityConfig,
+) -> std::result::Result<String, String> {
     let host_address = config.host_address.trim();
     if host_address.is_empty() {
         return Err(
@@ -2673,7 +2688,7 @@ fn internal_mesh_base_url(config: &IntegrityConfig) -> std::result::Result<Strin
 }
 
 impl RouteRegistry {
-    fn build(config: &IntegrityConfig) -> Result<Self> {
+    pub(crate) fn build(config: &IntegrityConfig) -> Result<Self> {
         let mut registry = Self::default();
         let mut seen_versions = HashMap::<(String, String), String>::new();
 
@@ -2764,7 +2779,7 @@ impl RouteRegistry {
         Ok(registry)
     }
 
-    fn ensure_dependencies_satisfied(
+    pub(crate) fn ensure_dependencies_satisfied(
         &self,
         route: &ResolvedRoute,
     ) -> std::result::Result<(), String> {
@@ -2794,7 +2809,7 @@ impl RouteRegistry {
         Ok(())
     }
 
-    fn resolve_dependency_route(
+    pub(crate) fn resolve_dependency_route(
         &self,
         caller_path: &str,
         dependency_name: &str,
@@ -2814,7 +2829,10 @@ impl RouteRegistry {
         self.resolve_dependency_candidate(caller, dependency_name, requirement)
     }
 
-    fn resolve_named_route(&self, route_name: &str) -> std::result::Result<&ResolvedRoute, String> {
+    pub(crate) fn resolve_named_route(
+        &self,
+        route_name: &str,
+    ) -> std::result::Result<&ResolvedRoute, String> {
         self.by_name
             .get(route_name)
             .and_then(|routes| routes.first())
@@ -2823,7 +2841,7 @@ impl RouteRegistry {
             })
     }
 
-    fn resolve_named_route_matching(
+    pub(crate) fn resolve_named_route_matching(
         &self,
         route_name: &str,
         requirement: &VersionReq,
@@ -2840,7 +2858,7 @@ impl RouteRegistry {
             })
     }
 
-    fn resolve_dependency_candidate(
+    pub(crate) fn resolve_dependency_candidate(
         &self,
         caller: &ResolvedRoute,
         dependency_name: &str,
@@ -2865,7 +2883,7 @@ impl RouteRegistry {
 }
 
 impl BatchTargetRegistry {
-    fn build(config: &IntegrityConfig) -> Result<Self> {
+    pub(crate) fn build(config: &IntegrityConfig) -> Result<Self> {
         let mut registry = Self::default();
         for target in &config.batch_targets {
             if registry
@@ -2883,12 +2901,12 @@ impl BatchTargetRegistry {
         Ok(registry)
     }
 
-    fn get(&self, name: &str) -> Option<&IntegrityBatchTarget> {
+    pub(crate) fn get(&self, name: &str) -> Option<&IntegrityBatchTarget> {
         self.by_name.get(name)
     }
 }
 
-fn client_connect_host(ip: IpAddr) -> String {
+pub(crate) fn client_connect_host(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(ip) if ip.is_unspecified() => Ipv4Addr::LOCALHOST.to_string(),
         IpAddr::V4(ip) => ip.to_string(),
@@ -2898,7 +2916,7 @@ fn client_connect_host(ip: IpAddr) -> String {
 }
 
 #[cfg(unix)]
-fn discovery_publish_ip(config: &IntegrityConfig) -> Result<String> {
+pub(crate) fn discovery_publish_ip(config: &IntegrityConfig) -> Result<String> {
     let host_address = config.host_address.trim();
     if host_address.is_empty() {
         return Err(anyhow!(
@@ -2936,7 +2954,7 @@ fn discovery_publish_ip(config: &IntegrityConfig) -> Result<String> {
     Ok(host.to_owned())
 }
 
-fn loop_detected_response() -> Response {
+pub(crate) fn loop_detected_response() -> Response {
     (
         StatusCode::LOOP_DETECTED,
         "Tachyon Mesh: Routing loop detected (Hop limit exceeded)",
@@ -2945,12 +2963,12 @@ fn loop_detected_response() -> Response {
 }
 
 impl HopLimit {
-    fn as_header_value(self) -> HeaderValue {
+    pub(crate) fn as_header_value(self) -> HeaderValue {
         HeaderValue::from_str(&self.0.to_string())
             .expect("hop limit should always produce a valid header value")
     }
 
-    fn decremented(self) -> u32 {
+    pub(crate) fn decremented(self) -> u32 {
         self.0.saturating_sub(1)
     }
 }
