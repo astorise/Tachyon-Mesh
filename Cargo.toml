@@ -26,6 +26,7 @@ members = [
     "systems/system-faas-k8s-scaler",
     "systems/system-faas-keda",
     "systems/system-faas-logger",
+    "systems/system-faas-otel",
     "systems/system-faas-gateway",
     "systems/system-faas-cert-manager",
     "systems/system-faas-cdc",
