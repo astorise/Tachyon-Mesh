@@ -1,0 +1,17 @@
+services:
+  quic-interop-runner:
+    image: ghcr.io/quic-interop/quic-interop-runner:latest
+    command:
+      - --client
+      - quinn
+      - --server
+      - tachyon
+      - --test
+      - handshake
+      - --test
+      - transfer
+      - --test
+      - retry
+    volumes:
+      - ./www:/www:ro
+      - ./logs:/logs

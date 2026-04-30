@@ -1,0 +1,11 @@
+[package]
+name = "guest-grpc-interop"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+prost = "0.13"
+wit-bindgen = "0.57"

@@ -134,3 +134,37 @@ jobs:
       - name: Delete k3d cluster
         if: always()
         run: k3d cluster delete tachyon-mesh || true
+
+  grpc-interop:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build gRPC interop guest
+        run: cargo build -p guest-grpc-interop --target wasm32-wasip2 --release
+
+      - name: Run gRPC Interop
+        run: |
+          docker run --rm grpc/go:latest \
+            go run google.golang.org/grpc/interop/client \
+            --server_host=127.0.0.1 \
+            --server_port=8080 \
+            --use_tls=false \
+            --test_case=empty_unary
+
+  quic-interop:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run QUIC Interop
+        run: docker compose -f tests/conformance/quic/docker-compose.yml config

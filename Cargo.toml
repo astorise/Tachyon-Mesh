@@ -9,6 +9,7 @@ members = [
     "examples/guest-example",
     "examples/guest-flaky",
     "examples/guest-grpc",
+    "examples/guest-grpc-interop",
     "examples/guest-log-storm",
     "examples/guest-loop",
     "examples/guest-malicious",
