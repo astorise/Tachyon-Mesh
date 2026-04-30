@@ -17,7 +17,7 @@ use axum::{
     routing::{get, post, put},
     Extension, Router,
 };
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 #[cfg(feature = "websockets")]
 use futures_util::{SinkExt, StreamExt};
@@ -2227,8 +2227,17 @@ enum ExecutionError {
 #[derive(Debug, Parser)]
 #[command(name = "core-host")]
 struct HostCli {
+    #[arg(long, value_enum, default_value_t = AccelerationMode::Userspace)]
+    accel: AccelerationMode,
     #[command(subcommand)]
     command: Option<HostCommand>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum AccelerationMode {
+    #[default]
+    Userspace,
+    Ebpf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2255,7 +2264,7 @@ async fn run() -> Result<()> {
     ensure_rustls_crypto_provider();
     let cli = HostCli::parse();
     match cli.command.unwrap_or(HostCommand::Serve) {
-        HostCommand::Serve => serve_host().await,
+        HostCommand::Serve => serve_host(cli.accel).await,
         HostCommand::Run(command) => {
             let exit_code = match execute_batch_target_from_manifest(
                 command.manifest.unwrap_or_else(integrity_manifest_path),
@@ -2275,13 +2284,14 @@ async fn run() -> Result<()> {
     }
 }
 
-async fn serve_host() -> Result<()> {
+async fn serve_host(accel: AccelerationMode) -> Result<()> {
     let manifest_path = integrity_manifest_path();
     let (export_sender, export_receiver) = mpsc::channel(TELEMETRY_EXPORT_QUEUE_CAPACITY);
     let telemetry =
         telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
     let memory_governor = Arc::new(memory_governor::MemoryGovernor::from_system_memory());
     let runtime = build_runtime_state(verify_integrity()?)?;
+    maybe_init_l4_acceleration(accel, &runtime.config.layer4);
     if maybe_run_bootstrap_mode(&runtime.config).await? {
         return Ok(());
     }
@@ -2409,6 +2419,27 @@ async fn serve_host() -> Result<()> {
     }
     background_workers.stop_all().await;
     Ok(())
+}
+
+fn maybe_init_l4_acceleration(accel: AccelerationMode, layer4: &IntegrityLayer4Config) {
+    if accel != AccelerationMode::Ebpf {
+        return;
+    }
+
+    let route_count = layer4.tcp.len().saturating_add(layer4.udp.len());
+    match network::ebpf::init_ebpf_fastpath(route_count) {
+        Ok(network::ebpf::EbpfFastPathStatus::NoRules) => {
+            tracing::info!("eBPF L4 fast-path requested, but no L4 routes are configured");
+        }
+        Ok(network::ebpf::EbpfFastPathStatus::Unsupported) => {
+            tracing::warn!(
+                "eBPF L4 fast-path is unsupported on this platform; using userspace routing"
+            );
+        }
+        Err(error) => {
+            tracing::warn!("{error}");
+        }
+    }
 }
 
 async fn execute_batch_target_from_manifest(
