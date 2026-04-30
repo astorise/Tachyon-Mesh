@@ -42,6 +42,7 @@ members = [
     "systems/system-faas-microvm-runner",
     "systems/system-faas-buffer",
     "systems/system-faas-s3-proxy",
+    "systems/system-faas-shadow-proxy",
     "systems/system-faas-sqs",
     "systems/system-faas-tde",
     "systems/system-faas-tee-runtime",
