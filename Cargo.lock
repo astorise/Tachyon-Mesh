@@ -6676,6 +6676,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachyon-faas-sdk"
+version = "1.0.0"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "tachyon-mcp"
 version = "0.1.0"
 dependencies = [

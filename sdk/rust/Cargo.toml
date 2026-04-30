@@ -1,0 +1,12 @@
+[package]
+name = "tachyon-faas-sdk"
+version = "1.0.0"
+edition = "2021"
+description = "Official Rust SDK bindings for Tachyon Mesh FaaS guests"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wit-bindgen = "0.57"

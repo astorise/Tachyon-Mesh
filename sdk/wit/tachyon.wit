@@ -1,0 +1,265 @@
+package tachyon:mesh@1.0.0;
+
+interface handler {
+    type headers = list<tuple<string, string>>;
+
+    record request {
+        method: string,
+        uri: string,
+        headers: headers,
+        body: list<u8>,
+        trailers: headers,
+    }
+
+    record response {
+        status: u16,
+        headers: headers,
+        body: list<u8>,
+        trailers: headers,
+    }
+
+    handle-request: func(req: request) -> response;
+}
+
+interface udp-handler {
+    record datagram {
+        target-ip: string,
+        target-port: u16,
+        payload: list<u8>,
+    }
+
+    handle-packet: func(source-ip: string, source-port: u16, payload: list<u8>) -> list<datagram>;
+}
+
+interface websocket {
+    variant frame {
+        text(string),
+        binary(list<u8>),
+        ping(list<u8>),
+        pong(list<u8>),
+        close,
+    }
+
+    resource connection {
+        send: func(frame: frame) -> result<_, string>;
+        receive: func() -> option<frame>;
+    }
+}
+
+interface telemetry-reader {
+    record metrics-snapshot {
+        total-requests: u64,
+        completed-requests: u64,
+        error-requests: u64,
+        active-requests: u32,
+        cpu-pressure: u8,
+        ram-pressure: u8,
+        active-instances: u32,
+        allocated-memory-pages: u32,
+        capability-mask: u64,
+        capabilities: list<string>,
+        active-l4-relays: u32,
+        l4-throughput-bytes-per-sec: u64,
+        l4-load-score: u8,
+        advertise-ip: string,
+        cpu-rt-load: u32,
+        cpu-standard-load: u32,
+        cpu-batch-load: u32,
+        gpu-rt-load: u32,
+        gpu-standard-load: u32,
+        gpu-batch-load: u32,
+        npu-rt-load: u32,
+        npu-standard-load: u32,
+        npu-batch-load: u32,
+        tpu-rt-load: u32,
+        tpu-standard-load: u32,
+        tpu-batch-load: u32,
+        hot-models: list<string>,
+        dropped-events: u64,
+        last-status: u16,
+        total-duration-us: u64,
+        total-wasm-duration-us: u64,
+        total-host-overhead-us: u64,
+    }
+
+    get-metrics: func() -> metrics-snapshot;
+}
+
+interface scaling-metrics {
+    get-pending-queue-size: func(route-path: string) -> u32;
+}
+
+interface vector {
+    type index-name = string;
+    type embedding = list<f32>;
+
+    record index-spec {
+        name: index-name,
+        dim: u32,
+        m: u32,
+        ef-construction: u32,
+    }
+
+    record document {
+        id: string,
+        embedding: embedding,
+        payload: option<list<u8>>,
+    }
+
+    record search-match {
+        id: string,
+        score: f32,
+        payload: option<list<u8>>,
+    }
+
+    create-index: func(spec: index-spec) -> result<_, string>;
+    upsert: func(name: index-name, docs: list<document>) -> result<_, string>;
+    search: func(name: index-name, query: embedding, k: u32) -> result<list<search-match>, string>;
+    remove: func(name: index-name, id: string) -> result<bool, string>;
+}
+
+interface training {
+    type rank = u32;
+    type step-budget = u32;
+
+    record dataset-handle {
+        volume-alias: string,
+        path: string,
+        split: option<string>,
+    }
+
+    record training-job {
+        base-model: string,
+        dataset: dataset-handle,
+        rank: rank,
+        max-steps: step-budget,
+        seed: option<u64>,
+    }
+
+    record job-id {
+        value: string,
+    }
+
+    variant job-status {
+        queued,
+        running(tuple<u32, u32>),
+        completed(string),
+        failed(string),
+    }
+
+    submit-training-job: func(job: training-job) -> result<job-id, string>;
+    get-training-status: func(id: job-id) -> result<job-status, string>;
+}
+
+interface storage-broker {
+    enum write-mode {
+        overwrite,
+        append,
+    }
+
+    enqueue-write: func(path: string, mode: write-mode, body: list<u8>) -> result<_, string>;
+    snapshot-volume: func(volume-id: string, source-path: string, snapshot-path: string) -> result<_, string>;
+    restore-volume: func(volume-id: string, snapshot-path: string, destination-path: string) -> result<_, string>;
+}
+
+interface outbound-http {
+    type headers = list<tuple<string, string>>;
+
+    record response {
+        status: u16,
+        headers: headers,
+        body: list<u8>,
+    }
+
+    send-request: func(method: string, url: string, headers: headers, body: list<u8>) -> result<response, string>;
+}
+
+interface outbox-store {
+    record outbox-event {
+        id: string,
+        content-type: string,
+        body: list<u8>,
+    }
+
+    claim-events: func(db-url: string, table: string, max-events: u32) -> result<list<outbox-event>, string>;
+    ack-event: func(db-url: string, table: string, id: string) -> result<_, string>;
+}
+
+interface bridge-controller {
+    record bridge-config {
+        client-a-addr: string,
+        client-b-addr: string,
+        timeout-seconds: u32,
+    }
+
+    record bridge-endpoints {
+        bridge-id: string,
+        ip: string,
+        port-a: u16,
+        port-b: u16,
+    }
+
+    create-bridge: func(config: bridge-config) -> result<bridge-endpoints, string>;
+    destroy-bridge: func(bridge-id: string) -> result<_, string>;
+}
+
+interface routing-control {
+    update-target: func(route-path: string, destination: string) -> result<_, string>;
+}
+
+interface secrets-vault {
+    enum error {
+        not-found,
+        permission-denied,
+        vault-disabled,
+    }
+
+    get-secret: func(name: string) -> result<string, error>;
+}
+
+world faas-guest {
+    import bridge-controller;
+    import secrets-vault;
+    import vector;
+    import training;
+    export handler;
+}
+
+world udp-faas-guest {
+    import secrets-vault;
+    export udp-handler;
+}
+
+world websocket-faas-guest {
+    import secrets-vault;
+    import websocket;
+    use websocket.{connection};
+    export on-connect: func(connection: borrow<connection>);
+}
+
+world system-faas-guest {
+    import bridge-controller;
+    import telemetry-reader;
+    import scaling-metrics;
+    import storage-broker;
+    import outbound-http;
+    export handler;
+}
+
+world background-system-faas {
+    import scaling-metrics;
+    import telemetry-reader;
+    import outbound-http;
+    import outbox-store;
+    import routing-control;
+    export on-tick: func();
+}
+
+world control-plane-faas {
+    import telemetry-reader;
+    import scaling-metrics;
+    import outbound-http;
+    import routing-control;
+    export handler;
+    export on-tick: func();
+}
