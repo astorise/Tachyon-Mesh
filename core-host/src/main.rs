@@ -40,6 +40,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     convert::Infallible,
     fmt, fs,
+    hash::{Hash, Hasher},
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -169,6 +170,10 @@ const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
 const INTEGRITY_MANIFEST_PATH_ENV: &str = "TACHYON_INTEGRITY_MANIFEST";
+const BOOTSTRAP_IF_UNENROLLED_ENV: &str = "TACHYON_BOOTSTRAP_IF_UNENROLLED";
+const ENROLLMENT_CERT_PATH_ENV: &str = "TACHYON_ENROLLMENT_CERT_PATH";
+const NODE_CERT_PEM_ENV: &str = "TACHYON_NODE_CERT_PEM";
+const NODE_KEY_PEM_ENV: &str = "TACHYON_NODE_KEY_PEM";
 const DEFAULT_HOP_LIMIT: u32 = 10;
 const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
 const COHORT_HEADER: &str = "x-cohort";
@@ -1962,17 +1967,12 @@ impl Default for IntegrityRoute {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AdmissionStrategy {
+    #[default]
     FailFast,
     MeshRetry,
-}
-
-impl Default for AdmissionStrategy {
-    fn default() -> Self {
-        Self::FailFast
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -2269,7 +2269,11 @@ async fn serve_host() -> Result<()> {
     let telemetry =
         telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
     let runtime = build_runtime_state(verify_integrity()?)?;
+    if maybe_run_bootstrap_mode(&runtime.config).await? {
+        return Ok(());
+    }
     let core_store = open_core_store_for_manifest(&manifest_path).await?;
+    secure_cache_bootstrap(core_store.as_ref(), &runtime)?;
     let host_identity = Arc::new(HostIdentity::generate());
     let uds_fast_path = Arc::new(new_uds_fast_path_registry());
     let storage_broker = Arc::new(StorageBrokerManager::new(Arc::clone(&core_store)));
@@ -4460,6 +4464,69 @@ async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+fn secure_cache_bootstrap(core_store: &store::CoreStore, runtime: &RuntimeState) -> Result<()> {
+    let engine_hash = runtime_engine_cache_hash(runtime);
+    core_store.secure_cwasm_cache_bootstrap(&engine_hash)?;
+    Ok(())
+}
+
+fn runtime_engine_cache_hash(runtime: &RuntimeState) -> String {
+    format!(
+        "{}:{}",
+        engine_precompile_hash_string(&runtime.engine),
+        engine_precompile_hash_string(&runtime.metered_engine)
+    )
+}
+
+fn engine_precompile_hash_string(engine: &Engine) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+async fn maybe_run_bootstrap_mode(config: &IntegrityConfig) -> Result<bool> {
+    if !env_flag(BOOTSTRAP_IF_UNENROLLED_ENV) || has_enrollment_credentials() {
+        return Ok(false);
+    }
+
+    let endpoint = config.enrollment_endpoint.as_deref().ok_or_else(|| {
+        anyhow!(
+            "bootstrap mode requested but sealed config does not define `enrollment_endpoint`"
+        )
+    })?;
+    let cert_output_path = std::env::var(ENROLLMENT_CERT_PATH_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("auth-state/enrolled-node.cert"));
+    tracing::warn!(
+        "Entering Bootstrap Mode: isolating host startup to system-faas-enrollment"
+    );
+    system_faas_enrollment::run_enrollment(system_faas_enrollment::EnrollmentConfig {
+        bootstrap_url: endpoint.to_owned(),
+        cert_output_path,
+        poll_interval: Duration::from_secs(30),
+        max_polls: 120,
+    })
+    .await?;
+    Ok(true)
+}
+
+fn has_enrollment_credentials() -> bool {
+    if std::env::var_os(NODE_CERT_PEM_ENV).is_some() && std::env::var_os(NODE_KEY_PEM_ENV).is_some()
+    {
+        return true;
+    }
+    std::env::var(ENROLLMENT_CERT_PATH_ENV)
+        .ok()
+        .map(|path| Path::new(&path).is_file())
+        .unwrap_or(false)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -5393,9 +5460,7 @@ async fn enforce_distributed_rate_limit(
     route: &IntegrityRoute,
     headers: &HeaderMap,
 ) -> Option<(StatusCode, String)> {
-    let Some(policy) = route.distributed_rate_limit.as_ref() else {
-        return None;
-    };
+    let policy = route.distributed_rate_limit.as_ref()?;
     let Some(limiter_route) = runtime
         .config
         .sealed_route(SYSTEM_DIST_LIMITER_ROUTE)
@@ -9142,6 +9207,7 @@ fn load_component_with_core_store(
         )
     })?;
     let cache_key = compiled_artifact_cache_key(
+        engine,
         module_path,
         &wasm_bytes,
         CompiledArtifactKind::Component,
@@ -9260,6 +9326,7 @@ fn load_module_with_core_store(
         )
     })?;
     let cache_key = compiled_artifact_cache_key(
+        engine,
         module_path,
         &wasm_bytes,
         CompiledArtifactKind::Module,
@@ -9295,6 +9362,7 @@ fn load_module_with_core_store(
 }
 
 fn compiled_artifact_cache_key(
+    engine: &Engine,
     module_path: &Path,
     wasm_bytes: &[u8],
     kind: CompiledArtifactKind,
@@ -9309,9 +9377,10 @@ fn compiled_artifact_cache_key(
     };
 
     format!(
-        "{kind}:{cache_scope}:{}:{}",
+        "{kind}:{cache_scope}:{}:{}:{}",
         module_path.display(),
-        hex::encode(digest)
+        hex::encode(digest),
+        engine_precompile_hash_string(engine)
     )
 }
 
@@ -14881,6 +14950,84 @@ mod tests {
 
     fn build_test_metered_engine(config: &IntegrityConfig) -> Engine {
         build_engine(config, true).expect("metered engine should be created")
+    }
+
+    #[test]
+    fn compiled_artifact_cache_key_includes_engine_compatibility_hash() {
+        let config = IntegrityConfig::default_sealed();
+        let normal_engine = build_test_engine(&config);
+        let metered_engine = build_test_metered_engine(&config);
+        let path = Path::new("target/wasm32-wasip2/debug/guest_example.wasm");
+        let wasm = b"\0asm-test";
+
+        let normal_key = compiled_artifact_cache_key(
+            &normal_engine,
+            path,
+            wasm,
+            CompiledArtifactKind::Module,
+            "scope",
+        );
+        let metered_key = compiled_artifact_cache_key(
+            &metered_engine,
+            path,
+            wasm,
+            CompiledArtifactKind::Module,
+            "scope",
+        );
+
+        assert_ne!(normal_key, metered_key);
+        assert!(normal_key.contains(&engine_precompile_hash_string(&normal_engine)));
+        assert!(metered_key.contains(&engine_precompile_hash_string(&metered_engine)));
+    }
+
+    #[test]
+    fn secure_cache_bootstrap_retains_matching_cwasm_cache() {
+        let dir = unique_test_dir("cwasm-retain");
+        let store =
+            store::CoreStore::open(&dir.join("core.redb")).expect("test store should open");
+        store
+            .secure_cwasm_cache_bootstrap("engine-a")
+            .expect("bootstrap should persist hash");
+        store
+            .put(store::CoreStoreBucket::CwasmCache, "entry", b"cached")
+            .expect("cache insert should succeed");
+
+        let purged = store
+            .secure_cwasm_cache_bootstrap("engine-a")
+            .expect("matching bootstrap should succeed");
+
+        assert!(!purged);
+        assert_eq!(
+            store
+                .get(store::CoreStoreBucket::CwasmCache, "entry")
+                .expect("cache read should succeed"),
+            Some(b"cached".to_vec())
+        );
+    }
+
+    #[test]
+    fn secure_cache_bootstrap_purges_stale_cwasm_cache() {
+        let dir = unique_test_dir("cwasm-purge");
+        let store =
+            store::CoreStore::open(&dir.join("core.redb")).expect("test store should open");
+        store
+            .secure_cwasm_cache_bootstrap("engine-a")
+            .expect("bootstrap should persist hash");
+        store
+            .put(store::CoreStoreBucket::CwasmCache, "entry", b"cached")
+            .expect("cache insert should succeed");
+
+        let purged = store
+            .secure_cwasm_cache_bootstrap("engine-b")
+            .expect("changed hash bootstrap should succeed");
+
+        assert!(purged);
+        assert_eq!(
+            store
+                .get(store::CoreStoreBucket::CwasmCache, "entry")
+                .expect("cache read should succeed"),
+            None
+        );
     }
 
     fn build_test_runtime(config: IntegrityConfig) -> RuntimeState {

@@ -29,6 +29,7 @@ members = [
     "systems/system-faas-cert-manager",
     "systems/system-faas-cdc",
     "systems/system-faas-dist-limiter",
+    "systems/system-faas-enrollment",
     "systems/system-faas-gc",
     "systems/system-faas-gossip",
     "systems/system-faas-prom",
