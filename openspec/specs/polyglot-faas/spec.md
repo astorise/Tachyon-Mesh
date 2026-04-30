@@ -1,29 +1,19 @@
 # polyglot-faas Specification
 
 ## Purpose
-TBD - created by archiving change polyglot-faas. Update Purpose after archive.
+Define polyglot Wasm component execution and official SDK generation for Tachyon FaaS guests.
+
 ## Requirements
-### Requirement: Repository packages polyglot WASI guest modules
-The repository SHALL include Go, JavaScript, C#, and Java guest examples that compile into standalone WASI modules and ship in the host runtime image alongside the Rust guest modules.
+### Requirement: WIT-driven guest interface
+Official SDKs SHALL be generated from the canonical Tachyon WIT interface so every supported language targets the same binary contract.
 
-#### Scenario: Container build emits polyglot guest modules
-- **WHEN** a developer or CI job runs `docker build -t tachyon-mesh:test .`
-- **THEN** the builder stage installs TinyGo, Javy, .NET 8 WASI tooling, and Maven/OpenJDK
-- **AND** `examples/guest-go/main.go` is compiled into `guest_go.wasm`
-- **AND** `examples/guest-js/index.js` is compiled into `guest_js.wasm`
-- **AND** `examples/guest-csharp/Program.cs` is published into `guest_csharp.wasm`
-- **AND** `examples/guest-java/src/main/java/com/tachyonmesh/guestjava/Main.java` is compiled into `guest_java.wasm`
-- **AND** the runtime image includes all four modules under `/app/guest-modules`
+#### Scenario: WIT interface changes
+- **WHEN** the canonical WIT interface changes
+- **THEN** generated SDK bindings for supported languages are refreshed from the same source interface
 
-### Requirement: Integration workflow exercises polyglot guest routes
-The repository SHALL verify that the deployed host can serve Go, JavaScript, C#, and Java guest modules through sealed HTTP routes without adding a language-specific execution path.
+### Requirement: Official SDK publishing
+The release pipeline SHALL publish generated SDKs to the configured ecosystem registries.
 
-#### Scenario: k3d integration validates polyglot guest responses
-- **WHEN** the integration workflow deploys the host image to k3d
-- **THEN** the sealed runtime configuration includes `/api/guest-go`, `/api/guest-js`, `/api/guest-csharp`, and `/api/guest-java`
-- **AND** `GET /api/guest-go` returns `Hello from TinyGo FaaS!`
-- **AND** `GET /api/guest-js` returns `Hello from JavaScript FaaS!`
-- **AND** `GET /api/guest-csharp` returns `Hello from C# FaaS!`
-- **AND** `GET /api/guest-java` returns `Hello from Java FaaS!`
-- **AND** the same host execution pipeline continues to serve the existing Rust guest routes
-
+#### Scenario: SDK publish workflow runs
+- **WHEN** a release triggers SDK publishing
+- **THEN** Rust, JavaScript or TypeScript, Python, and Go SDK outputs are generated and published through their configured channels

@@ -1,31 +1,19 @@
-# HTTP/3 over QUIC
+# http3-quic Specification
 
 ## Purpose
-Define how Tachyon Mesh exposes HTTP/3 over QUIC behind a compile-time feature while continuing to route requests through the existing HTTP application pipeline.
+Define HTTP/3 and QUIC ingress behavior for low-latency client traffic.
+
 ## Requirements
-### Requirement: HTTP/3 over QUIC is available behind a compile-time feature
-The host SHALL expose HTTP/3 over QUIC only when the corresponding feature is enabled and SHALL bridge accepted requests into the existing routing pipeline.
+### Requirement: HTTP/3 listener
+The host SHALL expose an HTTP/3 listener when the feature is enabled and a sealed route configuration permits ingress.
 
-#### Scenario: An HTTP/3 connection arrives while the feature is enabled
-- **WHEN** the host receives a QUIC connection on the configured UDP listener with HTTP/3 enabled
-- **THEN** it terminates the QUIC and TLS session
-- **AND** forwards the parsed request through the same routing behavior used by the standard HTTP stack
+#### Scenario: QUIC client connects
+- **WHEN** a QUIC client negotiates the supported ALPN and sends a valid HTTP/3 request
+- **THEN** the host dispatches the request through the same route pipeline used by HTTP ingress
 
-### Requirement: HTTP/3 request bodies are streamed without full buffering
-The `core-host` HTTP/3 server (`server_h3.rs`) SHALL bridge incoming `h3` data streams directly into an asynchronous `axum::body::Body` so that request payloads are forwarded chunk-by-chunk to downstream Wasm modules or storage brokers without being accumulated in host RAM.
+### Requirement: QUIC interoperability
+HTTP/3 behavior SHALL be covered by interoperability checks for ALPN negotiation, resumption, and connection migration.
 
-#### Scenario: Large GGUF upload streams without OOM
-- **WHEN** a client uploads a multi-gigabyte GGUF model body over HTTP/3
-- **THEN** the host forwards body chunks to the configured downstream sink as they arrive
-- **AND** the host's RSS does not grow with the cumulative size of the request body
-- **AND** the upload completes successfully without an OOM crash
-
-### Requirement: QUIC server is hardened against connection-exhaustion attacks
-The `quinn` server configuration SHALL set explicit idle timeouts and concurrent-connection / concurrent-stream limits so that hung or malicious QUIC peers cannot exhaust host resources.
-
-#### Scenario: Slowloris-style QUIC peer is reaped
-- **WHEN** a client opens a QUIC connection but stops sending data for longer than the configured idle timeout
-- **THEN** the host closes the connection and releases its associated state
-- **AND** new legitimate connections are still accepted
-- **AND** the configured concurrency caps prevent any single peer from monopolising server resources
-
+#### Scenario: Interop checks run in CI
+- **WHEN** the HTTP/3 conformance suite executes
+- **THEN** negotiation and request handling must remain compatible with standard clients

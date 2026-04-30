@@ -1,38 +1,20 @@
-# gRPC HTTP/2
+# grpc-http2 Specification
 
 ## Purpose
-Define how Tachyon preserves HTTP/2 and trailer semantics required by gRPC, exposes request and response metadata to Wasm guests, and provides a reference guest that answers protobuf RPC traffic over h2c.
+Define native gRPC and HTTP/2 support for FaaS routes, including frame handling, trailer mapping, and streaming behavior.
+
 ## Requirements
-### Requirement: The HTTP contract preserves gRPC-oriented metadata
-The Tachyon WIT package SHALL expose request headers, request trailers, response headers, and response trailers to component guests so a guest can participate in gRPC exchanges without raw frame parsing in Wasm.
+### Requirement: gRPC over HTTP/2 routing
+The host SHALL route gRPC requests over HTTP/2 while preserving request metadata, response trailers, and status semantics.
 
-#### Scenario: A guest returns gRPC trailers
-- **WHEN** a component guest returns an HTTP response with trailers such as `grpc-status`
-- **THEN** the host preserves those trailers on the outgoing HTTP response
-- **AND** the host forwards ordinary headers such as `content-type: application/grpc`
+#### Scenario: Unary gRPC request succeeds
+- **WHEN** a sealed gRPC route receives a valid unary HTTP/2 request
+- **THEN** the request is dispatched to the configured guest
+- **AND** the response maps guest output and trailers into a valid gRPC response
 
-### Requirement: The cleartext HTTP listener accepts HTTP/2 traffic
-The host SHALL accept HTTP/2 cleartext traffic on the primary HTTP listener so internal or local gRPC clients can use h2c without native TLS.
+### Requirement: Interop conformance
+The CI pipeline SHALL validate gRPC behavior against the repository interop suite.
 
-#### Scenario: A gRPC client connects over h2c
-- **WHEN** a client opens an HTTP/2 cleartext connection to a sealed Tachyon route
-- **THEN** the host accepts the connection
-- **AND** dispatches the request through the standard route execution path
-
-### Requirement: The workspace ships a reference gRPC guest
-The workspace SHALL include a guest component that decodes a protobuf request, encodes a protobuf response, and returns a successful `grpc-status` trailer through the shared HTTP contract.
-
-#### Scenario: The sample guest answers a unary RPC
-- **WHEN** a client sends a framed protobuf request to the sealed gRPC route
-- **THEN** the guest decodes the protobuf payload
-- **AND** returns a framed protobuf response body
-- **AND** the client observes `grpc-status: 0` in the HTTP/2 trailers
-
-### Requirement: The HTTP contract supports HTTP/2 trailers and gRPC-oriented middleware
-The host SHALL preserve HTTP/2 semantics required by gRPC, including trailers, and SHALL allow middleware to translate browser-facing protocols into backend gRPC requests.
-
-#### Scenario: A route handles gRPC traffic
-- **WHEN** a request path requires HTTP/2 trailers or gRPC-Web translation
-- **THEN** the host preserves trailers and stream semantics
-- **AND** middleware can transcode frontend traffic into backend gRPC exchanges
-
+#### Scenario: Interop suite runs
+- **WHEN** the gRPC interop workflow executes standard cases such as empty unary and cancellation
+- **THEN** each case must pass before the change is considered releasable
