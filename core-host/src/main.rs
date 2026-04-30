@@ -8026,7 +8026,6 @@ async fn execute_route_request_with_acquired_permit(
         )
     })?;
     let _permit = permit;
-    let active_request_guard = semaphore.begin_request();
     if let Some(FaaSRuntime::Microvm {
         image,
         vcpus,
@@ -8063,15 +8062,20 @@ async fn execute_route_request_with_acquired_permit(
                 "traceId": trace_id,
             }),
         };
-        let microvm_result = runner.invoke(invocation).await.map_err(|error| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "microvm runner failed for route `{}`: {error:#}",
-                    route.path
-                ),
-            )
-        })?;
+        semaphore.active_requests.fetch_add(1, Ordering::SeqCst);
+        let microvm_result = match runner.invoke(invocation).await {
+            Ok(result) => result,
+            Err(error) => {
+                semaphore.active_requests.fetch_sub(1, Ordering::SeqCst);
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "microvm runner failed for route `{}`: {error:#}",
+                        route.path
+                    ),
+                ));
+            }
+        };
         let status = StatusCode::from_u16(u16::try_from(microvm_result.status).unwrap_or(500))
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let response_body = if microvm_result.stdout.is_empty() {
@@ -8091,9 +8095,12 @@ async fn execute_route_request_with_acquired_permit(
         return Ok(RouteExecutionResult {
             response,
             fuel_consumed: None,
-            completion_guard: Some(active_request_guard.into_response_guard()),
+            completion_guard: Some(RouteResponseGuard {
+                control: Arc::clone(&semaphore),
+            }),
         });
     }
+    let active_request_guard = semaphore.begin_request();
     let propagated_headers = extract_propagated_headers(&headers);
     let engine = if sampled_execution {
         runtime.metered_engine.clone()

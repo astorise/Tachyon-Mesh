@@ -264,8 +264,8 @@ async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
         }
         "tachyon_hardware_status" => {
             let status = tachyon_client::read_local_hardware_status();
-            let body =
-                serde_json::to_string_pretty(&status).context("failed to encode hardware status")?;
+            let body = serde_json::to_string_pretty(&status)
+                .context("failed to encode hardware status")?;
             Ok(json!({
                 "content": [
                     {

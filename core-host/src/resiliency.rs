@@ -94,7 +94,7 @@ where
         + Clone
         + Send
         + 'static,
-    S::Future: Send + 'static,
+    S::Future: 'static,
 {
     let Some(config) = config else {
         return service.oneshot(request).await.map_err(|error| error.into());
