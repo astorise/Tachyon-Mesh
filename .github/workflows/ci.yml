@@ -109,6 +109,10 @@ jobs:
           cargo build -p system-faas-storage-broker --target wasm32-wasip2 --release
           cargo build -p guest-call-legacy --target wasm32-wasip1 --release
           cargo build -p guest-loop --target wasm32-wasip1 --release
+          cargo build -p guest-malicious --target wasm32-wasip1 --release
+
+      - name: Run chaos test harness
+        run: cargo test -p core-host --test chaos_test
 
       - name: Run tests
         run: cargo test --workspace
