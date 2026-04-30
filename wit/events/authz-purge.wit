@@ -1,4 +1,4 @@
-package tachyon:mesh;
+package tachyon:mesh@1.0.0;
 
 /// Event payload for AuthZ cache invalidation. `system-faas-authz` writes one of
 /// these into the `authz_purge_outbox` table whenever it processes a mutation that

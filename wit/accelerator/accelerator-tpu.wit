@@ -1,4 +1,4 @@
-package tachyon:accelerator;
+package tachyon:accelerator@1.0.0;
 
 interface tpu {
     load-model: func(name: string) -> result<u32, string>;

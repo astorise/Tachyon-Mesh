@@ -1,0 +1,3 @@
+- [x] Update all existing `.wit` files to include the `package ...@X.Y.Z;` declaration.
+- [x] Implement the `wit-compat.yml` CI workflow using `wasm-tools`.
+- [x] Document the SDK versioning policy (SemVer) in the contributor guidelines.

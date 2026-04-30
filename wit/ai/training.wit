@@ -1,4 +1,4 @@
-package tachyon:mesh;
+package tachyon:mesh@1.0.0;
 
 /// Submission interface for asynchronous on-Edge LoRA fine-tuning. The host enqueues
 /// jobs into the low-priority lane of `system-faas-buffer` so the inference critical

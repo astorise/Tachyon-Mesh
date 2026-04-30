@@ -1,0 +1,76 @@
+name: WIT Compatibility Check
+
+on:
+  pull_request:
+    paths:
+      - "wit/**/*.wit"
+      - ".github/workflows/wit-compat.yml"
+
+jobs:
+  check-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --locked
+
+      - name: Check WIT package declarations
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r wit; do
+            if ! head -n 1 "$wit" | grep -Eq '^package [a-z][a-z0-9-]*:[a-z][a-z0-9-]*@[0-9]+\.[0-9]+\.[0-9]+;$'; then
+              echo "::error file=$wit::first line must declare a semver package, for example: package tachyon:mesh@1.0.0;"
+              missing=1
+            fi
+          done < <(find wit -name '*.wit' -print | sort)
+          exit "$missing"
+
+      - name: Validate changed WIT packages against main
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.base_ref || 'main' }}"
+          git fetch --no-tags origin "$base_ref"
+
+          mapfile -t changed_wits < <(git diff --name-only "origin/$base_ref"...HEAD -- 'wit/**/*.wit' | sort)
+          if [ "${#changed_wits[@]}" -eq 0 ]; then
+            echo "No WIT files changed."
+            exit 0
+          fi
+
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          mkdir -p "$tmp/base"
+          git archive "origin/$base_ref" wit | tar -x -C "$tmp/base"
+
+          for wit in "${changed_wits[@]}"; do
+            package_input="$wit"
+            package_dir="$(dirname "$wit")"
+            if [ "$package_dir" != "wit" ]; then
+              package_input="$package_dir"
+            fi
+
+            if git cat-file -e "origin/$base_ref:$wit" 2>/dev/null; then
+              wasm-tools component wit "$tmp/base/$package_input" --wasm -o "$tmp/old.wasm"
+              wasm-tools component wit "$package_input" --wasm -o "$tmp/new.wasm"
+
+              old_version="$(head -n 1 "$tmp/base/$wit" | sed -E 's/^package [^@]+@([0-9]+\.[0-9]+\.[0-9]+);$/\1/')"
+              new_version="$(head -n 1 "$wit" | sed -E 's/^package [^@]+@([0-9]+\.[0-9]+\.[0-9]+);$/\1/')"
+              if [[ "$old_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                old_major="${old_version%%.*}"
+                new_major="${new_version%%.*}"
+                if [ "$new_major" -lt "$old_major" ]; then
+                  echo "::error file=$wit::WIT package versions must not move backward."
+                  exit 1
+                fi
+              fi
+            else
+              echo "New WIT file: $wit"
+              wasm-tools component wit "$package_input" --wasm -o "$tmp/new-file.wasm"
+            fi
+          done
