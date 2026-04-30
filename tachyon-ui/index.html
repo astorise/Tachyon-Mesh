@@ -157,11 +157,23 @@
               <button id="hardware-refresh-btn" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-medium rounded-lg border border-slate-700 transition-all">Refresh</button>
             </div>
             <div class="grid gap-3 md:grid-cols-5">
+              <label class="text-xs text-slate-400">Runtime
+                <select id="hardware-runtime" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm">
+                  <option value="wasm">Wasm</option>
+                  <option value="microvm">MicroVM</option>
+                </select>
+              </label>
               <label class="text-xs text-slate-400">RAM MiB
                 <input id="hardware-min-ram" type="number" min="0" step="128" value="512" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm" />
               </label>
+              <label class="text-xs text-slate-400">vCPU
+                <input id="hardware-microvm-vcpus" type="number" min="1" step="1" value="1" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm" />
+              </label>
               <label class="text-xs text-slate-400">VRAM MiB
                 <input id="hardware-min-vram" type="number" min="0" step="128" value="0" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm" />
+              </label>
+              <label class="text-xs text-slate-400">Image
+                <input id="hardware-microvm-image" type="text" value="guest.smolmachine" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm font-mono" />
               </label>
               <label class="text-xs text-slate-400">Accelerator
                 <select id="hardware-accelerator" class="mt-1 w-full bg-slate-950 border border-slate-700 p-2 rounded-lg text-white text-sm">

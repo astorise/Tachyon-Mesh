@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "core-host",
+    "crates/smolvm",
     "faas-sdk",
     "examples/guest-ai",
     "examples/guest-call-legacy",

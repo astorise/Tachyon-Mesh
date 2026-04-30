@@ -4490,16 +4490,12 @@ async fn maybe_run_bootstrap_mode(config: &IntegrityConfig) -> Result<bool> {
     }
 
     let endpoint = config.enrollment_endpoint.as_deref().ok_or_else(|| {
-        anyhow!(
-            "bootstrap mode requested but sealed config does not define `enrollment_endpoint`"
-        )
+        anyhow!("bootstrap mode requested but sealed config does not define `enrollment_endpoint`")
     })?;
     let cert_output_path = std::env::var(ENROLLMENT_CERT_PATH_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("auth-state/enrolled-node.cert"));
-    tracing::warn!(
-        "Entering Bootstrap Mode: isolating host startup to system-faas-enrollment"
-    );
+    tracing::warn!("Entering Bootstrap Mode: isolating host startup to system-faas-enrollment");
     system_faas_enrollment::run_enrollment(system_faas_enrollment::EnrollmentConfig {
         bootstrap_url: endpoint.to_owned(),
         cert_output_path,
@@ -7789,16 +7785,8 @@ async fn execute_route_request(
                 .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
         })?;
 
-    if let Some(rejection) = enforce_resource_admission(
-        state,
-        route,
-        headers,
-        method,
-        body,
-        hop_limit,
-        runtime,
-    )
-    .await?
+    if let Some(rejection) =
+        enforce_resource_admission(state, route, headers, method, body, hop_limit, runtime).await?
     {
         return Ok(rejection);
     }
@@ -8038,17 +8026,61 @@ async fn execute_route_request_with_acquired_permit(
         memory_mb,
     }) = route.runtime.as_ref()
     {
-        let mut response = GuestHttpResponse::new(
-            StatusCode::NOT_IMPLEMENTED,
-            format!(
-                "route `{}` is configured for MicroVM image `{image}` ({vcpus} vCPU, {memory_mb} MiB), but the SmolVM runner is not enabled in this host build",
-                route.path
-            ),
-        );
-        response.headers.push((
-            "x-tachyon-runtime".to_owned(),
-            "microvm".to_owned(),
-        ));
+        let runner = system_faas_microvm_runner::MicroVmRunner::new(
+            system_faas_microvm_runner::MicroVmConfig {
+                image: PathBuf::from(image),
+                vcpus: *vcpus,
+                memory_mb: *memory_mb,
+                keep_warm: false,
+                tap_device: None,
+                vsock_cid: None,
+                serial_path: None,
+                snapshot_path: None,
+            },
+        )
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("microvm runner rejected route `{}`: {error}", route.path),
+            )
+        })?;
+        let invocation = system_faas_microvm_runner::MicroVmInvocation {
+            module_id: selected_module.clone(),
+            payload: serde_json::json!({
+                "routePath": route.path,
+                "method": method.as_str(),
+                "uri": uri.to_string(),
+                "headers": header_map_to_guest_fields(&headers),
+                "bodyUtf8": String::from_utf8_lossy(&body),
+                "trailers": trailers,
+                "traceId": trace_id,
+            }),
+        };
+        let microvm_result = runner.invoke(invocation).await.map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "microvm runner failed for route `{}`: {error:#}",
+                    route.path
+                ),
+            )
+        })?;
+        let status = StatusCode::from_u16(u16::try_from(microvm_result.status).unwrap_or(500))
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let response_body = if microvm_result.stdout.is_empty() {
+            microvm_result.stderr.clone()
+        } else {
+            microvm_result.stdout.clone()
+        };
+        let mut response = GuestHttpResponse::new(status, response_body);
+        response
+            .headers
+            .push(("x-tachyon-runtime".to_owned(), "microvm".to_owned()));
+        if !microvm_result.stderr.is_empty() {
+            response
+                .headers
+                .push(("x-tachyon-microvm-stderr".to_owned(), microvm_result.stderr));
+        }
         return Ok(RouteExecutionResult {
             response,
             fuel_consumed: None,
@@ -14983,8 +15015,7 @@ mod tests {
     #[test]
     fn secure_cache_bootstrap_retains_matching_cwasm_cache() {
         let dir = unique_test_dir("cwasm-retain");
-        let store =
-            store::CoreStore::open(&dir.join("core.redb")).expect("test store should open");
+        let store = store::CoreStore::open(&dir.join("core.redb")).expect("test store should open");
         store
             .secure_cwasm_cache_bootstrap("engine-a")
             .expect("bootstrap should persist hash");
@@ -15008,8 +15039,7 @@ mod tests {
     #[test]
     fn secure_cache_bootstrap_purges_stale_cwasm_cache() {
         let dir = unique_test_dir("cwasm-purge");
-        let store =
-            store::CoreStore::open(&dir.join("core.redb")).expect("test store should open");
+        let store = store::CoreStore::open(&dir.join("core.redb")).expect("test store should open");
         store
             .secure_cwasm_cache_bootstrap("engine-a")
             .expect("bootstrap should persist hash");
