@@ -1,0 +1,3 @@
+- [x] Update the `RateLimitPolicy` struct to include an optional `scope` enum.
+- [x] Modify the middleware injection to ensure `CallerIdentityClaims` is evaluated *before* the rate limiter if a tenant scope is required.
+- [x] Write integration tests proving that requests from the same IP but different JWTs are bucketed into separate rate limits.

@@ -1157,6 +1157,10 @@ struct PropagatedHeader {
 struct CallerIdentityClaims {
     route_path: String,
     role: RouteRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_id: Option<String>,
     issued_at: u64,
     expires_at: u64,
 }
@@ -1187,6 +1191,8 @@ impl HostIdentity {
         self.sign_claims(&CallerIdentityClaims {
             route_path: normalize_route_path(&route.path),
             role: route.role,
+            tenant_id: None,
+            token_id: None,
             issued_at: now,
             expires_at: now.saturating_add(IDENTITY_TOKEN_TTL.as_secs()),
         })
@@ -2005,10 +2011,25 @@ fn is_default_admission_strategy(strategy: &AdmissionStrategy) -> bool {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct DistributedRateLimitConfig {
-    /// Per-IP request count permitted across the entire mesh within `window_seconds`.
+    /// Request count permitted across the entire mesh within `window_seconds`.
     threshold: u32,
     #[serde(default = "default_dist_rate_limit_window")]
     window_seconds: u32,
+    #[serde(default, skip_serializing_if = "is_default_dist_rate_limit_scope")]
+    scope: DistributedRateLimitScope,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DistributedRateLimitScope {
+    #[default]
+    Ip,
+    Tenant,
+    Token,
+}
+
+fn is_default_dist_rate_limit_scope(scope: &DistributedRateLimitScope) -> bool {
+    *scope == DistributedRateLimitScope::Ip
 }
 
 fn default_dist_rate_limit_window() -> u32 {
@@ -5526,7 +5547,10 @@ async fn enforce_distributed_rate_limit(
         return None;
     };
 
-    let key = distributed_rate_limit_key(headers);
+    let key = match distributed_rate_limit_key(policy, headers, &state.host_identity, &route.path) {
+        Ok(key) => key,
+        Err(message) => return Some((StatusCode::UNAUTHORIZED, message)),
+    };
     let body = match serde_json::to_vec(&serde_json::json!({
         "key": key,
         "threshold": policy.threshold,
@@ -5615,15 +5639,41 @@ fn distributed_rate_limit_decision(
     }
 }
 
-fn distributed_rate_limit_key(headers: &HeaderMap) -> String {
-    headers
+fn distributed_rate_limit_key(
+    policy: &DistributedRateLimitConfig,
+    headers: &HeaderMap,
+    host_identity: &HostIdentity,
+    route_path: &str,
+) -> std::result::Result<String, String> {
+    let route = normalize_route_path(route_path);
+    let ip = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("unknown")
-        .to_owned()
+        .to_owned();
+
+    match policy.scope {
+        DistributedRateLimitScope::Ip => Ok(format!("ip:{ip}:{route}")),
+        DistributedRateLimitScope::Tenant => {
+            let claims = host_identity.verify_header(headers)?;
+            let tenant = claims
+                .tenant_id
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(claims.route_path);
+            Ok(format!("tenant:{tenant}:{route}"))
+        }
+        DistributedRateLimitScope::Token => {
+            let claims = host_identity.verify_header(headers)?;
+            let token = claims
+                .token_id
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(claims.route_path);
+            Ok(format!("token:{token}:{route}"))
+        }
+    }
 }
 
 fn record_distributed_rate_limit_bypass(route_path: &str, reason: &str) {
@@ -16431,6 +16481,8 @@ mod tests {
             .sign_claims(&CallerIdentityClaims {
                 route_path: "/api/tenant-a".to_owned(),
                 role: RouteRole::User,
+                tenant_id: None,
+                token_id: None,
                 issued_at: now.saturating_sub(10),
                 expires_at: now.saturating_sub(1),
             })
@@ -21284,7 +21336,86 @@ mod tests {
                 .expect("header should parse"),
         );
 
-        assert_eq!(distributed_rate_limit_key(&headers), "203.0.113.10");
+        let policy = DistributedRateLimitConfig {
+            threshold: 100,
+            window_seconds: 60,
+            scope: DistributedRateLimitScope::Ip,
+        };
+
+        assert_eq!(
+            distributed_rate_limit_key(
+                &policy,
+                &headers,
+                &test_host_identity(31),
+                "/api/protected"
+            )
+            .expect("ip key should build"),
+            "ip:203.0.113.10:/api/protected"
+        );
+    }
+
+    #[test]
+    fn distributed_rate_limit_key_buckets_same_ip_by_tenant_identity() {
+        let host_identity = test_host_identity(32);
+        let policy = DistributedRateLimitConfig {
+            threshold: 1,
+            window_seconds: 60,
+            scope: DistributedRateLimitScope::Tenant,
+        };
+        let mut headers_a = HeaderMap::new();
+        let mut headers_b = HeaderMap::new();
+        headers_a.insert(
+            "x-forwarded-for",
+            "203.0.113.10".parse().expect("header should parse"),
+        );
+        headers_b.insert(
+            "x-forwarded-for",
+            "203.0.113.10".parse().expect("header should parse"),
+        );
+        let now = unix_timestamp_seconds().expect("system clock should be available");
+        let token_a = host_identity
+            .sign_claims(&CallerIdentityClaims {
+                route_path: "/api/protected".to_owned(),
+                role: RouteRole::User,
+                tenant_id: Some("tenant-a".to_owned()),
+                token_id: Some("token-a".to_owned()),
+                issued_at: now,
+                expires_at: now.saturating_add(60),
+            })
+            .expect("tenant-a token should sign");
+        let token_b = host_identity
+            .sign_claims(&CallerIdentityClaims {
+                route_path: "/api/protected".to_owned(),
+                role: RouteRole::User,
+                tenant_id: Some("tenant-b".to_owned()),
+                token_id: Some("token-b".to_owned()),
+                issued_at: now,
+                expires_at: now.saturating_add(60),
+            })
+            .expect("tenant-b token should sign");
+        headers_a.insert(
+            TACHYON_IDENTITY_HEADER,
+            format!("Bearer {token_a}")
+                .parse()
+                .expect("identity header should parse"),
+        );
+        headers_b.insert(
+            TACHYON_IDENTITY_HEADER,
+            format!("Bearer {token_b}")
+                .parse()
+                .expect("identity header should parse"),
+        );
+
+        let key_a =
+            distributed_rate_limit_key(&policy, &headers_a, &host_identity, "/api/protected")
+                .expect("tenant-a key should build");
+        let key_b =
+            distributed_rate_limit_key(&policy, &headers_b, &host_identity, "/api/protected")
+                .expect("tenant-b key should build");
+
+        assert_eq!(key_a, "tenant:tenant-a:/api/protected");
+        assert_eq!(key_b, "tenant:tenant-b:/api/protected");
+        assert_ne!(key_a, key_b);
     }
 
     #[test]
@@ -21293,6 +21424,7 @@ mod tests {
         route.distributed_rate_limit = Some(DistributedRateLimitConfig {
             threshold: 100,
             window_seconds: 60,
+            scope: DistributedRateLimitScope::Ip,
         });
         let response = GuestHttpResponse::new(
             StatusCode::OK,
