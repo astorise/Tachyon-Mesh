@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used)]
+
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -80,6 +82,7 @@ mod ai_inference;
 mod auth;
 mod core_error;
 mod data_events;
+mod error;
 mod identity;
 mod mesh;
 mod network;
@@ -16255,7 +16258,9 @@ mod tests {
         )
         .await;
         assert_eq!(poll.status(), StatusCode::OK);
-        let cert_bytes = axum::body::to_bytes(poll.into_body(), 1024).await.unwrap();
+        let cert_bytes = axum::body::to_bytes(poll.into_body(), 1024)
+            .await
+            .expect("poll response body should be readable");
         assert_eq!(cert_bytes.as_ref(), b"01020304");
 
         let poll_again = admin_enrollment_poll_handler(
@@ -19127,8 +19132,11 @@ mod tests {
         let client_config = quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(client_crypto).expect("HTTP/3 client config should convert"),
         ));
-        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
-            .expect("HTTP/3 client endpoint should bind");
+        let client_bind_addr = "127.0.0.1:0"
+            .parse()
+            .expect("literal HTTP/3 client bind address should parse");
+        let mut endpoint =
+            quinn::Endpoint::client(client_bind_addr).expect("HTTP/3 client endpoint should bind");
         endpoint.set_default_client_config(client_config);
         let connection = endpoint
             .connect(listener_addr, domain)
