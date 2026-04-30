@@ -1,19 +1,21 @@
+use super::*;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResourceLimitKind {
+pub(crate) enum ResourceLimitKind {
     Fuel,
     Memory,
     Stdout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RoutePermitError {
+pub(crate) enum RoutePermitError {
     Closed,
     TimedOut,
 }
 
 #[cfg_attr(not(feature = "secrets-vault"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SecretAccessErrorKind {
+pub(crate) enum SecretAccessErrorKind {
     NotFound,
     PermissionDenied,
     #[cfg(not(feature = "secrets-vault"))]
@@ -21,121 +23,121 @@ enum SecretAccessErrorKind {
 }
 
 #[derive(Debug)]
-struct ResourceLimitTrap {
-    kind: ResourceLimitKind,
+pub(crate) struct ResourceLimitTrap {
+    pub(crate) kind: ResourceLimitKind,
 }
 
 #[derive(Debug)]
-struct GuestModuleNotFound {
-    function_name: String,
-    candidate_paths: String,
+pub(crate) struct GuestModuleNotFound {
+    pub(crate) function_name: String,
+    pub(crate) candidate_paths: String,
 }
 
-struct RouteExecutionControl {
-    semaphore: Arc<Semaphore>,
-    pending_waiters: AtomicUsize,
-    active_requests: AtomicUsize,
-    draining: AtomicBool,
-    draining_since: Mutex<Option<Instant>>,
-    min_instances: u32,
-    max_concurrency: u32,
-    prewarmed_instances: AtomicUsize,
+pub(crate) struct RouteExecutionControl {
+    pub(crate) semaphore: Arc<Semaphore>,
+    pub(crate) pending_waiters: AtomicUsize,
+    pub(crate) active_requests: AtomicUsize,
+    pub(crate) draining: AtomicBool,
+    pub(crate) draining_since: Mutex<Option<Instant>>,
+    pub(crate) min_instances: u32,
+    pub(crate) max_concurrency: u32,
+    pub(crate) prewarmed_instances: AtomicUsize,
 }
 
 #[derive(Clone)]
-struct StorageBrokerManager {
-    core_store: Arc<store::CoreStore>,
-    queues: Arc<Mutex<HashMap<PathBuf, Arc<StorageVolumeQueue>>>>,
+pub(crate) struct StorageBrokerManager {
+    pub(crate) core_store: Arc<store::CoreStore>,
+    pub(crate) queues: Arc<Mutex<HashMap<PathBuf, Arc<StorageVolumeQueue>>>>,
 }
 
-struct StorageVolumeQueue {
-    volume_root: PathBuf,
-    core_store: Arc<store::CoreStore>,
-    sender: std::sync::mpsc::Sender<StorageBrokerOperation>,
-    state: Mutex<StorageVolumeQueueState>,
-    idle: Condvar,
+pub(crate) struct StorageVolumeQueue {
+    pub(crate) volume_root: PathBuf,
+    pub(crate) core_store: Arc<store::CoreStore>,
+    pub(crate) sender: std::sync::mpsc::Sender<StorageBrokerOperation>,
+    pub(crate) state: Mutex<StorageVolumeQueueState>,
+    pub(crate) idle: Condvar,
 }
 
 #[derive(Default)]
-struct StorageVolumeQueueState {
-    pending: usize,
+pub(crate) struct StorageVolumeQueueState {
+    pub(crate) pending: usize,
 }
 
 #[derive(Debug)]
-enum StorageBrokerOperation {
+pub(crate) enum StorageBrokerOperation {
     Write(StorageBrokerWriteRequest),
     Snapshot(StorageBrokerSnapshotRequest),
     Restore(StorageBrokerRestoreRequest),
 }
 
 #[derive(Clone, Debug)]
-struct StorageBrokerWriteRequest {
-    route_path: String,
-    guest_path: String,
-    host_target: PathBuf,
-    mode: StorageWriteMode,
-    body: Vec<u8>,
-    sync_to_cloud: bool,
+pub(crate) struct StorageBrokerWriteRequest {
+    pub(crate) route_path: String,
+    pub(crate) guest_path: String,
+    pub(crate) host_target: PathBuf,
+    pub(crate) mode: StorageWriteMode,
+    pub(crate) body: Vec<u8>,
+    pub(crate) sync_to_cloud: bool,
 }
 
 #[derive(Debug)]
-struct StorageBrokerSnapshotRequest {
-    volume_id: String,
-    source_path: PathBuf,
-    snapshot_path: PathBuf,
-    completion: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+pub(crate) struct StorageBrokerSnapshotRequest {
+    pub(crate) volume_id: String,
+    pub(crate) source_path: PathBuf,
+    pub(crate) snapshot_path: PathBuf,
+    pub(crate) completion: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
 #[derive(Debug)]
-struct StorageBrokerRestoreRequest {
-    volume_id: String,
-    snapshot_path: PathBuf,
-    destination_path: PathBuf,
-    completion: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+pub(crate) struct StorageBrokerRestoreRequest {
+    pub(crate) volume_id: String,
+    pub(crate) snapshot_path: PathBuf,
+    pub(crate) destination_path: PathBuf,
+    pub(crate) completion: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StorageWriteMode {
+pub(crate) enum StorageWriteMode {
     Overwrite,
     Append,
 }
 
-struct ResolvedStorageWriteTarget {
-    volume_root: PathBuf,
-    guest_path: String,
-    host_target: PathBuf,
+pub(crate) struct ResolvedStorageWriteTarget {
+    pub(crate) volume_root: PathBuf,
+    pub(crate) guest_path: String,
+    pub(crate) host_target: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct TtlManagedPath {
-    host_path: PathBuf,
-    ttl: Duration,
+pub(crate) struct TtlManagedPath {
+    pub(crate) host_path: PathBuf,
+    pub(crate) ttl: Duration,
 }
 
-static LORA_TRAINING_QUEUE: OnceLock<Arc<LoraTrainingQueue>> = OnceLock::new();
-static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInferenceJobStatus>>>> =
+pub(crate) static LORA_TRAINING_QUEUE: OnceLock<Arc<LoraTrainingQueue>> = OnceLock::new();
+pub(crate) static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInferenceJobStatus>>>> =
     OnceLock::new();
 
-struct LoraTrainingQueue {
-    sender: std::sync::mpsc::Sender<LoraTrainingJob>,
-    statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+pub(crate) struct LoraTrainingQueue {
+    pub(crate) sender: std::sync::mpsc::Sender<LoraTrainingJob>,
+    pub(crate) statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
 }
 
 #[derive(Clone, Debug)]
-struct LoraTrainingJob {
-    id: String,
-    tenant_id: String,
-    base_model: String,
-    dataset_volume: String,
-    dataset_path: String,
-    dataset_split: Option<String>,
-    rank: u32,
-    max_steps: u32,
-    seed: Option<u64>,
+pub(crate) struct LoraTrainingJob {
+    pub(crate) id: String,
+    pub(crate) tenant_id: String,
+    pub(crate) base_model: String,
+    pub(crate) dataset_volume: String,
+    pub(crate) dataset_path: String,
+    pub(crate) dataset_split: Option<String>,
+    pub(crate) rank: u32,
+    pub(crate) max_steps: u32,
+    pub(crate) seed: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
-enum LoraTrainingJobStatus {
+pub(crate) enum LoraTrainingJobStatus {
     Queued,
     Running { step: u32, total: u32 },
     Completed { adapter_path: String },
@@ -143,7 +145,7 @@ enum LoraTrainingJobStatus {
 }
 
 #[derive(Clone, Debug)]
-enum AiInferenceJobStatus {
+pub(crate) enum AiInferenceJobStatus {
     Queued,
     Running,
     Completed {
@@ -156,104 +158,104 @@ enum AiInferenceJobStatus {
 }
 
 #[derive(Clone, Default)]
-struct VolumeManager {
-    volumes: Arc<Mutex<HashMap<String, Arc<ManagedVolume>>>>,
+pub(crate) struct VolumeManager {
+    pub(crate) volumes: Arc<Mutex<HashMap<String, Arc<ManagedVolume>>>>,
 }
 
-struct ManagedVolume {
-    id: String,
-    route_path: String,
-    guest_path: String,
-    active_path: PathBuf,
-    snapshot_path: PathBuf,
-    idle_timeout: Duration,
-    storage_broker: Arc<StorageBrokerManager>,
-    state: Mutex<ManagedVolumeState>,
-    notify: Notify,
+pub(crate) struct ManagedVolume {
+    pub(crate) id: String,
+    pub(crate) route_path: String,
+    pub(crate) guest_path: String,
+    pub(crate) active_path: PathBuf,
+    pub(crate) snapshot_path: PathBuf,
+    pub(crate) idle_timeout: Duration,
+    pub(crate) storage_broker: Arc<StorageBrokerManager>,
+    pub(crate) state: Mutex<ManagedVolumeState>,
+    pub(crate) notify: Notify,
 }
 
-struct ManagedVolumeState {
-    lifecycle: ManagedVolumeLifecycle,
-    active_leases: usize,
-    generation: u64,
+pub(crate) struct ManagedVolumeState {
+    pub(crate) lifecycle: ManagedVolumeLifecycle,
+    pub(crate) active_leases: usize,
+    pub(crate) generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ManagedVolumeLifecycle {
+pub(crate) enum ManagedVolumeLifecycle {
     Active,
     Hibernating,
     OnDisk,
 }
 
-struct ManagedVolumeLease {
-    volume: Arc<ManagedVolume>,
+pub(crate) struct ManagedVolumeLease {
+    pub(crate) volume: Arc<ManagedVolume>,
 }
 
-struct RouteVolumeLeaseGuard {
-    leases: Vec<ManagedVolumeLease>,
+pub(crate) struct RouteVolumeLeaseGuard {
+    pub(crate) leases: Vec<ManagedVolumeLease>,
 }
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
 #[derive(Debug, Deserialize, Serialize)]
-struct IntegrityManifest {
-    config_payload: String,
-    public_key: String,
-    signature: String,
+pub(crate) struct IntegrityManifest {
+    pub(crate) config_payload: String,
+    pub(crate) public_key: String,
+    pub(crate) signature: String,
 }
 
 #[derive(Default)]
-struct BackgroundWorkerManager {
-    workers: Mutex<Vec<BackgroundWorkerHandle>>,
+pub(crate) struct BackgroundWorkerManager {
+    pub(crate) workers: Mutex<Vec<BackgroundWorkerHandle>>,
 }
 
-struct BackgroundWorkerHandle {
-    route_path: String,
-    stop_requested: Arc<AtomicBool>,
-    join_handle: tokio::task::JoinHandle<()>,
+pub(crate) struct BackgroundWorkerHandle {
+    pub(crate) route_path: String,
+    pub(crate) stop_requested: Arc<AtomicBool>,
+    pub(crate) join_handle: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GuestLogRecord {
-    level: String,
-    target: Option<String>,
-    fields: Map<String, Value>,
+pub(crate) struct GuestLogRecord {
+    pub(crate) level: String,
+    pub(crate) target: Option<String>,
+    pub(crate) fields: Map<String, Value>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum GuestLogStreamType {
+pub(crate) enum GuestLogStreamType {
     Stdout,
     Stderr,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct AsyncLogEntry {
-    target_name: String,
-    timestamp_unix_ms: u64,
-    stream_type: GuestLogStreamType,
-    level: String,
-    message: String,
+pub(crate) struct AsyncLogEntry {
+    pub(crate) target_name: String,
+    pub(crate) timestamp_unix_ms: u64,
+    pub(crate) stream_type: GuestLogStreamType,
+    pub(crate) level: String,
+    pub(crate) message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    guest_target: Option<String>,
+    pub(crate) guest_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    structured_fields: Option<Value>,
+    pub(crate) structured_fields: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum VolumeType {
+pub(crate) enum VolumeType {
     Host,
     Ram,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum VolumeEvictionPolicy {
+pub(crate) enum VolumeEvictionPolicy {
     Hibernate,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-enum RouteQos {
+pub(crate) enum RouteQos {
     #[serde(rename = "RealTime", alias = "realtime", alias = "real-time")]
     RealTime,
     #[default]
@@ -265,7 +267,7 @@ enum RouteQos {
 
 impl RouteQos {
     #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
-    fn score(self) -> u16 {
+    pub(crate) fn score(self) -> u16 {
         match self {
             Self::RealTime => 100,
             Self::Standard => 50,
@@ -274,13 +276,13 @@ impl RouteQos {
     }
 }
 
-fn is_default_route_qos(qos: &RouteQos) -> bool {
+pub(crate) fn is_default_route_qos(qos: &RouteQos) -> bool {
     *qos == RouteQos::Standard
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum ModelDevice {
+pub(crate) enum ModelDevice {
     #[default]
     Cpu,
     Cuda,
@@ -291,7 +293,7 @@ enum ModelDevice {
 
 impl ModelDevice {
     #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
@@ -303,85 +305,85 @@ impl ModelDevice {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-struct IntegrityLayer4Config {
+pub(crate) struct IntegrityLayer4Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    tcp: Vec<IntegrityTcpBinding>,
+    pub(crate) tcp: Vec<IntegrityTcpBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    udp: Vec<IntegrityUdpBinding>,
+    pub(crate) udp: Vec<IntegrityUdpBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct IntegrityTcpBinding {
-    port: u16,
-    target: String,
+pub(crate) struct IntegrityTcpBinding {
+    pub(crate) port: u16,
+    pub(crate) target: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct IntegrityUdpBinding {
-    port: u16,
-    target: String,
+pub(crate) struct IntegrityUdpBinding {
+    pub(crate) port: u16,
+    pub(crate) target: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct IntegrityRoute {
-    path: String,
-    role: RouteRole,
+pub(crate) struct IntegrityRoute {
+    pub(crate) path: String,
+    pub(crate) role: RouteRole,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    name: String,
-    version: String,
-    dependencies: BTreeMap<String, String>,
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) dependencies: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    requires_credentials: Vec<String>,
+    pub(crate) requires_credentials: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    middleware: Option<String>,
+    pub(crate) middleware: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    env: BTreeMap<String, String>,
+    pub(crate) env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    allowed_secrets: Vec<String>,
+    pub(crate) allowed_secrets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    targets: Vec<RouteTarget>,
+    pub(crate) targets: Vec<RouteTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    resiliency: Option<ResiliencyConfig>,
+    pub(crate) resiliency: Option<ResiliencyConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    models: Vec<IntegrityModelBinding>,
+    pub(crate) models: Vec<IntegrityModelBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    domains: Vec<String>,
+    pub(crate) domains: Vec<String>,
     #[serde(default)]
-    min_instances: u32,
+    pub(crate) min_instances: u32,
     #[serde(default = "default_max_concurrency")]
-    max_concurrency: u32,
+    pub(crate) max_concurrency: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    volumes: Vec<IntegrityVolume>,
+    pub(crate) volumes: Vec<IntegrityVolume>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    resource_policy: Option<ResourcePolicy>,
+    pub(crate) resource_policy: Option<ResourcePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    runtime: Option<FaaSRuntime>,
+    pub(crate) runtime: Option<FaaSRuntime>,
     /// Routes flagged here mirror data writes to a cloud endpoint via the existing
     /// `system-faas-cdc` outbox path. Off by default; opting in adds an asynchronous
     /// post-write event emit but no synchronous latency.
     #[serde(default, skip_serializing_if = "is_false")]
-    sync_to_cloud: bool,
+    pub(crate) sync_to_cloud: bool,
     /// Route runs inside a hardware Trusted Execution Environment when true. The host
     /// dispatches via `IntegrityConfig::tee_backend` instead of the pooled engine.
     #[serde(default, skip_serializing_if = "is_false")]
-    requires_tee: bool,
+    pub(crate) requires_tee: bool,
     /// Route may overflow to peer nodes via `system-faas-mesh-overlay` when the local
     /// accelerator or worker pool is saturated.
     #[serde(default, skip_serializing_if = "is_false")]
-    allow_overflow: bool,
+    pub(crate) allow_overflow: bool,
     /// Opt-in distributed rate-limiting policy enforced via `system-faas-dist-limiter`.
     /// When `None`, only the local LRU rate limiter applies (the host fails open on a
     /// distributed limiter outage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    distributed_rate_limit: Option<DistributedRateLimitConfig>,
+    pub(crate) distributed_rate_limit: Option<DistributedRateLimitConfig>,
     /// Optional target module or internal URL that receives a fire-and-forget copy
     /// of primary traffic through `system-faas-shadow-proxy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    shadow_target: Option<String>,
+    pub(crate) shadow_target: Option<String>,
     /// Tenant-specific LoRA adapter to apply on top of the route's foundation model
     /// at inference time. Per-call overrides may be passed via the inference WIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    adapter_id: Option<String>,
+    pub(crate) adapter_id: Option<String>,
 }
 
 impl Default for IntegrityRoute {
@@ -417,98 +419,98 @@ impl Default for IntegrityRoute {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum AdmissionStrategy {
+pub(crate) enum AdmissionStrategy {
     #[default]
     FailFast,
     MeshRetry,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-struct ResourcePolicy {
+pub(crate) struct ResourcePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    min_ram_gb: Option<u64>,
+    pub(crate) min_ram_gb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    min_ram_mb: Option<u64>,
+    pub(crate) min_ram_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    min_vram_mb: Option<u64>,
+    pub(crate) min_vram_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "is_default_admission_strategy")]
-    admission_strategy: AdmissionStrategy,
+    pub(crate) admission_strategy: AdmissionStrategy,
 }
 
-fn is_default_admission_strategy(strategy: &AdmissionStrategy) -> bool {
+pub(crate) fn is_default_admission_strategy(strategy: &AdmissionStrategy) -> bool {
     *strategy == AdmissionStrategy::FailFast
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct DistributedRateLimitConfig {
+pub(crate) struct DistributedRateLimitConfig {
     /// Request count permitted across the entire mesh within `window_seconds`.
-    threshold: u32,
+    pub(crate) threshold: u32,
     #[serde(default = "default_dist_rate_limit_window")]
-    window_seconds: u32,
+    pub(crate) window_seconds: u32,
     #[serde(default, skip_serializing_if = "is_default_dist_rate_limit_scope")]
-    scope: DistributedRateLimitScope,
+    pub(crate) scope: DistributedRateLimitScope,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum DistributedRateLimitScope {
+pub(crate) enum DistributedRateLimitScope {
     #[default]
     Ip,
     Tenant,
     Token,
 }
 
-fn is_default_dist_rate_limit_scope(scope: &DistributedRateLimitScope) -> bool {
+pub(crate) fn is_default_dist_rate_limit_scope(scope: &DistributedRateLimitScope) -> bool {
     *scope == DistributedRateLimitScope::Ip
 }
 
-fn default_dist_rate_limit_window() -> u32 {
+pub(crate) fn default_dist_rate_limit_window() -> u32 {
     60
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct IntegrityBatchTarget {
-    name: String,
-    module: String,
+pub(crate) struct IntegrityBatchTarget {
+    pub(crate) name: String,
+    pub(crate) module: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    env: BTreeMap<String, String>,
+    pub(crate) env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    volumes: Vec<IntegrityVolume>,
+    pub(crate) volumes: Vec<IntegrityVolume>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-struct IntegrityModelBinding {
-    alias: String,
-    path: String,
+pub(crate) struct IntegrityModelBinding {
+    pub(crate) alias: String,
+    pub(crate) path: String,
     #[serde(default, skip_serializing_if = "is_default_model_device")]
-    device: ModelDevice,
+    pub(crate) device: ModelDevice,
     #[serde(default, skip_serializing_if = "is_default_route_qos")]
-    qos: RouteQos,
+    pub(crate) qos: RouteQos,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct IntegrityVolume {
+pub(crate) struct IntegrityVolume {
     #[serde(
         rename = "type",
         default = "default_volume_type",
         skip_serializing_if = "is_default_volume_type"
     )]
-    volume_type: VolumeType,
-    host_path: String,
-    guest_path: String,
+    pub(crate) volume_type: VolumeType,
+    pub(crate) host_path: String,
+    pub(crate) guest_path: String,
     #[serde(default)]
-    readonly: bool,
+    pub(crate) readonly: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    ttl_seconds: Option<u64>,
+    pub(crate) ttl_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    idle_timeout: Option<String>,
+    pub(crate) idle_timeout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    eviction_policy: Option<VolumeEvictionPolicy>,
+    pub(crate) eviction_policy: Option<VolumeEvictionPolicy>,
     /// Route writes to this volume are paged through `system-faas-tde` for AES-256-GCM
     /// encryption at rest. Off by default to preserve native disk speed for routes
     /// that don't need TDE.
     #[serde(default, skip_serializing_if = "is_false")]
-    encrypted: bool,
+    pub(crate) encrypted: bool,
 }
 
 impl Default for IntegrityVolume {
@@ -528,7 +530,7 @@ impl Default for IntegrityVolume {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum IntegrityResource {
+pub(crate) enum IntegrityResource {
     Internal {
         target: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -542,50 +544,50 @@ enum IntegrityResource {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct IntegrityConfig {
-    host_address: String,
+pub(crate) struct IntegrityConfig {
+    pub(crate) host_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    advertise_ip: Option<String>,
+    pub(crate) advertise_ip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    tls_address: Option<String>,
-    max_stdout_bytes: usize,
-    guest_fuel_budget: u64,
-    guest_memory_limit_bytes: usize,
-    resource_limit_response: String,
+    pub(crate) tls_address: Option<String>,
+    pub(crate) max_stdout_bytes: usize,
+    pub(crate) guest_fuel_budget: u64,
+    pub(crate) guest_memory_limit_bytes: usize,
+    pub(crate) resource_limit_response: String,
     #[serde(default, skip_serializing_if = "IntegrityLayer4Config::is_empty")]
-    layer4: IntegrityLayer4Config,
+    pub(crate) layer4: IntegrityLayer4Config,
     #[serde(
         default = "default_telemetry_sample_rate",
         skip_serializing_if = "is_default_telemetry_sample_rate"
     )]
-    telemetry_sample_rate: f64,
+    pub(crate) telemetry_sample_rate: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    batch_targets: Vec<IntegrityBatchTarget>,
+    pub(crate) batch_targets: Vec<IntegrityBatchTarget>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    resources: BTreeMap<String, IntegrityResource>,
-    routes: Vec<IntegrityRoute>,
+    pub(crate) resources: BTreeMap<String, IntegrityResource>,
+    pub(crate) routes: Vec<IntegrityRoute>,
     /// Monotonically increasing version stamp used by the multi-master config sync
     /// path: a node receives a `ConfigUpdateEvent` and pulls the manifest from the
     /// origin only when the advertised version is higher than the local one.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
-    config_version: u64,
+    pub(crate) config_version: u64,
     /// Outbound endpoint a freshly booted, unenrolled node uses to wait for a PIN
     /// approval from an active mesh node. Optional — clusters that pre-seed
     /// credentials don't need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    enrollment_endpoint: Option<String>,
+    pub(crate) enrollment_endpoint: Option<String>,
     /// Cloud endpoint that `system-faas-cdc` POSTs to when draining the
     /// data-mutation outbox. Optional — air-gapped deployments leave it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    cloud_sync_endpoint: Option<String>,
+    pub(crate) cloud_sync_endpoint: Option<String>,
     /// TEE delegation backend used by routes flagged `requires_tee`. Optional —
     /// without it, a manifest with TEE-flagged routes is rejected by validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    tee_backend: Option<TeeBackendConfig>,
+    pub(crate) tee_backend: Option<TeeBackendConfig>,
     /// Hard cap on memory used by the Wasmtime instance pool. Optional — when unset,
     /// the existing `PoolingAllocationConfig` defaults apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    instance_pool_max_memory_bytes: Option<usize>,
+    pub(crate) instance_pool_max_memory_bytes: Option<usize>,
 }
 
 impl Default for IntegrityConfig {
@@ -612,13 +614,13 @@ impl Default for IntegrityConfig {
     }
 }
 
-fn is_zero_u64(value: &u64) -> bool {
+pub(crate) fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-enum TeeBackendConfig {
+pub(crate) enum TeeBackendConfig {
     /// In-process hardened wasmtime backend with mlocked memory and a self-attested
     /// JWT carrying the host identity. Available on every host; security guarantees
     /// match the host kernel.
@@ -628,45 +630,45 @@ enum TeeBackendConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum OutboundTargetKind {
+pub(crate) enum OutboundTargetKind {
     Internal,
     External,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ResolvedOutboundTarget {
-    url: String,
-    kind: OutboundTargetKind,
+pub(crate) struct ResolvedOutboundTarget {
+    pub(crate) url: String,
+    pub(crate) kind: OutboundTargetKind,
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedRoute {
-    path: String,
-    name: String,
-    version: Version,
-    dependencies: HashMap<String, VersionReq>,
-    requires_credentials: BTreeSet<String>,
+pub(crate) struct ResolvedRoute {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) version: Version,
+    pub(crate) dependencies: HashMap<String, VersionReq>,
+    pub(crate) requires_credentials: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct RouteRegistry {
-    by_name: HashMap<String, Vec<ResolvedRoute>>,
-    by_path: HashMap<String, ResolvedRoute>,
+pub(crate) struct RouteRegistry {
+    pub(crate) by_name: HashMap<String, Vec<ResolvedRoute>>,
+    pub(crate) by_path: HashMap<String, ResolvedRoute>,
 }
 
 #[derive(Clone, Debug, Default)]
-struct BatchTargetRegistry {
-    by_name: HashMap<String, IntegrityBatchTarget>,
+pub(crate) struct BatchTargetRegistry {
+    pub(crate) by_name: HashMap<String, IntegrityBatchTarget>,
 }
 
 impl IntegrityLayer4Config {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.tcp.is_empty() && self.udp.is_empty()
     }
 }
 
 #[derive(Debug)]
-enum ExecutionError {
+pub(crate) enum ExecutionError {
     GuestModuleNotFound(GuestModuleNotFound),
     ResourceLimitExceeded {
         kind: ResourceLimitKind,
@@ -677,30 +679,30 @@ enum ExecutionError {
 
 #[derive(Debug, Parser)]
 #[command(name = "core-host")]
-struct HostCli {
+pub(crate) struct HostCli {
     #[arg(long, value_enum, default_value_t = AccelerationMode::Userspace)]
-    accel: AccelerationMode,
+    pub(crate) accel: AccelerationMode,
     #[command(subcommand)]
-    command: Option<HostCommand>,
+    pub(crate) command: Option<HostCommand>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-enum AccelerationMode {
+pub(crate) enum AccelerationMode {
     #[default]
     Userspace,
     Ebpf,
 }
 
 #[derive(Debug, Subcommand)]
-enum HostCommand {
+pub(crate) enum HostCommand {
     Serve,
     Run(RunCommand),
 }
 
 #[derive(Debug, ClapArgs)]
-struct RunCommand {
+pub(crate) struct RunCommand {
     #[arg(long)]
-    manifest: Option<PathBuf>,
+    pub(crate) manifest: Option<PathBuf>,
     #[arg(long)]
-    target: String,
+    pub(crate) target: String,
 }

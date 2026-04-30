@@ -1,4 +1,6 @@
-fn init_host_tracing() {
+use super::*;
+
+pub(crate) fn init_host_tracing() {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {
@@ -15,7 +17,7 @@ pub(crate) fn ensure_rustls_crypto_provider() {
     tls_runtime::ensure_crypto_provider();
 }
 
-fn verify_integrity() -> Result<IntegrityConfig> {
+pub(crate) fn verify_integrity() -> Result<IntegrityConfig> {
     match verify_integrity_payload(
         EMBEDDED_CONFIG_PAYLOAD,
         EMBEDDED_PUBLIC_KEY,
@@ -42,7 +44,7 @@ fn verify_integrity() -> Result<IntegrityConfig> {
 }
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
-fn load_integrity_config_from_manifest_path(path: &Path) -> Result<IntegrityConfig> {
+pub(crate) fn load_integrity_config_from_manifest_path(path: &Path) -> Result<IntegrityConfig> {
     let manifest = read_integrity_manifest(path)?;
     verify_integrity_payload(
         &manifest.config_payload,
@@ -53,7 +55,7 @@ fn load_integrity_config_from_manifest_path(path: &Path) -> Result<IntegrityConf
 }
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
-fn read_integrity_manifest(path: &Path) -> Result<IntegrityManifest> {
+pub(crate) fn read_integrity_manifest(path: &Path) -> Result<IntegrityManifest> {
     let manifest = fs::read_to_string(path)
         .with_context(|| format!("failed to read integrity manifest at {}", path.display()))?;
 
@@ -61,7 +63,7 @@ fn read_integrity_manifest(path: &Path) -> Result<IntegrityManifest> {
         .with_context(|| format!("failed to parse integrity manifest at {}", path.display()))
 }
 
-fn verify_integrity_payload(
+pub(crate) fn verify_integrity_payload(
     payload: &str,
     public_key_hex: &str,
     signature_hex: &str,
@@ -73,37 +75,37 @@ fn verify_integrity_payload(
     validate_integrity_config(config)
 }
 
-fn integrity_schema_violation(source: &str, error: serde_json::Error) -> anyhow::Error {
+pub(crate) fn integrity_schema_violation(source: &str, error: serde_json::Error) -> anyhow::Error {
     anyhow!("{ERR_INTEGRITY_SCHEMA_VIOLATION}: failed to parse {source}: {error}")
 }
 
-fn is_integrity_schema_violation(error: &anyhow::Error) -> bool {
+pub(crate) fn is_integrity_schema_violation(error: &anyhow::Error) -> bool {
     error.to_string().contains(ERR_INTEGRITY_SCHEMA_VIOLATION)
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AdminEnrollmentStartRequest {
-    node_public_key: String,
+pub(crate) struct AdminEnrollmentStartRequest {
+    pub(crate) node_public_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AdminEnrollmentStartResponse {
-    session_id: String,
-    pin: String,
+pub(crate) struct AdminEnrollmentStartResponse {
+    pub(crate) session_id: String,
+    pub(crate) pin: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AdminEnrollmentApproveRequest {
-    session_id: String,
-    pin: String,
+pub(crate) struct AdminEnrollmentApproveRequest {
+    pub(crate) session_id: String,
+    pub(crate) pin: String,
     /// Hex-encoded signed certificate the operator-side node minted for the
     /// new device. The signing happens upstream of this endpoint (e.g. via the
     /// existing `auth_manager` token-signing or a dedicated cluster-CA tool);
     /// this handler just stages the bytes for the unenrolled node to fetch.
-    signed_certificate_hex: String,
+    pub(crate) signed_certificate_hex: String,
 }
 
 /// `POST /admin/enrollment/start` — begin a node enrollment session. Caller is
@@ -302,7 +304,7 @@ pub(crate) async fn admin_manifest_update_handler(
         .into_response()
 }
 
-fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityConfig> {
+pub(crate) fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityConfig> {
     if config.host_address.trim().is_empty() {
         return Err(anyhow!(
             "Integrity Validation Failed: embedded sealed configuration is missing `host_address`"
@@ -358,7 +360,7 @@ fn validate_integrity_config(mut config: IntegrityConfig) -> Result<IntegrityCon
     Ok(config)
 }
 
-fn validate_tee_requirements(config: &IntegrityConfig) -> Result<()> {
+pub(crate) fn validate_tee_requirements(config: &IntegrityConfig) -> Result<()> {
     if config.routes.iter().any(|route| route.requires_tee) && config.tee_backend.is_none() {
         return Err(anyhow!(
             "Integrity Validation Failed: routes with `requires_tee: true` require `tee_backend` to be configured"
@@ -368,7 +370,7 @@ fn validate_tee_requirements(config: &IntegrityConfig) -> Result<()> {
     Ok(())
 }
 
-fn normalize_config_routes(
+pub(crate) fn normalize_config_routes(
     routes: Vec<IntegrityRoute>,
     allow_empty: bool,
 ) -> Result<Vec<IntegrityRoute>> {
@@ -400,7 +402,7 @@ fn normalize_config_routes(
     Ok(normalized)
 }
 
-fn normalize_batch_targets(
+pub(crate) fn normalize_batch_targets(
     targets: Vec<IntegrityBatchTarget>,
 ) -> Result<Vec<IntegrityBatchTarget>> {
     let mut normalized = targets
@@ -421,7 +423,7 @@ fn normalize_batch_targets(
     Ok(normalized)
 }
 
-fn normalize_layer4_config(
+pub(crate) fn normalize_layer4_config(
     mut layer4: IntegrityLayer4Config,
     route_registry: &RouteRegistry,
 ) -> Result<IntegrityLayer4Config> {
@@ -430,7 +432,7 @@ fn normalize_layer4_config(
     Ok(layer4)
 }
 
-fn normalize_resources(
+pub(crate) fn normalize_resources(
     resources: BTreeMap<String, IntegrityResource>,
     routes: &[IntegrityRoute],
     route_registry: &RouteRegistry,
@@ -468,7 +470,7 @@ fn normalize_resources(
     Ok(normalized)
 }
 
-fn normalize_resource_definition(
+pub(crate) fn normalize_resource_definition(
     resource: IntegrityResource,
     resource_name: &str,
     route_registry: &RouteRegistry,
@@ -513,7 +515,7 @@ fn normalize_resource_definition(
     }
 }
 
-fn normalize_internal_resource_reference(
+pub(crate) fn normalize_internal_resource_reference(
     resource_name: &str,
     target: &str,
     version_constraint: Option<&str>,
@@ -569,7 +571,10 @@ fn normalize_internal_resource_reference(
     Ok(normalized_name)
 }
 
-fn normalize_external_resource_target(resource_name: &str, target: &str) -> Result<String> {
+pub(crate) fn normalize_external_resource_target(
+    resource_name: &str,
+    target: &str,
+) -> Result<String> {
     let parsed = reqwest::Url::parse(target.trim()).map_err(|error| {
         anyhow!(
             "Integrity Validation Failed: external resource `{resource_name}` target is not a valid URL: {error}"
@@ -595,7 +600,7 @@ fn normalize_external_resource_target(resource_name: &str, target: &str) -> Resu
     Ok(parsed.to_string())
 }
 
-fn is_cluster_local_service_host(host: &str) -> bool {
+pub(crate) fn is_cluster_local_service_host(host: &str) -> bool {
     let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
     !normalized.is_empty()
         && !normalized.eq("localhost")
@@ -604,7 +609,10 @@ fn is_cluster_local_service_host(host: &str) -> bool {
             || normalized.ends_with(".svc.cluster.local"))
 }
 
-fn normalize_resource_methods(resource_name: &str, methods: Vec<String>) -> Result<Vec<String>> {
+pub(crate) fn normalize_resource_methods(
+    resource_name: &str,
+    methods: Vec<String>,
+) -> Result<Vec<String>> {
     let normalized = methods
         .into_iter()
         .map(|method| {
@@ -630,7 +638,7 @@ fn normalize_resource_methods(resource_name: &str, methods: Vec<String>) -> Resu
     Ok(normalized.into_iter().collect())
 }
 
-fn normalize_tcp_bindings(
+pub(crate) fn normalize_tcp_bindings(
     bindings: Vec<IntegrityTcpBinding>,
     route_registry: &RouteRegistry,
 ) -> Result<Vec<IntegrityTcpBinding>> {
@@ -674,7 +682,7 @@ fn normalize_tcp_bindings(
     Ok(normalized)
 }
 
-fn normalize_udp_bindings(
+pub(crate) fn normalize_udp_bindings(
     bindings: Vec<IntegrityUdpBinding>,
     route_registry: &RouteRegistry,
 ) -> Result<Vec<IntegrityUdpBinding>> {
@@ -718,7 +726,7 @@ fn normalize_udp_bindings(
     Ok(normalized)
 }
 
-fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
+pub(crate) fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
     let normalized = normalize_route_path(&route.path);
 
     if normalized == "/" || resolve_function_name(&normalized).is_none() {
@@ -767,7 +775,7 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
     })
 }
 
-fn normalize_route_runtime(
+pub(crate) fn normalize_route_runtime(
     runtime: Option<FaaSRuntime>,
     route_path: &str,
 ) -> Result<Option<FaaSRuntime>> {
@@ -803,7 +811,9 @@ fn normalize_route_runtime(
     }
 }
 
-fn validate_integrity_batch_target(target: IntegrityBatchTarget) -> Result<IntegrityBatchTarget> {
+pub(crate) fn validate_integrity_batch_target(
+    target: IntegrityBatchTarget,
+) -> Result<IntegrityBatchTarget> {
     let name = target.name.trim();
     if name.is_empty() {
         return Err(anyhow!(
@@ -845,14 +855,14 @@ fn validate_integrity_batch_target(target: IntegrityBatchTarget) -> Result<Integ
     })
 }
 
-fn normalize_route_targets(targets: Vec<RouteTarget>) -> Result<Vec<RouteTarget>> {
+pub(crate) fn normalize_route_targets(targets: Vec<RouteTarget>) -> Result<Vec<RouteTarget>> {
     targets
         .into_iter()
         .map(normalize_route_target)
         .collect::<Result<Vec<_>>>()
 }
 
-fn normalize_route_resiliency(
+pub(crate) fn normalize_route_resiliency(
     resiliency: Option<ResiliencyConfig>,
     route_path: &str,
 ) -> Result<Option<ResiliencyConfig>> {
@@ -887,7 +897,7 @@ fn normalize_route_resiliency(
     }))
 }
 
-fn normalize_retry_policy(policy: RetryPolicy, route_path: &str) -> Result<RetryPolicy> {
+pub(crate) fn normalize_retry_policy(policy: RetryPolicy, route_path: &str) -> Result<RetryPolicy> {
     let retry_on = policy
         .retry_on
         .into_iter()
@@ -922,7 +932,7 @@ fn normalize_retry_policy(policy: RetryPolicy, route_path: &str) -> Result<Retry
     })
 }
 
-fn normalize_route_models(
+pub(crate) fn normalize_route_models(
     models: Vec<IntegrityModelBinding>,
     route_path: &str,
 ) -> Result<Vec<IntegrityModelBinding>> {
@@ -955,7 +965,10 @@ fn normalize_route_models(
     Ok(deduped.into_values().collect())
 }
 
-fn normalize_route_domains(domains: Vec<String>, route_path: &str) -> Result<Vec<String>> {
+pub(crate) fn normalize_route_domains(
+    domains: Vec<String>,
+    route_path: &str,
+) -> Result<Vec<String>> {
     domains
         .into_iter()
         .map(|domain| {
@@ -969,7 +982,7 @@ fn normalize_route_domains(domains: Vec<String>, route_path: &str) -> Result<Vec
         .map(|domains| domains.into_iter().collect())
 }
 
-fn ensure_unique_route_domains(routes: &[IntegrityRoute]) -> Result<()> {
+pub(crate) fn ensure_unique_route_domains(routes: &[IntegrityRoute]) -> Result<()> {
     let mut owners = HashMap::new();
 
     for route in routes {
@@ -986,7 +999,7 @@ fn ensure_unique_route_domains(routes: &[IntegrityRoute]) -> Result<()> {
     Ok(())
 }
 
-fn ensure_unique_model_aliases(routes: &[IntegrityRoute]) -> Result<()> {
+pub(crate) fn ensure_unique_model_aliases(routes: &[IntegrityRoute]) -> Result<()> {
     let mut owners = HashMap::new();
 
     for route in routes {
@@ -1003,7 +1016,7 @@ fn ensure_unique_model_aliases(routes: &[IntegrityRoute]) -> Result<()> {
     Ok(())
 }
 
-fn normalize_tls_address(address: Option<String>) -> Result<Option<String>> {
+pub(crate) fn normalize_tls_address(address: Option<String>) -> Result<Option<String>> {
     address
         .map(|address| {
             let trimmed = address.trim();
@@ -1022,7 +1035,7 @@ fn normalize_tls_address(address: Option<String>) -> Result<Option<String>> {
         .transpose()
 }
 
-fn normalize_advertise_ip(address: Option<String>) -> Result<Option<String>> {
+pub(crate) fn normalize_advertise_ip(address: Option<String>) -> Result<Option<String>> {
     address
         .map(|address| {
             let trimmed = address.trim();
@@ -1041,7 +1054,7 @@ fn normalize_advertise_ip(address: Option<String>) -> Result<Option<String>> {
         .transpose()
 }
 
-fn effective_advertise_ip(config: &IntegrityConfig) -> String {
+pub(crate) fn effective_advertise_ip(config: &IntegrityConfig) -> String {
     config
         .advertise_ip
         .clone()
@@ -1055,7 +1068,7 @@ fn effective_advertise_ip(config: &IntegrityConfig) -> String {
         .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string())
 }
 
-fn normalize_route_name(name: &str, path: &str) -> Result<String> {
+pub(crate) fn normalize_route_name(name: &str, path: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Ok(default_route_name(path));
@@ -1065,7 +1078,7 @@ fn normalize_route_name(name: &str, path: &str) -> Result<String> {
     })
 }
 
-fn normalize_service_name(name: &str) -> Result<String> {
+pub(crate) fn normalize_service_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("service names cannot be empty"));
@@ -1077,7 +1090,7 @@ fn normalize_service_name(name: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
-fn normalize_route_version(version: &str, path: &str) -> Result<String> {
+pub(crate) fn normalize_route_version(version: &str, path: &str) -> Result<String> {
     Version::parse(version.trim())
         .with_context(|| {
             format!(
@@ -1087,7 +1100,7 @@ fn normalize_route_version(version: &str, path: &str) -> Result<String> {
         .map(|parsed| parsed.to_string())
 }
 
-fn normalize_route_dependencies(
+pub(crate) fn normalize_route_dependencies(
     dependencies: BTreeMap<String, String>,
     path: &str,
 ) -> Result<BTreeMap<String, String>> {
@@ -1111,7 +1124,7 @@ fn normalize_route_dependencies(
         .collect()
 }
 
-fn normalize_route_credentials(credentials: Vec<String>) -> Result<Vec<String>> {
+pub(crate) fn normalize_route_credentials(credentials: Vec<String>) -> Result<Vec<String>> {
     credentials
         .into_iter()
         .map(|credential| {
@@ -1127,7 +1140,10 @@ fn normalize_route_credentials(credentials: Vec<String>) -> Result<Vec<String>> 
         .map(|credentials| credentials.into_iter().collect())
 }
 
-fn normalize_route_middleware(middleware: Option<String>, path: &str) -> Result<Option<String>> {
+pub(crate) fn normalize_route_middleware(
+    middleware: Option<String>,
+    path: &str,
+) -> Result<Option<String>> {
     middleware
         .map(|middleware| {
             normalize_service_name(&middleware).map_err(|error| {
@@ -1139,7 +1155,7 @@ fn normalize_route_middleware(middleware: Option<String>, path: &str) -> Result<
         .transpose()
 }
 
-fn normalize_route_env(
+pub(crate) fn normalize_route_env(
     env: BTreeMap<String, String>,
     route_path: &str,
 ) -> Result<BTreeMap<String, String>> {
@@ -1156,7 +1172,7 @@ fn normalize_route_env(
         .collect()
 }
 
-fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
+pub(crate) fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
     let module = normalize_target_module_name(&target.module);
     if module.is_empty() {
         return Err(anyhow!(
@@ -1190,7 +1206,7 @@ fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget> {
     })
 }
 
-fn normalize_header_match(header_match: HeaderMatch) -> Result<HeaderMatch> {
+pub(crate) fn normalize_header_match(header_match: HeaderMatch) -> Result<HeaderMatch> {
     let name = header_match.name.trim().to_ascii_lowercase();
     let value = header_match.value.trim().to_owned();
 
@@ -1208,7 +1224,7 @@ fn normalize_header_match(header_match: HeaderMatch) -> Result<HeaderMatch> {
     Ok(HeaderMatch { name, value })
 }
 
-fn normalize_route_volumes(
+pub(crate) fn normalize_route_volumes(
     volumes: Vec<IntegrityVolume>,
     route_role: RouteRole,
     route_path: &str,
@@ -1247,7 +1263,7 @@ fn normalize_route_volumes(
     Ok(deduped)
 }
 
-fn validate_route_volume(
+pub(crate) fn validate_route_volume(
     volume: IntegrityVolume,
     route_role: RouteRole,
     route_path: &str,
@@ -1307,7 +1323,7 @@ fn validate_route_volume(
     })
 }
 
-fn normalize_guest_volume_path(path: &str) -> Result<String> {
+pub(crate) fn normalize_guest_volume_path(path: &str) -> Result<String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(anyhow!(
@@ -1350,7 +1366,11 @@ fn normalize_guest_volume_path(path: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn normalize_idle_timeout(value: &str, route_path: &str, guest_path: &str) -> Result<String> {
+pub(crate) fn normalize_idle_timeout(
+    value: &str,
+    route_path: &str,
+    guest_path: &str,
+) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(anyhow!(
@@ -1367,7 +1387,7 @@ fn normalize_idle_timeout(value: &str, route_path: &str, guest_path: &str) -> Re
     Ok(trimmed.to_owned())
 }
 
-fn parse_hibernation_duration(value: &str) -> Result<Duration> {
+pub(crate) fn parse_hibernation_duration(value: &str) -> Result<Duration> {
     let trimmed = value.trim();
     let (digits, multiplier) = if let Some(value) = trimmed.strip_suffix("ms") {
         (value, Duration::from_millis(1))
@@ -1394,7 +1414,7 @@ fn parse_hibernation_duration(value: &str) -> Result<Duration> {
         .ok_or_else(|| anyhow!("idle_timeout is too large"))
 }
 
-fn normalize_allowed_secrets(allowed_secrets: Vec<String>) -> Result<Vec<String>> {
+pub(crate) fn normalize_allowed_secrets(allowed_secrets: Vec<String>) -> Result<Vec<String>> {
     allowed_secrets
         .into_iter()
         .map(|secret| {
@@ -1412,11 +1432,11 @@ fn normalize_allowed_secrets(allowed_secrets: Vec<String>) -> Result<Vec<String>
 }
 
 #[cfg(test)]
-fn canonical_config_payload(config: &IntegrityConfig) -> Result<String> {
+pub(crate) fn canonical_config_payload(config: &IntegrityConfig) -> Result<String> {
     serde_json::to_string(config).context("failed to serialize runtime integrity configuration")
 }
 
-fn verify_integrity_signature(
+pub(crate) fn verify_integrity_signature(
     payload: &str,
     public_key_hex: &str,
     signature_hex: &str,
@@ -1435,7 +1455,7 @@ fn verify_integrity_signature(
         })
 }
 
-fn decode_hex_array<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
+pub(crate) fn decode_hex_array<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
     let decoded =
         hex::decode(value).with_context(|| format!("failed to decode embedded {label} as hex"))?;
 

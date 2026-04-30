@@ -1,9 +1,6 @@
-#[tokio::main]
-async fn main() -> Result<()> {
-    run().await
-}
+use super::*;
 
-async fn run() -> Result<()> {
+pub(crate) async fn run() -> Result<()> {
     init_host_tracing();
     ensure_rustls_crypto_provider();
     let cli = HostCli::parse();
@@ -28,7 +25,7 @@ async fn run() -> Result<()> {
     }
 }
 
-async fn serve_host(accel: AccelerationMode) -> Result<()> {
+pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     let manifest_path = integrity_manifest_path();
     let (export_sender, export_receiver) = mpsc::channel(TELEMETRY_EXPORT_QUEUE_CAPACITY);
     let telemetry =
@@ -165,7 +162,7 @@ async fn serve_host(accel: AccelerationMode) -> Result<()> {
     Ok(())
 }
 
-fn maybe_init_l4_acceleration(accel: AccelerationMode, layer4: &IntegrityLayer4Config) {
+pub(crate) fn maybe_init_l4_acceleration(accel: AccelerationMode, layer4: &IntegrityLayer4Config) {
     if accel != AccelerationMode::Ebpf {
         return;
     }
@@ -186,7 +183,7 @@ fn maybe_init_l4_acceleration(accel: AccelerationMode, layer4: &IntegrityLayer4C
     }
 }
 
-async fn execute_batch_target_from_manifest(
+pub(crate) async fn execute_batch_target_from_manifest(
     manifest_path: PathBuf,
     target_name: &str,
 ) -> Result<bool> {

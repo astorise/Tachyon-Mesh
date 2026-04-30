@@ -1,6 +1,8 @@
+use super::*;
+
 impl BackgroundWorkerManager {
     #[allow(clippy::too_many_arguments)]
-    fn start_for_runtime(
+    pub(crate) fn start_for_runtime(
         &self,
         runtime: &RuntimeState,
         telemetry: TelemetryHandle,
@@ -107,7 +109,7 @@ impl BackgroundWorkerManager {
 
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
-    async fn replace_with(
+    pub(crate) async fn replace_with(
         &self,
         runtime: &RuntimeState,
         telemetry: TelemetryHandle,
@@ -131,7 +133,7 @@ impl BackgroundWorkerManager {
         );
     }
 
-    async fn stop_all(&self) {
+    pub(crate) async fn stop_all(&self) {
         let workers = {
             let mut guard = self
                 .workers
@@ -156,7 +158,7 @@ impl BackgroundWorkerManager {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_background_tick_loop(
+pub(crate) fn run_background_tick_loop(
     engine: Engine,
     config: IntegrityConfig,
     telemetry: TelemetryHandle,
@@ -208,7 +210,7 @@ fn run_background_tick_loop(
     }
 }
 
-fn wait_for_background_tick(stop_requested: &AtomicBool) -> bool {
+pub(crate) fn wait_for_background_tick(stop_requested: &AtomicBool) -> bool {
     let deadline = Instant::now() + AUTOSCALING_TICK_INTERVAL;
 
     loop {

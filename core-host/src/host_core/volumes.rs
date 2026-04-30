@@ -1,5 +1,7 @@
+use super::*;
+
 impl VolumeManager {
-    async fn acquire_route_volumes(
+    pub(crate) async fn acquire_route_volumes(
         &self,
         route: &IntegrityRoute,
         storage_broker: Arc<StorageBrokerManager>,
@@ -17,7 +19,7 @@ impl VolumeManager {
         Ok(RouteVolumeLeaseGuard { leases })
     }
 
-    fn managed_volume(
+    pub(crate) fn managed_volume(
         &self,
         route: &IntegrityRoute,
         volume: &IntegrityVolume,
@@ -38,7 +40,7 @@ impl VolumeManager {
     }
 
     #[cfg(test)]
-    fn managed_volume_for_route(
+    pub(crate) fn managed_volume_for_route(
         &self,
         route_path: &str,
         guest_path: &str,
@@ -52,7 +54,7 @@ impl VolumeManager {
 }
 
 impl ManagedVolume {
-    fn new(
+    pub(crate) fn new(
         route_path: &str,
         volume: &IntegrityVolume,
         storage_broker: Arc<StorageBrokerManager>,
@@ -90,7 +92,9 @@ impl ManagedVolume {
         })
     }
 
-    async fn acquire(self: &Arc<Self>) -> std::result::Result<ManagedVolumeLease, String> {
+    pub(crate) async fn acquire(
+        self: &Arc<Self>,
+    ) -> std::result::Result<ManagedVolumeLease, String> {
         loop {
             let should_restore = {
                 let mut state = self
@@ -145,7 +149,7 @@ impl ManagedVolume {
         }
     }
 
-    fn release(self: &Arc<Self>) {
+    pub(crate) fn release(self: &Arc<Self>) {
         let generation = {
             let mut state = self
                 .state
@@ -166,7 +170,7 @@ impl ManagedVolume {
         self.notify.notify_waiters();
     }
 
-    fn schedule_hibernation(self: &Arc<Self>, generation: u64) {
+    pub(crate) fn schedule_hibernation(self: &Arc<Self>, generation: u64) {
         let volume = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(volume.idle_timeout).await;
@@ -235,7 +239,7 @@ impl ManagedVolume {
         });
     }
 
-    fn finish_restore(&self, lifecycle: ManagedVolumeLifecycle) {
+    pub(crate) fn finish_restore(&self, lifecycle: ManagedVolumeLifecycle) {
         let mut state = self
             .state
             .lock()
@@ -246,7 +250,7 @@ impl ManagedVolume {
     }
 
     #[cfg(test)]
-    fn lifecycle(&self) -> ManagedVolumeLifecycle {
+    pub(crate) fn lifecycle(&self) -> ManagedVolumeLifecycle {
         self.state
             .lock()
             .expect("managed volume state should not be poisoned")
@@ -266,7 +270,7 @@ impl Drop for RouteVolumeLeaseGuard {
     }
 }
 
-async fn run_volume_gc_tick(runtime: Arc<RuntimeState>) -> Result<()> {
+pub(crate) async fn run_volume_gc_tick(runtime: Arc<RuntimeState>) -> Result<()> {
     let managed_paths = collect_ttl_managed_paths(&runtime.config);
     let mut handles = Vec::with_capacity(managed_paths.len());
 
@@ -287,7 +291,7 @@ async fn run_volume_gc_tick(runtime: Arc<RuntimeState>) -> Result<()> {
     Ok(())
 }
 
-fn collect_ttl_managed_paths(config: &IntegrityConfig) -> Vec<TtlManagedPath> {
+pub(crate) fn collect_ttl_managed_paths(config: &IntegrityConfig) -> Vec<TtlManagedPath> {
     let mut deduped = BTreeMap::<PathBuf, Duration>::new();
 
     for route in &config.routes {
@@ -314,7 +318,7 @@ fn collect_ttl_managed_paths(config: &IntegrityConfig) -> Vec<TtlManagedPath> {
         .collect()
 }
 
-fn sweep_ttl_managed_path(managed_path: &TtlManagedPath) -> Result<()> {
+pub(crate) fn sweep_ttl_managed_path(managed_path: &TtlManagedPath) -> Result<()> {
     let read_dir = match fs::read_dir(&managed_path.host_path) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -390,13 +394,13 @@ fn sweep_ttl_managed_path(managed_path: &TtlManagedPath) -> Result<()> {
     Ok(())
 }
 
-fn ttl_entry_is_stale(modified: SystemTime, ttl: Duration) -> bool {
+pub(crate) fn ttl_entry_is_stale(modified: SystemTime, ttl: Duration) -> bool {
     SystemTime::now()
         .duration_since(modified)
         .is_ok_and(|age| age >= ttl)
 }
 
-fn remove_stale_ttl_entry(path: &Path, is_dir: bool) -> Result<()> {
+pub(crate) fn remove_stale_ttl_entry(path: &Path, is_dir: bool) -> Result<()> {
     let result = if is_dir {
         fs::remove_dir_all(path)
     } else {
@@ -425,7 +429,7 @@ fn remove_stale_ttl_entry(path: &Path, is_dir: bool) -> Result<()> {
     }
 }
 
-fn resolve_storage_write_target(
+pub(crate) fn resolve_storage_write_target(
     route: &IntegrityRoute,
     path: &str,
 ) -> std::result::Result<ResolvedStorageWriteTarget, String> {
@@ -467,7 +471,7 @@ fn resolve_storage_write_target(
     })
 }
 
-fn parse_storage_broker_host_path(
+pub(crate) fn parse_storage_broker_host_path(
     value: &str,
     label: &str,
 ) -> std::result::Result<PathBuf, String> {
@@ -479,7 +483,7 @@ fn parse_storage_broker_host_path(
     Ok(PathBuf::from(trimmed))
 }
 
-fn authorize_storage_broker_write(
+pub(crate) fn authorize_storage_broker_write(
     config: &IntegrityConfig,
     headers: &HeaderMap,
     host_identity: &HostIdentity,
@@ -507,14 +511,14 @@ fn authorize_storage_broker_write(
     Ok((route, resolved))
 }
 
-fn guest_path_matches_volume(path: &str, guest_path: &str) -> bool {
+pub(crate) fn guest_path_matches_volume(path: &str, guest_path: &str) -> bool {
     path == guest_path
         || path
             .strip_prefix(guest_path)
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn process_storage_write_request(request: &StorageBrokerWriteRequest) -> Result<()> {
+pub(crate) fn process_storage_write_request(request: &StorageBrokerWriteRequest) -> Result<()> {
     if let Some(parent) = request.host_target.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -554,7 +558,7 @@ fn process_storage_write_request(request: &StorageBrokerWriteRequest) -> Result<
     }
 }
 
-fn emit_storage_mutation_event(
+pub(crate) fn emit_storage_mutation_event(
     core_store: &store::CoreStore,
     request: &StorageBrokerWriteRequest,
 ) -> Result<String> {
@@ -580,7 +584,7 @@ fn emit_storage_mutation_event(
     core_store.append_outbox(store::CoreStoreBucket::DataMutationOutbox, &payload)
 }
 
-fn process_storage_snapshot_request(
+pub(crate) fn process_storage_snapshot_request(
     request: &StorageBrokerSnapshotRequest,
     core_store: &store::CoreStore,
 ) -> Result<()> {
@@ -597,7 +601,7 @@ fn process_storage_snapshot_request(
     Ok(())
 }
 
-fn process_storage_restore_request(
+pub(crate) fn process_storage_restore_request(
     request: &StorageBrokerRestoreRequest,
     core_store: &store::CoreStore,
 ) -> Result<()> {
@@ -616,7 +620,7 @@ fn process_storage_restore_request(
     copy_directory_tree(&request.snapshot_path, &request.destination_path)
 }
 
-fn copy_directory_tree(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_directory_tree(source: &Path, destination: &Path) -> Result<()> {
     remove_path_if_exists(destination)?;
     fs::create_dir_all(destination).with_context(|| {
         format!(
@@ -667,7 +671,7 @@ fn copy_directory_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_path_if_exists(path: &Path) -> Result<()> {
+pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -685,11 +689,11 @@ fn remove_path_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn managed_volume_key(route_path: &str, guest_path: &str) -> String {
+pub(crate) fn managed_volume_key(route_path: &str, guest_path: &str) -> String {
     format!("{route_path}:{guest_path}")
 }
 
-fn managed_volume_id(route_path: &str, guest_path: &str) -> String {
+pub(crate) fn managed_volume_id(route_path: &str, guest_path: &str) -> String {
     format!(
         "{}:{}",
         route_path.trim_matches('/').replace('/', "_"),
@@ -697,7 +701,7 @@ fn managed_volume_id(route_path: &str, guest_path: &str) -> String {
     )
 }
 
-fn snapshot_path_for_volume(active_path: &Path) -> PathBuf {
+pub(crate) fn snapshot_path_for_volume(active_path: &Path) -> PathBuf {
     let mut snapshot = active_path.to_path_buf();
     snapshot.set_extension("snapshot");
     snapshot

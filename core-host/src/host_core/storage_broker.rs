@@ -1,5 +1,7 @@
+use super::*;
+
 impl StorageBrokerManager {
-    fn new(core_store: Arc<store::CoreStore>) -> Self {
+    pub(crate) fn new(core_store: Arc<store::CoreStore>) -> Self {
         Self {
             core_store,
             queues: Arc::new(Mutex::new(HashMap::new())),
@@ -7,7 +9,7 @@ impl StorageBrokerManager {
     }
 
     #[cfg(test)]
-    fn enqueue_write_for_route(
+    pub(crate) fn enqueue_write_for_route(
         &self,
         route: &IntegrityRoute,
         path: &str,
@@ -24,7 +26,7 @@ impl StorageBrokerManager {
         )
     }
 
-    fn enqueue_write_target(
+    pub(crate) fn enqueue_write_target(
         &self,
         route_path: String,
         sync_to_cloud: bool,
@@ -43,7 +45,7 @@ impl StorageBrokerManager {
         }))
     }
 
-    fn enqueue_snapshot(
+    pub(crate) fn enqueue_snapshot(
         &self,
         volume_id: String,
         volume_root: &Path,
@@ -64,7 +66,7 @@ impl StorageBrokerManager {
         Ok(receiver)
     }
 
-    fn enqueue_restore(
+    pub(crate) fn enqueue_restore(
         &self,
         volume_id: String,
         volume_root: &Path,
@@ -85,7 +87,7 @@ impl StorageBrokerManager {
         Ok(receiver)
     }
 
-    fn queue_for_volume(&self, volume_root: &Path) -> Arc<StorageVolumeQueue> {
+    pub(crate) fn queue_for_volume(&self, volume_root: &Path) -> Arc<StorageVolumeQueue> {
         let key = normalize_path(volume_root.to_path_buf());
         let mut queues = self
             .queues
@@ -99,7 +101,7 @@ impl StorageBrokerManager {
     }
 
     #[cfg(test)]
-    fn wait_for_volume_idle(&self, volume_root: &Path, timeout: Duration) -> bool {
+    pub(crate) fn wait_for_volume_idle(&self, volume_root: &Path, timeout: Duration) -> bool {
         self.queue_for_volume(volume_root).wait_for_idle(timeout)
     }
 }
@@ -114,7 +116,7 @@ impl Default for StorageBrokerManager {
 }
 
 impl StorageVolumeQueue {
-    fn new(volume_root: PathBuf, core_store: Arc<store::CoreStore>) -> Arc<Self> {
+    pub(crate) fn new(volume_root: PathBuf, core_store: Arc<store::CoreStore>) -> Arc<Self> {
         let (sender, receiver) = std::sync::mpsc::channel::<StorageBrokerOperation>();
         let queue = Arc::new(Self {
             volume_root,
@@ -128,7 +130,10 @@ impl StorageVolumeQueue {
         queue
     }
 
-    fn enqueue(&self, operation: StorageBrokerOperation) -> std::result::Result<(), String> {
+    pub(crate) fn enqueue(
+        &self,
+        operation: StorageBrokerOperation,
+    ) -> std::result::Result<(), String> {
         self.state
             .lock()
             .expect("storage broker queue state should not be poisoned")
@@ -149,7 +154,10 @@ impl StorageVolumeQueue {
         ))
     }
 
-    fn run(self: Arc<Self>, receiver: std::sync::mpsc::Receiver<StorageBrokerOperation>) {
+    pub(crate) fn run(
+        self: Arc<Self>,
+        receiver: std::sync::mpsc::Receiver<StorageBrokerOperation>,
+    ) {
         while let Ok(operation) = receiver.recv() {
             match operation {
                 StorageBrokerOperation::Write(request) => {
@@ -209,7 +217,7 @@ impl StorageVolumeQueue {
     }
 
     #[cfg(test)]
-    fn wait_for_idle(&self, timeout: Duration) -> bool {
+    pub(crate) fn wait_for_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self
             .state
@@ -237,7 +245,7 @@ impl StorageVolumeQueue {
 }
 
 impl BufferedRequestManager {
-    fn new(disk_dir: PathBuf) -> Result<Self> {
+    pub(crate) fn new(disk_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&disk_dir).with_context(|| {
             format!(
                 "failed to initialize buffered request spool directory `{}`",
@@ -257,7 +265,7 @@ impl BufferedRequestManager {
         })
     }
 
-    fn enqueue(
+    pub(crate) fn enqueue(
         &self,
         request: BufferedRouteRequest,
     ) -> std::result::Result<(oneshot::Receiver<BufferedRouteResult>, BufferedRequestTier), String>
@@ -304,7 +312,7 @@ impl BufferedRequestManager {
         }
     }
 
-    fn pop_next(&self) -> std::result::Result<Option<BufferedQueueItem>, String> {
+    pub(crate) fn pop_next(&self) -> std::result::Result<Option<BufferedQueueItem>, String> {
         let queued = {
             let mut state = self
                 .state
@@ -340,7 +348,7 @@ impl BufferedRequestManager {
         }))
     }
 
-    fn requeue_front(&self, item: BufferedQueueItem) -> std::result::Result<(), String> {
+    pub(crate) fn requeue_front(&self, item: BufferedQueueItem) -> std::result::Result<(), String> {
         let mut state = self
             .state
             .lock()
@@ -362,14 +370,14 @@ impl BufferedRequestManager {
         Ok(())
     }
 
-    fn complete(&self, item: BufferedQueueItem, result: BufferedRouteResult) {
+    pub(crate) fn complete(&self, item: BufferedQueueItem, result: BufferedRouteResult) {
         if let Some(path) = &item.disk_path {
             let _ = fs::remove_file(path);
         }
         let _ = item.completion.send(result);
     }
 
-    fn pending_count(&self) -> usize {
+    pub(crate) fn pending_count(&self) -> usize {
         let state = self
             .state
             .lock()
@@ -378,7 +386,7 @@ impl BufferedRequestManager {
     }
 
     #[cfg(test)]
-    fn disk_spill_count(&self) -> usize {
+    pub(crate) fn disk_spill_count(&self) -> usize {
         self.state
             .lock()
             .expect("buffered request state should not be poisoned")

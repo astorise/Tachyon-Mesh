@@ -1,4 +1,6 @@
-fn execute_guest(
+use super::*;
+
+pub(crate) fn execute_guest(
     engine: &Engine,
     function_name: &str,
     request: GuestRequest,
@@ -73,12 +75,12 @@ fn execute_guest(
 }
 
 #[derive(Clone, Copy)]
-enum CompiledArtifactKind {
+pub(crate) enum CompiledArtifactKind {
     Component,
     Module,
 }
 
-fn load_component_with_core_store(
+pub(crate) fn load_component_with_core_store(
     engine: &Engine,
     module_path: &Path,
     core_store: &store::CoreStore,
@@ -132,7 +134,7 @@ fn load_component_with_core_store(
 }
 
 #[cfg(test)]
-fn resolve_legacy_guest_module(
+pub(crate) fn resolve_legacy_guest_module(
     engine: &Engine,
     function_name: &str,
     core_store: &store::CoreStore,
@@ -146,7 +148,7 @@ fn resolve_legacy_guest_module(
 /// canonical path; on a hit we skip the redb lookup and the
 /// `Module::deserialize` cost entirely. On a miss we load through the existing
 /// redb-backed precompile path and populate the pool for subsequent requests.
-fn resolve_legacy_guest_module_with_pool(
+pub(crate) fn resolve_legacy_guest_module_with_pool(
     engine: &Engine,
     function_name: &str,
     core_store: &store::CoreStore,
@@ -197,7 +199,7 @@ fn resolve_legacy_guest_module_with_pool(
     ))
 }
 
-fn load_module_with_core_store(
+pub(crate) fn load_module_with_core_store(
     engine: &Engine,
     module_path: &Path,
     core_store: &store::CoreStore,
@@ -245,7 +247,7 @@ fn load_module_with_core_store(
     })
 }
 
-fn compiled_artifact_cache_key(
+pub(crate) fn compiled_artifact_cache_key(
     engine: &Engine,
     module_path: &Path,
     wasm_bytes: &[u8],
@@ -268,7 +270,7 @@ fn compiled_artifact_cache_key(
     )
 }
 
-fn execute_component_guest(
+pub(crate) fn execute_component_guest(
     engine: &Engine,
     request: GuestRequest,
     route: &IntegrityRoute,
@@ -396,7 +398,7 @@ fn execute_component_guest(
     })
 }
 
-fn execute_udp_layer4_guest(
+pub(crate) fn execute_udp_layer4_guest(
     engine: &Engine,
     route: &IntegrityRoute,
     function_name: &str,
@@ -430,7 +432,7 @@ fn execute_udp_layer4_guest(
     )
 }
 
-fn execute_udp_component_guest(
+pub(crate) fn execute_udp_component_guest(
     engine: &Engine,
     route: &IntegrityRoute,
     component_path: &Path,
@@ -524,7 +526,7 @@ fn execute_udp_component_guest(
 }
 
 #[cfg(feature = "websockets")]
-fn execute_websocket_guest(
+pub(crate) fn execute_websocket_guest(
     engine: &Engine,
     route: &IntegrityRoute,
     function_name: &str,
@@ -559,7 +561,7 @@ fn execute_websocket_guest(
 }
 
 #[cfg(feature = "websockets")]
-fn execute_websocket_component_guest(
+pub(crate) fn execute_websocket_component_guest(
     engine: &Engine,
     route: &IntegrityRoute,
     component_path: &Path,
@@ -656,7 +658,7 @@ fn execute_websocket_component_guest(
 }
 
 #[cfg(feature = "websockets")]
-fn websocket_message_to_host_frame(message: AxumWebSocketMessage) -> HostWebSocketFrame {
+pub(crate) fn websocket_message_to_host_frame(message: AxumWebSocketMessage) -> HostWebSocketFrame {
     match message {
         AxumWebSocketMessage::Text(text) => HostWebSocketFrame::Text(text.to_string()),
         AxumWebSocketMessage::Binary(bytes) => HostWebSocketFrame::Binary(bytes.to_vec()),
@@ -667,7 +669,7 @@ fn websocket_message_to_host_frame(message: AxumWebSocketMessage) -> HostWebSock
 }
 
 #[cfg(feature = "websockets")]
-fn host_frame_to_websocket_message(frame: HostWebSocketFrame) -> AxumWebSocketMessage {
+pub(crate) fn host_frame_to_websocket_message(frame: HostWebSocketFrame) -> AxumWebSocketMessage {
     match frame {
         HostWebSocketFrame::Text(text) => AxumWebSocketMessage::Text(text.into()),
         HostWebSocketFrame::Binary(bytes) => AxumWebSocketMessage::Binary(bytes.into()),
@@ -678,7 +680,7 @@ fn host_frame_to_websocket_message(frame: HostWebSocketFrame) -> AxumWebSocketMe
 }
 
 #[cfg(feature = "websockets")]
-fn websocket_binding_frame_to_host_frame(
+pub(crate) fn websocket_binding_frame_to_host_frame(
     frame: websocket_component_bindings::tachyon::mesh::websocket::Frame,
 ) -> HostWebSocketFrame {
     match frame {
@@ -701,7 +703,7 @@ fn websocket_binding_frame_to_host_frame(
 }
 
 #[cfg(feature = "websockets")]
-fn host_frame_to_websocket_binding_frame(
+pub(crate) fn host_frame_to_websocket_binding_frame(
     frame: HostWebSocketFrame,
 ) -> websocket_component_bindings::tachyon::mesh::websocket::Frame {
     match frame {
@@ -723,7 +725,7 @@ fn host_frame_to_websocket_binding_frame(
     }
 }
 
-fn execute_system_component_guest(
+pub(crate) fn execute_system_component_guest(
     engine: &Engine,
     request: GuestRequest,
     route: &IntegrityRoute,
@@ -907,7 +909,7 @@ fn execute_system_component_guest(
 
 impl BackgroundTickRunner {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         engine: &Engine,
         config: &IntegrityConfig,
         route: &IntegrityRoute,
@@ -1045,7 +1047,7 @@ impl BackgroundTickRunner {
         })
     }
 
-    fn tick(&mut self) -> std::result::Result<(), ExecutionError> {
+    pub(crate) fn tick(&mut self) -> std::result::Result<(), ExecutionError> {
         match &self.bindings {
             BackgroundGuestBindings::Background(bindings) => {
                 bindings.call_on_tick(&mut self.store).map_err(|error| {
@@ -1061,7 +1063,7 @@ impl BackgroundTickRunner {
     }
 }
 
-fn execute_legacy_guest(
+pub(crate) fn execute_legacy_guest(
     engine: &Engine,
     function_name: &str,
     body: Bytes,
@@ -1152,7 +1154,7 @@ fn execute_legacy_guest(
     })
 }
 
-fn execute_legacy_guest_with_stdio(
+pub(crate) fn execute_legacy_guest_with_stdio(
     engine: &Engine,
     route: &IntegrityRoute,
     module_path: &Path,
@@ -1221,12 +1223,12 @@ fn execute_legacy_guest_with_stdio(
 }
 
 #[derive(Clone)]
-struct TcpSocketStdin {
-    socket: Arc<Mutex<std::net::TcpStream>>,
+pub(crate) struct TcpSocketStdin {
+    pub(crate) socket: Arc<Mutex<std::net::TcpStream>>,
 }
 
 impl TcpSocketStdin {
-    fn new(socket: std::net::TcpStream) -> Self {
+    pub(crate) fn new(socket: std::net::TcpStream) -> Self {
         Self {
             socket: Arc::new(Mutex::new(socket)),
         }
@@ -1281,12 +1283,12 @@ impl Pollable for TcpSocketStdin {
 }
 
 #[derive(Clone)]
-struct TcpSocketStdout {
-    socket: Arc<Mutex<std::net::TcpStream>>,
+pub(crate) struct TcpSocketStdout {
+    pub(crate) socket: Arc<Mutex<std::net::TcpStream>>,
 }
 
 impl TcpSocketStdout {
-    fn new(socket: std::net::TcpStream) -> Self {
+    pub(crate) fn new(socket: std::net::TcpStream) -> Self {
         Self {
             socket: Arc::new(Mutex::new(socket)),
         }
@@ -1345,24 +1347,24 @@ impl Pollable for TcpSocketStdout {
 }
 
 #[derive(Default)]
-struct AsyncGuestOutputState {
-    function_name: String,
-    capture_response: bool,
-    max_response_bytes: usize,
-    response: Vec<u8>,
-    pending: Vec<u8>,
-    response_overflowed: bool,
-    sender: Option<mpsc::Sender<AsyncLogEntry>>,
-    stream_type: Option<GuestLogStreamType>,
+pub(crate) struct AsyncGuestOutputState {
+    pub(crate) function_name: String,
+    pub(crate) capture_response: bool,
+    pub(crate) max_response_bytes: usize,
+    pub(crate) response: Vec<u8>,
+    pub(crate) pending: Vec<u8>,
+    pub(crate) response_overflowed: bool,
+    pub(crate) sender: Option<mpsc::Sender<AsyncLogEntry>>,
+    pub(crate) stream_type: Option<GuestLogStreamType>,
 }
 
 #[derive(Clone, Default)]
-struct AsyncGuestOutputCapture {
-    state: Arc<Mutex<AsyncGuestOutputState>>,
+pub(crate) struct AsyncGuestOutputCapture {
+    pub(crate) state: Arc<Mutex<AsyncGuestOutputState>>,
 }
 
 impl AsyncGuestOutputCapture {
-    fn new(
+    pub(crate) fn new(
         function_name: impl Into<String>,
         stream_type: GuestLogStreamType,
         sender: mpsc::Sender<AsyncLogEntry>,
@@ -1383,7 +1385,7 @@ impl AsyncGuestOutputCapture {
         }
     }
 
-    fn finish(&self) -> std::result::Result<Bytes, ExecutionError> {
+    pub(crate) fn finish(&self) -> std::result::Result<Bytes, ExecutionError> {
         let mut state = self.state.lock().map_err(|_| {
             ExecutionError::Internal("guest async stdout capture lock poisoned".to_owned())
         })?;
@@ -1447,14 +1449,14 @@ impl Pollable for AsyncGuestOutputCapture {
     async fn ready(&mut self) {}
 }
 
-fn disconnected_log_sender() -> mpsc::Sender<AsyncLogEntry> {
+pub(crate) fn disconnected_log_sender() -> mpsc::Sender<AsyncLogEntry> {
     let (sender, _receiver) = mpsc::channel(1);
     sender
 }
 
-struct GuestTempFile {
-    path: PathBuf,
-    file: fs::File,
+pub(crate) struct GuestTempFile {
+    pub(crate) path: PathBuf,
+    pub(crate) file: fs::File,
 }
 
 impl Drop for GuestTempFile {
@@ -1463,7 +1465,9 @@ impl Drop for GuestTempFile {
     }
 }
 
-fn create_guest_stdin_file(body: &Bytes) -> std::result::Result<GuestTempFile, ExecutionError> {
+pub(crate) fn create_guest_stdin_file(
+    body: &Bytes,
+) -> std::result::Result<GuestTempFile, ExecutionError> {
     let path = guest_temp_file_path("stdin");
     let mut file = fs::OpenOptions::new()
         .create_new(true)
@@ -1490,7 +1494,7 @@ fn create_guest_stdin_file(body: &Bytes) -> std::result::Result<GuestTempFile, E
 }
 
 #[cfg(test)]
-fn create_guest_stdout_file() -> std::result::Result<GuestTempFile, ExecutionError> {
+pub(crate) fn create_guest_stdout_file() -> std::result::Result<GuestTempFile, ExecutionError> {
     let path = guest_temp_file_path("stdout");
     let file = fs::OpenOptions::new()
         .create_new(true)
@@ -1503,14 +1507,14 @@ fn create_guest_stdout_file() -> std::result::Result<GuestTempFile, ExecutionErr
     Ok(GuestTempFile { path, file })
 }
 
-fn guest_temp_file_path(kind: &str) -> PathBuf {
+pub(crate) fn guest_temp_file_path(kind: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("tachyon-{kind}-{}.tmp", Uuid::new_v4()));
     path
 }
 
 #[cfg(test)]
-fn read_guest_stdout_file(
+pub(crate) fn read_guest_stdout_file(
     path: &Path,
     max_stdout_bytes: usize,
 ) -> std::result::Result<Bytes, ExecutionError> {
@@ -1530,7 +1534,7 @@ fn read_guest_stdout_file(
     Ok(Bytes::from(stdout))
 }
 
-fn maybe_set_guest_fuel_budget<T>(
+pub(crate) fn maybe_set_guest_fuel_budget<T>(
     store: &mut Store<T>,
     execution: &GuestExecutionContext,
 ) -> std::result::Result<(), ExecutionError> {
@@ -1543,7 +1547,7 @@ fn maybe_set_guest_fuel_budget<T>(
         .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))
 }
 
-fn sampled_fuel_consumed<T>(
+pub(crate) fn sampled_fuel_consumed<T>(
     store: &mut Store<T>,
     execution: &GuestExecutionContext,
 ) -> std::result::Result<Option<u64>, ExecutionError> {
@@ -1559,7 +1563,7 @@ fn sampled_fuel_consumed<T>(
     ))
 }
 
-fn legacy_guest_program_name(module_path: &Path) -> String {
+pub(crate) fn legacy_guest_program_name(module_path: &Path) -> String {
     module_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1567,7 +1571,7 @@ fn legacy_guest_program_name(module_path: &Path) -> String {
         .unwrap_or_else(|| "./guest.wasm".to_owned())
 }
 
-fn resolve_guest_entrypoint(
+pub(crate) fn resolve_guest_entrypoint(
     store: &mut Store<LegacyHostState>,
     instance: &Instance,
 ) -> std::result::Result<(&'static str, TypedFunc<(), ()>), wasmtime::Error> {
@@ -1579,7 +1583,7 @@ fn resolve_guest_entrypoint(
     }
 }
 
-fn build_linker(
+pub(crate) fn build_linker(
     engine: &Engine,
 ) -> std::result::Result<ModuleLinker<LegacyHostState>, ExecutionError> {
     let mut linker = ModuleLinker::new(engine);
@@ -1595,22 +1599,22 @@ fn build_linker(
 }
 
 #[cfg_attr(feature = "ai-inference", allow(dead_code))]
-fn requires_ai_inference_feature(function_name: &str) -> bool {
+pub(crate) fn requires_ai_inference_feature(function_name: &str) -> bool {
     normalize_target_module_name(function_name) == "guest-ai"
 }
 
-fn resolve_function_name(path: &str) -> Option<String> {
+pub(crate) fn resolve_function_name(path: &str) -> Option<String> {
     path.split('/')
         .rev()
         .find(|segment| !segment.is_empty() && *segment != "api")
         .map(ToOwned::to_owned)
 }
 
-fn default_route_name(path: &str) -> String {
+pub(crate) fn default_route_name(path: &str) -> String {
     resolve_function_name(path).unwrap_or_else(|| path.trim_matches('/').to_owned())
 }
 
-fn background_route_module(route: &IntegrityRoute) -> Option<String> {
+pub(crate) fn background_route_module(route: &IntegrityRoute) -> Option<String> {
     route
         .targets
         .first()
@@ -1618,7 +1622,7 @@ fn background_route_module(route: &IntegrityRoute) -> Option<String> {
         .or_else(|| resolve_function_name(&route.path))
 }
 
-fn normalize_route_path(path: &str) -> String {
+pub(crate) fn normalize_route_path(path: &str) -> String {
     let trimmed = path.trim();
     let with_leading_slash = if trimmed.starts_with('/') {
         trimmed.to_owned()
@@ -1634,7 +1638,7 @@ fn normalize_route_path(path: &str) -> String {
     }
 }
 
-fn normalize_route_override_key(route_key: &str) -> String {
+pub(crate) fn normalize_route_override_key(route_key: &str) -> String {
     if let Some(route_path) = route_key.strip_prefix(MESH_QOS_OVERRIDE_PREFIX) {
         return format!(
             "{MESH_QOS_OVERRIDE_PREFIX}{}",
@@ -1645,14 +1649,14 @@ fn normalize_route_override_key(route_key: &str) -> String {
     normalize_route_path(route_key)
 }
 
-fn route_path_for_override_key(route_key: &str) -> String {
+pub(crate) fn route_path_for_override_key(route_key: &str) -> String {
     route_key
         .strip_prefix(MESH_QOS_OVERRIDE_PREFIX)
         .map(normalize_route_path)
         .unwrap_or_else(|| normalize_route_path(route_key))
 }
 
-fn resolve_guest_module_path(
+pub(crate) fn resolve_guest_module_path(
     function_name: &str,
 ) -> std::result::Result<PathBuf, GuestModuleNotFound> {
     if system_storage::is_asset_uri(function_name) {
@@ -1675,7 +1679,7 @@ fn resolve_guest_module_path(
         })
 }
 
-fn guest_module_candidate_paths(function_name: &str) -> Vec<PathBuf> {
+pub(crate) fn guest_module_candidate_paths(function_name: &str) -> Vec<PathBuf> {
     let wasm_file = format!(
         "{}.wasm",
         normalize_target_module_name(function_name).replace('-', "_")
@@ -1709,7 +1713,7 @@ fn guest_module_candidate_paths(function_name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn normalize_target_module_name(module_name: &str) -> String {
+pub(crate) fn normalize_target_module_name(module_name: &str) -> String {
     module_name
         .trim()
         .strip_suffix(".wasm")
@@ -1718,23 +1722,23 @@ fn normalize_target_module_name(module_name: &str) -> String {
         .to_owned()
 }
 
-fn normalize_path(path: PathBuf) -> PathBuf {
+pub(crate) fn normalize_path(path: PathBuf) -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
 
-fn format_candidate_list(paths: &[String]) -> String {
+pub(crate) fn format_candidate_list(paths: &[String]) -> String {
     paths.join(", ")
 }
 
-fn record_wasm_start(telemetry: Option<&GuestTelemetryContext>) {
+pub(crate) fn record_wasm_start(telemetry: Option<&GuestTelemetryContext>) {
     record_wasm_event(telemetry, true);
 }
 
-fn record_wasm_end(telemetry: Option<&GuestTelemetryContext>) {
+pub(crate) fn record_wasm_end(telemetry: Option<&GuestTelemetryContext>) {
     record_wasm_event(telemetry, false);
 }
 
-fn record_wasm_event(telemetry: Option<&GuestTelemetryContext>, is_start: bool) {
+pub(crate) fn record_wasm_event(telemetry: Option<&GuestTelemetryContext>, is_start: bool) {
     let Some(telemetry) = telemetry else {
         return;
     };
@@ -1754,15 +1758,15 @@ fn record_wasm_event(telemetry: Option<&GuestTelemetryContext>, is_start: bool) 
     telemetry::record_event(&telemetry.handle, event);
 }
 
-fn should_shed_system_route(telemetry: &TelemetryHandle) -> bool {
+pub(crate) fn should_shed_system_route(telemetry: &TelemetryHandle) -> bool {
     is_system_route_saturated(telemetry::active_requests(telemetry))
 }
 
-fn is_system_route_saturated(active_requests: usize) -> bool {
+pub(crate) fn is_system_route_saturated(active_requests: usize) -> bool {
     active_requests > SYSTEM_ROUTE_ACTIVE_REQUEST_THRESHOLD
 }
 
-fn handle_guest_entrypoint_result(
+pub(crate) fn handle_guest_entrypoint_result(
     entrypoint_name: &str,
     result: std::result::Result<(), wasmtime::Error>,
 ) -> std::result::Result<(), ExecutionError> {
@@ -1791,7 +1795,7 @@ fn handle_guest_entrypoint_result(
     }
 }
 
-fn build_concurrency_limits(
+pub(crate) fn build_concurrency_limits(
     config: &IntegrityConfig,
 ) -> Arc<HashMap<String, Arc<RouteExecutionControl>>> {
     Arc::new(
@@ -1808,7 +1812,7 @@ fn build_concurrency_limits(
     )
 }
 
-fn total_route_concurrency(routes: &[IntegrityRoute]) -> Result<u32> {
+pub(crate) fn total_route_concurrency(routes: &[IntegrityRoute]) -> Result<u32> {
     u32::try_from(
         routes
             .iter()
@@ -1818,7 +1822,7 @@ fn total_route_concurrency(routes: &[IntegrityRoute]) -> Result<u32> {
     .context("embedded sealed configuration declares more route concurrency than Wasmtime can pool")
 }
 
-fn total_min_instances(routes: &[IntegrityRoute]) -> Result<u32> {
+pub(crate) fn total_min_instances(routes: &[IntegrityRoute]) -> Result<u32> {
     u32::try_from(
         routes
             .iter()
@@ -1829,11 +1833,11 @@ fn total_min_instances(routes: &[IntegrityRoute]) -> Result<u32> {
 }
 
 impl RouteExecutionControl {
-    fn new(route: &IntegrityRoute) -> Self {
+    pub(crate) fn new(route: &IntegrityRoute) -> Self {
         Self::from_limits(route.min_instances, route.max_concurrency)
     }
 
-    fn from_limits(min_instances: u32, max_concurrency: u32) -> Self {
+    pub(crate) fn from_limits(min_instances: u32, max_concurrency: u32) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(
                 usize::try_from(max_concurrency)
@@ -1849,13 +1853,13 @@ impl RouteExecutionControl {
         }
     }
 
-    fn pending_queue_size(&self) -> u32 {
+    pub(crate) fn pending_queue_size(&self) -> u32 {
         self.pending_waiters
             .load(Ordering::Relaxed)
             .min(u32::MAX as usize) as u32
     }
 
-    fn keda_pending_queue_size(&self) -> u32 {
+    pub(crate) fn keda_pending_queue_size(&self) -> u32 {
         let pending = self.pending_queue_size();
         if pending == 0 {
             return 0;
@@ -1869,15 +1873,15 @@ impl RouteExecutionControl {
         pending.saturating_add(self.max_concurrency)
     }
 
-    fn record_prewarm_success(&self) {
+    pub(crate) fn record_prewarm_success(&self) {
         self.prewarmed_instances.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn begin_request(self: &Arc<Self>) -> ActiveRouteRequestGuard {
+    pub(crate) fn begin_request(self: &Arc<Self>) -> ActiveRouteRequestGuard {
         ActiveRouteRequestGuard::new(Arc::clone(self))
     }
 
-    fn mark_draining(&self, started_at: Instant) {
+    pub(crate) fn mark_draining(&self, started_at: Instant) {
         self.draining.store(true, Ordering::SeqCst);
         *self
             .draining_since
@@ -1885,11 +1889,11 @@ impl RouteExecutionControl {
             .expect("route lifecycle state should not be poisoned") = Some(started_at);
     }
 
-    fn force_terminate(&self) {
+    pub(crate) fn force_terminate(&self) {
         self.semaphore.close();
     }
 
-    fn lifecycle_state(&self) -> RouteLifecycleState {
+    pub(crate) fn lifecycle_state(&self) -> RouteLifecycleState {
         if self.draining.load(Ordering::SeqCst) {
             RouteLifecycleState::Draining
         } else {
@@ -1897,12 +1901,12 @@ impl RouteExecutionControl {
         }
     }
 
-    fn active_request_count(&self) -> usize {
+    pub(crate) fn active_request_count(&self) -> usize {
         self.active_requests.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
-    fn prewarmed_instances(&self) -> u32 {
+    pub(crate) fn prewarmed_instances(&self) -> u32 {
         self.prewarmed_instances
             .load(Ordering::SeqCst)
             .min(u32::MAX as usize) as u32

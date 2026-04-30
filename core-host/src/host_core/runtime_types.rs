@@ -1,175 +1,178 @@
-struct DrainingRuntime {
-    runtime: Arc<RuntimeState>,
-    draining_since: Instant,
+use super::*;
+
+pub(crate) struct DrainingRuntime {
+    pub(crate) runtime: Arc<RuntimeState>,
+    pub(crate) draining_since: Instant,
 }
 
-struct TcpLayer4ListenerHandle {
+pub(crate) struct TcpLayer4ListenerHandle {
     #[cfg_attr(not(test), allow(dead_code))]
-    local_addr: SocketAddr,
-    join_handle: tokio::task::JoinHandle<()>,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) join_handle: tokio::task::JoinHandle<()>,
 }
 
-struct UdpLayer4ListenerHandle {
+pub(crate) struct UdpLayer4ListenerHandle {
     #[cfg_attr(not(test), allow(dead_code))]
-    local_addr: SocketAddr,
-    join_handles: Vec<tokio::task::JoinHandle<()>>,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) join_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
-struct HttpsListenerHandle {
+pub(crate) struct HttpsListenerHandle {
     #[cfg_attr(not(test), allow(dead_code))]
-    local_addr: SocketAddr,
-    join_handle: tokio::task::JoinHandle<()>,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) join_handle: tokio::task::JoinHandle<()>,
 }
 
-struct MtlsGatewayListenerHandle {
+pub(crate) struct MtlsGatewayListenerHandle {
     #[cfg_attr(not(test), allow(dead_code))]
-    local_addr: SocketAddr,
-    join_handle: tokio::task::JoinHandle<()>,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) join_handle: tokio::task::JoinHandle<()>,
 }
 
-struct Http3ListenerHandle {
+pub(crate) struct Http3ListenerHandle {
     #[allow(dead_code)]
-    local_addr: SocketAddr,
-    join_handle: tokio::task::JoinHandle<()>,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) join_handle: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HopLimit(u32);
+pub(crate) struct HopLimit(pub(crate) u32);
 
 #[cfg(unix)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct UdsPeerMetadata {
-    host_id: String,
-    ip: String,
-    socket_path: String,
-    protocols: Vec<String>,
+pub(crate) struct UdsPeerMetadata {
+    pub(crate) host_id: String,
+    pub(crate) ip: String,
+    pub(crate) socket_path: String,
+    pub(crate) protocols: Vec<String>,
     #[serde(default)]
-    pressure_state: PeerPressureState,
+    pub(crate) pressure_state: PeerPressureState,
     #[serde(default)]
-    last_pressure_update_unix_ms: u64,
+    pub(crate) last_pressure_update_unix_ms: u64,
 }
 
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DiscoveredUdsPeer {
-    metadata_path: PathBuf,
-    socket_path: PathBuf,
-    metadata: UdsPeerMetadata,
+pub(crate) struct DiscoveredUdsPeer {
+    pub(crate) metadata_path: PathBuf,
+    pub(crate) socket_path: PathBuf,
+    pub(crate) metadata: UdsPeerMetadata,
 }
 
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct LocalUdsEndpoint {
-    metadata_path: PathBuf,
-    socket_path: PathBuf,
+pub(crate) struct LocalUdsEndpoint {
+    pub(crate) metadata_path: PathBuf,
+    pub(crate) socket_path: PathBuf,
 }
 
 #[cfg(unix)]
 #[derive(Clone, Default)]
-struct UdsFastPathRegistry {
-    discovery_dir_override: Arc<Mutex<Option<PathBuf>>>,
-    peers: Arc<Mutex<HashMap<String, DiscoveredUdsPeer>>>,
-    local_endpoint: Arc<Mutex<Option<LocalUdsEndpoint>>>,
+pub(crate) struct UdsFastPathRegistry {
+    pub(crate) discovery_dir_override: Arc<Mutex<Option<PathBuf>>>,
+    pub(crate) peers: Arc<Mutex<HashMap<String, DiscoveredUdsPeer>>>,
+    pub(crate) local_endpoint: Arc<Mutex<Option<LocalUdsEndpoint>>>,
 }
 
 #[cfg(not(unix))]
 #[derive(Clone, Default)]
-struct UdsFastPathRegistry;
+pub(crate) struct UdsFastPathRegistry;
 
 #[cfg(unix)]
-fn new_uds_fast_path_registry() -> UdsFastPathRegistry {
+pub(crate) fn new_uds_fast_path_registry() -> UdsFastPathRegistry {
     UdsFastPathRegistry::default()
 }
 
 #[cfg(not(unix))]
-fn new_uds_fast_path_registry() -> UdsFastPathRegistry {
+pub(crate) fn new_uds_fast_path_registry() -> UdsFastPathRegistry {
     UdsFastPathRegistry
 }
 
-struct LegacyHostState {
-    wasi: WasiP1Ctx,
+pub(crate) struct LegacyHostState {
+    pub(crate) wasi: WasiP1Ctx,
     #[cfg(feature = "ai-inference")]
-    wasi_nn: WasiNnCtx,
-    limits: GuestResourceLimiter,
+    pub(crate) wasi_nn: WasiNnCtx,
+    pub(crate) limits: GuestResourceLimiter,
 }
 
-struct ComponentHostState {
-    ctx: WasiCtx,
-    table: ResourceTable,
-    limits: GuestResourceLimiter,
-    secrets: SecretAccess,
-    runtime_config: IntegrityConfig,
-    request_headers: HeaderMap,
-    host_identity: Arc<HostIdentity>,
-    storage_broker: Arc<StorageBrokerManager>,
-    bridge_manager: Arc<BridgeManager>,
-    telemetry: TelemetryHandle,
-    concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
-    propagated_headers: Vec<PropagatedHeader>,
-    route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
-    peer_capabilities: PeerCapabilityCache,
-    host_capabilities: Capabilities,
-    host_load: Arc<HostLoadCounters>,
-    outbound_http_client: reqwest::blocking::Client,
-    route_path: String,
-    route_role: RouteRole,
+pub(crate) struct ComponentHostState {
+    pub(crate) ctx: WasiCtx,
+    pub(crate) table: ResourceTable,
+    pub(crate) limits: GuestResourceLimiter,
+    pub(crate) secrets: SecretAccess,
+    pub(crate) runtime_config: IntegrityConfig,
+    pub(crate) request_headers: HeaderMap,
+    pub(crate) host_identity: Arc<HostIdentity>,
+    pub(crate) storage_broker: Arc<StorageBrokerManager>,
+    pub(crate) bridge_manager: Arc<BridgeManager>,
+    pub(crate) telemetry: TelemetryHandle,
+    pub(crate) concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    pub(crate) propagated_headers: Vec<PropagatedHeader>,
+    pub(crate) route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    pub(crate) peer_capabilities: PeerCapabilityCache,
+    pub(crate) host_capabilities: Capabilities,
+    pub(crate) host_load: Arc<HostLoadCounters>,
+    pub(crate) outbound_http_client: reqwest::blocking::Client,
+    pub(crate) route_path: String,
+    pub(crate) route_role: RouteRole,
     #[cfg(feature = "ai-inference")]
-    ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
+    pub(crate) ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
     #[cfg(feature = "ai-inference")]
-    allowed_model_aliases: BTreeSet<String>,
+    pub(crate) allowed_model_aliases: BTreeSet<String>,
     #[cfg(feature = "ai-inference")]
-    adapter_id: Option<String>,
+    pub(crate) adapter_id: Option<String>,
     #[cfg(feature = "ai-inference")]
-    accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
+    pub(crate) accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
     #[cfg(feature = "ai-inference")]
-    next_accelerator_model_id: u32,
+    pub(crate) next_accelerator_model_id: u32,
 }
 
 #[cfg(feature = "ai-inference")]
 #[derive(Clone, Debug)]
-struct LoadedAcceleratorModel {
-    alias: String,
-    accelerator: ai_inference::AcceleratorKind,
+pub(crate) struct LoadedAcceleratorModel {
+    pub(crate) alias: String,
+    pub(crate) accelerator: ai_inference::AcceleratorKind,
 }
 
-struct BatchCommandState {
-    ctx: WasiCtx,
-    table: ResourceTable,
+pub(crate) struct BatchCommandState {
+    pub(crate) ctx: WasiCtx,
+    pub(crate) table: ResourceTable,
 }
 
 #[derive(Clone)]
-struct GuestTelemetryContext {
-    handle: TelemetryHandle,
-    trace_id: String,
+pub(crate) struct GuestTelemetryContext {
+    pub(crate) handle: TelemetryHandle,
+    pub(crate) trace_id: String,
 }
 
-struct GuestExecutionContext {
-    config: IntegrityConfig,
-    sampled_execution: bool,
-    runtime_telemetry: TelemetryHandle,
-    async_log_sender: mpsc::Sender<AsyncLogEntry>,
-    secret_access: SecretAccess,
-    request_headers: HeaderMap,
-    host_identity: Arc<HostIdentity>,
-    storage_broker: Arc<StorageBrokerManager>,
-    bridge_manager: Arc<BridgeManager>,
-    telemetry: Option<GuestTelemetryContext>,
-    concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
-    propagated_headers: Vec<PropagatedHeader>,
-    route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
-    host_load: Arc<HostLoadCounters>,
+pub(crate) struct GuestExecutionContext {
+    pub(crate) config: IntegrityConfig,
+    pub(crate) sampled_execution: bool,
+    pub(crate) runtime_telemetry: TelemetryHandle,
+    pub(crate) async_log_sender: mpsc::Sender<AsyncLogEntry>,
+    pub(crate) secret_access: SecretAccess,
+    pub(crate) request_headers: HeaderMap,
+    pub(crate) host_identity: Arc<HostIdentity>,
+    pub(crate) storage_broker: Arc<StorageBrokerManager>,
+    pub(crate) bridge_manager: Arc<BridgeManager>,
+    pub(crate) telemetry: Option<GuestTelemetryContext>,
+    pub(crate) concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+    pub(crate) propagated_headers: Vec<PropagatedHeader>,
+    pub(crate) route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+    pub(crate) host_load: Arc<HostLoadCounters>,
     /// In-memory `Arc<Module>` cache shared with the active runtime. The hot
     /// HTTP / L4 paths consult this before the redb-backed `cwasm_cache` to
     /// avoid the `Module::deserialize` cost on every request. Tests fill in
     /// `None`; production code clones it from `RuntimeState::instance_pool`.
-    instance_pool: Option<Arc<moka::sync::Cache<PathBuf, Arc<Module>>>>,
+    pub(crate) instance_pool: Option<Arc<moka::sync::Cache<PathBuf, Arc<Module>>>>,
     #[cfg(feature = "ai-inference")]
-    ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+    pub(crate) ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }
 
-static BLOCKING_OUTBOUND_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+pub(crate) static BLOCKING_OUTBOUND_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> =
+    OnceLock::new();
 
-fn blocking_outbound_http_client() -> reqwest::blocking::Client {
+pub(crate) fn blocking_outbound_http_client() -> reqwest::blocking::Client {
     BLOCKING_OUTBOUND_HTTP_CLIENT
         .get_or_init(|| {
             std::thread::Builder::new()
@@ -182,140 +185,141 @@ fn blocking_outbound_http_client() -> reqwest::blocking::Client {
         .clone()
 }
 
-struct BackgroundTickRunner {
-    function_name: String,
-    route_path: String,
-    store: Store<ComponentHostState>,
-    bindings: BackgroundGuestBindings,
+pub(crate) struct BackgroundTickRunner {
+    pub(crate) function_name: String,
+    pub(crate) route_path: String,
+    pub(crate) store: Store<ComponentHostState>,
+    pub(crate) bindings: BackgroundGuestBindings,
 }
 
-enum BackgroundGuestBindings {
+pub(crate) enum BackgroundGuestBindings {
     Background(background_component_bindings::BackgroundSystemFaas),
     ControlPlane(control_plane_component_bindings::ControlPlaneFaas),
 }
 
 #[derive(Clone, Default)]
-struct SecretsVault {
+pub(crate) struct SecretsVault {
     #[cfg(feature = "secrets-vault")]
-    entries: Arc<HashMap<String, String>>,
+    pub(crate) entries: Arc<HashMap<String, String>>,
 }
 
 #[cfg_attr(not(feature = "secrets-vault"), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
-struct SecretAccess {
-    allowed_secrets: BTreeSet<String>,
+pub(crate) struct SecretAccess {
+    pub(crate) allowed_secrets: BTreeSet<String>,
     #[cfg(feature = "secrets-vault")]
-    entries: Arc<HashMap<String, String>>,
+    pub(crate) entries: Arc<HashMap<String, String>>,
 }
 
 #[derive(Debug)]
-struct GuestResourceLimiter {
-    max_memory_bytes: usize,
+pub(crate) struct GuestResourceLimiter {
+    pub(crate) max_memory_bytes: usize,
 }
 
-type GuestHttpFields = Vec<(String, String)>;
+pub(crate) type GuestHttpFields = Vec<(String, String)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct GuestRequest {
-    method: String,
-    uri: String,
-    headers: GuestHttpFields,
-    body: Bytes,
-    trailers: GuestHttpFields,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GuestHttpResponse {
-    status: StatusCode,
-    headers: GuestHttpFields,
-    body: Bytes,
-    trailers: GuestHttpFields,
-}
-
-struct GuestResponseBody {
-    data: Option<Bytes>,
-    trailers: Option<HeaderMap>,
-    _completion_guard: Option<RouteResponseGuard>,
+pub(crate) struct GuestRequest {
+    pub(crate) method: String,
+    pub(crate) uri: String,
+    pub(crate) headers: GuestHttpFields,
+    pub(crate) body: Bytes,
+    pub(crate) trailers: GuestHttpFields,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct UdpResponseDatagram {
-    target: SocketAddr,
-    payload: Bytes,
+pub(crate) struct GuestHttpResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: GuestHttpFields,
+    pub(crate) body: Bytes,
+    pub(crate) trailers: GuestHttpFields,
+}
+
+pub(crate) struct GuestResponseBody {
+    pub(crate) data: Option<Bytes>,
+    pub(crate) trailers: Option<HeaderMap>,
+    pub(crate) _completion_guard: Option<RouteResponseGuard>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UdpResponseDatagram {
+    pub(crate) target: SocketAddr,
+    pub(crate) payload: Bytes,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum GuestExecutionOutput {
+pub(crate) enum GuestExecutionOutput {
     Http(GuestHttpResponse),
     LegacyStdout(Bytes),
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct GuestExecutionOutcome {
-    output: GuestExecutionOutput,
-    fuel_consumed: Option<u64>,
+pub(crate) struct GuestExecutionOutcome {
+    pub(crate) output: GuestExecutionOutput,
+    pub(crate) fuel_consumed: Option<u64>,
 }
 
-struct RouteExecutionResult {
-    response: GuestHttpResponse,
-    fuel_consumed: Option<u64>,
-    completion_guard: Option<RouteResponseGuard>,
+pub(crate) struct RouteExecutionResult {
+    pub(crate) response: GuestHttpResponse,
+    pub(crate) fuel_consumed: Option<u64>,
+    pub(crate) completion_guard: Option<RouteResponseGuard>,
 }
 
-type BufferedRouteResult = std::result::Result<RouteExecutionResult, (StatusCode, String)>;
+pub(crate) type BufferedRouteResult =
+    std::result::Result<RouteExecutionResult, (StatusCode, String)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BufferedRequestTier {
+pub(crate) enum BufferedRequestTier {
     Ram,
     Disk,
 }
 
 #[derive(Clone)]
-struct BufferedRequestManager {
-    disk_dir: PathBuf,
-    ram_capacity: usize,
-    total_capacity: usize,
-    state: Arc<Mutex<BufferedRequestState>>,
-    notify: Arc<Notify>,
+pub(crate) struct BufferedRequestManager {
+    pub(crate) disk_dir: PathBuf,
+    pub(crate) ram_capacity: usize,
+    pub(crate) total_capacity: usize,
+    pub(crate) state: Arc<Mutex<BufferedRequestState>>,
+    pub(crate) notify: Arc<Notify>,
 }
 
-struct BufferedRequestState {
-    next_id: u64,
-    ram_queue: VecDeque<BufferedMemoryRequest>,
-    disk_queue: VecDeque<BufferedDiskRequest>,
+pub(crate) struct BufferedRequestState {
+    pub(crate) next_id: u64,
+    pub(crate) ram_queue: VecDeque<BufferedMemoryRequest>,
+    pub(crate) disk_queue: VecDeque<BufferedDiskRequest>,
 }
 
-struct BufferedMemoryRequest {
-    id: String,
-    request: BufferedRouteRequest,
-    completion: oneshot::Sender<BufferedRouteResult>,
+pub(crate) struct BufferedMemoryRequest {
+    pub(crate) id: String,
+    pub(crate) request: BufferedRouteRequest,
+    pub(crate) completion: oneshot::Sender<BufferedRouteResult>,
 }
 
-struct BufferedDiskRequest {
-    id: String,
-    path: PathBuf,
-    completion: oneshot::Sender<BufferedRouteResult>,
+pub(crate) struct BufferedDiskRequest {
+    pub(crate) id: String,
+    pub(crate) path: PathBuf,
+    pub(crate) completion: oneshot::Sender<BufferedRouteResult>,
 }
 
-struct BufferedQueueItem {
-    id: String,
-    request: BufferedRouteRequest,
-    completion: oneshot::Sender<BufferedRouteResult>,
-    disk_path: Option<PathBuf>,
+pub(crate) struct BufferedQueueItem {
+    pub(crate) id: String,
+    pub(crate) request: BufferedRouteRequest,
+    pub(crate) completion: oneshot::Sender<BufferedRouteResult>,
+    pub(crate) disk_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct BufferedRouteRequest {
-    route_path: String,
-    selected_module: String,
-    method: String,
-    uri: String,
-    headers: GuestHttpFields,
-    body: Vec<u8>,
-    trailers: GuestHttpFields,
-    hop_limit: u32,
-    trace_id: Option<String>,
-    sampled_execution: bool,
+pub(crate) struct BufferedRouteRequest {
+    pub(crate) route_path: String,
+    pub(crate) selected_module: String,
+    pub(crate) method: String,
+    pub(crate) uri: String,
+    pub(crate) headers: GuestHttpFields,
+    pub(crate) body: Vec<u8>,
+    pub(crate) trailers: GuestHttpFields,
+    pub(crate) hop_limit: u32,
+    pub(crate) trace_id: Option<String>,
+    pub(crate) sampled_execution: bool,
 }
 
 impl fmt::Debug for RouteExecutionResult {
@@ -328,44 +332,44 @@ impl fmt::Debug for RouteExecutionResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RouteLifecycleState {
+pub(crate) enum RouteLifecycleState {
     Active,
     Draining,
 }
 
-struct ActiveRouteRequestGuard {
-    control: Arc<RouteExecutionControl>,
+pub(crate) struct ActiveRouteRequestGuard {
+    pub(crate) control: Arc<RouteExecutionControl>,
 }
 
-struct RouteResponseGuard {
-    control: Arc<RouteExecutionControl>,
+pub(crate) struct RouteResponseGuard {
+    pub(crate) control: Arc<RouteExecutionControl>,
 }
 
-struct HostLoadGuard {
-    counters: Arc<HostLoadCounters>,
-    allocated_pages: usize,
+pub(crate) struct HostLoadGuard {
+    pub(crate) counters: Arc<HostLoadCounters>,
+    pub(crate) allocated_pages: usize,
 }
 
 #[derive(Clone)]
-struct RouteInvocation {
-    state: AppState,
-    runtime: Arc<RuntimeState>,
-    route: IntegrityRoute,
-    headers: HeaderMap,
-    method: Method,
-    uri: Uri,
-    body: Bytes,
-    trailers: GuestHttpFields,
-    hop_limit: HopLimit,
-    trace_id: Option<String>,
-    sampled_execution: bool,
-    selected_module: Option<String>,
+pub(crate) struct RouteInvocation {
+    pub(crate) state: AppState,
+    pub(crate) runtime: Arc<RuntimeState>,
+    pub(crate) route: IntegrityRoute,
+    pub(crate) headers: HeaderMap,
+    pub(crate) method: Method,
+    pub(crate) uri: Uri,
+    pub(crate) body: Bytes,
+    pub(crate) trailers: GuestHttpFields,
+    pub(crate) hop_limit: HopLimit,
+    pub(crate) trace_id: Option<String>,
+    pub(crate) sampled_execution: bool,
+    pub(crate) selected_module: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-struct RouteServiceError {
-    status: StatusCode,
-    message: String,
+pub(crate) struct RouteServiceError {
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
 }
 
 impl fmt::Display for RouteServiceError {
@@ -389,7 +393,11 @@ impl From<RouteServiceError> for (StatusCode, String) {
 }
 
 impl GuestRequest {
-    fn new(method: impl Into<String>, uri: impl Into<String>, body: impl Into<Bytes>) -> Self {
+    pub(crate) fn new(
+        method: impl Into<String>,
+        uri: impl Into<String>,
+        body: impl Into<Bytes>,
+    ) -> Self {
         Self {
             method: method.into(),
             uri: uri.into(),
@@ -401,7 +409,7 @@ impl GuestRequest {
 }
 
 impl GuestHttpResponse {
-    fn new(status: StatusCode, body: impl Into<Bytes>) -> Self {
+    pub(crate) fn new(status: StatusCode, body: impl Into<Bytes>) -> Self {
         Self {
             status,
             headers: Vec::new(),
@@ -412,7 +420,7 @@ impl GuestHttpResponse {
 }
 
 impl GuestResponseBody {
-    fn new(
+    pub(crate) fn new(
         data: Bytes,
         trailers: Option<HeaderMap>,
         completion_guard: Option<RouteResponseGuard>,
@@ -462,12 +470,12 @@ impl hyper::body::Body for GuestResponseBody {
 }
 
 impl ActiveRouteRequestGuard {
-    fn new(control: Arc<RouteExecutionControl>) -> Self {
+    pub(crate) fn new(control: Arc<RouteExecutionControl>) -> Self {
         control.active_requests.fetch_add(1, Ordering::SeqCst);
         Self { control }
     }
 
-    fn into_response_guard(self) -> RouteResponseGuard {
+    pub(crate) fn into_response_guard(self) -> RouteResponseGuard {
         let control = Arc::clone(&self.control);
         std::mem::forget(self);
         RouteResponseGuard { control }
@@ -487,7 +495,7 @@ impl Drop for RouteResponseGuard {
 }
 
 impl HostLoadGuard {
-    fn new(counters: Arc<HostLoadCounters>, allocated_pages: usize) -> Self {
+    pub(crate) fn new(counters: Arc<HostLoadCounters>, allocated_pages: usize) -> Self {
         counters.active_instances.fetch_add(1, Ordering::SeqCst);
         counters
             .allocated_memory_pages
@@ -511,14 +519,14 @@ impl Drop for HostLoadGuard {
 }
 
 #[derive(Clone, Debug)]
-struct UdpInboundDatagram {
-    source: SocketAddr,
-    payload: Bytes,
+pub(crate) struct UdpInboundDatagram {
+    pub(crate) source: SocketAddr,
+    pub(crate) payload: Bytes,
 }
 
 #[cfg(feature = "websockets")]
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum HostWebSocketFrame {
+pub(crate) enum HostWebSocketFrame {
     Text(String),
     Binary(Vec<u8>),
     Ping(Vec<u8>),
@@ -527,43 +535,43 @@ enum HostWebSocketFrame {
 }
 
 #[cfg(feature = "websockets")]
-struct HostWebSocketConnection {
-    incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
-    outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+pub(crate) struct HostWebSocketConnection {
+    pub(crate) incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
+    pub(crate) outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum RouteRole {
+pub(crate) enum RouteRole {
     User,
     System,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct HeaderMatch {
-    name: String,
-    value: String,
+pub(crate) struct HeaderMatch {
+    pub(crate) name: String,
+    pub(crate) value: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct RetryPolicy {
+pub(crate) struct RetryPolicy {
     #[serde(default)]
-    max_retries: u32,
+    pub(crate) max_retries: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    retry_on: Vec<u16>,
+    pub(crate) retry_on: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct ResiliencyConfig {
+pub(crate) struct ResiliencyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    timeout_ms: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    retry_policy: Option<RetryPolicy>,
+    pub(crate) retry_policy: Option<RetryPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum FaaSRuntime {
+pub(crate) enum FaaSRuntime {
     Wasm {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
@@ -577,37 +585,37 @@ enum FaaSRuntime {
     },
 }
 
-fn default_microvm_vcpus() -> u8 {
+pub(crate) fn default_microvm_vcpus() -> u8 {
     1
 }
 
-fn default_microvm_memory_mb() -> u32 {
+pub(crate) fn default_microvm_memory_mb() -> u32 {
     256
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-struct RouteTarget {
-    module: String,
+pub(crate) struct RouteTarget {
+    pub(crate) module: String,
     #[serde(default)]
-    weight: u32,
+    pub(crate) weight: u32,
     #[serde(default, skip_serializing_if = "is_false")]
-    websocket: bool,
+    pub(crate) websocket: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    match_header: Option<HeaderMatch>,
+    pub(crate) match_header: Option<HeaderMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    requires: Vec<String>,
+    pub(crate) requires: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SelectedRouteTarget {
-    module: String,
-    websocket: bool,
-    required_capabilities: Vec<String>,
-    required_capability_mask: u64,
+pub(crate) struct SelectedRouteTarget {
+    pub(crate) module: String,
+    pub(crate) websocket: bool,
+    pub(crate) required_capabilities: Vec<String>,
+    pub(crate) required_capability_mask: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PropagatedHeader {
-    name: String,
-    value: String,
+pub(crate) struct PropagatedHeader {
+    pub(crate) name: String,
+    pub(crate) value: String,
 }

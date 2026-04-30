@@ -1,5 +1,7 @@
+use super::*;
+
 #[cfg(unix)]
-fn spawn_reload_watcher(state: AppState) {
+pub(crate) fn spawn_reload_watcher(state: AppState) {
     tokio::spawn(async move {
         let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -22,9 +24,9 @@ fn spawn_reload_watcher(state: AppState) {
 }
 
 #[cfg(not(unix))]
-fn spawn_reload_watcher(_state: AppState) {}
+pub(crate) fn spawn_reload_watcher(_state: AppState) {}
 
-const MANIFEST_FILE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(250);
+pub(crate) const MANIFEST_FILE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Spawn a file watcher that triggers a hot reload whenever the integrity manifest is
 /// modified or atomically replaced on disk. Many editors and CI/CD tools save the file
@@ -36,7 +38,7 @@ const MANIFEST_FILE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(250);
 /// (typical of atomic-rename saves) results in a single reload attempt. Validation
 /// errors are absorbed by the existing `reload_runtime_from_disk` path, which logs and
 /// keeps the previous runtime active.
-fn spawn_manifest_file_watcher(state: AppState) {
+pub(crate) fn spawn_manifest_file_watcher(state: AppState) {
     let manifest_path = state.manifest_path.clone();
     let Some(parent) = manifest_path.parent().map(Path::to_path_buf) else {
         tracing::warn!(
@@ -119,19 +121,19 @@ fn spawn_manifest_file_watcher(state: AppState) {
 /// How often the authz-purge subscriber polls the outbox. 250 ms keeps revocation
 /// latency well under one second while costing essentially nothing — the table is
 /// usually empty, in which case the txn returns immediately with no rows.
-const AUTHZ_PURGE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const AUTHZ_PURGE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Maximum events drained in a single poll tick. A larger batch is fine (we just
 /// pop them all into the cache predicate) but bounding it keeps the txn short
 /// and avoids starving other readers under a sudden burst of revocations.
-const AUTHZ_PURGE_BATCH_LIMIT: usize = 64;
+pub(crate) const AUTHZ_PURGE_BATCH_LIMIT: usize = 64;
 
 /// Drain the `authz_purge_outbox` table on a steady cadence, evict matching
 /// entries from the in-process `AuthDecisionCache`, and delete the row only after
 /// the eviction succeeds. The combined effect is at-most-five-minute (cache TTL)
 /// worst-case stale access in the absence of revocations, and sub-second
 /// revocation propagation in the presence of them.
-fn spawn_authz_purge_subscriber(state: AppState) {
+pub(crate) fn spawn_authz_purge_subscriber(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUTHZ_PURGE_POLL_INTERVAL);
         loop {
@@ -188,7 +190,7 @@ fn spawn_authz_purge_subscriber(state: AppState) {
     });
 }
 
-fn spawn_volume_gc_sweeper(state: AppState) {
+pub(crate) fn spawn_volume_gc_sweeper(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(VOLUME_GC_TICK_INTERVAL);
 
@@ -202,7 +204,7 @@ fn spawn_volume_gc_sweeper(state: AppState) {
     });
 }
 
-fn spawn_buffered_request_replayer(state: AppState) {
+pub(crate) fn spawn_buffered_request_replayer(state: AppState) {
     tokio::spawn(async move {
         loop {
             state.buffered_requests.notify.notified().await;
@@ -286,7 +288,7 @@ fn spawn_buffered_request_replayer(state: AppState) {
     });
 }
 
-fn spawn_global_memory_governor(state: AppState) {
+pub(crate) fn spawn_global_memory_governor(state: AppState) {
     let governor = Arc::clone(&state.memory_governor);
     let runtime = Arc::clone(&state.runtime);
     memory_governor::spawn_memory_governor(governor, move |pressure| {
@@ -300,7 +302,7 @@ fn spawn_global_memory_governor(state: AppState) {
     });
 }
 
-fn spawn_pressure_monitor(state: AppState) {
+pub(crate) fn spawn_pressure_monitor(state: AppState) {
     tokio::spawn(async move {
         let mut previous_state = PeerPressureState::Idle;
         loop {
@@ -353,7 +355,7 @@ fn spawn_pressure_monitor(state: AppState) {
     });
 }
 
-fn spawn_draining_runtime_reaper(state: AppState) {
+pub(crate) fn spawn_draining_runtime_reaper(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(DRAINING_REAPER_TICK_INTERVAL);
 
@@ -364,7 +366,7 @@ fn spawn_draining_runtime_reaper(state: AppState) {
     });
 }
 
-fn run_draining_runtime_reaper_tick(state: &AppState) {
+pub(crate) fn run_draining_runtime_reaper_tick(state: &AppState) {
     let now = Instant::now();
     let mut draining_runtimes = state
         .draining_runtimes
@@ -399,7 +401,7 @@ fn run_draining_runtime_reaper_tick(state: &AppState) {
 }
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
-async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
+pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
     let manifest_path = state.manifest_path.clone();
     let runtime = tokio::task::spawn_blocking(move || {
         let config = load_integrity_config_from_manifest_path(&manifest_path)?;
@@ -453,13 +455,16 @@ async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-fn secure_cache_bootstrap(core_store: &store::CoreStore, runtime: &RuntimeState) -> Result<()> {
+pub(crate) fn secure_cache_bootstrap(
+    core_store: &store::CoreStore,
+    runtime: &RuntimeState,
+) -> Result<()> {
     let engine_hash = runtime_engine_cache_hash(runtime);
     core_store.secure_cwasm_cache_bootstrap(&engine_hash)?;
     Ok(())
 }
 
-fn runtime_engine_cache_hash(runtime: &RuntimeState) -> String {
+pub(crate) fn runtime_engine_cache_hash(runtime: &RuntimeState) -> String {
     format!(
         "{}:{}",
         engine_precompile_hash_string(&runtime.engine),
@@ -467,13 +472,13 @@ fn runtime_engine_cache_hash(runtime: &RuntimeState) -> String {
     )
 }
 
-fn engine_precompile_hash_string(engine: &Engine) -> String {
+pub(crate) fn engine_precompile_hash_string(engine: &Engine) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
-async fn maybe_run_bootstrap_mode(config: &IntegrityConfig) -> Result<bool> {
+pub(crate) async fn maybe_run_bootstrap_mode(config: &IntegrityConfig) -> Result<bool> {
     if !env_flag(BOOTSTRAP_IF_UNENROLLED_ENV) || has_enrollment_credentials() {
         return Ok(false);
     }
@@ -495,7 +500,7 @@ async fn maybe_run_bootstrap_mode(config: &IntegrityConfig) -> Result<bool> {
     Ok(true)
 }
 
-fn has_enrollment_credentials() -> bool {
+pub(crate) fn has_enrollment_credentials() -> bool {
     if std::env::var_os(NODE_CERT_PEM_ENV).is_some() && std::env::var_os(NODE_KEY_PEM_ENV).is_some()
     {
         return true;
@@ -506,13 +511,13 @@ fn has_enrollment_credentials() -> bool {
         .unwrap_or(false)
 }
 
-fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         let ctrl_c = tokio::signal::ctrl_c();

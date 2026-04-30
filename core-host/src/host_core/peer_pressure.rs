@@ -1,6 +1,8 @@
+use super::*;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum PeerPressureState {
+pub(crate) enum PeerPressureState {
     #[default]
     Idle,
     Caution,

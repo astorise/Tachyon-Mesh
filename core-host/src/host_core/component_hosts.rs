@@ -1,5 +1,7 @@
+use super::*;
+
 impl LegacyHostState {
-    fn new(
+    pub(crate) fn new(
         wasi: WasiP1Ctx,
         max_memory_bytes: usize,
         #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
@@ -14,12 +16,12 @@ impl LegacyHostState {
 }
 
 #[cfg(feature = "ai-inference")]
-fn build_wasi_nn_ctx(runtime: &ai_inference::AiInferenceRuntime) -> WasiNnCtx {
+pub(crate) fn build_wasi_nn_ctx(runtime: &ai_inference::AiInferenceRuntime) -> WasiNnCtx {
     runtime.build_wasi_nn_ctx()
 }
 
 impl SecretsVault {
-    fn load() -> Self {
+    pub(crate) fn load() -> Self {
         #[cfg(feature = "secrets-vault")]
         {
             let entries = HashMap::from([("DB_PASS".to_owned(), "super_secret_123".to_owned())]);
@@ -36,7 +38,7 @@ impl SecretsVault {
 }
 
 impl SecretAccess {
-    fn from_route(route: &IntegrityRoute, _vault: &SecretsVault) -> Self {
+    pub(crate) fn from_route(route: &IntegrityRoute, _vault: &SecretsVault) -> Self {
         Self {
             allowed_secrets: route.allowed_secrets.iter().cloned().collect(),
             #[cfg(feature = "secrets-vault")]
@@ -44,7 +46,10 @@ impl SecretAccess {
         }
     }
 
-    fn get_secret(&self, name: &str) -> std::result::Result<String, SecretAccessErrorKind> {
+    pub(crate) fn get_secret(
+        &self,
+        name: &str,
+    ) -> std::result::Result<String, SecretAccessErrorKind> {
         #[cfg(not(feature = "secrets-vault"))]
         {
             let _ = name;
@@ -67,7 +72,7 @@ impl SecretAccess {
 
 impl ComponentHostState {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         route: &IntegrityRoute,
         runtime_config: IntegrityConfig,
         max_memory_bytes: usize,
@@ -116,14 +121,14 @@ impl ComponentHostState {
         })
     }
 
-    fn pending_queue_size(&self, route_path: &str) -> u32 {
+    pub(crate) fn pending_queue_size(&self, route_path: &str) -> u32 {
         self.concurrency_limits
             .get(&normalize_route_path(route_path))
             .map(|control| control.keda_pending_queue_size())
             .unwrap_or_default()
     }
 
-    fn vector_tenant_id(&self) -> String {
+    pub(crate) fn vector_tenant_id(&self) -> String {
         self.request_headers
             .get("x-tachyon-tenant")
             .or_else(|| self.request_headers.get("x-tenant-id"))
@@ -134,7 +139,7 @@ impl ComponentHostState {
             .to_owned()
     }
 
-    fn hot_model_aliases(&self) -> Vec<String> {
+    pub(crate) fn hot_model_aliases(&self) -> Vec<String> {
         #[cfg(feature = "ai-inference")]
         {
             self.ai_runtime
@@ -149,7 +154,7 @@ impl ComponentHostState {
         }
     }
 
-    fn accelerator_queue_loads(&self) -> AcceleratorQueueLoads {
+    pub(crate) fn accelerator_queue_loads(&self) -> AcceleratorQueueLoads {
         #[cfg(feature = "ai-inference")]
         {
             let Some(runtime) = self.ai_runtime.as_ref() else {
@@ -181,7 +186,7 @@ impl ComponentHostState {
         }
     }
 
-    fn handle_bridge_create(
+    pub(crate) fn handle_bridge_create(
         &self,
         config: BridgeConfig,
     ) -> std::result::Result<BridgeAllocation, String> {
@@ -217,7 +222,7 @@ impl ComponentHostState {
             .map_err(|error| format!("failed to decode bridge allocation response: {error}"))
     }
 
-    fn handle_bridge_destroy(&self, bridge_id: &str) -> std::result::Result<(), String> {
+    pub(crate) fn handle_bridge_destroy(&self, bridge_id: &str) -> std::result::Result<(), String> {
         if self.route_role == RouteRole::System && self.route_path == SYSTEM_BRIDGE_ROUTE {
             return self.bridge_manager.destroy_relay(bridge_id);
         }
@@ -250,7 +255,7 @@ impl ComponentHostState {
     }
 
     #[cfg(feature = "ai-inference")]
-    fn load_accelerator_model(
+    pub(crate) fn load_accelerator_model(
         &mut self,
         accelerator: ai_inference::AcceleratorKind,
         alias: String,
@@ -272,7 +277,7 @@ impl ComponentHostState {
     }
 
     #[cfg(feature = "ai-inference")]
-    fn compute_accelerator_prompt(
+    pub(crate) fn compute_accelerator_prompt(
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
         model_id: u32,
@@ -301,68 +306,68 @@ impl ComponentHostState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ControlPlaneSnapshot {
-    cpu_pressure: u8,
-    ram_pressure: u8,
-    active_tasks: u32,
-    active_instances: u32,
-    allocated_memory_pages: u32,
-    capability_mask: u64,
-    capabilities: Vec<String>,
-    cpu_rt_load: u32,
-    cpu_standard_load: u32,
-    cpu_batch_load: u32,
-    gpu_rt_load: u32,
-    gpu_standard_load: u32,
-    gpu_batch_load: u32,
-    npu_rt_load: u32,
-    npu_standard_load: u32,
-    npu_batch_load: u32,
-    tpu_rt_load: u32,
-    tpu_standard_load: u32,
-    tpu_batch_load: u32,
+pub(crate) struct ControlPlaneSnapshot {
+    pub(crate) cpu_pressure: u8,
+    pub(crate) ram_pressure: u8,
+    pub(crate) active_tasks: u32,
+    pub(crate) active_instances: u32,
+    pub(crate) allocated_memory_pages: u32,
+    pub(crate) capability_mask: u64,
+    pub(crate) capabilities: Vec<String>,
+    pub(crate) cpu_rt_load: u32,
+    pub(crate) cpu_standard_load: u32,
+    pub(crate) cpu_batch_load: u32,
+    pub(crate) gpu_rt_load: u32,
+    pub(crate) gpu_standard_load: u32,
+    pub(crate) gpu_batch_load: u32,
+    pub(crate) npu_rt_load: u32,
+    pub(crate) npu_standard_load: u32,
+    pub(crate) npu_batch_load: u32,
+    pub(crate) tpu_rt_load: u32,
+    pub(crate) tpu_standard_load: u32,
+    pub(crate) tpu_batch_load: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-struct AcceleratorQueueLoads {
-    cpu_rt_load: u32,
-    cpu_standard_load: u32,
-    cpu_batch_load: u32,
-    gpu_rt_load: u32,
-    gpu_standard_load: u32,
-    gpu_batch_load: u32,
-    npu_rt_load: u32,
-    npu_standard_load: u32,
-    npu_batch_load: u32,
-    tpu_rt_load: u32,
-    tpu_standard_load: u32,
-    tpu_batch_load: u32,
+pub(crate) struct AcceleratorQueueLoads {
+    pub(crate) cpu_rt_load: u32,
+    pub(crate) cpu_standard_load: u32,
+    pub(crate) cpu_batch_load: u32,
+    pub(crate) gpu_rt_load: u32,
+    pub(crate) gpu_standard_load: u32,
+    pub(crate) gpu_batch_load: u32,
+    pub(crate) npu_rt_load: u32,
+    pub(crate) npu_standard_load: u32,
+    pub(crate) npu_batch_load: u32,
+    pub(crate) tpu_rt_load: u32,
+    pub(crate) tpu_standard_load: u32,
+    pub(crate) tpu_batch_load: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct RouteOverrideDescriptor {
+pub(crate) struct RouteOverrideDescriptor {
     #[serde(default)]
-    candidates: Vec<RouteOverrideCandidate>,
+    pub(crate) candidates: Vec<RouteOverrideCandidate>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct RouteOverrideCandidate {
-    destination: String,
+pub(crate) struct RouteOverrideCandidate {
+    pub(crate) destination: String,
     #[serde(default)]
-    hot_models: Vec<String>,
+    pub(crate) hot_models: Vec<String>,
     #[serde(default)]
-    effective_pressure: u8,
+    pub(crate) effective_pressure: u8,
     #[serde(default)]
-    capability_mask: u64,
+    pub(crate) capability_mask: u64,
     #[serde(default)]
-    capabilities: Vec<String>,
+    pub(crate) capabilities: Vec<String>,
 }
 
-fn guest_memory_page_count(bytes: usize) -> usize {
+pub(crate) fn guest_memory_page_count(bytes: usize) -> usize {
     ((bytes.saturating_add(65_535)) / 65_536).max(1)
 }
 
-fn saturating_percent(value: usize, capacity: usize) -> u8 {
+pub(crate) fn saturating_percent(value: usize, capacity: usize) -> u8 {
     if capacity == 0 {
         return 0;
     }
@@ -371,7 +376,7 @@ fn saturating_percent(value: usize, capacity: usize) -> u8 {
     percent.min(100) as u8
 }
 
-fn control_plane_snapshot(
+pub(crate) fn control_plane_snapshot(
     telemetry: &TelemetryHandle,
     host_load: &HostLoadCounters,
     concurrency_limits: &HashMap<String, Arc<RouteExecutionControl>>,
@@ -419,7 +424,7 @@ fn control_plane_snapshot(
     }
 }
 
-fn control_plane_override_destination(
+pub(crate) fn control_plane_override_destination(
     route_overrides: &ArcSwap<HashMap<String, String>>,
     peer_capabilities: &PeerCapabilityCache,
     route_path: &str,
@@ -461,7 +466,7 @@ fn control_plane_override_destination(
     cached_capable_peer_destination(peer_capabilities, route_path, required_capability_mask)
 }
 
-fn update_control_plane_route_override(
+pub(crate) fn update_control_plane_route_override(
     route_overrides: &ArcSwap<HashMap<String, String>>,
     peer_capabilities: &PeerCapabilityCache,
     route_path: &str,
@@ -512,7 +517,7 @@ fn update_control_plane_route_override(
     Ok(())
 }
 
-fn candidate_supports_capabilities(
+pub(crate) fn candidate_supports_capabilities(
     candidate: &RouteOverrideCandidate,
     peer_capabilities: &PeerCapabilityCache,
     required_capability_mask: u64,
@@ -533,7 +538,7 @@ fn candidate_supports_capabilities(
     )
 }
 
-fn destination_supports_capabilities(
+pub(crate) fn destination_supports_capabilities(
     destination: &str,
     peer_capabilities: &PeerCapabilityCache,
     required_capability_mask: u64,
@@ -555,7 +560,7 @@ fn destination_supports_capabilities(
         })
 }
 
-fn cache_peer_capabilities(
+pub(crate) fn cache_peer_capabilities(
     peer_capabilities: &PeerCapabilityCache,
     candidates: &[RouteOverrideCandidate],
 ) {
@@ -586,7 +591,7 @@ fn cache_peer_capabilities(
     }
 }
 
-fn required_capability_mask_for_candidate(candidate: &RouteOverrideCandidate) -> u64 {
+pub(crate) fn required_capability_mask_for_candidate(candidate: &RouteOverrideCandidate) -> u64 {
     if candidate.capability_mask != 0 {
         return candidate.capability_mask;
     }
@@ -595,7 +600,7 @@ fn required_capability_mask_for_candidate(candidate: &RouteOverrideCandidate) ->
         .unwrap_or(0)
 }
 
-fn peer_base_url_for_destination(destination: &str) -> Option<String> {
+pub(crate) fn peer_base_url_for_destination(destination: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(destination).ok()?;
     let host = parsed.host_str()?;
     let mut base = format!("{}://{}", parsed.scheme(), host);
@@ -606,7 +611,7 @@ fn peer_base_url_for_destination(destination: &str) -> Option<String> {
     Some(base)
 }
 
-fn cached_capable_peer_destination(
+pub(crate) fn cached_capable_peer_destination(
     peer_capabilities: &PeerCapabilityCache,
     route_path: &str,
     required_capability_mask: u64,
@@ -623,7 +628,7 @@ fn cached_capable_peer_destination(
         .map(|(base_url, _)| format!("{base_url}{}", route_path_for_override_key(route_path)))
 }
 
-fn build_component_wasi_ctx(
+pub(crate) fn build_component_wasi_ctx(
     route: &IntegrityRoute,
     host_identity: &HostIdentity,
 ) -> std::result::Result<WasiCtx, ExecutionError> {
@@ -637,7 +642,7 @@ fn build_component_wasi_ctx(
     Ok(wasi.build())
 }
 
-fn add_route_environment(
+pub(crate) fn add_route_environment(
     wasi: &mut WasiCtxBuilder,
     route: &IntegrityRoute,
     host_identity: &HostIdentity,
@@ -645,7 +650,7 @@ fn add_route_environment(
     add_route_environment_with_trace(wasi, route, host_identity, None)
 }
 
-fn add_route_environment_with_trace(
+pub(crate) fn add_route_environment_with_trace(
     wasi: &mut WasiCtxBuilder,
     route: &IntegrityRoute,
     host_identity: &HostIdentity,
@@ -662,7 +667,7 @@ fn add_route_environment_with_trace(
     Ok(())
 }
 
-fn system_runtime_environment(
+pub(crate) fn system_runtime_environment(
     route: &IntegrityRoute,
     host_identity: &HostIdentity,
 ) -> Vec<(String, String)> {
@@ -682,7 +687,7 @@ fn system_runtime_environment(
 
 /// Standard W3C Trace Context environment variable name. Guests read it via WASI to
 /// obtain the active trace context for the request they are servicing.
-const TACHYON_TRACEPARENT_ENV: &str = "TRACEPARENT";
+pub(crate) const TACHYON_TRACEPARENT_ENV: &str = "TRACEPARENT";
 
 /// Honor the inbound `traceparent` header if it is well-formed per the W3C Trace
 /// Context spec, otherwise mint a fresh one via the existing `generate_traceparent`
@@ -698,7 +703,7 @@ pub(crate) fn trace_context_for_request(headers: &HeaderMap) -> String {
     generate_traceparent()
 }
 
-fn is_valid_w3c_traceparent(value: &str) -> bool {
+pub(crate) fn is_valid_w3c_traceparent(value: &str) -> bool {
     // Format: VERSION-TRACE_ID-PARENT_ID-FLAGS, hex; widths 2-32-16-2.
     let parts: Vec<&str> = value.split('-').collect();
     if parts.len() != 4 {
@@ -717,7 +722,7 @@ fn is_valid_w3c_traceparent(value: &str) -> bool {
     true
 }
 
-fn preopen_route_volumes(
+pub(crate) fn preopen_route_volumes(
     wasi: &mut WasiCtxBuilder,
     route: &IntegrityRoute,
 ) -> std::result::Result<(), ExecutionError> {
@@ -763,7 +768,7 @@ fn preopen_route_volumes(
     Ok(())
 }
 
-fn preopen_batch_target_volumes(
+pub(crate) fn preopen_batch_target_volumes(
     wasi: &mut WasiCtxBuilder,
     target: &IntegrityBatchTarget,
 ) -> Result<()> {
@@ -810,11 +815,11 @@ fn preopen_batch_target_volumes(
     Ok(())
 }
 
-fn encrypted_volume_host_path(host_path: &str) -> PathBuf {
+pub(crate) fn encrypted_volume_host_path(host_path: &str) -> PathBuf {
     PathBuf::from(host_path).join(".tachyon-tde")
 }
 
-fn prepare_encrypted_route_volumes(
+pub(crate) fn prepare_encrypted_route_volumes(
     route: &IntegrityRoute,
 ) -> std::result::Result<(), ExecutionError> {
     for volume in route.volumes.iter().filter(|volume| volume.encrypted) {
@@ -829,7 +834,9 @@ fn prepare_encrypted_route_volumes(
     Ok(())
 }
 
-fn seal_encrypted_route_volumes(route: &IntegrityRoute) -> std::result::Result<(), ExecutionError> {
+pub(crate) fn seal_encrypted_route_volumes(
+    route: &IntegrityRoute,
+) -> std::result::Result<(), ExecutionError> {
     for volume in route.volumes.iter().filter(|volume| volume.encrypted) {
         transform_encrypted_volume_files(&encrypted_volume_host_path(&volume.host_path), true)
             .map_err(|error| {
@@ -842,7 +849,7 @@ fn seal_encrypted_route_volumes(route: &IntegrityRoute) -> std::result::Result<(
     Ok(())
 }
 
-fn transform_encrypted_volume_files(root: &Path, encrypt: bool) -> Result<()> {
+pub(crate) fn transform_encrypted_volume_files(root: &Path, encrypt: bool) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
@@ -867,7 +874,7 @@ fn transform_encrypted_volume_files(root: &Path, encrypt: bool) -> Result<()> {
     Ok(())
 }
 
-fn transform_tde_file(path: &Path, encrypt: bool) -> Result<()> {
+pub(crate) fn transform_tde_file(path: &Path, encrypt: bool) -> Result<()> {
     let body =
         fs::read(path).with_context(|| format!("failed to read TDE file `{}`", path.display()))?;
     let transformed = if encrypt {
@@ -882,7 +889,7 @@ fn transform_tde_file(path: &Path, encrypt: bool) -> Result<()> {
     Ok(())
 }
 
-fn encrypt_tde_file_body(plaintext: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn encrypt_tde_file_body(plaintext: &[u8]) -> Result<Vec<u8>> {
     if plaintext.starts_with(TDE_FILE_MAGIC) {
         return Ok(plaintext.to_vec());
     }
@@ -899,7 +906,7 @@ fn encrypt_tde_file_body(plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decrypt_tde_file_body(body: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decrypt_tde_file_body(body: &[u8]) -> Result<Vec<u8>> {
     let Some(rest) = body.strip_prefix(TDE_FILE_MAGIC) else {
         return Ok(body.to_vec());
     };
@@ -912,18 +919,18 @@ fn decrypt_tde_file_body(body: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| anyhow!("failed to decrypt TDE file body"))
 }
 
-fn tde_cipher() -> Aes256Gcm {
+pub(crate) fn tde_cipher() -> Aes256Gcm {
     Aes256Gcm::new((&tde_key_bytes()).into())
 }
 
-fn tde_key_bytes() -> [u8; 32] {
+pub(crate) fn tde_key_bytes() -> [u8; 32] {
     std::env::var(TDE_KEY_HEX_ENV)
         .ok()
         .and_then(|value| decode_tde_key_hex(value.trim()).ok())
         .unwrap_or([0x42; 32])
 }
 
-fn decode_tde_key_hex(value: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_tde_key_hex(value: &str) -> Result<[u8; 32]> {
     if value.len() != 64 {
         return Err(anyhow!("TDE key must be 64 hexadecimal characters"));
     }
@@ -935,7 +942,7 @@ fn decode_tde_key_hex(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn volume_dir_perms(readonly: bool) -> DirPerms {
+pub(crate) fn volume_dir_perms(readonly: bool) -> DirPerms {
     if readonly {
         DirPerms::READ
     } else {
@@ -943,7 +950,7 @@ fn volume_dir_perms(readonly: bool) -> DirPerms {
     }
 }
 
-fn volume_file_perms(readonly: bool) -> FilePerms {
+pub(crate) fn volume_file_perms(readonly: bool) -> FilePerms {
     if readonly {
         FilePerms::READ
     } else {
@@ -1742,7 +1749,7 @@ impl control_plane_component_bindings::tachyon::mesh::outbound_http::Host for Co
     }
 }
 
-fn rewrite_outbound_http_url(url: &str, runtime_config: &IntegrityConfig) -> String {
+pub(crate) fn rewrite_outbound_http_url(url: &str, runtime_config: &IntegrityConfig) -> String {
     if let Some(path) = url.strip_prefix("http://mesh") {
         let host = runtime_config
             .host_address
@@ -1768,7 +1775,7 @@ fn rewrite_outbound_http_url(url: &str, runtime_config: &IntegrityConfig) -> Str
     }
 }
 
-fn filtered_outbound_http_headers(
+pub(crate) fn filtered_outbound_http_headers(
     headers: Vec<(String, String)>,
     propagated_headers: &[PropagatedHeader],
     target_kind: &OutboundTargetKind,
@@ -1787,7 +1794,7 @@ fn filtered_outbound_http_headers(
     filtered
 }
 
-fn allow_external_outbound_header(name: &str) -> bool {
+pub(crate) fn allow_external_outbound_header(name: &str) -> bool {
     ![
         HOP_LIMIT_HEADER,
         COHORT_HEADER,
@@ -1809,7 +1816,7 @@ fn allow_external_outbound_header(name: &str) -> bool {
     .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
 }
 
-fn loopback_ip_for(ip: IpAddr) -> IpAddr {
+pub(crate) fn loopback_ip_for(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),

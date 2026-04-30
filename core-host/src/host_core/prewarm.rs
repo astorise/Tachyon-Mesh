@@ -1,6 +1,8 @@
+use super::*;
+
 /// Maximum number of distinct `Arc<Module>` entries the in-memory instance pool
 /// keeps warm in a single runtime generation. Sized well above any reasonable
-fn prewarm_runtime_routes(
+pub(crate) fn prewarm_runtime_routes(
     runtime: &RuntimeState,
     telemetry: TelemetryHandle,
     host_identity: Arc<HostIdentity>,
@@ -53,7 +55,7 @@ fn prewarm_runtime_routes(
     Ok(())
 }
 
-fn route_modules_for_prewarm(route: &IntegrityRoute) -> Vec<String> {
+pub(crate) fn route_modules_for_prewarm(route: &IntegrityRoute) -> Vec<String> {
     let mut modules = BTreeSet::new();
 
     if route.targets.is_empty() {
@@ -68,7 +70,7 @@ fn route_modules_for_prewarm(route: &IntegrityRoute) -> Vec<String> {
 }
 
 #[cfg(feature = "ai-inference")]
-fn add_accelerator_interfaces_to_component_linker(
+pub(crate) fn add_accelerator_interfaces_to_component_linker(
     linker: &mut ComponentLinker<ComponentHostState>,
     ai_runtime: &ai_inference::AiInferenceRuntime,
     context: &str,
@@ -124,7 +126,7 @@ fn add_accelerator_interfaces_to_component_linker(
     Ok(())
 }
 
-fn prewarm_route_instance(
+pub(crate) fn prewarm_route_instance(
     runtime: &RuntimeState,
     route: &IntegrityRoute,
     function_name: &str,
@@ -170,7 +172,7 @@ fn prewarm_route_instance(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prewarm_component_route(
+pub(crate) fn prewarm_component_route(
     runtime: &RuntimeState,
     route: &IntegrityRoute,
     function_name: &str,
@@ -291,7 +293,7 @@ fn prewarm_component_route(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prewarm_http_component_instance(
+pub(crate) fn prewarm_http_component_instance(
     engine: &Engine,
     runtime_config: IntegrityConfig,
     max_memory_bytes: usize,
@@ -393,7 +395,7 @@ fn prewarm_http_component_instance(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prewarm_udp_component_instance(
+pub(crate) fn prewarm_udp_component_instance(
     engine: &Engine,
     runtime_config: IntegrityConfig,
     max_memory_bytes: usize,
@@ -454,7 +456,7 @@ fn prewarm_udp_component_instance(
 
 #[cfg(feature = "websockets")]
 #[allow(clippy::too_many_arguments)]
-fn prewarm_websocket_component_instance(
+pub(crate) fn prewarm_websocket_component_instance(
     engine: &Engine,
     runtime_config: IntegrityConfig,
     max_memory_bytes: usize,
@@ -526,7 +528,7 @@ fn prewarm_websocket_component_instance(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prewarm_system_component_instance(
+pub(crate) fn prewarm_system_component_instance(
     engine: &Engine,
     runtime_config: IntegrityConfig,
     max_memory_bytes: usize,
@@ -642,7 +644,7 @@ fn prewarm_system_component_instance(
     Ok(())
 }
 
-fn prewarm_legacy_route(
+pub(crate) fn prewarm_legacy_route(
     runtime: &RuntimeState,
     route: &IntegrityRoute,
     function_name: &str,
@@ -721,7 +723,7 @@ fn prewarm_legacy_route(
     Ok(())
 }
 
-fn route_has_udp_binding(config: &IntegrityConfig, function_name: &str) -> bool {
+pub(crate) fn route_has_udp_binding(config: &IntegrityConfig, function_name: &str) -> bool {
     let normalized = normalize_target_module_name(function_name);
     config
         .layer4
@@ -730,7 +732,7 @@ fn route_has_udp_binding(config: &IntegrityConfig, function_name: &str) -> bool 
         .any(|binding| normalize_target_module_name(&binding.target) == normalized)
 }
 
-fn should_fall_back_from_component_prewarm(error: &ExecutionError) -> bool {
+pub(crate) fn should_fall_back_from_component_prewarm(error: &ExecutionError) -> bool {
     match error {
         ExecutionError::Internal(message) => {
             message.contains("no exported instance named")
@@ -742,7 +744,7 @@ fn should_fall_back_from_component_prewarm(error: &ExecutionError) -> bool {
     }
 }
 
-fn execution_error_text(error: &ExecutionError) -> String {
+pub(crate) fn execution_error_text(error: &ExecutionError) -> String {
     match error {
         ExecutionError::GuestModuleNotFound(details) => details.to_string(),
         ExecutionError::ResourceLimitExceeded { detail, .. } => detail.clone(),
