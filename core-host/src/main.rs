@@ -177,6 +177,7 @@ const SYSTEM_CERT_MANAGER_ROUTE: &str = "/system/cert-manager";
 const SYSTEM_GATEWAY_ROUTE: &str = "/system/gateway";
 const SYSTEM_LOGGER_ROUTE: &str = "/system/logger";
 const SYSTEM_DIST_LIMITER_ROUTE: &str = "/system/dist-limiter";
+const SYSTEM_SHADOW_PROXY_ROUTE: &str = "/system/shadow-proxy";
 const EMBEDDED_CONFIG_PAYLOAD: &str = env!("FAAS_CONFIG");
 const EMBEDDED_PUBLIC_KEY: &str = env!("FAAS_PUBKEY");
 const EMBEDDED_SIGNATURE: &str = env!("FAAS_SIGNATURE");
@@ -1949,6 +1950,10 @@ struct IntegrityRoute {
     /// distributed limiter outage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     distributed_rate_limit: Option<DistributedRateLimitConfig>,
+    /// Optional target module or internal URL that receives a fire-and-forget copy
+    /// of primary traffic through `system-faas-shadow-proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shadow_target: Option<String>,
     /// Tenant-specific LoRA adapter to apply on top of the route's foundation model
     /// at inference time. Per-call overrides may be passed via the inference WIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1980,6 +1985,7 @@ impl Default for IntegrityRoute {
             requires_tee: false,
             allow_overflow: false,
             distributed_rate_limit: None,
+            shadow_target: None,
             adapter_id: None,
         }
     }
@@ -7860,7 +7866,102 @@ pub(crate) async fn execute_route_with_middleware_inner(
     )
     .await?;
     result.fuel_consumed = merge_fuel_samples(accumulated_fuel, result.fuel_consumed);
+    spawn_shadow_traffic_task(
+        state,
+        runtime,
+        route,
+        headers,
+        method,
+        uri,
+        body,
+        trailers,
+        &result.response,
+        trace_id,
+    );
     Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_shadow_traffic_task(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: &IntegrityRoute,
+    headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    trailers: &GuestHttpFields,
+    primary_response: &GuestHttpResponse,
+    trace_id: Option<&str>,
+) {
+    let Some(shadow_target) = route.shadow_target.clone() else {
+        return;
+    };
+    if route.path == SYSTEM_SHADOW_PROXY_ROUTE {
+        return;
+    }
+    let Some(shadow_route) = runtime
+        .config
+        .sealed_route(SYSTEM_SHADOW_PROXY_ROUTE)
+        .cloned()
+    else {
+        tracing::warn!(
+            route = %route.path,
+            "shadow_target configured but system-faas-shadow-proxy route is not sealed"
+        );
+        return;
+    };
+    let Ok(event) = serde_json::to_vec(&serde_json::json!({
+        "route": route.path,
+        "shadow_target": shadow_target,
+        "method": method.as_str(),
+        "uri": uri.to_string(),
+        "headers": header_map_to_guest_fields(headers),
+        "trailers": trailers,
+        "body_hex": hex::encode(body),
+        "primary_status": primary_response.status.as_u16(),
+        "primary_headers": primary_response.headers,
+        "primary_body_sha256": sha256_hex(&primary_response.body),
+        "trace_id": trace_id,
+    })) else {
+        tracing::warn!(route = %route.path, "failed to encode shadow traffic event");
+        return;
+    };
+
+    let state = state.clone();
+    let runtime = Arc::clone(runtime);
+    tokio::spawn(async move {
+        let headers = HeaderMap::new();
+        let method = Method::POST;
+        let uri = Uri::from_static(SYSTEM_SHADOW_PROXY_ROUTE);
+        if let Err((status, message)) = execute_route_with_middleware(
+            &state,
+            &runtime,
+            &shadow_route,
+            &headers,
+            &method,
+            &uri,
+            &Bytes::from(event),
+            &Vec::new(),
+            HopLimit(DEFAULT_HOP_LIMIT),
+            None,
+            false,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(
+                status = %status,
+                error = %message,
+                "shadow traffic dispatch failed"
+            );
+        }
+    });
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11988,6 +12089,7 @@ fn validate_integrity_route(route: IntegrityRoute) -> Result<IntegrityRoute> {
         requires_tee: route.requires_tee,
         allow_overflow: route.allow_overflow,
         distributed_rate_limit: route.distributed_rate_limit,
+        shadow_target: route.shadow_target,
         adapter_id: route.adapter_id,
     })
 }
