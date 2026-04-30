@@ -2733,6 +2733,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-grpc-interop"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "guest-log-storm"
 version = "0.1.0"
 

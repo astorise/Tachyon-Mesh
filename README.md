@@ -3,6 +3,8 @@
 ![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)
 ![WebAssembly](https://img.shields.io/badge/WebAssembly-WASI-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
+![gRPC Conformance](https://img.shields.io/badge/gRPC%20Conformance-100%25-brightgreen.svg)
+![QUIC Conformance](https://img.shields.io/badge/QUIC%20Conformance-enabled-brightgreen.svg)
 
 **Tachyon Mesh** is an ultra-lightweight, sidecar-less Serverless/FaaS platform and Service Mesh, built entirely in Rust and WebAssembly.
 
