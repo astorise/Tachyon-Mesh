@@ -7,11 +7,33 @@ on:
   pull_request:
     branches:
       - main
+  schedule:
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
 
 jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install security tooling
+        run: cargo install cargo-audit cargo-deny --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+
+      - name: Run cargo deny
+        run: cargo deny check advisories licenses bans sources
+
   rust-ci:
     runs-on: ubuntu-latest
     env:
@@ -150,6 +172,65 @@ jobs:
             target/wasm32-wasip2/release/system_faas_sqs.wasm
             target/wasm32-wasip2/release/system_faas_storage_broker.wasm
             target/wasm32-wasip1/release/guest_loop.wasm
+
+  feature-matrix-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--no-default-features"
+          - "--all-features"
+          - "--features http3"
+          - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test core-host feature set
+        run: cargo test -p core-host ${{ matrix.features }}
+
+  mutation-tests:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run auth mutation tests
+        run: cargo mutants --package core-host --file core-host/src/auth.rs --timeout 120
+
+  miri-cwasm-cache:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: "-Zmiri-disable-isolation"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Miri
+        run: |
+          rustup toolchain install nightly --component miri
+          cargo +nightly miri setup
+
+      - name: Run cwasm cache Miri smoke test
+        run: cargo +nightly miri test -p core-host cwasm_cache_deserializes_same_engine_component --no-default-features
 
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

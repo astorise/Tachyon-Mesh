@@ -75,6 +75,13 @@ jobs:
         working-directory: ./tachyon-ui
         run: npm install
 
+      - name: Generate Rust SBOM
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          cargo install cargo-sbom --locked
+          cargo sbom --output-format spdx_json_2_3 > tachyon-mesh.spdx.json
+
       - name: Build Tauri bundles for push artifacts
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: tauri-apps/tauri-action@v0
@@ -106,3 +113,11 @@ jobs:
           name: ${{ matrix.artifact_name }}
           if-no-files-found: error
           path: ${{ matrix.artifact_path }}
+
+      - name: Upload SBOM
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tachyon-mesh-sbom
+          if-no-files-found: error
+          path: tachyon-mesh.spdx.json
