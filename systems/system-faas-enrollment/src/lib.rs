@@ -94,7 +94,10 @@ pub async fn run_enrollment(config: EnrollmentConfig) -> Result<PathBuf> {
                     .context("enrollment poll returned non-hex certificate")?;
                 if let Some(parent) = config.cert_output_path.parent() {
                     tokio::fs::create_dir_all(parent).await.with_context(|| {
-                        format!("failed to create enrollment cert dir `{}`", parent.display())
+                        format!(
+                            "failed to create enrollment cert dir `{}`",
+                            parent.display()
+                        )
                     })?;
                 }
                 tokio::fs::write(&config.cert_output_path, cert)

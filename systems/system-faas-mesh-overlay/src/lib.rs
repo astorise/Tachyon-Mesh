@@ -122,8 +122,7 @@ fn serve_module(
         if !expected.eq_ignore_ascii_case(&actual) {
             return response(
                 409,
-                format!("module checksum mismatch: expected {expected}, got {actual}")
-                    .into_bytes(),
+                format!("module checksum mismatch: expected {expected}, got {actual}").into_bytes(),
                 &[],
             );
         }
@@ -170,18 +169,21 @@ fn pull_config_update(
         peer.base_url.trim_end_matches('/'),
         env_or_default(OVERLAY_PATH_ENV, DEFAULT_OVERLAY_PATH)
     );
-    let remote =
-        match bindings::tachyon::mesh::outbound_http::send_request("GET", &url, &auth_headers(), &[])
-        {
-            Ok(remote) => remote,
-            Err(error) => {
-                return response(
-                    502,
-                    format!("failed to pull manifest from `{url}`: {error}").into_bytes(),
-                    &[],
-                )
-            }
-        };
+    let remote = match bindings::tachyon::mesh::outbound_http::send_request(
+        "GET",
+        &url,
+        &auth_headers(),
+        &[],
+    ) {
+        Ok(remote) => remote,
+        Err(error) => {
+            return response(
+                502,
+                format!("failed to pull manifest from `{url}`: {error}").into_bytes(),
+                &[],
+            )
+        }
+    };
     if remote.status >= 400 {
         return response(
             remote.status,
@@ -189,7 +191,10 @@ fn pull_config_update(
             &[],
         );
     }
-    let expected = event.checksum.strip_prefix("sha256:").unwrap_or(&event.checksum);
+    let expected = event
+        .checksum
+        .strip_prefix("sha256:")
+        .unwrap_or(&event.checksum);
     let actual = sha256_hex(&remote.body);
     if !expected.eq_ignore_ascii_case(&actual) {
         return response(
