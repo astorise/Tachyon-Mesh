@@ -148,6 +148,11 @@ No latency or memory claim should be updated in this README without committing t
 ## 🤝 Contributing
 We believe in a leaner, faster, and more secure serverless future. PRs are welcome!
 
+### WIT and SDK versioning
+Every public WIT package under `wit/` is part of the SDK compatibility contract and must declare an explicit SemVer package version on the first line, for example `package tachyon:mesh@1.0.0;`.
+
+Backward-compatible additions keep the current major version and may bump minor or patch versions. Breaking changes, including removed functions, renamed fields, changed record shapes, or incompatible type changes, require a major version bump. Pull requests that modify WIT files run `.github/workflows/wit-compat.yml`, which validates the package declarations and checks the changed interfaces with `wasm-tools` against the target branch.
+
 ## Testing Standards
 
 Core host changes should keep business logic behind small module boundaries and include focused tests in the same change. New routing, manifest parsing, storage, identity, or IPC behavior should include unit tests; parser and normalization code should prefer property-based tests with `proptest`.

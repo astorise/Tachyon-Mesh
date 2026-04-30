@@ -1,4 +1,4 @@
-package tachyon:identity;
+package tachyon:identity@1.0.0;
 
 interface authz {
     record identity-payload {

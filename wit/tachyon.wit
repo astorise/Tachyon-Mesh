@@ -1,4 +1,4 @@
-package tachyon:mesh;
+package tachyon:mesh@1.0.0;
 
 interface handler {
     type headers = list<tuple<string, string>>;

@@ -1,4 +1,4 @@
-package tachyon:mesh;
+package tachyon:mesh@1.0.0;
 
 /// Embedded vector store interface. The host backs this with an HNSW
 /// (Hierarchical Navigable Small World) index persisted in the embedded redb

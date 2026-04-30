@@ -1,4 +1,4 @@
-package tachyon:mesh;
+package tachyon:mesh@1.0.0;
 
 /// Inference interface that accepts an optional per-call LoRA adapter. The default
 /// path (no adapter) matches the existing inference behaviour exactly.

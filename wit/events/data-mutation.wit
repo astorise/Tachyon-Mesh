@@ -1,4 +1,4 @@
-package tachyon:mesh;
+package tachyon:mesh@1.0.0;
 
 /// Event payload for the edge-to-cloud Change Data Capture (CDC) pipeline. The host
 /// writes one of these to `data_mutation_outbox` after a successful local write to a
@@ -16,7 +16,7 @@ interface data-mutation {
 
     record mutation-event {
         /// Resource alias as declared in `IntegrityConfig::resources`.
-        resource: string,
+        %resource: string,
         /// Tenant-scoped key (or path within the resource).
         key: string,
         /// Mutation kind.
