@@ -75,9 +75,10 @@ cargo build -p guest-example --target wasm32-wasip2 --release
 ```
 
 ### 3. Seal the Runtime Configuration
-The desktop UI no longer accepts manifest-generation CLI arguments. Ensure the repository root contains a valid signed `integrity.lock` manifest before starting `core-host`:
+Create or refresh `integrity.lock` from the Tachyon Studio desktop configurator, then keep the signed manifest at the repository root. For shell-based startup, validate that the manifest exists and point the host at it explicitly:
 ```bash
-Get-Content integrity.lock
+test -s integrity.lock
+export TACHYON_INTEGRITY_MANIFEST="$PWD/integrity.lock"
 ```
 
 ### 4. Run the Host
@@ -95,12 +96,12 @@ cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
 
 Seal `/metrics/scaling` to expose Prometheus queue depth for `/api/guest-call-legacy`:
 ```bash
-Get-Content integrity.lock
+test -s integrity.lock
 ```
 
 Seal `/system/k8s-scaler` to enable the five-second background autoscaler. For local validation against a mock API server, point the host at the mock base URL before starting it:
 ```bash
-$env:TACHYON_MOCK_K8S_URL="http://127.0.0.1:18080"
+export TACHYON_MOCK_K8S_URL="http://127.0.0.1:18080"
 cargo run -p core-host --release
 ```
 
@@ -112,7 +113,7 @@ cargo build -p guest-ai --target wasm32-wasip1 --release
 
 Seal the AI route and mount a read-only model directory into the guest. The guest expects ONNX files under `/models` and defaults to `/models/model.onnx`:
 ```bash
-Get-Content integrity.lock
+test -s integrity.lock
 ```
 
 Run the host with the optional feature so it exposes the `wasi_ephemeral_nn` imports:
@@ -129,14 +130,20 @@ curl --request POST http://127.0.0.1:8080/api/guest-ai \
 
 `ai-inference` is intentionally optional because the host machine must provide ONNX Runtime dynamic libraries for the selected execution provider.
 
+## Performance & Benchmarks
+
+The reproducible benchmark harness lives in [`bench/`](bench/README.md). It provisions a clean k3d cluster, deploys a neutral echo workload behind Istio Ambient, Linkerd, and Tachyon Mesh adapters, runs Fortio load tests, captures Kubernetes resource snapshots, and renders Markdown tables from raw JSON output.
+
+No latency or memory claim should be updated in this README without committing the raw benchmark output under `bench/results/` and the generated report that cites the cluster profile used for the run.
+
 ## 🗺️ Roadmap
 
-- [ ] **Phase 1:** Core Wasmtime Orchestrator & Axum HTTP Routing (In-memory pipes).
-- [ ] **Phase 2:** FaaS-Native Observability via `#[faas_handler]` macro.
-- [ ] **Phase 3:** Ed25519 Build-Time Cryptographic Validation (dedicated manifest tooling).
-- [ ] **Phase 4:** Compile-Time Service Mesh (Traffic shifting & autonomous A/B testing).
-- [ ] **Phase 5:** Rich Tauri GitOps Desktop Client for visual configuration generation.
-- [ ] **Phase 6:** Hybrid Mesh: Ultra-light Rust sidecar for external OCI containers.
+- [x] **Phase 1:** Core Wasmtime Orchestrator & Axum HTTP Routing.
+- [x] **Phase 2:** FaaS-native observability and privileged system FaaS routes.
+- [x] **Phase 3:** Ed25519 build-time cryptographic validation and sealed manifest tooling.
+- [x] **Phase 4:** Compile-time service mesh, resiliency, rate limits, and traffic policy.
+- [ ] **Phase 5:** Grid computing, TEE-backed route execution, and hardware-aware admission.
+- [ ] **Phase 6:** Hybrid Mesh: ultra-light Rust sidecar for external OCI containers.
 
 ## 🤝 Contributing
 We believe in a leaner, faster, and more secure serverless future. PRs are welcome!
