@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["ring"]
 ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
+fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
 mtls = []
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
+ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]
 secrets-vault = []
 websockets = ["axum/ws", "dep:futures-util"]
 
@@ -48,7 +50,7 @@ sha2 = "0.11"
 sysinfo = "0.38"
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false }
 tokio-stream = { version = "0.1", optional = true }
 tower = { version = "0.5", optional = true, features = ["retry", "timeout", "util"] }
 tracing = "0.1"

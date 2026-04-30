@@ -15,7 +15,44 @@ use std::{
     },
 };
 use tokio::sync::Mutex as TokioMutex;
-use tokio_rustls::rustls::{self, ServerConfig};
+use tokio_rustls::rustls::{self, crypto::CryptoProvider, ServerConfig};
+
+pub(crate) fn ensure_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+
+    INIT.call_once(|| {
+        let _ = crypto_provider().install_default();
+        #[cfg(feature = "fips")]
+        tracing::info!("Tachyon Mesh TLS crypto provider initialized in FIPS mode");
+    });
+}
+
+#[cfg(feature = "fips")]
+fn crypto_provider() -> CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
+
+#[cfg(not(feature = "fips"))]
+fn crypto_provider() -> CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+#[cfg(feature = "fips")]
+fn server_config_builder() -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
+    let provider = Arc::new(crypto_provider());
+    debug_assert!(
+        provider.fips(),
+        "FIPS builds must use a FIPS-capable rustls provider"
+    );
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 must be supported by the FIPS crypto provider")
+}
+
+#[cfg(not(feature = "fips"))]
+fn server_config_builder() -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
+    rustls::ServerConfig::builder()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CertificateMaterial {
@@ -348,10 +385,11 @@ fn build_server_config(material: &CertificateMaterial) -> Result<ServerConfig> {
         .context("failed to parse private key PEM")?
         .ok_or_else(|| anyhow!("certificate bundle did not contain a private key"))?;
 
-    let mut config = rustls::ServerConfig::builder()
+    let mut config = server_config_builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .context("failed to construct rustls server config")?;
+    enforce_fips_server_config(&config)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
 }
@@ -378,12 +416,29 @@ pub(crate) fn build_mtls_server_config(
     let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
         .context("failed to construct rustls client verifier")?;
-    let mut config = rustls::ServerConfig::builder()
+    let mut config = server_config_builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(cert_chain, private_key)
         .context("failed to construct rustls mTLS server config")?;
+    enforce_fips_server_config(&config)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
+}
+
+#[cfg(feature = "fips")]
+fn enforce_fips_server_config(config: &ServerConfig) -> Result<()> {
+    if config.fips() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "FIPS TLS mode requires TLS 1.3 and FIPS-approved AES-GCM cipher suites"
+        ))
+    }
+}
+
+#[cfg(not(feature = "fips"))]
+fn enforce_fips_server_config(_config: &ServerConfig) -> Result<()> {
+    Ok(())
 }
 
 fn parse_cert_chain(

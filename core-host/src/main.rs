@@ -11238,11 +11238,7 @@ fn init_host_tracing() {
 }
 
 pub(crate) fn ensure_rustls_crypto_provider() {
-    static INIT: Once = Once::new();
-
-    INIT.call_once(|| {
-        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    });
+    tls_runtime::ensure_crypto_provider();
 }
 
 fn verify_integrity() -> Result<IntegrityConfig> {
