@@ -170,7 +170,10 @@ mod tests {
         // Build a limiter with a tiny cap so we can prove the bound is enforced
         // without spending the time/memory of inserting 100k entries.
         let small_cap: u64 = 1024;
-        let quota = Quota::per_second(NonZeroU32::new(RATE_LIMIT_REQUESTS_PER_SECOND).unwrap());
+        let quota = Quota::per_second(
+            NonZeroU32::new(RATE_LIMIT_REQUESTS_PER_SECOND)
+                .expect("rate limit requests per second must be non-zero"),
+        );
         let limiter = BoundedRateLimiter::new(quota, small_cap);
 
         // Hammer with 10x the cap of distinct synthetic IPs.
