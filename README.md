@@ -140,3 +140,9 @@ curl --request POST http://127.0.0.1:8080/api/guest-ai \
 
 ## 🤝 Contributing
 We believe in a leaner, faster, and more secure serverless future. PRs are welcome!
+
+## Testing Standards
+
+Core host changes should keep business logic behind small module boundaries and include focused tests in the same change. New routing, manifest parsing, storage, identity, or IPC behavior should include unit tests; parser and normalization code should prefer property-based tests with `proptest`.
+
+Integration scenarios live under `core-host/tests/`. Tests that need signed manifests, compiled guest artifacts, HTTP/3 sockets, or host-level runtime services should be marked `#[ignore]` and document their prerequisites. CI generates an LCOV report for `core-host` with `cargo llvm-cov` so coverage can be uploaded to Codecov or another coverage service.

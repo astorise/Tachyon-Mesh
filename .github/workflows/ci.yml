@@ -91,6 +91,18 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Generate core-host coverage
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo llvm-cov -p core-host --lcov --output-path lcov.info
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-host-lcov-${{ github.sha }}
+          if-no-files-found: error
+          path: lcov.info
+
       - name: Check ai-inference host build
         run: cargo check -p core-host --features ai-inference
 
