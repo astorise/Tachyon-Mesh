@@ -1,24 +1,21 @@
 # distributed-crdt-rate-limiter Specification
 
 ## Purpose
-TBD - created by archiving change distributed-crdt-rate-limiter. Update Purpose after archive.
+Define the distributed CRDT-backed rate limiter and its identity-aware scoping model.
+
 ## Requirements
-### Requirement: Distributed limiter FaaS maintains CRDT-backed counters
-The Mesh SHALL provide `system-faas-dist-limiter` which maintains per-IP request counters as G-Counters or LWW-Maps and broadcasts/merges the counter state across nodes via `system-faas-gossip`.
+### Requirement: Identity-scoped distributed counters
+The rate limiter SHALL maintain CRDT counters that can be scoped by source IP, tenant identity, or token identity.
 
-#### Scenario: Counters converge across nodes via gossip
-- **WHEN** a route flagged with `distributed_rate_limit: true` receives traffic on multiple nodes
-- **THEN** each node updates its local CRDT counter for the source IP
-- **AND** counter deltas are propagated through `system-faas-gossip`
-- **AND** all nodes eventually observe a consistent global request count for the IP within the configured window
+#### Scenario: Tenant scoped route limit
+- **WHEN** a route configures tenant-scoped rate limiting
+- **THEN** the limiter groups requests with keys using the `tenant:{tenant_id}:{route}` format
+- **AND** requests from different tenants do not consume the same distributed counter
 
-### Requirement: Core host queries the distributed limiter only for opted-in routes and fails open on partition
-The `core-host` SHALL query `system-faas-dist-limiter` over IPC for routes that explicitly set `distributed_rate_limit: true` in `integrity.lock`, and SHALL fall back to its local rate limiter if the FaaS is unavailable or the network is partitioned.
+### Requirement: Bounded bypass behavior
+The host SHALL fail open only within the configured distributed-rate-limit timeout when remote CRDT state is unavailable.
 
-#### Scenario: Distributed limiter unavailable during partition
-- **WHEN** a route flagged for distributed rate limiting receives a request
-- **AND** `system-faas-dist-limiter` is unreachable or the gossip layer reports a partition
-- **THEN** the host falls back to the local rate limiter for that request
-- **AND** the request is accepted or rejected according to the local policy
-- **AND** the host records a metric indicating that distributed enforcement was bypassed
-
+#### Scenario: CRDT peer does not respond
+- **WHEN** distributed state lookup exceeds the timeout
+- **THEN** the request path records a bypass metric
+- **AND** the route continues using local enforcement instead of blocking indefinitely
