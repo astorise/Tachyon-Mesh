@@ -1,0 +1,3 @@
+- [x] Ensure `guest-malicious` covers 3 vectors: Infinite Loop (Fuel), Memory Allocation bomb (OOM), and Panic (Unwind).
+- [x] Create `core-host/tests/chaos_test.rs` to automate the execution of these endpoints.
+- [x] Integrate this specific test suite into `.github/workflows/ci.yml`.

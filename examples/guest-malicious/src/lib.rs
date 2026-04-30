@@ -7,12 +7,17 @@ pub extern "C" fn faas_entry() {
     let mut payload = String::new();
     let _ = io::stdin().read_to_string(&mut payload);
 
-    if payload.trim().eq_ignore_ascii_case("allocate") {
-        allocate_excessive_memory();
-        return;
+    match payload.trim().to_ascii_lowercase().as_str() {
+        "allocate" | "oom" | "memory" => {
+            allocate_excessive_memory();
+        }
+        "panic" | "unwind" => {
+            panic!("intentional guest panic for chaos testing");
+        }
+        _ => {
+            loop_forever();
+        }
     }
-
-    loop_forever();
 }
 
 fn loop_forever() -> ! {
