@@ -10,6 +10,7 @@ cargo build -p guest-tcp-echo --target wasm32-wasip1 --release
 cargo build -p guest-udp-echo --target wasm32-wasip2 --release
 cargo build -p guest-voip-gate --target wasm32-wasip2 --release
 cargo build -p guest-volume --target wasm32-wasip2 --release
+cargo build -p guest-websocket-echo --target wasm32-wasip2 --release
 cargo build -p system-faas-bridge --target wasm32-wasip2 --release
 cargo build -p system-faas-authn --target wasm32-wasip2 --release
 cargo build -p system-faas-authz --target wasm32-wasip2 --release
