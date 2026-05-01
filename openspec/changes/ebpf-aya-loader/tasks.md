@@ -1,0 +1,6 @@
+- [x] **Task 1**: Locate the current eBPF scaffold function in the codebase. Look inside `ebpf-probes/src/lib.rs`, `core-host/src/network/mod.rs`, or `core-host/src/host_core/uds_fast_path.rs`.
+- [x] **Task 2**: Remove the hardcoded `Err` or `unimplemented!()` scaffold.
+- [x] **Task 3**: Import the required `aya` components: `use aya::{Bpf, include_bytes_aligned};`.
+- [x] **Task 4**: Implement the `load_ebpf_fast_path` function using the blueprint provided in `design.md`.
+- [x] **Task 5**: Verify that no `unwrap()` or `panic!` macros are introduced. Use the `?` operator for strict error propagation.
+- [x] **Task 6**: Ensure the project compiles successfully via `cargo check`. If the BPF artifact is missing in the local dev environment, you may wrap the loading logic in a `cfg` macro or provide a graceful fallback, but the core `aya` logic must be present.
