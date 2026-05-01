@@ -31,7 +31,7 @@ pub(crate) async fn start_http3_listener(
     app: Router,
 ) -> Result<Option<crate::Http3ListenerHandle>> {
     let runtime = state.runtime.load_full();
-    let Some(bind_address) = crate::https_bind_address(&runtime.config)? else {
+    let Some(bind_address) = crate::network::https_bind_address(&runtime.config)? else {
         return Ok(None);
     };
     let domain = runtime

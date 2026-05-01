@@ -36,11 +36,11 @@ impl PacketRewrite {
     }
 }
 
-pub fn lookup_rewrite<'a>(
+pub fn lookup_rewrite(
     protocol: L4Protocol,
     destination_port: u16,
-    rules: &'a [PacketRewrite],
-) -> Option<&'a L4Target> {
+    rules: &[PacketRewrite],
+) -> Option<&L4Target> {
     rules
         .iter()
         .find(|rule| rule.key.protocol == protocol && rule.key.destination_port == destination_port)

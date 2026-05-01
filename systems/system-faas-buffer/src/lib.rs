@@ -440,7 +440,10 @@ mod tests {
         assert_eq!(
             files
                 .iter()
-                .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+                .filter_map(|path| {
+                    path.file_name()
+                        .map(|file_name| file_name.to_string_lossy().to_string())
+                })
                 .collect::<Vec<_>>(),
             vec!["0-high-001.json".to_owned(), "1-normal-002.json".to_owned()]
         );

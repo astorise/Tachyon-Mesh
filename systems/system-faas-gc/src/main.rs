@@ -140,8 +140,14 @@ mod tests {
         let dir = tempdir();
         let f1 = dir.path().join("a.tmp");
         let f2 = dir.path().join("b.tmp");
-        File::create(&f1).unwrap().write_all(b"x").unwrap();
-        File::create(&f2).unwrap().write_all(b"y").unwrap();
+        File::create(&f1)
+            .expect("stale test file a should be created")
+            .write_all(b"x")
+            .expect("stale test file a should be written");
+        File::create(&f2)
+            .expect("stale test file b should be created")
+            .write_all(b"y")
+            .expect("stale test file b should be written");
         touch_old(&f1, Duration::from_secs(3600));
         touch_old(&f2, Duration::from_secs(3600));
 
@@ -156,9 +162,12 @@ mod tests {
     fn sweep_tolerates_race_on_missing_file() {
         let dir = tempdir();
         let f = dir.path().join("ghost.tmp");
-        File::create(&f).unwrap().write_all(b"x").unwrap();
+        File::create(&f)
+            .expect("race test file should be created")
+            .write_all(b"x")
+            .expect("race test file should be written");
         // Pre-delete, simulating a concurrent process winning the race.
-        fs::remove_file(&f).unwrap();
+        fs::remove_file(&f).expect("race test file should be removed before sweep");
 
         // Sweep must finish without panicking even though the directory listing
         // could theoretically still reference the just-deleted entry on some FSes.
@@ -172,9 +181,12 @@ mod tests {
     fn sweep_reaps_nested_empty_dirs() {
         let dir = tempdir();
         let nested = dir.path().join("a").join("b").join("c");
-        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&nested).expect("nested test directory should be created");
         let stale = nested.join("file.tmp");
-        File::create(&stale).unwrap().write_all(b"x").unwrap();
+        File::create(&stale)
+            .expect("nested stale file should be created")
+            .write_all(b"x")
+            .expect("nested stale file should be written");
 
         let stats = sweep_directory(dir.path(), Duration::from_secs(0));
         assert_eq!(stats.removed_files, 1);
