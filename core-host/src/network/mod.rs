@@ -13,10 +13,29 @@ pub(crate) mod http3 {
 }
 
 pub(crate) mod ebpf {
+    #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
+    use anyhow::{bail, Context};
+    #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
+    use aya::{include_bytes_aligned, Bpf};
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum EbpfFastPathStatus {
-        Unsupported,
+        Loaded,
         NoRules,
+        Unsupported,
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
+    pub(crate) fn load_ebpf_fast_path() -> anyhow::Result<Bpf> {
+        let bpf_data = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/tachyon-ebpf"));
+        if option_env!("TACHYON_EBPF_ARTIFACT_PRESENT") != Some("1") {
+            bail!(
+                "compiled eBPF artifact not found at target/bpfel-unknown-none/release/tachyon-ebpf"
+            );
+        }
+
+        let bpf = Bpf::load(bpf_data).context("failed to load Tachyon eBPF fast-path object")?;
+        Ok(bpf)
     }
 
     pub(crate) fn init_ebpf_fastpath(route_count: usize) -> Result<EbpfFastPathStatus, String> {
@@ -24,12 +43,14 @@ pub(crate) mod ebpf {
             return Ok(EbpfFastPathStatus::NoRules);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
         {
-            Err("eBPF/XDP fast-path requires an aya loader build; falling back to userspace L4 routing".to_owned())
+            let _bpf = load_ebpf_fast_path()
+                .map_err(|error| format!("{error:#}; falling back to userspace L4 routing"))?;
+            Ok(EbpfFastPathStatus::Loaded)
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", feature = "ebpf-loader")))]
         {
             Ok(EbpfFastPathStatus::Unsupported)
         }

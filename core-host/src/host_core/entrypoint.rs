@@ -169,6 +169,9 @@ pub(crate) fn maybe_init_l4_acceleration(accel: AccelerationMode, layer4: &Integ
 
     let route_count = layer4.tcp.len().saturating_add(layer4.udp.len());
     match network::ebpf::init_ebpf_fastpath(route_count) {
+        Ok(network::ebpf::EbpfFastPathStatus::Loaded) => {
+            tracing::info!("eBPF L4 fast-path loader initialized");
+        }
         Ok(network::ebpf::EbpfFastPathStatus::NoRules) => {
             tracing::info!("eBPF L4 fast-path requested, but no L4 routes are configured");
         }
