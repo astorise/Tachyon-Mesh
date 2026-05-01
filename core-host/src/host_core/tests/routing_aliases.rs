@@ -1,6 +1,7 @@
 use super::support_and_cache::*;
 use crate::*;
 
+#[cfg(not(feature = "websockets"))]
 #[tokio::test]
 async fn websocket_upgrade_is_rejected_without_feature_flag() {
     let route = targeted_route("/ws/echo", vec![websocket_target("guest-websocket-echo")]);

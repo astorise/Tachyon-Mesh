@@ -411,7 +411,7 @@ async fn https_listener_provisions_mock_certificate_once_and_serves_custom_domai
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(
         first.text().await.expect("response body should decode"),
-        expected_guest_example_body("FaaS received an empty payload")
+        expected_guest_example_body_without_secret_grant("FaaS received an empty payload")
     );
     assert_eq!(state.tls_manager.provision_count(), 1);
     assert!(

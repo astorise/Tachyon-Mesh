@@ -130,14 +130,17 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_returns_too_many_requests_after_quota_is_exhausted() {
+        let quota = Quota::per_minute(
+            NonZeroU32::new(2).expect("test rate limit quota should be non-zero"),
+        );
         let app = Router::new()
             .route("/", get(|| async { StatusCode::OK }))
             .layer(from_fn_with_state(
-                new_rate_limiter(),
+                Arc::new(BoundedRateLimiter::new(quota, MAX_TRACKED_IPS)),
                 rate_limit_middleware,
             ));
 
-        for _ in 0..RATE_LIMIT_REQUESTS_PER_SECOND {
+        for _ in 0..2 {
             let response = app
                 .clone()
                 .oneshot(

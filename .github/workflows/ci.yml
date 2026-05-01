@@ -175,6 +175,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install FIPS build dependencies
+        if: matrix.features == '--all-features'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake nasm
@@ -195,6 +196,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-wasip2
 
       - name: Install FIPS build dependencies
         run: |
@@ -203,6 +206,9 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Build guest artifacts
+        run: bash scripts/build-guest-artifacts.sh
 
       - name: Test core-host FIPS feature
         run: cargo test -p core-host --features fips

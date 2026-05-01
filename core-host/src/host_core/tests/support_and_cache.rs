@@ -57,6 +57,15 @@ pub(super) fn expected_guest_example_body(payload: &str) -> String {
     )
 }
 
+pub(super) fn expected_guest_example_body_without_secret_grant(payload: &str) -> String {
+    let secret_status = if cfg!(feature = "secrets-vault") {
+        "permission-denied"
+    } else {
+        "vault-disabled"
+    };
+    format!("{payload} | env: missing | secret: {secret_status}")
+}
+
 proptest! {
     #[test]
     fn l7_route_normalization_is_stable(input in "[a-zA-Z0-9/_-]{0,64}") {

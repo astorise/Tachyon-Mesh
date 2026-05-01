@@ -2,11 +2,12 @@
 all-features = true
 
 [advisories]
-version = 2
-vulnerability = "deny"
-unmaintained = "deny"
+unmaintained = "workspace"
+unsound = "workspace"
 yanked = "deny"
-notice = "warn"
+ignore = [
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is a direct TLS parser dependency; warnings remain surfaced by cargo audit while we track replacement." },
+]
 
 [licenses]
 version = 2

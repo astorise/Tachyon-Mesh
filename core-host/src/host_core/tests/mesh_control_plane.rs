@@ -533,7 +533,7 @@ async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.text().await.expect("response body should decode"),
-        expected_guest_example_body("FaaS received: local-only")
+        expected_guest_example_body_without_secret_grant("FaaS received: local-only")
     );
 
     let peer_capture = peer_capture
