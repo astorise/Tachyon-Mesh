@@ -32,9 +32,14 @@ fn crypto_provider() -> CryptoProvider {
     rustls::crypto::aws_lc_rs::default_provider()
 }
 
-#[cfg(not(feature = "fips"))]
+#[cfg(all(not(feature = "fips"), feature = "ring"))]
 fn crypto_provider() -> CryptoProvider {
     rustls::crypto::ring::default_provider()
+}
+
+#[cfg(all(not(feature = "fips"), not(feature = "ring")))]
+fn crypto_provider() -> CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
 }
 
 #[cfg(feature = "fips")]

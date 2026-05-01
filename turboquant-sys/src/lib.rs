@@ -261,11 +261,11 @@ mod tests {
     #[test]
     fn packed_length_matches_div_ceil_of_total_bits() {
         // 5 values at 3 bits = 15 bits → 2 bytes (15 div_ceil 8).
-        assert_eq!(packed_len(5, 3).unwrap(), 2);
+        assert_eq!(packed_len(5, 3).expect("5 values at 3 bits should fit"), 2);
         // 8 values at 2 bits = 16 bits → 2 bytes.
-        assert_eq!(packed_len(8, 2).unwrap(), 2);
+        assert_eq!(packed_len(8, 2).expect("8 values at 2 bits should fit"), 2);
         // 0 values → 0 bytes regardless of bit rate.
-        assert_eq!(packed_len(0, 2).unwrap(), 0);
-        assert_eq!(packed_len(0, 3).unwrap(), 0);
+        assert_eq!(packed_len(0, 2).expect("0 values at 2 bits should fit"), 0);
+        assert_eq!(packed_len(0, 3).expect("0 values at 3 bits should fit"), 0);
     }
 }

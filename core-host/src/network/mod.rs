@@ -16,6 +16,7 @@ pub(crate) mod ebpf {
     #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
     use anyhow::{bail, Context};
     #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
+    #[allow(deprecated)]
     use aya::{include_bytes_aligned, Bpf};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +27,7 @@ pub(crate) mod ebpf {
     }
 
     #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
+    #[allow(deprecated)]
     pub(crate) fn load_ebpf_fast_path() -> anyhow::Result<Bpf> {
         let bpf_data = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/tachyon-ebpf"));
         if option_env!("TACHYON_EBPF_ARTIFACT_PRESENT") != Some("1") {

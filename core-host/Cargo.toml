@@ -51,7 +51,7 @@ sha2 = "0.11"
 sysinfo = "0.38"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = { version = "0.26", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 tokio-stream = { version = "0.1", optional = true }
 tower = { version = "0.5", optional = true, features = ["retry", "timeout", "util"] }
 tracing = "0.1"
@@ -60,9 +60,9 @@ system-faas-enrollment = { path = "../systems/system-faas-enrollment" }
 system-faas-microvm-runner = { path = "../systems/system-faas-microvm-runner" }
 turboquant-sys = { path = "../turboquant-sys", optional = true }
 uuid = { version = "1", features = ["v4"] }
-wasmtime = { version = "44.0.0", features = ["component-model"] }
-wasmtime-wasi = { version = "44.0.0", features = ["p1"] }
-wasmtime-wasi-nn = { version = "44.0.0", optional = true, default-features = false, features = ["onnx-download"] }
+wasmtime = { version = "44.0.1", features = ["component-model"] }
+wasmtime-wasi = { version = "44.0.1", features = ["p1"] }
+wasmtime-wasi-nn = { version = "44.0.1", optional = true, default-features = false, features = ["onnx-download"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13.1", optional = true }

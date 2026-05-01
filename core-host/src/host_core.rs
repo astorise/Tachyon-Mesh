@@ -25,8 +25,6 @@ pub(crate) use crate::runtime::{build_command_engine, build_runtime_state};
 pub(crate) use crate::runtime::{
     build_engine, INSTANCE_POOL_DEFAULT_CAPACITY, INSTANCE_POOL_IDLE_TIMEOUT,
 };
-#[cfg(feature = "http3")]
-pub(crate) use crate::server_h3;
 pub(crate) use crate::state::{
     AppState, CachedPeerCapabilities, Capabilities, HostLoadCounters, PeerCapabilityCache,
     RuntimeState,

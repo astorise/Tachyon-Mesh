@@ -90,7 +90,6 @@ async fn websocket_route_upgrades_and_echoes_frames() {
                 Some(Ok(_)) => continue,
                 Some(Err(error)) => {
                     unreachable!("WebSocket close should not error: {error}");
-                    break;
                 }
             }
         }
