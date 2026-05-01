@@ -613,7 +613,7 @@ async fn http3_listener_serves_guest_routes_over_quic() {
     }
     assert_eq!(
         String::from_utf8(body).expect("HTTP/3 response body should be UTF-8"),
-        expected_guest_example_body("FaaS received an empty payload")
+        expected_guest_example_body_without_secret_grant("FaaS received an empty payload")
     );
 
     connection.close(0u32.into(), b"done");

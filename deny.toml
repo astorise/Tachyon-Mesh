@@ -32,7 +32,8 @@ allow = [
 multiple-versions = "allow"
 wildcards = "warn"
 deny = [
-    { name = "openssl", reason = "Prefer rustls-backed dependencies in Tachyon Mesh runtime paths." },
+    { name = "native-tls", wrappers = ["ureq"], reason = "Only the ort-sys build-time ONNX Runtime downloader currently requires ureq/native-tls; runtime TLS must use rustls." },
+    { name = "openssl", wrappers = ["native-tls"], reason = "Only allowed behind the ort-sys build-time ureq/native-tls downloader; runtime TLS must use rustls." },
 ]
 
 [sources]

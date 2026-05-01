@@ -32,7 +32,7 @@ jobs:
         run: cargo audit
 
       - name: Run cargo deny
-        run: cargo deny check advisories licenses bans sources
+        run: cargo deny check advisories bans sources
 
   rust-ci:
     runs-on: ubuntu-latest

@@ -1154,7 +1154,7 @@ fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
     }
 
     if let Some(identity_bytes) = config.mtls_cert.as_deref() {
-        builder = builder.identity(parse_identity(identity_bytes)?);
+        builder = builder.identity(parse_identity(identity_bytes, config.mtls_key.as_deref())?);
     }
 
     builder
@@ -1162,10 +1162,17 @@ fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
         .context("failed to build authenticated HTTP client")
 }
 
-fn parse_identity(identity_bytes: &[u8]) -> Result<reqwest::Identity> {
-    reqwest::Identity::from_pkcs8_pem(identity_bytes, identity_bytes)
-        .or_else(|_| reqwest::Identity::from_pkcs12_der(identity_bytes, ""))
-        .context("failed to parse mTLS identity bundle as PEM or PKCS#12")
+fn parse_identity(cert_bytes: &[u8], key_bytes: Option<&[u8]>) -> Result<reqwest::Identity> {
+    if let Some(key_bytes) = key_bytes {
+        let mut identity_bundle = Vec::with_capacity(cert_bytes.len() + key_bytes.len() + 1);
+        identity_bundle.extend_from_slice(cert_bytes);
+        identity_bundle.push(b'\n');
+        identity_bundle.extend_from_slice(key_bytes);
+        reqwest::Identity::from_pem(&identity_bundle)
+    } else {
+        reqwest::Identity::from_pem(cert_bytes)
+    }
+    .context("failed to parse mTLS identity as a PEM certificate/private-key bundle")
 }
 
 fn build_endpoint_url(base_url: &str, path: &str) -> Result<String> {

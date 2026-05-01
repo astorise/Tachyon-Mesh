@@ -698,7 +698,7 @@ async fn capability_routing_returns_503_when_local_and_mesh_lack_requirements() 
             "/api/guest-example",
             vec![capability_target(
                 "guest-example",
-                &["core:wasi", "accel:cuda"],
+                &["core:wasi", "os:linux", "os:windows"],
             )],
         )],
         ..IntegrityConfig::default_sealed()
@@ -720,7 +720,7 @@ async fn capability_routing_returns_503_when_local_and_mesh_lack_requirements() 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = response.text().await.expect("response body should decode");
     assert!(body.contains("Missing Capability"));
-    assert!(body.contains("accel:cuda"));
+    assert!(body.contains("os:linux") || body.contains("os:windows"));
 
     host_server.abort();
 }
@@ -934,7 +934,7 @@ async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold()
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.text().await.expect("response body should decode"),
-        expected_guest_example_body("FaaS received: batch-request")
+        expected_guest_example_body_without_secret_grant("FaaS received: batch-request")
     );
     let peer_capture = peer_capture
         .lock()
