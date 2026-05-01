@@ -43,6 +43,13 @@ The `core-host` SHALL expose an `--accel` startup option with `userspace` as the
 - **THEN** startup continues with userspace routing
 - **AND** the fallback is logged
 
+#### Scenario: Host starts with eBPF acceleration and the Aya loader is available
+- **GIVEN** the operator starts `core-host --accel ebpf`
+- **AND** a compiled Tachyon eBPF artifact is available to the host build
+- **WHEN** the host initializes Layer 4 routing
+- **THEN** it loads the embedded eBPF object through the Aya loader
+- **AND** startup continues with the eBPF fast-path initialized
+
 ### Requirement: eBPF probe rules are represented independently
 The workspace SHALL provide a dedicated `ebpf-probes` crate that models Layer 4 rewrite keys and targets independently from the userspace host so packet rewrite behavior can be unit-tested before kernel loading is enabled.
 
