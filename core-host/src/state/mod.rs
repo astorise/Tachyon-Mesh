@@ -68,10 +68,17 @@ pub(crate) struct AppState {
     pub(crate) mtls_gateway: Option<Arc<tls_runtime::MtlsGatewayConfig>>,
     pub(crate) auth_manager: Arc<auth::AuthManager>,
     pub(crate) enrollment_manager: Arc<node_enrollment::EnrollmentManager>,
+    pub(crate) config_updates: broadcast::Sender<ConfigUpdate>,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     pub(crate) manifest_path: PathBuf,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     pub(crate) background_workers: Arc<BackgroundWorkerManager>,
+}
+
+impl AppState {
+    pub(crate) fn subscribe_config_updates(&self) -> broadcast::Receiver<ConfigUpdate> {
+        self.config_updates.subscribe()
+    }
 }
 
 #[derive(Clone)]

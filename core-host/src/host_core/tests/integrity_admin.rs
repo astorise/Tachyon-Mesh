@@ -90,6 +90,7 @@ async fn admin_manifest_update_accepts_higher_version_and_emits_outbox_event() {
     current.config_version = 1;
     let telemetry = telemetry::init_test_telemetry();
     let state = build_test_state(current.clone(), telemetry);
+    let mut updates = state.subscribe_config_updates();
 
     let mut next = current.clone();
     next.config_version = 7;
@@ -98,6 +99,15 @@ async fn admin_manifest_update_accepts_higher_version_and_emits_outbox_event() {
 
     let response = admin_manifest_update_handler(State(state.clone()), body).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let broadcast_event = updates
+        .recv()
+        .await
+        .expect("config update should broadcast");
+    assert_eq!(broadcast_event.version, 7);
+    assert_eq!(
+        broadcast_event.origin_node_id,
+        state.host_identity.public_key_hex
+    );
 
     // The outbox should now hold exactly one event for the new version.
     let rows = state

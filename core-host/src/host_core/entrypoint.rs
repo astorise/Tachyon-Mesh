@@ -53,6 +53,7 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     let mtls_gateway = tls_runtime::load_mtls_gateway_config_from_env()?;
     let auth_manager = Arc::new(auth::AuthManager::new(&manifest_path)?);
+    let (config_updates, _) = broadcast::channel(CONFIG_UPDATE_CHANNEL_CAPACITY);
     let (async_log_sender, async_log_receiver) = mpsc::channel(LOG_QUEUE_CAPACITY);
     background_workers.start_for_runtime(
         &runtime,
@@ -88,6 +89,7 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
         mtls_gateway: mtls_gateway.map(Arc::new),
         auth_manager,
         enrollment_manager: Arc::new(node_enrollment::EnrollmentManager::new()),
+        config_updates,
         manifest_path,
         background_workers: Arc::clone(&background_workers),
     };
