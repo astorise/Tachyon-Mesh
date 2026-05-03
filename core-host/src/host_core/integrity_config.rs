@@ -189,6 +189,8 @@ pub(crate) struct ConfigUpdateEvent {
     pub ts_ms: u64,
 }
 
+pub(crate) type ConfigUpdate = ConfigUpdateEvent;
+
 /// `POST /admin/manifest` body: the same `IntegrityManifest` shape as the
 /// on-disk file (so admin tooling can hand the file's bytes through unchanged).
 /// The payload's signature is verified against the same trust root as the
@@ -285,6 +287,7 @@ pub(crate) async fn admin_manifest_update_handler(
         origin_node_id: state.host_identity.public_key_hex.clone(),
         ts_ms,
     };
+    let _ = state.config_updates.send(event.clone());
     if let Ok(payload) = serde_json::to_vec(&event) {
         if let Err(error) = state
             .core_store

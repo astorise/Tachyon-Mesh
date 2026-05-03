@@ -30,6 +30,8 @@ members = [
     "systems/system-faas-logger",
     "systems/system-faas-otel",
     "systems/system-faas-gateway",
+    "systems/system-faas-config-api",
+    "systems/system-faas-gitops-broker",
     "systems/system-faas-cert-manager",
     "systems/system-faas-cdc",
     "systems/system-faas-dist-limiter",

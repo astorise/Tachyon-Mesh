@@ -96,7 +96,7 @@ pub(crate) use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 pub(crate) use tokio::net::UnixListener;
 pub(crate) use tokio::sync::Mutex as TokioMutex;
 pub(crate) use tokio::sync::{
-    mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError,
+    broadcast, mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError,
 };
 pub(crate) use tokio_rustls::LazyConfigAcceptor;
 pub(crate) use uuid::Uuid;

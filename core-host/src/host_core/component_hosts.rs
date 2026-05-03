@@ -639,6 +639,7 @@ pub(crate) fn build_component_wasi_ctx(
         wasi.env(&name, &value);
     }
     preopen_route_volumes(&mut wasi, route)?;
+    preopen_gitops_config_store(&mut wasi, route)?;
     Ok(wasi.build())
 }
 
@@ -766,6 +767,69 @@ pub(crate) fn preopen_route_volumes(
     }
 
     Ok(())
+}
+
+pub(crate) fn preopen_gitops_config_store(
+    wasi: &mut WasiCtxBuilder,
+    route: &IntegrityRoute,
+) -> std::result::Result<(), ExecutionError> {
+    if !is_gitops_broker_route(route)
+        || route_preopens_guest_path(route, GITOPS_CONFIG_STORE_GUEST_PATH)
+    {
+        return Ok(());
+    }
+
+    let host_path = gitops_config_store_host_path();
+    fs::create_dir_all(&host_path).map_err(|error| {
+        ExecutionError::Internal(format!(
+            "failed to initialize GitOps config store `{}` for route `{}`: {error}",
+            host_path.display(),
+            route.path
+        ))
+    })?;
+    wasi.preopened_dir(
+        &host_path,
+        GITOPS_CONFIG_STORE_GUEST_PATH,
+        volume_dir_perms(false),
+        volume_file_perms(false),
+    )
+    .map_err(|error| {
+        ExecutionError::Internal(format!(
+            "failed to preopen GitOps config store `{}` for route `{}` at guest path `{}`: {error}",
+            host_path.display(),
+            route.path,
+            GITOPS_CONFIG_STORE_GUEST_PATH
+        ))
+    })?;
+
+    Ok(())
+}
+
+pub(crate) fn is_gitops_broker_route(route: &IntegrityRoute) -> bool {
+    route.role == RouteRole::System
+        && (route.path == SYSTEM_GITOPS_BROKER_ROUTE
+            || route.name == SYSTEM_GITOPS_BROKER_MODULE
+            || route
+                .targets
+                .iter()
+                .any(|target| target.module == SYSTEM_GITOPS_BROKER_MODULE))
+}
+
+pub(crate) fn route_preopens_guest_path(route: &IntegrityRoute, guest_path: &str) -> bool {
+    let normalized = guest_path.trim_end_matches('/');
+    route
+        .volumes
+        .iter()
+        .any(|volume| volume.guest_path.trim_end_matches('/') == normalized)
+}
+
+pub(crate) fn gitops_config_store_host_path() -> PathBuf {
+    std::env::var(TACHYON_CONFIG_STORE_DIR_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_GITOPS_CONFIG_STORE_PATH))
 }
 
 pub(crate) fn preopen_batch_target_volumes(
