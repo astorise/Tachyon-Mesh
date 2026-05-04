@@ -1,0 +1,32 @@
+package tachyon:topology-config@1.0.0;
+
+interface config-topology {
+    enum enrollment-strategy {
+        manual,
+        device-flow,
+        zero-touch,
+    }
+
+    record gossip-config {
+        heartbeat-ms: u32,
+        peer-timeout-ms: u32,
+    }
+
+    record enrollment-config {
+        strategy: enrollment-strategy,
+        auto-approve-tags: list<string>,
+    }
+
+    record topology-configuration {
+        gossip: gossip-config,
+        enrollment: enrollment-config,
+    }
+
+    validate-topology-config: func(config: topology-configuration) -> result<_, string>;
+    get-topology-config: func() -> result<topology-configuration, string>;
+    apply-topology-config: func(config: topology-configuration) -> result<_, string>;
+}
+
+world mesh-topology-config {
+    export config-topology;
+}
