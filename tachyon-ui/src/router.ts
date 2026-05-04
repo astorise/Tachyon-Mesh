@@ -1,3 +1,6 @@
+import { RoutingController } from "./controllers/routingController";
+import { renderRoutingView } from "./views/routing";
+
 type RouteRenderer = () => string;
 
 export class Router {
@@ -27,12 +30,7 @@ export class Router {
           </div>
         </div>
       `,
-      "/routing": () => `
-        <div>
-          <h1 class="text-2xl font-semibold text-slate-100">Routing</h1>
-          <p class="text-slate-400">L4/L7 Configuration</p>
-        </div>
-      `,
+      "/routing": () => renderRoutingView(),
       "/security": () => `
         <div>
           <h1 class="text-2xl font-semibold text-slate-100">Security & IAM</h1>
@@ -54,6 +52,12 @@ export class Router {
           detail: { path, renderer, container: viewContainer },
         }),
       );
+    }
+  }
+
+  public initRoute(path: string) {
+    if (path === "/routing") {
+      RoutingController.init();
     }
   }
 }

@@ -11,7 +11,8 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 
 window.addEventListener("route-change", (event) => {
-  const { renderer, container } = (event as CustomEvent<{
+  const { path, renderer, container } = (event as CustomEvent<{
+    path: string;
     renderer: () => string;
     container: HTMLElement;
   }>).detail;
@@ -23,6 +24,8 @@ window.addEventListener("route-change", (event) => {
     ease: "power1.in",
     onComplete: () => {
       container.innerHTML = renderer();
+      const router = (window as unknown as { tachyonRouter?: { initRoute(path: string): void } }).tachyonRouter;
+      router?.initRoute(path);
       gsap.fromTo(
         container.children,
         { opacity: 0, y: 10 },
