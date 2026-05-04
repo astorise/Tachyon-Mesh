@@ -16,7 +16,7 @@ interface config-observability {
 
     record trace-policy {
         otlp-endpoint: option<string>,
-        sample-rate: float64,
+        sample-rate: f64,
     }
 
     record telemetry-config {
