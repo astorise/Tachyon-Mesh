@@ -1,0 +1,43 @@
+package tachyon:routing@1.0.0;
+
+interface config-routing {
+    enum protocol {
+        tcp,
+        udp,
+        http,
+        https,
+        grpc,
+        uds,
+    }
+
+    enum accel-mode {
+        userspace,
+        ebpf,
+    }
+
+    record gateway-config {
+        name: string,
+        proto: protocol,
+        bind-address: string,
+        accel: accel-mode,
+    }
+
+    record route-config {
+        name: string,
+        gateway-refs: list<string>,
+    }
+
+    record traffic-configuration {
+        gateways: list<gateway-config>,
+        routes: list<route-config>,
+    }
+
+    validate-traffic-config: func(config: traffic-configuration) -> result<_, string>;
+    get-config: func() -> result<traffic-configuration, string>;
+    apply-route: func(route: route-config) -> result<_, string>;
+    delete-route: func(name: string) -> result<_, string>;
+}
+
+world traffic-management-config {
+    export config-routing;
+}
