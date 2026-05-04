@@ -1,0 +1,56 @@
+package tachyon:observability-config@1.0.0;
+
+interface config-observability {
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+        fatal,
+    }
+
+    record log-policy {
+        global-level: log-level,
+    }
+
+    record trace-policy {
+        otlp-endpoint: option<string>,
+        sample-rate: float64,
+    }
+
+    record telemetry-config {
+        logs: log-policy,
+        traces: trace-policy,
+    }
+
+    record resource-limits {
+        max-memory-mb: u32,
+        max-cpu-millis: u32,
+    }
+
+    record scaling-policy {
+        min-instances: u32,
+        max-instances: u32,
+    }
+
+    record compute-quota {
+        target-group-ref: string,
+        limits: resource-limits,
+        scaling: scaling-policy,
+    }
+
+    record ops-configuration {
+        telemetry: telemetry-config,
+        quotas: list<compute-quota>,
+    }
+
+    validate-ops-config: func(config: ops-configuration) -> result<_, string>;
+    get-ops-config: func() -> result<ops-configuration, string>;
+    apply-compute-quota: func(quota: compute-quota) -> result<_, string>;
+    update-telemetry: func(config: telemetry-config) -> result<_, string>;
+}
+
+world observability-compute-config {
+    export config-observability;
+}

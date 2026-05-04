@@ -65,6 +65,14 @@ mod topology_contract {
     });
 }
 
+#[allow(dead_code)]
+mod observability_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-observability.wit",
+        world: "observability-compute-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -126,6 +134,18 @@ pub fn validate_topology_config<T>(_config: T) -> Result<(), String> {
 }
 
 pub fn apply_topology_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_ops_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_compute_quota<T>(_quota: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn update_telemetry<T>(_config: T) -> Result<(), String> {
     Ok(())
 }
 
@@ -295,5 +315,12 @@ mod tests {
     fn topology_config_scaffold_accepts_updates() {
         validate_topology_config(()).expect("topology config scaffold accepts payloads");
         apply_topology_config(()).expect("topology update scaffold accepts payloads");
+    }
+
+    #[test]
+    fn observability_config_scaffold_accepts_updates() {
+        validate_ops_config(()).expect("ops config scaffold accepts payloads");
+        apply_compute_quota(()).expect("quota scaffold accepts payloads");
+        update_telemetry(()).expect("telemetry scaffold accepts payloads");
     }
 }
