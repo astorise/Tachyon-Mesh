@@ -1,0 +1,39 @@
+package tachyon:cache-config@1.0.0;
+
+interface config-cache {
+    enum distribution-mode {
+        local-only,
+        distributed-gossip,
+    }
+
+    enum eviction-policy {
+        lru,
+        lfu,
+        fifo,
+    }
+
+    enum encryption-mode {
+        none,
+        transparent-data-encryption,
+    }
+
+    record distributed-cache-config {
+        name: string,
+        tenant-isolation: bool,
+        distribution: distribution-mode,
+        eviction: eviction-policy,
+        encryption: encryption-mode,
+    }
+
+    record cache-configuration {
+        caches: list<distributed-cache-config>,
+    }
+
+    validate-cache-config: func(config: cache-configuration) -> result<_, string>;
+    get-cache-config: func() -> result<cache-configuration, string>;
+    apply-cache-config: func(config: distributed-cache-config) -> result<_, string>;
+}
+
+world distributed-cache-config {
+    export config-cache;
+}

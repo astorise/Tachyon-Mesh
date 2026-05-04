@@ -33,6 +33,14 @@ mod assets_contract {
     });
 }
 
+#[allow(dead_code)]
+mod cache_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-cache.wit",
+        world: "distributed-cache-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -58,6 +66,14 @@ pub fn validate_asset_config<T>(_config: T) -> Result<(), String> {
 }
 
 pub fn apply_asset_bundle<T>(_bundle: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_cache_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_cache_config<T>(_config: T) -> Result<(), String> {
     Ok(())
 }
 
@@ -202,5 +218,11 @@ mod tests {
     fn asset_config_scaffold_accepts_bundles() {
         validate_asset_config(()).expect("asset config scaffold accepts payloads");
         apply_asset_bundle(()).expect("asset bundle scaffold accepts payloads");
+    }
+
+    #[test]
+    fn cache_config_scaffold_accepts_cache_configs() {
+        validate_cache_config(()).expect("cache config scaffold accepts payloads");
+        apply_cache_config(()).expect("cache apply scaffold accepts payloads");
     }
 }
