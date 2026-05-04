@@ -73,6 +73,14 @@ mod observability_contract {
     });
 }
 
+#[allow(dead_code)]
+mod resilience_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-resilience.wit",
+        world: "resilience-chaos-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -146,6 +154,18 @@ pub fn apply_compute_quota<T>(_quota: T) -> Result<(), String> {
 }
 
 pub fn update_telemetry<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_resilience_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_resilience_policy<T>(_policy: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn delete_resilience_policy(_name: &str) -> Result<(), String> {
     Ok(())
 }
 
@@ -322,5 +342,12 @@ mod tests {
         validate_ops_config(()).expect("ops config scaffold accepts payloads");
         apply_compute_quota(()).expect("quota scaffold accepts payloads");
         update_telemetry(()).expect("telemetry scaffold accepts payloads");
+    }
+
+    #[test]
+    fn resilience_config_scaffold_accepts_policies() {
+        validate_resilience_config(()).expect("resilience config scaffold accepts payloads");
+        apply_resilience_policy(()).expect("resilience policy scaffold accepts payloads");
+        delete_resilience_policy("default").expect("resilience delete scaffold accepts names");
     }
 }
