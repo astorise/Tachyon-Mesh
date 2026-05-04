@@ -1,0 +1,36 @@
+package tachyon:fleet-config@1.0.0;
+
+interface config-fleet {
+    enum rollout-strategy {
+        rolling-update,
+        blue-green,
+        all-at-once,
+    }
+
+    record label-selector {
+        match-labels: list<tuple<string, string>>,
+    }
+
+    record rollout-policy {
+        strategy: rollout-strategy,
+        max-unavailable: u32,
+    }
+
+    record fleet-profile {
+        name: string,
+        selector: label-selector,
+        rollout: rollout-policy,
+    }
+
+    record fleet-configuration {
+        profiles: list<fleet-profile>,
+    }
+
+    validate-fleet-config: func(config: fleet-configuration) -> result<_, string>;
+    get-fleet-config: func() -> result<fleet-configuration, string>;
+    apply-fleet-profile: func(profile: fleet-profile) -> result<_, string>;
+}
+
+world fleet-profile-config {
+    export config-fleet;
+}
