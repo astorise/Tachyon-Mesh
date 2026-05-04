@@ -40,3 +40,11 @@ The MCP server MUST provide a tool that validates draft FaaS hardware policies b
 - **THEN** the server simulates the admission decision
 - **AND** it returns approval or a structured rejection reason
 
+### Requirement: Hardware accelerators MUST be declaratively allocatable
+The control plane SHALL use the declarative GitOps schema to negotiate the allocation of TPUs, GPUs, and eBPF network maps with the host operating system.
+
+#### Scenario: Configuring eBPF XDP in generic mode
+- **WHEN** the `system-faas-config-api` receives a configuration setting `ebpf_xdp.mode` to `generic`
+- **THEN** the `core-host` gracefully reloads the eBPF probes
+- **AND** attaches them to the generic network stack (SKB) instead of the native driver queue, preventing compatibility panics on older hardware.
+
