@@ -1,0 +1,54 @@
+package tachyon:resilience-config@1.0.0;
+
+interface config-resilience {
+    enum fault-type {
+        latency,
+        abort,
+    }
+
+    record timeout-policy {
+        request-timeout-ms: u32,
+    }
+
+    record retry-policy {
+        max-attempts: u8,
+        backoff-ms: u32,
+    }
+
+    record shadow-policy {
+        target-group-ref: string,
+        percentage: u8,
+    }
+
+    record chaos-fault {
+        fault-type: fault-type,
+        value-ms: option<u32>,
+    }
+
+    record chaos-policy {
+        percentage: u8,
+        fault: chaos-fault,
+    }
+
+    record resilience-policy {
+        name: string,
+        target-route-refs: list<string>,
+        timeouts: option<timeout-policy>,
+        retries: option<retry-policy>,
+        shadow: option<shadow-policy>,
+        chaos: option<chaos-policy>,
+    }
+
+    record resilience-configuration {
+        policies: list<resilience-policy>,
+    }
+
+    validate-resilience-config: func(config: resilience-configuration) -> result<_, string>;
+    get-resilience-config: func() -> result<resilience-configuration, string>;
+    apply-resilience-policy: func(policy: resilience-policy) -> result<_, string>;
+    delete-resilience-policy: func(name: string) -> result<_, string>;
+}
+
+world resilience-chaos-config {
+    export config-resilience;
+}
