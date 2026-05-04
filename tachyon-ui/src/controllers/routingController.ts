@@ -1,4 +1,5 @@
 import gsap from "gsap";
+import { invoke } from "@tauri-apps/api/core";
 
 type TrafficConfiguration = {
   api_version: "routing.tachyon.io/v1alpha1";
@@ -36,11 +37,22 @@ export class RoutingController {
       return;
     }
 
-    deployBtn.addEventListener("click", () => {
+    deployBtn.addEventListener("click", async () => {
       gsap.to(deployBtn, { scale: 0.95, duration: 0.1, yoyo: true, repeat: 1 });
       const payload = this.buildPayload();
-      console.log("Pushing to System FaaS Config API:", JSON.stringify(payload, null, 2));
-      this.showToast("Configuration Applied Successfully");
+
+      try {
+        const response = await invoke<{ success: boolean; message: string }>("apply_configuration", {
+          domain: "config-routing",
+          payload,
+        });
+
+        if (response.success) {
+          this.showToast(response.message, "success");
+        }
+      } catch (error) {
+        this.showToast(String(error), "error");
+      }
     });
   }
 
@@ -84,10 +96,14 @@ export class RoutingController {
     };
   }
 
-  private static showToast(message: string) {
+  private static showToast(message: string, type: "success" | "error" = "success") {
     const toast = document.createElement("div");
+    const tone =
+      type === "success"
+        ? "border-emerald-500/30 text-emerald-300"
+        : "border-red-500/30 text-red-300";
     toast.className =
-      "fixed bottom-6 right-6 z-50 rounded border border-emerald-500/30 bg-slate-900 px-4 py-3 text-sm text-emerald-300 shadow-lg";
+      `fixed bottom-6 right-6 z-50 rounded border bg-slate-900 px-4 py-3 text-sm shadow-lg ${tone}`;
     toast.textContent = message;
     document.body.appendChild(toast);
     gsap.fromTo(toast, { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.2 });

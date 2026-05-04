@@ -4,7 +4,14 @@
 )]
 
 use serde::Deserialize;
+use serde_json::Value;
 use tauri::Emitter;
+
+#[derive(serde::Serialize)]
+struct ApiResponse {
+    success: bool,
+    message: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -214,6 +221,28 @@ async fn delete_resource(name: String) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn apply_configuration(domain: String, payload: Value) -> Result<ApiResponse, String> {
+    println!("Received IPC Intent for Domain: {domain}");
+
+    if domain == "config-routing" {
+        if payload
+            .get("api_version")
+            .and_then(Value::as_str)
+            == Some("routing.tachyon.io/v1alpha1")
+        {
+            return Ok(ApiResponse {
+                success: true,
+                message: "Configuration dynamically validated by Rust Backend".to_owned(),
+            });
+        }
+
+        return Err("Invalid Schema: Missing or incorrect api_version".to_owned());
+    }
+
+    Err(format!("Unknown configuration domain: {domain}"))
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -235,7 +264,8 @@ fn main() {
             get_hardware_status,
             validate_hardware_policy,
             save_resource,
-            delete_resource
+            delete_resource,
+            apply_configuration
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
