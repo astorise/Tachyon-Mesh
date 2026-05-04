@@ -57,6 +57,14 @@ mod hardware_contract {
     });
 }
 
+#[allow(dead_code)]
+mod topology_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-topology.wit",
+        world: "mesh-topology-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -110,6 +118,14 @@ pub fn validate_hardware_config<T>(_config: T) -> Result<(), String> {
 }
 
 pub fn update_hardware<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_topology_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_topology_config<T>(_config: T) -> Result<(), String> {
     Ok(())
 }
 
@@ -273,5 +289,11 @@ mod tests {
     fn hardware_config_scaffold_accepts_updates() {
         validate_hardware_config(()).expect("hardware config scaffold accepts payloads");
         update_hardware(()).expect("hardware update scaffold accepts payloads");
+    }
+
+    #[test]
+    fn topology_config_scaffold_accepts_updates() {
+        validate_topology_config(()).expect("topology config scaffold accepts payloads");
+        apply_topology_config(()).expect("topology update scaffold accepts payloads");
     }
 }
