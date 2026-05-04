@@ -1,0 +1,54 @@
+package tachyon:rbac-config@1.0.0;
+
+interface config-rbac {
+    enum action {
+        create,
+        read,
+        update,
+        delete,
+    }
+
+    enum subject-kind {
+        user,
+        oidc-group,
+        service-account,
+    }
+
+    record permission {
+        domains: list<string>,
+        actions: list<action>,
+    }
+
+    record role {
+        name: string,
+        permissions: list<permission>,
+    }
+
+    record subject {
+        kind: subject-kind,
+        name: string,
+    }
+
+    record label-selector {
+        match-labels: list<tuple<string, string>>,
+    }
+
+    record role-binding {
+        name: string,
+        role-ref: string,
+        subjects: list<subject>,
+        resource-selectors: option<label-selector>,
+    }
+
+    record rbac-configuration {
+        roles: list<role>,
+        bindings: list<role-binding>,
+    }
+
+    validate-rbac-config: func(config: rbac-configuration) -> result<_, string>;
+    evaluate-access: func(subject-claims: list<tuple<string, string>>, action: action, domain: string, resource-labels: list<tuple<string, string>>) -> result<bool, string>;
+}
+
+world control-plane-rbac-config {
+    export config-rbac;
+}
