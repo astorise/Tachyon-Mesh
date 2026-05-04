@@ -25,6 +25,14 @@ mod ai_contract {
     });
 }
 
+#[allow(dead_code)]
+mod assets_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-assets.wit",
+        world: "air-gapped-asset-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -42,6 +50,14 @@ pub fn validate_ai_config<T>(_config: T) -> Result<(), String> {
 }
 
 pub fn apply_model_deployment<T>(_deployment: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_asset_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_asset_bundle<T>(_bundle: T) -> Result<(), String> {
     Ok(())
 }
 
@@ -180,5 +196,11 @@ mod tests {
     fn ai_config_scaffold_accepts_model_deployments() {
         validate_ai_config(()).expect("AI config scaffold accepts payloads");
         apply_model_deployment(()).expect("AI deployment scaffold accepts payloads");
+    }
+
+    #[test]
+    fn asset_config_scaffold_accepts_bundles() {
+        validate_asset_config(()).expect("asset config scaffold accepts payloads");
+        apply_asset_bundle(()).expect("asset bundle scaffold accepts payloads");
     }
 }

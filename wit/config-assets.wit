@@ -1,0 +1,39 @@
+package tachyon:asset-config@1.0.0;
+
+interface config-assets {
+    enum asset-type {
+        wasm-component,
+        ai-model-gguf,
+        static-blob,
+    }
+
+    record artifact-metadata {
+        name: string,
+        asset-type: asset-type,
+        sha256-hash: string,
+        signature: option<string>,
+    }
+
+    record security-policy {
+        strict-signature-verification: bool,
+        allowed-public-keys: list<string>,
+    }
+
+    record asset-bundle {
+        name: string,
+        artifacts: list<artifact-metadata>,
+        security: security-policy,
+    }
+
+    record asset-configuration {
+        bundles: list<asset-bundle>,
+    }
+
+    validate-asset-config: func(config: asset-configuration) -> result<_, string>;
+    get-asset-config: func() -> result<asset-configuration, string>;
+    apply-asset-bundle: func(bundle: asset-bundle) -> result<_, string>;
+}
+
+world air-gapped-asset-config {
+    export config-assets;
+}
