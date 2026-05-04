@@ -456,9 +456,7 @@ mod tests {
     #[test]
     fn rbac_config_scaffold_allows_access_by_default() {
         validate_rbac_config(()).expect("rbac config scaffold accepts payloads");
-        assert!(
-            evaluate_access((), (), "config-routing", ())
-                .expect("rbac evaluation scaffold accepts payloads")
-        );
+        assert!(evaluate_access((), (), "config-routing", ())
+            .expect("rbac evaluation scaffold accepts payloads"));
     }
 }

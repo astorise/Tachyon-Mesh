@@ -226,10 +226,7 @@ async fn apply_configuration(domain: String, payload: Value) -> Result<ApiRespon
     println!("Received IPC Intent for Domain: {domain}");
 
     if domain == "config-routing" {
-        if payload
-            .get("api_version")
-            .and_then(Value::as_str)
-            == Some("routing.tachyon.io/v1alpha1")
+        if payload.get("api_version").and_then(Value::as_str) == Some("routing.tachyon.io/v1alpha1")
         {
             return Ok(ApiResponse {
                 success: true,
