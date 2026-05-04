@@ -9,14 +9,14 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/api": "^2.11.0",
     "gsap": "^3.13.0",
     "qrcode": "^1.5.4",
     "zustand": "^5.0.12"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.16",
-    "@tauri-apps/cli": "^2.10.1",
+    "@tauri-apps/cli": "^2.11.0",
     "@types/qrcode": "^1.5.5",
     "autoprefixer": "^10.4.21",
     "postcss": "^8.5.6",
