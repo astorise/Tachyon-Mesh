@@ -9,6 +9,14 @@ mod bindings {
     export!(Component);
 }
 
+#[allow(dead_code)]
+mod routing_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-routing.wit",
+        world: "traffic-management-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -16,6 +24,10 @@ const DEFAULT_BROKER_ROUTE: &str = "/system/gitops-broker";
 const ENVIRONMENT_HEADER: &str = "x-tachyon-environment";
 
 struct Component;
+
+pub fn validate_traffic_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
 
 impl bindings::exports::tachyon::mesh::handler::Guest for Component {
     fn handle_request(
@@ -141,5 +153,10 @@ mod tests {
             .expect_err("slash should be rejected");
 
         assert!(error.contains("environment"));
+    }
+
+    #[test]
+    fn validate_traffic_config_scaffold_accepts_typed_payloads() {
+        validate_traffic_config(()).expect("scaffold validator accepts payloads");
     }
 }
