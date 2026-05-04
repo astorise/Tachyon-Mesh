@@ -81,6 +81,14 @@ mod resilience_contract {
     });
 }
 
+#[allow(dead_code)]
+mod security_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-security.wit",
+        world: "security-identity-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -166,6 +174,18 @@ pub fn apply_resilience_policy<T>(_policy: T) -> Result<(), String> {
 }
 
 pub fn delete_resilience_policy(_name: &str) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_security_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_rate_limit<T>(_limit: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn delete_rate_limit(_name: &str) -> Result<(), String> {
     Ok(())
 }
 
@@ -349,5 +369,12 @@ mod tests {
         validate_resilience_config(()).expect("resilience config scaffold accepts payloads");
         apply_resilience_policy(()).expect("resilience policy scaffold accepts payloads");
         delete_resilience_policy("default").expect("resilience delete scaffold accepts names");
+    }
+
+    #[test]
+    fn security_config_scaffold_accepts_rate_limits() {
+        validate_security_config(()).expect("security config scaffold accepts payloads");
+        apply_rate_limit(()).expect("rate-limit scaffold accepts payloads");
+        delete_rate_limit("default").expect("rate-limit delete scaffold accepts names");
     }
 }

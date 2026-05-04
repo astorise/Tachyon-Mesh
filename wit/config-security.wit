@@ -1,0 +1,66 @@
+package tachyon:security-config@1.0.0;
+
+interface config-security {
+    enum auth-type {
+        jwt,
+        mtls,
+        api-key,
+    }
+
+    enum action-type {
+        allow,
+        deny,
+        custom-challenge,
+    }
+
+    enum limit-algorithm {
+        token-bucket,
+        distributed-crdt,
+    }
+
+    enum limit-scope {
+        global,
+        identity-tenant,
+        identity-subject,
+        ip-address,
+    }
+
+    record auth-provider {
+        name: string,
+        auth-type: auth-type,
+    }
+
+    record authz-policy {
+        name: string,
+        target-route-refs: list<string>,
+        action: action-type,
+    }
+
+    record limit-threshold {
+        requests-per-second: u32,
+        burst: u32,
+    }
+
+    record rate-limit-policy {
+        name: string,
+        target-route-refs: list<string>,
+        algo: limit-algorithm,
+        scope: limit-scope,
+        threshold: limit-threshold,
+    }
+
+    record security-configuration {
+        providers: list<auth-provider>,
+        authz: list<authz-policy>,
+        rate-limits: list<rate-limit-policy>,
+    }
+
+    validate-security-config: func(config: security-configuration) -> result<_, string>;
+    get-security-config: func() -> result<security-configuration, string>;
+    apply-rate-limit: func(limit: rate-limit-policy) -> result<_, string>;
+    delete-rate-limit: func(name: string) -> result<_, string>;
+}
+
+world security-identity-config {
+    export config-security;
+}
