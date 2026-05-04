@@ -1,4 +1,6 @@
+import { AiOrchestrationController } from "./controllers/aiController";
 import { RoutingController } from "./controllers/routingController";
+import { renderAiOrchestrationView } from "./views/aiOrchestration";
 import { renderRoutingView } from "./views/routing";
 
 type RouteRenderer = () => string;
@@ -31,6 +33,7 @@ export class Router {
         </div>
       `,
       "/routing": () => renderRoutingView(),
+      "/ai-models": () => renderAiOrchestrationView(),
       "/security": () => `
         <div>
           <h1 class="text-2xl font-semibold text-slate-100">Security & IAM</h1>
@@ -58,6 +61,8 @@ export class Router {
   public initRoute(path: string) {
     if (path === "/routing") {
       RoutingController.init();
+    } else if (path === "/ai-models") {
+      AiOrchestrationController.init();
     }
   }
 }
