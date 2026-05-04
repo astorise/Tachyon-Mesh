@@ -96,3 +96,10 @@ The workspace SHALL provide a `system-faas-otel` component that accepts sampled 
 - **WHEN** `system-faas-otel` handles the batch
 - **THEN** it appends the normalized span payload to `/app/data/otel-spans.ndjson`
 
+### Requirement: Telemetry levels MUST be hot-reloadable
+The runtime SHALL adjust log levels and distributed tracing sampling rates dynamically based on the declarative GitOps state without restarting the host daemon.
+
+#### Scenario: Enabling debug logs for a specific component
+- **WHEN** the config API updates the `ObservabilityAndCompute` state with a debug override for `system-faas-authz`
+- **THEN** the logging subsystem immediately begins emitting DEBUG level logs only for the `system-faas-authz` target, leaving the rest of the mesh at INFO level.
+
