@@ -49,6 +49,14 @@ mod fleet_contract {
     });
 }
 
+#[allow(dead_code)]
+mod hardware_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-hardware.wit",
+        world: "hardware-acceleration-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -95,6 +103,14 @@ pub fn apply_fleet_profile<T>(_profile: T) -> Result<(), String> {
 
 pub fn fleet_profile_matches_node<T, U>(_profile: T, _node: U) -> bool {
     true
+}
+
+pub fn validate_hardware_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn update_hardware<T>(_config: T) -> Result<(), String> {
+    Ok(())
 }
 
 impl bindings::exports::tachyon::mesh::handler::Guest for Component {
@@ -251,5 +267,11 @@ mod tests {
         validate_fleet_config(()).expect("fleet config scaffold accepts payloads");
         apply_fleet_profile(()).expect("fleet profile scaffold accepts payloads");
         assert!(fleet_profile_matches_node((), ()));
+    }
+
+    #[test]
+    fn hardware_config_scaffold_accepts_updates() {
+        validate_hardware_config(()).expect("hardware config scaffold accepts payloads");
+        update_hardware(()).expect("hardware update scaffold accepts payloads");
     }
 }
