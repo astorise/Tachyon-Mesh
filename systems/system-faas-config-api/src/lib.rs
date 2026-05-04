@@ -89,6 +89,14 @@ mod security_contract {
     });
 }
 
+#[allow(dead_code)]
+mod storage_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-storage.wit",
+        world: "storage-state-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -186,6 +194,22 @@ pub fn apply_rate_limit<T>(_limit: T) -> Result<(), String> {
 }
 
 pub fn delete_rate_limit(_name: &str) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_storage_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_wasi_volume<T>(_volume: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_s3_backend<T>(_backend: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_kv_partition<T>(_partition: T) -> Result<(), String> {
     Ok(())
 }
 
@@ -376,5 +400,13 @@ mod tests {
         validate_security_config(()).expect("security config scaffold accepts payloads");
         apply_rate_limit(()).expect("rate-limit scaffold accepts payloads");
         delete_rate_limit("default").expect("rate-limit delete scaffold accepts names");
+    }
+
+    #[test]
+    fn storage_config_scaffold_accepts_resources() {
+        validate_storage_config(()).expect("storage config scaffold accepts payloads");
+        apply_wasi_volume(()).expect("volume scaffold accepts payloads");
+        apply_s3_backend(()).expect("s3 scaffold accepts payloads");
+        apply_kv_partition(()).expect("kv scaffold accepts payloads");
     }
 }

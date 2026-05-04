@@ -1,0 +1,53 @@
+package tachyon:storage-config@1.0.0;
+
+interface config-storage {
+    enum volume-type {
+        local-disk,
+        memory-tmpfs,
+    }
+
+    enum kv-persistence {
+        memory-only,
+        disk-backed,
+    }
+
+    record volume-gc-policy {
+        enabled: bool,
+        ttl-seconds: option<u64>,
+    }
+
+    record wasi-volume {
+        name: string,
+        guest-path: string,
+        volume-type: volume-type,
+        max-size-mb: option<u32>,
+        gc: option<volume-gc-policy>,
+    }
+
+    record s3-backend {
+        name: string,
+        bucket: string,
+    }
+
+    record kv-partition {
+        name: string,
+        persistence: kv-persistence,
+        sync-to-s3-backend-ref: option<string>,
+    }
+
+    record storage-configuration {
+        volumes: list<wasi-volume>,
+        s3-backends: list<s3-backend>,
+        kv-partitions: list<kv-partition>,
+    }
+
+    validate-storage-config: func(config: storage-configuration) -> result<_, string>;
+    get-storage-config: func() -> result<storage-configuration, string>;
+    apply-wasi-volume: func(vol: wasi-volume) -> result<_, string>;
+    apply-s3-backend: func(s3: s3-backend) -> result<_, string>;
+    apply-kv-partition: func(kv: kv-partition) -> result<_, string>;
+}
+
+world storage-state-config {
+    export config-storage;
+}
