@@ -105,6 +105,14 @@ mod workloads_contract {
     });
 }
 
+#[allow(dead_code)]
+mod rbac_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-rbac.wit",
+        world: "control-plane-rbac-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -227,6 +235,19 @@ pub fn validate_workload_config<T>(_config: T) -> Result<(), String> {
 
 pub fn apply_workload<T>(_spec: T) -> Result<(), String> {
     Ok(())
+}
+
+pub fn validate_rbac_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn evaluate_access<T, U>(
+    _subject_claims: T,
+    _action: U,
+    _domain: &str,
+    _resource_labels: T,
+) -> Result<bool, String> {
+    Ok(true)
 }
 
 impl bindings::exports::tachyon::mesh::handler::Guest for Component {
@@ -430,5 +451,14 @@ mod tests {
     fn workload_config_scaffold_accepts_specs() {
         validate_workload_config(()).expect("workload config scaffold accepts payloads");
         apply_workload(()).expect("workload scaffold accepts payloads");
+    }
+
+    #[test]
+    fn rbac_config_scaffold_allows_access_by_default() {
+        validate_rbac_config(()).expect("rbac config scaffold accepts payloads");
+        assert!(
+            evaluate_access((), (), "config-routing", ())
+                .expect("rbac evaluation scaffold accepts payloads")
+        );
     }
 }
