@@ -1,0 +1,52 @@
+package tachyon:hardware-config@1.0.0;
+
+interface config-hardware {
+    enum xdp-mode {
+        native,
+        generic,
+    }
+
+    enum accelerator-type {
+        gpu,
+        tpu,
+        npu,
+        fpga,
+    }
+
+    enum tee-provider {
+        intel-sgx,
+        amd-sev,
+        aws-nitro,
+        arm-cca,
+    }
+
+    record ebpf-config {
+        enabled: bool,
+        mode: xdp-mode,
+    }
+
+    record coprocessor-config {
+        device-type: accelerator-type,
+        count: u32,
+    }
+
+    record tee-config {
+        enabled: bool,
+        provider: tee-provider,
+        strict-enforcement: bool,
+    }
+
+    record hardware-configuration {
+        network: option<ebpf-config>,
+        accelerators: list<coprocessor-config>,
+        tee: option<tee-config>,
+    }
+
+    validate-hardware-config: func(config: hardware-configuration) -> result<_, string>;
+    get-hardware-config: func() -> result<hardware-configuration, string>;
+    update-hardware: func(config: hardware-configuration) -> result<_, string>;
+}
+
+world hardware-acceleration-config {
+    export config-hardware;
+}
