@@ -1,0 +1,44 @@
+package tachyon:workload-config@1.0.0;
+
+interface config-workloads {
+    enum runtime-type {
+        faas-wasm,
+        smolvm-microvm,
+        legacy-container,
+    }
+
+    enum secret-backend {
+        system-faas-tde,
+        external-vault,
+    }
+
+    record secret-provider {
+        name: string,
+        backend: secret-backend,
+    }
+
+    record secret-mount {
+        env-var: string,
+        secret-ref: string,
+    }
+
+    record workload-spec {
+        name: string,
+        runtime: runtime-type,
+        endpoint: option<string>,
+        secret-mounts: list<secret-mount>,
+    }
+
+    record workload-configuration {
+        secrets: list<secret-provider>,
+        workloads: list<workload-spec>,
+    }
+
+    validate-workload-config: func(config: workload-configuration) -> result<_, string>;
+    get-workload-config: func() -> result<workload-configuration, string>;
+    apply-workload: func(spec: workload-spec) -> result<_, string>;
+}
+
+world workload-orchestration-config {
+    export config-workloads;
+}
