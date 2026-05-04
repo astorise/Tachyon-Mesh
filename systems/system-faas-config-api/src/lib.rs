@@ -41,6 +41,14 @@ mod cache_contract {
     });
 }
 
+#[allow(dead_code)]
+mod fleet_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-fleet.wit",
+        world: "fleet-profile-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -75,6 +83,18 @@ pub fn validate_cache_config<T>(_config: T) -> Result<(), String> {
 
 pub fn apply_cache_config<T>(_config: T) -> Result<(), String> {
     Ok(())
+}
+
+pub fn validate_fleet_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_fleet_profile<T>(_profile: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn fleet_profile_matches_node<T, U>(_profile: T, _node: U) -> bool {
+    true
 }
 
 impl bindings::exports::tachyon::mesh::handler::Guest for Component {
@@ -224,5 +244,12 @@ mod tests {
     fn cache_config_scaffold_accepts_cache_configs() {
         validate_cache_config(()).expect("cache config scaffold accepts payloads");
         apply_cache_config(()).expect("cache apply scaffold accepts payloads");
+    }
+
+    #[test]
+    fn fleet_config_scaffold_accepts_profiles() {
+        validate_fleet_config(()).expect("fleet config scaffold accepts payloads");
+        apply_fleet_profile(()).expect("fleet profile scaffold accepts payloads");
+        assert!(fleet_profile_matches_node((), ()));
     }
 }
