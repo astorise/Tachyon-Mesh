@@ -97,6 +97,14 @@ mod storage_contract {
     });
 }
 
+#[allow(dead_code)]
+mod workloads_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-workloads.wit",
+        world: "workload-orchestration-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -210,6 +218,14 @@ pub fn apply_s3_backend<T>(_backend: T) -> Result<(), String> {
 }
 
 pub fn apply_kv_partition<T>(_partition: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_workload_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_workload<T>(_spec: T) -> Result<(), String> {
     Ok(())
 }
 
@@ -408,5 +424,11 @@ mod tests {
         apply_wasi_volume(()).expect("volume scaffold accepts payloads");
         apply_s3_backend(()).expect("s3 scaffold accepts payloads");
         apply_kv_partition(()).expect("kv scaffold accepts payloads");
+    }
+
+    #[test]
+    fn workload_config_scaffold_accepts_specs() {
+        validate_workload_config(()).expect("workload config scaffold accepts payloads");
+        apply_workload(()).expect("workload scaffold accepts payloads");
     }
 }
