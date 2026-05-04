@@ -1,0 +1,66 @@
+package tachyon:ai-config@1.0.0;
+
+interface config-ai {
+    enum engine-backend {
+        cpu,
+        cuda,
+        metal,
+        auto-detect,
+    }
+
+    enum gpu-distribution {
+        single,
+        tensor-parallelism,
+        pipeline-parallelism,
+    }
+
+    enum sharing-mode {
+        isolated,
+        lora-multiplexing,
+    }
+
+    record engine-config {
+        backend: engine-backend,
+        quantization: option<string>,
+        max-context-window: u32,
+        flash-attention: bool,
+    }
+
+    record hardware-strategy {
+        multi-gpu: bool,
+        distribution-mode: gpu-distribution,
+    }
+
+    record lora-adapter {
+        name: string,
+        asset-ref: string,
+        routing-header-key: string,
+        routing-header-value: string,
+    }
+
+    record sharing-strategy {
+        mode: sharing-mode,
+        base-model-memory-lock: bool,
+        adapters: list<lora-adapter>,
+    }
+
+    record model-deployment {
+        name: string,
+        asset-ref: string,
+        engine: engine-config,
+        strategy: hardware-strategy,
+        sharing: sharing-strategy,
+    }
+
+    record ai-configuration {
+        deployments: list<model-deployment>,
+    }
+
+    validate-ai-config: func(config: ai-configuration) -> result<_, string>;
+    get-ai-config: func() -> result<ai-configuration, string>;
+    apply-model-deployment: func(deployment: model-deployment) -> result<_, string>;
+}
+
+world ai-orchestration-config {
+    export config-ai;
+}

@@ -17,6 +17,14 @@ mod routing_contract {
     });
 }
 
+#[allow(dead_code)]
+mod ai_contract {
+    wit_bindgen::generate!({
+        path: "../../wit/config-ai.wit",
+        world: "ai-orchestration-config",
+    });
+}
+
 use serde_json::Value;
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -26,6 +34,14 @@ const ENVIRONMENT_HEADER: &str = "x-tachyon-environment";
 struct Component;
 
 pub fn validate_traffic_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn validate_ai_config<T>(_config: T) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn apply_model_deployment<T>(_deployment: T) -> Result<(), String> {
     Ok(())
 }
 
@@ -158,5 +174,11 @@ mod tests {
     #[test]
     fn validate_traffic_config_scaffold_accepts_typed_payloads() {
         validate_traffic_config(()).expect("scaffold validator accepts payloads");
+    }
+
+    #[test]
+    fn ai_config_scaffold_accepts_model_deployments() {
+        validate_ai_config(()).expect("AI config scaffold accepts payloads");
+        apply_model_deployment(()).expect("AI deployment scaffold accepts payloads");
     }
 }
