@@ -430,7 +430,9 @@
       </div>
   </div>
 
-  <div id="auth-overlay" class="fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center">
+  <tachyon-iam id="auth-layer"></tachyon-iam>
+
+  <div id="auth-overlay" class="hidden fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center">
       <div class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-2xl shadow-2xl relative overflow-hidden">
           <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-600 to-blue-500"></div>
           <h2 class="text-white text-2xl font-bold mb-1">Tachyon AuthN</h2>
