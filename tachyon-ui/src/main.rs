@@ -3,7 +3,8 @@
     windows_subsystem = "windows"
 )]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tauri::Emitter;
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +43,86 @@ struct SignupFinalizePayload {
     session_id: String,
     totp_code: String,
     cert: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiResponse {
+    success: bool,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficConfig {
+    api_version: String,
+    kind: String,
+    metadata: TrafficMetadata,
+    spec: TrafficSpec,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficMetadata {
+    name: String,
+    environment: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficSpec {
+    gateways: Vec<TrafficGateway>,
+    routes: Vec<TrafficRoute>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficGateway {
+    name: String,
+    protocol: TrafficProtocol,
+    bind_address: String,
+}
+
+#[derive(Debug, Deserialize)]
+enum TrafficProtocol {
+    HTTP,
+    HTTPS,
+    TCP,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficRoute {
+    name: String,
+    gateway_refs: Vec<String>,
+    #[serde(rename = "type")]
+    route_type: TrafficRouteType,
+    rules: Vec<TrafficRouteRule>,
+}
+
+#[derive(Debug, Deserialize)]
+enum TrafficRouteType {
+    HTTP,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficRouteRule {
+    #[serde(rename = "match")]
+    match_rule: TrafficRuleMatch,
+    target: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficRuleMatch {
+    path: TrafficPathMatch,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficPathMatch {
+    prefix: String,
 }
 
 #[tauri::command]
@@ -214,6 +295,88 @@ async fn delete_resource(name: String) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn apply_configuration(domain: String, payload: Value) -> Result<ApiResponse, String> {
+    if domain != "config-routing" && domain != "routing" {
+        return Err(format!("Unknown configuration domain: {domain}"));
+    }
+
+    match serde_json::from_value::<TrafficConfig>(payload) {
+        Ok(config) => Ok(validate_traffic_config(config)),
+        Err(error) => Ok(ApiResponse {
+            success: false,
+            message: format!("WIT validation failed: {error}"),
+        }),
+    }
+}
+
+fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
+    if config.api_version != "routing.tachyon.io/v1alpha1" {
+        return ApiResponse {
+            success: false,
+            message: format!("WIT validation failed: unsupported api_version {}", config.api_version),
+        };
+    }
+    if config.kind != "TrafficConfiguration" {
+        return ApiResponse {
+            success: false,
+            message: format!("WIT validation failed: unsupported kind {}", config.kind),
+        };
+    }
+    if config.metadata.name.trim().is_empty() || config.metadata.environment.trim().is_empty() {
+        return ApiResponse {
+            success: false,
+            message: "WIT validation failed: metadata.name and metadata.environment are required"
+                .to_string(),
+        };
+    }
+
+    for gateway in &config.spec.gateways {
+        if gateway.name.trim().is_empty() || gateway.bind_address.trim().is_empty() {
+            return ApiResponse {
+                success: false,
+                message: "WIT validation failed: gateway.name and gateway.bind_address are required"
+                    .to_string(),
+            };
+        }
+        match gateway.protocol {
+            TrafficProtocol::HTTP | TrafficProtocol::HTTPS | TrafficProtocol::TCP => {}
+        }
+    }
+
+    for route in &config.spec.routes {
+        if route.name.trim().is_empty() || route.gateway_refs.is_empty() || route.rules.is_empty() {
+            return ApiResponse {
+                success: false,
+                message: "WIT validation failed: route.name, gateway_refs, and rules are required"
+                    .to_string(),
+            };
+        }
+        match route.route_type {
+            TrafficRouteType::HTTP => {}
+        }
+        for rule in &route.rules {
+            if rule.match_rule.path.prefix.trim().is_empty() || rule.target.trim().is_empty() {
+                return ApiResponse {
+                    success: false,
+                    message: "WIT validation failed: rule path prefix and target are required"
+                        .to_string(),
+                };
+            }
+        }
+    }
+
+    ApiResponse {
+        success: true,
+        message: format!(
+            "WIT validation passed for {}: {} gateway(s), {} route(s).",
+            config.metadata.name,
+            config.spec.gateways.len(),
+            config.spec.routes.len()
+        ),
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -235,7 +398,8 @@ fn main() {
             get_hardware_status,
             validate_hardware_policy,
             save_resource,
-            delete_resource
+            delete_resource,
+            apply_configuration
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

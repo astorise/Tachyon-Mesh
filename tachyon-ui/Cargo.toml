@@ -9,6 +9,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tachyon-client = { path = "../tachyon-client" }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
