@@ -3,6 +3,7 @@ import gsap from "gsap";
 import QRCode from "qrcode";
 
 import { mountNetworkStatus } from "./components/NetworkStatus";
+import "./components/iam/TachyonIAM";
 import { resilientInvoke as invoke } from "./utils/network";
 
 const configuredNodeUrl = (import.meta.env.VITE_TACHYON_NODE_URL ?? "").trim();
@@ -217,6 +218,15 @@ document.addEventListener("DOMContentLoaded", () => {
   const resourceTypeRadios = Array.from(
     document.querySelectorAll<HTMLInputElement>("input[name='resource-type']"),
   );
+
+  document.addEventListener("iam:authenticated", (event) => {
+    const detail = (event as CustomEvent<{ user: string; role: string; token: string }>).detail;
+    console.info("[tachyon-ui] iam authenticated", detail);
+    activeOperator = detail.user;
+    authGatewayValidated = true;
+    renderIdentityView();
+    renderAccountView();
+  });
 
   let downloadedRecoveryCodes = false;
   let recoveryCodes: string[] = [];
