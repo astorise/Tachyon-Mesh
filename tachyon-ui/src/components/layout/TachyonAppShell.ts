@@ -1,5 +1,6 @@
 import gsap from "gsap";
 
+import "../routing/TachyonRoutingDashboard";
 import stylesheetText from "../../style.css?inline";
 
 type AuthenticatedDetail = {
@@ -102,6 +103,9 @@ export class TachyonAppShell extends HTMLElement {
                 </div>
               </div>
             </section>
+            <section data-route-panel="routing" class="route-panel hidden">
+              <tachyon-routing-dashboard></tachyon-routing-dashboard>
+            </section>
           </main>
         </div>
       </section>
@@ -112,6 +116,7 @@ export class TachyonAppShell extends HTMLElement {
         const route = button.dataset.route ?? "dashboard";
         this.dispatchEvent(new CustomEvent("app:navigation", { bubbles: true, composed: true, detail: { route } }));
         this.updateNavigation(route);
+        this.showRoute(route);
       });
     });
   }
@@ -122,6 +127,12 @@ export class TachyonAppShell extends HTMLElement {
       button.classList.toggle("bg-slate-800", active);
       button.classList.toggle("text-cyan-400", active);
       button.classList.toggle("text-slate-300", !active);
+    });
+  }
+
+  private showRoute(route: string): void {
+    this.root.querySelectorAll<HTMLElement>("[data-route-panel]").forEach((panel) => {
+      panel.classList.toggle("hidden", panel.dataset.routePanel !== route);
     });
   }
 }
