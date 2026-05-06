@@ -1,4 +1,5 @@
 import gsap from "gsap";
+import QRCode from "qrcode";
 
 import stylesheetText from "../../style.css?inline";
 import { resilientInvoke as invoke } from "../../utils/network";
@@ -92,7 +93,24 @@ export class TachyonIAM extends HTMLElement {
             </div>
           </form>
           <form id="auth-step-signup-totp" class="auth-step hidden space-y-4">
-            <div id="signup-totp-summary" class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5 text-sm text-slate-300 break-all whitespace-pre-wrap">Waiting for staged enrollment.</div>
+            <div class="grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5">
+                <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">Authenticator QR</div>
+                <div id="signup-totp-qr" class="flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-slate-700 bg-slate-900 p-4 text-center text-sm text-slate-500">
+                  Waiting for staged enrollment.
+                </div>
+              </div>
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5 space-y-4">
+                <div>
+                  <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">Session</div>
+                  <div id="signup-session-id" class="break-all font-mono text-sm text-cyan-300">Pending</div>
+                </div>
+                <div>
+                  <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">Manual Secret</div>
+                  <div id="signup-manual-secret" class="break-all font-mono text-sm text-white">Scan the QR code when available.</div>
+                </div>
+              </div>
+            </div>
             <input type="text" id="signup-totp-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
             <div class="grid gap-3 md:grid-cols-2">
               <button type="button" id="btn-signup-totp-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back</button>
@@ -185,10 +203,7 @@ export class TachyonIAM extends HTMLElement {
           cert: null,
         },
       });
-      const summary = this.root.getElementById("signup-totp-summary");
-      if (summary) {
-        summary.textContent = `Session: ${this.stagedSignup.sessionId}\n${this.stagedSignup.provisioningUri}`;
-      }
+      await this.renderTotpEnrollment(this.stagedSignup);
       await this.switchStep("signup-totp");
     } catch (error) {
       this.emitError(error, "signup_stage_failed");
@@ -249,6 +264,54 @@ export class TachyonIAM extends HTMLElement {
     const first = this.value("signup-first-name").toLowerCase();
     const last = this.value("signup-last-name").toLowerCase();
     username.value = [first, last].filter(Boolean).join(".").replace(/[^a-z0-9._-]/g, "");
+  }
+
+  private async renderTotpEnrollment(session: StagedSignupSession): Promise<void> {
+    const qr = this.root.getElementById("signup-totp-qr");
+    const sessionId = this.root.getElementById("signup-session-id");
+    const manualSecret = this.root.getElementById("signup-manual-secret");
+
+    if (sessionId) {
+      sessionId.textContent = session.sessionId;
+    }
+    if (manualSecret) {
+      manualSecret.textContent = this.extractProvisioningSecret(session.provisioningUri);
+    }
+    if (!qr) {
+      return;
+    }
+
+    try {
+      qr.innerHTML = await QRCode.toString(session.provisioningUri, {
+        type: "svg",
+        margin: 1,
+        width: 256,
+        color: {
+          dark: "#e2e8f0",
+          light: "#0f172a",
+        },
+      });
+      qr.className =
+        "flex min-h-64 items-center justify-center rounded-2xl border border-slate-700 bg-slate-900 p-4";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      qr.textContent = `Unable to render QR code. Manual secret: ${this.extractProvisioningSecret(session.provisioningUri)}`;
+      this.dispatchEvent(
+        new CustomEvent("iam:error", {
+          bubbles: true,
+          composed: true,
+          detail: { message, code: "signup_qr_failed" },
+        }),
+      );
+    }
+  }
+
+  private extractProvisioningSecret(provisioningUri: string): string {
+    try {
+      return new URL(provisioningUri).searchParams.get("secret") || provisioningUri;
+    } catch {
+      return provisioningUri;
+    }
   }
 
   private emitError(error: unknown, code: string): void {
