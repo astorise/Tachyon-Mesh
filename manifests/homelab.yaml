@@ -21,6 +21,9 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
+          volumeMounts:
+            - name: tachyon-auth-state
+              mountPath: /app/auth-state
           readinessProbe:
             tcpSocket:
               port: 8080
@@ -32,6 +35,23 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 6
+      volumes:
+        - name: tachyon-auth-state
+          persistentVolumeClaim:
+            claimName: tachyon-auth-state
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tachyon-auth-state
+  labels:
+    app: tachyon-host
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 128Mi
 ---
 apiVersion: v1
 kind: Service

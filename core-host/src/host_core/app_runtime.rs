@@ -1070,6 +1070,13 @@ pub(crate) async fn faas_handler(
     let _active_request = telemetry::begin_request(&state.telemetry);
     let runtime = state.runtime.load_full();
     let normalized_path = normalize_route_path(uri.path());
+    if is_reserved_system_path(&normalized_path) {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("system route `{normalized_path}` is not registered in core-host"),
+        )
+            .into_response();
+    }
     if method == Method::POST && normalized_path == "/api/v1/generate" {
         return enqueue_async_ai_inference_job(body);
     }
@@ -1353,6 +1360,10 @@ pub(crate) async fn faas_handler(
     );
 
     response
+}
+
+fn is_reserved_system_path(path: &str) -> bool {
+    path.starts_with("/auth/") || path.starts_with("/admin/")
 }
 
 #[allow(clippy::too_many_arguments)]

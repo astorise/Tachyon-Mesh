@@ -9,6 +9,7 @@ import { resilientInvoke as invoke } from "./utils/network";
 
 const configuredNodeUrl = (import.meta.env.VITE_TACHYON_NODE_URL ?? "").trim();
 const configuredNodeToken = (import.meta.env.VITE_TACHYON_NODE_TOKEN ?? "").trim();
+const savedCredentialsKey = "tachyon:auth:saved-credentials";
 
 type ViewName = "dashboard" | "topology" | "registry" | "identity" | "account" | "resources" | "broker";
 
@@ -119,6 +120,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const nodeUrl = document.getElementById("auth-url") as HTMLInputElement | null;
   const authUsername = document.getElementById("auth-username") as HTMLInputElement | null;
   const nodeToken = document.getElementById("auth-password") as HTMLInputElement | null;
+  const rememberCredentials = document.getElementById("remember-credentials") as HTMLInputElement | null;
   const mtlsFile = document.getElementById("auth-mtls") as HTMLInputElement | null;
   const connectSubmitBtn = document.getElementById("btn-login-submit") as HTMLButtonElement | null;
   const openSignupBtn = document.getElementById("btn-open-signup") as HTMLButtonElement | null;
@@ -311,7 +313,21 @@ document.addEventListener("DOMContentLoaded", () => {
   if (authUsername && !authUsername.value) {
     authUsername.value = activeOperator;
   }
-  if (nodeToken && !nodeToken.value && configuredNodeToken) {
+  const savedCredentials = loadSavedCredentials();
+  if (savedCredentials) {
+    if (nodeUrl) {
+      nodeUrl.value = savedCredentials.url;
+    }
+    if (authUsername) {
+      authUsername.value = savedCredentials.username;
+    }
+    if (nodeToken) {
+      nodeToken.value = savedCredentials.password;
+    }
+    if (rememberCredentials) {
+      rememberCredentials.checked = true;
+    }
+  } else if (nodeToken && !nodeToken.value && configuredNodeToken) {
     nodeToken.value = configuredNodeToken;
   }
 
@@ -1353,6 +1369,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!response.sessionId) {
           throw new Error("Login staged without an MFA session id.");
         }
+        persistCredentialsPreference();
         stagedLogin = response;
         authGatewayValidated = false;
         renderIdentityMessage(
@@ -1361,6 +1378,7 @@ document.addEventListener("DOMContentLoaded", () => {
         );
         await switchAuthStep("mfa");
       } else {
+        persistCredentialsPreference();
         const status = await invoke<string>("get_engine_status");
         if (activeFaaS) {
           activeFaaS.innerText = String(status);
@@ -1382,6 +1400,41 @@ document.addEventListener("DOMContentLoaded", () => {
       connectSubmitBtn.textContent = "Authenticate";
     }
   };
+
+  function loadSavedCredentials(): { url: string; username: string; password: string } | null {
+    try {
+      const raw = localStorage.getItem(savedCredentialsKey);
+      if (!raw) {
+        return null;
+      }
+      const parsed = JSON.parse(raw) as Partial<{ url: string; username: string; password: string }>;
+      if (!parsed.url || !parsed.username || !parsed.password) {
+        return null;
+      }
+      return {
+        url: parsed.url,
+        username: parsed.username,
+        password: parsed.password,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function persistCredentialsPreference(): void {
+    if (!rememberCredentials?.checked) {
+      localStorage.removeItem(savedCredentialsKey);
+      return;
+    }
+    localStorage.setItem(
+      savedCredentialsKey,
+      JSON.stringify({
+        url: nodeUrl?.value.trim() ?? "",
+        username: authUsername?.value.trim() ?? "",
+        password: nodeToken?.value ?? "",
+      }),
+    );
+  }
 
   const completeMfa = async () => {
     if (!authMfaCode || !authMfaSubmitBtn) {
@@ -2088,8 +2141,15 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   nodeToken?.addEventListener("input", () => {
+    if (!rememberCredentials?.checked) {
+      localStorage.removeItem(savedCredentialsKey);
+    }
     renderIdentityView();
     renderAccountView();
+  });
+
+  rememberCredentials?.addEventListener("change", () => {
+    persistCredentialsPreference();
   });
 
   updateConnectionBadge();
