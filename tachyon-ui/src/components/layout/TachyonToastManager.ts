@@ -32,10 +32,12 @@ export class TachyonToastManager extends HTMLElement {
   connectedCallback(): void {
     this.render();
     window.addEventListener("app:notify", this.onNotify);
+    window.addEventListener("toast", this.onNotify);
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("app:notify", this.onNotify);
+    window.removeEventListener("toast", this.onNotify);
   }
 
   private render(): void {

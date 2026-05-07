@@ -91,8 +91,6 @@ export class TachyonAppShell extends HTMLElement {
           <nav class="flex-1 p-4 space-y-2">
             <button data-route="dashboard" class="nav-link w-full text-left block px-4 py-2 rounded-md bg-slate-800 text-cyan-400 font-medium transition-colors">Dashboard</button>
             ${configLinks}
-            <button data-route="topology" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Mesh Topology</button>
-            <button data-route="registry" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Asset Registry</button>
           </nav>
           <div class="p-4 border-t border-slate-800 text-xs text-slate-500">v1.0.0-webcomponents</div>
         </aside>

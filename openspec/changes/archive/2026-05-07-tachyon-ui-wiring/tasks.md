@@ -1,0 +1,3 @@
+- [x] **Task 1:** Update `tachyon-ui/src/registry/ComponentRegistry.ts` to correctly map `registry` and `topology` routes.
+- [x] **Task 2:** Refactor `tachyon-ui/src/components/domains/TachyonOverviewPanel.ts` to fetch dynamic data via Tauri `invoke` and handle async rendering.
+- [x] **Task 3:** Implement the user addition form and submission logic in `tachyon-ui/src/components/iam/TachyonIAM.ts` targeting the `stage_signup` command.
