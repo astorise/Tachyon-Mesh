@@ -63,6 +63,49 @@ export class TachyonIAM extends HTMLElement {
           <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-600 to-blue-500"></div>
           <h2 class="text-white text-2xl font-bold mb-1">Tachyon AuthN</h2>
           <p class="text-slate-400 text-sm mb-6">Zero-Trust Control Plane Access</p>
+          <form id="iam-signup-form" class="mb-6 space-y-6 max-w-lg rounded-xl border border-slate-800 bg-slate-900/50 p-6 backdrop-blur-sm">
+            <div class="border-b border-slate-800 pb-4 mb-4">
+              <h3 class="text-lg font-medium text-cyan-400">Stage New Operator</h3>
+              <p class="text-sm text-slate-500">Initiate a secure enrollment session</p>
+            </div>
+
+            <div class="space-y-2">
+              <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Node URL</label>
+              <input type="text" id="iam-url" placeholder="https://..." class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+              <div class="space-y-2">
+                <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">First Name</label>
+                <input type="text" id="iam-first-name" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
+              </div>
+              <div class="space-y-2">
+                <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Last Name</label>
+                <input type="text" id="iam-last-name" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
+              </div>
+            </div>
+
+            <div class="space-y-2">
+              <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Username</label>
+              <input type="text" id="iam-username" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
+            </div>
+
+            <div class="space-y-2">
+              <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Initial Password</label>
+              <input type="password" id="iam-password" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
+            </div>
+
+            <div class="space-y-2">
+              <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Enrollment Token</label>
+              <input type="text" id="iam-token" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-cyan-300 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
+            </div>
+
+            <div class="pt-4">
+              <button type="submit" class="w-full rounded-md bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/50 px-4 py-2.5 text-sm font-medium text-cyan-300 transition-colors focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:ring-offset-2 focus:ring-offset-slate-900">
+                Provision Identity
+              </button>
+            </div>
+          </form>
           <form id="auth-step-login" class="auth-step space-y-3">
             <input type="text" id="auth-url" placeholder="Mesh Node URL (https://...)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
             <input type="text" id="auth-username" placeholder="Username" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
@@ -140,12 +183,17 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private bindEvents(): void {
+    this.form("iam-signup-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void this.stageOperator();
+    });
     this.form("auth-step-login")?.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.login();
     });
     this.button("btn-toggle-login-password")?.addEventListener("click", () => this.togglePassword("auth-password"));
     this.input("remember-credentials")?.addEventListener("change", () => this.persistCredentialsPreference());
+    this.input("iam-url")?.addEventListener("input", () => this.syncAuthUrls("iam-url", "auth-url"));
     this.input("auth-url")?.addEventListener("input", () => this.syncAuthUrls("auth-url", "signup-auth-url"));
     this.input("signup-auth-url")?.addEventListener("input", () => this.syncAuthUrls("signup-auth-url", "auth-url"));
     this.form("auth-step-mfa")?.addEventListener("submit", (event) => {
@@ -171,6 +219,27 @@ export class TachyonIAM extends HTMLElement {
     this.input("signup-first-name")?.addEventListener("input", () => this.updateUsername());
     this.input("signup-last-name")?.addEventListener("input", () => this.updateUsername());
     this.restoreSavedCredentials();
+  }
+
+  private async stageOperator(): Promise<void> {
+    const url = this.value("iam-url") || this.signupUrl();
+    const token = this.value("iam-token");
+    const firstName = this.value("iam-first-name");
+    const lastName = this.value("iam-last-name");
+    const username = this.value("iam-username");
+    const password = this.value("iam-password");
+    if (!url || !token || !firstName || !lastName || !username || !password) {
+      this.notify("error", "Node URL, token, first name, last name, username and password are required.");
+      return;
+    }
+    try {
+      await invoke<StagedSignupSession>("stage_signup", {
+        payload: { url, token, firstName, lastName, username, password, cert: null },
+      });
+      this.notify("success", `Enrollment staged for ${username}.`);
+    } catch (error) {
+      this.notify("error", error instanceof Error ? error.message : String(error));
+    }
   }
 
   private async login(): Promise<void> {
@@ -409,6 +478,10 @@ export class TachyonIAM extends HTMLElement {
       }
       const parsed = JSON.parse(raw) as Partial<{ url: string; username: string; password: string }>;
       if (parsed.url) {
+        const iamUrl = this.input("iam-url");
+        if (iamUrl) {
+          iamUrl.value = parsed.url;
+        }
         const url = this.input("auth-url");
         if (url) {
           url.value = parsed.url;
@@ -478,6 +551,10 @@ export class TachyonIAM extends HTMLElement {
 
   private hideError(): void {
     this.root.getElementById("auth-error")?.classList.add("hidden");
+  }
+
+  private notify(type: "success" | "error", message: string): void {
+    window.dispatchEvent(new CustomEvent("toast", { detail: { type, message } }));
   }
 
   private value(id: string): string {

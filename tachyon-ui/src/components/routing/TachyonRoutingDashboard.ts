@@ -129,3 +129,7 @@ export class TachyonRoutingDashboard extends TachyonConfigDashboard {
 }
 
 customElements.define("tachyon-routing-dashboard", TachyonRoutingDashboard);
+
+export class TachyonTopologyPanel extends TachyonRoutingDashboard {}
+
+customElements.define("tachyon-topology-panel", TachyonTopologyPanel);

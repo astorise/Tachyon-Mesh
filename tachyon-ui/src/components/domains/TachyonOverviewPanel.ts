@@ -1,28 +1,56 @@
 import gsap from "gsap";
 
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
+import { resilientInvoke as invoke } from "../../utils/network";
 
 type OverviewMetric = {
+  key: "nodes" | "wasm" | "gpu";
   label: string;
   value: number;
   suffix: string;
   detail: string;
 };
 
-const metrics: OverviewMetric[] = [
-  { label: "Active Edge Nodes", value: 12, suffix: "", detail: "Mesh members reporting healthy control-plane heartbeats" },
-  { label: "Global Wasm Instances", value: 48, suffix: "", detail: "Component workloads currently admitted across the fleet" },
-  { label: "AI/GPU Utilization", value: 73, suffix: "%", detail: "Accelerator allocation across active AI routing targets" },
+type MeshRouteSummary = {
+  name: string;
+  path: string;
+  role: string;
+  targetCount: number;
+  requiresTee: boolean;
+  encryptedVolumeCount: number;
+};
+
+type MeshGraphSnapshot = {
+  source: string;
+  status: string;
+  routes: MeshRouteSummary[];
+  batchTargets: string[];
+};
+
+const initialMetrics: OverviewMetric[] = [
+  { key: "nodes", label: "Active Edge Nodes", value: 0, suffix: "", detail: "Mesh members reporting healthy control-plane heartbeats" },
+  { key: "wasm", label: "Global Wasm Instances", value: 0, suffix: "", detail: "Component workloads currently admitted across the fleet" },
+  { key: "gpu", label: "AI/GPU Utilization", value: 0, suffix: "%", detail: "Accelerator allocation across active AI routing targets" },
 ];
 
 export class TachyonOverviewPanel extends TachyonConfigDashboard {
-  connectedCallback(): void {
-    this.render();
+  async connectedCallback(): Promise<void> {
+    this.render(initialMetrics, "Loading mesh telemetry...");
     this.animateEntrance();
-    this.animateCounters();
+    try {
+      const snapshot = await invoke<MeshGraphSnapshot>("get_mesh_graph");
+      const metrics = this.metricsFromSnapshot(snapshot);
+      this.render(metrics, snapshot.status || "Mesh telemetry online");
+      this.animateEntrance();
+      this.animateCounters();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.render(initialMetrics, "Telemetry fetch failed");
+      window.dispatchEvent(new CustomEvent("app:notify", { detail: { type: "error", message: `Telemetry fetch failed: ${message}` } }));
+    }
   }
 
-  private render(): void {
+  private render(metrics: OverviewMetric[], status: string): void {
     this.renderTemplate(`
       <section class="p-6 space-y-8 text-slate-300">
         <header data-stagger-panel class="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
@@ -31,7 +59,7 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
             <p class="text-xs font-mono text-slate-500">Mesh telemetry / boot sequence snapshot</p>
           </div>
           <div class="rounded border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 font-mono text-xs text-cyan-300">
-            CONTROL PLANE ONLINE
+            ${this.escapeStatus(status)}
           </div>
         </header>
 
@@ -45,7 +73,7 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
                     <span class="h-2 w-2 rounded-full bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.75)]"></span>
                   </div>
                   <div class="font-mono text-5xl font-light text-slate-100">
-                    <span data-counter="${metric.value}" data-suffix="${metric.suffix}">0${metric.suffix}</span>
+                    <span data-metric="${metric.key}" data-counter="${metric.value}" data-suffix="${metric.suffix}">0${metric.suffix}</span>
                   </div>
                   <p class="mt-4 min-h-12 text-sm leading-6 text-slate-500">${metric.detail}</p>
                 </article>
@@ -77,6 +105,28 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
         },
       });
     });
+  }
+
+  private metricsFromSnapshot(snapshot: MeshGraphSnapshot): OverviewMetric[] {
+    const routeTargets = snapshot.routes.reduce((total, route) => total + Math.max(route.targetCount, 1), 0);
+    const acceleratedRoutes = snapshot.routes.filter((route) =>
+      [route.name, route.path, route.role].some((value) => value.toLowerCase().includes("gpu") || value.toLowerCase().includes("ai")),
+    ).length;
+    const gpuUtilization = Math.min(100, Math.round(((acceleratedRoutes + snapshot.batchTargets.length) / Math.max(snapshot.routes.length, 1)) * 50));
+    return [
+      { ...initialMetrics[0], value: snapshot.batchTargets.length },
+      { ...initialMetrics[1], value: routeTargets },
+      { ...initialMetrics[2], value: gpuUtilization },
+    ];
+  }
+
+  private escapeStatus(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 }
 
