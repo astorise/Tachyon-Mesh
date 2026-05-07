@@ -7,12 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::Emitter;
 
-#[derive(serde::Serialize)]
-struct ApiResponse {
-    success: bool,
-    message: String,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthnLoginPayload {

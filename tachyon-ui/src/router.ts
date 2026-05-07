@@ -60,7 +60,7 @@ export class Router {
 
   public initRoute(path: string) {
     if (path === "/routing") {
-      RoutingController.init();
+      RoutingController.mount();
     } else if (path === "/ai-models") {
       AiOrchestrationController.init();
     }
