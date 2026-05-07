@@ -100,36 +100,13 @@ The `tachyon-ui` frontend SHALL expose dedicated panels for mesh topology, asset
 - **WHEN** the Model Broker panel becomes active
 - **THEN** the frontend renders the chunked model upload controls and progress bar in that panel
 
-### Requirement: The UI MUST operate as a Single Page Application without heavy DOM frameworks
-The Tachyon-UI client SHALL use a lightweight Vanilla JS routing mechanism based on URL hashes (`hashchange`) to navigate between configuration domains (Routing, Security, etc.) without triggering a full browser reload.
+### Requirement: The UI Backend MUST strictly validate intents against WIT definitions
+The Rust Tauri backend SHALL NOT act as a simple passthrough proxy for JSON payloads. Before dispatching any configuration to the `system-faas-gossip` network, the backend MUST deserialize and validate the JSON payload against the strict Rust structures generated from the `.wit` contracts (e.g., `config-routing.wit`).
 
-#### Scenario: Navigating between configuration domains
-- **GIVEN** the user is viewing the Dashboard at `#/dashboard`
-- **WHEN** the user clicks the "Routing & Gateways" sidebar link changing the hash to `#/routing`
-- **THEN** the Vanilla JS Router intercepts the event, destroys the dashboard DOM, and injects the routing DOM
-- **AND** the GSAP animation engine performs a fluid cross-fade transition without relying on a Virtual DOM diffing algorithm.
-
-### Requirement: UI Configuration Views MUST generate strict Schema payloads
-The frontend views SHALL NOT use custom or intermediate data formats for submitting configurations. Forms and controllers MUST serialize DOM state directly into the standard GitOps JSON payloads defined by the `system-faas-config-api` WIT schemas (e.g., `routing.tachyon.io/v1alpha1`).
-
-#### Scenario: Submitting a new route
-- **WHEN** the user interacts with the "Routing & Gateways" dashboard and clicks "Deploy Configuration"
-- **THEN** the Vanilla JS controller builds a JSON object matching the `TrafficConfiguration` schema
-- **AND** sends this exact payload to the Tauri backend for pushing to the Edge node, ensuring total compatibility with the Rust data-plane.
-
-### Requirement: The UI MUST provide declarative builders for AI Multiplexing
-The frontend SHALL expose a dedicated "AI Orchestration" dashboard that allows operators to visually map Layer 7 request headers to specific LoRA adapter assets without manual JSON editing.
-
-#### Scenario: Configuring a new tenant-specific LLM adapter
-- **WHEN** the user navigates to the AI Orchestration view and adds a "Routing Rule" mapping `X-Tenant: HR` to `hr-lora.gguf`
-- **THEN** the Vanilla JS controller constructs the `sharing_strategy` JSON block
-- **AND** submits the payload, allowing the Edge node to hot-swap the HR adapter into VRAM instantly upon receiving matching traffic.
-
-### Requirement: The UI MUST push intents through the Tauri IPC boundary
-To maintain strict Zero-Panic validation and cryptographic integrity, the Vanilla JS frontend SHALL NOT manipulate the file system or local storage directly. It MUST send all JSON configuration payloads through the Tauri `invoke` IPC mechanism.
-
-#### Scenario: Validating a UI payload in Rust
-- **WHEN** the Vanilla JS routing controller dispatches an `apply_configuration` command
-- **THEN** the Rust backend receives the intent asynchronously
-- **AND** the backend verifies the schema integrity before taking any action on the data-plane.
+#### Scenario: Submitting a malformed route configuration
+- **GIVEN** the UI submits a JSON payload for `config-routing` missing the required `bind_address` in a Gateway object
+- **WHEN** the Rust backend receives the payload via IPC
+- **THEN** the strict Serde deserialization fails
+- **AND** the backend returns a safe, handled failure response to the UI
+- **AND** the data-plane remains untouched.
 
