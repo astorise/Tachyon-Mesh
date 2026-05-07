@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: core-host
-          image: ghcr.io/astorise/tachyon-mesh:sha-48a5663
+          image: ghcr.io/astorise/tachyon-mesh:sha-df6075a
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
