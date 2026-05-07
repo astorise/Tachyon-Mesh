@@ -35,6 +35,7 @@ type AuthenticatedDetail = {
 
 const iamStylesheet = new CSSStyleSheet();
 iamStylesheet.replaceSync(stylesheetText);
+const savedCredentialsKey = "tachyon:auth:saved-credentials";
 
 export class TachyonIAM extends HTMLElement {
   private readonly root: ShadowRoot;
@@ -65,7 +66,14 @@ export class TachyonIAM extends HTMLElement {
           <form id="auth-step-login" class="auth-step space-y-3">
             <input type="text" id="auth-url" placeholder="Mesh Node URL (https://...)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
             <input type="text" id="auth-username" placeholder="Username" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
-            <input type="password" id="auth-password" placeholder="Password" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+            <div class="flex gap-2">
+              <input type="password" id="auth-password" placeholder="Password" class="min-w-0 flex-1 bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+              <button type="button" id="btn-toggle-login-password" class="rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm text-slate-300">Show</button>
+            </div>
+            <label class="flex items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs text-slate-300">
+              <input type="checkbox" id="remember-credentials" class="h-4 w-4 accent-cyan-500" />
+              <span>Remember login and password on this workstation</span>
+            </label>
             <input type="file" id="auth-mtls" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-cyan-500/10 file:text-cyan-400 cursor-pointer hover:file:bg-cyan-500/20" />
             <div class="grid gap-3 md:grid-cols-2 pt-3">
               <button id="btn-login-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)]">Authenticate</button>
@@ -135,6 +143,8 @@ export class TachyonIAM extends HTMLElement {
       event.preventDefault();
       void this.login();
     });
+    this.button("btn-toggle-login-password")?.addEventListener("click", () => this.togglePassword("auth-password"));
+    this.input("remember-credentials")?.addEventListener("change", () => this.persistCredentialsPreference());
     this.form("auth-step-mfa")?.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.finalizeLogin();
@@ -157,6 +167,7 @@ export class TachyonIAM extends HTMLElement {
     });
     this.input("signup-first-name")?.addEventListener("input", () => this.updateUsername());
     this.input("signup-last-name")?.addEventListener("input", () => this.updateUsername());
+    this.restoreSavedCredentials();
   }
 
   private async login(): Promise<void> {
@@ -175,10 +186,12 @@ export class TachyonIAM extends HTMLElement {
         if (!response.sessionId) {
           throw new Error("Login staged without an MFA session id.");
         }
+        this.persistCredentialsPreference();
         this.stagedLogin = response;
         await this.switchStep("mfa");
         return;
       }
+      this.persistCredentialsPreference();
       await this.completeAuthentication({ user: response.username, role: "admin", token: password });
     } catch (error) {
       this.emitError(error, "authn_login_failed");
@@ -359,6 +372,67 @@ export class TachyonIAM extends HTMLElement {
     const message = error instanceof Error ? error.message : String(error);
     this.showError(message);
     this.dispatchEvent(new CustomEvent("iam:error", { bubbles: true, composed: true, detail: { message, code } }));
+  }
+
+  private togglePassword(id: string): void {
+    const input = this.input(id);
+    const button = this.button("btn-toggle-login-password");
+    if (!input) {
+      return;
+    }
+    input.type = input.type === "password" ? "text" : "password";
+    if (button) {
+      button.textContent = input.type === "password" ? "Show" : "Hide";
+    }
+  }
+
+  private restoreSavedCredentials(): void {
+    try {
+      const raw = localStorage.getItem(savedCredentialsKey);
+      if (!raw) {
+        return;
+      }
+      const parsed = JSON.parse(raw) as Partial<{ url: string; username: string; password: string }>;
+      if (parsed.url) {
+        const url = this.input("auth-url");
+        if (url) {
+          url.value = parsed.url;
+        }
+      }
+      if (parsed.username) {
+        const username = this.input("auth-username");
+        if (username) {
+          username.value = parsed.username;
+        }
+      }
+      if (parsed.password) {
+        const password = this.input("auth-password");
+        if (password) {
+          password.value = parsed.password;
+        }
+      }
+      const remember = this.input("remember-credentials");
+      if (remember) {
+        remember.checked = true;
+      }
+    } catch {
+      localStorage.removeItem(savedCredentialsKey);
+    }
+  }
+
+  private persistCredentialsPreference(): void {
+    if (!this.input("remember-credentials")?.checked) {
+      localStorage.removeItem(savedCredentialsKey);
+      return;
+    }
+    localStorage.setItem(
+      savedCredentialsKey,
+      JSON.stringify({
+        url: this.value("auth-url"),
+        username: this.value("auth-username"),
+        password: this.input("auth-password")?.value ?? "",
+      }),
+    );
   }
 
   private showError(message: string): void {
