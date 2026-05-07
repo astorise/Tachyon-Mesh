@@ -677,15 +677,17 @@ fn prune_expired_pending_logins() -> Result<(), String> {
             continue;
         }
 
-        let raw = fs::read(&path).map_err(|error| {
-            format!("failed to read pending login {}: {error}", path.display())
-        })?;
+        let raw = fs::read(&path)
+            .map_err(|error| format!("failed to read pending login {}: {error}", path.display()))?;
         let pending: PendingLoginRecord = serde_json::from_slice(&raw).map_err(|error| {
             format!("failed to decode pending login {}: {error}", path.display())
         })?;
         if now >= pending.expires_at {
             fs::remove_file(&path).map_err(|error| {
-                format!("failed to delete expired pending login {}: {error}", path.display())
+                format!(
+                    "failed to delete expired pending login {}: {error}",
+                    path.display()
+                )
             })?;
         }
     }
@@ -756,8 +758,12 @@ fn save_pending_login(pending: &PendingLoginRecord) -> Result<(), String> {
     }
     let payload = serde_json::to_vec_pretty(pending)
         .map_err(|error| format!("failed to encode pending login: {error}"))?;
-    fs::write(&path, payload)
-        .map_err(|error| format!("failed to persist pending login {}: {error}", path.display()))
+    fs::write(&path, payload).map_err(|error| {
+        format!(
+            "failed to persist pending login {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn load_pending_login(session_id: &str) -> Result<PendingLoginRecord, String> {
@@ -771,8 +777,9 @@ fn load_pending_login(session_id: &str) -> Result<PendingLoginRecord, String> {
 fn delete_pending_login(session_id: &str) -> Result<(), String> {
     let path = pending_login_path(session_id)?;
     if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|error| format!("failed to delete pending login {}: {error}", path.display()))?;
+        fs::remove_file(&path).map_err(|error| {
+            format!("failed to delete pending login {}: {error}", path.display())
+        })?;
     }
     Ok(())
 }
