@@ -171,6 +171,37 @@ struct RbacPanelConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkloadsPanelConfig {
+    engine: WorkloadEngine,
+    secret_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum WorkloadEngine {
+    Wasmtime,
+    Smolvm,
+    Legacy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservabilityPanelConfig {
+    otlp_endpoint: String,
+    log_level: LogLevel,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum LoraMode {
     Dynamic,
@@ -411,6 +442,24 @@ async fn apply_configuration(domain: String, payload: Value) -> Result<ApiRespon
                 message: format!("RBAC WIT validation failed: {error}"),
             }),
         },
+        "config-workloads" | "workloads" => {
+            match serde_json::from_value::<WorkloadsPanelConfig>(payload) {
+                Ok(config) => Ok(validate_workloads_panel_config(config)),
+                Err(error) => Ok(ApiResponse {
+                    success: false,
+                    message: format!("Workloads WIT validation failed: {error}"),
+                }),
+            }
+        }
+        "config-observability" | "observability" => {
+            match serde_json::from_value::<ObservabilityPanelConfig>(payload) {
+                Ok(config) => Ok(validate_observability_panel_config(config)),
+                Err(error) => Ok(ApiResponse {
+                    success: false,
+                    message: format!("Observability WIT validation failed: {error}"),
+                }),
+            }
+        }
         _ => Err(format!("Unknown configuration domain: {domain}")),
     }
 }
@@ -591,6 +640,52 @@ fn validate_rbac_panel_config(config: RbacPanelConfig) -> ApiResponse {
     ApiResponse {
         success: true,
         message: format!("RBAC policy accepted for role {}", config.role),
+    }
+}
+
+fn validate_workloads_panel_config(config: WorkloadsPanelConfig) -> ApiResponse {
+    if !config.secret_ref.is_empty() && !config.secret_ref.starts_with("vault://") {
+        return ApiResponse {
+            success: false,
+            message: "Workloads WIT validation failed: secret_ref must use vault://".to_owned(),
+        };
+    }
+    let engine = match config.engine {
+        WorkloadEngine::Wasmtime => "wasmtime",
+        WorkloadEngine::Smolvm => "smolvm",
+        WorkloadEngine::Legacy => "legacy",
+    };
+    ApiResponse {
+        success: true,
+        message: format!("Workload contract accepted for {engine} runtime"),
+    }
+}
+
+fn validate_observability_panel_config(config: ObservabilityPanelConfig) -> ApiResponse {
+    if !config.otlp_endpoint.is_empty()
+        && !config.otlp_endpoint.starts_with("https://")
+        && !config.otlp_endpoint.starts_with("http://")
+    {
+        return ApiResponse {
+            success: false,
+            message: "Observability WIT validation failed: otlp_endpoint must use http(s)://"
+                .to_owned(),
+        };
+    }
+    let level = match config.log_level {
+        LogLevel::Debug => "debug",
+        LogLevel::Info => "info",
+        LogLevel::Warn => "warn",
+        LogLevel::Error => "error",
+    };
+    let target = if config.otlp_endpoint.is_empty() {
+        "local logging".to_owned()
+    } else {
+        config.otlp_endpoint
+    };
+    ApiResponse {
+        success: true,
+        message: format!("Observability config accepted at {level} level for {target}"),
     }
 }
 

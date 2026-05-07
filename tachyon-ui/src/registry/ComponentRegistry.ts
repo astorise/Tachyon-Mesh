@@ -11,6 +11,8 @@ const routes: ComponentRoute[] = [
   { route: "hardware", label: "Hardware", tagName: "tachyon-hardware-panel" },
   { route: "identity-config", label: "Identity & Quotas", tagName: "tachyon-identity-panel" },
   { route: "rbac", label: "RBAC", tagName: "tachyon-rbac-panel" },
+  { route: "workloads", label: "Workloads", tagName: "tachyon-workloads-panel" },
+  { route: "observability", label: "Observability", tagName: "tachyon-observability-panel" },
 ];
 
 export function listComponentRoutes(): ComponentRoute[] {
