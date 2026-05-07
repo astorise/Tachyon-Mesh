@@ -87,6 +87,7 @@ export class TachyonIAM extends HTMLElement {
           </form>
           <form id="auth-step-signup-token" class="auth-step hidden space-y-4">
             <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">Validate a 24-hour invite token before creating the admin profile.</div>
+            <input type="text" id="signup-auth-url" placeholder="Mesh Node URL (https://...)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
             <input type="password" id="signup-token" placeholder="Paste invite token" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
             <div class="grid gap-3 md:grid-cols-2">
               <button type="button" id="btn-signup-token-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back to Login</button>
@@ -145,6 +146,8 @@ export class TachyonIAM extends HTMLElement {
     });
     this.button("btn-toggle-login-password")?.addEventListener("click", () => this.togglePassword("auth-password"));
     this.input("remember-credentials")?.addEventListener("change", () => this.persistCredentialsPreference());
+    this.input("auth-url")?.addEventListener("input", () => this.syncAuthUrls("auth-url", "signup-auth-url"));
+    this.input("signup-auth-url")?.addEventListener("input", () => this.syncAuthUrls("signup-auth-url", "auth-url"));
     this.form("auth-step-mfa")?.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.finalizeLogin();
@@ -225,9 +228,13 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private async validateInvite(): Promise<void> {
+    if (!this.signupUrl()) {
+      this.showError("Mesh Node URL is required for enrollment.");
+      return;
+    }
     try {
       this.claims = await invoke<RegistrationTokenClaims>("validate_signup_token", {
-        payload: { url: this.value("auth-url"), token: this.value("signup-token"), cert: null },
+        payload: { url: this.signupUrl(), token: this.value("signup-token"), cert: null },
       });
       const summary = this.root.getElementById("signup-token-summary");
       if (summary) {
@@ -240,6 +247,10 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private async stageAccount(): Promise<void> {
+    if (!this.signupUrl()) {
+      this.showError("Mesh Node URL is required for enrollment.");
+      return;
+    }
     const password = this.value("signup-password");
     if (password.length < 8 || password !== this.value("signup-confirm-password")) {
       this.showError("Password must be at least 8 characters and match confirmation.");
@@ -248,7 +259,7 @@ export class TachyonIAM extends HTMLElement {
     try {
       this.stagedSignup = await invoke<StagedSignupSession>("stage_signup", {
         payload: {
-          url: this.value("auth-url"),
+          url: this.signupUrl(),
           token: this.value("signup-token"),
           firstName: this.value("signup-first-name"),
           lastName: this.value("signup-last-name"),
@@ -269,10 +280,14 @@ export class TachyonIAM extends HTMLElement {
       this.showError("No staged signup session is active.");
       return;
     }
+    if (!this.signupUrl()) {
+      this.showError("Mesh Node URL is required for enrollment.");
+      return;
+    }
     try {
       const response = await invoke<AuthLoginResponse>("finalize_signup", {
         payload: {
-          url: this.value("auth-url"),
+          url: this.signupUrl(),
           sessionId: this.stagedSignup.sessionId,
           totpCode: this.value("signup-totp-code"),
           cert: null,
@@ -398,6 +413,10 @@ export class TachyonIAM extends HTMLElement {
         if (url) {
           url.value = parsed.url;
         }
+        const signupUrl = this.input("signup-auth-url");
+        if (signupUrl) {
+          signupUrl.value = parsed.url;
+        }
       }
       if (parsed.username) {
         const username = this.input("auth-username");
@@ -433,6 +452,19 @@ export class TachyonIAM extends HTMLElement {
         password: this.input("auth-password")?.value ?? "",
       }),
     );
+  }
+
+  private syncAuthUrls(sourceId: string, targetId: string): void {
+    const source = this.input(sourceId);
+    const target = this.input(targetId);
+    if (!source || !target || target.value === source.value) {
+      return;
+    }
+    target.value = source.value;
+  }
+
+  private signupUrl(): string {
+    return this.value("signup-auth-url") || this.value("auth-url");
   }
 
   private showError(message: string): void {
