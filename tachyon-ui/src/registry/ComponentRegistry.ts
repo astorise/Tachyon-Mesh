@@ -13,6 +13,9 @@ const routes: ComponentRoute[] = [
   { route: "rbac", label: "RBAC", tagName: "tachyon-rbac-panel" },
   { route: "workloads", label: "Workloads", tagName: "tachyon-workloads-panel" },
   { route: "observability", label: "Observability", tagName: "tachyon-observability-panel" },
+  { route: "storage", label: "Storage", tagName: "tachyon-storage-panel" },
+  { route: "fleet", label: "Fleet", tagName: "tachyon-fleet-panel" },
+  { route: "supply-chain", label: "Supply Chain", tagName: "tachyon-supply-chain-panel" },
 ];
 
 export function listComponentRoutes(): ComponentRoute[] {

@@ -193,6 +193,34 @@ struct ObservabilityPanelConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoragePanelConfig {
+    mount_path: String,
+    s3_endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetPanelConfig {
+    selector_tags: String,
+    node_profile: NodeProfile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum NodeProfile {
+    EdgeLight,
+    CoreHeavy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupplyChainPanelConfig {
+    signature_key: String,
+    air_gapped: bool,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum LogLevel {
     Debug,
@@ -460,6 +488,30 @@ async fn apply_configuration(domain: String, payload: Value) -> Result<ApiRespon
                 }),
             }
         }
+        "config-storage" | "storage" => match serde_json::from_value::<StoragePanelConfig>(payload)
+        {
+            Ok(config) => Ok(validate_storage_panel_config(config)),
+            Err(error) => Ok(ApiResponse {
+                success: false,
+                message: format!("Storage WIT validation failed: {error}"),
+            }),
+        },
+        "config-fleet" | "fleet" => match serde_json::from_value::<FleetPanelConfig>(payload) {
+            Ok(config) => Ok(validate_fleet_panel_config(config)),
+            Err(error) => Ok(ApiResponse {
+                success: false,
+                message: format!("Fleet WIT validation failed: {error}"),
+            }),
+        },
+        "config-assets" | "supply_chain" | "supply-chain" => {
+            match serde_json::from_value::<SupplyChainPanelConfig>(payload) {
+                Ok(config) => Ok(validate_supply_chain_panel_config(config)),
+                Err(error) => Ok(ApiResponse {
+                    success: false,
+                    message: format!("Supply Chain WIT validation failed: {error}"),
+                }),
+            }
+        }
         _ => Err(format!("Unknown configuration domain: {domain}")),
     }
 }
@@ -686,6 +738,67 @@ fn validate_observability_panel_config(config: ObservabilityPanelConfig) -> ApiR
     ApiResponse {
         success: true,
         message: format!("Observability config accepted at {level} level for {target}"),
+    }
+}
+
+fn validate_storage_panel_config(config: StoragePanelConfig) -> ApiResponse {
+    if !config.mount_path.starts_with('/') {
+        return ApiResponse {
+            success: false,
+            message: "Storage WIT validation failed: mount_path must be absolute".to_owned(),
+        };
+    }
+    if !config.s3_endpoint.is_empty()
+        && !config.s3_endpoint.starts_with("https://")
+        && !config.s3_endpoint.starts_with("http://")
+    {
+        return ApiResponse {
+            success: false,
+            message: "Storage WIT validation failed: s3_endpoint must use http(s)://".to_owned(),
+        };
+    }
+    ApiResponse {
+        success: true,
+        message: format!("Storage config accepted for mount {}", config.mount_path),
+    }
+}
+
+fn validate_fleet_panel_config(config: FleetPanelConfig) -> ApiResponse {
+    if config.selector_tags.trim().is_empty() {
+        return ApiResponse {
+            success: false,
+            message: "Fleet WIT validation failed: selector_tags are required".to_owned(),
+        };
+    }
+    let profile = match config.node_profile {
+        NodeProfile::EdgeLight => "edge-light",
+        NodeProfile::CoreHeavy => "core-heavy",
+    };
+    ApiResponse {
+        success: true,
+        message: format!(
+            "Fleet config accepted for profile {profile} with selectors {}",
+            config.selector_tags
+        ),
+    }
+}
+
+fn validate_supply_chain_panel_config(config: SupplyChainPanelConfig) -> ApiResponse {
+    if !config.signature_key.starts_with("sha256:") {
+        return ApiResponse {
+            success: false,
+            message: "Supply Chain WIT validation failed: signature_key must start with sha256:"
+                .to_owned(),
+        };
+    }
+    let mode = if config.air_gapped {
+        "air-gapped"
+    } else {
+        "connected"
+    };
+    ApiResponse {
+        success: true,
+        message: format!("Supply chain config accepted for {mode} mode"),
     }
 }
 
