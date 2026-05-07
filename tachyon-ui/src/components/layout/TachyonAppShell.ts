@@ -1,7 +1,10 @@
 import gsap from "gsap";
 
 import "../routing/TachyonRoutingDashboard";
+import "../traffic/TachyonResiliencePanel";
+import "../traffic/TachyonRoutingPanel";
 import stylesheetText from "../../style.css?inline";
+import { listComponentRoutes, resolveComponentTag } from "../../registry/ComponentRegistry";
 
 type AuthenticatedDetail = {
   user: string;
@@ -60,6 +63,12 @@ export class TachyonAppShell extends HTMLElement {
   }
 
   private render(): void {
+    const configLinks = listComponentRoutes()
+      .map(
+        (entry) =>
+          `<button data-route="${entry.route}" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">${entry.label}</button>`,
+      )
+      .join("");
     this.root.innerHTML = `
       <section id="shell" class="hidden fixed inset-0 z-30 h-screen w-screen bg-slate-950 text-slate-300">
         <aside id="shell-sidebar" class="w-64 bg-slate-900 border-r border-slate-800 flex flex-col opacity-0">
@@ -69,7 +78,7 @@ export class TachyonAppShell extends HTMLElement {
           </div>
           <nav class="flex-1 p-4 space-y-2">
             <button data-route="dashboard" class="nav-link w-full text-left block px-4 py-2 rounded-md bg-slate-800 text-cyan-400 font-medium transition-colors">Dashboard</button>
-            <button data-route="routing" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Routing</button>
+            ${configLinks}
             <button data-route="topology" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Mesh Topology</button>
             <button data-route="registry" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">Asset Registry</button>
           </nav>
@@ -103,9 +112,6 @@ export class TachyonAppShell extends HTMLElement {
                 </div>
               </div>
             </section>
-            <section data-route-panel="routing" class="route-panel hidden">
-              <tachyon-routing-dashboard></tachyon-routing-dashboard>
-            </section>
           </main>
         </div>
       </section>
@@ -131,9 +137,45 @@ export class TachyonAppShell extends HTMLElement {
   }
 
   private showRoute(route: string): void {
+    const staticPanel = this.root.querySelector<HTMLElement>(`[data-route-panel="${route}"]`);
     this.root.querySelectorAll<HTMLElement>("[data-route-panel]").forEach((panel) => {
-      panel.classList.toggle("hidden", panel.dataset.routePanel !== route);
+      panel.classList.toggle("hidden", panel !== staticPanel);
     });
+
+    if (staticPanel) {
+      return;
+    }
+
+    const routerView = this.root.getElementById("router-view");
+    if (!routerView) {
+      return;
+    }
+
+    const tagName = resolveComponentTag(route);
+    const dynamicPanel = this.ensureDynamicPanel(routerView);
+    dynamicPanel.classList.remove("hidden");
+    if (!tagName) {
+      dynamicPanel.innerHTML = `
+        <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+          Unknown route: ${route}
+        </div>
+      `;
+      return;
+    }
+
+    dynamicPanel.innerHTML = "";
+    dynamicPanel.appendChild(document.createElement(tagName));
+  }
+
+  private ensureDynamicPanel(routerView: HTMLElement): HTMLElement {
+    let panel = this.root.querySelector<HTMLElement>('[data-route-panel="dynamic"]');
+    if (!panel) {
+      panel = document.createElement("section");
+      panel.dataset.routePanel = "dynamic";
+      panel.className = "route-panel";
+      routerView.appendChild(panel);
+    }
+    return panel;
   }
 }
 
