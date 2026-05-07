@@ -125,6 +125,14 @@ struct TrafficPathMatch {
     prefix: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResilienceConfig {
+    timeout_ms: u64,
+    retry_count: u32,
+    circuit_breaker_threshold: u32,
+}
+
 #[tauri::command]
 async fn get_engine_status() -> Result<String, String> {
     tachyon_client::get_engine_status()
@@ -297,16 +305,24 @@ async fn delete_resource(name: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn apply_configuration(domain: String, payload: Value) -> Result<ApiResponse, String> {
-    if domain != "config-routing" && domain != "routing" {
-        return Err(format!("Unknown configuration domain: {domain}"));
-    }
-
-    match serde_json::from_value::<TrafficConfig>(payload) {
-        Ok(config) => Ok(validate_traffic_config(config)),
-        Err(error) => Ok(ApiResponse {
-            success: false,
-            message: format!("WIT validation failed: {error}"),
-        }),
+    match domain.as_str() {
+        "config-routing" | "routing" => match serde_json::from_value::<TrafficConfig>(payload) {
+            Ok(config) => Ok(validate_traffic_config(config)),
+            Err(error) => Ok(ApiResponse {
+                success: false,
+                message: format!("WIT validation failed: {error}"),
+            }),
+        },
+        "config-resilience" | "resilience" => {
+            match serde_json::from_value::<ResilienceConfig>(payload) {
+                Ok(config) => Ok(validate_resilience_config(config)),
+                Err(error) => Ok(ApiResponse {
+                    success: false,
+                    message: format!("Resilience validation failed: {error}"),
+                }),
+            }
+        }
+        _ => Err(format!("Unknown configuration domain: {domain}")),
     }
 }
 
@@ -314,7 +330,10 @@ fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
     if config.api_version != "routing.tachyon.io/v1alpha1" {
         return ApiResponse {
             success: false,
-            message: format!("WIT validation failed: unsupported api_version {}", config.api_version),
+            message: format!(
+                "WIT validation failed: unsupported api_version {}",
+                config.api_version
+            ),
         };
     }
     if config.kind != "TrafficConfiguration" {
@@ -335,8 +354,9 @@ fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
         if gateway.name.trim().is_empty() || gateway.bind_address.trim().is_empty() {
             return ApiResponse {
                 success: false,
-                message: "WIT validation failed: gateway.name and gateway.bind_address are required"
-                    .to_string(),
+                message:
+                    "WIT validation failed: gateway.name and gateway.bind_address are required"
+                        .to_string(),
             };
         }
         match gateway.protocol {
@@ -373,6 +393,32 @@ fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
             config.metadata.name,
             config.spec.gateways.len(),
             config.spec.routes.len()
+        ),
+    }
+}
+
+fn validate_resilience_config(config: ResilienceConfig) -> ApiResponse {
+    if config.timeout_ms == 0 {
+        return ApiResponse {
+            success: false,
+            message: "Resilience validation failed: timeout_ms must be greater than zero"
+                .to_string(),
+        };
+    }
+    if config.circuit_breaker_threshold == 0 {
+        return ApiResponse {
+            success: false,
+            message:
+                "Resilience validation failed: circuit_breaker_threshold must be greater than zero"
+                    .to_string(),
+        };
+    }
+
+    ApiResponse {
+        success: true,
+        message: format!(
+            "Resilience validation passed: timeout={}ms, retries={}, breaker_threshold={}.",
+            config.timeout_ms, config.retry_count, config.circuit_breaker_threshold
         ),
     }
 }
