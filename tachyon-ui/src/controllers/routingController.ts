@@ -1,7 +1,11 @@
-import gsap from "gsap";
-import { invoke } from "@tauri-apps/api/core";
+import { resilientInvoke as invoke } from "../utils/network";
 
-type TrafficConfiguration = {
+type ApplyConfigurationResponse = {
+  success: boolean;
+  message: string;
+};
+
+type RoutingPayload = {
   api_version: "routing.tachyon.io/v1alpha1";
   kind: "TrafficConfiguration";
   metadata: {
@@ -31,38 +35,35 @@ type TrafficConfiguration = {
 };
 
 export class RoutingController {
-  static init() {
-    const deployBtn = document.getElementById("btn-deploy-routing");
-    if (!deployBtn) {
-      return;
-    }
-
-    deployBtn.addEventListener("click", async () => {
-      gsap.to(deployBtn, { scale: 0.95, duration: 0.1, yoyo: true, repeat: 1 });
-      const payload = this.buildPayload();
-
-      try {
-        const response = await invoke<{ success: boolean; message: string }>("apply_configuration", {
-          domain: "config-routing",
-          payload,
-        });
-
-        if (response.success) {
-          this.showToast(response.message, "success");
-        }
-      } catch (error) {
-        this.showToast(String(error), "error");
-      }
+  static mount(): void {
+    document.getElementById("btn-deploy-routing")?.addEventListener("click", () => {
+      void RoutingController.deploy();
     });
   }
 
-  private static buildPayload(): TrafficConfiguration {
-    const gatewayName = readText("[data-routing-gateway-name]", "public-https");
-    const gatewayProtocol = readText("[data-routing-gateway-protocol]", "HTTPS");
-    const bindAddress = readText("[data-routing-gateway-bind]", "0.0.0.0:443");
-    const routeName = readText("[data-routing-route-name]", "api-v1-routing");
-    const routePath = readText("[data-routing-route-path]", "/v1/inference");
-    const routeTarget = readText("[data-routing-route-target]", "ai-inference-wasm");
+  private static async deploy(): Promise<void> {
+    const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
+      domain: "config-routing",
+      payload: RoutingController.buildPayload(),
+    });
+
+    const level = response.success ? "info" : "error";
+    console[level](`[routing] ${response.message}`);
+  }
+
+  private static buildPayload(): RoutingPayload {
+    const getValue = (id: string, fallback: string): string => {
+      const el = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+      const value = el?.value.trim();
+      return value ? value : fallback;
+    };
+
+    const gatewayName = getValue("input-gw-name", "default-gw");
+    const gatewayProtocol = getValue("input-gw-protocol", "HTTPS");
+    const bindAddress = getValue("input-gw-bind", "0.0.0.0:443");
+    const routeName = getValue("input-route-name", "default-route");
+    const routePath = getValue("input-route-path", "/");
+    const routeTarget = getValue("input-route-target", "default-target");
 
     return {
       api_version: "routing.tachyon.io/v1alpha1",
@@ -95,28 +96,4 @@ export class RoutingController {
       },
     };
   }
-
-  private static showToast(message: string, type: "success" | "error" = "success") {
-    const toast = document.createElement("div");
-    const tone =
-      type === "success"
-        ? "border-emerald-500/30 text-emerald-300"
-        : "border-red-500/30 text-red-300";
-    toast.className =
-      `fixed bottom-6 right-6 z-50 rounded border bg-slate-900 px-4 py-3 text-sm shadow-lg ${tone}`;
-    toast.textContent = message;
-    document.body.appendChild(toast);
-    gsap.fromTo(toast, { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.2 });
-    gsap.to(toast, {
-      opacity: 0,
-      y: 12,
-      delay: 2,
-      duration: 0.2,
-      onComplete: () => toast.remove(),
-    });
-  }
-}
-
-function readText(selector: string, fallback: string): string {
-  return document.querySelector(selector)?.textContent?.trim() || fallback;
 }
