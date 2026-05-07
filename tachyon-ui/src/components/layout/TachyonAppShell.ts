@@ -4,6 +4,7 @@ import "../domains/TachyonAIPanel";
 import "../domains/TachyonHardwarePanel";
 import "../domains/TachyonIdentityPanel";
 import "../domains/TachyonObservabilityPanel";
+import "../domains/TachyonOverviewPanel";
 import "../domains/TachyonRbacPanel";
 import "../domains/TachyonFleetPanel";
 import "../domains/TachyonStoragePanel";
@@ -62,6 +63,8 @@ export class TachyonAppShell extends HTMLElement {
     this.classList.remove("hidden");
     shell.classList.remove("hidden");
     shell.classList.add("flex");
+    this.updateNavigation("overview");
+    this.showRoute("overview");
 
     const timeline = gsap.timeline();
     timeline
