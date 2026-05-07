@@ -157,6 +157,20 @@ struct AiConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityIdentityConfig {
+    jwt_issuer: String,
+    crdt_quota: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RbacPanelConfig {
+    role: String,
+    policy: Value,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum LoraMode {
     Dynamic,
@@ -381,6 +395,22 @@ async fn apply_configuration(domain: String, payload: Value) -> Result<ApiRespon
                 message: format!("AI WIT validation failed: {error}"),
             }),
         },
+        "config-security" | "identity" | "security-identity" => {
+            match serde_json::from_value::<SecurityIdentityConfig>(payload) {
+                Ok(config) => Ok(validate_security_identity_config(config)),
+                Err(error) => Ok(ApiResponse {
+                    success: false,
+                    message: format!("Security WIT validation failed: {error}"),
+                }),
+            }
+        }
+        "config-rbac" | "rbac" => match serde_json::from_value::<RbacPanelConfig>(payload) {
+            Ok(config) => Ok(validate_rbac_panel_config(config)),
+            Err(error) => Ok(ApiResponse {
+                success: false,
+                message: format!("RBAC WIT validation failed: {error}"),
+            }),
+        },
         _ => Err(format!("Unknown configuration domain: {domain}")),
     }
 }
@@ -519,6 +549,48 @@ fn validate_ai_config(config: AiConfig) -> ApiResponse {
             "AI WIT validation passed: lora_mode={lora_mode}, kv_cache={}GB, accelerator={accelerator}, xdp_offload={xdp_status}.",
             config.kv_cache_size
         ),
+    }
+}
+
+fn validate_security_identity_config(config: SecurityIdentityConfig) -> ApiResponse {
+    if !config.jwt_issuer.starts_with("https://") {
+        return ApiResponse {
+            success: false,
+            message: "Security WIT validation failed: jwt_issuer must use https://".to_owned(),
+        };
+    }
+    if config.crdt_quota == 0 {
+        return ApiResponse {
+            success: false,
+            message: "Security WIT validation failed: crdt_quota must be greater than zero"
+                .to_owned(),
+        };
+    }
+    ApiResponse {
+        success: true,
+        message: format!(
+            "Identity security config accepted for issuer {} with {} req/sec CRDT quota",
+            config.jwt_issuer, config.crdt_quota
+        ),
+    }
+}
+
+fn validate_rbac_panel_config(config: RbacPanelConfig) -> ApiResponse {
+    if config.role.trim().is_empty() {
+        return ApiResponse {
+            success: false,
+            message: "RBAC WIT validation failed: role is required".to_owned(),
+        };
+    }
+    if !config.policy.is_object() {
+        return ApiResponse {
+            success: false,
+            message: "RBAC WIT validation failed: policy must be a JSON object".to_owned(),
+        };
+    }
+    ApiResponse {
+        success: true,
+        message: format!("RBAC policy accepted for role {}", config.role),
     }
 }
 
