@@ -7,6 +7,8 @@ export type ComponentRoute = {
 const routes: ComponentRoute[] = [
   { route: "routing", label: "Routing", tagName: "tachyon-routing-panel" },
   { route: "resilience", label: "Resilience", tagName: "tachyon-resilience-panel" },
+  { route: "ai", label: "AI Orchestration", tagName: "tachyon-ai-panel" },
+  { route: "hardware", label: "Hardware", tagName: "tachyon-hardware-panel" },
 ];
 
 export function listComponentRoutes(): ComponentRoute[] {
