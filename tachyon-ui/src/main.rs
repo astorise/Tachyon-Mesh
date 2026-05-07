@@ -85,9 +85,12 @@ struct TrafficGateway {
 
 #[derive(Debug, Deserialize)]
 enum TrafficProtocol {
-    HTTP,
-    HTTPS,
-    TCP,
+    #[serde(rename = "HTTP")]
+    Http,
+    #[serde(rename = "HTTPS")]
+    Https,
+    #[serde(rename = "TCP")]
+    Tcp,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,7 +105,8 @@ struct TrafficRoute {
 
 #[derive(Debug, Deserialize)]
 enum TrafficRouteType {
-    HTTP,
+    #[serde(rename = "HTTP")]
+    Http,
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,7 +396,7 @@ fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
             };
         }
         match gateway.protocol {
-            TrafficProtocol::HTTP | TrafficProtocol::HTTPS | TrafficProtocol::TCP => {}
+            TrafficProtocol::Http | TrafficProtocol::Https | TrafficProtocol::Tcp => {}
         }
     }
 
@@ -405,7 +409,7 @@ fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
             };
         }
         match route.route_type {
-            TrafficRouteType::HTTP => {}
+            TrafficRouteType::Http => {}
         }
         for rule in &route.rules {
             if rule.match_rule.path.prefix.trim().is_empty() || rule.target.trim().is_empty() {
