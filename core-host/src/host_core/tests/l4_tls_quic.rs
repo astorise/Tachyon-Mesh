@@ -56,7 +56,13 @@ async fn bridge_manager_relays_packets_between_allocated_ports() {
             .expect("client A should receive relayed datagram");
     assert_eq!(&received[..size], b"beta");
     assert_eq!(source.port(), allocation.port_a);
-    assert!(manager.total_relayed_bytes() >= 9);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager.total_relayed_bytes() < 9 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bridge byte accounting should include both relayed datagrams");
 
     manager
         .destroy_relay(&allocation.bridge_id)
