@@ -22,6 +22,8 @@ export abstract class TachyonConfigDashboard extends HTMLElement {
   }
 
   protected showFeedback(type: FeedbackKind, message: string): void {
+    window.dispatchEvent(new CustomEvent("app:notify", { detail: { type, message } }));
+
     const zone = this.root.getElementById("feedback-zone");
     if (!zone) {
       return;

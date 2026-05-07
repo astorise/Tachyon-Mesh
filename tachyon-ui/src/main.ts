@@ -5,6 +5,7 @@ import QRCode from "qrcode";
 import { mountNetworkStatus } from "./components/NetworkStatus";
 import "./components/iam/TachyonIAM";
 import "./components/layout/TachyonAppShell";
+import "./components/layout/TachyonToastManager";
 import { resilientInvoke as invoke } from "./utils/network";
 
 const configuredNodeUrl = (import.meta.env.VITE_TACHYON_NODE_URL ?? "").trim();
