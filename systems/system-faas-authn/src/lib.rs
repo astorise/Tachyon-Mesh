@@ -12,7 +12,7 @@ mod bindings {
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bindings::exports::tachyon::identity::authn::{
     AuthSession, AuthnError, IdentityPayload, RegistrationTokenClaims, SignupProfile,
-    StagedUserSession,
+    StagedLoginSession, StagedUserSession,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rand::distr::{Alphanumeric, SampleString};
@@ -36,6 +36,7 @@ const RECOVERY_SESSION_TTL_SECONDS: u64 = 300;
 const REGISTRATION_TOKEN_USE: &str = "registration";
 const REGISTRATION_TOKEN_TTL_SECONDS: u64 = 24 * 60 * 60;
 const AUTH_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
+const LOGIN_SESSION_TTL_SECONDS: u64 = 5 * 60;
 const TOTP_SECRET_BYTES: usize = 20;
 const TOTP_PERIOD_SECONDS: u64 = 30;
 const TOTP_ALLOWED_SKEW_STEPS: i64 = 1;
@@ -120,6 +121,14 @@ struct PendingEnrollmentRecord {
     expires_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingLoginRecord {
+    session_id: String,
+    username: String,
+    created_at: u64,
+    expires_at: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ConsumedRegistrationTokenStore {
     #[serde(default)]
@@ -141,6 +150,14 @@ impl bindings::exports::tachyon::identity::authn::Guest for Component {
 
     fn finalize_enrollment(session_id: String, totp_code: String) -> Result<AuthSession, String> {
         finalize_pending_enrollment(&session_id, &totp_code)
+    }
+
+    fn stage_login(username: String, password: String) -> Result<StagedLoginSession, String> {
+        stage_pending_login(&username, &password)
+    }
+
+    fn finalize_login(session_id: String, totp_code: String) -> Result<AuthSession, String> {
+        finalize_pending_login(&session_id, &totp_code)
     }
 
     fn issue_pat(
@@ -337,6 +354,67 @@ fn finalize_pending_enrollment(session_id: &str, totp_code: &str) -> Result<Auth
         username: pending.username,
         roles: pending.roles,
         scopes: pending.scopes,
+    })
+}
+
+fn stage_pending_login(username: &str, password: &str) -> Result<StagedLoginSession, String> {
+    let username = normalize_username(username)?;
+    let password_hash = hash_user_password(&username, password)?;
+    let record = load_user_record(&username)?;
+    let profile = record
+        .profile
+        .ok_or_else(|| "username or password is invalid".to_owned())?;
+
+    if profile.password_hash != password_hash {
+        return Err("username or password is invalid".to_owned());
+    }
+
+    prune_expired_pending_logins()?;
+    let now = unix_timestamp_seconds().map_err(|error| error.to_string())?;
+    let pending = PendingLoginRecord {
+        session_id: generate_pending_session_id(),
+        username: profile.username,
+        created_at: now,
+        expires_at: now.saturating_add(LOGIN_SESSION_TTL_SECONDS),
+    };
+    save_pending_login(&pending)?;
+
+    Ok(StagedLoginSession {
+        session_id: pending.session_id,
+        username: pending.username,
+        expires_at: pending.expires_at,
+    })
+}
+
+fn finalize_pending_login(session_id: &str, totp_code: &str) -> Result<AuthSession, String> {
+    let session_id = normalize_session_id(session_id)?;
+    let pending = load_pending_login(&session_id)?;
+    let now = unix_timestamp_seconds().map_err(|error| error.to_string())?;
+
+    if now >= pending.expires_at {
+        delete_pending_login(&session_id)?;
+        return Err("login session has expired".to_owned());
+    }
+
+    let record = load_user_record(&pending.username)?;
+    let profile = record
+        .profile
+        .ok_or_else(|| "username is not enrolled".to_owned())?;
+    verify_totp_code(&profile.totp_secret, totp_code, now)?;
+    delete_pending_login(&session_id)?;
+
+    let token = issue_jwt(
+        &profile.username,
+        &profile.roles,
+        &profile.scopes,
+        Duration::from_secs(AUTH_SESSION_TTL_SECONDS),
+    )?;
+
+    Ok(AuthSession {
+        token,
+        username: profile.username,
+        roles: profile.roles,
+        scopes: profile.scopes,
     })
 }
 
@@ -575,6 +653,46 @@ fn prune_expired_pending_enrollments() -> Result<(), String> {
     Ok(())
 }
 
+fn prune_expired_pending_logins() -> Result<(), String> {
+    let pending_dir = pending_login_dir();
+    if !pending_dir.exists() {
+        return Ok(());
+    }
+    let now = unix_timestamp_seconds().map_err(|error| error.to_string())?;
+
+    for entry in fs::read_dir(&pending_dir).map_err(|error| {
+        format!(
+            "failed to enumerate pending logins in {}: {error}",
+            pending_dir.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to inspect pending login in {}: {error}",
+                pending_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let raw = fs::read(&path).map_err(|error| {
+            format!("failed to read pending login {}: {error}", path.display())
+        })?;
+        let pending: PendingLoginRecord = serde_json::from_slice(&raw).map_err(|error| {
+            format!("failed to decode pending login {}: {error}", path.display())
+        })?;
+        if now >= pending.expires_at {
+            fs::remove_file(&path).map_err(|error| {
+                format!("failed to delete expired pending login {}: {error}", path.display())
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 fn save_pending_enrollment(record: &PendingEnrollmentRecord) -> Result<(), String> {
     let path = pending_enrollment_path(&record.session_id)?;
     if let Some(parent) = path.parent() {
@@ -624,6 +742,39 @@ fn delete_pending_enrollment(session_id: &str) -> Result<(), String> {
             path.display()
         )
     })
+}
+
+fn save_pending_login(pending: &PendingLoginRecord) -> Result<(), String> {
+    let path = pending_login_path(&pending.session_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create pending login directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let payload = serde_json::to_vec_pretty(pending)
+        .map_err(|error| format!("failed to encode pending login: {error}"))?;
+    fs::write(&path, payload)
+        .map_err(|error| format!("failed to persist pending login {}: {error}", path.display()))
+}
+
+fn load_pending_login(session_id: &str) -> Result<PendingLoginRecord, String> {
+    let path = pending_login_path(session_id)?;
+    let raw = fs::read(&path)
+        .map_err(|error| format!("failed to read pending login {}: {error}", path.display()))?;
+    serde_json::from_slice(&raw)
+        .map_err(|error| format!("failed to decode pending login {}: {error}", path.display()))
+}
+
+fn delete_pending_login(session_id: &str) -> Result<(), String> {
+    let path = pending_login_path(session_id)?;
+    if path.exists() {
+        fs::remove_file(&path)
+            .map_err(|error| format!("failed to delete pending login {}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn verify_hs256_token(token: &str) -> Result<TokenPayload, AuthnError> {
@@ -804,10 +955,14 @@ fn generate_pat_token() -> String {
     format!("{PAT_PREFIX}{suffix}")
 }
 
-fn generate_pending_enrollment_id() -> String {
+fn generate_pending_session_id() -> String {
     Alphanumeric
         .sample_string(&mut rand::rng(), 32)
         .to_ascii_lowercase()
+}
+
+fn generate_pending_enrollment_id() -> String {
+    generate_pending_session_id()
 }
 
 fn generate_totp_secret() -> String {
@@ -1072,6 +1227,15 @@ fn pending_enrollment_dir() -> PathBuf {
 fn pending_enrollment_path(session_id: &str) -> Result<PathBuf, String> {
     let sanitized = sanitize_filename(session_id)?;
     Ok(pending_enrollment_dir().join(format!("{sanitized}.json")))
+}
+
+fn pending_login_dir() -> PathBuf {
+    state_root_dir().join("pending-logins")
+}
+
+fn pending_login_path(session_id: &str) -> Result<PathBuf, String> {
+    let sanitized = sanitize_filename(session_id)?;
+    Ok(pending_login_dir().join(format!("{sanitized}.json")))
 }
 
 fn registration_token_store_path() -> PathBuf {

@@ -8,6 +8,7 @@ type AuthLoginResponse = {
   username: string;
   endpoint: string;
   requiresMfa: boolean;
+  sessionId?: string | null;
 };
 
 type RegistrationTokenClaims = {
@@ -37,9 +38,10 @@ iamStylesheet.replaceSync(stylesheetText);
 
 export class TachyonIAM extends HTMLElement {
   private readonly root: ShadowRoot;
-  private activeStep: "login" | "signup-token" | "signup-profile" | "signup-totp" = "login";
+  private activeStep: "login" | "mfa" | "signup-token" | "signup-profile" | "signup-totp" = "login";
   private claims: RegistrationTokenClaims | null = null;
   private stagedSignup: StagedSignupSession | null = null;
+  private stagedLogin: AuthLoginResponse | null = null;
 
   constructor() {
     super();
@@ -69,6 +71,11 @@ export class TachyonIAM extends HTMLElement {
               <button id="btn-login-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)]">Authenticate</button>
               <button type="button" id="btn-open-signup" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Register with Invite Token</button>
             </div>
+          </form>
+          <form id="auth-step-mfa" class="auth-step hidden space-y-4">
+            <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">Enter the 6-digit code from your authenticator app.</div>
+            <input type="text" id="auth-mfa-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
+            <button id="btn-mfa-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Verify Code</button>
           </form>
           <form id="auth-step-signup-token" class="auth-step hidden space-y-4">
             <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">Validate a 24-hour invite token before creating the admin profile.</div>
@@ -128,6 +135,10 @@ export class TachyonIAM extends HTMLElement {
       event.preventDefault();
       void this.login();
     });
+    this.form("auth-step-mfa")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void this.finalizeLogin();
+    });
     this.button("btn-open-signup")?.addEventListener("click", () => void this.switchStep("signup-token"));
     this.button("btn-signup-token-back")?.addEventListener("click", () => void this.switchStep("login"));
     this.form("auth-step-signup-token")?.addEventListener("submit", (event) => {
@@ -161,12 +172,42 @@ export class TachyonIAM extends HTMLElement {
         payload: { url, username, password, cert: null },
       });
       if (response.requiresMfa) {
-        this.showError("MFA challenge is not available in this component yet.");
+        if (!response.sessionId) {
+          throw new Error("Login staged without an MFA session id.");
+        }
+        this.stagedLogin = response;
+        await this.switchStep("mfa");
         return;
       }
       await this.completeAuthentication({ user: response.username, role: "admin", token: password });
     } catch (error) {
       this.emitError(error, "authn_login_failed");
+    }
+  }
+
+  private async finalizeLogin(): Promise<void> {
+    if (!this.stagedLogin?.sessionId) {
+      this.showError("No staged login session is active.");
+      return;
+    }
+    const totpCode = this.value("auth-mfa-code").replace(/\s+/g, "");
+    if (!/^\d{6}$/.test(totpCode)) {
+      this.showError("Enter a 6-digit MFA code.");
+      return;
+    }
+    try {
+      const response = await invoke<AuthLoginResponse>("finalize_login", {
+        payload: {
+          url: this.value("auth-url"),
+          sessionId: this.stagedLogin.sessionId,
+          totpCode,
+          cert: null,
+        },
+      });
+      this.stagedLogin = null;
+      await this.completeAuthentication({ user: response.username, role: "admin", token: "" });
+    } catch (error) {
+      this.emitError(error, "authn_mfa_failed");
     }
   }
 

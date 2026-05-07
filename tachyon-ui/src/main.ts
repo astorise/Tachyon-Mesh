@@ -35,6 +35,7 @@ type AuthLoginResponse = {
   username: string;
   endpoint: string;
   requiresMfa: boolean;
+  sessionId?: string | null;
 };
 
 type RegistrationTokenClaims = {
@@ -236,6 +237,7 @@ document.addEventListener("DOMContentLoaded", () => {
   let authGatewayValidated = false;
   let iamUsers: IamUserSummary[] = [];
   let activeAuthStep: "login" | "mfa" | "signup-token" | "signup-profile" | "signup-totp" = "login";
+  let stagedLogin: AuthLoginResponse | null = null;
   let signupClaims: RegistrationTokenClaims | null = null;
   let stagedSignup: StagedSignupSession | null = null;
   let meshResources: MeshResource[] = [];
@@ -1344,25 +1346,29 @@ document.addEventListener("DOMContentLoaded", () => {
           cert,
         },
       });
-      const status = await invoke<string>("get_engine_status");
-
-      if (activeFaaS) {
-        activeFaaS.innerText = String(status);
-      }
       activeOperator = response.username;
-      authGatewayValidated = true;
       updateConnectionBadge();
-      await loadIamUsers();
-      renderAccountView();
-      void refreshMeshTopology();
-      renderIdentityMessage(
-        `Authenticated ${response.username} against ${response.endpoint}. Complete MFA to unlock the dashboard.`,
-        "min-h-24 rounded-xl border border-cyan-500/20 bg-slate-900 px-4 py-3 font-mono text-xs text-cyan-300 whitespace-pre-wrap break-words",
-      );
 
       if (response.requiresMfa) {
+        if (!response.sessionId) {
+          throw new Error("Login staged without an MFA session id.");
+        }
+        stagedLogin = response;
+        authGatewayValidated = false;
+        renderIdentityMessage(
+          `Password accepted for ${response.username}. Enter the 6-digit TOTP code to unlock ${response.endpoint}.`,
+          "min-h-24 rounded-xl border border-cyan-500/20 bg-slate-900 px-4 py-3 font-mono text-xs text-cyan-300 whitespace-pre-wrap break-words",
+        );
         await switchAuthStep("mfa");
       } else {
+        const status = await invoke<string>("get_engine_status");
+        if (activeFaaS) {
+          activeFaaS.innerText = String(status);
+        }
+        authGatewayValidated = true;
+        await loadIamUsers();
+        renderAccountView();
+        void refreshMeshTopology();
         await hideAuthOverlay();
         await showFirstRunModal();
       }
@@ -1393,10 +1399,36 @@ document.addEventListener("DOMContentLoaded", () => {
     authMfaSubmitBtn.textContent = "Verifying...";
 
     try {
+      if (!stagedLogin?.sessionId || !nodeUrl) {
+        throw new Error("No staged login session is active.");
+      }
+      const cert = await readIdentityBytes();
+      const response = await invoke<AuthLoginResponse>("finalize_login", {
+        payload: {
+          url: nodeUrl.value,
+          sessionId: stagedLogin.sessionId,
+          totpCode: code,
+          cert,
+        },
+      });
+      const status = await invoke<string>("get_engine_status");
+      if (activeFaaS) {
+        activeFaaS.innerText = String(status);
+      }
+      activeOperator = response.username;
+      authGatewayValidated = true;
+      stagedLogin = null;
+      updateConnectionBadge();
+      await loadIamUsers();
       await hideAuthOverlay();
       renderIdentityView();
       renderAccountView();
+      void refreshMeshTopology();
       await showFirstRunModal();
+    } catch (error) {
+      authGatewayValidated = false;
+      console.error("MFA verification error:", error);
+      showConnectionError(String(error));
     } finally {
       authMfaSubmitBtn.disabled = false;
       authMfaSubmitBtn.textContent = "Verify Code";
