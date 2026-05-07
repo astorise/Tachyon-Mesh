@@ -2,6 +2,8 @@ import gsap from "gsap";
 
 import "../domains/TachyonAIPanel";
 import "../domains/TachyonHardwarePanel";
+import "../domains/TachyonIdentityPanel";
+import "../domains/TachyonRbacPanel";
 import "../routing/TachyonRoutingDashboard";
 import "../traffic/TachyonResiliencePanel";
 import "../traffic/TachyonRoutingPanel";
