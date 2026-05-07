@@ -133,6 +133,31 @@ struct ResilienceConfig {
     circuit_breaker_threshold: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiConfig {
+    lora_mode: LoraMode,
+    kv_cache_size: u32,
+    tde_key: String,
+    accelerator: Option<Accelerator>,
+    xdp_offload: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LoraMode {
+    Dynamic,
+    Static,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Accelerator {
+    Npu,
+    Tpu,
+    Gpu,
+}
+
 #[tauri::command]
 async fn get_engine_status() -> Result<String, String> {
     tachyon_client::get_engine_status()
@@ -322,6 +347,13 @@ async fn apply_configuration(domain: String, payload: Value) -> Result<ApiRespon
                 }),
             }
         }
+        "config-ai" | "ai_orchestration" => match serde_json::from_value::<AiConfig>(payload) {
+            Ok(config) => Ok(validate_ai_config(config)),
+            Err(error) => Ok(ApiResponse {
+                success: false,
+                message: format!("AI WIT validation failed: {error}"),
+            }),
+        },
         _ => Err(format!("Unknown configuration domain: {domain}")),
     }
 }
@@ -419,6 +451,46 @@ fn validate_resilience_config(config: ResilienceConfig) -> ApiResponse {
         message: format!(
             "Resilience validation passed: timeout={}ms, retries={}, breaker_threshold={}.",
             config.timeout_ms, config.retry_count, config.circuit_breaker_threshold
+        ),
+    }
+}
+
+fn validate_ai_config(config: AiConfig) -> ApiResponse {
+    if !(8..=128).contains(&config.kv_cache_size) {
+        return ApiResponse {
+            success: false,
+            message: "AI WIT validation failed: kv_cache_size must be between 8 and 128 GB"
+                .to_string(),
+        };
+    }
+    if config.tde_key.trim().is_empty() {
+        return ApiResponse {
+            success: false,
+            message: "AI WIT validation failed: tde_key is required".to_string(),
+        };
+    }
+
+    let lora_mode = match config.lora_mode {
+        LoraMode::Dynamic => "dynamic",
+        LoraMode::Static => "static",
+    };
+    let accelerator = match config.accelerator {
+        Some(Accelerator::Npu) => "npu",
+        Some(Accelerator::Tpu) => "tpu",
+        Some(Accelerator::Gpu) => "gpu",
+        None => "auto",
+    };
+    let xdp_status = if config.xdp_offload.unwrap_or(false) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+
+    ApiResponse {
+        success: true,
+        message: format!(
+            "AI WIT validation passed: lora_mode={lora_mode}, kv_cache={}GB, accelerator={accelerator}, xdp_offload={xdp_status}.",
+            config.kv_cache_size
         ),
     }
 }
