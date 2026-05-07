@@ -118,6 +118,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const signupProfileStep = document.getElementById("auth-step-signup-profile");
   const signupTotpStep = document.getElementById("auth-step-signup-totp");
   const nodeUrl = document.getElementById("auth-url") as HTMLInputElement | null;
+  const signupNodeUrl = document.getElementById("signup-auth-url") as HTMLInputElement | null;
   const authUsername = document.getElementById("auth-username") as HTMLInputElement | null;
   const nodeToken = document.getElementById("auth-password") as HTMLInputElement | null;
   const rememberCredentials = document.getElementById("remember-credentials") as HTMLInputElement | null;
@@ -310,6 +311,9 @@ document.addEventListener("DOMContentLoaded", () => {
   if (nodeUrl && !nodeUrl.value && configuredNodeUrl) {
     nodeUrl.value = configuredNodeUrl;
   }
+  if (signupNodeUrl && !signupNodeUrl.value && nodeUrl?.value) {
+    signupNodeUrl.value = nodeUrl.value;
+  }
   if (authUsername && !authUsername.value) {
     authUsername.value = activeOperator;
   }
@@ -317,6 +321,9 @@ document.addEventListener("DOMContentLoaded", () => {
   if (savedCredentials) {
     if (nodeUrl) {
       nodeUrl.value = savedCredentials.url;
+    }
+    if (signupNodeUrl) {
+      signupNodeUrl.value = savedCredentials.url;
     }
     if (authUsername) {
       authUsername.value = savedCredentials.username;
@@ -1401,6 +1408,15 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
+  const syncAuthUrls = (source: HTMLInputElement | null, target: HTMLInputElement | null) => {
+    if (!source || !target || target.value === source.value) {
+      return;
+    }
+    target.value = source.value;
+  };
+
+  const currentSignupUrl = () => (signupNodeUrl?.value.trim() || nodeUrl?.value.trim() || "");
+
   function loadSavedCredentials(): { url: string; username: string; password: string } | null {
     try {
       const raw = localStorage.getItem(savedCredentialsKey);
@@ -1494,11 +1510,15 @@ document.addEventListener("DOMContentLoaded", () => {
   };
 
   const validateSignupToken = async () => {
-    if (!nodeUrl || !signupTokenInput || !signupTokenSubmitBtn) {
+    if (!signupTokenInput || !signupTokenSubmitBtn) {
       return;
     }
 
     clearConnectionError();
+    if (!currentSignupUrl()) {
+      showConnectionError("Mesh Node URL is required for enrollment.");
+      return;
+    }
     signupTokenSubmitBtn.disabled = true;
     signupTokenSubmitBtn.textContent = "Validating...";
 
@@ -1506,7 +1526,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const cert = await readIdentityBytes();
       const claims = await invoke<RegistrationTokenClaims>("validate_signup_token", {
         payload: {
-          url: nodeUrl.value,
+          url: currentSignupUrl(),
           token: signupTokenInput.value,
           cert,
         },
@@ -1526,7 +1546,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const stageSignupAccount = async () => {
     if (
-      !nodeUrl ||
       !signupTokenInput ||
       !signupFirstName ||
       !signupLastName ||
@@ -1538,6 +1557,10 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     clearConnectionError();
+    if (!currentSignupUrl()) {
+      showConnectionError("Mesh Node URL is required for enrollment.");
+      return;
+    }
     signupProfileSubmitBtn.disabled = true;
     signupProfileSubmitBtn.textContent = "Staging...";
 
@@ -1545,7 +1568,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const cert = await readIdentityBytes();
       const session = await invoke<StagedSignupSession>("stage_signup", {
         payload: {
-          url: nodeUrl.value,
+          url: currentSignupUrl(),
           token: signupTokenInput.value,
           firstName: signupFirstName.value,
           lastName: signupLastName.value,
@@ -1567,11 +1590,15 @@ document.addEventListener("DOMContentLoaded", () => {
   };
 
   const finalizeSignup = async () => {
-    if (!nodeUrl || !stagedSignup || !signupTotpCode || !signupTotpSubmitBtn) {
+    if (!stagedSignup || !signupTotpCode || !signupTotpSubmitBtn) {
       return;
     }
 
     clearConnectionError();
+    if (!currentSignupUrl()) {
+      showConnectionError("Mesh Node URL is required for enrollment.");
+      return;
+    }
     const code = signupTotpCode.value.replace(/\s+/g, "");
     if (!/^\d{6}$/.test(code)) {
       showConnectionError("Enter the first 6-digit TOTP code from your authenticator app.");
@@ -1585,7 +1612,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const cert = await readIdentityBytes();
       const response = await invoke<AuthLoginResponse>("finalize_signup", {
         payload: {
-          url: nodeUrl.value,
+          url: currentSignupUrl(),
           sessionId: stagedSignup.sessionId,
           totpCode: code,
           cert,
@@ -2146,6 +2173,14 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     renderIdentityView();
     renderAccountView();
+  });
+
+  nodeUrl?.addEventListener("input", () => {
+    syncAuthUrls(nodeUrl, signupNodeUrl);
+  });
+
+  signupNodeUrl?.addEventListener("input", () => {
+    syncAuthUrls(signupNodeUrl, nodeUrl);
   });
 
   rememberCredentials?.addEventListener("change", () => {
