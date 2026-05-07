@@ -42,7 +42,7 @@ const DEFAULT_PAT_TTL_DAYS: u32 = 30;
 use authn_bindings::exports::tachyon::identity::authn::{
     AuthSession as AuthnSession, AuthnError,
     RegistrationTokenClaims as AuthnRegistrationTokenClaims, SignupProfile as AuthnSignupProfile,
-    StagedUserSession as AuthnStagedUserSession,
+    StagedLoginSession as AuthnStagedLoginSession, StagedUserSession as AuthnStagedUserSession,
 };
 use authz_bindings::exports::tachyon::identity::authz::AuthzError;
 
@@ -219,9 +219,31 @@ pub(crate) struct StagedUserSessionResponse {
     expires_at: u64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StagedLoginSessionResponse {
+    session_id: String,
+    username: String,
+    expires_at: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FinalizeEnrollmentRequest {
+    session_id: String,
+    totp_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StageLoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FinalizeLoginRequest {
     session_id: String,
     totp_code: String,
 }
@@ -390,6 +412,38 @@ impl AuthManager {
             .map_err(|error| {
                 anyhow!("authn component trapped while finalizing enrollment: {error}")
             })?
+            .map_err(|error| anyhow!(error))?;
+
+        Ok(map_auth_session(session))
+    }
+
+    pub(crate) fn stage_login(
+        &self,
+        engine: &Engine,
+        username: &str,
+        password: &str,
+    ) -> Result<StagedLoginSessionResponse> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let session = bindings
+            .tachyon_identity_authn()
+            .call_stage_login(&mut store, username, password)
+            .map_err(|error| anyhow!("authn component trapped while staging login: {error}"))?
+            .map_err(|error| anyhow!(error))?;
+
+        Ok(map_staged_login_session(session))
+    }
+
+    pub(crate) fn finalize_login(
+        &self,
+        engine: &Engine,
+        session_id: &str,
+        totp_code: &str,
+    ) -> Result<FinalizeEnrollmentResponse> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let session = bindings
+            .tachyon_identity_authn()
+            .call_finalize_login(&mut store, session_id, totp_code)
+            .map_err(|error| anyhow!("authn component trapped while finalizing login: {error}"))?
             .map_err(|error| anyhow!(error))?;
 
         Ok(map_auth_session(session))
@@ -783,6 +837,56 @@ pub(crate) async fn finalize_enrollment_handler(
     Ok(Json(session))
 }
 
+pub(crate) async fn stage_login_handler(
+    State(state): State<crate::AppState>,
+    Json(payload): Json<StageLoginRequest>,
+) -> Result<Json<StagedLoginSessionResponse>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let username = payload.username;
+    let password = payload.password;
+
+    let session = tokio::task::spawn_blocking(move || {
+        auth_manager.stage_login(&engine, &username, &password)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to join login staging task: {error}"),
+        )
+            .into_response()
+    })?
+    .map_err(string_error_to_response)?;
+
+    Ok(Json(session))
+}
+
+pub(crate) async fn finalize_login_handler(
+    State(state): State<crate::AppState>,
+    Json(payload): Json<FinalizeLoginRequest>,
+) -> Result<Json<FinalizeEnrollmentResponse>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let session_id = payload.session_id;
+    let totp_code = payload.totp_code;
+
+    let session = tokio::task::spawn_blocking(move || {
+        auth_manager.finalize_login(&engine, &session_id, &totp_code)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to join login finalization task: {error}"),
+        )
+            .into_response()
+    })?
+    .map_err(string_error_to_response)?;
+
+    Ok(Json(session))
+}
+
 pub(crate) async fn regenerate_account_security_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -926,6 +1030,14 @@ fn map_staged_user_session(session: AuthnStagedUserSession) -> StagedUserSession
         provisioning_uri: session.provisioning_uri,
         roles: session.roles,
         scopes: session.scopes,
+        expires_at: session.expires_at,
+    }
+}
+
+fn map_staged_login_session(session: AuthnStagedLoginSession) -> StagedLoginSessionResponse {
+    StagedLoginSessionResponse {
+        session_id: session.session_id,
+        username: session.username,
         expires_at: session.expires_at,
     }
 }

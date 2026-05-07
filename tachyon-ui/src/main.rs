@@ -45,6 +45,15 @@ struct SignupFinalizePayload {
     cert: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginFinalizePayload {
+    url: String,
+    session_id: String,
+    totp_code: String,
+    cert: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiResponse {
@@ -196,6 +205,20 @@ async fn authn_login(
         &payload.url,
         &payload.username,
         &payload.password,
+        payload.cert,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn finalize_login(
+    payload: LoginFinalizePayload,
+) -> Result<tachyon_client::AuthLoginResponse, String> {
+    tachyon_client::finalize_login(
+        &payload.url,
+        &payload.session_id,
+        &payload.totp_code,
         payload.cert,
     )
     .await
@@ -506,6 +529,7 @@ fn main() {
             get_mesh_graph,
             connect_to_node,
             authn_login,
+            finalize_login,
             validate_signup_token,
             stage_signup,
             finalize_signup,

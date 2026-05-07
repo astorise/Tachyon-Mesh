@@ -17,6 +17,8 @@ const ADMIN_ASSET_UPLOAD_PATH: &str = "/admin/assets";
 const AUTH_SIGNUP_VALIDATE_PATH: &str = "/auth/signup/validate-token";
 const AUTH_SIGNUP_STAGE_PATH: &str = "/auth/signup/stage";
 const AUTH_SIGNUP_FINALIZE_PATH: &str = "/auth/signup/finalize";
+const AUTH_LOGIN_STAGE_PATH: &str = "/auth/login/stage";
+const AUTH_LOGIN_FINALIZE_PATH: &str = "/auth/login/finalize";
 const EXPECTED_HASH_HEADER: &str = "x-tachyon-expected-sha256";
 const ADMIN_MODEL_INIT_PATH: &str = "/admin/models/init";
 const ADMIN_MODEL_UPLOAD_PATH: &str = "/admin/models/upload";
@@ -40,6 +42,7 @@ pub struct AuthLoginResponse {
     pub username: String,
     pub endpoint: String,
     pub requires_mfa: bool,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +114,27 @@ struct RecoveryCodeRequest<'a> {
 #[serde(rename_all = "camelCase")]
 struct ValidateRegistrationTokenRequest<'a> {
     token: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StageLoginRequest<'a> {
+    username: &'a str,
+    password: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalizeLoginRequest<'a> {
+    session_id: &'a str,
+    totp_code: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedLoginResponse {
+    session_id: String,
+    username: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -625,21 +649,87 @@ pub async fn authn_login(
     cert: Option<Vec<u8>>,
 ) -> Result<AuthLoginResponse> {
     let normalized_username = normalize_operator_name(username)?;
-    set_connection(url.trim().to_owned(), password.trim().to_owned(), cert)
+    let config = public_connection_config(url, cert);
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_endpoint_url(&config.url, AUTH_LOGIN_STAGE_PATH)?)
+        .json(&StageLoginRequest {
+            username: &normalized_username,
+            password,
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to reach Tachyon node at {}", config.url))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read login staging response body")?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "login staging failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    let staged: StagedLoginResponse =
+        serde_json::from_slice(&body).context("failed to decode login staging response payload")?;
+
+    Ok(AuthLoginResponse {
+        username: staged.username,
+        endpoint: config.url,
+        requires_mfa: true,
+        session_id: Some(staged.session_id),
+    })
+}
+
+pub async fn finalize_login(
+    url: &str,
+    session_id: &str,
+    totp_code: &str,
+    cert: Option<Vec<u8>>,
+) -> Result<AuthLoginResponse> {
+    let config = public_connection_config(url, cert.clone());
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_endpoint_url(&config.url, AUTH_LOGIN_FINALIZE_PATH)?)
+        .json(&FinalizeLoginRequest {
+            session_id: session_id.trim(),
+            totp_code: totp_code.trim(),
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to reach Tachyon node at {}", config.url))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read login finalization response body")?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "login finalization failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    let payload: FinalizeEnrollmentResponse = serde_json::from_slice(&body)
+        .context("failed to decode login finalization response payload")?;
+    set_connection(config.url.clone(), payload.token, cert)
         .await
         .map_err(anyhow::Error::msg)?;
 
-    let mut state = operator_state()
+    let mut operator = operator_state()
         .write()
         .expect("operator state should not be poisoned");
-    *state = Some(normalized_username.clone());
+    *operator = Some(payload.username.clone());
 
     Ok(AuthLoginResponse {
-        username: normalized_username,
-        endpoint: current_connection()
-            .map(|config| config.url)
-            .unwrap_or_else(|| url.trim().to_owned()),
-        requires_mfa: true,
+        username: payload.username,
+        endpoint: config.url,
+        requires_mfa: false,
+        session_id: None,
     })
 }
 
@@ -758,6 +848,7 @@ pub async fn finalize_enrollment(
         username: payload.username,
         endpoint: config.url,
         requires_mfa: false,
+        session_id: None,
     })
 }
 

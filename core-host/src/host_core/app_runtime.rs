@@ -60,6 +60,8 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/auth/signup/finalize",
             post(auth::finalize_enrollment_handler),
         )
+        .route("/auth/login/stage", post(auth::stage_login_handler))
+        .route("/auth/login/finalize", post(auth::finalize_login_handler))
         .route(
             "/auth/recovery/consume",
             post(auth::consume_recovery_code_handler),
