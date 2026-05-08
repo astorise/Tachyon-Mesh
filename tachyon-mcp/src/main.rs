@@ -355,7 +355,7 @@ async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Resul
         "tachyon_register_resource" | "tachyon_seal_overlay" | "tachyon_apply_manifest"
             if !allow_write(context) =>
         {
-            return Ok(error_response(None, -32000, "Rate limit exceeded"));
+            Ok(error_response(None, -32000, "Rate limit exceeded"))
         }
         "tachyon_mesh_status" => {
             let status = tachyon_client::get_engine_status().await?;
