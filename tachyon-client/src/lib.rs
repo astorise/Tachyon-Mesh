@@ -1926,7 +1926,9 @@ mod tests {
     #[test]
     fn parse_engine_status_summarizes_routes_and_batches() {
         let raw_lockfile = r#"{
-          "config_payload": "{\"routes\":[{\"path\":\"/api/a\"},{\"path\":\"/api/b\"}],\"batch_targets\":[{\"name\":\"gc-job\"}]}"
+          "config_payload": "{\"routes\":[{\"path\":\"/api/a\"},{\"path\":\"/api/b\"}],\"batch_targets\":[{\"name\":\"gc-job\"}]}",
+          "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+          "signature": "fixture-signature"
         }"#;
 
         let status = parse_engine_status(raw_lockfile).expect("status should parse");
