@@ -10,6 +10,7 @@ import "../domains/TachyonFleetPanel";
 import "../domains/TachyonStoragePanel";
 import "../domains/TachyonSupplyChainPanel";
 import "../domains/TachyonWorkloadsPanel";
+import "../iam/TachyonIAM";
 import "./TachyonGuidedTour";
 import "./TachyonToastManager";
 import "../routing/TachyonRoutingDashboard";
@@ -44,6 +45,7 @@ export class TachyonAppShell extends HTMLElement {
   private readonly root: ShadowRoot;
   private activeRoute = "overview";
   private activeUser = t("shell.unknown");
+  private activeRole = "operator";
   private shellStarted = false;
   private requiresSeal = false;
   private applyingSeal = false;
@@ -92,6 +94,9 @@ export class TachyonAppShell extends HTMLElement {
   }
 
   async startTransition(userData: AuthenticatedDetail): Promise<void> {
+    this.activeUser = userData.user;
+    this.activeRole = userData.role;
+    this.render();
     const authLayer = document.getElementById("auth-layer");
     const shell = this.root.getElementById("shell");
     const sidebar = this.root.getElementById("shell-sidebar");
@@ -102,7 +107,6 @@ export class TachyonAppShell extends HTMLElement {
       return;
     }
 
-    this.activeUser = userData.user;
     this.activeRoute = this.resolveHashRoute();
     this.shellStarted = true;
     user.textContent = this.activeUser;
@@ -180,6 +184,11 @@ export class TachyonAppShell extends HTMLElement {
                   <div class="mt-3 text-3xl font-light text-white">${t("dashboard.ready")}</div>
                 </div>
               </div>
+              ${
+                this.activeRole === "admin"
+                  ? '<tachyon-iam mode="admin"></tachyon-iam>'
+                  : ""
+              }
             </section>
           </main>
         </div>

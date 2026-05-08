@@ -33,6 +33,12 @@ type AuthenticatedDetail = {
   token: string;
 };
 
+type EnrollmentInvite = {
+  sessionId: string;
+  inviteToken: string;
+  qrPayload: string;
+};
+
 const iamStylesheet = new CSSStyleSheet();
 iamStylesheet.replaceSync(stylesheetText);
 
@@ -52,10 +58,16 @@ export class TachyonIAM extends HTMLElement {
   connectedCallback(): void {
     this.render();
     this.bindEvents();
-    void gsap.fromTo(this.panel(), { y: 16, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35 });
+    if (this.mode() === "auth") {
+      void gsap.fromTo(this.panel(), { y: 16, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35 });
+    }
   }
 
   private render(): void {
+    if (this.mode() === "admin") {
+      this.renderAdminPanel();
+      return;
+    }
     this.root.innerHTML = `
       <section class="fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center text-slate-300">
         <div id="iam-panel" class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-2xl shadow-2xl relative overflow-hidden">
@@ -117,6 +129,11 @@ export class TachyonIAM extends HTMLElement {
               <span>Remember login and password on this workstation</span>
             </label>
             <input type="file" id="auth-mtls" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-cyan-500/10 file:text-cyan-400 cursor-pointer hover:file:bg-cyan-500/20" />
+            <div id="auth-ca-status" class="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs text-slate-400">No custom CA loaded.</div>
+            <div class="grid gap-2 md:grid-cols-2">
+              <button type="button" id="btn-save-custom-ca" class="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700">Save CA</button>
+              <button type="button" id="btn-clear-custom-ca" class="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700">Clear CA</button>
+            </div>
             <div class="grid gap-3 md:grid-cols-2 pt-3">
               <button id="btn-login-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)]">Authenticate</button>
               <button type="button" id="btn-open-signup" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Register with Invite Token</button>
@@ -182,6 +199,10 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private bindEvents(): void {
+    if (this.mode() === "admin") {
+      this.bindAdminEvents();
+      return;
+    }
     this.form("iam-signup-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.stageOperator();
@@ -192,6 +213,8 @@ export class TachyonIAM extends HTMLElement {
     });
     this.button("btn-toggle-login-password")?.addEventListener("click", () => this.togglePassword("auth-password"));
     this.input("remember-credentials")?.addEventListener("change", () => void this.persistCredentialsPreference());
+    this.button("btn-save-custom-ca")?.addEventListener("click", () => void this.saveSelectedCustomCa());
+    this.button("btn-clear-custom-ca")?.addEventListener("click", () => void this.clearCustomCa());
     this.input("iam-url")?.addEventListener("input", () => this.syncAuthUrls("iam-url", "auth-url"));
     this.input("auth-url")?.addEventListener("input", () => this.syncAuthUrls("auth-url", "signup-auth-url"));
     this.input("signup-auth-url")?.addEventListener("input", () => this.syncAuthUrls("signup-auth-url", "auth-url"));
@@ -218,6 +241,60 @@ export class TachyonIAM extends HTMLElement {
     this.input("signup-first-name")?.addEventListener("input", () => this.updateUsername());
     this.input("signup-last-name")?.addEventListener("input", () => this.updateUsername());
     void this.restoreSavedCredentials();
+    void this.restoreCustomCa();
+  }
+
+  private renderAdminPanel(): void {
+    this.root.innerHTML = `
+      <section class="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-6 backdrop-blur-sm">
+        <h3 class="mb-2 text-lg font-medium text-emerald-400">Generate Operator Invite</h3>
+        <p class="mb-4 text-sm text-slate-400">Creates a single-use token and QR code for a new operator to provision their identity.</p>
+        <button id="btn-generate-invite" class="rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-300 transition-colors hover:bg-emerald-500/30">
+          Generate Token
+        </button>
+        <div id="invite-result-container" class="mt-6 hidden gap-6">
+          <div id="invite-qr-code" class="rounded-md bg-white p-2"></div>
+          <div class="flex flex-col justify-center">
+            <span class="text-xs uppercase text-slate-500">Manual Entry Token</span>
+            <span id="invite-token-display" class="mt-1 font-mono text-2xl tracking-widest text-emerald-300"></span>
+            <span id="invite-session-display" class="mt-2 break-all font-mono text-xs text-slate-500"></span>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  private bindAdminEvents(): void {
+    this.button("btn-generate-invite")?.addEventListener("click", () => void this.generateInvite());
+  }
+
+  private async generateInvite(): Promise<void> {
+    try {
+      const invite = await invoke<EnrollmentInvite>("generate_operator_invite");
+      const container = this.root.getElementById("invite-result-container");
+      const token = this.root.getElementById("invite-token-display");
+      const session = this.root.getElementById("invite-session-display");
+      const qr = this.root.getElementById("invite-qr-code");
+      if (token) {
+        token.textContent = invite.inviteToken;
+      }
+      if (session) {
+        session.textContent = invite.sessionId;
+      }
+      if (qr) {
+        qr.innerHTML = await QRCode.toString(invite.qrPayload, {
+          type: "svg",
+          margin: 1,
+          width: 180,
+          color: { dark: "#020617", light: "#ffffff" },
+        });
+      }
+      container?.classList.remove("hidden");
+      container?.classList.add("flex");
+      this.notify("success", "Invite token generated.");
+    } catch (error) {
+      this.notify("error", error instanceof Error ? error.message : String(error));
+    }
   }
 
   private async stageOperator(): Promise<void> {
@@ -251,7 +328,7 @@ export class TachyonIAM extends HTMLElement {
     }
     try {
       const response = await invoke<AuthLoginResponse>("authn_login", {
-        payload: { url, username, password, cert: null },
+        payload: { url, username, password, cert: await this.currentCustomCa() },
       });
       if (response.requiresMfa) {
         if (!response.sessionId) {
@@ -286,7 +363,7 @@ export class TachyonIAM extends HTMLElement {
           url: this.value("auth-url"),
           sessionId: this.stagedLogin.sessionId,
           totpCode,
-          cert: null,
+          cert: await this.currentCustomCa(),
         },
       });
       this.stagedLogin = null;
@@ -304,7 +381,7 @@ export class TachyonIAM extends HTMLElement {
     }
     try {
       this.claims = await invoke<RegistrationTokenClaims>("validate_signup_token", {
-        payload: { url: this.signupUrl(), token: this.value("signup-token"), cert: null },
+        payload: { url: this.signupUrl(), token: this.value("signup-token"), cert: await this.currentCustomCa() },
       });
       const summary = this.root.getElementById("signup-token-summary");
       if (summary) {
@@ -335,7 +412,7 @@ export class TachyonIAM extends HTMLElement {
           lastName: this.value("signup-last-name"),
           username: this.value("signup-username"),
           password,
-          cert: null,
+          cert: await this.currentCustomCa(),
         },
       });
       await this.renderTotpEnrollment(this.stagedSignup);
@@ -361,7 +438,7 @@ export class TachyonIAM extends HTMLElement {
           url: this.signupUrl(),
           sessionId: this.stagedSignup.sessionId,
           totpCode: this.value("signup-totp-code"),
-          cert: null,
+          cert: await this.currentCustomCa(),
         },
       });
       await this.completeAuthentication({
@@ -474,7 +551,7 @@ export class TachyonIAM extends HTMLElement {
 
   private async restoreSavedCredentials(): Promise<void> {
     try {
-      const parsed = await invoke<Partial<{ url: string; username: string; password: string }> | null>("load_credentials");
+      const parsed = await invoke<Partial<{ url: string; username: string; password: string; customCa: number[] }> | null>("load_credentials");
       if (!parsed) {
         return;
       }
@@ -513,6 +590,15 @@ export class TachyonIAM extends HTMLElement {
     }
   }
 
+  private async restoreCustomCa(): Promise<void> {
+    try {
+      const cert = await invoke<number[] | null>("load_custom_ca");
+      this.updateCaStatus(cert?.length ?? 0);
+    } catch {
+      this.updateCaStatus(0);
+    }
+  }
+
   private async persistCredentialsPreference(): Promise<void> {
     if (!this.input("remember-credentials")?.checked) {
       await invoke("delete_credentials");
@@ -524,8 +610,50 @@ export class TachyonIAM extends HTMLElement {
         url: this.value("auth-url"),
         username: this.value("auth-username"),
         password: this.input("auth-password")?.value ?? "",
+        customCa: await this.currentCustomCa(),
       },
     });
+  }
+
+  private async saveSelectedCustomCa(): Promise<void> {
+    const cert = await this.readSelectedCert();
+    if (!cert) {
+      this.notify("error", "Select a custom CA certificate first.");
+      return;
+    }
+    await invoke("save_custom_ca", { cert });
+    this.updateCaStatus(cert.length);
+    this.notify("success", "Custom CA saved for this workstation.");
+  }
+
+  private async clearCustomCa(): Promise<void> {
+    await invoke("clear_custom_ca");
+    this.updateCaStatus(0);
+    this.notify("success", "Custom CA cleared.");
+  }
+
+  private async currentCustomCa(): Promise<number[] | null> {
+    const selected = await this.readSelectedCert();
+    if (selected) {
+      return selected;
+    }
+    return await invoke<number[] | null>("load_custom_ca");
+  }
+
+  private async readSelectedCert(): Promise<number[] | null> {
+    const file = this.input("auth-mtls")?.files?.[0];
+    if (!file) {
+      return null;
+    }
+    return Array.from(new Uint8Array(await file.arrayBuffer()));
+  }
+
+  private updateCaStatus(byteLength: number): void {
+    const status = this.root.getElementById("auth-ca-status");
+    if (!status) {
+      return;
+    }
+    status.textContent = byteLength > 0 ? `Custom CA loaded (${byteLength} bytes).` : "No custom CA loaded.";
   }
 
   private syncAuthUrls(sourceId: string, targetId: string): void {
@@ -576,6 +704,10 @@ export class TachyonIAM extends HTMLElement {
 
   private button(id: string): HTMLButtonElement | null {
     return this.root.getElementById(id) as HTMLButtonElement | null;
+  }
+
+  private mode(): "auth" | "admin" {
+    return this.getAttribute("mode") === "admin" ? "admin" : "auth";
   }
 
   private clearPasswordFields(): void {

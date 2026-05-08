@@ -16,6 +16,7 @@ const ADMIN_STATUS_PATH: &str = "/admin/status";
 const ADMIN_RECOVERY_CODES_PATH: &str = "/admin/security/recovery-codes";
 const ADMIN_ACCOUNT_SECURITY_PATH: &str = "/admin/security/2fa/regenerate";
 const ADMIN_PAT_PATH: &str = "/admin/security/pats";
+const ADMIN_ENROLLMENT_START_PATH: &str = "/admin/enrollment/start";
 const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
 const ADMIN_METRICS_PATH: &str = "/admin/metrics";
 const ADMIN_LOGS_PATH: &str = "/admin/logs";
@@ -113,6 +114,27 @@ struct IssuePatRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct IssuePatResponse {
     token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminEnrollmentStartRequest<'a> {
+    node_public_key: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminEnrollmentStartResponse {
+    session_id: String,
+    pin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollmentInvite {
+    pub session_id: String,
+    pub invite_token: String,
+    pub qr_payload: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1406,6 +1428,52 @@ pub async fn generate_pat(name: &str, scopes: &[String], ttl_days: u32) -> Resul
     let payload: IssuePatResponse =
         serde_json::from_slice(&body).context("failed to decode PAT response payload")?;
     Ok(payload.token)
+}
+
+pub async fn start_enrollment_invite(node_public_key: &str) -> Result<EnrollmentInvite> {
+    let trimmed = node_public_key.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("node public key must not be empty");
+    }
+
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_endpoint_url(
+            &config.url,
+            ADMIN_ENROLLMENT_START_PATH,
+        )?)
+        .bearer_auth(&config.token)
+        .json(&AdminEnrollmentStartRequest {
+            node_public_key: trimmed,
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to start enrollment invite at {}", config.url))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read enrollment invite response body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "enrollment invite failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    let payload: AdminEnrollmentStartResponse =
+        serde_json::from_slice(&body).context("failed to decode enrollment invite payload")?;
+    let qr_payload = format!(
+        "tachyon://enroll?endpoint={}&session_id={}&pin={}",
+        config.url, payload.session_id, payload.pin
+    );
+
+    Ok(EnrollmentInvite {
+        session_id: payload.session_id,
+        invite_token: payload.pin,
+        qr_payload,
+    })
 }
 
 pub async fn push_asset(file_path: &str) -> Result<String> {

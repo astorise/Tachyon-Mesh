@@ -14,10 +14,11 @@ tourStylesheet.replaceSync(stylesheetText);
 const tourCompletedKey = "tachyon_tour_completed";
 
 const steps: TourStep[] = [
-  { target: "#shell-sidebar", titleKey: "tour.nav.title", contentKey: "tour.nav.desc" },
+  { target: "#shell-user", titleKey: "tour.auth.title", contentKey: "tour.auth.desc" },
   { target: "#shell-header", titleKey: "tour.header.title", contentKey: "tour.header.desc" },
+  { target: "#btn-seal-apply", titleKey: "tour.seal.title", contentKey: "tour.seal.desc" },
   { target: '[data-route-panel="dynamic"] [data-metric="nodes"]', titleKey: "tour.overview.title", contentKey: "tour.overview.desc" },
-  { target: '[data-route="registry"]', titleKey: "tour.registry.title", contentKey: "tour.registry.desc" },
+  { target: '[data-route="observability"]', titleKey: "tour.observability.title", contentKey: "tour.observability.desc" },
 ];
 
 export class TachyonGuidedTour extends HTMLElement {
@@ -120,7 +121,7 @@ export class TachyonGuidedTour extends HTMLElement {
 
   private positionAroundTarget(selector: string): void {
     const rootNode = this.getRootNode() as Document | ShadowRoot;
-    const target = rootNode.querySelector<HTMLElement>(selector) ?? rootNode.querySelector<HTMLElement>("#shell-sidebar");
+    const target = rootNode.querySelector<HTMLElement>(selector) ?? rootNode.querySelector<HTMLElement>("#shell-header") ?? rootNode.querySelector<HTMLElement>("#shell-sidebar");
     const highlight = this.root.getElementById("tour-highlight");
     const dialog = this.root.getElementById("tour-dialog");
     if (!target || !highlight || !dialog) {
