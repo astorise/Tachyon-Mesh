@@ -8044,6 +8044,7 @@ name = "tachyon-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
  "serde_json",
  "tachyon-client",
  "tokio",

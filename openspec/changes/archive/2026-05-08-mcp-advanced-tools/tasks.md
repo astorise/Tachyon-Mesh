@@ -1,0 +1,6 @@
+- [x] **Task 1: Dry-Run Tool.** Implement `tachyon_dryrun_manifest` in `tachyon-mcp` to validate WIT contracts and mesh logic without altering the `integrity.lock` or persisting changes.
+- [x] **Task 2: Metrics Tool.** Implement `tachyon_get_metrics` to query the host for active node telemetry (error rates, p50/p99 latencies, queue depths).
+- [x] **Task 3: Log Streaming (via Notifications).** Implement `tachyon_tail_logs` to initiate a log stream using the MCP standard `notifications/` JSON-RPC mechanism.
+- [x] **Task 4: Shadow Traffic Analysis.** Implement `tachyon_get_shadow_diffs` to interface with `system-faas-shadow-proxy` and retrieve payload/response divergence data.
+- [x] **Task 5: Chaos Harness API.** Implement `tachyon_run_chaos_scenario` to expose the existing Rust chaos testing harness to the MCP agent.
+- [x] **Task 6: Client Bindings.** Ensure `tachyon-client` has the necessary underlying HTTP/UDS request bindings to support these 5 new MCP tools.

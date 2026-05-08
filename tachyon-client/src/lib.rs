@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -17,6 +17,10 @@ const ADMIN_RECOVERY_CODES_PATH: &str = "/admin/security/recovery-codes";
 const ADMIN_ACCOUNT_SECURITY_PATH: &str = "/admin/security/2fa/regenerate";
 const ADMIN_PAT_PATH: &str = "/admin/security/pats";
 const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
+const ADMIN_METRICS_PATH: &str = "/admin/metrics";
+const ADMIN_LOGS_PATH: &str = "/admin/logs";
+const ADMIN_SHADOW_DIFFS_PATH: &str = "/admin/shadow/diffs";
+const ADMIN_CHAOS_SCENARIOS_PATH: &str = "/admin/chaos/scenarios";
 const ADMIN_ASSET_UPLOAD_PATH: &str = "/admin/assets";
 const AUTH_SIGNUP_VALIDATE_PATH: &str = "/auth/signup/validate-token";
 const AUTH_SIGNUP_STAGE_PATH: &str = "/auth/signup/stage";
@@ -285,6 +289,66 @@ pub struct HardwareValidation {
     pub reason: String,
     pub available_ram_mb: u64,
     pub required_ram_mb: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DryRunManifestReport {
+    pub valid: bool,
+    pub config_version: u64,
+    pub route_count: usize,
+    pub batch_target_count: usize,
+    pub resource_count: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeMetrics {
+    pub source: String,
+    pub error_rate: f64,
+    pub p50_latency_ms: f64,
+    pub p99_latency_ms: f64,
+    pub queue_depth: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogLine {
+    pub timestamp: String,
+    pub level: String,
+    pub target: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadowDiff {
+    pub route: String,
+    pub request_id: String,
+    pub divergence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChaosScenarioRequest {
+    pub scenario: String,
+    #[serde(default)]
+    pub duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChaosScenarioOutcome {
+    pub accepted: bool,
+    pub scenario: String,
+    pub message: String,
 }
 
 fn connection_state() -> &'static RwLock<Option<InstanceConfig>> {
@@ -853,6 +917,128 @@ async fn apply_manifest_to_active_node(manifest: &IntegrityManifest) -> Result<S
         message: text.trim().to_owned(),
         config_version: version,
     })
+}
+
+pub async fn dryrun_manifest(manifest: serde_json::Value) -> Result<DryRunManifestReport> {
+    let config_payload = manifest
+        .get("config_payload")
+        .or_else(|| manifest.get("configPayload"))
+        .and_then(serde_json::Value::as_str);
+    let config = if let Some(payload) = config_payload {
+        serde_json::from_str::<serde_json::Value>(payload)
+            .context("failed to parse dry-run config payload")?
+    } else {
+        manifest
+    };
+    let object = config
+        .as_object()
+        .context("manifest dry-run payload must be a JSON object")?;
+
+    let routes = object
+        .get("routes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let batch_targets = object
+        .get("batch_targets")
+        .or_else(|| object.get("batchTargets"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let resource_count = object
+        .get("resources")
+        .and_then(serde_json::Value::as_object)
+        .map(|resources| resources.len())
+        .unwrap_or(0);
+    let config_version = object
+        .get("config_version")
+        .or_else(|| object.get("configVersion"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    let mut warnings = Vec::new();
+    if routes.is_empty() && batch_targets.is_empty() && resource_count == 0 {
+        warnings.push("manifest contains no routes, batch targets, or resources".to_owned());
+    }
+    for (index, route) in routes.iter().enumerate() {
+        if route
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            warnings.push(format!("route[{index}] is missing a path"));
+        }
+        if route.get("targets").is_none() && route.get("target").is_none() {
+            warnings.push(format!(
+                "route[{index}] is missing a target or targets list"
+            ));
+        }
+    }
+    for (index, batch_target) in batch_targets.iter().enumerate() {
+        if batch_target
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            warnings.push(format!("batchTargets[{index}] is missing a name"));
+        }
+    }
+
+    Ok(DryRunManifestReport {
+        valid: warnings.is_empty(),
+        config_version,
+        route_count: routes.len(),
+        batch_target_count: batch_targets.len(),
+        resource_count,
+        warnings,
+    })
+}
+
+pub async fn get_metrics() -> Result<RuntimeMetrics> {
+    if current_connection().is_some() {
+        return get_admin_json(ADMIN_METRICS_PATH).await;
+    }
+
+    let graph = get_mesh_graph().await?;
+    Ok(RuntimeMetrics {
+        source: graph.source,
+        error_rate: 0.0,
+        p50_latency_ms: 0.0,
+        p99_latency_ms: 0.0,
+        queue_depth: graph.batch_targets.len() as u64,
+    })
+}
+
+pub async fn tail_logs(lines: usize) -> Result<Vec<LogLine>> {
+    if current_connection().is_none() {
+        return Ok(Vec::new());
+    }
+
+    let limit = lines.clamp(1, 1_000);
+    get_admin_json_with_query(ADMIN_LOGS_PATH, &[("lines", limit.to_string())]).await
+}
+
+pub async fn get_shadow_diffs() -> Result<Vec<ShadowDiff>> {
+    if current_connection().is_none() {
+        return Ok(Vec::new());
+    }
+
+    get_admin_json(ADMIN_SHADOW_DIFFS_PATH).await
+}
+
+pub async fn run_chaos_scenario(request: ChaosScenarioRequest) -> Result<ChaosScenarioOutcome> {
+    if request.scenario.trim().is_empty() {
+        anyhow::bail!("chaos scenario must not be empty");
+    }
+    if request.duration_seconds.unwrap_or(0) > 3_600 {
+        anyhow::bail!("chaos scenario duration must be less than or equal to 3600 seconds");
+    }
+
+    post_admin_json(ADMIN_CHAOS_SCENARIOS_PATH, &request).await
 }
 
 pub async fn remove_overlay_resource(name: &str) -> Result<()> {
@@ -1486,6 +1672,70 @@ async fn fetch_remote_status(config: &InstanceConfig) -> Result<String> {
     }
 
     Ok(body)
+}
+
+async fn get_admin_json<T>(path: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    get_admin_json_with_query(path, &[]).await
+}
+
+async fn get_admin_json_with_query<T>(path: &str, query: &[(&str, String)]) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let mut url = reqwest::Url::parse(&build_endpoint_url(&config.url, path)?)
+        .with_context(|| format!("invalid Tachyon admin endpoint `{path}`"))?;
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query.iter());
+    }
+    let response = client
+        .get(url)
+        .bearer_auth(&config.token)
+        .send()
+        .await
+        .with_context(|| format!("failed to query Tachyon admin endpoint `{path}`"))?;
+    decode_admin_response(response, path).await
+}
+
+async fn post_admin_json<I, T>(path: &str, input: &I) -> Result<T>
+where
+    I: Serialize + ?Sized,
+    T: DeserializeOwned,
+{
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_endpoint_url(&config.url, path)?)
+        .bearer_auth(&config.token)
+        .json(input)
+        .send()
+        .await
+        .with_context(|| format!("failed to post Tachyon admin endpoint `{path}`"))?;
+    decode_admin_response(response, path).await
+}
+
+async fn decode_admin_response<T>(response: reqwest::Response, path: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read Tachyon admin endpoint `{path}` response"))?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "admin endpoint `{path}` failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    serde_json::from_slice(&body)
+        .with_context(|| format!("failed to decode Tachyon admin endpoint `{path}` response"))
 }
 
 fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
