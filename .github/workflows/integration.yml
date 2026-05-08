@@ -39,6 +39,8 @@ jobs:
         run: |
           k3d cluster create tachyon-mesh --wait
           k3d image import tachyon-mesh:test legacy-mock:test -c tachyon-mesh
+          docker save tachyon-mesh:test legacy-mock:test | docker exec -i k3d-tachyon-mesh-server-0 ctr -n k8s.io images import -
+          docker exec k3d-tachyon-mesh-server-0 crictl images | grep -E 'tachyon-mesh|legacy-mock'
           kubectl cluster-info
 
       - name: Deploy workload
