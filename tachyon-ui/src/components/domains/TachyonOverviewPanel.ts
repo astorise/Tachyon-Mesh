@@ -2,6 +2,7 @@ import gsap from "gsap";
 
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import { t } from "../../utils/i18n";
 
 type OverviewMetric = {
   key: "nodes" | "wasm" | "gpu";
@@ -27,27 +28,40 @@ type MeshGraphSnapshot = {
   batchTargets: string[];
 };
 
-const initialMetrics: OverviewMetric[] = [
-  { key: "nodes", label: "Active Edge Nodes", value: 0, suffix: "", detail: "Mesh members reporting healthy control-plane heartbeats" },
-  { key: "wasm", label: "Global Wasm Instances", value: 0, suffix: "", detail: "Component workloads currently admitted across the fleet" },
-  { key: "gpu", label: "AI/GPU Utilization", value: 0, suffix: "%", detail: "Accelerator allocation across active AI routing targets" },
-];
-
 export class TachyonOverviewPanel extends TachyonConfigDashboard {
+  private metrics: OverviewMetric[] = this.initialMetrics();
+  private status = t("overview.loading");
+  private readonly onLanguageChanged = () => {
+    this.metrics = this.translateMetrics(this.metrics);
+    this.status = this.statusKeyForCurrentState();
+    this.render(this.metrics, this.status);
+    this.animateCounters();
+  };
+
   async connectedCallback(): Promise<void> {
-    this.render(initialMetrics, "Loading mesh telemetry...");
+    window.addEventListener("i18n:language-changed", this.onLanguageChanged);
+    this.metrics = this.initialMetrics();
+    this.status = t("overview.loading");
+    this.render(this.metrics, this.status);
     this.animateEntrance();
     try {
       const snapshot = await invoke<MeshGraphSnapshot>("get_mesh_graph");
-      const metrics = this.metricsFromSnapshot(snapshot);
-      this.render(metrics, snapshot.status || "Mesh telemetry online");
+      this.metrics = this.metricsFromSnapshot(snapshot);
+      this.status = snapshot.status || t("overview.online");
+      this.render(this.metrics, this.status);
       this.animateEntrance();
       this.animateCounters();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.render(initialMetrics, "Telemetry fetch failed");
-      window.dispatchEvent(new CustomEvent("app:notify", { detail: { type: "error", message: `Telemetry fetch failed: ${message}` } }));
+      this.metrics = this.initialMetrics();
+      this.status = t("overview.failed");
+      this.render(this.metrics, this.status);
+      window.dispatchEvent(new CustomEvent("app:notify", { detail: { type: "error", message: `${t("overview.failedToast")}: ${message}` } }));
     }
+  }
+
+  disconnectedCallback(): void {
+    window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
   }
 
   private render(metrics: OverviewMetric[], status: string): void {
@@ -55,8 +69,8 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
       <section class="p-6 space-y-8 text-slate-300">
         <header data-stagger-panel class="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
-            <h2 class="text-3xl font-light text-cyan-400">Global <span class="font-bold text-slate-100">Overview</span></h2>
-            <p class="text-xs font-mono text-slate-500">Mesh telemetry / boot sequence snapshot</p>
+            <h2 class="text-3xl font-light text-cyan-400">${t("overview.title.prefix")} <span class="font-bold text-slate-100">${t("overview.title.strong")}</span></h2>
+            <p class="text-xs font-mono text-slate-500">${t("overview.telemetry")}</p>
           </div>
           <div class="rounded border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 font-mono text-xs text-cyan-300">
             ${this.escapeStatus(status)}
@@ -83,9 +97,9 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
         </div>
 
         <div data-stagger-panel class="grid grid-cols-1 gap-4 rounded-lg border border-slate-800 bg-slate-900/70 p-5 font-mono text-xs text-slate-400 md:grid-cols-3">
-          <div><span class="text-cyan-400">routing</span> sealed</div>
-          <div><span class="text-cyan-400">identity</span> enforced</div>
-          <div><span class="text-cyan-400">observability</span> ready</div>
+          <div><span class="text-cyan-400">${t("overview.routing")}</span> ${t("overview.routing.status")}</div>
+          <div><span class="text-cyan-400">${t("overview.identity")}</span> ${t("overview.identity.status")}</div>
+          <div><span class="text-cyan-400">${t("overview.observability")}</span> ${t("overview.observability.status")}</div>
         </div>
       </section>
     `);
@@ -114,10 +128,42 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
     ).length;
     const gpuUtilization = Math.min(100, Math.round(((acceleratedRoutes + snapshot.batchTargets.length) / Math.max(snapshot.routes.length, 1)) * 50));
     return [
-      { ...initialMetrics[0], value: snapshot.batchTargets.length },
-      { ...initialMetrics[1], value: routeTargets },
-      { ...initialMetrics[2], value: gpuUtilization },
+      { ...this.metricTemplate("nodes"), value: snapshot.batchTargets.length },
+      { ...this.metricTemplate("wasm"), value: routeTargets },
+      { ...this.metricTemplate("gpu"), value: gpuUtilization },
     ];
+  }
+
+  private initialMetrics(): OverviewMetric[] {
+    return [
+      { ...this.metricTemplate("nodes"), value: 0 },
+      { ...this.metricTemplate("wasm"), value: 0 },
+      { ...this.metricTemplate("gpu"), value: 0 },
+    ];
+  }
+
+  private translateMetrics(metrics: OverviewMetric[]): OverviewMetric[] {
+    return metrics.map((metric) => ({ ...this.metricTemplate(metric.key), value: metric.value }));
+  }
+
+  private metricTemplate(key: OverviewMetric["key"]): Omit<OverviewMetric, "value"> {
+    const suffix = key === "gpu" ? "%" : "";
+    return {
+      key,
+      label: t(`overview.${key}.label`),
+      suffix,
+      detail: t(`overview.${key}.detail`),
+    };
+  }
+
+  private statusKeyForCurrentState(): string {
+    if (this.status === "Telemetry fetch failed" || this.status === "Échec de récupération de la télémétrie") {
+      return t("overview.failed");
+    }
+    if (this.status === "Loading mesh telemetry..." || this.status === "Chargement de la télémétrie mesh...") {
+      return t("overview.loading");
+    }
+    return this.status;
   }
 
   private escapeStatus(value: string): string {
