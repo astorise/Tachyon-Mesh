@@ -169,6 +169,63 @@ async fn handle_line(line: &str) -> Result<Option<Value>> {
                     }
                 },
                 {
+                    "name": "tachyon_dryrun_manifest",
+                    "description": "Validate a Tachyon manifest payload without writing the overlay, integrity.lock, or remote node state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["manifest"],
+                        "properties": {
+                            "manifest": {
+                                "type": "object",
+                                "description": "Either a sealed manifest with configPayload/config_payload, or the raw config payload object."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_get_metrics",
+                    "description": "Return active node telemetry such as error rate, p50/p99 latency, and queue depth.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "tachyon_tail_logs",
+                    "description": "Fetch recent logs and expose them as MCP notifications/message payloads for clients that want to stream them.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "lines": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                            "follow": { "type": "boolean" }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_get_shadow_diffs",
+                    "description": "Return divergence reports produced by system-faas-shadow-proxy.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "tachyon_run_chaos_scenario",
+                    "description": "Start a Tachyon chaos harness scenario and return the accepted scenario outcome.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["scenario"],
+                        "properties": {
+                            "scenario": {
+                                "type": "string",
+                                "enum": ["network_partition", "pod_eviction", "cpu_pressure", "lora_swap_failure"]
+                            },
+                            "durationSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+                            "target": { "type": "string" }
+                        }
+                    }
+                },
+                {
                     "name": "tachyon_hardware_status",
                     "description": "Return local RAM and accelerator availability for sizing Tachyon FaaS manifests.",
                     "inputSchema": {
@@ -300,6 +357,78 @@ async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
                 ]
             }))
         }
+        "tachyon_dryrun_manifest" => {
+            let arguments = params
+                .and_then(|value| value.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let manifest = arguments
+                .get("manifest")
+                .cloned()
+                .context("missing manifest payload")?;
+            let report = tachyon_client::dryrun_manifest(manifest).await?;
+            Ok(text_tool_result(&report)?)
+        }
+        "tachyon_get_metrics" => {
+            let metrics = tachyon_client::get_metrics().await?;
+            Ok(text_tool_result(&metrics)?)
+        }
+        "tachyon_tail_logs" => {
+            let arguments = params
+                .and_then(|value| value.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let lines = arguments
+                .get("lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .min(1_000) as usize;
+            let follow = arguments
+                .get("follow")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let logs = tachyon_client::tail_logs(lines).await?;
+            let notifications: Vec<Value> = logs
+                .iter()
+                .map(|line| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/message",
+                        "params": {
+                            "level": line.level,
+                            "logger": line.target,
+                            "data": line
+                        }
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&logs)?
+                    }
+                ],
+                "structuredContent": {
+                    "followRequested": follow,
+                    "notifications": notifications
+                }
+            }))
+        }
+        "tachyon_get_shadow_diffs" => {
+            let diffs = tachyon_client::get_shadow_diffs().await?;
+            Ok(text_tool_result(&diffs)?)
+        }
+        "tachyon_run_chaos_scenario" => {
+            let arguments = params
+                .and_then(|value| value.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let request: tachyon_client::ChaosScenarioRequest =
+                serde_json::from_value(arguments).context("invalid chaos scenario payload")?;
+            let outcome = tachyon_client::run_chaos_scenario(request).await?;
+            Ok(text_tool_result(&outcome)?)
+        }
         "tachyon_hardware_status" => {
             let status = tachyon_client::read_local_hardware_status();
             let body = serde_json::to_string_pretty(&status)
@@ -338,6 +467,17 @@ async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
             &format!("unsupported tool `{other}`"),
         )),
     }
+}
+
+fn text_tool_result(value: &impl serde::Serialize) -> Result<Value> {
+    Ok(json!({
+        "content": [
+            {
+                "type": "text",
+                "text": serde_json::to_string_pretty(value)?
+            }
+        ]
+    }))
 }
 
 fn error_response(id: Option<Value>, code: i64, message: &str) -> Value {
