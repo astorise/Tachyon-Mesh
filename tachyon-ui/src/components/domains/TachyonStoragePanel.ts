@@ -1,19 +1,40 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import { t } from "../../utils/i18n";
 
 type ApplyConfigurationResponse = {
   success: boolean;
   message: string;
 };
 
+type MeshResource = {
+  name: string;
+  type: string;
+  target: string;
+  pending?: boolean;
+};
+
 export class TachyonStoragePanel extends TachyonConfigDashboard {
-  connectedCallback(): void {
+  private resources: MeshResource[] = [];
+
+  async connectedCallback(): Promise<void> {
     this.render();
+    this.bindForm();
+    this.animateEntrance();
+    try {
+      this.resources = await invoke<MeshResource[]>("get_resources");
+    } catch {
+      this.resources = [];
+    }
+    this.render();
+    this.bindForm();
+  }
+
+  private bindForm(): void {
     this.root.querySelector("form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.applyStorageConfig();
     });
-    this.animateEntrance();
   }
 
   private render(): void {
@@ -23,6 +44,11 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
           <h2 class="text-2xl font-bold text-slate-100">Storage Volumes</h2>
           <p class="text-sm font-mono text-slate-400">Domain: config-storage / WASI state</p>
         </header>
+
+        <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900/70 p-5">
+          <h3 class="mb-3 text-sm font-semibold uppercase tracking-widest text-cyan-300">${t("storage.preview.title")}</h3>
+          ${this.renderResources()}
+        </article>
 
         <form class="space-y-6 rounded-lg border border-slate-700 bg-slate-800/40 p-6">
           <label data-stagger-panel class="block text-xs uppercase tracking-widest text-cyan-500">WASI Volume Mount Path
@@ -43,6 +69,26 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
     `);
   }
 
+  private renderResources(): string {
+    if (this.resources.length === 0) {
+      return `<p class="text-xs text-slate-500">${t("storage.preview.empty")}</p>`;
+    }
+    const rows = this.resources
+      .map(
+        (resource) =>
+          `<tr><td class="py-1 pr-4 text-cyan-300">${this.escape(resource.name)}</td><td class="py-1 pr-4 text-slate-300">${this.escape(resource.type)}</td><td class="py-1 pr-4 font-mono text-slate-300">${this.escape(resource.target)}</td><td class="py-1 text-slate-300">${resource.pending ? "yes" : "no"}</td></tr>`,
+      )
+      .join("");
+    return `
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 uppercase tracking-widest">
+          <tr><th class="text-left pb-2 pr-4">${t("storage.preview.column.name")}</th><th class="text-left pb-2 pr-4">${t("storage.preview.column.kind")}</th><th class="text-left pb-2 pr-4">${t("storage.preview.column.target")}</th><th class="text-left pb-2">${t("storage.preview.column.pending")}</th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }
+
   private async applyStorageConfig(): Promise<void> {
     try {
       const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
@@ -61,6 +107,15 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
   private value(id: string, fallback: string): string {
     const value = (this.root.getElementById(id) as HTMLInputElement | null)?.value.trim();
     return value ? value : fallback;
+  }
+
+  private escape(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 }
 
