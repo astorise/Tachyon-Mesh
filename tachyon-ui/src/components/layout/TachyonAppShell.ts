@@ -11,6 +11,7 @@ import "../domains/TachyonStoragePanel";
 import "../domains/TachyonSupplyChainPanel";
 import "../domains/TachyonWorkloadsPanel";
 import "./TachyonGuidedTour";
+import "./TachyonToastManager";
 import "../routing/TachyonRoutingDashboard";
 import "../traffic/TachyonResiliencePanel";
 import "../traffic/TachyonRoutingPanel";
@@ -63,6 +64,11 @@ export class TachyonAppShell extends HTMLElement {
       this.restoreStartedState();
     }
   };
+  private readonly onHashChange = () => {
+    const route = this.resolveHashRoute();
+    this.updateNavigation(route);
+    this.showRoute(route);
+  };
 
   constructor() {
     super();
@@ -75,12 +81,14 @@ export class TachyonAppShell extends HTMLElement {
     document.addEventListener("iam:authenticated", this.onAuthenticated);
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     window.addEventListener("config:staged", this.onConfigStaged);
+    window.addEventListener("hashchange", this.onHashChange);
   }
 
   disconnectedCallback(): void {
     document.removeEventListener("iam:authenticated", this.onAuthenticated);
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
     window.removeEventListener("config:staged", this.onConfigStaged);
+    window.removeEventListener("hashchange", this.onHashChange);
   }
 
   async startTransition(userData: AuthenticatedDetail): Promise<void> {
@@ -95,15 +103,15 @@ export class TachyonAppShell extends HTMLElement {
     }
 
     this.activeUser = userData.user;
-    this.activeRoute = "overview";
+    this.activeRoute = this.resolveHashRoute();
     this.shellStarted = true;
     user.textContent = this.activeUser;
     authLayer?.classList.add("hidden");
     this.classList.remove("hidden");
     shell.classList.remove("hidden");
     shell.classList.add("flex");
-    this.updateNavigation("overview");
-    this.showRoute("overview");
+    this.updateNavigation(this.activeRoute);
+    this.showRoute(this.activeRoute);
 
     const timeline = gsap.timeline();
     timeline
@@ -176,6 +184,7 @@ export class TachyonAppShell extends HTMLElement {
           </main>
         </div>
         <tachyon-guided-tour></tachyon-guided-tour>
+        <tachyon-toast-manager></tachyon-toast-manager>
       </section>
     `;
 
@@ -183,8 +192,11 @@ export class TachyonAppShell extends HTMLElement {
       button.addEventListener("click", () => {
         const route = button.dataset.route ?? "dashboard";
         this.dispatchEvent(new CustomEvent("app:navigation", { bubbles: true, composed: true, detail: { route } }));
-        this.updateNavigation(route);
-        this.showRoute(route);
+        if (window.location.hash.slice(1) === route) {
+          this.onHashChange();
+          return;
+        }
+        window.location.hash = route;
       });
     });
     this.root.getElementById("language-select")?.addEventListener("change", (event) => {
@@ -208,8 +220,8 @@ export class TachyonAppShell extends HTMLElement {
   }
 
   private showRoute(route: string): void {
-    this.activeRoute = route;
-    const staticPanel = this.root.querySelector<HTMLElement>(`[data-route-panel="${route}"]`);
+    this.activeRoute = this.normalizeRoute(route);
+    const staticPanel = this.root.querySelector<HTMLElement>(`[data-route-panel="${this.activeRoute}"]`);
     this.root.querySelectorAll<HTMLElement>("[data-route-panel]").forEach((panel) => {
       panel.classList.toggle("hidden", panel !== staticPanel);
     });
@@ -223,7 +235,7 @@ export class TachyonAppShell extends HTMLElement {
       return;
     }
 
-    const tagName = resolveComponentTag(route);
+    const tagName = resolveComponentTag(this.activeRoute);
     const dynamicPanel = this.ensureDynamicPanel(routerView);
     dynamicPanel.classList.remove("hidden");
     if (!tagName) {
@@ -276,6 +288,18 @@ export class TachyonAppShell extends HTMLElement {
     }
     this.updateNavigation(this.activeRoute);
     this.showRoute(this.activeRoute);
+  }
+
+  private resolveHashRoute(): string {
+    return this.normalizeRoute(window.location.hash.replace(/^#/, ""));
+  }
+
+  private normalizeRoute(route: string): string {
+    const normalized = route.trim().replace(/^\//, "") || "dashboard";
+    if (normalized === "dashboard") {
+      return normalized;
+    }
+    return listComponentRoutes().some((entry) => entry.route === normalized) ? normalized : "dashboard";
   }
 
   private async sealAndApply(): Promise<void> {
