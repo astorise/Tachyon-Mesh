@@ -35,7 +35,6 @@ type AuthenticatedDetail = {
 
 const iamStylesheet = new CSSStyleSheet();
 iamStylesheet.replaceSync(stylesheetText);
-const savedCredentialsKey = "tachyon:auth:saved-credentials";
 
 export class TachyonIAM extends HTMLElement {
   private readonly root: ShadowRoot;
@@ -192,7 +191,7 @@ export class TachyonIAM extends HTMLElement {
       void this.login();
     });
     this.button("btn-toggle-login-password")?.addEventListener("click", () => this.togglePassword("auth-password"));
-    this.input("remember-credentials")?.addEventListener("change", () => this.persistCredentialsPreference());
+    this.input("remember-credentials")?.addEventListener("change", () => void this.persistCredentialsPreference());
     this.input("iam-url")?.addEventListener("input", () => this.syncAuthUrls("iam-url", "auth-url"));
     this.input("auth-url")?.addEventListener("input", () => this.syncAuthUrls("auth-url", "signup-auth-url"));
     this.input("signup-auth-url")?.addEventListener("input", () => this.syncAuthUrls("signup-auth-url", "auth-url"));
@@ -218,7 +217,7 @@ export class TachyonIAM extends HTMLElement {
     });
     this.input("signup-first-name")?.addEventListener("input", () => this.updateUsername());
     this.input("signup-last-name")?.addEventListener("input", () => this.updateUsername());
-    this.restoreSavedCredentials();
+    void this.restoreSavedCredentials();
   }
 
   private async stageOperator(): Promise<void> {
@@ -258,12 +257,13 @@ export class TachyonIAM extends HTMLElement {
         if (!response.sessionId) {
           throw new Error("Login staged without an MFA session id.");
         }
-        this.persistCredentialsPreference();
+        await this.persistCredentialsPreference();
         this.stagedLogin = response;
         await this.switchStep("mfa");
         return;
       }
-      this.persistCredentialsPreference();
+      await this.persistCredentialsPreference();
+      this.clearPasswordFields();
       await this.completeAuthentication({ user: response.username, role: "admin", token: password });
     } catch (error) {
       this.emitError(error, "authn_login_failed");
@@ -290,6 +290,7 @@ export class TachyonIAM extends HTMLElement {
         },
       });
       this.stagedLogin = null;
+      this.clearPasswordFields();
       await this.completeAuthentication({ user: response.username, role: "admin", token: "" });
     } catch (error) {
       this.emitError(error, "authn_mfa_failed");
@@ -338,6 +339,7 @@ export class TachyonIAM extends HTMLElement {
         },
       });
       await this.renderTotpEnrollment(this.stagedSignup);
+      this.clearSignupPasswordFields();
       await this.switchStep("signup-totp");
     } catch (error) {
       this.emitError(error, "signup_stage_failed");
@@ -470,13 +472,12 @@ export class TachyonIAM extends HTMLElement {
     }
   }
 
-  private restoreSavedCredentials(): void {
+  private async restoreSavedCredentials(): Promise<void> {
     try {
-      const raw = localStorage.getItem(savedCredentialsKey);
-      if (!raw) {
+      const parsed = await invoke<Partial<{ url: string; username: string; password: string }> | null>("load_credentials");
+      if (!parsed) {
         return;
       }
-      const parsed = JSON.parse(raw) as Partial<{ url: string; username: string; password: string }>;
       if (parsed.url) {
         const iamUrl = this.input("iam-url");
         if (iamUrl) {
@@ -508,23 +509,23 @@ export class TachyonIAM extends HTMLElement {
         remember.checked = true;
       }
     } catch {
-      localStorage.removeItem(savedCredentialsKey);
+      await invoke("delete_credentials");
     }
   }
 
-  private persistCredentialsPreference(): void {
+  private async persistCredentialsPreference(): Promise<void> {
     if (!this.input("remember-credentials")?.checked) {
-      localStorage.removeItem(savedCredentialsKey);
+      await invoke("delete_credentials");
       return;
     }
-    localStorage.setItem(
-      savedCredentialsKey,
-      JSON.stringify({
+    this.notify("success", "Credentials are stored by the native Stronghold secure enclave, not browser localStorage.");
+    await invoke("save_credentials", {
+      payload: {
         url: this.value("auth-url"),
         username: this.value("auth-username"),
         password: this.input("auth-password")?.value ?? "",
-      }),
-    );
+      },
+    });
   }
 
   private syncAuthUrls(sourceId: string, targetId: string): void {
@@ -575,6 +576,22 @@ export class TachyonIAM extends HTMLElement {
 
   private button(id: string): HTMLButtonElement | null {
     return this.root.getElementById(id) as HTMLButtonElement | null;
+  }
+
+  private clearPasswordFields(): void {
+    const password = this.input("auth-password");
+    if (password) {
+      password.value = "";
+    }
+  }
+
+  private clearSignupPasswordFields(): void {
+    for (const id of ["iam-password", "signup-password", "signup-confirm-password"]) {
+      const input = this.input(id);
+      if (input) {
+        input.value = "";
+      }
+    }
   }
 }
 

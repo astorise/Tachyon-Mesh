@@ -132,7 +132,7 @@ async fn handle_line(line: &str) -> Result<Option<Value>> {
                 },
                 {
                     "name": "tachyon_register_resource",
-                    "description": "Register a new mesh resource into the workspace overlay (tachyon.resources.json). The entry is persisted as `pending` and requires a CLI re-seal to take effect inside integrity.lock.",
+                    "description": "Register a new mesh resource into the workspace overlay (tachyon.resources.json). The entry is persisted as `pending` and requires tachyon_seal_overlay plus tachyon_apply_manifest to take effect.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["name", "type", "target"],
@@ -150,6 +150,22 @@ async fn handle_line(line: &str) -> Result<Option<Value>> {
                                 "description": "Internal-only: semver constraint such as `^1.2.0`."
                             }
                         }
+                    }
+                },
+                {
+                    "name": "tachyon_seal_overlay",
+                    "description": "Seal the local Tachyon overlay into integrity.lock using the local Ed25519 key and incremented config_version.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "tachyon_apply_manifest",
+                    "description": "POST the currently sealed integrity.lock manifest to the active Tachyon host /admin/manifest endpoint.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
                     }
                 },
                 {
@@ -258,6 +274,28 @@ async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
                             "Registered `{name}` in workspace overlay. Pending CLI re-seal of integrity.lock to take effect.\n\n{body}",
                             name = resource.name,
                         )
+                    }
+                ]
+            }))
+        }
+        "tachyon_seal_overlay" => {
+            let outcome = tachyon_client::seal_overlay().await?;
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&outcome)?
+                    }
+                ]
+            }))
+        }
+        "tachyon_apply_manifest" => {
+            let outcome = tachyon_client::apply_current_manifest().await?;
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&outcome)?
                     }
                 ]
             }))

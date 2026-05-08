@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     net::IpAddr,
     path::PathBuf,
     sync::{OnceLock, RwLock},
@@ -13,6 +16,7 @@ const ADMIN_STATUS_PATH: &str = "/admin/status";
 const ADMIN_RECOVERY_CODES_PATH: &str = "/admin/security/recovery-codes";
 const ADMIN_ACCOUNT_SECURITY_PATH: &str = "/admin/security/2fa/regenerate";
 const ADMIN_PAT_PATH: &str = "/admin/security/pats";
+const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
 const ADMIN_ASSET_UPLOAD_PATH: &str = "/admin/assets";
 const AUTH_SIGNUP_VALIDATE_PATH: &str = "/auth/signup/validate-token";
 const AUTH_SIGNUP_STAGE_PATH: &str = "/auth/signup/stage";
@@ -73,9 +77,11 @@ pub struct IamUserSummary {
     pub security_status: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct IntegrityManifest {
     config_payload: String,
+    public_key: String,
+    signature: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +221,23 @@ pub struct MeshResource {
     pub allowed_methods: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_constraint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyConfigurationOutcome {
+    pub success: bool,
+    pub message: String,
+    pub staged: bool,
+    pub requires_seal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SealApplyOutcome {
+    pub success: bool,
+    pub message: String,
+    pub config_version: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -390,6 +413,15 @@ fn overlay_path() -> PathBuf {
 struct ResourceOverlayFile {
     #[serde(default)]
     resources: Vec<MeshResource>,
+    #[serde(default)]
+    configurations: Vec<StagedConfiguration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedConfiguration {
+    domain: String,
+    payload: serde_json::Value,
 }
 
 async fn read_overlay_file() -> Result<ResourceOverlayFile> {
@@ -600,6 +632,227 @@ pub async fn upsert_overlay_resource(input: MeshResourceInput) -> Result<MeshRes
     overlay.resources.sort_by(|a, b| a.name.cmp(&b.name));
     write_overlay_file(&overlay).await?;
     Ok(resource)
+}
+
+pub async fn stage_configuration_overlay(domain: &str, payload: serde_json::Value) -> Result<()> {
+    let domain = domain.trim();
+    if domain.is_empty() {
+        anyhow::bail!("configuration domain must not be empty");
+    }
+    let mut overlay = read_overlay_file().await?;
+    if let Some(existing) = overlay
+        .configurations
+        .iter_mut()
+        .find(|entry| entry.domain == domain)
+    {
+        existing.payload = payload;
+    } else {
+        overlay.configurations.push(StagedConfiguration {
+            domain: domain.to_owned(),
+            payload,
+        });
+    }
+    overlay
+        .configurations
+        .sort_by(|left, right| left.domain.cmp(&right.domain));
+    write_overlay_file(&overlay).await?;
+    Ok(())
+}
+
+pub async fn seal_overlay() -> Result<SealApplyOutcome> {
+    let manifest = seal_overlay_manifest().await?;
+    write_lockfile(&manifest).await?;
+    let version = manifest_config_version(&manifest)?;
+    Ok(SealApplyOutcome {
+        success: true,
+        message: format!("Overlay sealed into integrity.lock at config_version={version}."),
+        config_version: version,
+    })
+}
+
+pub async fn seal_and_apply_manifest() -> Result<SealApplyOutcome> {
+    let manifest = seal_overlay_manifest().await?;
+    write_lockfile(&manifest).await?;
+    apply_manifest_to_active_node(&manifest).await
+}
+
+pub async fn apply_current_manifest() -> Result<SealApplyOutcome> {
+    let raw = read_lockfile().await?;
+    let manifest: IntegrityManifest =
+        serde_json::from_str(&raw).context("failed to parse integrity.lock manifest")?;
+    apply_manifest_to_active_node(&manifest).await
+}
+
+async fn seal_overlay_manifest() -> Result<IntegrityManifest> {
+    let raw_lockfile = read_lockfile().await?;
+    let current_manifest: IntegrityManifest =
+        serde_json::from_str(&raw_lockfile).context("failed to parse integrity.lock manifest")?;
+    let overlay = read_overlay_file().await?;
+    let mut config: serde_json::Value = serde_json::from_str(&current_manifest.config_payload)
+        .context("failed to parse sealed config payload")?;
+    apply_overlay_to_config(&mut config, overlay)?;
+    let payload =
+        serde_json::to_string(&config).context("failed to serialize overlay config payload")?;
+    sign_manifest_payload(payload).await
+}
+
+fn apply_overlay_to_config(
+    config: &mut serde_json::Value,
+    overlay: ResourceOverlayFile,
+) -> Result<()> {
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("sealed config payload must be a JSON object"))?;
+    let next_version = object
+        .get("config_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    object.insert(
+        "config_version".to_owned(),
+        serde_json::Value::Number(next_version.into()),
+    );
+
+    if !overlay.resources.is_empty() {
+        let resources = object
+            .entry("resources".to_owned())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        let resources = resources
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("sealed config resources must be a JSON object"))?;
+        for resource in overlay.resources {
+            let mut entry = serde_json::Map::new();
+            entry.insert("type".to_owned(), serde_json::Value::String(resource.kind));
+            entry.insert(
+                "target".to_owned(),
+                serde_json::Value::String(resource.target),
+            );
+            if !resource.allowed_methods.is_empty() {
+                entry.insert(
+                    "allowed_methods".to_owned(),
+                    serde_json::Value::Array(
+                        resource
+                            .allowed_methods
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(version_constraint) = resource.version_constraint {
+                entry.insert(
+                    "version_constraint".to_owned(),
+                    serde_json::Value::String(version_constraint),
+                );
+            }
+            resources.insert(resource.name, serde_json::Value::Object(entry));
+        }
+    }
+
+    if !overlay.configurations.is_empty() {
+        let configs: BTreeMap<String, serde_json::Value> = overlay
+            .configurations
+            .into_iter()
+            .map(|entry| (entry.domain, entry.payload))
+            .collect();
+        object.insert(
+            "ui_configurations".to_owned(),
+            serde_json::to_value(configs).context("failed to serialize staged configurations")?,
+        );
+    }
+
+    Ok(())
+}
+
+async fn sign_manifest_payload(config_payload: String) -> Result<IntegrityManifest> {
+    let signing_key = load_or_create_local_signing_key().await?;
+    let signature = signing_key.sign(&Sha256::digest(config_payload.as_bytes()));
+    Ok(IntegrityManifest {
+        config_payload,
+        public_key: hex::encode(signing_key.verifying_key().to_bytes()),
+        signature: hex::encode(signature.to_bytes()),
+    })
+}
+
+fn local_signing_key_path() -> PathBuf {
+    workspace_root().join(".tachyon-local-ed25519")
+}
+
+async fn load_or_create_local_signing_key() -> Result<SigningKey> {
+    let path = local_signing_key_path();
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let seed: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("local Ed25519 key has invalid length"))?;
+            Ok(SigningKey::from_bytes(&seed))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            tokio::fs::write(&path, signing_key.to_bytes())
+                .await
+                .with_context(|| {
+                    format!("failed to persist local Ed25519 key `{}`", path.display())
+                })?;
+            Ok(signing_key)
+        }
+        Err(error) => Err(anyhow::Error::from(error).context(format!(
+            "failed to read local Ed25519 key `{}`",
+            path.display()
+        ))),
+    }
+}
+
+async fn write_lockfile(manifest: &IntegrityManifest) -> Result<()> {
+    let path = workspace_root().join("integrity.lock");
+    let tmp = path.with_extension("lock.tmp");
+    let bytes =
+        serde_json::to_vec_pretty(manifest).context("failed to serialize sealed manifest")?;
+    tokio::fs::write(&tmp, bytes)
+        .await
+        .with_context(|| format!("failed to write sealed manifest tmp `{}`", tmp.display()))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .with_context(|| format!("failed to replace `{}`", path.display()))?;
+    Ok(())
+}
+
+fn manifest_config_version(manifest: &IntegrityManifest) -> Result<u64> {
+    let payload: serde_json::Value = serde_json::from_str(&manifest.config_payload)
+        .context("failed to parse sealed config payload")?;
+    Ok(payload
+        .get("config_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0))
+}
+
+async fn apply_manifest_to_active_node(manifest: &IntegrityManifest) -> Result<SealApplyOutcome> {
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let body = serde_json::to_vec(manifest).context("failed to serialize admin manifest")?;
+    let response = client
+        .post(build_endpoint_url(&config.url, ADMIN_MANIFEST_PATH)?)
+        .bearer_auth(&config.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("failed to apply manifest to {}", config.url))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("failed to read admin manifest response body")?;
+    if !status.is_success() {
+        anyhow::bail!("manifest apply failed with {status}: {}", text.trim());
+    }
+    let version = manifest_config_version(manifest)?;
+    Ok(SealApplyOutcome {
+        success: true,
+        message: text.trim().to_owned(),
+        config_version: version,
+    })
 }
 
 pub async fn remove_overlay_resource(name: &str) -> Result<()> {

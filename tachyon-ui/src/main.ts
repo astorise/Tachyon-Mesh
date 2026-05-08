@@ -1425,13 +1425,13 @@ document.addEventListener("DOMContentLoaded", () => {
         return null;
       }
       const parsed = JSON.parse(raw) as Partial<{ url: string; username: string; password: string }>;
-      if (!parsed.url || !parsed.username || !parsed.password) {
+      if (!parsed.url || !parsed.username) {
         return null;
       }
       return {
         url: parsed.url,
         username: parsed.username,
-        password: parsed.password,
+        password: "",
       };
     } catch {
       return null;
@@ -1448,7 +1448,6 @@ document.addEventListener("DOMContentLoaded", () => {
       JSON.stringify({
         url: nodeUrl?.value.trim() ?? "",
         username: authUsername?.value.trim() ?? "",
-        password: nodeToken?.value ?? "",
       }),
     );
   }

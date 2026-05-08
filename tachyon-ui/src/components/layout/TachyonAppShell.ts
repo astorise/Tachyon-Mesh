@@ -17,6 +17,7 @@ import "../traffic/TachyonRoutingPanel";
 import stylesheetText from "../../style.css?inline";
 import { listComponentRoutes, resolveComponentTag } from "../../registry/ComponentRegistry";
 import { getLanguage, setLanguage, t } from "../../utils/i18n";
+import { resilientInvoke as invoke } from "../../utils/network";
 
 type AuthenticatedDetail = {
   user: string;
@@ -29,6 +30,12 @@ type GuidedTourElement = HTMLElement & {
   startIfFirstVisit: () => void;
 };
 
+type SealApplyOutcome = {
+  success: boolean;
+  message: string;
+  configVersion: number;
+};
+
 const appShellStylesheet = new CSSStyleSheet();
 appShellStylesheet.replaceSync(stylesheetText);
 
@@ -37,11 +44,20 @@ export class TachyonAppShell extends HTMLElement {
   private activeRoute = "overview";
   private activeUser = t("shell.unknown");
   private shellStarted = false;
+  private requiresSeal = false;
+  private applyingSeal = false;
   private readonly onAuthenticated = (event: Event) => {
     const detail = (event as CustomEvent<AuthenticatedDetail>).detail;
     void this.startTransition(detail);
   };
   private readonly onLanguageChanged = () => {
+    this.render();
+    if (this.shellStarted) {
+      this.restoreStartedState();
+    }
+  };
+  private readonly onConfigStaged = () => {
+    this.requiresSeal = true;
     this.render();
     if (this.shellStarted) {
       this.restoreStartedState();
@@ -58,11 +74,13 @@ export class TachyonAppShell extends HTMLElement {
     this.render();
     document.addEventListener("iam:authenticated", this.onAuthenticated);
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
+    window.addEventListener("config:staged", this.onConfigStaged);
   }
 
   disconnectedCallback(): void {
     document.removeEventListener("iam:authenticated", this.onAuthenticated);
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
+    window.removeEventListener("config:staged", this.onConfigStaged);
   }
 
   async startTransition(userData: AuthenticatedDetail): Promise<void> {
@@ -123,6 +141,9 @@ export class TachyonAppShell extends HTMLElement {
               <p class="text-xs text-slate-500">${t("shell.subtitle")}</p>
             </div>
             <div class="flex items-center gap-3">
+              <button id="btn-seal-apply" type="button" class="${this.requiresSeal ? "inline-flex" : "hidden"} items-center rounded border border-amber-400/60 bg-amber-400/15 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-amber-200 shadow-[0_0_18px_rgba(251,191,36,0.24)] transition-colors hover:bg-amber-400/25 disabled:cursor-wait disabled:opacity-70">
+                ${this.applyingSeal ? "Applying..." : "Pending Changes: Seal & Apply"}
+              </button>
               <label class="flex items-center gap-2 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-400">
                 <span>${t("shell.language")}</span>
                 <select id="language-select" class="bg-slate-950 text-cyan-300 focus:outline-none" aria-label="${t("shell.language")}">
@@ -171,6 +192,9 @@ export class TachyonAppShell extends HTMLElement {
     });
     this.root.getElementById("btn-help-tour")?.addEventListener("click", () => {
       this.guidedTour()?.start();
+    });
+    this.root.getElementById("btn-seal-apply")?.addEventListener("click", () => {
+      void this.sealAndApply();
     });
   }
 
@@ -252,6 +276,38 @@ export class TachyonAppShell extends HTMLElement {
     }
     this.updateNavigation(this.activeRoute);
     this.showRoute(this.activeRoute);
+  }
+
+  private async sealAndApply(): Promise<void> {
+    if (this.applyingSeal) {
+      return;
+    }
+    this.applyingSeal = true;
+    this.render();
+    this.restoreStartedState();
+    try {
+      const result = await invoke<SealApplyOutcome>("seal_and_apply_manifest");
+      this.requiresSeal = false;
+      window.dispatchEvent(
+        new CustomEvent("app:notify", {
+          detail: { type: "success", message: `${result.message} config_version=${result.configVersion}` },
+        }),
+      );
+      const header = this.root.getElementById("shell-header");
+      if (header) {
+        void gsap.fromTo(header, { boxShadow: "0 0 0 rgba(34,211,238,0)" }, { boxShadow: "0 0 28px rgba(34,211,238,0.25)", duration: 0.35, yoyo: true, repeat: 1 });
+      }
+    } catch (error) {
+      window.dispatchEvent(
+        new CustomEvent("app:notify", {
+          detail: { type: "error", message: error instanceof Error ? error.message : String(error) },
+        }),
+      );
+    } finally {
+      this.applyingSeal = false;
+      this.render();
+      this.restoreStartedState();
+    }
   }
 }
 
