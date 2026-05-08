@@ -117,6 +117,27 @@ async fn get_mesh_graph() -> Result<tachyon_client::MeshGraphSnapshot, String> {
 }
 
 #[tauri::command]
+async fn get_metrics() -> Result<tachyon_client::RuntimeMetrics, String> {
+    tachyon_client::get_metrics()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn tail_logs(lines: Option<usize>) -> Result<Vec<tachyon_client::LogLine>, String> {
+    tachyon_client::tail_logs(lines.unwrap_or(50))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_shadow_diffs() -> Result<Vec<tachyon_client::ShadowDiff>, String> {
+    tachyon_client::get_shadow_diffs()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn connect_to_node(
     url: String,
     token: String,
@@ -418,12 +439,42 @@ async fn clear_custom_ca(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn verify_session_totp(code: String) -> Result<(), String> {
+async fn verify_session_totp(app: tauri::AppHandle, code: String) -> Result<(), String> {
     let trimmed = code.trim();
-    if trimmed.len() == 6 && trimmed.chars().all(|digit| digit.is_ascii_digit()) {
-        return Ok(());
+    if trimmed.len() != 6 || !trimmed.chars().all(|digit| digit.is_ascii_digit()) {
+        return Err("MFA code must contain exactly 6 digits".to_owned());
     }
-    Err("MFA code must contain exactly 6 digits".to_owned())
+
+    let profile = read_secure_profile(&app)
+        .await?
+        .ok_or_else(|| {
+            "Step-up cannot complete without remembered credentials. Sign in with the remember toggle enabled, then retry the action.".to_owned()
+        })?;
+
+    if profile.url.is_empty() || profile.username.is_empty() || profile.password.is_empty() {
+        return Err(
+            "Step-up requires the workstation profile to contain a node URL, username, and password.".to_owned(),
+        );
+    }
+
+    let staged = tachyon_client::authn_login(
+        &profile.url,
+        &profile.username,
+        &profile.password,
+        profile.custom_ca.clone(),
+    )
+    .await
+    .map_err(|error| format!("step-up login staging failed: {error}"))?;
+
+    let session_id = staged.session_id.ok_or_else(|| {
+        "Step-up login staging did not return an MFA session id; refresh credentials and retry."
+            .to_owned()
+    })?;
+
+    tachyon_client::finalize_login(&profile.url, &session_id, trimmed, profile.custom_ca)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("step-up TOTP verification failed: {error}"))
 }
 
 fn secure_profile_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -629,6 +680,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_engine_status,
             get_mesh_graph,
+            get_metrics,
+            tail_logs,
+            get_shadow_diffs,
             connect_to_node,
             authn_login,
             finalize_login,

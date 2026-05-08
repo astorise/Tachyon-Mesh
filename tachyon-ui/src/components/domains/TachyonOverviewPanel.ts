@@ -28,6 +28,14 @@ type MeshGraphSnapshot = {
   batchTargets: string[];
 };
 
+type RuntimeMetrics = {
+  source: string;
+  errorRate: number;
+  p50LatencyMs: number;
+  p99LatencyMs: number;
+  queueDepth: number;
+};
+
 export class TachyonOverviewPanel extends TachyonConfigDashboard {
   private metrics: OverviewMetric[] = this.initialMetrics();
   private status = t("overview.loading");
@@ -46,8 +54,14 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
     this.animateEntrance();
     try {
       const snapshot = await invoke<MeshGraphSnapshot>("get_mesh_graph");
-      this.metrics = this.metricsFromSnapshot(snapshot);
-      this.status = snapshot.status || t("overview.online");
+      let runtime: RuntimeMetrics | null = null;
+      try {
+        runtime = await invoke<RuntimeMetrics>("get_metrics");
+      } catch {
+        runtime = null;
+      }
+      this.metrics = this.metricsFromSources(snapshot, runtime);
+      this.status = runtime?.source ? `${runtime.source}` : snapshot.status || t("overview.online");
       this.render(this.metrics, this.status);
       this.animateEntrance();
       this.animateCounters();
@@ -121,17 +135,33 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
     });
   }
 
-  private metricsFromSnapshot(snapshot: MeshGraphSnapshot): OverviewMetric[] {
-    const routeTargets = snapshot.routes.reduce((total, route) => total + Math.max(route.targetCount, 1), 0);
+  private metricsFromSources(snapshot: MeshGraphSnapshot, runtime: RuntimeMetrics | null): OverviewMetric[] {
+    const sealedFallback = snapshot.routes.reduce((total, route) => total + Math.max(route.targetCount, 1), 0);
+    const liveQueue = runtime?.queueDepth;
+    const wasmInstances = typeof liveQueue === "number" && liveQueue > 0 ? liveQueue : sealedFallback;
+    const gpuUtilization = this.gpuUtilizationFromMetrics(snapshot, runtime);
+    return [
+      { ...this.metricTemplate("nodes"), value: Math.max(snapshot.batchTargets.length, 0) },
+      { ...this.metricTemplate("wasm"), value: Math.round(wasmInstances) },
+      { ...this.metricTemplate("gpu"), value: gpuUtilization },
+    ];
+  }
+
+  private gpuUtilizationFromMetrics(snapshot: MeshGraphSnapshot, runtime: RuntimeMetrics | null): number {
+    if (runtime) {
+      const errorComponent = Math.min(100, Math.round((runtime.errorRate ?? 0) * 100));
+      const latencyComponent = runtime.p99LatencyMs > 0
+        ? Math.min(100, Math.round((runtime.p99LatencyMs / 500) * 100))
+        : 0;
+      return Math.max(errorComponent, latencyComponent);
+    }
+    if (snapshot.routes.length === 0) {
+      return 0;
+    }
     const acceleratedRoutes = snapshot.routes.filter((route) =>
       [route.name, route.path, route.role].some((value) => value.toLowerCase().includes("gpu") || value.toLowerCase().includes("ai")),
     ).length;
-    const gpuUtilization = Math.min(100, Math.round(((acceleratedRoutes + snapshot.batchTargets.length) / Math.max(snapshot.routes.length, 1)) * 50));
-    return [
-      { ...this.metricTemplate("nodes"), value: snapshot.batchTargets.length },
-      { ...this.metricTemplate("wasm"), value: routeTargets },
-      { ...this.metricTemplate("gpu"), value: gpuUtilization },
-    ];
+    return Math.min(100, Math.round(((acceleratedRoutes + snapshot.batchTargets.length) / Math.max(snapshot.routes.length, 1)) * 50));
   }
 
   private initialMetrics(): OverviewMetric[] {

@@ -1,19 +1,49 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import { t } from "../../utils/i18n";
 
 type ApplyConfigurationResponse = {
   success: boolean;
   message: string;
 };
 
+type MeshRouteSummary = {
+  name: string;
+  path: string;
+  role: string;
+  targetCount: number;
+  requiresTee: boolean;
+  encryptedVolumeCount: number;
+};
+
+type MeshGraphSnapshot = {
+  source: string;
+  status: string;
+  routes: MeshRouteSummary[];
+  batchTargets: string[];
+};
+
 export class TachyonRoutingPanel extends TachyonConfigDashboard {
-  connectedCallback(): void {
+  private snapshot: MeshGraphSnapshot | null = null;
+
+  async connectedCallback(): Promise<void> {
     this.render();
+    this.bindForm();
+    this.animateEntrance();
+    try {
+      this.snapshot = await invoke<MeshGraphSnapshot>("get_mesh_graph");
+    } catch {
+      this.snapshot = null;
+    }
+    this.render();
+    this.bindForm();
+  }
+
+  private bindForm(): void {
     this.root.querySelector("form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.applyRoute();
     });
-    this.animateEntrance();
   }
 
   private render(): void {
@@ -23,6 +53,11 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
           <h2 class="text-2xl font-bold text-slate-100">Gateway Routing</h2>
           <p class="text-slate-400 text-sm font-mono">Domain: routing.wit</p>
         </div>
+
+        <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900/70 p-5">
+          <h3 class="mb-3 text-sm font-semibold uppercase tracking-widest text-cyan-300">${t("routing.preview.title")}</h3>
+          ${this.renderSnapshot()}
+        </article>
 
         <form class="space-y-6">
           <div data-stagger-panel class="grid grid-cols-1 md:grid-cols-2 gap-6 bg-slate-800/40 p-6 rounded-lg border border-slate-700">
@@ -96,9 +131,38 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
     };
   }
 
+  private renderSnapshot(): string {
+    if (!this.snapshot || this.snapshot.routes.length === 0) {
+      return `<p class="text-xs text-slate-500">${t("routing.preview.empty")}</p>`;
+    }
+    const rows = this.snapshot.routes
+      .map(
+        (route) =>
+          `<tr><td class="py-1 pr-4 text-cyan-300">${this.escape(route.name)}</td><td class="py-1 pr-4 font-mono text-slate-300">${this.escape(route.path)}</td><td class="py-1 pr-4 text-slate-300">${route.targetCount}</td><td class="py-1 text-slate-300">${route.requiresTee ? "yes" : "no"}</td></tr>`,
+      )
+      .join("");
+    return `
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 uppercase tracking-widest">
+          <tr><th class="text-left pb-2 pr-4">${t("routing.preview.column.name")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.path")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.targets")}</th><th class="text-left pb-2">${t("routing.preview.column.tee")}</th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }
+
   private value(id: string, fallback: string): string {
     const value = (this.root.getElementById(id) as HTMLInputElement | null)?.value.trim();
     return value ? value : fallback;
+  }
+
+  private escape(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 }
 

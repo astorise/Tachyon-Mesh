@@ -2,6 +2,7 @@ import gsap from "gsap";
 import QRCode from "qrcode";
 
 import stylesheetText from "../../style.css?inline";
+import { t } from "../../utils/i18n";
 import { resilientInvoke as invoke } from "../../utils/network";
 
 type AuthLoginResponse = {
@@ -72,127 +73,84 @@ export class TachyonIAM extends HTMLElement {
       <section class="fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center text-slate-300">
         <div id="iam-panel" class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-2xl shadow-2xl relative overflow-hidden">
           <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-600 to-blue-500"></div>
-          <h2 class="text-white text-2xl font-bold mb-1">Tachyon AuthN</h2>
-          <p class="text-slate-400 text-sm mb-6">Zero-Trust Control Plane Access</p>
-          <form id="iam-signup-form" class="mb-6 space-y-6 max-w-lg rounded-xl border border-slate-800 bg-slate-900/50 p-6 backdrop-blur-sm">
-            <div class="border-b border-slate-800 pb-4 mb-4">
-              <h3 class="text-lg font-medium text-cyan-400">Stage New Operator</h3>
-              <p class="text-sm text-slate-500">Initiate a secure enrollment session</p>
-            </div>
-
-            <div class="space-y-2">
-              <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Node URL</label>
-              <input type="text" id="iam-url" placeholder="https://..." class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
-            </div>
-
-            <div class="grid grid-cols-2 gap-4">
-              <div class="space-y-2">
-                <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">First Name</label>
-                <input type="text" id="iam-first-name" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
-              </div>
-              <div class="space-y-2">
-                <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Last Name</label>
-                <input type="text" id="iam-last-name" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
-              </div>
-            </div>
-
-            <div class="space-y-2">
-              <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Username</label>
-              <input type="text" id="iam-username" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
-            </div>
-
-            <div class="space-y-2">
-              <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Initial Password</label>
-              <input type="password" id="iam-password" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
-            </div>
-
-            <div class="space-y-2">
-              <label class="text-xs font-semibold uppercase tracking-wider text-slate-400">Enrollment Token</label>
-              <input type="text" id="iam-token" class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-cyan-300 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500" required>
-            </div>
-
-            <div class="pt-4">
-              <button type="submit" class="w-full rounded-md bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/50 px-4 py-2.5 text-sm font-medium text-cyan-300 transition-colors focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:ring-offset-2 focus:ring-offset-slate-900">
-                Provision Identity
-              </button>
-            </div>
-          </form>
+          <h2 class="text-white text-2xl font-bold mb-1">${t("iam.title")}</h2>
+          <p class="text-slate-400 text-sm mb-6">${t("iam.subtitle")}</p>
           <form id="auth-step-login" class="auth-step space-y-3">
-            <input type="text" id="auth-url" placeholder="Mesh Node URL (https://...)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
-            <input type="text" id="auth-username" placeholder="Username" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+            <input type="text" id="auth-url" placeholder="${t("iam.placeholder.url")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
+            <input type="text" id="auth-username" placeholder="${t("iam.placeholder.username")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
             <div class="flex gap-2">
-              <input type="password" id="auth-password" placeholder="Password" class="min-w-0 flex-1 bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
-              <button type="button" id="btn-toggle-login-password" class="rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm text-slate-300">Show</button>
+              <input type="password" id="auth-password" placeholder="${t("iam.placeholder.password")}" class="min-w-0 flex-1 bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+              <button type="button" id="btn-toggle-login-password" class="rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm text-slate-300">${t("iam.password.show")}</button>
             </div>
             <label class="flex items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs text-slate-300">
               <input type="checkbox" id="remember-credentials" class="h-4 w-4 accent-cyan-500" />
-              <span>Remember login and password on this workstation</span>
+              <span>${t("iam.remember")}</span>
             </label>
             <input type="file" id="auth-mtls" class="w-full text-slate-400 text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-cyan-500/10 file:text-cyan-400 cursor-pointer hover:file:bg-cyan-500/20" />
-            <div id="auth-ca-status" class="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs text-slate-400">No custom CA loaded.</div>
+            <div id="auth-ca-status" class="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs text-slate-400">${t("iam.ca.none")}</div>
             <div class="grid gap-2 md:grid-cols-2">
-              <button type="button" id="btn-save-custom-ca" class="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700">Save CA</button>
-              <button type="button" id="btn-clear-custom-ca" class="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700">Clear CA</button>
+              <button type="button" id="btn-save-custom-ca" class="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700">${t("iam.ca.save")}</button>
+              <button type="button" id="btn-clear-custom-ca" class="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700">${t("iam.ca.clear")}</button>
             </div>
             <div class="grid gap-3 md:grid-cols-2 pt-3">
-              <button id="btn-login-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)]">Authenticate</button>
-              <button type="button" id="btn-open-signup" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Register with Invite Token</button>
+              <button id="btn-login-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all shadow-[0_0_15px_rgba(34,211,238,0.2)]">${t("iam.authenticate")}</button>
+              <button type="button" id="btn-open-signup" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">${t("iam.register")}</button>
             </div>
           </form>
           <form id="auth-step-mfa" class="auth-step hidden space-y-4">
-            <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">Enter the 6-digit code from your authenticator app.</div>
+            <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">${t("iam.mfa.prompt")}</div>
             <input type="text" id="auth-mfa-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
-            <button id="btn-mfa-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Verify Code</button>
+            <button id="btn-mfa-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">${t("iam.mfa.verify")}</button>
           </form>
           <form id="auth-step-signup-token" class="auth-step hidden space-y-4">
-            <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">Validate a 24-hour invite token before creating the admin profile.</div>
-            <input type="text" id="signup-auth-url" placeholder="Mesh Node URL (https://...)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
-            <input type="password" id="signup-token" placeholder="Paste invite token" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
+            <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">${t("iam.signup.intro")}</div>
+            <input type="text" id="signup-auth-url" placeholder="${t("iam.placeholder.url")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
+            <input type="password" id="signup-token" placeholder="${t("iam.placeholder.invite")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
             <div class="grid gap-3 md:grid-cols-2">
-              <button type="button" id="btn-signup-token-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back to Login</button>
-              <button id="btn-signup-token-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Validate Invite</button>
+              <button type="button" id="btn-signup-token-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">${t("iam.signup.back-to-login")}</button>
+              <button id="btn-signup-token-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">${t("iam.signup.validate-invite")}</button>
             </div>
           </form>
           <form id="auth-step-signup-profile" class="auth-step hidden space-y-3">
             <div class="grid gap-3 md:grid-cols-2">
-              <input type="text" id="signup-first-name" placeholder="First Name" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
-              <input type="text" id="signup-last-name" placeholder="Last Name" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+              <input type="text" id="signup-first-name" placeholder="${t("iam.placeholder.first-name")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+              <input type="text" id="signup-last-name" placeholder="${t("iam.placeholder.last-name")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
             </div>
-            <input type="text" id="signup-username" placeholder="Username (auto: firstname.lastname)" readonly class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-slate-300 text-sm font-mono cursor-not-allowed" />
-            <input type="password" id="signup-password" placeholder="Password (8+ characters)" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
-            <input type="password" id="signup-confirm-password" placeholder="Confirm password" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
-            <p id="signup-token-summary" class="text-xs text-slate-500">No invite loaded yet.</p>
+            <input type="text" id="signup-username" placeholder="${t("iam.placeholder.username-auto")}" readonly class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-slate-300 text-sm font-mono cursor-not-allowed" />
+            <input type="password" id="signup-password" placeholder="${t("iam.placeholder.password-min")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+            <input type="password" id="signup-confirm-password" placeholder="${t("iam.placeholder.password-confirm")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+            <p id="signup-token-summary" class="text-xs text-slate-500">${t("iam.signup.no-invite")}</p>
             <div class="grid gap-3 md:grid-cols-2 pt-2">
-              <button type="button" id="btn-signup-profile-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back</button>
-              <button id="btn-signup-profile-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Stage Account</button>
+              <button type="button" id="btn-signup-profile-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">${t("iam.back")}</button>
+              <button id="btn-signup-profile-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">${t("iam.signup.stage-account")}</button>
             </div>
           </form>
           <form id="auth-step-signup-totp" class="auth-step hidden space-y-4">
             <div class="grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
               <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5">
-                <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">Authenticator QR</div>
+                <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">${t("iam.signup.qr-title")}</div>
                 <div id="signup-totp-qr" class="flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-slate-700 bg-slate-900 p-4 text-center text-sm text-slate-500">
-                  Waiting for staged enrollment.
+                  ${t("iam.signup.qr-waiting")}
                 </div>
               </div>
               <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5 space-y-4">
                 <div>
-                  <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">Session</div>
-                  <div id="signup-session-id" class="break-all font-mono text-sm text-cyan-300">Pending</div>
+                  <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">${t("iam.signup.session")}</div>
+                  <div id="signup-session-id" class="break-all font-mono text-sm text-cyan-300">${t("iam.signup.pending")}</div>
                 </div>
                 <div>
-                  <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">Manual Secret</div>
-                  <div id="signup-manual-secret" class="break-all font-mono text-sm text-white">Scan the QR code when available.</div>
+                  <div class="mb-2 text-xs uppercase tracking-[0.2em] text-slate-500">${t("iam.signup.manual-secret")}</div>
+                  <div id="signup-manual-secret" class="break-all font-mono text-sm text-white">${t("iam.signup.scan-when-ready")}</div>
                 </div>
               </div>
             </div>
             <input type="text" id="signup-totp-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
             <div class="grid gap-3 md:grid-cols-2">
-              <button type="button" id="btn-signup-totp-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">Back</button>
-              <button id="btn-signup-totp-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">Finalize Enrollment</button>
+              <button type="button" id="btn-signup-totp-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">${t("iam.back")}</button>
+              <button id="btn-signup-totp-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">${t("iam.signup.finalize")}</button>
             </div>
           </form>
-          <div id="auth-error" class="hidden mt-4 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 text-center">Authentication failed.</div>
+          <div id="auth-error" class="hidden mt-4 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 text-center">${t("iam.error.generic")}</div>
         </div>
       </section>
     `;
@@ -203,10 +161,6 @@ export class TachyonIAM extends HTMLElement {
       this.bindAdminEvents();
       return;
     }
-    this.form("iam-signup-form")?.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void this.stageOperator();
-    });
     this.form("auth-step-login")?.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.login();
@@ -215,7 +169,6 @@ export class TachyonIAM extends HTMLElement {
     this.input("remember-credentials")?.addEventListener("change", () => void this.persistCredentialsPreference());
     this.button("btn-save-custom-ca")?.addEventListener("click", () => void this.saveSelectedCustomCa());
     this.button("btn-clear-custom-ca")?.addEventListener("click", () => void this.clearCustomCa());
-    this.input("iam-url")?.addEventListener("input", () => this.syncAuthUrls("iam-url", "auth-url"));
     this.input("auth-url")?.addEventListener("input", () => this.syncAuthUrls("auth-url", "signup-auth-url"));
     this.input("signup-auth-url")?.addEventListener("input", () => this.syncAuthUrls("signup-auth-url", "auth-url"));
     this.form("auth-step-mfa")?.addEventListener("submit", (event) => {
@@ -247,15 +200,15 @@ export class TachyonIAM extends HTMLElement {
   private renderAdminPanel(): void {
     this.root.innerHTML = `
       <section class="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-6 backdrop-blur-sm">
-        <h3 class="mb-2 text-lg font-medium text-emerald-400">Generate Operator Invite</h3>
-        <p class="mb-4 text-sm text-slate-400">Creates a single-use token and QR code for a new operator to provision their identity.</p>
+        <h3 class="mb-2 text-lg font-medium text-emerald-400">${t("iam.admin.title")}</h3>
+        <p class="mb-4 text-sm text-slate-400">${t("iam.admin.subtitle")}</p>
         <button id="btn-generate-invite" class="rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-300 transition-colors hover:bg-emerald-500/30">
-          Generate Token
+          ${t("iam.admin.generate")}
         </button>
         <div id="invite-result-container" class="mt-6 hidden gap-6">
           <div id="invite-qr-code" class="rounded-md bg-white p-2"></div>
           <div class="flex flex-col justify-center">
-            <span class="text-xs uppercase text-slate-500">Manual Entry Token</span>
+            <span class="text-xs uppercase text-slate-500">${t("iam.admin.manual-token")}</span>
             <span id="invite-token-display" class="mt-1 font-mono text-2xl tracking-widest text-emerald-300"></span>
             <span id="invite-session-display" class="mt-2 break-all font-mono text-xs text-slate-500"></span>
           </div>
@@ -291,28 +244,7 @@ export class TachyonIAM extends HTMLElement {
       }
       container?.classList.remove("hidden");
       container?.classList.add("flex");
-      this.notify("success", "Invite token generated.");
-    } catch (error) {
-      this.notify("error", error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  private async stageOperator(): Promise<void> {
-    const url = this.value("iam-url") || this.signupUrl();
-    const token = this.value("iam-token");
-    const firstName = this.value("iam-first-name");
-    const lastName = this.value("iam-last-name");
-    const username = this.value("iam-username");
-    const password = this.value("iam-password");
-    if (!url || !token || !firstName || !lastName || !username || !password) {
-      this.notify("error", "Node URL, token, first name, last name, username and password are required.");
-      return;
-    }
-    try {
-      await invoke<StagedSignupSession>("stage_signup", {
-        payload: { url, token, firstName, lastName, username, password, cert: null },
-      });
-      this.notify("success", `Enrollment staged for ${username}.`);
+      this.notify("success", t("iam.admin.invite-generated"));
     } catch (error) {
       this.notify("error", error instanceof Error ? error.message : String(error));
     }
@@ -323,25 +255,19 @@ export class TachyonIAM extends HTMLElement {
     const username = this.value("auth-username");
     const password = this.value("auth-password");
     if (!url || !username || !password) {
-      this.showError("Node URL, username and password are required.");
+      this.showError(t("iam.error.login-required"));
       return;
     }
     try {
       const response = await invoke<AuthLoginResponse>("authn_login", {
         payload: { url, username, password, cert: await this.currentCustomCa() },
       });
-      if (response.requiresMfa) {
-        if (!response.sessionId) {
-          throw new Error("Login staged without an MFA session id.");
-        }
-        await this.persistCredentialsPreference();
-        this.stagedLogin = response;
-        await this.switchStep("mfa");
-        return;
+      if (!response.sessionId) {
+        throw new Error(t("iam.error.no-session"));
       }
       await this.persistCredentialsPreference();
-      this.clearPasswordFields();
-      await this.completeAuthentication({ user: response.username, role: "admin", token: password });
+      this.stagedLogin = response;
+      await this.switchStep("mfa");
     } catch (error) {
       this.emitError(error, "authn_login_failed");
     }
@@ -349,12 +275,12 @@ export class TachyonIAM extends HTMLElement {
 
   private async finalizeLogin(): Promise<void> {
     if (!this.stagedLogin?.sessionId) {
-      this.showError("No staged login session is active.");
+      this.showError(t("iam.error.no-staged-login"));
       return;
     }
     const totpCode = this.value("auth-mfa-code").replace(/\s+/g, "");
     if (!/^\d{6}$/.test(totpCode)) {
-      this.showError("Enter a 6-digit MFA code.");
+      this.showError(t("iam.error.totp-format"));
       return;
     }
     try {
@@ -376,7 +302,7 @@ export class TachyonIAM extends HTMLElement {
 
   private async validateInvite(): Promise<void> {
     if (!this.signupUrl()) {
-      this.showError("Mesh Node URL is required for enrollment.");
+      this.showError(t("iam.error.url-required"));
       return;
     }
     try {
@@ -385,7 +311,8 @@ export class TachyonIAM extends HTMLElement {
       });
       const summary = this.root.getElementById("signup-token-summary");
       if (summary) {
-        summary.textContent = `${this.claims.subject} | roles=${this.claims.roles.join(", ") || "none"} | scopes=${this.claims.scopes.join(", ") || "none"}`;
+        const noneLabel = t("iam.signup.none");
+        summary.textContent = `${this.claims.subject} | ${t("iam.signup.roles")}=${this.claims.roles.join(", ") || noneLabel} | ${t("iam.signup.scopes")}=${this.claims.scopes.join(", ") || noneLabel}`;
       }
       await this.switchStep("signup-profile");
     } catch (error) {
@@ -395,12 +322,12 @@ export class TachyonIAM extends HTMLElement {
 
   private async stageAccount(): Promise<void> {
     if (!this.signupUrl()) {
-      this.showError("Mesh Node URL is required for enrollment.");
+      this.showError(t("iam.error.url-required"));
       return;
     }
     const password = this.value("signup-password");
     if (password.length < 8 || password !== this.value("signup-confirm-password")) {
-      this.showError("Password must be at least 8 characters and match confirmation.");
+      this.showError(t("iam.error.password-rules"));
       return;
     }
     try {
@@ -425,11 +352,11 @@ export class TachyonIAM extends HTMLElement {
 
   private async finalizeSignup(): Promise<void> {
     if (!this.stagedSignup) {
-      this.showError("No staged signup session is active.");
+      this.showError(t("iam.error.no-staged-signup"));
       return;
     }
     if (!this.signupUrl()) {
-      this.showError("Mesh Node URL is required for enrollment.");
+      this.showError(t("iam.error.url-required"));
       return;
     }
     try {
@@ -512,7 +439,7 @@ export class TachyonIAM extends HTMLElement {
         "flex min-h-64 items-center justify-center rounded-2xl border border-slate-700 bg-slate-900 p-4";
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      qr.textContent = `Unable to render QR code. Manual secret: ${this.extractProvisioningSecret(session.provisioningUri)}`;
+      qr.textContent = `${t("iam.error.qr")} ${t("iam.signup.manual-secret")}: ${this.extractProvisioningSecret(session.provisioningUri)}`;
       this.dispatchEvent(
         new CustomEvent("iam:error", {
           bubbles: true,
@@ -545,7 +472,7 @@ export class TachyonIAM extends HTMLElement {
     }
     input.type = input.type === "password" ? "text" : "password";
     if (button) {
-      button.textContent = input.type === "password" ? "Show" : "Hide";
+      button.textContent = input.type === "password" ? t("iam.password.show") : t("iam.password.hide");
     }
   }
 
@@ -556,10 +483,6 @@ export class TachyonIAM extends HTMLElement {
         return;
       }
       if (parsed.url) {
-        const iamUrl = this.input("iam-url");
-        if (iamUrl) {
-          iamUrl.value = parsed.url;
-        }
         const url = this.input("auth-url");
         if (url) {
           url.value = parsed.url;
@@ -604,7 +527,7 @@ export class TachyonIAM extends HTMLElement {
       await invoke("delete_credentials");
       return;
     }
-    this.notify("success", "Credentials are stored by the native Stronghold secure enclave, not browser localStorage.");
+    this.notify("success", t("iam.credentials.stronghold-stored"));
     await invoke("save_credentials", {
       payload: {
         url: this.value("auth-url"),
@@ -618,18 +541,18 @@ export class TachyonIAM extends HTMLElement {
   private async saveSelectedCustomCa(): Promise<void> {
     const cert = await this.readSelectedCert();
     if (!cert) {
-      this.notify("error", "Select a custom CA certificate first.");
+      this.notify("error", t("iam.ca.select-first"));
       return;
     }
     await invoke("save_custom_ca", { cert });
     this.updateCaStatus(cert.length);
-    this.notify("success", "Custom CA saved for this workstation.");
+    this.notify("success", t("iam.ca.saved"));
   }
 
   private async clearCustomCa(): Promise<void> {
     await invoke("clear_custom_ca");
     this.updateCaStatus(0);
-    this.notify("success", "Custom CA cleared.");
+    this.notify("success", t("iam.ca.cleared"));
   }
 
   private async currentCustomCa(): Promise<number[] | null> {
@@ -653,7 +576,7 @@ export class TachyonIAM extends HTMLElement {
     if (!status) {
       return;
     }
-    status.textContent = byteLength > 0 ? `Custom CA loaded (${byteLength} bytes).` : "No custom CA loaded.";
+    status.textContent = byteLength > 0 ? `${t("iam.ca.loaded.prefix")} (${byteLength} ${t("iam.ca.bytes")}).` : t("iam.ca.none");
   }
 
   private syncAuthUrls(sourceId: string, targetId: string): void {
@@ -718,7 +641,7 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private clearSignupPasswordFields(): void {
-    for (const id of ["iam-password", "signup-password", "signup-confirm-password"]) {
+    for (const id of ["signup-password", "signup-confirm-password"]) {
       const input = this.input(id);
       if (input) {
         input.value = "";
