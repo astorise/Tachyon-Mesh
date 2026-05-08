@@ -2,6 +2,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import { connectionStore } from "../stores/connectionStore";
 import { ensureMfa } from "./authSudo";
+import { translateBackendError } from "./i18n";
 
 export const reconnectDelayMs = (retryCount: number): number => Math.min(1000 * 2 ** retryCount, 30000);
 
@@ -23,7 +24,8 @@ export async function resilientInvoke<T>(command: string, args?: Record<string, 
   } catch (error) {
     connectionStore.getState().setStatus("disconnected");
     startReconnectLoop();
-    throw error;
+    const raw = error instanceof Error ? error.message : String(error);
+    throw new Error(translateBackendError(raw));
   }
 }
 

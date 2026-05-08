@@ -33,7 +33,10 @@ export abstract class TachyonConfigDashboard extends HTMLElement {
       type === "success"
         ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
         : "border-red-500/30 bg-red-500/10 text-red-300";
-    zone.innerHTML = `<div class="rounded-lg border px-4 py-3 ${tone}">${this.escapeHtml(message)}</div>`;
+    const feedback = document.createElement("div");
+    feedback.className = `rounded-lg border px-4 py-3 ${tone}`;
+    feedback.textContent = message;
+    zone.replaceChildren(feedback);
     void gsap.fromTo(zone, { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: 0.24, ease: "power2.out" });
     if (type === "success") {
       void gsap.fromTo(
@@ -61,14 +64,5 @@ export abstract class TachyonConfigDashboard extends HTMLElement {
       { y: 16, opacity: 0 },
       { y: 0, opacity: 1, duration: 0.32, stagger: 0.06, ease: "power2.out" },
     );
-  }
-
-  private escapeHtml(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
   }
 }

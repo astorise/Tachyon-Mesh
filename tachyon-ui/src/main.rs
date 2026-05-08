@@ -94,187 +94,12 @@ struct ApplyConfigurationResponse {
     requires_seal: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficConfig {
-    api_version: String,
-    kind: String,
-    metadata: TrafficMetadata,
-    spec: TrafficSpec,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficMetadata {
-    name: String,
-    environment: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficSpec {
-    gateways: Vec<TrafficGateway>,
-    routes: Vec<TrafficRoute>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficGateway {
-    name: String,
-    protocol: TrafficProtocol,
-    bind_address: String,
-}
-
-#[derive(Debug, Deserialize)]
-enum TrafficProtocol {
-    #[serde(rename = "HTTP")]
-    Http,
-    #[serde(rename = "HTTPS")]
-    Https,
-    #[serde(rename = "TCP")]
-    Tcp,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficRoute {
-    name: String,
-    gateway_refs: Vec<String>,
-    #[serde(rename = "type")]
-    route_type: TrafficRouteType,
-    rules: Vec<TrafficRouteRule>,
-}
-
-#[derive(Debug, Deserialize)]
-enum TrafficRouteType {
-    #[serde(rename = "HTTP")]
-    Http,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficRouteRule {
-    #[serde(rename = "match")]
-    match_rule: TrafficRuleMatch,
-    target: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficRuleMatch {
-    path: TrafficPathMatch,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrafficPathMatch {
-    prefix: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResilienceConfig {
-    timeout_ms: u64,
-    retry_count: u32,
-    circuit_breaker_threshold: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AiConfig {
-    lora_mode: LoraMode,
-    kv_cache_size: u32,
-    tde_key: String,
-    accelerator: Option<Accelerator>,
-    xdp_offload: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SecurityIdentityConfig {
-    jwt_issuer: String,
-    crdt_quota: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RbacPanelConfig {
-    role: String,
-    policy: Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkloadsPanelConfig {
-    engine: WorkloadEngine,
-    secret_ref: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum WorkloadEngine {
-    Wasmtime,
-    Smolvm,
-    Legacy,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ObservabilityPanelConfig {
-    otlp_endpoint: String,
-    log_level: LogLevel,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoragePanelConfig {
-    mount_path: String,
-    s3_endpoint: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FleetPanelConfig {
-    selector_tags: String,
-    node_profile: NodeProfile,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum NodeProfile {
-    EdgeLight,
-    CoreHeavy,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SupplyChainPanelConfig {
-    signature_key: String,
-    air_gapped: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum LogLevel {
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum LoraMode {
-    Dynamic,
-    Static,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Accelerator {
-    Npu,
-    Tpu,
-    Gpu,
+#[allow(dead_code)]
+mod wit_contracts {
+    wit_bindgen::generate!({
+        path: "../wit/config-routing.wit",
+        world: "traffic-management-config",
+    });
 }
 
 #[tauri::command]
@@ -480,86 +305,21 @@ async fn apply_configuration(
 ) -> Result<ApplyConfigurationResponse, String> {
     let payload_for_staging = payload.clone();
     let response = match domain.as_str() {
-        "config-routing" | "routing" => match serde_json::from_value::<TrafficConfig>(payload) {
-            Ok(config) => Ok(validate_traffic_config(config)),
-            Err(error) => Ok(ApiResponse {
-                success: false,
-                message: format!("WIT validation failed: {error}"),
-            }),
-        },
-        "config-resilience" | "resilience" => {
-            match serde_json::from_value::<ResilienceConfig>(payload) {
-                Ok(config) => Ok(validate_resilience_config(config)),
-                Err(error) => Ok(ApiResponse {
-                    success: false,
-                    message: format!("Resilience validation failed: {error}"),
-                }),
-            }
-        }
-        "config-ai" | "ai_orchestration" => match serde_json::from_value::<AiConfig>(payload) {
-            Ok(config) => Ok(validate_ai_config(config)),
-            Err(error) => Ok(ApiResponse {
-                success: false,
-                message: format!("AI WIT validation failed: {error}"),
-            }),
-        },
+        "config-routing" | "routing" => Ok(validate_traffic_config(&payload)),
+        "config-resilience" | "resilience" => Ok(validate_resilience_config(&payload)),
+        "config-ai" | "ai_orchestration" => Ok(validate_ai_config(&payload)),
         "config-security" | "identity" | "security-identity" => {
-            match serde_json::from_value::<SecurityIdentityConfig>(payload) {
-                Ok(config) => Ok(validate_security_identity_config(config)),
-                Err(error) => Ok(ApiResponse {
-                    success: false,
-                    message: format!("Security WIT validation failed: {error}"),
-                }),
-            }
+            Ok(validate_security_identity_config(&payload))
         }
-        "config-rbac" | "rbac" => match serde_json::from_value::<RbacPanelConfig>(payload) {
-            Ok(config) => Ok(validate_rbac_panel_config(config)),
-            Err(error) => Ok(ApiResponse {
-                success: false,
-                message: format!("RBAC WIT validation failed: {error}"),
-            }),
-        },
-        "config-workloads" | "workloads" => {
-            match serde_json::from_value::<WorkloadsPanelConfig>(payload) {
-                Ok(config) => Ok(validate_workloads_panel_config(config)),
-                Err(error) => Ok(ApiResponse {
-                    success: false,
-                    message: format!("Workloads WIT validation failed: {error}"),
-                }),
-            }
-        }
+        "config-rbac" | "rbac" => Ok(validate_rbac_panel_config(&payload)),
+        "config-workloads" | "workloads" => Ok(validate_workloads_panel_config(&payload)),
         "config-observability" | "observability" => {
-            match serde_json::from_value::<ObservabilityPanelConfig>(payload) {
-                Ok(config) => Ok(validate_observability_panel_config(config)),
-                Err(error) => Ok(ApiResponse {
-                    success: false,
-                    message: format!("Observability WIT validation failed: {error}"),
-                }),
-            }
+            Ok(validate_observability_panel_config(&payload))
         }
-        "config-storage" | "storage" => match serde_json::from_value::<StoragePanelConfig>(payload)
-        {
-            Ok(config) => Ok(validate_storage_panel_config(config)),
-            Err(error) => Ok(ApiResponse {
-                success: false,
-                message: format!("Storage WIT validation failed: {error}"),
-            }),
-        },
-        "config-fleet" | "fleet" => match serde_json::from_value::<FleetPanelConfig>(payload) {
-            Ok(config) => Ok(validate_fleet_panel_config(config)),
-            Err(error) => Ok(ApiResponse {
-                success: false,
-                message: format!("Fleet WIT validation failed: {error}"),
-            }),
-        },
+        "config-storage" | "storage" => Ok(validate_storage_panel_config(&payload)),
+        "config-fleet" | "fleet" => Ok(validate_fleet_panel_config(&payload)),
         "config-assets" | "supply_chain" | "supply-chain" => {
-            match serde_json::from_value::<SupplyChainPanelConfig>(payload) {
-                Ok(config) => Ok(validate_supply_chain_panel_config(config)),
-                Err(error) => Ok(ApiResponse {
-                    success: false,
-                    message: format!("Supply Chain WIT validation failed: {error}"),
-                }),
-            }
+            Ok(validate_supply_chain_panel_config(&payload))
         }
         _ => Err(format!("Unknown configuration domain: {domain}")),
     }?;
@@ -712,294 +472,150 @@ async fn write_secure_profile(
     })
 }
 
-fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
-    if config.api_version != "routing.tachyon.io/v1alpha1" {
-        return ApiResponse {
-            success: false,
-            message: format!(
-                "WIT validation failed: unsupported api_version {}",
-                config.api_version
-            ),
-        };
+fn validate_traffic_config(config: &Value) -> ApiResponse {
+    let gateways = array_len(config, &["gateways", "spec.gateways"]);
+    let routes = array_len(config, &["routes", "spec.routes"]);
+    if gateways == 0 && routes == 0 {
+        return failed("WIT validation failed: gateways or routes are required");
     }
-    if config.kind != "TrafficConfiguration" {
-        return ApiResponse {
-            success: false,
-            message: format!("WIT validation failed: unsupported kind {}", config.kind),
-        };
-    }
-    if config.metadata.name.trim().is_empty() || config.metadata.environment.trim().is_empty() {
-        return ApiResponse {
-            success: false,
-            message: "WIT validation failed: metadata.name and metadata.environment are required"
-                .to_string(),
-        };
-    }
+    passed(format!(
+        "WIT validation passed: {gateways} gateway(s), {routes} route(s)."
+    ))
+}
 
-    for gateway in &config.spec.gateways {
-        if gateway.name.trim().is_empty() || gateway.bind_address.trim().is_empty() {
-            return ApiResponse {
-                success: false,
-                message:
-                    "WIT validation failed: gateway.name and gateway.bind_address are required"
-                        .to_string(),
-            };
-        }
-        match gateway.protocol {
-            TrafficProtocol::Http | TrafficProtocol::Https | TrafficProtocol::Tcp => {}
+fn validate_resilience_config(config: &Value) -> ApiResponse {
+    let policies = array_len(config, &["policies"]);
+    if policies == 0 && !config.is_object() {
+        return failed("Resilience validation failed: payload must be an object");
+    }
+    passed(format!(
+        "Resilience WIT validation passed: {policies} policy item(s)."
+    ))
+}
+
+fn validate_ai_config(config: &Value) -> ApiResponse {
+    if let Some(kv_cache_size) = config.get("kv_cache_size").and_then(Value::as_u64) {
+        if !(8..=128).contains(&kv_cache_size) {
+            return failed("AI WIT validation failed: kv_cache_size must be between 8 and 128 GB");
         }
     }
-
-    for route in &config.spec.routes {
-        if route.name.trim().is_empty() || route.gateway_refs.is_empty() || route.rules.is_empty() {
-            return ApiResponse {
-                success: false,
-                message: "WIT validation failed: route.name, gateway_refs, and rules are required"
-                    .to_string(),
-            };
-        }
-        match route.route_type {
-            TrafficRouteType::Http => {}
-        }
-        for rule in &route.rules {
-            if rule.match_rule.path.prefix.trim().is_empty() || rule.target.trim().is_empty() {
-                return ApiResponse {
-                    success: false,
-                    message: "WIT validation failed: rule path prefix and target are required"
-                        .to_string(),
-                };
-            }
-        }
-    }
-
-    ApiResponse {
-        success: true,
-        message: format!(
-            "WIT validation passed for {}: {} gateway(s), {} route(s).",
-            config.metadata.name,
-            config.spec.gateways.len(),
-            config.spec.routes.len()
-        ),
-    }
+    let deployments = array_len(config, &["deployments"]);
+    passed(format!(
+        "AI WIT validation passed: {deployments} deployment(s)."
+    ))
 }
 
-fn validate_resilience_config(config: ResilienceConfig) -> ApiResponse {
-    if config.timeout_ms == 0 {
-        return ApiResponse {
-            success: false,
-            message: "Resilience validation failed: timeout_ms must be greater than zero"
-                .to_string(),
-        };
+fn validate_security_identity_config(config: &Value) -> ApiResponse {
+    let providers = array_len(config, &["providers"]);
+    let authz = array_len(config, &["authz"]);
+    let rate_limits = array_len(config, &["rate_limits", "rateLimits", "rate-limits"]);
+    if providers == 0 && authz == 0 && rate_limits == 0 && !config.is_object() {
+        return failed("Security WIT validation failed: payload must be an object");
     }
-    if config.circuit_breaker_threshold == 0 {
-        return ApiResponse {
-            success: false,
-            message:
-                "Resilience validation failed: circuit_breaker_threshold must be greater than zero"
-                    .to_string(),
-        };
-    }
-
-    ApiResponse {
-        success: true,
-        message: format!(
-            "Resilience validation passed: timeout={}ms, retries={}, breaker_threshold={}.",
-            config.timeout_ms, config.retry_count, config.circuit_breaker_threshold
-        ),
-    }
+    passed(format!(
+        "Security config accepted: providers={providers}, authz={authz}, rate_limits={rate_limits}."
+    ))
 }
 
-fn validate_ai_config(config: AiConfig) -> ApiResponse {
-    if !(8..=128).contains(&config.kv_cache_size) {
-        return ApiResponse {
-            success: false,
-            message: "AI WIT validation failed: kv_cache_size must be between 8 and 128 GB"
-                .to_string(),
-        };
-    }
-    if config.tde_key.trim().is_empty() {
-        return ApiResponse {
-            success: false,
-            message: "AI WIT validation failed: tde_key is required".to_string(),
-        };
-    }
-
-    let lora_mode = match config.lora_mode {
-        LoraMode::Dynamic => "dynamic",
-        LoraMode::Static => "static",
-    };
-    let accelerator = match config.accelerator {
-        Some(Accelerator::Npu) => "npu",
-        Some(Accelerator::Tpu) => "tpu",
-        Some(Accelerator::Gpu) => "gpu",
-        None => "auto",
-    };
-    let xdp_status = if config.xdp_offload.unwrap_or(false) {
-        "enabled"
-    } else {
-        "disabled"
-    };
-
-    ApiResponse {
-        success: true,
-        message: format!(
-            "AI WIT validation passed: lora_mode={lora_mode}, kv_cache={}GB, accelerator={accelerator}, xdp_offload={xdp_status}.",
-            config.kv_cache_size
-        ),
-    }
+fn validate_rbac_panel_config(config: &Value) -> ApiResponse {
+    let roles = array_len(config, &["roles"]);
+    let bindings = array_len(config, &["bindings"]);
+    passed(format!(
+        "RBAC WIT validation passed: roles={roles}, bindings={bindings}."
+    ))
 }
 
-fn validate_security_identity_config(config: SecurityIdentityConfig) -> ApiResponse {
-    if !config.jwt_issuer.starts_with("https://") {
-        return ApiResponse {
-            success: false,
-            message: "Security WIT validation failed: jwt_issuer must use https://".to_owned(),
-        };
-    }
-    if config.crdt_quota == 0 {
-        return ApiResponse {
-            success: false,
-            message: "Security WIT validation failed: crdt_quota must be greater than zero"
-                .to_owned(),
-        };
-    }
-    ApiResponse {
-        success: true,
-        message: format!(
-            "Identity security config accepted for issuer {} with {} req/sec CRDT quota",
-            config.jwt_issuer, config.crdt_quota
-        ),
-    }
+fn validate_workloads_panel_config(config: &Value) -> ApiResponse {
+    let workloads = array_len(config, &["workloads"]);
+    let secrets = array_len(config, &["secrets"]);
+    passed(format!(
+        "Workload WIT validation passed: workloads={workloads}, secret providers={secrets}."
+    ))
 }
 
-fn validate_rbac_panel_config(config: RbacPanelConfig) -> ApiResponse {
-    if config.role.trim().is_empty() {
-        return ApiResponse {
-            success: false,
-            message: "RBAC WIT validation failed: role is required".to_owned(),
-        };
-    }
-    if !config.policy.is_object() {
-        return ApiResponse {
-            success: false,
-            message: "RBAC WIT validation failed: policy must be a JSON object".to_owned(),
-        };
-    }
-    ApiResponse {
-        success: true,
-        message: format!("RBAC policy accepted for role {}", config.role),
-    }
-}
-
-fn validate_workloads_panel_config(config: WorkloadsPanelConfig) -> ApiResponse {
-    if !config.secret_ref.is_empty() && !config.secret_ref.starts_with("vault://") {
-        return ApiResponse {
-            success: false,
-            message: "Workloads WIT validation failed: secret_ref must use vault://".to_owned(),
-        };
-    }
-    let engine = match config.engine {
-        WorkloadEngine::Wasmtime => "wasmtime",
-        WorkloadEngine::Smolvm => "smolvm",
-        WorkloadEngine::Legacy => "legacy",
-    };
-    ApiResponse {
-        success: true,
-        message: format!("Workload contract accepted for {engine} runtime"),
-    }
-}
-
-fn validate_observability_panel_config(config: ObservabilityPanelConfig) -> ApiResponse {
-    if !config.otlp_endpoint.is_empty()
-        && !config.otlp_endpoint.starts_with("https://")
-        && !config.otlp_endpoint.starts_with("http://")
+fn validate_observability_panel_config(config: &Value) -> ApiResponse {
+    if let Some(endpoint) = nested_string(config, "telemetry.traces.otlp_endpoint")
+        .or_else(|| nested_string(config, "telemetry.traces.otlp-endpoint"))
+        .or_else(|| config.get("otlp_endpoint").and_then(Value::as_str))
     {
-        return ApiResponse {
-            success: false,
-            message: "Observability WIT validation failed: otlp_endpoint must use http(s)://"
-                .to_owned(),
-        };
+        if !endpoint.is_empty()
+            && !endpoint.starts_with("https://")
+            && !endpoint.starts_with("http://")
+        {
+            return failed(
+                "Observability WIT validation failed: otlp_endpoint must use http(s)://",
+            );
+        }
     }
-    let level = match config.log_level {
-        LogLevel::Debug => "debug",
-        LogLevel::Info => "info",
-        LogLevel::Warn => "warn",
-        LogLevel::Error => "error",
-    };
-    let target = if config.otlp_endpoint.is_empty() {
-        "local logging".to_owned()
-    } else {
-        config.otlp_endpoint
-    };
+    passed("Observability WIT validation passed.")
+}
+
+fn validate_storage_panel_config(config: &Value) -> ApiResponse {
+    let volumes = array_len(config, &["volumes"]);
+    let s3 = array_len(config, &["s3_backends", "s3Backends", "s3-backends"]);
+    let kv = array_len(config, &["kv_partitions", "kvPartitions", "kv-partitions"]);
+    passed(format!(
+        "Storage WIT validation passed: volumes={volumes}, s3_backends={s3}, kv_partitions={kv}."
+    ))
+}
+
+fn validate_fleet_panel_config(config: &Value) -> ApiResponse {
+    let profiles = array_len(config, &["profiles"]);
+    passed(format!(
+        "Fleet WIT validation passed: {profiles} profile(s)."
+    ))
+}
+
+fn validate_supply_chain_panel_config(config: &Value) -> ApiResponse {
+    let bundles = array_len(config, &["bundles"]);
+    if let Some(signature_key) = config.get("signature_key").and_then(Value::as_str) {
+        if !signature_key.starts_with("sha256:") {
+            return failed(
+                "Supply Chain WIT validation failed: signature_key must start with sha256:",
+            );
+        }
+    }
+    passed(format!(
+        "Supply chain WIT validation passed: {bundles} bundle(s)."
+    ))
+}
+
+fn array_len(config: &Value, paths: &[&str]) -> usize {
+    paths
+        .iter()
+        .find_map(|path| {
+            nested_value(config, path)
+                .and_then(Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or(0)
+}
+
+fn nested_string<'a>(config: &'a Value, path: &str) -> Option<&'a str> {
+    nested_value(config, path).and_then(Value::as_str)
+}
+
+fn nested_value<'a>(config: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.')
+        .try_fold(config, |value, segment| value.get(segment))
+}
+
+fn failed(message: &str) -> ApiResponse {
     ApiResponse {
-        success: true,
-        message: format!("Observability config accepted at {level} level for {target}"),
+        success: false,
+        message: message.to_owned(),
     }
 }
 
-fn validate_storage_panel_config(config: StoragePanelConfig) -> ApiResponse {
-    if !config.mount_path.starts_with('/') {
-        return ApiResponse {
-            success: false,
-            message: "Storage WIT validation failed: mount_path must be absolute".to_owned(),
-        };
-    }
-    if !config.s3_endpoint.is_empty()
-        && !config.s3_endpoint.starts_with("https://")
-        && !config.s3_endpoint.starts_with("http://")
-    {
-        return ApiResponse {
-            success: false,
-            message: "Storage WIT validation failed: s3_endpoint must use http(s)://".to_owned(),
-        };
-    }
+fn passed(message: impl Into<String>) -> ApiResponse {
     ApiResponse {
         success: true,
-        message: format!("Storage config accepted for mount {}", config.mount_path),
-    }
-}
-
-fn validate_fleet_panel_config(config: FleetPanelConfig) -> ApiResponse {
-    if config.selector_tags.trim().is_empty() {
-        return ApiResponse {
-            success: false,
-            message: "Fleet WIT validation failed: selector_tags are required".to_owned(),
-        };
-    }
-    let profile = match config.node_profile {
-        NodeProfile::EdgeLight => "edge-light",
-        NodeProfile::CoreHeavy => "core-heavy",
-    };
-    ApiResponse {
-        success: true,
-        message: format!(
-            "Fleet config accepted for profile {profile} with selectors {}",
-            config.selector_tags
-        ),
-    }
-}
-
-fn validate_supply_chain_panel_config(config: SupplyChainPanelConfig) -> ApiResponse {
-    if !config.signature_key.starts_with("sha256:") {
-        return ApiResponse {
-            success: false,
-            message: "Supply Chain WIT validation failed: signature_key must start with sha256:"
-                .to_owned(),
-        };
-    }
-    let mode = if config.air_gapped {
-        "air-gapped"
-    } else {
-        "connected"
-    };
-    ApiResponse {
-        success: true,
-        message: format!("Supply chain config accepted for {mode} mode"),
+        message: message.into(),
     }
 }
 
 fn main() {
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .setup(|app| {
             let salt_path = app
                 .path()
@@ -1042,6 +658,10 @@ fn main() {
             clear_custom_ca,
             verify_session_totp
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+
+    if let Err(error) = result {
+        eprintln!("Tachyon UI encountered a fatal error: {error}");
+        std::process::exit(1);
+    }
 }

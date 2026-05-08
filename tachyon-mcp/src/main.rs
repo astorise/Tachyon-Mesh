@@ -1,9 +1,58 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::{
+    env,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+const WRITE_LIMIT_PER_MINUTE: u32 = 5;
+
+struct McpContext {
+    _token: String,
+    write_limiter: Mutex<TokenBucket>,
+}
+
+struct TokenBucket {
+    tokens: u32,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new() -> Self {
+        Self {
+            tokens: WRITE_LIMIT_PER_MINUTE,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        if self.last_refill.elapsed() >= Duration::from_secs(60) {
+            self.tokens = WRITE_LIMIT_PER_MINUTE;
+            self.last_refill = Instant::now();
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let context = McpContext {
+        _token: load_required_token()?,
+        write_limiter: Mutex::new(TokenBucket::new()),
+    };
+    if let Ok(url) = env::var("TACHYON_MCP_URL") {
+        tachyon_client::set_connection(url, context._token.clone(), None)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("failed to validate TACHYON_MCP_PAT against TACHYON_MCP_URL")?;
+    }
+
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = io::stdout();
@@ -13,7 +62,7 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        match handle_line(&line).await {
+        match handle_line(&line, &context).await {
             Ok(Some(response)) => {
                 stdout
                     .write_all(response.to_string().as_bytes())
@@ -45,7 +94,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_line(line: &str) -> Result<Option<Value>> {
+fn load_required_token() -> Result<String> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--token" {
+            let token = args.next().context("--token requires a PAT value")?;
+            if !token.trim().is_empty() {
+                return Ok(token);
+            }
+        }
+        if let Some(token) = arg.strip_prefix("--token=") {
+            if !token.trim().is_empty() {
+                return Ok(token.to_owned());
+            }
+        }
+    }
+
+    let token = env::var("TACHYON_MCP_PAT").context(
+        "tachyon-mcp requires a PAT via --token <pat> or TACHYON_MCP_PAT before accepting requests",
+    )?;
+    if token.trim().is_empty() {
+        anyhow::bail!("tachyon-mcp PAT must not be empty");
+    }
+    Ok(token)
+}
+
+async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> {
     let request: Value =
         serde_json::from_str(line).with_context(|| format!("invalid JSON-RPC payload: {line}"))?;
     let id = request.get("id").cloned();
@@ -253,7 +327,7 @@ async fn handle_line(line: &str) -> Result<Option<Value>> {
                 }
             ]
         }),
-        "tools/call" => handle_tool_call(request.get("params")).await?,
+        "tools/call" => handle_tool_call(request.get("params"), context).await?,
         "ping" => json!({}),
         other => {
             return Ok(Some(error_response(
@@ -271,13 +345,18 @@ async fn handle_line(line: &str) -> Result<Option<Value>> {
     })))
 }
 
-async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
+async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Result<Value> {
     let name = params
         .and_then(|value| value.get("name"))
         .and_then(Value::as_str)
         .context("missing tool name")?;
 
     match name {
+        "tachyon_register_resource" | "tachyon_seal_overlay" | "tachyon_apply_manifest"
+            if !allow_write(context) =>
+        {
+            return Ok(error_response(None, -32000, "Rate limit exceeded"));
+        }
         "tachyon_mesh_status" => {
             let status = tachyon_client::get_engine_status().await?;
             Ok(json!({
@@ -467,6 +546,14 @@ async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
             &format!("unsupported tool `{other}`"),
         )),
     }
+}
+
+fn allow_write(context: &McpContext) -> bool {
+    context
+        .write_limiter
+        .lock()
+        .expect("write limiter should not be poisoned")
+        .allow()
 }
 
 fn text_tool_result(value: &impl serde::Serialize) -> Result<Value> {

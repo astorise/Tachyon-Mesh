@@ -66,13 +66,22 @@ export class TachyonToastManager extends HTMLElement {
 
     const toast = document.createElement("div");
     toast.className = `pointer-events-auto flex min-w-72 items-start gap-3 rounded-lg border px-4 py-3 shadow-xl shadow-black/50 backdrop-blur-sm ${tone}`;
-    toast.innerHTML = `
-      <span class="mt-0.5 inline-flex h-6 min-w-6 items-center justify-center rounded border border-current px-1 font-mono text-[10px] font-bold">${marker}</span>
-      <p class="min-w-0 flex-1 text-sm font-medium leading-5">${this.escapeHtml(message)}</p>
-      <button type="button" class="rounded px-1 font-mono text-xs opacity-70 transition-opacity hover:opacity-100" aria-label="Dismiss notification">x</button>
-    `;
+    const markerNode = document.createElement("span");
+    markerNode.className =
+      "mt-0.5 inline-flex h-6 min-w-6 items-center justify-center rounded border border-current px-1 font-mono text-[10px] font-bold";
+    markerNode.textContent = marker;
+    const body = document.createElement("p");
+    body.className = "min-w-0 flex-1 text-sm font-medium leading-5";
+    body.textContent = message;
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className =
+      "rounded px-1 font-mono text-xs opacity-70 transition-opacity hover:opacity-100";
+    dismiss.setAttribute("aria-label", "Dismiss notification");
+    dismiss.textContent = "x";
+    toast.append(markerNode, body, dismiss);
 
-    toast.querySelector("button")?.addEventListener("click", () => {
+    dismiss.addEventListener("click", () => {
       this.dismissToast(toast);
     });
     container.appendChild(toast);
@@ -99,14 +108,6 @@ export class TachyonToastManager extends HTMLElement {
     });
   }
 
-  private escapeHtml(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
 }
 
 customElements.define("tachyon-toast-manager", TachyonToastManager);

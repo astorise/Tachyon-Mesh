@@ -158,6 +158,60 @@ export function t(key: string): string {
   return dictionaries[currentLanguage][key] ?? dictionaries.en[key] ?? key;
 }
 
+type ErrorPattern = {
+  regex: RegExp;
+  handler: (matches: RegExpMatchArray, language: SupportedLanguage) => string;
+};
+
+export class ErrorTranslator {
+  private readonly patterns: ErrorPattern[] = [
+    {
+      regex: /AI WIT validation failed: kv_cache_size must be between (\d+) and (\d+) GB/,
+      handler: (matches, language) =>
+        language === "fr"
+          ? `Validation IA echouee : le cache KV doit etre compris entre ${matches[1]} et ${matches[2]} Go.`
+          : `AI validation failed: KV cache must be between ${matches[1]} and ${matches[2]} GB.`,
+    },
+    {
+      regex: /metadata\.name and metadata\.environment are required/,
+      handler: (_matches, language) =>
+        language === "fr"
+          ? "Erreur de routage : le nom et l'environnement sont obligatoires."
+          : "Routing error: name and environment are mandatory.",
+    },
+    {
+      regex: /otlp_endpoint must use http\(s\):\/\//,
+      handler: (_matches, language) =>
+        language === "fr"
+          ? "Erreur observabilite : l'endpoint OTLP doit utiliser http:// ou https://."
+          : "Observability error: OTLP endpoint must use http:// or https://.",
+    },
+    {
+      regex: /Rate limit exceeded/,
+      handler: (_matches, language) =>
+        language === "fr"
+          ? "Limite de debit atteinte : patientez avant de relancer cette operation."
+          : "Rate limit exceeded: wait before retrying this operation.",
+    },
+  ];
+
+  translate(rawError: string): string {
+    for (const pattern of this.patterns) {
+      const match = rawError.match(pattern.regex);
+      if (match) {
+        return pattern.handler(match, currentLanguage);
+      }
+    }
+    return currentLanguage === "fr" ? `Erreur systeme : ${rawError}` : `System error: ${rawError}`;
+  }
+}
+
+const backendErrorTranslator = new ErrorTranslator();
+
+export function translateBackendError(rawError: string): string {
+  return backendErrorTranslator.translate(rawError);
+}
+
 export const i18n = {
   getLanguage,
   setLanguage,
