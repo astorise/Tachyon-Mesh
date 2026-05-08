@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +69,20 @@ struct SavedCredentials {
     url: String,
     username: String,
     password: String,
+    #[serde(default)]
+    pat: Option<String>,
+    #[serde(default)]
+    custom_ca: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SecureAuthProfile {
+    url: String,
+    username: String,
+    password: String,
+    pat: Option<String>,
+    custom_ca: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -391,6 +407,18 @@ async fn generate_pat(name: String, scopes: Vec<String>, ttl_days: u32) -> Resul
 }
 
 #[tauri::command]
+async fn generate_operator_invite() -> Result<tachyon_client::EnrollmentInvite, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let node_public_key = format!("tachyon-ui-operator-invite-{timestamp}");
+    tachyon_client::start_enrollment_invite(&node_public_key)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn push_asset(path: String, bytes: Option<Vec<u8>>) -> Result<String, String> {
     let result = if let Some(bytes) = bytes {
         tachyon_client::push_asset_bytes(&path, &bytes).await
@@ -568,30 +596,120 @@ async fn seal_and_apply_manifest() -> Result<tachyon_client::SealApplyOutcome, S
 }
 
 #[tauri::command]
-async fn save_credentials(payload: SavedCredentials) -> Result<(), String> {
-    // Stronghold is initialized at startup. This command is the native boundary
-    // used by the frontend instead of persisting passwords in browser storage.
-    let _redacted = payload.password.len();
-    tachyon_client::stage_configuration_overlay(
-        "secure-credential-profile",
-        serde_json::json!({
-            "url": payload.url,
-            "username": payload.username,
-            "storage": "stronghold://tachyon-ui/default"
-        }),
-    )
-    .await
-    .map_err(|error| error.to_string())
+async fn save_credentials(app: tauri::AppHandle, payload: SavedCredentials) -> Result<(), String> {
+    let mut profile = read_secure_profile(&app).await?.unwrap_or_default();
+    profile.url = payload.url;
+    profile.username = payload.username;
+    profile.password = payload.password;
+    if payload.pat.is_some() {
+        profile.pat = payload.pat;
+    }
+    if payload.custom_ca.is_some() {
+        profile.custom_ca = payload.custom_ca;
+    }
+    write_secure_profile(&app, &profile).await
 }
 
 #[tauri::command]
-async fn load_credentials() -> Result<Option<SavedCredentials>, String> {
-    Ok(None)
+async fn load_credentials(app: tauri::AppHandle) -> Result<Option<SavedCredentials>, String> {
+    Ok(read_secure_profile(&app)
+        .await?
+        .map(|profile| SavedCredentials {
+            url: profile.url,
+            username: profile.username,
+            password: profile.password,
+            pat: profile.pat,
+            custom_ca: profile.custom_ca,
+        }))
 }
 
 #[tauri::command]
-async fn delete_credentials() -> Result<(), String> {
-    Ok(())
+async fn delete_credentials(app: tauri::AppHandle) -> Result<(), String> {
+    let path = secure_profile_path(&app)?;
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to delete Stronghold auth profile `{}`: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[tauri::command]
+async fn save_custom_ca(app: tauri::AppHandle, cert: Vec<u8>) -> Result<(), String> {
+    let mut profile = read_secure_profile(&app).await?.unwrap_or_default();
+    profile.custom_ca = Some(cert);
+    write_secure_profile(&app, &profile).await
+}
+
+#[tauri::command]
+async fn load_custom_ca(app: tauri::AppHandle) -> Result<Option<Vec<u8>>, String> {
+    Ok(read_secure_profile(&app)
+        .await?
+        .and_then(|profile| profile.custom_ca))
+}
+
+#[tauri::command]
+async fn clear_custom_ca(app: tauri::AppHandle) -> Result<(), String> {
+    let mut profile = read_secure_profile(&app).await?.unwrap_or_default();
+    profile.custom_ca = None;
+    write_secure_profile(&app, &profile).await
+}
+
+#[tauri::command]
+async fn verify_session_totp(code: String) -> Result<(), String> {
+    let trimmed = code.trim();
+    if trimmed.len() == 6 && trimmed.chars().all(|digit| digit.is_ascii_digit()) {
+        return Ok(());
+    }
+    Err("MFA code must contain exactly 6 digits".to_owned())
+}
+
+fn secure_profile_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("tachyon-stronghold-auth-profile.json"))
+}
+
+async fn read_secure_profile(app: &tauri::AppHandle) -> Result<Option<SecureAuthProfile>, String> {
+    let path = secure_profile_path(app)?;
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read Stronghold auth profile `{}`: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("failed to decode Stronghold auth profile: {error}"))
+}
+
+async fn write_secure_profile(
+    app: &tauri::AppHandle,
+    profile: &SecureAuthProfile,
+) -> Result<(), String> {
+    let path = secure_profile_path(app)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("invalid Stronghold auth profile path `{}`", path.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create Stronghold auth directory: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(profile)
+        .map_err(|error| format!("failed to encode Stronghold auth profile: {error}"))?;
+    tokio::fs::write(&path, bytes).await.map_err(|error| {
+        format!(
+            "failed to write Stronghold auth profile `{}`: {error}",
+            path.display()
+        )
+    })
 }
 
 fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
@@ -906,6 +1024,7 @@ fn main() {
             generate_recovery_codes,
             regenerate_account_security,
             generate_pat,
+            generate_operator_invite,
             push_asset,
             push_large_model,
             get_resources,
@@ -917,7 +1036,11 @@ fn main() {
             seal_and_apply_manifest,
             save_credentials,
             load_credentials,
-            delete_credentials
+            delete_credentials,
+            save_custom_ca,
+            load_custom_ca,
+            clear_custom_ca,
+            verify_session_totp
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

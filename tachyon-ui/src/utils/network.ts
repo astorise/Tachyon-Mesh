@@ -1,6 +1,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import { connectionStore } from "../stores/connectionStore";
+import { ensureMfa } from "./authSudo";
 
 export const reconnectDelayMs = (retryCount: number): number => Math.min(1000 * 2 ** retryCount, 30000);
 
@@ -9,6 +10,9 @@ let reconnectLoop: Promise<void> | null = null;
 
 export async function resilientInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   try {
+    if (requiresStepUp(command)) {
+      await ensureMfa();
+    }
     const result = await tauriInvoke<T>(command, args);
     if (command === "apply_configuration" && isStagedConfiguration(result)) {
       window.dispatchEvent(new CustomEvent("config:staged", { detail: result }));
@@ -21,6 +25,22 @@ export async function resilientInvoke<T>(command: string, args?: Record<string, 
     startReconnectLoop();
     throw error;
   }
+}
+
+function requiresStepUp(command: string): boolean {
+  return new Set([
+    "apply_configuration",
+    "seal_and_apply_manifest",
+    "save_resource",
+    "delete_resource",
+    "push_asset",
+    "push_large_model",
+    "generate_operator_invite",
+    "generate_pat",
+    "iam_regen_mfa",
+    "generate_recovery_codes",
+    "regenerate_account_security",
+  ]).has(command);
 }
 
 function isStagedConfiguration(result: unknown): result is { requiresSeal: boolean; staged: boolean } {

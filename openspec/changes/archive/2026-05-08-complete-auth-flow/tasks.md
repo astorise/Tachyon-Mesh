@@ -1,0 +1,5 @@
+- [x] **Task 1: Stronghold Persistence.** Integrate `tauri-plugin-stronghold`. Refactor the auth store to securely persist the Personal Access Token (PAT) and custom CA certificates, entirely removing `localStorage` credential storage.
+- [x] **Task 2: Invite Token Admin Panel.** Create a dedicated section in `<tachyon-iam>` (accessible only to operators with Admin RBAC) that invokes `/admin/enrollment/start` and displays the resulting short token and QR code.
+- [x] **Task 3: Step-up Authentication (Sudo Mode).** Create `<tachyon-mfa-prompt>` and an `ensureMfa()` interceptor utility. Enforce this barrier on `seal_and_apply_manifest` and other write commands, with a 20-minute valid grace period.
+- [x] **Task 4: Custom CA Management.** Update the login screen to load the persisted CA from Stronghold automatically, adding a small UI element to view or clear the active custom certificate.
+- [x] **Task 5: Guided Tour Overhaul.** Extend `TachyonGuidedTour.ts` to explicitly guide the user through the critical auth, sealing, and application flow.
