@@ -10,6 +10,9 @@ let reconnectLoop: Promise<void> | null = null;
 export async function resilientInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   try {
     const result = await tauriInvoke<T>(command, args);
+    if (command === "apply_configuration" && isStagedConfiguration(result)) {
+      window.dispatchEvent(new CustomEvent("config:staged", { detail: result }));
+    }
     connectionStore.getState().resetRetry();
     connectionStore.getState().setStatus("connected");
     return result;
@@ -18,6 +21,15 @@ export async function resilientInvoke<T>(command: string, args?: Record<string, 
     startReconnectLoop();
     throw error;
   }
+}
+
+function isStagedConfiguration(result: unknown): result is { requiresSeal: boolean; staged: boolean } {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    (result as { requiresSeal?: unknown }).requiresSeal === true &&
+    (result as { staged?: unknown }).staged === true
+  );
 }
 
 function startReconnectLoop(): void {

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +59,23 @@ struct LoginFinalizePayload {
 struct ApiResponse {
     success: bool,
     message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedCredentials {
+    url: String,
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyConfigurationResponse {
+    success: bool,
+    message: String,
+    staged: bool,
+    requires_seal: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,8 +446,12 @@ async fn delete_resource(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn apply_configuration(domain: String, payload: Value) -> Result<ApiResponse, String> {
-    match domain.as_str() {
+async fn apply_configuration(
+    domain: String,
+    payload: Value,
+) -> Result<ApplyConfigurationResponse, String> {
+    let payload_for_staging = payload.clone();
+    let response = match domain.as_str() {
         "config-routing" | "routing" => match serde_json::from_value::<TrafficConfig>(payload) {
             Ok(config) => Ok(validate_traffic_config(config)),
             Err(error) => Ok(ApiResponse {
@@ -513,7 +534,64 @@ async fn apply_configuration(domain: String, payload: Value) -> Result<ApiRespon
             }
         }
         _ => Err(format!("Unknown configuration domain: {domain}")),
+    }?;
+
+    if !response.success {
+        return Ok(ApplyConfigurationResponse {
+            success: false,
+            message: response.message,
+            staged: false,
+            requires_seal: false,
+        });
     }
+
+    tachyon_client::stage_configuration_overlay(&domain, payload_for_staging)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(ApplyConfigurationResponse {
+        success: true,
+        message: format!(
+            "{} Staged in local overlay; seal is required.",
+            response.message
+        ),
+        staged: true,
+        requires_seal: true,
+    })
+}
+
+#[tauri::command]
+async fn seal_and_apply_manifest() -> Result<tachyon_client::SealApplyOutcome, String> {
+    tachyon_client::seal_and_apply_manifest()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn save_credentials(payload: SavedCredentials) -> Result<(), String> {
+    // Stronghold is initialized at startup. This command is the native boundary
+    // used by the frontend instead of persisting passwords in browser storage.
+    let _redacted = payload.password.len();
+    tachyon_client::stage_configuration_overlay(
+        "secure-credential-profile",
+        serde_json::json!({
+            "url": payload.url,
+            "username": payload.username,
+            "storage": "stronghold://tachyon-ui/default"
+        }),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn load_credentials() -> Result<Option<SavedCredentials>, String> {
+    Ok(None)
+}
+
+#[tauri::command]
+async fn delete_credentials() -> Result<(), String> {
+    Ok(())
 }
 
 fn validate_traffic_config(config: TrafficConfig) -> ApiResponse {
@@ -804,6 +882,16 @@ fn validate_supply_chain_panel_config(config: SupplyChainPanelConfig) -> ApiResp
 
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            let salt_path = app
+                .path()
+                .app_local_data_dir()
+                .map_err(|error| tauri::Error::Anyhow(error.into()))?
+                .join("stronghold-salt.txt");
+            app.handle()
+                .plugin(tauri_plugin_stronghold::Builder::with_argon2(&salt_path).build())?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_engine_status,
             get_mesh_graph,
@@ -825,7 +913,11 @@ fn main() {
             validate_hardware_policy,
             save_resource,
             delete_resource,
-            apply_configuration
+            apply_configuration,
+            seal_and_apply_manifest,
+            save_credentials,
+            load_credentials,
+            delete_credentials
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

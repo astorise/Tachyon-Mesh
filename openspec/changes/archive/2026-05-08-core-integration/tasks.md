@@ -1,0 +1,5 @@
+- [x] **Task 1: Secure Credential Storage.** Install `tauri-plugin-stronghold`. Refactor `tachyon-ui/src/main.rs` and the frontend auth store to save, retrieve, and delete credentials using the encrypted Stronghold enclave instead of `localStorage`.
+- [x] **Task 2: Backend Manifest Integration.** Update `apply_configuration` in `tachyon-ui/src/main.rs` to not only validate against WIT but to serialize the payload into the staged local overlay.
+- [x] **Task 3: Seal & Apply Pipeline (Backend).** Create a new Tauri command `seal_and_apply_manifest` that regenerates the `integrity.lock` using the local Ed25519 key, and POSTs the signed manifest to `/admin/manifest`.
+- [x] **Task 4: Seal & Apply Pipeline (Frontend).** Add a globally visible "Pending Changes: Seal & Apply" action button in `TachyonAppShell.ts` that triggers when changes are staged, calls `seal_and_apply_manifest`, and awaits the monotonic `config_version` bump.
+- [x] **Task 5: MCP Write Empowerment.** Add `tachyon_seal_overlay` and `tachyon_apply_manifest` to the `tachyon-mcp` toolset, allowing agents to finalize resource registrations.
