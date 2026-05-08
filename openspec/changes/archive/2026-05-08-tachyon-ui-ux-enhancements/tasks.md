@@ -1,0 +1,4 @@
+- [x] **Task 1:** Create `tachyon-ui/src/utils/i18n.ts` with a dictionary-based translation engine supporting `en` and `fr`, and a reactive event system (`i18n:language-changed`).
+- [x] **Task 2:** Refactor `TachyonAppShell.ts` and `TachyonOverviewPanel.ts` to consume the `i18n.ts` utility instead of hardcoded English strings.
+- [x] **Task 3:** Create a new Web Component `tachyon-ui/src/components/layout/TachyonGuidedTour.ts` that highlights key UI elements (using GSAP for transitions) and provides contextual explanations.
+- [x] **Task 4:** Add a language toggle switch and a "Help/Tour" trigger button in the `TachyonAppShell` header.
