@@ -248,15 +248,16 @@ export class TachyonAppShell extends HTMLElement {
     const dynamicPanel = this.ensureDynamicPanel(routerView);
     dynamicPanel.classList.remove("hidden");
     if (!tagName) {
-      dynamicPanel.innerHTML = `
-        <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
-          Unknown route: ${route}
-        </div>
-      `;
+      dynamicPanel.replaceChildren();
+      const warning = document.createElement("div");
+      warning.className =
+        "rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200";
+      warning.textContent = `Unknown route: ${route}`;
+      dynamicPanel.appendChild(warning);
       return;
     }
 
-    dynamicPanel.innerHTML = "";
+    dynamicPanel.replaceChildren();
     dynamicPanel.appendChild(document.createElement(tagName));
   }
 
