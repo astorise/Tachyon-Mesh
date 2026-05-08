@@ -1,0 +1,4 @@
+- [x] **Task 1: Clean `index.html`.** Strip all legacy Light DOM markup (old sidebars, dashboard grids, legacy auth modals). The body should only contain the root bootstrapper, `<tachyon-iam>`, and `<tachyon-app-shell>`.
+- [x] **Task 2: Delete `tachyon-ui/src/router.ts`.** Remove the file entirely.
+- [x] **Task 3: Unify Routing.** Update `tachyon-ui/src/components/layout/TachyonAppShell.ts` to independently handle `hashchange` events (to allow direct URL linking) and map them exclusively against `ComponentRegistry.ts`.
+- [x] **Task 4: Exorcise `main.ts`.** Remove the 2000+ lines of imperative legacy UI code. `main.ts` must only import the CSS, initialize Tauri listeners, set up the Zustand auth store, and import the Web Components.
