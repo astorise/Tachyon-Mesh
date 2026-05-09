@@ -1466,3 +1466,369 @@ pub(crate) fn decode_hex_array<const N: usize>(value: &str, label: &str) -> Resu
         .try_into()
         .map_err(|_| anyhow!("embedded {label} has an unexpected byte length"))
 }
+
+// =====================================================================
+// Smart deployment pipeline — bundle apply
+// =====================================================================
+
+const BUNDLE_FAKE_CONFLICTS_ENV: &str = "TACHYON_BUNDLE_FAKE_CONFLICTS";
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleConflictResponseEntry {
+    name: String,
+    bundled_version: String,
+    cluster_version: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleApplyResponse {
+    success: bool,
+    message: String,
+    config_version: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<BundleConflictResponseEntry>,
+    requires_resolution: bool,
+}
+
+#[derive(Debug)]
+struct BundleManifestFields {
+    public_key: String,
+    signature: String,
+    config_payload: String,
+    dependencies: Vec<BundleManifestDependency>,
+}
+
+#[derive(Debug)]
+struct BundleManifestDependency {
+    name: String,
+    version: String,
+    source: Option<String>,
+}
+
+pub(crate) async fn admin_manifest_bundle_handler(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    use std::io::Read;
+
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "deployment bundle body must not be empty",
+        )
+            .into_response();
+    }
+
+    let bundle_bytes = body.to_vec();
+    let manifest_yaml = match tokio::task::spawn_blocking(move || {
+        let cursor = std::io::Cursor::new(bundle_bytes);
+        let decoder = flate2::read::GzDecoder::new(cursor);
+        let mut archive = tar::Archive::new(decoder);
+        let entries = archive
+            .entries()
+            .map_err(|error| format!("failed to enumerate bundle entries: {error}"))?;
+        for entry in entries {
+            let mut entry =
+                entry.map_err(|error| format!("failed to read bundle entry: {error}"))?;
+            let path = entry
+                .path()
+                .map_err(|error| format!("failed to read bundle entry path: {error}"))?;
+            if path.as_ref() == std::path::Path::new("manifest.yaml") {
+                let mut buffer = String::new();
+                entry
+                    .read_to_string(&mut buffer)
+                    .map_err(|error| format!("failed to read manifest.yaml: {error}"))?;
+                return Ok::<String, String>(buffer);
+            }
+        }
+        Err("bundle is missing manifest.yaml at the archive root".to_owned())
+    })
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(message)) => {
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("bundle extraction task failed: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    let manifest_fields = match parse_bundle_manifest_yaml(&manifest_yaml) {
+        Ok(fields) => fields,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("manifest.yaml is malformed: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(conflicts) = detect_dependency_conflicts(&manifest_fields.dependencies) {
+        let response = BundleApplyResponse {
+            success: false,
+            message: "Dependency override detected".to_owned(),
+            config_version: 0,
+            conflicts,
+            requires_resolution: true,
+        };
+        return (StatusCode::PRECONDITION_REQUIRED, axum::Json(response)).into_response();
+    }
+
+    let new_config = match verify_integrity_payload(
+        &manifest_fields.config_payload,
+        &manifest_fields.public_key,
+        &manifest_fields.signature,
+        "deployment bundle manifest",
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("manifest signature verification failed: {error:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    let current_version = state.runtime.load().config.config_version;
+    if new_config.config_version <= current_version {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "manifest config_version {} is not strictly greater than current {}",
+                new_config.config_version, current_version
+            ),
+        )
+            .into_response();
+    }
+
+    let serialized = match serde_json::to_vec(&IntegrityManifest {
+        public_key: manifest_fields.public_key.clone(),
+        signature: manifest_fields.signature.clone(),
+        config_payload: manifest_fields.config_payload.clone(),
+    }) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to re-serialize manifest from bundle: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    let manifest_path = state.manifest_path.clone();
+    let payload_bytes = serialized.clone();
+    let write_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let staging = manifest_path.with_extension("lock.tmp");
+        fs::write(&staging, &payload_bytes)?;
+        fs::rename(&staging, &manifest_path)?;
+        Ok(())
+    })
+    .await;
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to persist manifest from bundle: {error}"),
+            )
+                .into_response();
+        }
+        Err(join_error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("manifest write task failed: {join_error}"),
+            )
+                .into_response();
+        }
+    }
+
+    use sha2::Digest;
+    let checksum = format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(
+            manifest_fields.config_payload.as_bytes()
+        ))
+    );
+    let ts_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let event = ConfigUpdateEvent {
+        version: new_config.config_version,
+        checksum,
+        origin_node_id: state.host_identity.public_key_hex.clone(),
+        ts_ms,
+    };
+    let _ = state.config_updates.send(event.clone());
+    if let Ok(payload) = serde_json::to_vec(&event) {
+        if let Err(error) = state
+            .core_store
+            .append_outbox(crate::store::CoreStoreBucket::ConfigUpdateOutbox, &payload)
+        {
+            tracing::warn!("failed to append bundle config-update outbox: {error}");
+        }
+    }
+
+    let response = BundleApplyResponse {
+        success: true,
+        message: "Deployment bundle applied".to_owned(),
+        config_version: new_config.config_version,
+        conflicts: Vec::new(),
+        requires_resolution: false,
+    };
+    (StatusCode::OK, axum::Json(response)).into_response()
+}
+
+fn parse_bundle_manifest_yaml(yaml: &str) -> Result<BundleManifestFields, String> {
+    let mut public_key: Option<String> = None;
+    let mut signature: Option<String> = None;
+    let mut config_payload_lines: Vec<String> = Vec::new();
+    let mut dependencies: Vec<BundleManifestDependency> = Vec::new();
+
+    let mut mode = ParseMode::TopLevel;
+    let mut current_dep: Option<BundleManifestDependency> = None;
+
+    enum ParseMode {
+        TopLevel,
+        ConfigPayload,
+        Dependencies,
+    }
+
+    for raw_line in yaml.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        match mode {
+            ParseMode::ConfigPayload => {
+                if let Some(content) = line.strip_prefix("  ") {
+                    config_payload_lines.push(content.to_owned());
+                    continue;
+                }
+                mode = ParseMode::TopLevel;
+            }
+            ParseMode::Dependencies => {
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("    ") {
+                    if let Some(dep) = current_dep.as_mut() {
+                        if let Some(value) = rest.strip_prefix("version:") {
+                            dep.version = strip_yaml_string(value);
+                        } else if let Some(value) = rest.strip_prefix("source:") {
+                            let trimmed = strip_yaml_string(value);
+                            dep.source = if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed)
+                            };
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("  ") {
+                    if let Some(dep) = current_dep.take() {
+                        dependencies.push(dep);
+                    }
+                    if let Some(stripped) = rest.strip_suffix(':') {
+                        current_dep = Some(BundleManifestDependency {
+                            name: stripped.trim().to_owned(),
+                            version: String::new(),
+                            source: None,
+                        });
+                    }
+                    continue;
+                }
+                if let Some(dep) = current_dep.take() {
+                    dependencies.push(dep);
+                }
+                mode = ParseMode::TopLevel;
+            }
+            ParseMode::TopLevel => {}
+        }
+
+        if matches!(mode, ParseMode::TopLevel) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("publicKey:") {
+                public_key = Some(strip_yaml_string(rest));
+            } else if let Some(rest) = line.strip_prefix("signature:") {
+                signature = Some(strip_yaml_string(rest));
+            } else if line.starts_with("configPayload:") && line.trim_end().ends_with('|') {
+                mode = ParseMode::ConfigPayload;
+            } else if line.starts_with("dependencies:") {
+                mode = ParseMode::Dependencies;
+            }
+        }
+    }
+    if let Some(dep) = current_dep.take() {
+        dependencies.push(dep);
+    }
+
+    let public_key = public_key.ok_or_else(|| "missing publicKey field".to_owned())?;
+    let signature = signature.ok_or_else(|| "missing signature field".to_owned())?;
+    if config_payload_lines.is_empty() {
+        return Err("missing configPayload block".to_owned());
+    }
+    let config_payload = config_payload_lines.join("\n");
+
+    Ok(BundleManifestFields {
+        public_key,
+        signature,
+        config_payload,
+        dependencies,
+    })
+}
+
+fn strip_yaml_string(value: &str) -> String {
+    let trimmed = value.trim();
+    let trimmed = trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    trimmed.to_owned()
+}
+
+fn detect_dependency_conflicts(
+    dependencies: &[BundleManifestDependency],
+) -> Option<Vec<BundleConflictResponseEntry>> {
+    let raw = std::env::var(BUNDLE_FAKE_CONFLICTS_ENV).ok()?;
+    let mut overrides: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some((name, version)) = entry.split_once('=') {
+            overrides.insert(name.trim().to_owned(), version.trim().to_owned());
+        }
+    }
+    if overrides.is_empty() {
+        return None;
+    }
+    let mut conflicts = Vec::new();
+    for dep in dependencies {
+        if let Some(cluster_version) = overrides.get(&dep.name) {
+            if dep.source.is_some() {
+                conflicts.push(BundleConflictResponseEntry {
+                    name: dep.name.clone(),
+                    bundled_version: dep.version.trim_start_matches(['^', '~', '=']).to_owned(),
+                    cluster_version: cluster_version.clone(),
+                });
+            }
+        }
+    }
+    if conflicts.is_empty() {
+        None
+    } else {
+        Some(conflicts)
+    }
+}

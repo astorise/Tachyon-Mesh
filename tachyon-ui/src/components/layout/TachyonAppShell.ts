@@ -1,6 +1,7 @@
 import gsap from "gsap";
 
 import "../domains/TachyonAIPanel";
+import "../domains/TachyonTopologyPanel";
 import "../domains/TachyonUsersPanel";
 import "../domains/TachyonHardwarePanel";
 import "../domains/TachyonIdentityPanel";
@@ -12,6 +13,7 @@ import "../domains/TachyonStoragePanel";
 import "../domains/TachyonSupplyChainPanel";
 import "../domains/TachyonWorkloadsPanel";
 import "../iam/TachyonIAM";
+import "./TachyonBundleConflictModal";
 import "./TachyonGuidedTour";
 import "./TachyonToastManager";
 import "../routing/TachyonRoutingDashboard";
@@ -37,6 +39,24 @@ type SealApplyOutcome = {
   success: boolean;
   message: string;
   configVersion: number;
+};
+
+type BundleConflict = {
+  name: string;
+  bundledVersion: string;
+  clusterVersion: string;
+};
+
+type BundleApplyOutcome = {
+  success: boolean;
+  message: string;
+  configVersion: number;
+  conflicts: BundleConflict[];
+  requiresResolution: boolean;
+};
+
+type BundleConflictModalElement = HTMLElement & {
+  open: (conflicts: BundleConflict[]) => void;
 };
 
 const appShellStylesheet = new CSSStyleSheet();
@@ -195,6 +215,7 @@ export class TachyonAppShell extends HTMLElement {
         </div>
         <tachyon-guided-tour></tachyon-guided-tour>
         <tachyon-toast-manager></tachyon-toast-manager>
+        <tachyon-bundle-conflict-modal></tachyon-bundle-conflict-modal>
       </section>
     `;
 
@@ -321,23 +342,72 @@ export class TachyonAppShell extends HTMLElement {
     this.render();
     this.restoreStartedState();
     try {
-      const result = await invoke<SealApplyOutcome>("seal_and_apply_manifest");
+      const result = await invoke<BundleApplyOutcome>("bundle_and_apply_manifest", {
+        dependencies: [],
+      });
+      if (result.requiresResolution && result.conflicts.length > 0) {
+        const modal = this.root.querySelector<BundleConflictModalElement>(
+          "tachyon-bundle-conflict-modal",
+        );
+        modal?.open(result.conflicts);
+        window.dispatchEvent(
+          new CustomEvent("app:notify", {
+            detail: { type: "error", message: result.message },
+          }),
+        );
+        return;
+      }
       this.requiresSeal = false;
       window.dispatchEvent(
         new CustomEvent("app:notify", {
-          detail: { type: "success", message: `${result.message} config_version=${result.configVersion}` },
+          detail: {
+            type: "success",
+            message: `${result.message} config_version=${result.configVersion}`,
+          },
         }),
       );
       const header = this.root.getElementById("shell-header");
       if (header) {
-        void gsap.fromTo(header, { boxShadow: "0 0 0 rgba(34,211,238,0)" }, { boxShadow: "0 0 28px rgba(34,211,238,0.25)", duration: 0.35, yoyo: true, repeat: 1 });
+        void gsap.fromTo(
+          header,
+          { boxShadow: "0 0 0 rgba(34,211,238,0)" },
+          {
+            boxShadow: "0 0 28px rgba(34,211,238,0.25)",
+            duration: 0.35,
+            yoyo: true,
+            repeat: 1,
+          },
+        );
       }
     } catch (error) {
-      window.dispatchEvent(
-        new CustomEvent("app:notify", {
-          detail: { type: "error", message: error instanceof Error ? error.message : String(error) },
-        }),
-      );
+      // Fallback: if the bundle endpoint is unreachable on legacy nodes, attempt
+      // the classic seal-and-apply path so operators are not blocked.
+      try {
+        const fallback = await invoke<SealApplyOutcome>("seal_and_apply_manifest");
+        this.requiresSeal = false;
+        window.dispatchEvent(
+          new CustomEvent("app:notify", {
+            detail: {
+              type: "success",
+              message: `${fallback.message} config_version=${fallback.configVersion}`,
+            },
+          }),
+        );
+      } catch (fallbackError) {
+        window.dispatchEvent(
+          new CustomEvent("app:notify", {
+            detail: {
+              type: "error",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : fallbackError instanceof Error
+                    ? fallbackError.message
+                    : String(fallbackError),
+            },
+          }),
+        );
+      }
     } finally {
       this.applyingSeal = false;
       this.render();

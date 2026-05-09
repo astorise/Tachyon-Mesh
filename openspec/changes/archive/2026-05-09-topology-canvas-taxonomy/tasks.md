@@ -1,0 +1,4 @@
+- [x] **Task 1: Node Taxonomy Styling.** Define specific Tailwind color palettes and SVG icons for the 8 core node types in `tachyon-ui`.
+- [x] **Task 2: Dynamic Node Renderer.** Update `<tachyon-topology-canvas>` to render nodes based on their specific `type` property, injecting the appropriate icons and real-time badges (e.g., displaying the model name directly on the LLM node).
+- [x] **Task 3: Contextual Node Editor.** Create a `<tachyon-node-editor>` sidebar component. It must listen for node selection events and render a dynamic HTML form tailored to the selected node type (e.g., LoRA configurations for LLMs, Egress rules for External REST).
+- [x] **Task 4: Graph Serialization.** Implement a utility within the canvas state manager that parses the nodes and SVG links (edges) to generate the declarative `manifest.yaml` (including SemVer dependencies) ready for the `BundleBuilder`.
