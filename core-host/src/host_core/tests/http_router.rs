@@ -416,6 +416,7 @@ async fn router_returns_service_unavailable_when_route_concurrency_is_exhausted(
             auth::AuthManager::new(&core_store_manifest)
                 .expect("test auth manager should initialize"),
         ),
+        iam_audit_log: crate::iam_audit::IamAuditLog::new(),
         enrollment_manager: Arc::new(node_enrollment::EnrollmentManager::new()),
         config_updates: broadcast::channel(CONFIG_UPDATE_CHANNEL_CAPACITY).0,
         manifest_path: core_store_manifest,

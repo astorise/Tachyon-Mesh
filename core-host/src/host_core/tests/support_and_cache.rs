@@ -658,6 +658,7 @@ pub(super) fn build_test_state_with_manifest(
         auth_manager: Arc::new(
             auth::AuthManager::new(&manifest_path).expect("test auth manager should initialize"),
         ),
+        iam_audit_log: crate::iam_audit::IamAuditLog::new(),
         enrollment_manager: Arc::new(node_enrollment::EnrollmentManager::new()),
         config_updates: broadcast::channel(CONFIG_UPDATE_CHANNEL_CAPACITY).0,
         manifest_path,

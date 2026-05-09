@@ -1,6 +1,7 @@
 import gsap from "gsap";
 
 import "../domains/TachyonAIPanel";
+import "../domains/TachyonUsersPanel";
 import "../domains/TachyonHardwarePanel";
 import "../domains/TachyonIdentityPanel";
 import "../domains/TachyonObservabilityPanel";

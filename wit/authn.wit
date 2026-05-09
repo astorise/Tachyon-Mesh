@@ -1,4 +1,4 @@
-package tachyon:identity@1.0.0;
+package tachyon:identity@1.1.0;
 
 interface authn {
     record identity-payload {
@@ -43,6 +43,45 @@ interface authn {
         scopes: list<string>,
     }
 
+    record user-summary {
+        username: string,
+        first-name: string,
+        last-name: string,
+        roles: list<string>,
+        scopes: list<string>,
+        groups: list<string>,
+        disabled-at: option<u64>,
+        created-at: u64,
+        last-login-at: option<u64>,
+    }
+
+    record user-update {
+        add-groups: option<list<string>>,
+        remove-groups: option<list<string>>,
+        add-roles: option<list<string>>,
+        remove-roles: option<list<string>>,
+        add-scopes: option<list<string>>,
+        remove-scopes: option<list<string>>,
+        disabled: option<bool>,
+    }
+
+    record group-summary {
+        name: string,
+        description: string,
+        roles: list<string>,
+        scopes: list<string>,
+        member-count: u32,
+        created-at: u64,
+        updated-at: u64,
+    }
+
+    record group-input {
+        name: string,
+        description: string,
+        roles: list<string>,
+        scopes: list<string>,
+    }
+
     variant authn-error {
         expired,
         invalid-credential,
@@ -58,6 +97,13 @@ interface authn {
     issue-pat: func(subject: string, name: string, scopes: list<string>, ttl-days: u32) -> result<string, string>;
     generate-recovery-codes: func(username: string) -> result<list<string>, string>;
     consume-recovery-code: func(username: string, code: string) -> result<string, string>;
+
+    list-users: func() -> result<list<user-summary>, string>;
+    update-user: func(actor: string, username: string, update: user-update) -> result<user-summary, string>;
+    delete-user: func(actor: string, username: string) -> result<_, string>;
+    list-groups: func() -> result<list<group-summary>, string>;
+    upsert-group: func(input: group-input) -> result<group-summary, string>;
+    delete-group: func(name: string) -> result<_, string>;
 }
 
 world authn-guest {

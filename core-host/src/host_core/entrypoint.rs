@@ -88,6 +88,7 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
         tls_manager,
         mtls_gateway: mtls_gateway.map(Arc::new),
         auth_manager,
+        iam_audit_log: crate::iam_audit::IamAuditLog::new(),
         enrollment_manager: Arc::new(node_enrollment::EnrollmentManager::new()),
         config_updates,
         manifest_path,
