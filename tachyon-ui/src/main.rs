@@ -427,6 +427,13 @@ async fn seal_and_apply_manifest() -> Result<tachyon_client::SealApplyOutcome, S
 }
 
 #[tauri::command]
+async fn get_node_public_key() -> Result<String, String> {
+    tachyon_client::get_node_public_key()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn bundle_and_apply_manifest(
     dependencies: Option<Vec<tachyon_client::BundleDependency>>,
 ) -> Result<tachyon_client::BundleApplyOutcome, String> {
@@ -769,6 +776,7 @@ fn main() {
             delete_resource,
             apply_configuration,
             seal_and_apply_manifest,
+            get_node_public_key,
             bundle_and_apply_manifest,
             save_credentials,
             load_credentials,

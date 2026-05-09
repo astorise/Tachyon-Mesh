@@ -38,7 +38,16 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     }
     let core_store = open_core_store_for_manifest(&manifest_path).await?;
     secure_cache_bootstrap(core_store.as_ref(), &runtime)?;
-    let host_identity = Arc::new(HostIdentity::generate());
+    let host_key_path = manifest_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("host-identity.key");
+    let host_identity = Arc::new(
+        HostIdentity::load_or_generate(&host_key_path).unwrap_or_else(|error| {
+            tracing::warn!("failed to persist host identity key: {error}; using ephemeral key");
+            HostIdentity::generate()
+        }),
+    );
     let uds_fast_path = Arc::new(new_uds_fast_path_registry());
     let storage_broker = Arc::new(StorageBrokerManager::new(Arc::clone(&core_store)));
     let bridge_manager = Arc::new(BridgeManager::default());

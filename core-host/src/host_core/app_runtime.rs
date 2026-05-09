@@ -15,6 +15,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(admin_manifest_bundle_handler),
         )
         .route(
+            "/admin/identity/public-key",
+            get(auth::node_public_key_handler),
+        )
+        .route(
             "/admin/enrollment/start",
             post(admin_enrollment_start_handler),
         )

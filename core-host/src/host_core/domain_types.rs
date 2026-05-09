@@ -588,6 +588,12 @@ pub(crate) struct IntegrityConfig {
     /// the existing `PoolingAllocationConfig` defaults apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) instance_pool_max_memory_bytes: Option<usize>,
+    /// Hex-encoded Ed25519 public keys of peer nodes whose `integrity.lock`
+    /// manifests this node should accept in addition to the embedded
+    /// boot-time key.  Populated via `PUT /admin/identity/trusted-signers` and
+    /// propagated by the config-update gossip path after each seal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) trusted_signers: Vec<String>,
 }
 
 impl Default for IntegrityConfig {
@@ -610,6 +616,7 @@ impl Default for IntegrityConfig {
             cloud_sync_endpoint: None,
             tee_backend: None,
             instance_pool_max_memory_bytes: None,
+            trusted_signers: Vec::new(),
         }
     }
 }
