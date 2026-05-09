@@ -956,8 +956,8 @@ fn render_manifest_yaml(
     use std::fmt::Write as _;
     let mut yaml = String::new();
     writeln!(&mut yaml, "version: 1")?;
-    writeln!(&mut yaml, "publicKey: \"{}\"", manifest.public_key)?;
-    writeln!(&mut yaml, "signature: \"{}\"", manifest.signature)?;
+    // publicKey and signature are intentionally omitted — the receiving node
+    // signs the manifest itself using its own HostIdentity key.
     writeln!(&mut yaml, "configPayload: |")?;
     for line in manifest.config_payload.lines() {
         writeln!(&mut yaml, "  {line}")?;
@@ -978,6 +978,16 @@ fn render_manifest_yaml(
         }
     }
     Ok(yaml)
+}
+
+pub async fn get_node_public_key() -> Result<String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Response {
+        public_key: String,
+    }
+    let response: Response = get_admin_json("/admin/identity/public-key").await?;
+    Ok(response.public_key)
 }
 
 pub async fn apply_current_manifest() -> Result<SealApplyOutcome> {

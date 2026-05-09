@@ -45,12 +45,20 @@ pub(crate) fn verify_integrity() -> Result<IntegrityConfig> {
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
 pub(crate) fn load_integrity_config_from_manifest_path(path: &Path) -> Result<IntegrityConfig> {
+    load_integrity_config_from_manifest_path_with_trusted(path, &[])
+}
+
+pub(crate) fn load_integrity_config_from_manifest_path_with_trusted(
+    path: &Path,
+    trusted_signers: &[String],
+) -> Result<IntegrityConfig> {
     let manifest = read_integrity_manifest(path)?;
-    verify_integrity_payload(
+    verify_integrity_payload_with_trusted(
         &manifest.config_payload,
         &manifest.public_key,
         &manifest.signature,
         &format!("integrity manifest at {}", path.display()),
+        trusted_signers,
     )
 }
 
@@ -69,7 +77,36 @@ pub(crate) fn verify_integrity_payload(
     signature_hex: &str,
     source: &str,
 ) -> Result<IntegrityConfig> {
-    verify_integrity_signature(payload, public_key_hex, signature_hex)?;
+    verify_integrity_payload_with_trusted(payload, public_key_hex, signature_hex, source, &[])
+}
+
+pub(crate) fn verify_integrity_payload_with_trusted(
+    payload: &str,
+    public_key_hex: &str,
+    signature_hex: &str,
+    source: &str,
+    trusted_signers: &[String],
+) -> Result<IntegrityConfig> {
+    // Verify the cryptographic signature with the declared key.
+    verify_integrity_signature_with_trusted(
+        payload,
+        public_key_hex,
+        signature_hex,
+        trusted_signers,
+    )?;
+    // Verify the declared key itself is trusted (embedded boot key or explicit list).
+    let embedded_key = EMBEDDED_PUBLIC_KEY;
+    let is_embedded = public_key_hex.eq_ignore_ascii_case(embedded_key);
+    let is_trusted = is_embedded
+        || trusted_signers
+            .iter()
+            .any(|k| k.trim().eq_ignore_ascii_case(public_key_hex));
+    if !is_trusted {
+        anyhow::bail!(
+            "Integrity Validation Failed: signer `{public_key_hex}` is not the embedded key \
+             and is not in the trusted-signers list"
+        );
+    }
     let config = serde_json::from_str::<IntegrityConfig>(payload)
         .map_err(|error| integrity_schema_violation(source, error))?;
     validate_integrity_config(config)
@@ -1439,11 +1476,26 @@ pub(crate) fn canonical_config_payload(config: &IntegrityConfig) -> Result<Strin
     serde_json::to_string(config).context("failed to serialize runtime integrity configuration")
 }
 
+/// Thin wrapper kept for backwards compatibility and test coverage.
+/// Production code should prefer `verify_integrity_payload` or the
+/// `_with_trusted` variants.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn verify_integrity_signature(
     payload: &str,
     public_key_hex: &str,
     signature_hex: &str,
 ) -> Result<()> {
+    verify_integrity_signature_with_trusted(payload, public_key_hex, signature_hex, &[])
+}
+
+pub(crate) fn verify_integrity_signature_with_trusted(
+    payload: &str,
+    public_key_hex: &str,
+    signature_hex: &str,
+    _trusted_signers: &[String],
+) -> Result<()> {
+    // Pure cryptographic check: is the signature valid for the declared key?
+    // Trust-level checks (is this key trusted?) happen in verify_integrity_payload_with_trusted.
     let payload_hash = Sha256::digest(payload.as_bytes());
     let public_key_bytes = decode_hex_array::<32>(public_key_hex, "public key")?;
     let signature_bytes = decode_hex_array::<64>(signature_hex, "signature")?;
@@ -1494,8 +1546,6 @@ struct BundleApplyResponse {
 
 #[derive(Debug)]
 struct BundleManifestFields {
-    public_key: String,
-    signature: String,
     config_payload: String,
     dependencies: Vec<BundleManifestDependency>,
 }
@@ -1582,17 +1632,27 @@ pub(crate) async fn admin_manifest_bundle_handler(
         return (StatusCode::PRECONDITION_REQUIRED, axum::Json(response)).into_response();
     }
 
-    let new_config = match verify_integrity_payload(
-        &manifest_fields.config_payload,
-        &manifest_fields.public_key,
-        &manifest_fields.signature,
-        "deployment bundle manifest",
-    ) {
-        Ok(config) => config,
+    // Parse the config payload to validate its schema and determine version.
+    let mut new_config =
+        match serde_json::from_str::<IntegrityConfig>(&manifest_fields.config_payload) {
+            Ok(config) => config,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("manifest.yaml configPayload is not valid JSON: {error}"),
+                )
+                    .into_response();
+            }
+        };
+    let new_config = match validate_integrity_config(new_config.clone()) {
+        Ok(validated) => {
+            new_config = validated;
+            new_config
+        }
         Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("manifest signature verification failed: {error:#}"),
+                format!("manifest config validation failed: {error:#}"),
             )
                 .into_response();
         }
@@ -1610,16 +1670,40 @@ pub(crate) async fn admin_manifest_bundle_handler(
             .into_response();
     }
 
+    // Sign the config payload with this node's stable host identity key.
+    let host_pubkey_hex = state.host_identity.public_key_hex.clone();
+    let host_signing_key = Arc::clone(&state.host_identity.signing_key);
+    let payload_for_signing = manifest_fields.config_payload.clone();
+    let signature_hex = tokio::task::spawn_blocking(move || {
+        use ed25519_dalek::Signer as _;
+        use sha2::Digest;
+        let hash = sha2::Sha256::digest(payload_for_signing.as_bytes());
+        let signature = host_signing_key.sign(&hash);
+        hex::encode(signature.to_bytes())
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("host signing task failed: {error}"),
+        )
+            .into_response()
+    });
+    let signature_hex = match signature_hex {
+        Ok(sig) => sig,
+        Err(response) => return response,
+    };
+
     let serialized = match serde_json::to_vec(&IntegrityManifest {
-        public_key: manifest_fields.public_key.clone(),
-        signature: manifest_fields.signature.clone(),
+        public_key: host_pubkey_hex.clone(),
+        signature: signature_hex,
         config_payload: manifest_fields.config_payload.clone(),
     }) {
         Ok(bytes) => bytes,
         Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to re-serialize manifest from bundle: {error}"),
+                format!("failed to serialize host-signed manifest: {error}"),
             )
                 .into_response();
         }
@@ -1690,8 +1774,6 @@ pub(crate) async fn admin_manifest_bundle_handler(
 }
 
 fn parse_bundle_manifest_yaml(yaml: &str) -> Result<BundleManifestFields, String> {
-    let mut public_key: Option<String> = None;
-    let mut signature: Option<String> = None;
     let mut config_payload_lines: Vec<String> = Vec::new();
     let mut dependencies: Vec<BundleManifestDependency> = Vec::new();
 
@@ -1755,14 +1837,17 @@ fn parse_bundle_manifest_yaml(yaml: &str) -> Result<BundleManifestFields, String
         }
 
         if matches!(mode, ParseMode::TopLevel) {
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with("version:")
+                || line.starts_with("publicKey:")
+                || line.starts_with("signature:")
+            {
+                // version, publicKey, signature are accepted but ignored — the host
+                // signs the manifest itself.
                 continue;
             }
-            if let Some(rest) = line.strip_prefix("publicKey:") {
-                public_key = Some(strip_yaml_string(rest));
-            } else if let Some(rest) = line.strip_prefix("signature:") {
-                signature = Some(strip_yaml_string(rest));
-            } else if line.starts_with("configPayload:") && line.trim_end().ends_with('|') {
+            if line.starts_with("configPayload:") && line.trim_end().ends_with('|') {
                 mode = ParseMode::ConfigPayload;
             } else if line.starts_with("dependencies:") {
                 mode = ParseMode::Dependencies;
@@ -1773,16 +1858,12 @@ fn parse_bundle_manifest_yaml(yaml: &str) -> Result<BundleManifestFields, String
         dependencies.push(dep);
     }
 
-    let public_key = public_key.ok_or_else(|| "missing publicKey field".to_owned())?;
-    let signature = signature.ok_or_else(|| "missing signature field".to_owned())?;
     if config_payload_lines.is_empty() {
         return Err("missing configPayload block".to_owned());
     }
     let config_payload = config_payload_lines.join("\n");
 
     Ok(BundleManifestFields {
-        public_key,
-        signature,
         config_payload,
         dependencies,
     })

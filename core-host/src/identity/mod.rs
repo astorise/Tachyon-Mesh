@@ -43,6 +43,32 @@ impl HostIdentity {
         Self::from_signing_key(SigningKey::from_bytes(&rand::random::<[u8; 32]>()))
     }
 
+    /// Load a stable signing key from `key_path` if it exists, otherwise
+    /// generate a fresh one and persist it for future boots.
+    pub(crate) fn load_or_generate(key_path: &std::path::Path) -> anyhow::Result<Self> {
+        use std::io::Write as _;
+
+        if key_path.exists() {
+            let raw = std::fs::read(key_path)
+                .with_context(|| format!("failed to read host key from {}", key_path.display()))?;
+            let bytes: [u8; 32] = raw.try_into().map_err(|_| {
+                anyhow::anyhow!("host key file has unexpected length (expected 32 bytes)")
+            })?;
+            return Ok(Self::from_signing_key(SigningKey::from_bytes(&bytes)));
+        }
+
+        let key = SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create key directory {}", parent.display()))?;
+        }
+        let mut file = std::fs::File::create(key_path)
+            .with_context(|| format!("failed to create host key at {}", key_path.display()))?;
+        file.write_all(key.as_bytes())
+            .with_context(|| format!("failed to write host key to {}", key_path.display()))?;
+        Ok(Self::from_signing_key(key))
+    }
+
     pub(crate) fn from_signing_key(signing_key: SigningKey) -> Self {
         let public_key = signing_key.verifying_key();
         Self {

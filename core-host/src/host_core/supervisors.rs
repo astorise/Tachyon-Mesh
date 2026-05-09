@@ -403,8 +403,12 @@ pub(crate) fn run_draining_runtime_reaper_tick(state: &AppState) {
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
 pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
     let manifest_path = state.manifest_path.clone();
+    let current_trusted = state.runtime.load().config.trusted_signers.clone();
     let runtime = tokio::task::spawn_blocking(move || {
-        let config = load_integrity_config_from_manifest_path(&manifest_path)?;
+        let config = load_integrity_config_from_manifest_path_with_trusted(
+            &manifest_path,
+            &current_trusted,
+        )?;
         build_runtime_state(config)
     })
     .await

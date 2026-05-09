@@ -861,6 +861,22 @@ pub(crate) async fn admin_auth_middleware(
     next.run(request).await
 }
 
+/// `GET /admin/identity/public-key` — returns the node's stable Ed25519 public
+/// key in hex so operators can register it in peer `trusted_signers` lists.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NodePublicKeyResponse {
+    public_key: String,
+}
+
+pub(crate) async fn node_public_key_handler(
+    State(state): State<crate::AppState>,
+) -> axum::Json<NodePublicKeyResponse> {
+    axum::Json(NodePublicKeyResponse {
+        public_key: state.host_identity.public_key_hex.clone(),
+    })
+}
+
 pub(crate) async fn admin_status_handler(State(state): State<crate::AppState>) -> String {
     let runtime = state.runtime.load();
     format!(
