@@ -225,6 +225,56 @@ async fn iam_list_users() -> Result<Vec<tachyon_client::IamUserSummary>, String>
 }
 
 #[tauri::command]
+async fn iam_update_user(
+    username: String,
+    update: tachyon_client::IamUserUpdate,
+) -> Result<tachyon_client::IamUserSummary, String> {
+    tachyon_client::iam_update_user(&username, &update)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn iam_delete_user(username: String) -> Result<(), String> {
+    tachyon_client::iam_delete_user(&username)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn iam_list_groups() -> Result<Vec<tachyon_client::IamGroupSummary>, String> {
+    tachyon_client::iam_list_groups()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn iam_upsert_group(
+    input: tachyon_client::IamGroupInput,
+) -> Result<tachyon_client::IamGroupSummary, String> {
+    tachyon_client::iam_upsert_group(&input)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn iam_delete_group(name: String) -> Result<(), String> {
+    tachyon_client::iam_delete_group(&name)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn fetch_user_audit_log(
+    user: Option<String>,
+    lines: Option<usize>,
+) -> Result<Vec<tachyon_client::IamAuditEntry>, String> {
+    tachyon_client::fetch_user_audit_log(user.as_deref(), lines.unwrap_or(50))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn iam_regen_mfa(username: String) -> Result<Vec<String>, String> {
     tachyon_client::iam_regen_mfa(&username)
         .await
@@ -690,6 +740,12 @@ fn main() {
             stage_signup,
             finalize_signup,
             iam_list_users,
+            iam_update_user,
+            iam_delete_user,
+            iam_list_groups,
+            iam_upsert_group,
+            iam_delete_group,
+            fetch_user_audit_log,
             iam_regen_mfa,
             generate_recovery_codes,
             regenerate_account_security,

@@ -40,9 +40,11 @@ const AUTH_STATE_DIR_ENV: &str = "TACHYON_AUTH_STATE_DIR";
 const DEFAULT_PAT_TTL_DAYS: u32 = 30;
 
 use authn_bindings::exports::tachyon::identity::authn::{
-    AuthSession as AuthnSession, AuthnError,
-    RegistrationTokenClaims as AuthnRegistrationTokenClaims, SignupProfile as AuthnSignupProfile,
-    StagedLoginSession as AuthnStagedLoginSession, StagedUserSession as AuthnStagedUserSession,
+    AuthSession as AuthnSession, AuthnError, GroupInput as AuthnGroupInput,
+    GroupSummary as AuthnGroupSummary, RegistrationTokenClaims as AuthnRegistrationTokenClaims,
+    SignupProfile as AuthnSignupProfile, StagedLoginSession as AuthnStagedLoginSession,
+    StagedUserSession as AuthnStagedUserSession, UserSummary as AuthnUserSummary,
+    UserUpdate as AuthnUserUpdate,
 };
 use authz_bindings::exports::tachyon::identity::authz::AuthzError;
 
@@ -287,6 +289,63 @@ pub(crate) struct IssuePatResponse {
     token: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct IamUserSummaryResponse {
+    pub(crate) username: String,
+    pub(crate) first_name: String,
+    pub(crate) last_name: String,
+    pub(crate) roles: Vec<String>,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) groups: Vec<String>,
+    pub(crate) disabled_at: Option<u64>,
+    pub(crate) created_at: u64,
+    pub(crate) last_login_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct IamGroupSummaryResponse {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) roles: Vec<String>,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) member_count: u32,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: u64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateUserRequest {
+    #[serde(default)]
+    pub(crate) add_groups: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) remove_groups: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) add_roles: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) remove_roles: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) add_scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) remove_scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) disabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpsertGroupRequest {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: String,
+    #[serde(default)]
+    pub(crate) roles: Vec<String>,
+    #[serde(default)]
+    pub(crate) scopes: Vec<String>,
+}
+
 fn default_pat_ttl_days() -> u32 {
     DEFAULT_PAT_TTL_DAYS
 }
@@ -478,6 +537,74 @@ impl AuthManager {
             .tachyon_identity_authn()
             .call_issue_pat(&mut store, subject, name, scopes, ttl_days)
             .map_err(|error| anyhow!("authn component trapped while issuing PAT: {error}"))?
+            .map_err(|error| anyhow!(error))
+    }
+
+    pub(crate) fn list_users(&self, engine: &Engine) -> Result<Vec<IamUserSummaryResponse>> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let summaries = bindings
+            .tachyon_identity_authn()
+            .call_list_users(&mut store)
+            .map_err(|error| anyhow!("authn component trapped while listing users: {error}"))?
+            .map_err(|error| anyhow!(error))?;
+        Ok(summaries.into_iter().map(map_user_summary).collect())
+    }
+
+    pub(crate) fn update_user(
+        &self,
+        engine: &Engine,
+        actor: &str,
+        username: &str,
+        update: AuthnUserUpdate,
+    ) -> Result<IamUserSummaryResponse> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let summary = bindings
+            .tachyon_identity_authn()
+            .call_update_user(&mut store, actor, username, &update)
+            .map_err(|error| anyhow!("authn component trapped while updating user: {error}"))?
+            .map_err(|error| anyhow!(error))?;
+        Ok(map_user_summary(summary))
+    }
+
+    pub(crate) fn delete_user(&self, engine: &Engine, actor: &str, username: &str) -> Result<()> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        bindings
+            .tachyon_identity_authn()
+            .call_delete_user(&mut store, actor, username)
+            .map_err(|error| anyhow!("authn component trapped while deleting user: {error}"))?
+            .map_err(|error| anyhow!(error))
+    }
+
+    pub(crate) fn list_groups(&self, engine: &Engine) -> Result<Vec<IamGroupSummaryResponse>> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let summaries = bindings
+            .tachyon_identity_authn()
+            .call_list_groups(&mut store)
+            .map_err(|error| anyhow!("authn component trapped while listing groups: {error}"))?
+            .map_err(|error| anyhow!(error))?;
+        Ok(summaries.into_iter().map(map_group_summary).collect())
+    }
+
+    pub(crate) fn upsert_group(
+        &self,
+        engine: &Engine,
+        input: AuthnGroupInput,
+    ) -> Result<IamGroupSummaryResponse> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        let summary = bindings
+            .tachyon_identity_authn()
+            .call_upsert_group(&mut store, &input)
+            .map_err(|error| anyhow!("authn component trapped while upserting group: {error}"))?
+            .map_err(|error| anyhow!(error))?;
+        Ok(map_group_summary(summary))
+    }
+
+    pub(crate) fn delete_group(&self, engine: &Engine, name: &str) -> Result<()> {
+        let (mut store, bindings) = self.instantiate_authn(engine)?;
+        bindings
+            .tachyon_identity_authn()
+            .call_delete_group(&mut store, name)
+            .map_err(|error| anyhow!("authn component trapped while deleting group: {error}"))?
             .map_err(|error| anyhow!(error))
     }
 
@@ -845,20 +972,47 @@ pub(crate) async fn stage_login_handler(
     let engine = state.runtime.load().engine.clone();
     let username = payload.username;
     let password = payload.password;
+    let username_for_audit = username.clone();
 
     let session = tokio::task::spawn_blocking(move || {
         auth_manager.stage_login(&engine, &username, &password)
     })
     .await
     .map_err(|error| {
+        state.iam_audit_log.record(
+            username_for_audit.clone(),
+            "login.stage",
+            Some(username_for_audit.clone()),
+            None,
+            "error",
+            error.to_string(),
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to join login staging task: {error}"),
         )
             .into_response()
     })?
-    .map_err(string_error_to_response)?;
+    .map_err(|error| {
+        state.iam_audit_log.record(
+            username_for_audit.clone(),
+            "login.stage",
+            Some(username_for_audit.clone()),
+            None,
+            "error",
+            error.to_string(),
+        );
+        string_error_to_response(error)
+    })?;
 
+    state.iam_audit_log.record(
+        username_for_audit.clone(),
+        "login.stage",
+        Some(username_for_audit),
+        None,
+        "ok",
+        String::new(),
+    );
     Ok(Json(session))
 }
 
@@ -870,20 +1024,47 @@ pub(crate) async fn finalize_login_handler(
     let engine = state.runtime.load().engine.clone();
     let session_id = payload.session_id;
     let totp_code = payload.totp_code;
+    let session_id_for_audit = session_id.clone();
 
     let session = tokio::task::spawn_blocking(move || {
         auth_manager.finalize_login(&engine, &session_id, &totp_code)
     })
     .await
     .map_err(|error| {
+        state.iam_audit_log.record(
+            "<unknown>",
+            "login.finalize",
+            None,
+            None,
+            "error",
+            format!("session_id={} {error}", session_id_for_audit),
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to join login finalization task: {error}"),
         )
             .into_response()
     })?
-    .map_err(string_error_to_response)?;
+    .map_err(|error| {
+        state.iam_audit_log.record(
+            "<unknown>",
+            "login.finalize",
+            None,
+            None,
+            "error",
+            format!("session_id={} {error}", session_id_for_audit),
+        );
+        string_error_to_response(error)
+    })?;
 
+    state.iam_audit_log.record(
+        session.username.clone(),
+        "login.finalize",
+        Some(session.username.clone()),
+        None,
+        "ok",
+        String::new(),
+    );
     Ok(Json(session))
 }
 
@@ -966,6 +1147,281 @@ pub(crate) async fn consume_recovery_code_handler(
     Ok(Json(ConsumeRecoveryCodeResponse { token }))
 }
 
+pub(crate) async fn list_users_handler(
+    State(state): State<crate::AppState>,
+    Extension(claims): Extension<AuthClaims>,
+) -> Result<Json<Vec<IamUserSummaryResponse>>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let actor = claims.subject.clone();
+
+    let users = tokio::task::spawn_blocking(move || auth_manager.list_users(&engine))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to join user listing task: {error}"),
+            )
+                .into_response()
+        })?
+        .map_err(|error| {
+            state.iam_audit_log.record(
+                actor.clone(),
+                "user.list",
+                None,
+                None,
+                "error",
+                error.to_string(),
+            );
+            string_error_to_response(error)
+        })?;
+
+    state.iam_audit_log.record(
+        actor,
+        "user.list",
+        None,
+        None,
+        "ok",
+        format!("{} users", users.len()),
+    );
+    Ok(Json(users))
+}
+
+pub(crate) async fn update_user_handler(
+    State(state): State<crate::AppState>,
+    Extension(claims): Extension<AuthClaims>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Json(payload): Json<UpdateUserRequest>,
+) -> Result<Json<IamUserSummaryResponse>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let actor = claims.subject.clone();
+    let target = username.clone();
+    let action = if payload.disabled == Some(true) {
+        "user.disable"
+    } else if payload.disabled == Some(false) {
+        "user.enable"
+    } else {
+        "user.update"
+    };
+    let detail = serde_json::to_string(&payload).unwrap_or_default();
+    let update = user_update_from_request(payload);
+    let actor_for_call = actor.clone();
+    let target_for_call = target.clone();
+
+    let summary = tokio::task::spawn_blocking(move || {
+        auth_manager.update_user(&engine, &actor_for_call, &target_for_call, update)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to join user update task: {error}"),
+        )
+            .into_response()
+    })?
+    .map_err(|error| {
+        state.iam_audit_log.record(
+            actor.clone(),
+            action,
+            Some(target.clone()),
+            None,
+            "error",
+            error.to_string(),
+        );
+        string_error_to_response(error)
+    })?;
+
+    state
+        .iam_audit_log
+        .record(actor, action, Some(target), None, "ok", detail);
+    Ok(Json(summary))
+}
+
+pub(crate) async fn delete_user_handler(
+    State(state): State<crate::AppState>,
+    Extension(claims): Extension<AuthClaims>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<StatusCode, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let actor = claims.subject.clone();
+    let target = username.clone();
+    let actor_for_call = actor.clone();
+    let target_for_call = target.clone();
+
+    tokio::task::spawn_blocking(move || {
+        auth_manager.delete_user(&engine, &actor_for_call, &target_for_call)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to join user delete task: {error}"),
+        )
+            .into_response()
+    })?
+    .map_err(|error| {
+        state.iam_audit_log.record(
+            actor.clone(),
+            "user.delete",
+            Some(target.clone()),
+            None,
+            "error",
+            error.to_string(),
+        );
+        string_error_to_response(error)
+    })?;
+
+    state.iam_audit_log.record(
+        actor,
+        "user.delete",
+        Some(target),
+        None,
+        "ok",
+        String::new(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn list_groups_handler(
+    State(state): State<crate::AppState>,
+    Extension(claims): Extension<AuthClaims>,
+) -> Result<Json<Vec<IamGroupSummaryResponse>>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let actor = claims.subject.clone();
+
+    let groups = tokio::task::spawn_blocking(move || auth_manager.list_groups(&engine))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to join group listing task: {error}"),
+            )
+                .into_response()
+        })?
+        .map_err(|error| {
+            state.iam_audit_log.record(
+                actor.clone(),
+                "group.list",
+                None,
+                None,
+                "error",
+                error.to_string(),
+            );
+            string_error_to_response(error)
+        })?;
+
+    state.iam_audit_log.record(
+        actor,
+        "group.list",
+        None,
+        None,
+        "ok",
+        format!("{} groups", groups.len()),
+    );
+    Ok(Json(groups))
+}
+
+pub(crate) async fn upsert_group_handler(
+    State(state): State<crate::AppState>,
+    Extension(claims): Extension<AuthClaims>,
+    Json(payload): Json<UpsertGroupRequest>,
+) -> Result<Json<IamGroupSummaryResponse>, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let actor = claims.subject.clone();
+    let group_name = payload.name.clone();
+    let detail = format!(
+        "roles={} scopes={}",
+        payload.roles.join(","),
+        payload.scopes.join(",")
+    );
+    let input = group_input_from_request(payload);
+
+    let summary = tokio::task::spawn_blocking(move || auth_manager.upsert_group(&engine, input))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to join group upsert task: {error}"),
+            )
+                .into_response()
+        })?
+        .map_err(|error| {
+            state.iam_audit_log.record(
+                actor.clone(),
+                "group.upsert",
+                None,
+                Some(group_name.clone()),
+                "error",
+                error.to_string(),
+            );
+            string_error_to_response(error)
+        })?;
+
+    state
+        .iam_audit_log
+        .record(actor, "group.upsert", None, Some(group_name), "ok", detail);
+    Ok(Json(summary))
+}
+
+pub(crate) async fn delete_group_handler(
+    State(state): State<crate::AppState>,
+    Extension(claims): Extension<AuthClaims>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<StatusCode, Response> {
+    let auth_manager = Arc::clone(&state.auth_manager);
+    let engine = state.runtime.load().engine.clone();
+    let actor = claims.subject.clone();
+    let group_name = name.clone();
+
+    tokio::task::spawn_blocking(move || auth_manager.delete_group(&engine, &group_name))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to join group delete task: {error}"),
+            )
+                .into_response()
+        })?
+        .map_err(|error| {
+            state.iam_audit_log.record(
+                actor.clone(),
+                "group.delete",
+                None,
+                Some(name.clone()),
+                "error",
+                error.to_string(),
+            );
+            string_error_to_response(error)
+        })?;
+
+    state
+        .iam_audit_log
+        .record(actor, "group.delete", None, Some(name), "ok", String::new());
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuditLogQuery {
+    #[serde(default)]
+    pub(crate) user: Option<String>,
+    #[serde(default)]
+    pub(crate) lines: Option<usize>,
+}
+
+pub(crate) async fn audit_log_handler(
+    State(state): State<crate::AppState>,
+    axum::extract::Query(query): axum::extract::Query<AuditLogQuery>,
+) -> Json<Vec<crate::iam_audit::IamAuditEntry>> {
+    let lines = query.lines.unwrap_or(crate::iam_audit::DEFAULT_TAIL);
+    let user = query.user.as_deref();
+    Json(state.iam_audit_log.snapshot(user, lines))
+}
+
 impl WasiView for AuthComponentState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -1039,6 +1495,53 @@ fn map_staged_login_session(session: AuthnStagedLoginSession) -> StagedLoginSess
         session_id: session.session_id,
         username: session.username,
         expires_at: session.expires_at,
+    }
+}
+
+fn map_user_summary(summary: AuthnUserSummary) -> IamUserSummaryResponse {
+    IamUserSummaryResponse {
+        username: summary.username,
+        first_name: summary.first_name,
+        last_name: summary.last_name,
+        roles: summary.roles,
+        scopes: summary.scopes,
+        groups: summary.groups,
+        disabled_at: summary.disabled_at,
+        created_at: summary.created_at,
+        last_login_at: summary.last_login_at,
+    }
+}
+
+fn map_group_summary(summary: AuthnGroupSummary) -> IamGroupSummaryResponse {
+    IamGroupSummaryResponse {
+        name: summary.name,
+        description: summary.description,
+        roles: summary.roles,
+        scopes: summary.scopes,
+        member_count: summary.member_count,
+        created_at: summary.created_at,
+        updated_at: summary.updated_at,
+    }
+}
+
+pub(crate) fn user_update_from_request(request: UpdateUserRequest) -> AuthnUserUpdate {
+    AuthnUserUpdate {
+        add_groups: request.add_groups,
+        remove_groups: request.remove_groups,
+        add_roles: request.add_roles,
+        remove_roles: request.remove_roles,
+        add_scopes: request.add_scopes,
+        remove_scopes: request.remove_scopes,
+        disabled: request.disabled,
+    }
+}
+
+pub(crate) fn group_input_from_request(request: UpsertGroupRequest) -> AuthnGroupInput {
+    AuthnGroupInput {
+        name: request.name,
+        description: request.description,
+        roles: request.roles,
+        scopes: request.scopes,
     }
 }
 

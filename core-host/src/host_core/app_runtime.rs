@@ -31,6 +31,20 @@ pub(crate) fn build_app(state: AppState) -> Router {
             post(auth::regenerate_account_security_handler),
         )
         .route("/admin/security/pats", post(auth::issue_pat_handler))
+        .route("/admin/iam/users", get(auth::list_users_handler))
+        .route(
+            "/admin/iam/users/{username}",
+            patch(auth::update_user_handler).delete(auth::delete_user_handler),
+        )
+        .route(
+            "/admin/iam/groups",
+            get(auth::list_groups_handler).post(auth::upsert_group_handler),
+        )
+        .route(
+            "/admin/iam/groups/{name}",
+            delete(auth::delete_group_handler),
+        )
+        .route("/admin/logs", get(auth::audit_log_handler))
         .route("/admin/assets", post(system_storage::upload_asset_handler))
         .route(
             "/admin/models/init",

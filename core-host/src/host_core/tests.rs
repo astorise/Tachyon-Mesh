@@ -3,6 +3,7 @@ mod support_and_cache;
 mod background_connectors;
 mod config_validation;
 mod http_router;
+mod iam_management;
 mod integrity_admin;
 mod l4_tls_quic;
 mod mesh_control_plane;

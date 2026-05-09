@@ -17,6 +17,8 @@ const ADMIN_RECOVERY_CODES_PATH: &str = "/admin/security/recovery-codes";
 const ADMIN_ACCOUNT_SECURITY_PATH: &str = "/admin/security/2fa/regenerate";
 const ADMIN_PAT_PATH: &str = "/admin/security/pats";
 const ADMIN_ENROLLMENT_START_PATH: &str = "/admin/enrollment/start";
+const ADMIN_IAM_USERS_PATH: &str = "/admin/iam/users";
+const ADMIN_IAM_GROUPS_PATH: &str = "/admin/iam/groups";
 const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
 const ADMIN_METRICS_PATH: &str = "/admin/metrics";
 const ADMIN_LOGS_PATH: &str = "/admin/logs";
@@ -74,12 +76,90 @@ pub struct StagedSignupSession {
     pub expires_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IamUserSummary {
     pub username: String,
+    #[serde(default)]
+    pub first_name: String,
+    #[serde(default)]
+    pub last_name: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
     pub groups: Vec<String>,
-    pub security_status: String,
+    #[serde(default)]
+    pub disabled_at: Option<u64>,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub last_login_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IamUserUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_groups: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_groups: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_roles: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_roles: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_scopes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_scopes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IamGroupSummary {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub member_count: u32,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IamGroupInput {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IamAuditEntry {
+    pub timestamp: u64,
+    pub actor: String,
+    #[serde(default)]
+    pub target_user: Option<String>,
+    #[serde(default)]
+    pub target_group: Option<String>,
+    pub action: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub detail: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1314,14 +1394,54 @@ pub async fn finalize_enrollment(
 }
 
 pub async fn iam_list_users() -> Result<Vec<IamUserSummary>> {
-    let _config = require_connection()?;
-    let username = current_operator_name().unwrap_or_else(|| "admin".to_owned());
+    get_admin_json(ADMIN_IAM_USERS_PATH).await
+}
 
-    Ok(vec![IamUserSummary {
-        username,
-        groups: vec!["admin".to_owned(), "ops".to_owned()],
-        security_status: "Recovery bundle managed through desktop onboarding".to_owned(),
-    }])
+pub async fn iam_update_user(username: &str, update: &IamUserUpdate) -> Result<IamUserSummary> {
+    let trimmed = username.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("username must not be empty");
+    }
+    patch_admin_json(&format!("{ADMIN_IAM_USERS_PATH}/{trimmed}"), update).await
+}
+
+pub async fn iam_delete_user(username: &str) -> Result<()> {
+    let trimmed = username.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("username must not be empty");
+    }
+    delete_admin_path(&format!("{ADMIN_IAM_USERS_PATH}/{trimmed}")).await
+}
+
+pub async fn iam_list_groups() -> Result<Vec<IamGroupSummary>> {
+    get_admin_json(ADMIN_IAM_GROUPS_PATH).await
+}
+
+pub async fn iam_upsert_group(input: &IamGroupInput) -> Result<IamGroupSummary> {
+    if input.name.trim().is_empty() {
+        anyhow::bail!("group name must not be empty");
+    }
+    post_admin_json(ADMIN_IAM_GROUPS_PATH, input).await
+}
+
+pub async fn iam_delete_group(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("group name must not be empty");
+    }
+    delete_admin_path(&format!("{ADMIN_IAM_GROUPS_PATH}/{trimmed}")).await
+}
+
+pub async fn fetch_user_audit_log(user: Option<&str>, lines: usize) -> Result<Vec<IamAuditEntry>> {
+    let limit = lines.clamp(1, 500);
+    let mut params: Vec<(&str, String)> = vec![("lines", limit.to_string())];
+    if let Some(value) = user {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            params.push(("user", trimmed.to_owned()));
+        }
+    }
+    get_admin_json_with_query(ADMIN_LOGS_PATH, &params).await
 }
 
 pub async fn iam_regen_mfa(username: &str) -> Result<Vec<String>> {
@@ -1784,6 +1904,43 @@ where
         .await
         .with_context(|| format!("failed to post Tachyon admin endpoint `{path}`"))?;
     decode_admin_response(response, path).await
+}
+
+async fn patch_admin_json<I, T>(path: &str, input: &I) -> Result<T>
+where
+    I: Serialize + ?Sized,
+    T: DeserializeOwned,
+{
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let response = client
+        .patch(build_endpoint_url(&config.url, path)?)
+        .bearer_auth(&config.token)
+        .json(input)
+        .send()
+        .await
+        .with_context(|| format!("failed to patch Tachyon admin endpoint `{path}`"))?;
+    decode_admin_response(response, path).await
+}
+
+async fn delete_admin_path(path: &str) -> Result<()> {
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let response = client
+        .delete(build_endpoint_url(&config.url, path)?)
+        .bearer_auth(&config.token)
+        .send()
+        .await
+        .with_context(|| format!("failed to delete Tachyon admin endpoint `{path}`"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_default();
+        anyhow::bail!(
+            "admin endpoint `{path}` failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+    Ok(())
 }
 
 async fn decode_admin_response<T>(response: reqwest::Response, path: &str) -> Result<T>

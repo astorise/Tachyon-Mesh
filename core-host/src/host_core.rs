@@ -51,7 +51,7 @@ pub(crate) use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::from_fn,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, patch, post, put},
     Extension, Router,
 };
 pub(crate) use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};

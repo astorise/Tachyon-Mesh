@@ -11,8 +11,8 @@ mod bindings {
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bindings::exports::tachyon::identity::authn::{
-    AuthSession, AuthnError, IdentityPayload, RegistrationTokenClaims, SignupProfile,
-    StagedLoginSession, StagedUserSession,
+    AuthSession, AuthnError, GroupInput, GroupSummary, IdentityPayload, RegistrationTokenClaims,
+    SignupProfile, StagedLoginSession, StagedUserSession, UserSummary, UserUpdate,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rand::distr::{Alphanumeric, SampleString};
@@ -103,6 +103,25 @@ struct UserProfileRecord {
     scopes: Vec<String>,
     created_at: u64,
     activated_at: u64,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    disabled_at: Option<u64>,
+    #[serde(default)]
+    last_login_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GroupRecord {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    created_at: u64,
+    updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +203,34 @@ impl bindings::exports::tachyon::identity::authn::Guest for Component {
         record.recovery_hashes = hashes;
         save_user_record(&username, &record)?;
         Ok(codes)
+    }
+
+    fn list_users() -> Result<Vec<UserSummary>, String> {
+        list_user_summaries()
+    }
+
+    fn update_user(
+        actor: String,
+        username: String,
+        update: UserUpdate,
+    ) -> Result<UserSummary, String> {
+        update_user_record(&actor, &username, update)
+    }
+
+    fn delete_user(actor: String, username: String) -> Result<(), String> {
+        delete_user_record(&actor, &username)
+    }
+
+    fn list_groups() -> Result<Vec<GroupSummary>, String> {
+        list_group_summaries()
+    }
+
+    fn upsert_group(input: GroupInput) -> Result<GroupSummary, String> {
+        upsert_group_record(input)
+    }
+
+    fn delete_group(name: String) -> Result<(), String> {
+        delete_group_record(&name)
     }
 
     fn consume_recovery_code(username: String, code: String) -> Result<String, String> {
@@ -337,6 +384,9 @@ fn finalize_pending_enrollment(session_id: &str, totp_code: &str) -> Result<Auth
         scopes: pending.scopes.clone(),
         created_at: pending.created_at,
         activated_at: now,
+        groups: Vec::new(),
+        disabled_at: None,
+        last_login_at: None,
     });
     save_user_record(&pending.username, &record)?;
     consume_registration_token(&pending.registration_token_hash)?;
@@ -369,6 +419,10 @@ fn stage_pending_login(username: &str, password: &str) -> Result<StagedLoginSess
         return Err("username or password is invalid".to_owned());
     }
 
+    if profile.disabled_at.is_some() {
+        return Err("account is disabled".to_owned());
+    }
+
     prune_expired_pending_logins()?;
     let now = unix_timestamp_seconds().map_err(|error| error.to_string())?;
     let pending = PendingLoginRecord {
@@ -396,26 +450,61 @@ fn finalize_pending_login(session_id: &str, totp_code: &str) -> Result<AuthSessi
         return Err("login session has expired".to_owned());
     }
 
-    let record = load_user_record(&pending.username)?;
+    let mut record = load_user_record(&pending.username)?;
     let profile = record
         .profile
-        .ok_or_else(|| "username is not enrolled".to_owned())?;
+        .as_ref()
+        .ok_or_else(|| "username is not enrolled".to_owned())?
+        .clone();
+
+    if profile.disabled_at.is_some() {
+        delete_pending_login(&session_id)?;
+        return Err("account is disabled".to_owned());
+    }
+
     verify_totp_code(&profile.totp_secret, totp_code, now)?;
     delete_pending_login(&session_id)?;
 
+    let (effective_roles, effective_scopes) = effective_authorization(&profile);
+
+    if let Some(stored) = record.profile.as_mut() {
+        stored.last_login_at = Some(now);
+    }
+    save_user_record(&pending.username, &record)?;
+
     let token = issue_jwt(
         &profile.username,
-        &profile.roles,
-        &profile.scopes,
+        &effective_roles,
+        &effective_scopes,
         Duration::from_secs(AUTH_SESSION_TTL_SECONDS),
     )?;
 
     Ok(AuthSession {
         token,
         username: profile.username,
-        roles: profile.roles,
-        scopes: profile.scopes,
+        roles: effective_roles,
+        scopes: effective_scopes,
     })
+}
+
+fn effective_authorization(profile: &UserProfileRecord) -> (Vec<String>, Vec<String>) {
+    let mut roles: Vec<String> = profile.roles.clone();
+    let mut scopes: Vec<String> = profile.scopes.clone();
+    for group_name in &profile.groups {
+        if let Ok(Some(group)) = load_group_record(group_name) {
+            for role in group.roles {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+            for scope in group.scopes {
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+        }
+    }
+    (normalize_roles(roles), normalize_scopes(scopes))
 }
 
 fn resolve_pat_identity(token: &str) -> Result<IdentityPayload, AuthnError> {
@@ -1227,6 +1316,296 @@ fn user_record_path(username: &str) -> Result<PathBuf, String> {
     Ok(state_root_dir().join(format!("{sanitized}.json")))
 }
 
+fn groups_dir() -> PathBuf {
+    state_root_dir().join("groups")
+}
+
+fn group_record_path(name: &str) -> Result<PathBuf, String> {
+    let sanitized = sanitize_filename(name)?;
+    Ok(groups_dir().join(format!("{sanitized}.json")))
+}
+
+fn load_group_record(name: &str) -> Result<Option<GroupRecord>, String> {
+    let path = group_record_path(name)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read(&path)
+        .map_err(|error| format!("failed to read group `{}`: {error}", path.display()))?;
+    serde_json::from_slice::<GroupRecord>(&raw)
+        .map(Some)
+        .map_err(|error| format!("failed to decode group `{}`: {error}", path.display()))
+}
+
+fn save_group_record(record: &GroupRecord) -> Result<(), String> {
+    let path = group_record_path(&record.name)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create groups directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let payload = serde_json::to_vec_pretty(record)
+        .map_err(|error| format!("failed to encode group `{}`: {error}", record.name))?;
+    fs::write(&path, payload)
+        .map_err(|error| format!("failed to persist group `{}`: {error}", path.display()))
+}
+
+fn list_user_records() -> Result<Vec<UserSecurityRecord>, String> {
+    let state_dir = state_root_dir();
+    if !state_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&state_dir).map_err(|error| {
+        format!(
+            "failed to enumerate auth state directory {}: {error}",
+            state_dir.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|error| format!("failed to inspect auth state entry: {error}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let record: UserSecurityRecord = match serde_json::from_slice(&raw) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+        out.push(record);
+    }
+    Ok(out)
+}
+
+fn user_summary_from(profile: &UserProfileRecord) -> UserSummary {
+    UserSummary {
+        username: profile.username.clone(),
+        first_name: profile.first_name.clone(),
+        last_name: profile.last_name.clone(),
+        roles: profile.roles.clone(),
+        scopes: profile.scopes.clone(),
+        groups: profile.groups.clone(),
+        disabled_at: profile.disabled_at,
+        created_at: profile.created_at,
+        last_login_at: profile.last_login_at,
+    }
+}
+
+fn group_summary_from(record: &GroupRecord, member_count: u32) -> GroupSummary {
+    GroupSummary {
+        name: record.name.clone(),
+        description: record.description.clone(),
+        roles: record.roles.clone(),
+        scopes: record.scopes.clone(),
+        member_count,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn list_user_summaries() -> Result<Vec<UserSummary>, String> {
+    let mut out = Vec::new();
+    for record in list_user_records()? {
+        if let Some(profile) = record.profile {
+            out.push(user_summary_from(&profile));
+        }
+    }
+    out.sort_by(|a, b| a.username.cmp(&b.username));
+    Ok(out)
+}
+
+fn update_user_record(
+    actor: &str,
+    username: &str,
+    update: UserUpdate,
+) -> Result<UserSummary, String> {
+    let actor = normalize_username(actor)?;
+    let username = normalize_username(username)?;
+    let mut record = load_user_record(&username)?;
+    let profile = record
+        .profile
+        .as_mut()
+        .ok_or_else(|| format!("user `{username}` is not enrolled"))?;
+
+    if let Some(disable) = update.disabled {
+        if disable {
+            if actor == username {
+                return Err("operators cannot disable their own account".to_owned());
+            }
+            if profile.disabled_at.is_none() {
+                profile.disabled_at =
+                    Some(unix_timestamp_seconds().map_err(|error| error.to_string())?);
+            }
+        } else {
+            profile.disabled_at = None;
+        }
+    }
+
+    if let Some(values) = update.add_groups {
+        for value in values {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && !profile.groups.iter().any(|g| g == trimmed) {
+                profile.groups.push(trimmed.to_owned());
+            }
+        }
+    }
+    if let Some(values) = update.remove_groups {
+        let to_remove: Vec<String> = values
+            .into_iter()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .collect();
+        profile.groups.retain(|g| !to_remove.contains(g));
+    }
+    if let Some(values) = update.add_roles {
+        for value in normalize_roles(values) {
+            if !profile.roles.contains(&value) {
+                profile.roles.push(value);
+            }
+        }
+    }
+    if let Some(values) = update.remove_roles {
+        let to_remove = normalize_roles(values);
+        profile.roles.retain(|r| !to_remove.contains(r));
+    }
+    if let Some(values) = update.add_scopes {
+        for value in normalize_scopes(values) {
+            if !profile.scopes.contains(&value) {
+                profile.scopes.push(value);
+            }
+        }
+    }
+    if let Some(values) = update.remove_scopes {
+        let to_remove = normalize_scopes(values);
+        profile.scopes.retain(|s| !to_remove.contains(s));
+    }
+
+    let summary = user_summary_from(profile);
+    save_user_record(&username, &record)?;
+    Ok(summary)
+}
+
+fn delete_user_record(actor: &str, username: &str) -> Result<(), String> {
+    let actor = normalize_username(actor)?;
+    let username = normalize_username(username)?;
+    if actor == username {
+        return Err("operators cannot delete their own account".to_owned());
+    }
+    let path = user_record_path(&username)?;
+    if !path.exists() {
+        return Err(format!("user `{username}` does not exist"));
+    }
+    fs::remove_file(&path).map_err(|error| format!("failed to delete user `{username}`: {error}"))
+}
+
+fn count_group_members(group_name: &str) -> Result<u32, String> {
+    let mut count: u32 = 0;
+    for record in list_user_records()? {
+        if let Some(profile) = record.profile {
+            if profile.groups.iter().any(|g| g == group_name) {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn list_group_summaries() -> Result<Vec<GroupSummary>, String> {
+    let dir = groups_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|error| {
+        format!(
+            "failed to enumerate groups directory {}: {error}",
+            dir.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| format!("failed to inspect groups entry: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let record: GroupRecord = match serde_json::from_slice(&raw) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+        let count = count_group_members(&record.name)?;
+        out.push(group_summary_from(&record, count));
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn upsert_group_record(input: GroupInput) -> Result<GroupSummary, String> {
+    let name = normalize_group_name(&input.name)?;
+    let description = input.description.trim().to_owned();
+    let roles = normalize_roles(input.roles);
+    let scopes = normalize_scopes(input.scopes);
+
+    let now = unix_timestamp_seconds().map_err(|error| error.to_string())?;
+    let mut record = match load_group_record(&name)? {
+        Some(mut existing) => {
+            existing.description = description;
+            existing.roles = roles;
+            existing.scopes = scopes;
+            existing.updated_at = now;
+            existing
+        }
+        None => GroupRecord {
+            name: name.clone(),
+            description,
+            roles,
+            scopes,
+            created_at: now,
+            updated_at: now,
+        },
+    };
+    record.name = name.clone();
+    save_group_record(&record)?;
+    let count = count_group_members(&name)?;
+    Ok(group_summary_from(&record, count))
+}
+
+fn delete_group_record(name: &str) -> Result<(), String> {
+    let name = normalize_group_name(name)?;
+    let path = group_record_path(&name)?;
+    if !path.exists() {
+        return Err(format!("group `{name}` does not exist"));
+    }
+    fs::remove_file(&path).map_err(|error| format!("failed to delete group `{name}`: {error}"))
+}
+
+fn normalize_group_name(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("group name must not be empty".to_owned());
+    }
+    if trimmed.len() > 64 {
+        return Err("group name must be 64 characters or fewer".to_owned());
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(
+            "group name may only contain ASCII letters, digits, `-`, `_`, or `.`".to_owned(),
+        );
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
 fn pending_enrollment_dir() -> PathBuf {
     state_root_dir().join("pending-enrollments")
 }
@@ -1500,6 +1879,447 @@ mod tests {
                 assert!(validate_registration_token_claims(&token).is_err());
             });
             std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    fn empty_user_update() -> UserUpdate {
+        UserUpdate {
+            add_groups: None,
+            remove_groups: None,
+            add_roles: None,
+            remove_roles: None,
+            add_scopes: None,
+            remove_scopes: None,
+            disabled: None,
+        }
+    }
+
+    fn enroll_test_user(secret: &str, username: &str, roles: &[&str], scopes: &[&str]) -> u64 {
+        std::env::set_var(JWT_SECRET_ENV, secret);
+        let issued_at =
+            unix_timestamp_seconds().expect("clock should be available for enrollment helper");
+        let expires_at = issued_at + 300;
+        let token = issue_registration_token_for_test(
+            secret,
+            &format!("invite:{username}"),
+            roles,
+            scopes,
+            issued_at,
+            expires_at,
+        );
+        let staged = stage_pending_user(
+            &token,
+            SignupProfile {
+                first_name: "Test".to_owned(),
+                last_name: "User".to_owned(),
+                username: username.to_owned(),
+                password: "correct horse battery staple".to_owned(),
+            },
+        )
+        .expect("staging should succeed in test helper");
+        let code = totp_code_for_test(
+            &provisioning_secret_for_test(&staged.provisioning_uri),
+            issued_at,
+        );
+        finalize_pending_enrollment(&staged.session_id, &code)
+            .expect("enrollment should finalize in test helper");
+        issued_at
+    }
+
+    #[test]
+    fn list_users_returns_every_enrolled_account() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("list-users-secret", "alice", &["admin"], &["scope:a"]);
+                enroll_test_user("list-users-secret", "bob", &["viewer"], &["scope:b"]);
+
+                let users = list_user_summaries().expect("listing should succeed");
+
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].username, "alice");
+                assert_eq!(users[1].username, "bob");
+                assert!(users.iter().all(|u| u.disabled_at.is_none()));
+                assert!(users.iter().all(|u| u.last_login_at.is_none()));
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn update_user_merges_add_and_remove_deltas() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("merge-deltas-secret", "alice", &["viewer"], &["scope:a"]);
+                upsert_group_record(GroupInput {
+                    name: "platform-admins".to_owned(),
+                    description: String::new(),
+                    roles: vec!["admin".to_owned()],
+                    scopes: vec![],
+                })
+                .expect("group upsert should succeed");
+
+                let summary = update_user_record(
+                    "admin",
+                    "alice",
+                    UserUpdate {
+                        add_groups: Some(vec!["platform-admins".to_owned()]),
+                        remove_roles: Some(vec!["viewer".to_owned()]),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("update should succeed");
+
+                assert_eq!(summary.groups, vec!["platform-admins".to_owned()]);
+                assert!(summary.roles.is_empty(), "viewer should be stripped");
+
+                let summary = update_user_record(
+                    "admin",
+                    "alice",
+                    UserUpdate {
+                        add_roles: Some(vec!["ops".to_owned()]),
+                        remove_groups: Some(vec!["platform-admins".to_owned()]),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("second update should succeed");
+
+                assert_eq!(summary.roles, vec!["ops".to_owned()]);
+                assert!(summary.groups.is_empty());
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn update_user_rejects_self_disable() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("self-disable-secret", "alice", &["admin"], &[]);
+
+                let error = update_user_record(
+                    "alice",
+                    "alice",
+                    UserUpdate {
+                        disabled: Some(true),
+                        ..empty_user_update()
+                    },
+                )
+                .expect_err("self disable should be rejected");
+                assert!(error.contains("disable their own account"));
+
+                let summary = list_user_summaries().expect("list should succeed");
+                assert!(
+                    summary[0].disabled_at.is_none(),
+                    "alice should still be active"
+                );
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn delete_user_rejects_self_deletion() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("self-delete-secret", "alice", &["admin"], &[]);
+
+                let error = delete_user_record("alice", "alice")
+                    .expect_err("self delete should be rejected");
+                assert!(error.contains("delete their own account"));
+
+                let summary = list_user_summaries().expect("list should succeed");
+                assert_eq!(summary.len(), 1);
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn delete_user_removes_record_from_disk() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("delete-secret", "alice", &["viewer"], &[]);
+                enroll_test_user("delete-secret", "bob", &["admin"], &[]);
+
+                delete_user_record("admin", "alice").expect("delete should succeed");
+
+                let users = list_user_summaries().expect("listing should succeed");
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].username, "bob");
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn disabled_accounts_cannot_stage_or_finalize_login() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("disabled-secret", "alice", &["admin"], &[]);
+
+                update_user_record(
+                    "admin",
+                    "alice",
+                    UserUpdate {
+                        disabled: Some(true),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("disable update should succeed");
+
+                let error = stage_pending_login("alice", "correct horse battery staple")
+                    .expect_err("staging should refuse a disabled account");
+                assert!(error.contains("disabled") || error.contains("invalid"));
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn re_enabling_clears_the_disable_timestamp() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("re-enable-secret", "alice", &["admin"], &[]);
+
+                update_user_record(
+                    "admin",
+                    "alice",
+                    UserUpdate {
+                        disabled: Some(true),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("disable should succeed");
+                let users = list_user_summaries().expect("list should succeed");
+                assert!(users[0].disabled_at.is_some());
+
+                update_user_record(
+                    "admin",
+                    "alice",
+                    UserUpdate {
+                        disabled: Some(false),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("enable should succeed");
+                let users = list_user_summaries().expect("list should succeed");
+                assert!(users[0].disabled_at.is_none());
+
+                stage_pending_login("alice", "correct horse battery staple")
+                    .expect("staging should succeed once re-enabled");
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn successful_login_updates_last_login_at_and_unions_group_roles() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("login-update-secret", "alice", &["viewer"], &["scope:a"]);
+                upsert_group_record(GroupInput {
+                    name: "ops-team".to_owned(),
+                    description: String::new(),
+                    roles: vec!["ops".to_owned()],
+                    scopes: vec!["deploy:wasm".to_owned()],
+                })
+                .expect("group should upsert");
+                update_user_record(
+                    "admin",
+                    "alice",
+                    UserUpdate {
+                        add_groups: Some(vec!["ops-team".to_owned()]),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("update should succeed");
+
+                let staged = stage_pending_login("alice", "correct horse battery staple")
+                    .expect("staging should succeed");
+                let secret = {
+                    let record = load_user_record("alice")
+                        .expect("alice record should load")
+                        .profile
+                        .expect("alice profile should exist");
+                    record.totp_secret
+                };
+                let now = unix_timestamp_seconds().expect("clock");
+                let code = totp_code_for_test(&secret, now);
+                let session = finalize_pending_login(&staged.session_id, &code)
+                    .expect("finalize should succeed");
+
+                assert!(session.roles.contains(&"viewer".to_owned()));
+                assert!(session.roles.contains(&"ops".to_owned()));
+                assert!(session.scopes.contains(&"scope:a".to_owned()));
+                assert!(session.scopes.contains(&"deploy:wasm".to_owned()));
+
+                let users = list_user_summaries().expect("list should succeed");
+                assert!(users[0].last_login_at.is_some());
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn missing_group_references_are_tolerated_at_login() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("missing-group-secret", "alice", &["viewer"], &[]);
+                upsert_group_record(GroupInput {
+                    name: "soon-deleted".to_owned(),
+                    description: String::new(),
+                    roles: vec!["admin".to_owned()],
+                    scopes: vec![],
+                })
+                .expect("group should upsert");
+                update_user_record(
+                    "admin",
+                    "alice",
+                    UserUpdate {
+                        add_groups: Some(vec!["soon-deleted".to_owned()]),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("attach group should succeed");
+                delete_group_record("soon-deleted").expect("delete should succeed");
+
+                let staged = stage_pending_login("alice", "correct horse battery staple")
+                    .expect("staging should still succeed");
+                let secret = load_user_record("alice")
+                    .expect("alice record should load")
+                    .profile
+                    .expect("alice profile should exist")
+                    .totp_secret;
+                let now = unix_timestamp_seconds().expect("clock");
+                let code = totp_code_for_test(&secret, now);
+                let session = finalize_pending_login(&staged.session_id, &code)
+                    .expect("finalize should succeed even with missing group");
+
+                assert_eq!(session.roles, vec!["viewer".to_owned()]);
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn upsert_group_normalizes_name_and_dedupes_roles() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                let summary = upsert_group_record(GroupInput {
+                    name: "  Platform-Admins  ".to_owned(),
+                    description: "Mesh ops".to_owned(),
+                    roles: vec!["admin".to_owned(), "ADMIN".to_owned(), "ops".to_owned()],
+                    scopes: vec!["deploy:wasm".to_owned(), "deploy:wasm".to_owned()],
+                })
+                .expect("upsert should succeed");
+
+                assert_eq!(summary.name, "platform-admins");
+                assert_eq!(summary.roles, vec!["admin".to_owned(), "ops".to_owned()]);
+                assert_eq!(summary.scopes, vec!["deploy:wasm".to_owned()]);
+
+                let updated = upsert_group_record(GroupInput {
+                    name: "platform-admins".to_owned(),
+                    description: "Updated".to_owned(),
+                    roles: vec!["admin".to_owned()],
+                    scopes: vec![],
+                })
+                .expect("second upsert should succeed");
+                assert_eq!(updated.description, "Updated");
+                assert!(updated.scopes.is_empty());
+                assert!(updated.updated_at >= summary.updated_at);
+            });
+        });
+    }
+
+    #[test]
+    fn upsert_group_rejects_invalid_name() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                let error = upsert_group_record(GroupInput {
+                    name: "bad name!".to_owned(),
+                    description: String::new(),
+                    roles: vec![],
+                    scopes: vec![],
+                })
+                .expect_err("invalid characters should be rejected");
+                assert!(error.contains("ASCII letters") || error.contains("group name"));
+
+                let error = upsert_group_record(GroupInput {
+                    name: "   ".to_owned(),
+                    description: String::new(),
+                    roles: vec![],
+                    scopes: vec![],
+                })
+                .expect_err("empty name should be rejected");
+                assert!(error.contains("must not be empty"));
+            });
+        });
+    }
+
+    #[test]
+    fn list_groups_includes_member_count() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                enroll_test_user("group-members-secret", "alice", &["viewer"], &[]);
+                enroll_test_user("group-members-secret", "bob", &["viewer"], &[]);
+                upsert_group_record(GroupInput {
+                    name: "ops".to_owned(),
+                    description: String::new(),
+                    roles: vec![],
+                    scopes: vec![],
+                })
+                .expect("group should upsert");
+                update_user_record(
+                    "admin",
+                    "alice",
+                    UserUpdate {
+                        add_groups: Some(vec!["ops".to_owned()]),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("attach should succeed");
+                update_user_record(
+                    "admin",
+                    "bob",
+                    UserUpdate {
+                        add_groups: Some(vec!["ops".to_owned()]),
+                        ..empty_user_update()
+                    },
+                )
+                .expect("attach should succeed");
+
+                let groups = list_group_summaries().expect("listing should succeed");
+                let ops = groups
+                    .iter()
+                    .find(|g| g.name == "ops")
+                    .expect("ops group should be present");
+                assert_eq!(ops.member_count, 2);
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn delete_group_removes_file_and_rejects_missing() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                upsert_group_record(GroupInput {
+                    name: "ephemeral".to_owned(),
+                    description: String::new(),
+                    roles: vec![],
+                    scopes: vec![],
+                })
+                .expect("upsert should succeed");
+                let path = group_record_path("ephemeral").expect("path should resolve");
+                assert!(path.exists());
+
+                delete_group_record("ephemeral").expect("delete should succeed");
+                assert!(!path.exists());
+
+                let error =
+                    delete_group_record("ephemeral").expect_err("second delete should fail");
+                assert!(error.contains("does not exist"));
+            });
         });
     }
 }

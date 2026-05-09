@@ -6,6 +6,7 @@ mod auth;
 mod core_error;
 mod data_events;
 mod error;
+mod iam_audit;
 pub mod identity;
 mod memory_governor;
 mod mesh;
