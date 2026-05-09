@@ -19,6 +19,7 @@ const ADMIN_PAT_PATH: &str = "/admin/security/pats";
 const ADMIN_ENROLLMENT_START_PATH: &str = "/admin/enrollment/start";
 const ADMIN_IAM_USERS_PATH: &str = "/admin/iam/users";
 const ADMIN_IAM_GROUPS_PATH: &str = "/admin/iam/groups";
+const ADMIN_MANIFEST_BUNDLE_PATH: &str = "/admin/manifest/bundle";
 const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
 const ADMIN_METRICS_PATH: &str = "/admin/metrics";
 const ADMIN_LOGS_PATH: &str = "/admin/logs";
@@ -840,6 +841,143 @@ pub async fn seal_and_apply_manifest() -> Result<SealApplyOutcome> {
     let manifest = seal_overlay_manifest().await?;
     write_lockfile(&manifest).await?;
     apply_manifest_to_active_node(&manifest).await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleDependency {
+    pub name: String,
+    pub version_constraint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleConflict {
+    pub name: String,
+    pub bundled_version: String,
+    pub cluster_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleApplyOutcome {
+    pub success: bool,
+    pub message: String,
+    #[serde(default)]
+    pub config_version: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<BundleConflict>,
+    #[serde(default)]
+    pub requires_resolution: bool,
+}
+
+pub async fn bundle_and_apply_manifest(
+    dependencies: Vec<BundleDependency>,
+) -> Result<BundleApplyOutcome> {
+    let manifest = seal_overlay_manifest().await?;
+    let bytes = build_deployment_bundle(&manifest, &dependencies)?;
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let response = client
+        .post(build_endpoint_url(&config.url, ADMIN_MANIFEST_BUNDLE_PATH)?)
+        .bearer_auth(&config.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+        .body(bytes)
+        .send()
+        .await
+        .context("failed to POST deployment bundle")?;
+
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read deployment bundle response body")?;
+
+    if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
+        let outcome: BundleApplyOutcome = serde_json::from_slice(&body)
+            .context("failed to decode deployment bundle 428 response payload")?;
+        return Ok(BundleApplyOutcome {
+            requires_resolution: true,
+            ..outcome
+        });
+    }
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "deployment bundle apply failed with {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    write_lockfile(&manifest).await?;
+    let outcome: BundleApplyOutcome = serde_json::from_slice(&body)
+        .context("failed to decode deployment bundle 200 response payload")?;
+    Ok(outcome)
+}
+
+fn build_deployment_bundle(
+    manifest: &IntegrityManifest,
+    dependencies: &[BundleDependency],
+) -> Result<Vec<u8>> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    use tar::{Builder, Header};
+
+    let manifest_yaml = render_manifest_yaml(manifest, dependencies)?;
+    let manifest_bytes = manifest_yaml.into_bytes();
+
+    let buffer = Vec::new();
+    let encoder = GzEncoder::new(buffer, Compression::default());
+    let mut tar = Builder::new(encoder);
+    let mut header = Header::new_gnu();
+    header.set_path("manifest.yaml")?;
+    header.set_size(manifest_bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append(&header, manifest_bytes.as_slice())
+        .context("failed to append manifest.yaml to deployment bundle")?;
+
+    let encoder = tar
+        .into_inner()
+        .context("failed to finalize deployment bundle tar stream")?;
+    let mut buffer = encoder
+        .finish()
+        .context("failed to finalize deployment bundle gzip stream")?;
+    buffer.flush().ok();
+    Ok(buffer)
+}
+
+fn render_manifest_yaml(
+    manifest: &IntegrityManifest,
+    dependencies: &[BundleDependency],
+) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut yaml = String::new();
+    writeln!(&mut yaml, "version: 1")?;
+    writeln!(&mut yaml, "publicKey: \"{}\"", manifest.public_key)?;
+    writeln!(&mut yaml, "signature: \"{}\"", manifest.signature)?;
+    writeln!(&mut yaml, "configPayload: |")?;
+    for line in manifest.config_payload.lines() {
+        writeln!(&mut yaml, "  {line}")?;
+    }
+    if !dependencies.is_empty() {
+        writeln!(&mut yaml, "dependencies:")?;
+        for dep in dependencies {
+            let name = dep.name.replace([' ', '\n'], "_");
+            writeln!(&mut yaml, "  {name}:")?;
+            writeln!(
+                &mut yaml,
+                "    version: \"{}\"",
+                dep.version_constraint.replace('"', "'")
+            )?;
+            if let Some(source) = dep.source.as_deref() {
+                writeln!(&mut yaml, "    source: \"{}\"", source.replace('"', "'"))?;
+            }
+        }
+    }
+    Ok(yaml)
 }
 
 pub async fn apply_current_manifest() -> Result<SealApplyOutcome> {

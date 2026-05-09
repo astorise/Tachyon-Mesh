@@ -1166,6 +1166,7 @@ dependencies = [
  "candle-nn",
  "clap",
  "ed25519-dalek",
+ "flate2",
  "forwarded-header-value",
  "futures-util",
  "governor",
@@ -1194,6 +1195,7 @@ dependencies = [
  "sysinfo",
  "system-faas-enrollment",
  "system-faas-microvm-runner",
+ "tar",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -8022,6 +8024,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
+ "flate2",
  "hex",
  "rand_core 0.6.4",
  "reqwest",
@@ -8029,6 +8032,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sysinfo",
+ "tar",
  "tokio",
 ]
 

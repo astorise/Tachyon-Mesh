@@ -427,6 +427,15 @@ async fn seal_and_apply_manifest() -> Result<tachyon_client::SealApplyOutcome, S
 }
 
 #[tauri::command]
+async fn bundle_and_apply_manifest(
+    dependencies: Option<Vec<tachyon_client::BundleDependency>>,
+) -> Result<tachyon_client::BundleApplyOutcome, String> {
+    tachyon_client::bundle_and_apply_manifest(dependencies.unwrap_or_default())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn save_credentials(app: tauri::AppHandle, payload: SavedCredentials) -> Result<(), String> {
     let mut profile = read_secure_profile(&app).await?.unwrap_or_default();
     profile.url = payload.url;
@@ -760,6 +769,7 @@ fn main() {
             delete_resource,
             apply_configuration,
             seal_and_apply_manifest,
+            bundle_and_apply_manifest,
             save_credentials,
             load_credentials,
             delete_credentials,

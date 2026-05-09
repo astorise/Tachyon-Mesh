@@ -1,0 +1,5 @@
+- [x] **Task 1: Client Archive Builder.** Update `tachyon-client` to build a `.tar.gz` bundle containing `manifest.yaml` and an `/assets/` directory for local `.wasm` files. Do not generate the `integrity.lock` locally.
+- [x] **Task 2: Host-Side Resolution & Locking.** Implement the host-side FaaS logic to unpack the bundle, resolve SemVer requirements using the `semver` crate, and (if successful) generate and sign the final `integrity.lock` on the server.
+- [x] **Task 3: Conflict Detection (HTTP 428).** Update the host logic: if a bundled asset satisfies the SemVer but a higher compatible version exists in the cluster, return `428 Precondition Required` with a JSON payload detailing the override conflict.
+- [x] **Task 4: Interactive UI Modal.** Create a modal in `TachyonAppShell` (triggered by the 428 error) prompting the user to "Use Cluster Version" or "Force Local Version".
+- [x] **Task 5: Manifest Auto-Correction.** Update the client logic to modify the `manifest.yaml` based on the user's choice (strict pinning `=x.y.z` to force local, or stripping the local `source` to use the cluster cache), rebuild the `.tar.gz`, and automatically retry.
