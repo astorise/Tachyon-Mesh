@@ -545,18 +545,13 @@ pub(crate) enum IntegrityResource {
 
 // ── KV-cache configuration ────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum KvCacheEvictionPolicy {
+    #[default]
     Lru,
     Lfu,
     Fifo,
-}
-
-impl Default for KvCacheEvictionPolicy {
-    fn default() -> Self {
-        Self::Lru
-    }
 }
 
 /// Declares a token KV-cache that is bound to a specific LLM deployment.
