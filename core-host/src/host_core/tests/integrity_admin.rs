@@ -18,7 +18,6 @@ fn make_bundle_yaml(config_json: &str) -> String {
 }
 
 fn tar_gz_bundle(manifest_yaml: &str) -> Vec<u8> {
-    use std::io::Write;
     let buf: Vec<u8> = Vec::new();
     let enc = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
     let mut ar = tar::Builder::new(enc);
@@ -72,14 +71,14 @@ fn parse_manifest_yaml_parses_dependencies_with_source() {
         .dependencies
         .iter()
         .find(|d| d.name == "alpha")
-        .unwrap();
+        .expect("alpha dependency should exist");
     assert_eq!(alpha.version, "^2.0.0");
     assert_eq!(alpha.source.as_deref(), Some("./assets/alpha.wasm"));
     let beta = result
         .dependencies
         .iter()
         .find(|d| d.name == "beta")
-        .unwrap();
+        .expect("beta dependency should exist");
     assert!(beta.source.is_none());
 }
 
@@ -544,7 +543,11 @@ async fn bundle_handler_missing_manifest_yaml_returns_400() {
     header.set_cksum();
     ar.append_data(&mut header, "other.txt", content.as_slice())
         .expect("append other.txt");
-    let bundle = ar.into_inner().unwrap().finish().unwrap();
+    let bundle = ar
+        .into_inner()
+        .expect("finish tar builder")
+        .finish()
+        .expect("finish gz encoder");
 
     let response = admin_manifest_bundle_handler(State(state), Bytes::from(bundle)).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
