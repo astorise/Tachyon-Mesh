@@ -1,6 +1,16 @@
+import { invoke } from "@tauri-apps/api/core";
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { t } from "../../utils/i18n";
 import stylesheetText from "../../style.css?inline";
+
+type BundleConflict = { name: string; bundledVersion: string; clusterVersion: string };
+type BundleApplyOutcome = {
+  success: boolean;
+  message: string;
+  configVersion: number;
+  conflicts: BundleConflict[];
+  requiresResolution: boolean;
+};
 
 export type TopologyNodeType =
   | "endpoint"
@@ -205,6 +215,8 @@ export class TachyonTopologyCanvas extends HTMLElement {
       </div>
     `;
 
+    this.wireFileDrop();
+
     this.root.querySelectorAll<HTMLButtonElement>("[data-node-id]").forEach((button) => {
       button.addEventListener("pointerdown", (event) => {
         this.didDrag = false;
@@ -271,6 +283,48 @@ export class TachyonTopologyCanvas extends HTMLElement {
           }),
         );
       });
+    });
+  }
+
+  private wireFileDrop(): void {
+    const container = this.root.getElementById("canvas-container");
+    if (!container) return;
+
+    container.addEventListener("dragenter", (e) => {
+      e.preventDefault();
+      container.style.borderColor = "rgba(34,211,238,0.8)";
+      container.style.boxShadow = "0 0 24px rgba(34,211,238,0.25)";
+    });
+    container.addEventListener("dragover", (e) => {
+      e.preventDefault();
+    });
+    container.addEventListener("dragleave", () => {
+      container.style.borderColor = "";
+      container.style.boxShadow = "";
+    });
+    container.addEventListener("drop", (e) => {
+      e.preventDefault();
+      container.style.borderColor = "";
+      container.style.boxShadow = "";
+      const rect = container.getBoundingClientRect();
+      const files = Array.from((e as DragEvent).dataTransfer?.files ?? []);
+      for (const file of files) {
+        if (!file.name.endsWith(".wasm")) continue;
+        const x = Math.max(0, Math.min(rect.width - 256, e.clientX - rect.left - 128));
+        const y = Math.max(0, Math.min(rect.height - 80, e.clientY - rect.top - 40));
+        this.dispatchEvent(
+          new CustomEvent("topology:wasm-dropped", {
+            bubbles: true,
+            composed: true,
+            detail: {
+              name: file.name.replace(/\.wasm$/, ""),
+              path: (file as File & { path?: string }).path ?? file.name,
+              x: Math.round(x),
+              y: Math.round(y),
+            },
+          }),
+        );
+      }
     });
   }
 
@@ -547,6 +601,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
   private nodes: TopologyNode[] = DEFAULT_NODES.map((node) => ({ ...node, data: { ...node.data } }));
   private edges: TopologyEdge[] = DEFAULT_EDGES.map((edge) => ({ ...edge }));
   private selectedId: string | null = null;
+  private applying = false;
   private readonly onLanguageChanged = () => this.refresh();
 
   connectedCallback(): void {
@@ -573,12 +628,16 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
             <h2 class="text-2xl font-bold text-slate-100">${t("topology.title")}</h2>
             <p class="text-sm font-mono text-slate-400">${t("topology.subtitle")}</p>
           </div>
-          <button id="btn-build-bundle" type="button" class="rounded-md border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-xs font-medium text-cyan-200 hover:bg-cyan-500/20">${t("topology.build-bundle")}</button>
+          <button id="btn-apply-topology" type="button" ${this.applying ? "disabled" : ""}
+            class="rounded-md border border-cyan-500/60 bg-cyan-600/20 px-4 py-2 text-xs font-bold text-cyan-200 hover:bg-cyan-600/30 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
+            ${this.applying ? `<span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent"></span>${t("topology.applying")}` : t("topology.apply-topology")}
+          </button>
         </header>
 
         <article data-stagger-panel>
           <tachyon-topology-canvas></tachyon-topology-canvas>
           <tachyon-node-editor></tachyon-node-editor>
+          <p class="mt-2 text-center text-[11px] text-slate-600 select-none">${t("topology.drop.hint")}</p>
         </article>
 
         <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-4">
@@ -614,20 +673,8 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
   }
 
   private bindEvents(): void {
-    this.root.getElementById("btn-build-bundle")?.addEventListener("click", () => {
-      const canvas = this.canvas();
-      const detail = canvas?.serialize() ?? { nodes: [], edges: [] };
-      this.dispatchEvent(
-        new CustomEvent("topology:serialize", {
-          bubbles: true,
-          composed: true,
-          detail,
-        }),
-      );
-      this.showFeedback(
-        "success",
-        `${t("topology.feedback.serialized")} (${detail.nodes.length} ${t("topology.nodes")}, ${detail.edges.length} ${t("topology.edges")})`,
-      );
+    this.root.getElementById("btn-apply-topology")?.addEventListener("click", () => {
+      void this.applyTopology();
     });
 
     this.root.getElementById("add-node-form")?.addEventListener("submit", (event) => {
@@ -636,6 +683,26 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
     });
 
     const canvas = this.canvas();
+    canvas?.addEventListener("topology:wasm-dropped", (event) => {
+      const { name, path, x, y } = (
+        event as CustomEvent<{ name: string; path: string; x: number; y: number }>
+      ).detail;
+      const id = `wasm-${Date.now()}`;
+      this.nodes.push({
+        id,
+        type: "custom-wasm",
+        label: name,
+        x,
+        y,
+        data: {
+          capabilityName: name,
+          semver: "^1.0.0",
+          assetSource: path,
+        },
+      });
+      this.pushGraphToCanvas();
+      this.showFeedback("success", `${t("topology.feedback.wasm-dropped")} ${name}`);
+    });
     canvas?.addEventListener("topology:node-selected", (event) => {
       const id = (event as CustomEvent<{ nodeId: string }>).detail.nodeId;
       this.selectedId = id;
@@ -676,6 +743,51 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
       this.editor()?.setNode(null);
       this.canvas()?.setSelected(null);
     });
+  }
+
+  private async applyTopology(): Promise<void> {
+    if (this.applying) return;
+    this.applying = true;
+    this.render();
+    this.bindEvents();
+    this.pushGraphToCanvas();
+    this.showFeedback("success", t("topology.feedback.applying"));
+
+    const dependencies = this.nodes
+      .filter((n) => n.type === "custom-wasm" && n.data.assetSource)
+      .map((n) => ({
+        name: n.data.capabilityName || n.label || n.id,
+        version: n.data.semver || "^1.0.0",
+        source: n.data.assetSource || null,
+      }));
+
+    try {
+      const result = await invoke<BundleApplyOutcome>("bundle_and_apply_manifest", {
+        dependencies,
+      });
+      if (result.requiresResolution && result.conflicts.length > 0) {
+        window.dispatchEvent(
+          new CustomEvent("topology:conflict", {
+            detail: { conflicts: result.conflicts },
+          }),
+        );
+        this.showFeedback("error", t("topology.feedback.apply-conflict"));
+      } else if (result.success) {
+        this.showFeedback(
+          "success",
+          `${t("topology.feedback.apply-success")} ${result.configVersion}`,
+        );
+      } else {
+        this.showFeedback("error", result.message);
+      }
+    } catch (error) {
+      this.showFeedback("error", String(error));
+    } finally {
+      this.applying = false;
+      this.render();
+      this.bindEvents();
+      this.pushGraphToCanvas();
+    }
   }
 
   private addNode(): void {

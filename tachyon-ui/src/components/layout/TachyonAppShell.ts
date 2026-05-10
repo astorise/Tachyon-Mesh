@@ -92,6 +92,11 @@ export class TachyonAppShell extends HTMLElement {
     this.updateNavigation(route);
     this.showRoute(route);
   };
+  private readonly onTopologyConflict = (event: Event) => {
+    const conflicts = (event as CustomEvent<{ conflicts: BundleConflict[] }>).detail.conflicts;
+    const modal = this.root.querySelector<BundleConflictModalElement>("tachyon-bundle-conflict-modal");
+    modal?.open(conflicts);
+  };
 
   constructor() {
     super();
@@ -105,6 +110,7 @@ export class TachyonAppShell extends HTMLElement {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     window.addEventListener("config:staged", this.onConfigStaged);
     window.addEventListener("hashchange", this.onHashChange);
+    window.addEventListener("topology:conflict", this.onTopologyConflict);
   }
 
   disconnectedCallback(): void {
@@ -112,6 +118,7 @@ export class TachyonAppShell extends HTMLElement {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
     window.removeEventListener("config:staged", this.onConfigStaged);
     window.removeEventListener("hashchange", this.onHashChange);
+    window.removeEventListener("topology:conflict", this.onTopologyConflict);
   }
 
   async startTransition(userData: AuthenticatedDetail): Promise<void> {
