@@ -94,18 +94,24 @@ pub(crate) fn verify_integrity_payload_with_trusted(
         signature_hex,
         trusted_signers,
     )?;
-    // Verify the declared key itself is trusted (embedded boot key or explicit list).
-    let embedded_key = EMBEDDED_PUBLIC_KEY;
-    let is_embedded = public_key_hex.eq_ignore_ascii_case(embedded_key);
-    let is_trusted = is_embedded
-        || trusted_signers
-            .iter()
-            .any(|k| k.trim().eq_ignore_ascii_case(public_key_hex));
-    if !is_trusted {
-        anyhow::bail!(
-            "Integrity Validation Failed: signer `{public_key_hex}` is not the embedded key \
-             and is not in the trusted-signers list"
-        );
+    // Trust check: only applies when a non-empty trusted-signers list has been
+    // configured.  An empty list means "open mode" — any cryptographically
+    // valid signature is accepted (boot-time and batch-job paths).  A non-empty
+    // list restricts submission to the embedded boot key or explicitly-listed
+    // cluster keys.
+    if !trusted_signers.is_empty() {
+        let embedded_key = EMBEDDED_PUBLIC_KEY;
+        let is_embedded = public_key_hex.eq_ignore_ascii_case(embedded_key);
+        let is_trusted = is_embedded
+            || trusted_signers
+                .iter()
+                .any(|k| k.trim().eq_ignore_ascii_case(public_key_hex));
+        if !is_trusted {
+            anyhow::bail!(
+                "Integrity Validation Failed: signer `{public_key_hex}` is not the embedded key \
+                 and is not in the trusted-signers list"
+            );
+        }
     }
     let config = serde_json::from_str::<IntegrityConfig>(payload)
         .map_err(|error| integrity_schema_violation(source, error))?;
