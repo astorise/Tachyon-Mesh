@@ -53,6 +53,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
             delete(auth::delete_group_handler),
         )
         .route("/admin/logs", get(auth::audit_log_handler))
+        .route(
+            "/admin/kv-cache/{model}/stats",
+            get(kv_cache::kv_cache_stats_handler),
+        )
+        .route(
+            "/admin/kv-cache/{model}",
+            delete(kv_cache::kv_cache_evict_handler),
+        )
         .route("/admin/assets", post(system_storage::upload_asset_handler))
         .route(
             "/admin/models/init",
@@ -84,6 +92,12 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/auth/login/stage", post(auth::stage_login_handler))
         .route("/auth/login/finalize", post(auth::finalize_login_handler))
+        .route(
+            "/api/kv-cache/{model}/{key}",
+            get(kv_cache::kv_cache_get_handler)
+                .put(kv_cache::kv_cache_put_handler)
+                .delete(kv_cache::kv_cache_delete_handler),
+        )
         .route(
             "/auth/recovery/consume",
             post(auth::consume_recovery_code_handler),

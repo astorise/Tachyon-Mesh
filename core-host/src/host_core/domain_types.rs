@@ -543,6 +543,50 @@ pub(crate) enum IntegrityResource {
     },
 }
 
+// ── KV-cache configuration ────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum KvCacheEvictionPolicy {
+    Lru,
+    Lfu,
+    Fifo,
+}
+
+impl Default for KvCacheEvictionPolicy {
+    fn default() -> Self {
+        Self::Lru
+    }
+}
+
+/// Declares a token KV-cache that is bound to a specific LLM deployment.
+/// Writes are only accepted on nodes where `model_ref` is currently hot;
+/// the `model_ref` is used as the first segment of every storage key so
+/// entries from different models are physically isolated in the ReDB table.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct IntegrityKvCacheConfig {
+    /// Logical name for this cache (used in admin APIs and metrics).
+    pub(crate) name: String,
+    /// Alias of the LLM model this cache is bound to (must match a route's
+    /// model alias). Writes are refused with 503 if this model is not
+    /// currently loaded on the receiving node.
+    pub(crate) model_ref: String,
+    /// Maximum TTL in seconds for individual cache entries (`None` = no expiry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_ttl_seconds: Option<u64>,
+    /// Eviction strategy applied when `max_ttl_seconds` expires on reads.
+    #[serde(default)]
+    pub(crate) eviction_policy: KvCacheEvictionPolicy,
+    /// Isolate entries per tenant (uses the `x-tachyon-tenant` request header
+    /// as the tenant segment in storage keys). Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub(crate) tenant_isolation: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct IntegrityConfig {
     pub(crate) host_address: String,
@@ -600,6 +644,11 @@ pub(crate) struct IntegrityConfig {
     /// compatible version is already present in the cluster.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) asset_versions: BTreeMap<String, String>,
+    /// LLM inference KV-caches declared for this node. Each entry binds a
+    /// cache to a specific model via `model_ref`; writes are only accepted
+    /// when that model is hot on the receiving node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) kv_caches: Vec<IntegrityKvCacheConfig>,
 }
 
 impl Default for IntegrityConfig {
@@ -624,6 +673,7 @@ impl Default for IntegrityConfig {
             instance_pool_max_memory_bytes: None,
             trusted_signers: Vec::new(),
             asset_versions: BTreeMap::new(),
+            kv_caches: Vec::new(),
         }
     }
 }
