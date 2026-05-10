@@ -594,6 +594,12 @@ pub(crate) struct IntegrityConfig {
     /// propagated by the config-update gossip path after each seal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) trusted_signers: Vec<String>,
+    /// Deployed asset versions, keyed by asset name, values are SemVer strings
+    /// (e.g. `"2.4.1"`).  Written by `admin_manifest_bundle_handler` after each
+    /// successful bundle apply so subsequent applies can detect whether a higher
+    /// compatible version is already present in the cluster.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) asset_versions: BTreeMap<String, String>,
 }
 
 impl Default for IntegrityConfig {
@@ -617,6 +623,7 @@ impl Default for IntegrityConfig {
             tee_backend: None,
             instance_pool_max_memory_bytes: None,
             trusted_signers: Vec::new(),
+            asset_versions: BTreeMap::new(),
         }
     }
 }
