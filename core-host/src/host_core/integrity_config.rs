@@ -251,11 +251,15 @@ pub(crate) async fn admin_manifest_update_handler(
 
     // Verify signature + parse + validate the embedded config. This rejects
     // unsigned / tampered submissions before we touch disk.
-    let new_config = match verify_integrity_payload(
+    // The current runtime's trusted_signers extend the verification set beyond
+    // the embedded boot key, allowing cluster nodes to sign manifests.
+    let current_trusted = state.runtime.load().config.trusted_signers.clone();
+    let new_config = match verify_integrity_payload_with_trusted(
         &manifest.config_payload,
         &manifest.public_key,
         &manifest.signature,
         "admin manifest submission",
+        &current_trusted,
     ) {
         Ok(config) => config,
         Err(error) => {
@@ -1543,9 +1547,9 @@ struct BundleApplyResponse {
 }
 
 #[derive(Debug)]
-struct BundleManifestFields {
-    config_payload: String,
-    dependencies: Vec<BundleManifestDependency>,
+pub(crate) struct BundleManifestFields {
+    pub(crate) config_payload: String,
+    pub(crate) dependencies: Vec<BundleManifestDependency>,
 }
 
 #[derive(Debug)]
@@ -1808,7 +1812,7 @@ pub(crate) async fn admin_manifest_bundle_handler(
     (StatusCode::OK, axum::Json(response)).into_response()
 }
 
-fn parse_bundle_manifest_yaml(yaml: &str) -> Result<BundleManifestFields, String> {
+pub(crate) fn parse_bundle_manifest_yaml(yaml: &str) -> Result<BundleManifestFields, String> {
     let mut config_payload_lines: Vec<String> = Vec::new();
     let mut dependencies: Vec<BundleManifestDependency> = Vec::new();
 
