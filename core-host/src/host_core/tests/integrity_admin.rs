@@ -1,6 +1,101 @@
 use super::support_and_cache::*;
 use crate::*;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Bundle SemVer conflict detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn make_dep(name: &str, version: &str, source: Option<&str>) -> BundleManifestDependency {
+    BundleManifestDependency {
+        name: name.to_owned(),
+        version: version.to_owned(),
+        source: source.map(str::to_owned),
+    }
+}
+
+fn cluster(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn no_conflict_when_cluster_has_no_entry() {
+    let deps = vec![make_dep("toto", "^2.3.5", Some("./assets/toto.wasm"))];
+    let result = detect_dependency_conflicts(&deps, &cluster(&[]));
+    assert!(result.is_none());
+}
+
+#[test]
+fn no_conflict_when_cluster_version_equals_bundled() {
+    let deps = vec![make_dep("toto", "^2.3.5", Some("./assets/toto.wasm"))];
+    let result = detect_dependency_conflicts(&deps, &cluster(&[("toto", "2.3.5")]));
+    assert!(result.is_none());
+}
+
+#[test]
+fn no_conflict_when_cluster_version_is_lower() {
+    let deps = vec![make_dep("toto", "^2.3.5", Some("./assets/toto.wasm"))];
+    let result = detect_dependency_conflicts(&deps, &cluster(&[("toto", "2.3.0")]));
+    assert!(result.is_none());
+}
+
+#[test]
+fn no_conflict_when_cluster_version_does_not_satisfy_constraint() {
+    // cluster has 3.0.0 which is outside ^2.x
+    let deps = vec![make_dep("toto", "^2.3.5", Some("./assets/toto.wasm"))];
+    let result = detect_dependency_conflicts(&deps, &cluster(&[("toto", "3.0.0")]));
+    assert!(result.is_none());
+}
+
+#[test]
+fn conflict_detected_when_cluster_has_better_compatible_version() {
+    let deps = vec![make_dep("toto", "^2.3.5", Some("./assets/toto.wasm"))];
+    let result = detect_dependency_conflicts(&deps, &cluster(&[("toto", "2.4.1")]));
+    let conflicts = result.expect("conflict should be detected");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].name, "toto");
+    assert_eq!(conflicts[0].bundled_version, "2.3.5");
+    assert_eq!(conflicts[0].cluster_version, "2.4.1");
+}
+
+#[test]
+fn no_conflict_for_dep_without_local_source() {
+    // no source → not a bundled asset, no conflict possible
+    let deps = vec![make_dep("toto", "^2.3.5", None)];
+    let result = detect_dependency_conflicts(&deps, &cluster(&[("toto", "2.4.1")]));
+    assert!(result.is_none());
+}
+
+#[test]
+fn multiple_conflicts_reported() {
+    let deps = vec![
+        make_dep("alpha", "^1.0.0", Some("./assets/alpha.wasm")),
+        make_dep("beta", "~0.5.0", Some("./assets/beta.wasm")),
+        make_dep("gamma", "^3.0.0", None), // no source → no conflict
+    ];
+    let result = detect_dependency_conflicts(
+        &deps,
+        &cluster(&[("alpha", "1.2.0"), ("beta", "0.5.9"), ("gamma", "3.1.0")]),
+    );
+    let conflicts = result.expect("two conflicts should be detected");
+    assert_eq!(conflicts.len(), 2);
+    assert!(conflicts.iter().any(|c| c.name == "alpha"));
+    assert!(conflicts.iter().any(|c| c.name == "beta"));
+}
+
+#[test]
+fn extract_semver_version_strips_operators() {
+    assert_eq!(extract_semver_version("^2.3.5"), Some("2.3.5".to_owned()));
+    assert_eq!(extract_semver_version("~1.0.0"), Some("1.0.0".to_owned()));
+    assert_eq!(extract_semver_version("=3.1.4"), Some("3.1.4".to_owned()));
+    assert_eq!(extract_semver_version(">=0.9.0"), Some("0.9.0".to_owned()));
+    assert_eq!(extract_semver_version("0.1.0"), Some("0.1.0".to_owned()));
+    assert!(extract_semver_version("not-a-version").is_none());
+    assert!(extract_semver_version("^latest").is_none());
+}
+
 #[test]
 fn split_guest_stdout_removes_json_log_lines() {
     let stdout = Bytes::from(

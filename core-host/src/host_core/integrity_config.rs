@@ -1523,14 +1523,12 @@ pub(crate) fn decode_hex_array<const N: usize>(value: &str, label: &str) -> Resu
 // Smart deployment pipeline — bundle apply
 // =====================================================================
 
-const BUNDLE_FAKE_CONFLICTS_ENV: &str = "TACHYON_BUNDLE_FAKE_CONFLICTS";
-
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BundleConflictResponseEntry {
-    name: String,
-    bundled_version: String,
-    cluster_version: String,
+pub(crate) struct BundleConflictResponseEntry {
+    pub(crate) name: String,
+    pub(crate) bundled_version: String,
+    pub(crate) cluster_version: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1551,10 +1549,10 @@ struct BundleManifestFields {
 }
 
 #[derive(Debug)]
-struct BundleManifestDependency {
-    name: String,
-    version: String,
-    source: Option<String>,
+pub(crate) struct BundleManifestDependency {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) source: Option<String>,
 }
 
 pub(crate) async fn admin_manifest_bundle_handler(
@@ -1621,18 +1619,7 @@ pub(crate) async fn admin_manifest_bundle_handler(
         }
     };
 
-    if let Some(conflicts) = detect_dependency_conflicts(&manifest_fields.dependencies) {
-        let response = BundleApplyResponse {
-            success: false,
-            message: "Dependency override detected".to_owned(),
-            config_version: 0,
-            conflicts,
-            requires_resolution: true,
-        };
-        return (StatusCode::PRECONDITION_REQUIRED, axum::Json(response)).into_response();
-    }
-
-    // Parse the config payload to validate its schema and determine version.
+    // Parse the config payload early so we can validate schema before any signing.
     let mut new_config =
         match serde_json::from_str::<IntegrityConfig>(&manifest_fields.config_payload) {
             Ok(config) => config,
@@ -1644,6 +1631,22 @@ pub(crate) async fn admin_manifest_bundle_handler(
                     .into_response();
             }
         };
+
+    // Detect dependency conflicts against the cluster's current asset registry.
+    // Done before signing so a 428 never produces an integrity.lock write.
+    let cluster_versions = state.runtime.load().config.asset_versions.clone();
+    if let Some(conflicts) =
+        detect_dependency_conflicts(&manifest_fields.dependencies, &cluster_versions)
+    {
+        let response = BundleApplyResponse {
+            success: false,
+            message: "Dependency override detected".to_owned(),
+            config_version: 0,
+            conflicts,
+            requires_resolution: true,
+        };
+        return (StatusCode::PRECONDITION_REQUIRED, axum::Json(response)).into_response();
+    }
 
     // Auto-bootstrap: inject the node's own public key into trusted_signers so
     // that future reloads accept this node-signed manifest without any manual
@@ -1658,8 +1661,17 @@ pub(crate) async fn admin_manifest_bundle_handler(
         new_config.trusted_signers.push(host_pubkey_hex.clone());
     }
 
-    // Re-serialize the (possibly extended) config so the signature covers the
-    // injected trusted_signers field.
+    // Record the resolved asset versions in the config so future bundle applies
+    // can detect when the cluster already holds a better-compatible version.
+    for dep in &manifest_fields.dependencies {
+        if dep.source.is_some() {
+            if let Some(version) = extract_semver_version(&dep.version) {
+                new_config.asset_versions.insert(dep.name.clone(), version);
+            }
+        }
+    }
+
+    // Re-serialize so the signature covers trusted_signers + asset_versions.
     let signed_payload = match serde_json::to_string(&new_config) {
         Ok(json) => json,
         Err(error) => {
@@ -1901,38 +1913,71 @@ fn strip_yaml_string(value: &str) -> String {
     trimmed.to_owned()
 }
 
-fn detect_dependency_conflicts(
+/// Compares each bundled dependency that includes a local `source` asset
+/// against the cluster's current asset version registry.  A conflict is
+/// reported when the cluster already holds a version that:
+///   (a) satisfies the same SemVer constraint as the bundle, AND
+///   (b) is strictly greater than the bundled version.
+///
+/// In that situation the bundled asset would silently shadow a better
+/// available version, so the apply is halted and a 428 is returned to let the
+/// operator decide whether to use the cluster version or pin the local one.
+pub(crate) fn detect_dependency_conflicts(
     dependencies: &[BundleManifestDependency],
+    cluster_versions: &std::collections::BTreeMap<String, String>,
 ) -> Option<Vec<BundleConflictResponseEntry>> {
-    let raw = std::env::var(BUNDLE_FAKE_CONFLICTS_ENV).ok()?;
-    let mut overrides: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for entry in raw.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
+    let mut conflicts = Vec::new();
+
+    for dep in dependencies {
+        // Only local-asset deps can shadow a cluster version.
+        if dep.source.is_none() {
             continue;
         }
-        if let Some((name, version)) = entry.split_once('=') {
-            overrides.insert(name.trim().to_owned(), version.trim().to_owned());
+
+        let cluster_ver_str = match cluster_versions.get(&dep.name) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let constraint = match semver::VersionReq::parse(&dep.version) {
+            Ok(req) => req,
+            Err(_) => continue,
+        };
+        let bundled_ver = match extract_semver_version(&dep.version)
+            .as_deref()
+            .and_then(|v| semver::Version::parse(v).ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let cluster_ver = match semver::Version::parse(cluster_ver_str.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Conflict: cluster has a better version that still satisfies the req.
+        if cluster_ver > bundled_ver && constraint.matches(&cluster_ver) {
+            conflicts.push(BundleConflictResponseEntry {
+                name: dep.name.clone(),
+                bundled_version: bundled_ver.to_string(),
+                cluster_version: cluster_ver.to_string(),
+            });
         }
     }
-    if overrides.is_empty() {
-        return None;
-    }
-    let mut conflicts = Vec::new();
-    for dep in dependencies {
-        if let Some(cluster_version) = overrides.get(&dep.name) {
-            if dep.source.is_some() {
-                conflicts.push(BundleConflictResponseEntry {
-                    name: dep.name.clone(),
-                    bundled_version: dep.version.trim_start_matches(['^', '~', '=']).to_owned(),
-                    cluster_version: cluster_version.clone(),
-                });
-            }
-        }
-    }
+
     if conflicts.is_empty() {
         None
     } else {
         Some(conflicts)
     }
+}
+
+/// Strips SemVer range operators (`^`, `~`, `>=`, `>`, `<=`, `<`, `=`) from
+/// the start of a version constraint string and returns the bare version
+/// portion if it parses as a valid `semver::Version`.
+pub(crate) fn extract_semver_version(constraint: &str) -> Option<String> {
+    let stripped = constraint
+        .trim()
+        .trim_start_matches(['^', '~', '=', '>', '<', ' ']);
+    semver::Version::parse(stripped).ok().map(|v| v.to_string())
 }
