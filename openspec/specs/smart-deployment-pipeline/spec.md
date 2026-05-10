@@ -15,24 +15,25 @@ client.
 - **AND** it does not contain `publicKey` or `signature` fields
 
 ### Requirement: Server-Side Resolution and Locking
-The core host SHALL sign the `integrity.lock` produced by a bundle apply with
-the receiving node's own Ed25519 `HostIdentity` key instead of delegating
-signing authority to the client workstation.
+The core host SHALL automatically inject its own Ed25519 public key into the
+`trusted_signers` list of the `IntegrityConfig` before signing and writing the
+`integrity.lock`, so that subsequent reloads accept the node-signed manifest
+without any manual operator step.
 
-#### Scenario: Bundle manifest requires no client signature
-- **GIVEN** the client POSTs a bundle whose `manifest.yaml` contains only
-  `configPayload` and optional `dependencies`
-- **WHEN** the host processes the bundle
-- **THEN** the host signs the `configPayload` with its own `HostIdentity.signing_key`
-- **AND** the written `integrity.lock` carries the node's public key, not the
-  client's
+#### Scenario: First bundle apply self-bootstraps trusted_signers
+- **GIVEN** a fresh node whose config has an empty `trusted_signers` list
+- **WHEN** an admin applies a deployment bundle for the first time
+- **THEN** the written `integrity.lock` contains the node's public key in
+  `trusted_signers`
+- **AND** the node can reload the manifest after a reboot without operator
+  intervention
 
-#### Scenario: Peer nodes can trust the signing node
-- **GIVEN** node A's public key has been added to the `trusted_signers` list of
-  node B's sealed config
-- **WHEN** node B verifies a manifest signed by node A via gossip
-- **THEN** the verification succeeds
-- **AND** node B accepts and applies the manifest
+#### Scenario: Injection is idempotent
+- **GIVEN** the node's public key is already present in `trusted_signers`
+- **WHEN** a subsequent bundle apply is performed
+- **THEN** `trusted_signers` contains exactly one entry for that key
+- **AND** the resulting `integrity.lock` is otherwise identical to what it
+  would be without the injection
 
 ### Requirement: Override Conflict Detection
 The core host SHALL detect when a bundled asset's pinned version is
