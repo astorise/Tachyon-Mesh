@@ -137,6 +137,8 @@ export class TachyonTopologyCanvas extends HTMLElement {
   private nodes: TopologyNode[] = [];
   private edges: TopologyEdge[] = [];
   private selectedId: string | null = null;
+  private dragState: { nodeId: string; offsetX: number; offsetY: number } | null = null;
+  private didDrag = false;
 
   constructor() {
     super();
@@ -169,18 +171,7 @@ export class TachyonTopologyCanvas extends HTMLElement {
   private render(): void {
     const width = 960;
     const height = 540;
-    const edgeSvg = this.edges
-      .map((edge) => {
-        const from = this.nodes.find((n) => n.id === edge.from);
-        const to = this.nodes.find((n) => n.id === edge.to);
-        if (!from || !to) return "";
-        const x1 = from.x + 128;
-        const y1 = from.y + 36;
-        const x2 = to.x + 128;
-        const y2 = to.y + 36;
-        return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="rgba(34,211,238,0.5)" stroke-width="1.5" stroke-dasharray="4 3"/>`;
-      })
-      .join("");
+    const edgeSvg = this.buildEdgeSvg();
 
     const nodeBlocks = this.nodes
       .map((node) => {
@@ -188,7 +179,9 @@ export class TachyonTopologyCanvas extends HTMLElement {
         const isSelected = node.id === this.selectedId;
         const ring = isSelected ? "ring-2 ring-cyan-300" : "";
         return `
-          <button data-node-id="${this.escape(node.id)}" type="button" class="absolute p-3 rounded-xl border-2 backdrop-blur-md w-64 cursor-pointer transition-colors text-left ${theme.card} ${ring}" style="left: ${node.x}px; top: ${node.y}px;">
+          <button data-node-id="${this.escape(node.id)}" type="button"
+            class="absolute p-3 rounded-xl border-2 backdrop-blur-md w-64 touch-none select-none text-left ${theme.card} ${ring}"
+            style="left: ${node.x}px; top: ${node.y}px; cursor: grab;">
             <div class="flex items-center gap-3 mb-2">
               <span class="inline-flex h-8 w-8 items-center justify-center rounded ${theme.iconBg} font-bold">${theme.glyph}</span>
               <div class="flex-1">
@@ -206,14 +199,69 @@ export class TachyonTopologyCanvas extends HTMLElement {
       .join("");
 
     this.root.innerHTML = `
-      <div class="relative h-[540px] w-full overflow-hidden rounded-lg border border-slate-800 bg-slate-950/60 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.08),transparent_50%)]">
-        <svg class="absolute inset-0 pointer-events-none" width="${width}" height="${height}">${edgeSvg}</svg>
+      <div id="canvas-container" class="relative h-[540px] w-full overflow-hidden rounded-lg border border-slate-800 bg-slate-950/60 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.08),transparent_50%)]">
+        <svg id="canvas-svg" class="absolute inset-0 pointer-events-none" width="${width}" height="${height}">${edgeSvg}</svg>
         ${nodeBlocks}
       </div>
     `;
 
     this.root.querySelectorAll<HTMLButtonElement>("[data-node-id]").forEach((button) => {
-      button.addEventListener("click", () => {
+      button.addEventListener("pointerdown", (event) => {
+        this.didDrag = false;
+        this.dragState = {
+          nodeId: button.dataset.nodeId ?? "",
+          offsetX: event.offsetX,
+          offsetY: event.offsetY,
+        };
+        button.setPointerCapture(event.pointerId);
+        button.style.cursor = "grabbing";
+        button.style.zIndex = "10";
+      });
+
+      button.addEventListener("pointermove", (event) => {
+        if (!this.dragState || this.dragState.nodeId !== (button.dataset.nodeId ?? "")) return;
+        const container = this.root.getElementById("canvas-container");
+        if (!container) return;
+        const rect = container.getBoundingClientRect();
+        const newX = Math.max(0, Math.min(rect.width - 256, event.clientX - rect.left - this.dragState.offsetX));
+        const newY = Math.max(0, Math.min(rect.height - 80, event.clientY - rect.top - this.dragState.offsetY));
+        button.style.left = `${newX}px`;
+        button.style.top = `${newY}px`;
+        this.didDrag = true;
+        this.updateEdgeSvgLive();
+      });
+
+      button.addEventListener("pointerup", (event) => {
+        if (!this.dragState || this.dragState.nodeId !== (button.dataset.nodeId ?? "")) return;
+        button.style.cursor = "grab";
+        button.style.zIndex = "";
+        if (this.didDrag) {
+          const container = this.root.getElementById("canvas-container");
+          const rect = container?.getBoundingClientRect();
+          if (rect) {
+            const newX = Math.max(0, Math.min(rect.width - 256, event.clientX - rect.left - this.dragState.offsetX));
+            const newY = Math.max(0, Math.min(rect.height - 80, event.clientY - rect.top - this.dragState.offsetY));
+            const nodeId = this.dragState.nodeId;
+            this.nodes = this.nodes.map((n) => (n.id === nodeId ? { ...n, x: Math.round(newX), y: Math.round(newY) } : n));
+            this.dispatchEvent(
+              new CustomEvent("topology:node-moved", {
+                bubbles: true,
+                composed: true,
+                detail: { nodeId, x: Math.round(newX), y: Math.round(newY) },
+              }),
+            );
+          }
+          this.updateEdgeSvgLive();
+        }
+        this.dragState = null;
+      });
+
+      button.addEventListener("click", (event) => {
+        if (this.didDrag) {
+          event.stopPropagation();
+          this.didDrag = false;
+          return;
+        }
         const id = button.dataset.nodeId ?? "";
         this.dispatchEvent(
           new CustomEvent("topology:node-selected", {
@@ -223,6 +271,37 @@ export class TachyonTopologyCanvas extends HTMLElement {
           }),
         );
       });
+    });
+  }
+
+  private buildEdgeSvg(): string {
+    return this.edges
+      .map((edge) => {
+        const from = this.nodes.find((n) => n.id === edge.from);
+        const to = this.nodes.find((n) => n.id === edge.to);
+        if (!from || !to) return "";
+        return `<line data-edge-id="${this.escape(edge.id)}" x1="${from.x + 128}" y1="${from.y + 36}" x2="${to.x + 128}" y2="${to.y + 36}" stroke="rgba(34,211,238,0.5)" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+      })
+      .join("");
+  }
+
+  private updateEdgeSvgLive(): void {
+    const container = this.root.getElementById("canvas-container");
+    if (!container) return;
+    this.edges.forEach((edge) => {
+      const line = this.root.querySelector<SVGLineElement>(`[data-edge-id="${edge.id}"]`);
+      if (!line) return;
+      const fromBtn = this.root.querySelector<HTMLButtonElement>(`[data-node-id="${edge.from}"]`);
+      const toBtn = this.root.querySelector<HTMLButtonElement>(`[data-node-id="${edge.to}"]`);
+      if (!fromBtn || !toBtn) return;
+      const fromLeft = parseFloat(fromBtn.style.left) || 0;
+      const fromTop = parseFloat(fromBtn.style.top) || 0;
+      const toLeft = parseFloat(toBtn.style.left) || 0;
+      const toTop = parseFloat(toBtn.style.top) || 0;
+      line.setAttribute("x1", String(fromLeft + 128));
+      line.setAttribute("y1", String(fromTop + 36));
+      line.setAttribute("x2", String(toLeft + 128));
+      line.setAttribute("y2", String(toTop + 36));
     });
   }
 
@@ -283,7 +362,8 @@ export class TachyonNodeEditor extends HTMLElement {
             <input id="node-label" type="text" value="${this.escape(this.node.label)}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 outline-none focus:border-cyan-400" />
           </label>
           ${this.renderTypeFields()}
-          <div class="flex justify-end gap-2 pt-3">
+          <div class="flex items-center justify-between gap-2 pt-3">
+            <button id="btn-delete-node" type="button" class="rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/20">${t("topology.editor.delete")}</button>
             <button type="submit" class="rounded border border-cyan-500/50 bg-cyan-500/15 px-3 py-2 text-xs font-medium text-cyan-200 hover:bg-cyan-500/25">${t("topology.editor.save")}</button>
           </div>
         </form>
@@ -295,6 +375,17 @@ export class TachyonNodeEditor extends HTMLElement {
         new CustomEvent("topology:editor-closed", {
           bubbles: true,
           composed: true,
+        }),
+      );
+    });
+
+    this.root.getElementById("btn-delete-node")?.addEventListener("click", () => {
+      if (!this.node) return;
+      this.dispatchEvent(
+        new CustomEvent("topology:node-delete", {
+          bubbles: true,
+          composed: true,
+          detail: { nodeId: this.node.id },
         }),
       );
     });
@@ -471,6 +562,10 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
   }
 
   private render(): void {
+    const typeOptions = (Object.keys(NODE_THEMES) as TopologyNodeType[])
+      .map((type) => `<option value="${type}">${t(`topology.type.${type}`)}</option>`)
+      .join("");
+
     this.renderTemplate(`
       <section class="p-6 space-y-6 text-slate-300">
         <header data-stagger-panel class="flex items-end justify-between gap-4 border-l-4 border-cyan-500 pl-4">
@@ -484,6 +579,21 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         <article data-stagger-panel>
           <tachyon-topology-canvas></tachyon-topology-canvas>
           <tachyon-node-editor></tachyon-node-editor>
+        </article>
+
+        <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-4">
+          <h3 class="mb-3 text-xs uppercase tracking-widest text-cyan-300">${t("topology.add.title")}</h3>
+          <form id="add-node-form" class="flex flex-wrap items-end gap-3">
+            <label class="block text-xs text-slate-400">${t("topology.add.type")}
+              <select id="add-node-type" class="mt-1 rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-cyan-400">
+                ${typeOptions}
+              </select>
+            </label>
+            <label class="block text-xs text-slate-400">${t("topology.add.label")}
+              <input id="add-node-label" type="text" class="mt-1 rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-cyan-400" style="width: 180px;" />
+            </label>
+            <button type="submit" class="rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-200 hover:bg-cyan-500/20">${t("topology.add.submit")}</button>
+          </form>
         </article>
 
         <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-4">
@@ -520,6 +630,11 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
       );
     });
 
+    this.root.getElementById("add-node-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      this.addNode();
+    });
+
     const canvas = this.canvas();
     canvas?.addEventListener("topology:node-selected", (event) => {
       const id = (event as CustomEvent<{ nodeId: string }>).detail.nodeId;
@@ -527,6 +642,14 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
       const node = this.nodes.find((n) => n.id === id) ?? null;
       this.editor()?.setNode(node);
       canvas.setSelected(id);
+    });
+
+    canvas?.addEventListener("topology:node-moved", (event) => {
+      const { nodeId, x, y } = (event as CustomEvent<{ nodeId: string; x: number; y: number }>).detail;
+      const index = this.nodes.findIndex((n) => n.id === nodeId);
+      if (index >= 0) {
+        this.nodes[index] = { ...this.nodes[index], x, y };
+      }
     });
 
     const editor = this.editor();
@@ -539,11 +662,34 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         this.showFeedback("success", t("topology.feedback.updated"));
       }
     });
+    editor?.addEventListener("topology:node-delete", (event) => {
+      const { nodeId } = (event as CustomEvent<{ nodeId: string }>).detail;
+      this.nodes = this.nodes.filter((n) => n.id !== nodeId);
+      this.edges = this.edges.filter((e) => e.from !== nodeId && e.to !== nodeId);
+      this.selectedId = null;
+      this.editor()?.setNode(null);
+      this.pushGraphToCanvas();
+      this.showFeedback("success", t("topology.feedback.deleted"));
+    });
     editor?.addEventListener("topology:editor-closed", () => {
       this.selectedId = null;
       this.editor()?.setNode(null);
       this.canvas()?.setSelected(null);
     });
+  }
+
+  private addNode(): void {
+    const typeEl = this.root.getElementById("add-node-type") as HTMLSelectElement | null;
+    const labelEl = this.root.getElementById("add-node-label") as HTMLInputElement | null;
+    const type = (typeEl?.value ?? "endpoint") as TopologyNodeType;
+    const label = labelEl?.value.trim() || t(`topology.type.${type}`);
+    const id = `node-${Date.now()}`;
+    const x = 24 + Math.floor(Math.random() * 480);
+    const y = 24 + Math.floor(Math.random() * 380);
+    this.nodes.push({ id, type, label, x, y, data: {} });
+    if (labelEl) labelEl.value = "";
+    this.pushGraphToCanvas();
+    this.showFeedback("success", t("topology.feedback.added"));
   }
 
   private refresh(): void {

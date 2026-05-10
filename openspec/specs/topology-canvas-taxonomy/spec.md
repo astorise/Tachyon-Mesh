@@ -23,22 +23,22 @@ and badge slot. The eight types SHALL be `endpoint`, `system-faas`,
 - **AND** the rendering does not crash the canvas
 
 ### Requirement: Topology Canvas Web Component
-Tachyon-UI SHALL expose a `<tachyon-topology-canvas>` web component
-that accepts a `nodes` array and an `edges` array as data, renders
-nodes as positioned `<div>` blocks, draws edges as SVG lines between
-node anchors, and emits `topology:node-selected` when a node is
-clicked.
+The `<tachyon-topology-canvas>` component SHALL support pointer-based
+drag-and-drop repositioning of nodes, updating SVG edges in real time
+during the drag and committing the final position via a
+`topology:node-moved` event on release.
 
-#### Scenario: Canvas paints nodes from data
-- **WHEN** the canvas is mounted with a `nodes` array containing
-  positioned entries
-- **THEN** every node is rendered at its declared coordinates
-- **AND** every edge is rendered as an SVG line connecting two nodes
+#### Scenario: Drag repositions a node
+- **WHEN** the operator presses and holds on a node then moves the pointer
+- **THEN** the node follows the pointer within the canvas bounds
+- **AND** the SVG edges connecting that node update their endpoints live
+- **AND** releasing the pointer emits `topology:node-moved` with the final
+  coordinates
 
-#### Scenario: Click selects a node and fires an event
-- **WHEN** the operator clicks a node block
-- **THEN** the canvas dispatches a `topology:node-selected` custom
-  event whose `detail.nodeId` matches the clicked node identifier
+#### Scenario: Click after drag does not select
+- **WHEN** the operator drags a node and releases
+- **THEN** the subsequent implicit click event is suppressed
+- **AND** no `topology:node-selected` event is dispatched for that release
 
 ### Requirement: Contextual Node Editor
 Tachyon-UI SHALL expose a `<tachyon-node-editor>` web component that
@@ -72,4 +72,28 @@ event that emits a JSON object containing a `nodes` array and an
 - **THEN** the canvas dispatches `topology:serialize`
 - **AND** the event detail contains both `nodes` and `edges` arrays
 - **AND** every node entry carries the `type` it was rendered with
+
+### Requirement: Add-Node Toolbar
+`<tachyon-topology-panel>` SHALL expose a form with a node-type selector
+and a label input that, when submitted, inserts a new node at a random
+position inside the visible canvas area.
+
+#### Scenario: Add node with type and label
+- **GIVEN** the operator selects a type and enters a label in the toolbar
+- **WHEN** they submit the add form
+- **THEN** a new node with a unique id appears on the canvas at a random
+  position
+- **AND** `topology.feedback.added` is displayed in the feedback zone
+
+### Requirement: Delete Node from Editor
+`<tachyon-node-editor>` SHALL expose a "Delete node" button that emits
+`topology:node-delete`. The parent panel SHALL remove the node and all
+edges that reference it and close the editor.
+
+#### Scenario: Delete removes node and connected edges
+- **GIVEN** a node is selected and the editor is open
+- **WHEN** the operator clicks "Delete node"
+- **THEN** the node is removed from the canvas
+- **AND** all edges that had that node as `from` or `to` are also removed
+- **AND** the editor closes
 
