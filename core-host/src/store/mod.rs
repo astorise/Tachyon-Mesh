@@ -9,6 +9,10 @@ use std::{
 };
 
 const CWASM_CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cwasm_cache");
+/// LLM inference KV-cache entries. Key format: `{model_ref}/{tenant}/{cache_key}`.
+/// The `model_ref` segment isolates entries per LLM so they are never served to
+/// a node that doesn't host the corresponding model.
+const KV_CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kv_cache");
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 const CWASM_ENGINE_HASH_KEY: &str = "cwasm_engine_hash";
 const TLS_CERTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tls_certs");
@@ -164,6 +168,9 @@ impl CoreStore {
             write_txn
                 .open_table(CONFIG_UPDATE_OUTBOX_TABLE)
                 .context("failed to open config_update_outbox table")?;
+            write_txn
+                .open_table(KV_CACHE_TABLE)
+                .context("failed to open kv_cache table")?;
         }
         write_txn
             .commit()
@@ -586,6 +593,158 @@ impl CoreStore {
         Ok(removed)
     }
 
+    // ── KV-cache (LLM inference token cache, isolated per model) ────────────
+
+    pub(crate) fn kv_cache_get(
+        &self,
+        model_ref: &str,
+        tenant: &str,
+        cache_key: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = kv_cache_key(model_ref, tenant, cache_key)?;
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("failed to begin kv_cache read transaction")?;
+        let table = read_txn
+            .open_table(KV_CACHE_TABLE)
+            .context("failed to open kv_cache table")?;
+        let Some(raw) = table.get(key.as_str())? else {
+            return Ok(None);
+        };
+        let entry: KvCacheEntry =
+            serde_json::from_slice(raw.value()).context("failed to deserialize kv_cache entry")?;
+        // Evict expired entries on read.
+        if entry.is_expired() {
+            drop(raw);
+            drop(table);
+            drop(read_txn);
+            let _ = self.kv_cache_delete(model_ref, tenant, cache_key);
+            return Ok(None);
+        }
+        Ok(Some(entry.value))
+    }
+
+    pub(crate) fn kv_cache_put(
+        &self,
+        model_ref: &str,
+        tenant: &str,
+        cache_key: &str,
+        value: &[u8],
+        ttl_seconds: Option<u64>,
+    ) -> Result<()> {
+        let key = kv_cache_key(model_ref, tenant, cache_key)?;
+        let entry = KvCacheEntry::new(value.to_vec(), ttl_seconds);
+        let payload = serde_json::to_vec(&entry).context("failed to serialize kv_cache entry")?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("failed to begin kv_cache write transaction")?;
+        {
+            write_txn
+                .open_table(KV_CACHE_TABLE)
+                .context("failed to open kv_cache table")?
+                .insert(key.as_str(), payload.as_slice())
+                .context("failed to insert kv_cache entry")?;
+        }
+        write_txn
+            .commit()
+            .context("failed to commit kv_cache write transaction")
+    }
+
+    pub(crate) fn kv_cache_delete(
+        &self,
+        model_ref: &str,
+        tenant: &str,
+        cache_key: &str,
+    ) -> Result<()> {
+        let key = kv_cache_key(model_ref, tenant, cache_key)?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("failed to begin kv_cache delete transaction")?;
+        {
+            write_txn
+                .open_table(KV_CACHE_TABLE)
+                .context("failed to open kv_cache table")?
+                .remove(key.as_str())
+                .context("failed to delete kv_cache entry")?;
+        }
+        write_txn
+            .commit()
+            .context("failed to commit kv_cache delete transaction")
+    }
+
+    /// Delete all cache entries whose key begins with `{model_ref}/`.
+    /// Returns the number of evicted entries.
+    pub(crate) fn kv_cache_evict_model(&self, model_ref: &str) -> Result<usize> {
+        let prefix = format!("{}/", sanitize_kv_key_part(model_ref, "model_ref")?);
+        // Upper bound: replace the trailing '/' (0x2F) with '0' (0x30).
+        let upper = format!("{}0", sanitize_kv_key_part(model_ref, "model_ref")?);
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("failed to begin kv_cache evict transaction")?;
+        let evicted;
+        {
+            let mut table = write_txn
+                .open_table(KV_CACHE_TABLE)
+                .context("failed to open kv_cache table")?;
+            let keys_to_delete: Vec<String> = table
+                .range(prefix.as_str()..upper.as_str())?
+                .filter_map(|entry| entry.ok())
+                .filter(|(k, _)| k.value().starts_with(prefix.as_str()))
+                .map(|(k, _)| k.value().to_owned())
+                .collect();
+            evicted = keys_to_delete.len();
+            for key in &keys_to_delete {
+                table
+                    .remove(key.as_str())
+                    .context("failed to remove kv_cache entry during eviction")?;
+            }
+        }
+        write_txn
+            .commit()
+            .context("failed to commit kv_cache eviction transaction")?;
+        Ok(evicted)
+    }
+
+    /// Count of live (non-expired) entries for `model_ref` and total bytes stored.
+    pub(crate) fn kv_cache_stats(&self, model_ref: &str) -> Result<KvCacheStats> {
+        let prefix = format!("{}/", sanitize_kv_key_part(model_ref, "model_ref")?);
+        let upper = format!("{}0", sanitize_kv_key_part(model_ref, "model_ref")?);
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("failed to begin kv_cache stats transaction")?;
+        let table = read_txn
+            .open_table(KV_CACHE_TABLE)
+            .context("failed to open kv_cache table")?;
+        let mut entry_count: usize = 0;
+        let mut total_bytes: usize = 0;
+        let mut expired_count: usize = 0;
+        for result in table.range(prefix.as_str()..upper.as_str())? {
+            let (k, v) = result?;
+            if !k.value().starts_with(prefix.as_str()) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<KvCacheEntry>(v.value()) {
+                if entry.is_expired() {
+                    expired_count += 1;
+                } else {
+                    entry_count += 1;
+                    total_bytes += entry.value.len();
+                }
+            }
+        }
+        Ok(KvCacheStats {
+            entry_count,
+            total_bytes,
+            expired_count,
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn load_vector_index(&self, key: &str) -> Result<VectorIndex> {
         let Some(payload) = self.get(CoreStoreBucket::VectorIndices, key)? else {
@@ -593,6 +752,66 @@ impl CoreStore {
         };
         serde_json::from_slice(&payload).context("failed to deserialize vector index")
     }
+}
+
+// ── KV-cache support types and helpers ──────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct KvCacheEntry {
+    pub(crate) value: Vec<u8>,
+    /// Unix timestamp (seconds) after which this entry is considered stale.
+    /// `None` means the entry never expires.
+    pub(crate) expires_at: Option<u64>,
+}
+
+impl KvCacheEntry {
+    fn new(value: Vec<u8>, ttl_seconds: Option<u64>) -> Self {
+        let expires_at = ttl_seconds.map(|ttl| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .saturating_add(ttl)
+        });
+        Self { value, expires_at }
+    }
+
+    fn is_expired(&self) -> bool {
+        let Some(expires_at) = self.expires_at else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now >= expires_at
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct KvCacheStats {
+    pub(crate) entry_count: usize,
+    pub(crate) total_bytes: usize,
+    pub(crate) expired_count: usize,
+}
+
+/// Compose a storage key: `{model_ref}/{tenant}/{cache_key}`.
+/// Model_ref and tenant may not contain `/` to keep prefix scans unambiguous.
+fn kv_cache_key(model_ref: &str, tenant: &str, cache_key: &str) -> Result<String> {
+    let model = sanitize_kv_key_part(model_ref, "model_ref")?;
+    let t = sanitize_kv_key_part(tenant, "tenant")?;
+    if cache_key.is_empty() {
+        anyhow::bail!("kv cache_key must not be empty");
+    }
+    Ok(format!("{model}/{t}/{cache_key}"))
+}
+
+fn sanitize_kv_key_part(value: &str, label: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') {
+        anyhow::bail!("invalid kv-cache {label} `{value}`: must be non-empty and contain no slashes");
+    }
+    Ok(trimmed.to_owned())
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

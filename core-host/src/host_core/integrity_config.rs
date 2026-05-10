@@ -404,10 +404,40 @@ pub(crate) fn validate_integrity_config(mut config: IntegrityConfig) -> Result<I
     config.batch_targets = normalize_batch_targets(config.batch_targets)?;
     config.routes = normalize_config_routes(config.routes, !config.batch_targets.is_empty())?;
     validate_tee_requirements(&config)?;
+    validate_kv_caches(&config)?;
     let route_registry = RouteRegistry::build(&config)?;
     config.resources = normalize_resources(config.resources, &config.routes, &route_registry)?;
     config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
     Ok(config)
+}
+
+pub(crate) fn validate_kv_caches(config: &IntegrityConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for cache in &config.kv_caches {
+        if cache.name.trim().is_empty() {
+            anyhow::bail!("Integrity Validation Failed: kv_caches entry has an empty `name`");
+        }
+        if cache.model_ref.trim().is_empty() {
+            anyhow::bail!(
+                "Integrity Validation Failed: kv_caches entry `{}` has an empty `model_ref`",
+                cache.name
+            );
+        }
+        if cache.model_ref.contains('/') || cache.model_ref.contains('\\') {
+            anyhow::bail!(
+                "Integrity Validation Failed: kv_caches entry `{}` has an invalid `model_ref` \
+                 (slashes are not allowed)",
+                cache.name
+            );
+        }
+        if !seen_names.insert(cache.name.clone()) {
+            anyhow::bail!(
+                "Integrity Validation Failed: duplicate kv_caches name `{}`",
+                cache.name
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_tee_requirements(config: &IntegrityConfig) -> Result<()> {
