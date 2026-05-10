@@ -68,10 +68,18 @@ fn parse_manifest_yaml_parses_dependencies_with_source() {
     );
     let result = parse_bundle_manifest_yaml(&yaml).expect("should parse");
     assert_eq!(result.dependencies.len(), 2);
-    let alpha = result.dependencies.iter().find(|d| d.name == "alpha").unwrap();
+    let alpha = result
+        .dependencies
+        .iter()
+        .find(|d| d.name == "alpha")
+        .unwrap();
     assert_eq!(alpha.version, "^2.0.0");
     assert_eq!(alpha.source.as_deref(), Some("./assets/alpha.wasm"));
-    let beta = result.dependencies.iter().find(|d| d.name == "beta").unwrap();
+    let beta = result
+        .dependencies
+        .iter()
+        .find(|d| d.name == "beta")
+        .unwrap();
     assert!(beta.source.is_none());
 }
 
@@ -502,7 +510,13 @@ fn bundle_config(version: u64) -> IntegrityConfig {
 
 fn make_bundle_bytes_for(config: &IntegrityConfig) -> Vec<u8> {
     let json = serde_json::to_string(config).expect("config serializes");
-    let yaml = format!("configPayload: |\n{}\n", json.lines().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"));
+    let yaml = format!(
+        "configPayload: |\n{}\n",
+        json.lines()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     tar_gz_bundle(&yaml)
 }
 
@@ -553,11 +567,16 @@ async fn bundle_handler_valid_bundle_returns_200_and_increments_version() {
     let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .expect("body collects");
-    let result: serde_json::Value =
-        serde_json::from_slice(&body_bytes).expect("response is JSON");
+    let result: serde_json::Value = serde_json::from_slice(&body_bytes).expect("response is JSON");
     assert_eq!(result["success"], true);
     assert_eq!(result["configVersion"], 5);
-    assert!(result["conflicts"].is_null() || result["conflicts"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+    assert!(
+        result["conflicts"].is_null()
+            || result["conflicts"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true)
+    );
 }
 
 #[tokio::test]
@@ -577,7 +596,9 @@ async fn bundle_handler_rollback_returns_409() {
 async fn bundle_handler_dependency_conflict_returns_428() {
     let mut current = bundle_config(1);
     // Seed the cluster registry with a better-compatible version of "mylib".
-    current.asset_versions.insert("mylib".to_owned(), "2.5.0".to_owned());
+    current
+        .asset_versions
+        .insert("mylib".to_owned(), "2.5.0".to_owned());
     current.config_version = 1;
     let telemetry = telemetry::init_test_telemetry();
     let state = build_test_state(current.clone(), telemetry);
@@ -598,8 +619,7 @@ async fn bundle_handler_dependency_conflict_returns_428() {
     let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .expect("body collects");
-    let result: serde_json::Value =
-        serde_json::from_slice(&body_bytes).expect("response is JSON");
+    let result: serde_json::Value = serde_json::from_slice(&body_bytes).expect("response is JSON");
     assert_eq!(result["success"], false);
     assert_eq!(result["requiresResolution"], true);
     let conflicts = result["conflicts"].as_array().expect("conflicts array");

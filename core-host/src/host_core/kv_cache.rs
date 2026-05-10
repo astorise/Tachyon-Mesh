@@ -47,10 +47,7 @@ fn cache_config_for<'a>(
     config: &'a IntegrityConfig,
     model_ref: &str,
 ) -> Option<&'a IntegrityKvCacheConfig> {
-    config
-        .kv_caches
-        .iter()
-        .find(|c| c.model_ref == model_ref)
+    config.kv_caches.iter().find(|c| c.model_ref == model_ref)
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
