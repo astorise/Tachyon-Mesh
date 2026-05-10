@@ -1,9 +1,7 @@
 ## Purpose
 
 Define the Tachyon UI localization and guided onboarding behavior for the Web Components shell.
-
 ## Requirements
-
 ### Requirement: Tachyon UI exposes a lightweight translation engine
 The Tachyon UI SHALL provide a dependency-free i18n utility with English and French dictionaries, dot-notated keys, language persistence, and a global reactive language-change event.
 
@@ -19,17 +17,17 @@ The Tachyon UI SHALL provide a dependency-free i18n utility with English and Fre
 - **AND** otherwise returns the requested key
 
 ### Requirement: Shell and overview text react to language changes
-The Tachyon app shell and overview panel SHALL consume the i18n utility for user-facing navigation, header, dashboard, and overview telemetry labels.
+Every operator-visible string in all Tachyon-UI domain panels SHALL be
+sourced from `utils/i18n.ts` rather than hardcoded. Each panel SHALL
+subscribe to the `i18n:language-changed` event and re-render so the
+language toggle takes immediate effect.
 
-#### Scenario: Shell language toggle updates visible shell text
-- **WHEN** the operator changes the header language selector
-- **THEN** the shell updates navigation, header, and dashboard labels without a page reload
-- **AND** the current route remains selected
-
-#### Scenario: Overview panel refreshes localized text
-- **WHEN** the global `i18n:language-changed` event fires
-- **THEN** `<tachyon-overview-panel>` re-renders its labels and telemetry descriptions in the active language
-- **AND** it preserves the latest displayed metric values
+#### Scenario: Language toggle propagates to all domain panels
+- **WHEN** the operator switches the shell language to `fr`
+- **THEN** the headings, field labels, option text, placeholders, buttons,
+  and feedback messages in AI, Hardware, Identity, RBAC, Workloads, Fleet,
+  SupplyChain, and Resilience panels render in French
+- **AND** the change takes effect without a page reload
 
 ### Requirement: Tachyon UI provides a guided tour component
 The Tachyon UI SHALL provide a `<tachyon-guided-tour>` Web Component that explains key shell areas and uses GSAP to highlight target elements.
@@ -56,3 +54,4 @@ The Tachyon app shell header SHALL include a compact EN/FR selector and a Help/T
 #### Scenario: Operator launches tour from the header
 - **WHEN** the operator clicks the Help/Tour button
 - **THEN** the existing `<tachyon-guided-tour>` instance starts from the first step
+
