@@ -809,7 +809,9 @@ fn kv_cache_key(model_ref: &str, tenant: &str, cache_key: &str) -> Result<String
 fn sanitize_kv_key_part(value: &str, label: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') {
-        anyhow::bail!("invalid kv-cache {label} `{value}`: must be non-empty and contain no slashes");
+        anyhow::bail!(
+            "invalid kv-cache {label} `{value}`: must be non-empty and contain no slashes"
+        );
     }
     Ok(trimmed.to_owned())
 }

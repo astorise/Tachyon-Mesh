@@ -7,10 +7,7 @@ use crate::*;
 
 fn open_test_store() -> Arc<store::CoreStore> {
     let dir = unique_test_dir("kv-cache-store");
-    Arc::new(
-        store::CoreStore::open(&dir.join("core.db"))
-            .expect("test core store should open"),
-    )
+    Arc::new(store::CoreStore::open(&dir.join("core.db")).expect("test core store should open"))
 }
 
 #[test]
@@ -106,7 +103,13 @@ fn kv_cache_evict_model_removes_only_target_model() {
     }
     for i in 0..2 {
         store
-            .kv_cache_put("mistral-7b", "tenant-a", &format!("ctx:{i}"), b"mistral", None)
+            .kv_cache_put(
+                "mistral-7b",
+                "tenant-a",
+                &format!("ctx:{i}"),
+                b"mistral",
+                None,
+            )
             .expect("mistral put");
     }
 
@@ -148,7 +151,10 @@ fn kv_cache_expired_entry_returns_none_on_read() {
     let result = store
         .kv_cache_get("llama-3", "tenant-a", "ctx:ttl")
         .expect("get expired entry");
-    assert!(result.is_none(), "expired entry should be treated as absent");
+    assert!(
+        result.is_none(),
+        "expired entry should be treated as absent"
+    );
 }
 
 #[test]
@@ -245,11 +251,9 @@ async fn kv_cache_evict_returns_eviction_count() {
             .expect("pre-populate");
     }
 
-    let response = kv_cache::kv_cache_evict_handler(
-        State(state),
-        axum::extract::Path("llama-3".to_owned()),
-    )
-    .await;
+    let response =
+        kv_cache::kv_cache_evict_handler(State(state), axum::extract::Path("llama-3".to_owned()))
+            .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 1024)
         .await
@@ -268,11 +272,9 @@ async fn kv_cache_stats_returns_json_summary() {
             .expect("pre-populate");
     }
 
-    let response = kv_cache::kv_cache_stats_handler(
-        State(state),
-        axum::extract::Path("llama-3".to_owned()),
-    )
-    .await;
+    let response =
+        kv_cache::kv_cache_stats_handler(State(state), axum::extract::Path("llama-3".to_owned()))
+            .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 1024)
         .await
