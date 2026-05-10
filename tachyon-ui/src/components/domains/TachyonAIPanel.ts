@@ -2,6 +2,7 @@ import gsap from "gsap";
 
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import { t } from "../../utils/i18n";
 
 type ApplyConfigurationResponse = {
   success: boolean;
@@ -9,10 +10,17 @@ type ApplyConfigurationResponse = {
 };
 
 export class TachyonAIPanel extends TachyonConfigDashboard {
+  private readonly onLanguageChanged = () => { this.render(); this.bindEvents(); };
+
   connectedCallback(): void {
+    window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindEvents();
     this.animateGlitchEntrance();
+  }
+
+  disconnectedCallback(): void {
+    window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
   }
 
   private render(): void {
@@ -20,28 +28,28 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
       <section class="p-6 space-y-8 text-slate-300">
         <header data-stagger-panel class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div>
-            <h2 class="text-3xl font-light text-cyan-400">AI Mesh <span class="font-bold text-slate-100">Compute</span></h2>
-            <p class="text-xs font-mono text-slate-500">WIT: config-ai / Multi-GPU multiplexing</p>
+            <h2 class="text-3xl font-light text-cyan-400">${t("ai.title")} <span class="font-bold text-slate-100">${t("ai.title.strong")}</span></h2>
+            <p class="text-xs font-mono text-slate-500">${t("ai.subtitle")}</p>
           </div>
           <div class="text-left md:text-right">
-            <span class="block text-[10px] uppercase text-cyan-500/70">Accelerator Status</span>
-            <span class="font-mono text-xs text-emerald-400">ENCLAVE SECURE (TEE)</span>
+            <span class="block text-[10px] uppercase text-cyan-500/70">${t("ai.status.label")}</span>
+            <span class="font-mono text-xs text-emerald-400">${t("ai.status.value")}</span>
           </div>
         </header>
 
         <form class="space-y-6">
           <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
             <div data-stagger-panel class="space-y-4 rounded border border-slate-700 bg-slate-800/70 p-5">
-              <label class="block text-sm font-bold uppercase tracking-widest text-slate-300">LoRA Multiplexing
+              <label class="block text-sm font-bold uppercase tracking-widest text-slate-300">${t("ai.field.lora")}
                 <select id="lora-mode" class="mt-3 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-cyan-300 outline-none transition-colors focus:border-cyan-400">
-                  <option value="dynamic">Dynamic Allocation</option>
-                  <option value="static">Static High Priority</option>
+                  <option value="dynamic">${t("ai.option.lora.dynamic")}</option>
+                  <option value="static">${t("ai.option.lora.static")}</option>
                 </select>
               </label>
             </div>
 
             <div data-stagger-panel class="rounded border border-slate-700 bg-slate-800/70 p-5 lg:col-span-2">
-              <label for="kv-cache-range" class="mb-4 block text-sm font-bold uppercase tracking-widest text-slate-300">Edge KV Cache</label>
+              <label for="kv-cache-range" class="mb-4 block text-sm font-bold uppercase tracking-widest text-slate-300">${t("ai.field.kv-cache")}</label>
               <input id="kv-cache-range" type="range" min="8" max="128" value="32" class="h-1 w-full cursor-pointer appearance-none rounded-lg bg-slate-700 accent-cyan-500">
               <div class="mt-2 flex justify-between font-mono text-[10px] text-slate-500">
                 <span>8GB</span>
@@ -52,17 +60,17 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
           </div>
 
           <div data-stagger-panel class="border border-cyan-500/20 bg-cyan-900/10 p-4">
-            <label class="block text-[10px] font-bold uppercase text-cyan-500">TDE Master Key
-              <input id="tde-key" type="password" placeholder="Encrypted storage key" class="mt-2 w-full border-0 border-b border-cyan-500/30 bg-transparent pb-1 text-cyan-100 outline-none placeholder:text-slate-600 focus:border-cyan-400">
+            <label class="block text-[10px] font-bold uppercase text-cyan-500">${t("ai.field.tde-key")}
+              <input id="tde-key" type="password" placeholder="${t("ai.placeholder.tde")}" class="mt-2 w-full border-0 border-b border-cyan-500/30 bg-transparent pb-1 text-cyan-100 outline-none placeholder:text-slate-600 focus:border-cyan-400">
             </label>
           </div>
 
           <button id="sync-ai" class="w-full border border-cyan-500 bg-transparent py-4 font-bold text-cyan-500 transition-colors hover:bg-cyan-500 hover:text-slate-950">
-            Synchronize AI Control Plane
+            ${t("ai.button")}
           </button>
         </form>
 
-        <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">Awaiting AI control plane sync.</div>
+        <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">${t("ai.feedback.empty")}</div>
       </section>
     `);
   }

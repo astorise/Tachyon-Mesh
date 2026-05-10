@@ -1,5 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import { t } from "../../utils/i18n";
 
 type ApplyConfigurationResponse = {
   success: boolean;
@@ -7,34 +8,38 @@ type ApplyConfigurationResponse = {
 };
 
 export class TachyonRbacPanel extends TachyonConfigDashboard {
+  private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
+
   connectedCallback(): void {
+    window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
-    this.root.querySelector("form")?.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void this.applyRbacPolicy();
-    });
+    this.bindForm();
     this.animateEntrance();
+  }
+
+  disconnectedCallback(): void {
+    window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
   }
 
   private render(): void {
     this.renderTemplate(`
       <section class="p-6 space-y-6 text-slate-300">
         <header data-stagger-panel class="border-l-4 border-cyan-500 pl-4">
-          <h2 class="text-2xl font-bold text-slate-100">RBAC Control Plane</h2>
-          <p class="text-sm font-mono text-slate-400">Domain: config-rbac / access policy</p>
+          <h2 class="text-2xl font-bold text-slate-100">${t("rbac.title")}</h2>
+          <p class="text-sm font-mono text-slate-400">${t("rbac.subtitle")}</p>
         </header>
 
         <form class="space-y-6 rounded-lg border border-slate-700 bg-slate-800/40 p-6">
-          <label data-stagger-panel class="block text-xs uppercase tracking-widest text-cyan-500">Role
+          <label data-stagger-panel class="block text-xs uppercase tracking-widest text-cyan-500">${t("rbac.field.role")}
             <select id="role" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-slate-200 outline-none transition-colors focus:border-cyan-400">
-              <option value="admin">Admin</option>
-              <option value="ops">Ops</option>
-              <option value="viewer">Viewer</option>
-              <option value="service-account">Service Account</option>
+              <option value="admin">${t("rbac.option.admin")}</option>
+              <option value="ops">${t("rbac.option.ops")}</option>
+              <option value="viewer">${t("rbac.option.viewer")}</option>
+              <option value="service-account">${t("rbac.option.service-account")}</option>
             </select>
           </label>
 
-          <label data-stagger-panel class="block text-xs uppercase tracking-widest text-cyan-500">Policy (JSON)
+          <label data-stagger-panel class="block text-xs uppercase tracking-widest text-cyan-500">${t("rbac.field.policy")}
             <textarea id="policy" rows="12" spellcheck="false" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-3 font-mono text-xs text-slate-200 outline-none transition-colors focus:border-cyan-400">{
   "permissions": [
     {
@@ -46,22 +51,33 @@ export class TachyonRbacPanel extends TachyonConfigDashboard {
           </label>
 
           <button data-stagger-panel class="border border-cyan-500 px-6 py-3 font-bold text-cyan-500 transition-colors hover:bg-cyan-500 hover:text-slate-950">
-            Apply RBAC Policy
+            ${t("rbac.button")}
           </button>
         </form>
 
-        <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">Awaiting RBAC policy.</div>
+        <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">${t("rbac.feedback.empty")}</div>
       </section>
     `);
   }
 
+  private bindForm(): void {
+    this.root.querySelector("form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void this.applyRbacPolicy();
+    });
+  }
+
   private async applyRbacPolicy(): Promise<void> {
-    const policyText = (this.root.getElementById("policy") as HTMLTextAreaElement | null)?.value.trim() ?? "";
+    const policyText =
+      (this.root.getElementById("policy") as HTMLTextAreaElement | null)?.value.trim() ?? "";
     let policy: unknown;
     try {
       policy = JSON.parse(policyText);
     } catch (error) {
-      this.showFeedback("error", `Policy JSON is invalid: ${error instanceof Error ? error.message : String(error)}`);
+      this.showFeedback(
+        "error",
+        `${t("rbac.error.invalid-json")} ${error instanceof Error ? error.message : String(error)}`,
+      );
       return;
     }
 
