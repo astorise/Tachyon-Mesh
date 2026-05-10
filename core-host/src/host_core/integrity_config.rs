@@ -1644,11 +1644,37 @@ pub(crate) async fn admin_manifest_bundle_handler(
                     .into_response();
             }
         };
-    let new_config = match validate_integrity_config(new_config.clone()) {
-        Ok(validated) => {
-            new_config = validated;
-            new_config
+
+    // Auto-bootstrap: inject the node's own public key into trusted_signers so
+    // that future reloads accept this node-signed manifest without any manual
+    // operator step.  The field is normalised to lowercase hex; we skip the
+    // injection if the key is already present to stay idempotent.
+    let host_pubkey_hex = state.host_identity.public_key_hex.clone();
+    let already_trusted = new_config
+        .trusted_signers
+        .iter()
+        .any(|k| k.trim().eq_ignore_ascii_case(&host_pubkey_hex));
+    if !already_trusted {
+        new_config.trusted_signers.push(host_pubkey_hex.clone());
+    }
+
+    // Re-serialize the (possibly extended) config so the signature covers the
+    // injected trusted_signers field.
+    let signed_payload = match serde_json::to_string(&new_config) {
+        Ok(json) => json,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "failed to re-serialize config payload after trusted-signer injection: {error}"
+                ),
+            )
+                .into_response();
         }
+    };
+
+    let new_config = match validate_integrity_config(new_config) {
+        Ok(validated) => validated,
         Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1670,10 +1696,9 @@ pub(crate) async fn admin_manifest_bundle_handler(
             .into_response();
     }
 
-    // Sign the config payload with this node's stable host identity key.
-    let host_pubkey_hex = state.host_identity.public_key_hex.clone();
+    // Sign the (extended) config payload with this node's stable host identity key.
     let host_signing_key = Arc::clone(&state.host_identity.signing_key);
-    let payload_for_signing = manifest_fields.config_payload.clone();
+    let payload_for_signing = signed_payload.clone();
     let signature_hex = tokio::task::spawn_blocking(move || {
         use ed25519_dalek::Signer as _;
         use sha2::Digest;
@@ -1697,7 +1722,7 @@ pub(crate) async fn admin_manifest_bundle_handler(
     let serialized = match serde_json::to_vec(&IntegrityManifest {
         public_key: host_pubkey_hex.clone(),
         signature: signature_hex,
-        config_payload: manifest_fields.config_payload.clone(),
+        config_payload: signed_payload.clone(),
     }) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -1739,9 +1764,7 @@ pub(crate) async fn admin_manifest_bundle_handler(
     use sha2::Digest;
     let checksum = format!(
         "sha256:{}",
-        hex::encode(sha2::Sha256::digest(
-            manifest_fields.config_payload.as_bytes()
-        ))
+        hex::encode(sha2::Sha256::digest(signed_payload.as_bytes()))
     );
     let ts_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
