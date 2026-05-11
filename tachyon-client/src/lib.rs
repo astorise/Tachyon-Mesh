@@ -504,29 +504,45 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 }
 
 pub fn workspace_root() -> PathBuf {
-    // 1. Runtime override — set by Tauri setup or system administrator.
+    // Candidates tried in priority order; the first directory that actually
+    // contains an integrity.lock wins.  This avoids stale env-var overrides
+    // (e.g. TACHYON_WORKSPACE_ROOT set to app_local_data_dir when the lockfile
+    // hasn't been written there yet) from hiding a perfectly valid lockfile in
+    // another location.
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Explicit override (Tauri setup, system admin, CI).
     if let Some(root) = std::env::var_os("TACHYON_WORKSPACE_ROOT") {
-        return PathBuf::from(root);
+        candidates.push(PathBuf::from(root));
     }
-    // 2. Packaged binary: look next to the executable.  The core-host writes
-    //    integrity.lock in its working directory which, for Tauri sidecars, is
-    //    typically the app's local data directory — resolved by the Tauri setup
-    //    hook and exported via the env var above.  As a last-resort fallback we
-    //    try the executable's parent so that a bare binary invocation also works.
+
+    // 2. Directory of the running executable (works for bare binary invocations
+    //    and for packaged Tauri apps when core-host writes next to itself).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            if dir.join("integrity.lock").exists() {
-                return dir.to_path_buf();
-            }
+            candidates.push(dir.to_path_buf());
         }
     }
-    // 3. Development fallback: use the compile-time manifest directory.
-    //    This path is only correct when running `cargo run` from the workspace
-    //    and is intentionally NOT correct for distributed binaries.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("tachyon-client should live directly under the workspace root")
-        .to_path_buf()
+
+    // 3. Compile-time workspace root (correct for `cargo run` / dev builds).
+    if let Some(dev_root) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent() {
+        candidates.push(dev_root.to_path_buf());
+    }
+
+    // Return the first candidate that holds an integrity.lock.
+    for dir in &candidates {
+        if dir.join("integrity.lock").exists() {
+            return dir.clone();
+        }
+    }
+
+    // No lockfile found anywhere — return the first candidate so callers get a
+    // meaningful NotFound error rather than an empty path.
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub async fn read_lockfile() -> Result<String> {
