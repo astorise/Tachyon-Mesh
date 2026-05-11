@@ -11,5 +11,6 @@ mod mesh_control_plane;
 mod rate_limit_models;
 mod reload_and_guest;
 mod routing_aliases;
+mod secret_injection;
 mod telemetry_and_l4;
 mod uds_loop_resilience;

@@ -1703,10 +1703,17 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             "autoscaling guest sending outbound HTTP request"
         );
 
+        let (headers, body) = inject_outbound_secrets(
+            filtered_outbound_http_headers(
+                headers,
+                &self.propagated_headers,
+                &resolved_target.kind,
+            ),
+            body,
+            outbound_target_host(&url).as_deref(),
+        );
         let mut request = self.outbound_http_client.request(method, &url);
-        for (name, value) in
-            filtered_outbound_http_headers(headers, &self.propagated_headers, &resolved_target.kind)
-        {
+        for (name, value) in headers {
             request = request.header(&name, &value);
         }
         let response = request
@@ -1856,6 +1863,79 @@ pub(crate) fn filtered_outbound_http_headers(
 
     filtered.retain(|(name, _)| allow_external_outbound_header(name));
     filtered
+}
+
+pub(crate) fn inject_outbound_secrets(
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    target_host: Option<&str>,
+) -> (Vec<(String, String)>, Vec<u8>) {
+    let Some(target_host) = target_host else {
+        return (headers, body);
+    };
+    let headers = headers
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                name,
+                rewrite_secret_placeholders(&value, target_host, "header value"),
+            )
+        })
+        .collect();
+    let body = rewrite_secret_placeholders_in_body(body, target_host);
+    (headers, body)
+}
+
+fn rewrite_secret_placeholders_in_body(body: Vec<u8>, target_host: &str) -> Vec<u8> {
+    if !body
+        .windows(store::secrets::SECRET_PLACEHOLDER_PREFIX.len())
+        .any(|window| window == store::secrets::SECRET_PLACEHOLDER_PREFIX.as_bytes())
+    {
+        return body;
+    }
+
+    match String::from_utf8(body) {
+        Ok(value) => rewrite_secret_placeholders(&value, target_host, "request body").into_bytes(),
+        Err(error) => error.into_bytes(),
+    }
+}
+
+fn rewrite_secret_placeholders(value: &str, target_host: &str, field: &str) -> String {
+    let mut rewritten = String::with_capacity(value.len());
+    let mut remaining = value;
+
+    while let Some(index) = remaining.find(store::secrets::SECRET_PLACEHOLDER_PREFIX) {
+        rewritten.push_str(&remaining[..index]);
+        let candidate = &remaining[index..];
+        let Some(token) = store::secrets::placeholder_token_at(candidate) else {
+            rewritten.push_str(store::secrets::SECRET_PLACEHOLDER_PREFIX);
+            remaining = &candidate[store::secrets::SECRET_PLACEHOLDER_PREFIX.len()..];
+            continue;
+        };
+
+        match store::secrets::resolve_secret(token, target_host) {
+            Ok(secret) => rewritten.push_str(&secret),
+            Err(error) => {
+                tracing::warn!(
+                    target_host,
+                    field,
+                    reason = %error,
+                    "leaving unresolved outbound secret placeholder"
+                );
+                rewritten.push_str(token);
+            }
+        }
+        remaining = &candidate[token.len()..];
+    }
+
+    rewritten.push_str(remaining);
+    rewritten
+}
+
+fn outbound_target_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
 }
 
 pub(crate) fn allow_external_outbound_header(name: &str) -> bool {

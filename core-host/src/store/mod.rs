@@ -8,6 +8,8 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) mod secrets;
+
 const CWASM_CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cwasm_cache");
 /// LLM inference KV-cache entries. Key format: `{model_ref}/{tenant}/{cache_key}`.
 /// The `model_ref` segment isolates entries per LLM so they are never served to
