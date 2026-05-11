@@ -672,6 +672,26 @@ pub async fn get_mesh_graph() -> Result<MeshGraphSnapshot> {
 
 // ── Topology graph — full component view with real backend data ───────────────
 
+/// Load a SealedConfig from the local integrity.lock, returning (config, status).
+/// Returns an offline TopologyGraphSpec error-value when the file is missing.
+async fn load_sealed_config_from_file(source: &str) -> Result<(SealedConfig, String)> {
+    let raw = match read_lockfile().await {
+        Ok(raw) => raw,
+        Err(error) if is_not_found(&error) => {
+            // Return an offline sentinel via an error that get_topology_graph handles.
+            anyhow::bail!("__offline__");
+        }
+        Err(error) => return Err(error),
+    };
+    let manifest: IntegrityManifest =
+        serde_json::from_str(&raw).context("failed to parse integrity.lock")?;
+    let sealed: SealedConfig = serde_json::from_str(&manifest.config_payload)
+        .context("failed to parse sealed config payload")?;
+    let status = parse_engine_status(&raw).unwrap_or_else(|_| "offline".to_owned());
+    let _ = source;
+    Ok((sealed, status))
+}
+
 pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
     let current = current_connection();
     let source = current
@@ -679,30 +699,38 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         .map(|c| c.url.clone())
         .unwrap_or_else(|| "workspace://local".to_owned());
 
-    let raw_lockfile = match read_lockfile().await {
-        Ok(raw) => raw,
-        Err(error) if is_not_found(&error) => {
-            return Ok(TopologyGraphSpec {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                source,
-                status: "offline".to_owned(),
-            });
+    // ── Prefer the live cluster config over a local file ─────────────────────
+    // When connected, GET /admin/manifest returns the active IntegrityConfig
+    // directly from the running node's memory — no filesystem path resolution
+    // required, and it works even when the client runs on a different machine.
+    let (sealed, status) = if let Some(config) = current.as_ref() {
+        match get_admin_json::<SealedConfig>(ADMIN_MANIFEST_PATH).await {
+            Ok(live_config) => {
+                let status = fetch_remote_status(config)
+                    .await
+                    .unwrap_or_else(|_| "degraded".to_owned());
+                (live_config, status)
+            }
+            Err(_) => {
+                // Connected but manifest endpoint unreachable — fall back to
+                // local file (e.g. older node version without GET /admin/manifest).
+                load_sealed_config_from_file(&source).await?
+            }
         }
-        Err(error) => return Err(error),
-    };
-
-    let manifest: IntegrityManifest =
-        serde_json::from_str(&raw_lockfile).context("failed to parse integrity.lock")?;
-    let sealed: SealedConfig = serde_json::from_str(&manifest.config_payload)
-        .context("failed to parse sealed config payload")?;
-
-    let status = if let Some(config) = current.as_ref() {
-        fetch_remote_status(config)
-            .await
-            .unwrap_or_else(|_| "offline".to_owned())
     } else {
-        parse_engine_status(&raw_lockfile).unwrap_or_else(|_| "offline".to_owned())
+        // No remote connection — read local integrity.lock.
+        match load_sealed_config_from_file(&source).await {
+            Ok(pair) => pair,
+            Err(error) if error.to_string().contains("__offline__") => {
+                return Ok(TopologyGraphSpec {
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                    source,
+                    status: "offline".to_owned(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
     };
 
     // ── Node construction ─────────────────────────────────────────────────────

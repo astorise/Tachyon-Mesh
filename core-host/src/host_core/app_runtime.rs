@@ -9,7 +9,10 @@ pub(crate) fn integrity_manifest_path() -> PathBuf {
 pub(crate) fn build_app(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/status", get(auth::admin_status_handler))
-        .route("/admin/manifest", post(admin_manifest_update_handler))
+        .route(
+            "/admin/manifest",
+            get(admin_get_manifest_handler).post(admin_manifest_update_handler),
+        )
         .route(
             "/admin/manifest/bundle",
             post(admin_manifest_bundle_handler),
