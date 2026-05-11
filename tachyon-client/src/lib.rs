@@ -462,7 +462,37 @@ fn operator_state() -> &'static RwLock<Option<String>> {
     SESSION_OPERATOR.get_or_init(|| RwLock::new(None))
 }
 
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .map(|e| e.kind() == std::io::ErrorKind::NotFound)
+                .unwrap_or(false)
+        })
+}
+
 pub fn workspace_root() -> PathBuf {
+    // 1. Runtime override — set by Tauri setup or system administrator.
+    if let Some(root) = std::env::var_os("TACHYON_WORKSPACE_ROOT") {
+        return PathBuf::from(root);
+    }
+    // 2. Packaged binary: look next to the executable.  The core-host writes
+    //    integrity.lock in its working directory which, for Tauri sidecars, is
+    //    typically the app's local data directory — resolved by the Tauri setup
+    //    hook and exported via the env var above.  As a last-resort fallback we
+    //    try the executable's parent so that a bare binary invocation also works.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if dir.join("integrity.lock").exists() {
+                return dir.to_path_buf();
+            }
+        }
+    }
+    // 3. Development fallback: use the compile-time manifest directory.
+    //    This path is only correct when running `cargo run` from the workspace
+    //    and is intentionally NOT correct for distributed binaries.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("tachyon-client should live directly under the workspace root")
@@ -481,8 +511,11 @@ pub async fn get_engine_status() -> Result<String> {
         return fetch_remote_status(&config).await;
     }
 
-    let raw_lockfile = read_lockfile().await?;
-    parse_engine_status(&raw_lockfile)
+    match read_lockfile().await {
+        Ok(raw) => parse_engine_status(&raw),
+        Err(error) if is_not_found(&error) => Ok("offline".to_owned()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn read_local_hardware_status() -> HardwareStatus {
@@ -535,24 +568,45 @@ pub fn validate_hardware_policy(policy: &HardwarePolicy) -> HardwareValidation {
 }
 
 pub async fn get_mesh_graph() -> Result<MeshGraphSnapshot> {
-    let raw_lockfile = read_lockfile().await?;
-    let manifest: IntegrityManifest =
-        serde_json::from_str(&raw_lockfile).context("failed to parse integrity.lock manifest")?;
-    let sealed_config: SealedConfig = serde_json::from_str(&manifest.config_payload)
-        .context("failed to parse sealed config payload")?;
     let current = current_connection();
     let source = current
         .as_ref()
         .map(|config| config.url.clone())
         .unwrap_or_else(|| "workspace://local".to_owned());
-    let status = if let Some(config) = current.as_ref() {
-        match fetch_remote_status(config).await {
-            Ok(status) => status,
-            Err(_) => parse_engine_status(&raw_lockfile)?,
+
+    // When there is a remote connection, we can derive status without a local lockfile.
+    if let Some(config) = current.as_ref() {
+        let status = match fetch_remote_status(config).await {
+            Ok(s) => s,
+            Err(_) => "offline".to_owned(),
+        };
+        return Ok(MeshGraphSnapshot {
+            source,
+            status,
+            routes: Vec::new(),
+            batch_targets: Vec::new(),
+        });
+    }
+
+    // No remote connection — fall back to local integrity.lock.
+    let raw_lockfile = match read_lockfile().await {
+        Ok(raw) => raw,
+        Err(error) if is_not_found(&error) => {
+            return Ok(MeshGraphSnapshot {
+                source,
+                status: "offline".to_owned(),
+                routes: Vec::new(),
+                batch_targets: Vec::new(),
+            });
         }
-    } else {
-        parse_engine_status(&raw_lockfile)?
+        Err(error) => return Err(error),
     };
+
+    let manifest: IntegrityManifest =
+        serde_json::from_str(&raw_lockfile).context("failed to parse integrity.lock manifest")?;
+    let sealed_config: SealedConfig = serde_json::from_str(&manifest.config_payload)
+        .context("failed to parse sealed config payload")?;
+    let status = parse_engine_status(&raw_lockfile).unwrap_or_else(|_| "offline".to_owned());
 
     Ok(MeshGraphSnapshot {
         source,

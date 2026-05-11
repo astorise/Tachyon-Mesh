@@ -734,11 +734,14 @@ fn passed(message: impl Into<String>) -> ApiResponse {
 fn main() {
     let result = tauri::Builder::default()
         .setup(|app| {
-            let salt_path = app
+            let data_dir = app
                 .path()
                 .app_local_data_dir()
-                .map_err(|error| tauri::Error::Anyhow(error.into()))?
-                .join("stronghold-salt.txt");
+                .map_err(|error| tauri::Error::Anyhow(error.into()))?;
+            // Export the runtime workspace root so tachyon-client can resolve
+            // integrity.lock without relying on the compile-time CARGO_MANIFEST_DIR.
+            std::env::set_var("TACHYON_WORKSPACE_ROOT", &data_dir);
+            let salt_path = data_dir.join("stronghold-salt.txt");
             app.handle()
                 .plugin(tauri_plugin_stronghold::Builder::with_argon2(&salt_path).build())?;
             Ok(())
