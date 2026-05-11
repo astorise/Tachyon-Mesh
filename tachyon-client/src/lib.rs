@@ -178,6 +178,8 @@ struct SealedConfig {
     batch_targets: Vec<serde_json::Value>,
     #[serde(default)]
     resources: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    kv_caches: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,6 +304,36 @@ pub struct MeshGraphSnapshot {
     pub status: String,
     pub routes: Vec<MeshRouteSummary>,
     pub batch_targets: Vec<String>,
+}
+
+// ── Topology graph types ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyNodeSpec {
+    pub id: String,
+    pub node_type: String,
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub data: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyEdgeSpec {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyGraphSpec {
+    pub nodes: Vec<TopologyNodeSpec>,
+    pub edges: Vec<TopologyEdgeSpec>,
+    pub source: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -622,6 +654,193 @@ pub async fn get_mesh_graph() -> Result<MeshGraphSnapshot> {
             .filter_map(batch_target_name)
             .collect(),
     })
+}
+
+// ── Topology graph — full component view with real backend data ───────────────
+
+pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
+    let current = current_connection();
+    let source = current
+        .as_ref()
+        .map(|c| c.url.clone())
+        .unwrap_or_else(|| "workspace://local".to_owned());
+
+    let raw_lockfile = match read_lockfile().await {
+        Ok(raw) => raw,
+        Err(error) if is_not_found(&error) => {
+            return Ok(TopologyGraphSpec {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                source,
+                status: "offline".to_owned(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+
+    let manifest: IntegrityManifest =
+        serde_json::from_str(&raw_lockfile).context("failed to parse integrity.lock")?;
+    let sealed: SealedConfig = serde_json::from_str(&manifest.config_payload)
+        .context("failed to parse sealed config payload")?;
+
+    let status = if let Some(config) = current.as_ref() {
+        fetch_remote_status(config).await.unwrap_or_else(|_| "offline".to_owned())
+    } else {
+        parse_engine_status(&raw_lockfile).unwrap_or_else(|_| "offline".to_owned())
+    };
+
+    // ── Node construction ─────────────────────────────────────────────────────
+    // Track type-row indices for auto-layout.
+    let type_order = ["endpoint", "system-faas", "llm", "kv-cache", "custom-wasm", "message-broker", "storage", "external-resource"];
+    let mut type_counters: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut nodes: Vec<TopologyNodeSpec> = Vec::new();
+    let mut edges: Vec<TopologyEdgeSpec> = Vec::new();
+    let mut edge_counter: usize = 0;
+
+    // Map route path → node id for edge construction.
+    let mut path_to_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    // Routes → endpoint / system-faas / llm / custom-wasm nodes
+    for route in &sealed.routes {
+        let Some(path) = route.get("path").and_then(|v| v.as_str()) else { continue };
+        let name = route
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| path.trim_start_matches('/'));
+        let role = route.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let has_models = route
+            .get("models")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        let module_name = route.get("module").and_then(|v| v.as_str()).unwrap_or("");
+
+        let node_type = if has_models {
+            "llm"
+        } else if role == "system" {
+            "system-faas"
+        } else if module_name.ends_with(".wasm") {
+            "custom-wasm"
+        } else {
+            "endpoint"
+        };
+
+        let id = format!("route:{path}");
+        path_to_id.insert(path.to_owned(), id.clone());
+
+        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        match node_type {
+            "llm" => {
+                if let Some(alias) = route
+                    .get("models")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|m| m.get("alias").and_then(|v| v.as_str()))
+                {
+                    data.insert("modelName".to_owned(), alias.to_owned());
+                }
+            }
+            "system-faas" => {
+                data.insert("component".to_owned(), name.to_owned());
+            }
+            "custom-wasm" => {
+                data.insert("capabilityName".to_owned(), name.to_owned());
+                let version = route.get("version").and_then(|v| v.as_str()).unwrap_or("^1.0.0");
+                data.insert("semver".to_owned(), version.to_owned());
+                if !module_name.is_empty() {
+                    data.insert("assetSource".to_owned(), module_name.to_owned());
+                }
+            }
+            _ => {
+                // endpoint: infer protocol from path or defaults
+                let protocol = if path.starts_with("/wss") || path.starts_with("/ws") {
+                    "WS"
+                } else {
+                    "HTTP"
+                };
+                data.insert("protocol".to_owned(), protocol.to_owned());
+            }
+        }
+
+        let (x, y) = topology_layout_position(node_type, &type_order, &mut type_counters);
+        nodes.push(TopologyNodeSpec { id: id.clone(), node_type: node_type.to_owned(), label: name.to_owned(), x, y, data });
+
+        // Collect dependency edges (route path → other route path).
+        if let Some(deps) = route.get("dependencies").and_then(|v| v.as_object()) {
+            for dep_path in deps.keys() {
+                edge_counter += 1;
+                edges.push(TopologyEdgeSpec {
+                    id: format!("e{edge_counter}"),
+                    from: id.clone(),
+                    to: format!("route:{dep_path}"),
+                });
+            }
+        }
+    }
+
+    // kv_caches → kv-cache nodes
+    for cache in &sealed.kv_caches {
+        let Some(name) = cache.get("name").and_then(|v| v.as_str()) else { continue };
+        let model_ref = cache.get("model_ref").and_then(|v| v.as_str()).unwrap_or("");
+        let capacity = cache
+            .get("capacity_mb")
+            .and_then(|v| v.as_u64())
+            .map(|mb| (mb / 1024).to_string())
+            .unwrap_or_default();
+
+        let id = format!("kvcache:{name}");
+        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if !capacity.is_empty() { data.insert("capacityGb".to_owned(), capacity); }
+        if !model_ref.is_empty() { data.insert("modelRef".to_owned(), model_ref.to_owned()); }
+
+        let (x, y) = topology_layout_position("kv-cache", &type_order, &mut type_counters);
+        nodes.push(TopologyNodeSpec { id: id.clone(), node_type: "kv-cache".to_owned(), label: name.to_owned(), x, y, data });
+
+        // Edge: kv-cache depends on its bound LLM node.
+        if !model_ref.is_empty() {
+            if let Some(llm_id) = path_to_id.values().find(|v| v.contains(model_ref)) {
+                edge_counter += 1;
+                edges.push(TopologyEdgeSpec {
+                    id: format!("e{edge_counter}"),
+                    from: id.clone(),
+                    to: llm_id.clone(),
+                });
+            }
+        }
+    }
+
+    // External resources → external-resource nodes
+    for (name, resource) in &sealed.resources {
+        let target = resource.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        let id = format!("resource:{name}");
+        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        data.insert("targetUrl".to_owned(), target.to_owned());
+
+        let (x, y) = topology_layout_position("external-resource", &type_order, &mut type_counters);
+        nodes.push(TopologyNodeSpec { id, node_type: "external-resource".to_owned(), label: name.clone(), x, y, data });
+    }
+
+    Ok(TopologyGraphSpec { nodes, edges, source, status })
+}
+
+/// Assign a canvas position based on node type, grouping same-type nodes in rows.
+/// Each type occupies its own horizontal band; wraps to a new sub-row after 5 nodes.
+fn topology_layout_position(
+    node_type: &str,
+    type_order: &[&str],
+    counters: &mut std::collections::HashMap<String, usize>,
+) -> (i32, i32) {
+    let index = *counters.entry(node_type.to_owned()).or_insert(0);
+    *counters.get_mut(node_type).expect("just inserted") += 1;
+
+    let type_row = type_order.iter().position(|&t| t == node_type).unwrap_or(7) as i32;
+    let max_per_row: i32 = 5;
+    let col = (index as i32) % max_per_row;
+    let sub_row = (index as i32) / max_per_row;
+
+    let x = 40 + col * 300;
+    let y = 40 + (type_row + sub_row) * 140;
+    (x, y)
 }
 
 const OVERLAY_FILE_NAME: &str = "tachyon.resources.json";

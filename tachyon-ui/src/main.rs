@@ -117,6 +117,13 @@ async fn get_mesh_graph() -> Result<tachyon_client::MeshGraphSnapshot, String> {
 }
 
 #[tauri::command]
+async fn get_topology_graph() -> Result<tachyon_client::TopologyGraphSpec, String> {
+    tachyon_client::get_topology_graph()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_metrics() -> Result<tachyon_client::RuntimeMetrics, String> {
     tachyon_client::get_metrics()
         .await
@@ -749,6 +756,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_engine_status,
             get_mesh_graph,
+            get_topology_graph,
             get_metrics,
             tail_logs,
             get_shadow_diffs,

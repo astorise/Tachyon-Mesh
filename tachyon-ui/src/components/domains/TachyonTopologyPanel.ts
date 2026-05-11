@@ -139,6 +139,12 @@ function badgeValueFor(node: TopologyNode): string {
   }
 }
 
+const VIRTUAL_W = 1920;
+const VIRTUAL_H = 1080;
+const CARD_W = 256;
+const CARD_H = 80;
+const BUBBLE_R = 24; // radius → 48px diameter
+
 const canvasStylesheet = new CSSStyleSheet();
 canvasStylesheet.replaceSync(stylesheetText);
 
@@ -147,8 +153,16 @@ export class TachyonTopologyCanvas extends HTMLElement {
   private nodes: TopologyNode[] = [];
   private edges: TopologyEdge[] = [];
   private selectedId: string | null = null;
+  // Drag state (node repositioning)
   private dragState: { nodeId: string; offsetX: number; offsetY: number } | null = null;
   private didDrag = false;
+  // Zoom / pan state
+  private zoom = 1.0;
+  private panX = 0;
+  private panY = 0;
+  private panState: { startX: number; startY: number; startPanX: number; startPanY: number } | null = null;
+  // View mode
+  private compactMode = false;
 
   constructor() {
     super();
@@ -164,8 +178,30 @@ export class TachyonTopologyCanvas extends HTMLElement {
 
   setSelected(id: string | null): void {
     this.selectedId = id;
+    // Lightweight update: just update ring classes without full re-render.
+    this.root.querySelectorAll<HTMLButtonElement>("[data-node-id]").forEach((btn) => {
+      const selected = btn.dataset.nodeId === id;
+      if (selected) btn.classList.add("ring-2", "ring-cyan-300");
+      else btn.classList.remove("ring-2", "ring-cyan-300");
+    });
+  }
+
+  zoomIn(): void { this.adjustZoom(0.2); }
+  zoomOut(): void { this.adjustZoom(-0.2); }
+
+  resetView(): void {
+    this.zoom = 1.0;
+    this.panX = 0;
+    this.panY = 0;
+    this.applyViewTransform();
+  }
+
+  toggleCompact(): void {
+    this.compactMode = !this.compactMode;
     this.render();
   }
+
+  get isCompact(): boolean { return this.compactMode; }
 
   serialize(): { nodes: Array<TopologyNode & { domainHint: string }>; edges: TopologyEdge[] } {
     return {
@@ -178,44 +214,121 @@ export class TachyonTopologyCanvas extends HTMLElement {
     this.render();
   }
 
-  private render(): void {
-    const width = 960;
-    const height = 540;
-    const edgeSvg = this.buildEdgeSvg();
+  private adjustZoom(delta: number): void {
+    const outer = this.root.getElementById("canvas-outer");
+    if (!outer) return;
+    const rect = outer.getBoundingClientRect();
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    const newZoom = Math.max(0.2, Math.min(4.0, this.zoom + delta));
+    const factor = newZoom / this.zoom;
+    this.panX = cx - factor * (cx - this.panX);
+    this.panY = cy - factor * (cy - this.panY);
+    this.zoom = newZoom;
+    this.applyViewTransform();
+  }
 
-    const nodeBlocks = this.nodes
-      .map((node) => {
-        const theme = themeFor(node.type);
-        const isSelected = node.id === this.selectedId;
-        const ring = isSelected ? "ring-2 ring-cyan-300" : "";
-        return `
-          <button data-node-id="${this.escape(node.id)}" type="button"
-            class="absolute p-3 rounded-xl border-2 backdrop-blur-md w-64 touch-none select-none text-left ${theme.card} ${ring}"
-            style="left: ${node.x}px; top: ${node.y}px; cursor: grab;">
-            <div class="flex items-center gap-3 mb-2">
-              <span class="inline-flex h-8 w-8 items-center justify-center rounded ${theme.iconBg} font-bold">${theme.glyph}</span>
-              <div class="flex-1">
-                <div class="text-[10px] uppercase tracking-widest text-slate-500">${this.escape(t(`topology.type.${node.type}`))}</div>
-                <h4 class="${theme.badge} font-semibold text-sm truncate">${this.escape(node.label || node.id)}</h4>
-              </div>
-            </div>
-            <div class="bg-slate-950/50 rounded px-2 py-1 flex justify-between items-center text-xs">
-              <span class="text-slate-500">${this.escape(t(`topology.badge.${node.type}`))}</span>
-              <span class="font-mono ${theme.badge} truncate ml-2">${this.escape(badgeValueFor(node))}</span>
-            </div>
-          </button>
-        `;
-      })
-      .join("");
+  private applyViewTransform(): void {
+    const vp = this.root.getElementById("canvas-viewport");
+    if (vp) {
+      vp.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    }
+  }
+
+  private wireViewport(): void {
+    const outer = this.root.getElementById("canvas-outer");
+    if (!outer) return;
+
+    outer.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const rect = outer.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const delta = e.deltaY > 0 ? -0.12 : 0.12;
+      const newZoom = Math.max(0.2, Math.min(4.0, this.zoom + delta));
+      const factor = newZoom / this.zoom;
+      this.panX = cx - factor * (cx - this.panX);
+      this.panY = cy - factor * (cy - this.panY);
+      this.zoom = newZoom;
+      this.applyViewTransform();
+    }, { passive: false });
+
+    outer.addEventListener("pointerdown", (e) => {
+      const target = e.target as Element;
+      if (target.closest("[data-node-id]")) return;
+      if (e.button !== 0 && e.button !== 1) return;
+      e.preventDefault();
+      outer.setPointerCapture(e.pointerId);
+      outer.style.cursor = "grabbing";
+      this.panState = { startX: e.clientX, startY: e.clientY, startPanX: this.panX, startPanY: this.panY };
+    });
+
+    outer.addEventListener("pointermove", (e) => {
+      if (!this.panState) return;
+      this.panX = this.panState.startPanX + (e.clientX - this.panState.startX);
+      this.panY = this.panState.startPanY + (e.clientY - this.panState.startY);
+      this.applyViewTransform();
+    });
+
+    outer.addEventListener("pointerup", () => {
+      if (this.panState) {
+        this.panState = null;
+        outer.style.cursor = "grab";
+      }
+    });
+  }
+
+  private renderNode(node: TopologyNode): string {
+    const theme = themeFor(node.type);
+    const isSelected = node.id === this.selectedId;
+    const ring = isSelected ? "ring-2 ring-cyan-300" : "";
+    if (this.compactMode) {
+      return `<button data-node-id="${this.escape(node.id)}" type="button"
+        title="${this.escape(node.label || node.id)}"
+        class="absolute flex items-center justify-center rounded-full border-2 touch-none select-none ${theme.card} ${ring}"
+        style="left:${node.x}px;top:${node.y}px;width:48px;height:48px;cursor:grab;">
+        <span style="font-size:18px;line-height:1">${theme.glyph}</span>
+      </button>`;
+    }
+    return `<button data-node-id="${this.escape(node.id)}" type="button"
+      class="absolute p-3 rounded-xl border-2 backdrop-blur-md w-64 touch-none select-none text-left ${theme.card} ${ring}"
+      style="left:${node.x}px;top:${node.y}px;cursor:grab;">
+      <div class="flex items-center gap-3 mb-2">
+        <span class="inline-flex h-8 w-8 items-center justify-center rounded ${theme.iconBg} font-bold">${theme.glyph}</span>
+        <div class="flex-1">
+          <div class="text-[10px] uppercase tracking-widest text-slate-500">${this.escape(t(`topology.type.${node.type}`))}</div>
+          <h4 class="${theme.badge} font-semibold text-sm truncate">${this.escape(node.label || node.id)}</h4>
+        </div>
+      </div>
+      <div class="bg-slate-950/50 rounded px-2 py-1 flex justify-between items-center text-xs">
+        <span class="text-slate-500">${this.escape(t(`topology.badge.${node.type}`))}</span>
+        <span class="font-mono ${theme.badge} truncate ml-2">${this.escape(badgeValueFor(node))}</span>
+      </div>
+    </button>`;
+  }
+
+  private render(): void {
+    const nodeBlocks = this.nodes.map((n) => this.renderNode(n)).join("");
+    const edgeSvg = this.buildEdgeSvg();
+    const transform = `translate(${this.panX}px,${this.panY}px) scale(${this.zoom})`;
 
     this.root.innerHTML = `
-      <div id="canvas-container" class="relative h-[540px] w-full overflow-hidden rounded-lg border border-slate-800 bg-slate-950/60 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.08),transparent_50%)]">
-        <svg id="canvas-svg" class="absolute inset-0 pointer-events-none" width="${width}" height="${height}">${edgeSvg}</svg>
-        ${nodeBlocks}
+      <div id="canvas-outer" class="relative h-[540px] w-full overflow-hidden rounded-lg border border-slate-800 bg-slate-950/60 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.08),transparent_50%)]" style="cursor:grab;">
+        <div id="canvas-viewport" style="position:absolute;transform-origin:0 0;width:${VIRTUAL_W}px;height:${VIRTUAL_H}px;transform:${transform};">
+          <svg class="absolute inset-0 pointer-events-none" width="${VIRTUAL_W}" height="${VIRTUAL_H}">${edgeSvg}</svg>
+          ${nodeBlocks}
+        </div>
       </div>
     `;
 
+    this.wireViewport();
     this.wireFileDrop();
+    this.wireNodeEvents();
+  }
+
+  private wireNodeEvents(): void {
+    const viewport = this.root.getElementById("canvas-viewport");
+    if (!viewport) return;
 
     this.root.querySelectorAll<HTMLButtonElement>("[data-node-id]").forEach((button) => {
       button.addEventListener("pointerdown", (event) => {
@@ -232,11 +345,11 @@ export class TachyonTopologyCanvas extends HTMLElement {
 
       button.addEventListener("pointermove", (event) => {
         if (!this.dragState || this.dragState.nodeId !== (button.dataset.nodeId ?? "")) return;
-        const container = this.root.getElementById("canvas-container");
-        if (!container) return;
-        const rect = container.getBoundingClientRect();
-        const newX = Math.max(0, Math.min(rect.width - 256, event.clientX - rect.left - this.dragState.offsetX));
-        const newY = Math.max(0, Math.min(rect.height - 80, event.clientY - rect.top - this.dragState.offsetY));
+        // Convert from screen coords to virtual canvas coords
+        const newX = Math.max(0, Math.min(VIRTUAL_W - (this.compactMode ? 48 : CARD_W),
+          (event.clientX - viewport.getBoundingClientRect().left) / this.zoom - this.dragState.offsetX));
+        const newY = Math.max(0, Math.min(VIRTUAL_H - (this.compactMode ? 48 : CARD_H),
+          (event.clientY - viewport.getBoundingClientRect().top) / this.zoom - this.dragState.offsetY));
         button.style.left = `${newX}px`;
         button.style.top = `${newY}px`;
         this.didDrag = true;
@@ -248,84 +361,78 @@ export class TachyonTopologyCanvas extends HTMLElement {
         button.style.cursor = "grab";
         button.style.zIndex = "";
         if (this.didDrag) {
-          const container = this.root.getElementById("canvas-container");
-          const rect = container?.getBoundingClientRect();
-          if (rect) {
-            const newX = Math.max(0, Math.min(rect.width - 256, event.clientX - rect.left - this.dragState.offsetX));
-            const newY = Math.max(0, Math.min(rect.height - 80, event.clientY - rect.top - this.dragState.offsetY));
-            const nodeId = this.dragState.nodeId;
-            this.nodes = this.nodes.map((n) => (n.id === nodeId ? { ...n, x: Math.round(newX), y: Math.round(newY) } : n));
-            this.dispatchEvent(
-              new CustomEvent("topology:node-moved", {
-                bubbles: true,
-                composed: true,
-                detail: { nodeId, x: Math.round(newX), y: Math.round(newY) },
-              }),
-            );
-          }
+          const nodeW = this.compactMode ? 48 : CARD_W;
+          const nodeH = this.compactMode ? 48 : CARD_H;
+          const newX = Math.max(0, Math.min(VIRTUAL_W - nodeW,
+            (event.clientX - viewport.getBoundingClientRect().left) / this.zoom - this.dragState.offsetX));
+          const newY = Math.max(0, Math.min(VIRTUAL_H - nodeH,
+            (event.clientY - viewport.getBoundingClientRect().top) / this.zoom - this.dragState.offsetY));
+          const nodeId = this.dragState.nodeId;
+          this.nodes = this.nodes.map((n) =>
+            n.id === nodeId ? { ...n, x: Math.round(newX), y: Math.round(newY) } : n,
+          );
+          this.dispatchEvent(new CustomEvent("topology:node-moved", {
+            bubbles: true, composed: true,
+            detail: { nodeId, x: Math.round(newX), y: Math.round(newY) },
+          }));
           this.updateEdgeSvgLive();
         }
         this.dragState = null;
       });
 
       button.addEventListener("click", (event) => {
-        if (this.didDrag) {
-          event.stopPropagation();
-          this.didDrag = false;
-          return;
-        }
+        if (this.didDrag) { event.stopPropagation(); this.didDrag = false; return; }
         const id = button.dataset.nodeId ?? "";
-        this.dispatchEvent(
-          new CustomEvent("topology:node-selected", {
-            bubbles: true,
-            composed: true,
-            detail: { nodeId: id },
-          }),
-        );
+        this.dispatchEvent(new CustomEvent("topology:node-selected", {
+          bubbles: true, composed: true, detail: { nodeId: id },
+        }));
       });
     });
   }
 
   private wireFileDrop(): void {
-    const container = this.root.getElementById("canvas-container");
-    if (!container) return;
+    const outer = this.root.getElementById("canvas-outer");
+    if (!outer) return;
 
-    container.addEventListener("dragenter", (e) => {
+    outer.addEventListener("dragenter", (e) => {
       e.preventDefault();
-      container.style.borderColor = "rgba(34,211,238,0.8)";
-      container.style.boxShadow = "0 0 24px rgba(34,211,238,0.25)";
+      outer.style.borderColor = "rgba(34,211,238,0.8)";
+      outer.style.boxShadow = "0 0 24px rgba(34,211,238,0.25)";
     });
-    container.addEventListener("dragover", (e) => {
+    outer.addEventListener("dragover", (e) => { e.preventDefault(); });
+    outer.addEventListener("dragleave", () => {
+      outer.style.borderColor = "";
+      outer.style.boxShadow = "";
+    });
+    outer.addEventListener("drop", (e) => {
       e.preventDefault();
-    });
-    container.addEventListener("dragleave", () => {
-      container.style.borderColor = "";
-      container.style.boxShadow = "";
-    });
-    container.addEventListener("drop", (e) => {
-      e.preventDefault();
-      container.style.borderColor = "";
-      container.style.boxShadow = "";
-      const rect = container.getBoundingClientRect();
+      outer.style.borderColor = "";
+      outer.style.boxShadow = "";
+      const rect = outer.getBoundingClientRect();
       const files = Array.from((e as DragEvent).dataTransfer?.files ?? []);
       for (const file of files) {
         if (!file.name.endsWith(".wasm")) continue;
-        const x = Math.max(0, Math.min(rect.width - 256, e.clientX - rect.left - 128));
-        const y = Math.max(0, Math.min(rect.height - 80, e.clientY - rect.top - 40));
-        this.dispatchEvent(
-          new CustomEvent("topology:wasm-dropped", {
-            bubbles: true,
-            composed: true,
-            detail: {
-              name: file.name.replace(/\.wasm$/, ""),
-              path: (file as File & { path?: string }).path ?? file.name,
-              x: Math.round(x),
-              y: Math.round(y),
-            },
-          }),
-        );
+        // Convert screen coords to virtual canvas coords
+        const vx = Math.max(0, Math.min(VIRTUAL_W - CARD_W,
+          (e.clientX - rect.left - this.panX) / this.zoom - CARD_W / 2));
+        const vy = Math.max(0, Math.min(VIRTUAL_H - CARD_H,
+          (e.clientY - rect.top - this.panY) / this.zoom - CARD_H / 2));
+        this.dispatchEvent(new CustomEvent("topology:wasm-dropped", {
+          bubbles: true, composed: true,
+          detail: {
+            name: file.name.replace(/\.wasm$/, ""),
+            path: (file as File & { path?: string }).path ?? file.name,
+            x: Math.round(vx), y: Math.round(vy),
+          },
+        }));
       }
     });
+  }
+
+  private edgeCenter(node: TopologyNode): { x: number; y: number } {
+    return this.compactMode
+      ? { x: node.x + BUBBLE_R, y: node.y + BUBBLE_R }
+      : { x: node.x + CARD_W / 2, y: node.y + CARD_H / 2 };
   }
 
   private buildEdgeSvg(): string {
@@ -334,28 +441,26 @@ export class TachyonTopologyCanvas extends HTMLElement {
         const from = this.nodes.find((n) => n.id === edge.from);
         const to = this.nodes.find((n) => n.id === edge.to);
         if (!from || !to) return "";
-        return `<line data-edge-id="${this.escape(edge.id)}" x1="${from.x + 128}" y1="${from.y + 36}" x2="${to.x + 128}" y2="${to.y + 36}" stroke="rgba(34,211,238,0.5)" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+        const fc = this.edgeCenter(from);
+        const tc = this.edgeCenter(to);
+        return `<line data-edge-id="${this.escape(edge.id)}" x1="${fc.x}" y1="${fc.y}" x2="${tc.x}" y2="${tc.y}" stroke="rgba(34,211,238,0.5)" stroke-width="1.5" stroke-dasharray="4 3"/>`;
       })
       .join("");
   }
 
   private updateEdgeSvgLive(): void {
-    const container = this.root.getElementById("canvas-container");
-    if (!container) return;
     this.edges.forEach((edge) => {
       const line = this.root.querySelector<SVGLineElement>(`[data-edge-id="${edge.id}"]`);
       if (!line) return;
       const fromBtn = this.root.querySelector<HTMLButtonElement>(`[data-node-id="${edge.from}"]`);
       const toBtn = this.root.querySelector<HTMLButtonElement>(`[data-node-id="${edge.to}"]`);
       if (!fromBtn || !toBtn) return;
-      const fromLeft = parseFloat(fromBtn.style.left) || 0;
-      const fromTop = parseFloat(fromBtn.style.top) || 0;
-      const toLeft = parseFloat(toBtn.style.left) || 0;
-      const toTop = parseFloat(toBtn.style.top) || 0;
-      line.setAttribute("x1", String(fromLeft + 128));
-      line.setAttribute("y1", String(fromTop + 36));
-      line.setAttribute("x2", String(toLeft + 128));
-      line.setAttribute("y2", String(toTop + 36));
+      const offset = this.compactMode ? BUBBLE_R : CARD_W / 2;
+      const offsetY = this.compactMode ? BUBBLE_R : CARD_H / 2;
+      line.setAttribute("x1", String((parseFloat(fromBtn.style.left) || 0) + offset));
+      line.setAttribute("y1", String((parseFloat(fromBtn.style.top) || 0) + offsetY));
+      line.setAttribute("x2", String((parseFloat(toBtn.style.left) || 0) + offset));
+      line.setAttribute("y2", String((parseFloat(toBtn.style.top) || 0) + offsetY));
     });
   }
 
@@ -598,10 +703,11 @@ const DEFAULT_EDGES: TopologyEdge[] = [
 ];
 
 export class TachyonTopologyPanel extends TachyonConfigDashboard {
-  private nodes: TopologyNode[] = DEFAULT_NODES.map((node) => ({ ...node, data: { ...node.data } }));
-  private edges: TopologyEdge[] = DEFAULT_EDGES.map((edge) => ({ ...edge }));
+  private nodes: TopologyNode[] = DEFAULT_NODES.map((n) => ({ ...n, data: { ...n.data } }));
+  private edges: TopologyEdge[] = DEFAULT_EDGES.map((e) => ({ ...e }));
   private selectedId: string | null = null;
   private applying = false;
+  private liveSource: string | null = null; // set when real data loaded
   private readonly onLanguageChanged = () => this.refresh();
 
   connectedCallback(): void {
@@ -610,10 +716,40 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
     this.bindEvents();
     this.animateEntrance();
     this.pushGraphToCanvas();
+    void this.loadLiveTopology();
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
+  }
+
+  private async loadLiveTopology(): Promise<void> {
+    try {
+      const graph = await invoke<{
+        nodes: Array<{ id: string; nodeType: string; label: string; x: number; y: number; data: Record<string, string> }>;
+        edges: Array<{ id: string; from: string; to: string }>;
+        source: string;
+        status: string;
+      }>("get_topology_graph");
+
+      if (graph.nodes.length === 0) return; // offline — keep sample
+
+      this.nodes = graph.nodes.map((n) => ({
+        id: n.id,
+        type: (n.nodeType as TopologyNodeType) ?? "endpoint",
+        label: n.label,
+        x: n.x,
+        y: n.y,
+        data: { ...n.data },
+      }));
+      this.edges = graph.edges.map((e) => ({ ...e }));
+      this.liveSource = graph.source;
+      this.render();
+      this.bindEvents();
+      this.pushGraphToCanvas();
+    } catch {
+      // offline or Tauri not available — keep sample nodes
+    }
   }
 
   private render(): void {
@@ -621,11 +757,17 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
       .map((type) => `<option value="${type}">${t(`topology.type.${type}`)}</option>`)
       .join("");
 
+    const sourceBanner = this.liveSource
+      ? `<span class="ml-2 text-[10px] text-emerald-400 font-mono">${t("topology.live-banner")} ${this.liveSource}</span>`
+      : `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">${t("topology.offline-banner")}</span>`;
+
+    const btnClass = "rounded border border-slate-700 bg-slate-800/60 px-2 py-1 text-xs text-slate-300 hover:bg-slate-700 transition-colors";
+
     this.renderTemplate(`
-      <section class="p-6 space-y-6 text-slate-300">
+      <section class="p-6 space-y-4 text-slate-300">
         <header data-stagger-panel class="flex items-end justify-between gap-4 border-l-4 border-cyan-500 pl-4">
           <div>
-            <h2 class="text-2xl font-bold text-slate-100">${t("topology.title")}</h2>
+            <h2 class="text-2xl font-bold text-slate-100">${t("topology.title")}${sourceBanner}</h2>
             <p class="text-sm font-mono text-slate-400">${t("topology.subtitle")}</p>
           </div>
           <button id="btn-apply-topology" type="button" ${this.applying ? "disabled" : ""}
@@ -635,6 +777,12 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         </header>
 
         <article data-stagger-panel>
+          <div class="mb-2 flex items-center gap-2 justify-end">
+            <button id="btn-zoom-in"    type="button" class="${btnClass}" title="${t("topology.zoom-in")}">＋</button>
+            <button id="btn-zoom-out"   type="button" class="${btnClass}" title="${t("topology.zoom-out")}">－</button>
+            <button id="btn-zoom-reset" type="button" class="${btnClass}" title="${t("topology.zoom-reset")}">⊙</button>
+            <button id="btn-compact"    type="button" class="${btnClass}" title="${t("topology.compact-mode")}">⊞</button>
+          </div>
           <tachyon-topology-canvas></tachyon-topology-canvas>
           <tachyon-node-editor></tachyon-node-editor>
           <p class="mt-2 text-center text-[11px] text-slate-600 select-none">${t("topology.drop.hint")}</p>
@@ -649,7 +797,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
               </select>
             </label>
             <label class="block text-xs text-slate-400">${t("topology.add.label")}
-              <input id="add-node-label" type="text" class="mt-1 rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-cyan-400" style="width: 180px;" />
+              <input id="add-node-label" type="text" class="mt-1 rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-cyan-400" style="width:180px;" />
             </label>
             <button type="submit" class="rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-200 hover:bg-cyan-500/20">${t("topology.add.submit")}</button>
           </form>
@@ -675,6 +823,17 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
   private bindEvents(): void {
     this.root.getElementById("btn-apply-topology")?.addEventListener("click", () => {
       void this.applyTopology();
+    });
+
+    this.root.getElementById("btn-zoom-in")?.addEventListener("click", () => this.canvas()?.zoomIn());
+    this.root.getElementById("btn-zoom-out")?.addEventListener("click", () => this.canvas()?.zoomOut());
+    this.root.getElementById("btn-zoom-reset")?.addEventListener("click", () => this.canvas()?.resetView());
+    this.root.getElementById("btn-compact")?.addEventListener("click", () => {
+      const canvas = this.canvas();
+      if (!canvas) return;
+      canvas.toggleCompact();
+      const btn = this.root.getElementById("btn-compact");
+      if (btn) btn.textContent = canvas.isCompact ? "☰" : "⊞";
     });
 
     this.root.getElementById("add-node-form")?.addEventListener("submit", (event) => {
