@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
@@ -64,12 +59,9 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
 
   private async applyWorkloadContract(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "workloads",
-        payload: {
+      const response = await applyAndSeal("workloads", {
           engine: this.value("engine", "wasmtime"),
           secret_ref: this.value("secret-ref", ""),
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

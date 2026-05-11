@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 export class TachyonRbacPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
@@ -82,12 +77,9 @@ export class TachyonRbacPanel extends TachyonConfigDashboard {
     }
 
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "config-rbac",
-        payload: {
+      const response = await applyAndSeal("config-rbac", {
           role: this.value("role", "admin"),
           policy,
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

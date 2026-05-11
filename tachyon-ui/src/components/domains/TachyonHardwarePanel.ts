@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 export class TachyonHardwarePanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
@@ -63,16 +58,13 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
 
   private async applyHardwarePolicy(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "config-ai",
-        payload: {
+      const response = await applyAndSeal("config-ai", {
           lora_mode: "dynamic",
           kv_cache_size: 32,
           tde_key: "hardware-policy-validation",
           accelerator: this.value("accelerator", "npu"),
           xdp_offload:
             (this.root.getElementById("xdp-offload") as HTMLInputElement | null)?.checked ?? true,
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

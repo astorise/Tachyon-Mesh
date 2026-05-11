@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 type MeshResource = {
   name: string;
@@ -91,12 +86,9 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
 
   private async applyStorageConfig(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "storage",
-        payload: {
+      const response = await applyAndSeal("storage", {
           mount_path: this.value("mount-path", "/mnt/data"),
           s3_endpoint: this.value("s3-endpoint", ""),
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

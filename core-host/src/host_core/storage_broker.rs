@@ -30,10 +30,17 @@ impl StorageBrokerManager {
         &self,
         route_path: String,
         sync_to_cloud: bool,
-        resolved: ResolvedStorageWriteTarget,
+        mut resolved: ResolvedStorageWriteTarget,
         mode: StorageWriteMode,
         body: Vec<u8>,
     ) -> std::result::Result<(), String> {
+        fs::create_dir_all(&resolved.volume_root).map_err(|error| {
+            format!(
+                "failed to create storage broker volume root `{}`: {error}",
+                resolved.volume_root.display()
+            )
+        })?;
+        resolved.volume_root = normalize_path(resolved.volume_root);
         let queue = self.queue_for_volume(&resolved.volume_root);
         queue.enqueue(StorageBrokerOperation::Write(StorageBrokerWriteRequest {
             route_path,

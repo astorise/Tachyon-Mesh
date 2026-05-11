@@ -55,6 +55,30 @@ The Tachyon app shell SHALL show a global pending changes button when any config
 - **THEN** the shell invokes `seal_and_apply_manifest`
 - **AND** shows success or failure through the global toast manager
 
+### Requirement: Core host exposes runtime metrics to admin clients
+The core host SHALL expose `GET /admin/metrics` as an authenticated admin endpoint backed by the runtime telemetry snapshot.
+
+#### Scenario: Admin requests runtime metrics
+- **WHEN** an authenticated admin client requests `/admin/metrics`
+- **THEN** the host returns JSON containing source, error rate, latency, and queue depth fields
+- **AND** the request does not fall through to the FaaS route fallback
+
+### Requirement: Core host exposes shadow divergence reports to admin clients
+The core host SHALL expose `GET /admin/shadow/diffs` as an authenticated admin endpoint for recent shadow traffic divergence reports.
+
+#### Scenario: Admin requests shadow diffs
+- **WHEN** an authenticated admin client requests `/admin/shadow/diffs`
+- **THEN** the host returns a JSON array of divergence records
+- **AND** the endpoint remains available even when no divergences have been recorded
+
+### Requirement: Core host accepts chaos scenario requests
+The core host SHALL expose `POST /admin/chaos/scenarios` as an authenticated admin endpoint for supported chaos harness scenarios.
+
+#### Scenario: Admin starts a supported chaos scenario
+- **WHEN** an authenticated admin client posts a supported scenario payload
+- **THEN** the host returns an accepted JSON outcome
+- **AND** invalid scenario names or excessive durations are rejected as caller errors
+
 ### Requirement: MCP can seal and apply manifests
 The Tachyon MCP server SHALL expose tools that allow agents to seal local overlays and apply sealed manifests.
 

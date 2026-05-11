@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 export class TachyonResiliencePanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
@@ -61,13 +56,10 @@ export class TachyonResiliencePanel extends TachyonConfigDashboard {
 
   private async applyPolicy(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "config-resilience",
-        payload: {
+      const response = await applyAndSeal("config-resilience", {
           timeout_ms: this.numberValue("timeout-ms", 1500),
           retry_count: this.numberValue("retry-count", 2),
           circuit_breaker_threshold: this.numberValue("circuit-breaker-threshold", 5),
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

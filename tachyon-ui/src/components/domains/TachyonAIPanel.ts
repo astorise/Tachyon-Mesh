@@ -1,13 +1,8 @@
 import gsap from "gsap";
 
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 export class TachyonAIPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindEvents(); };
@@ -92,13 +87,10 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
 
   private async applyConfiguration(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "config-ai",
-        payload: {
+      const response = await applyAndSeal("config-ai", {
           lora_mode: this.value("lora-mode", "dynamic"),
           kv_cache_size: this.numberValue("kv-cache-range", 32),
           tde_key: this.value("tde-key", ""),
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

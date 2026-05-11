@@ -3,11 +3,19 @@
     windows_subsystem = "windows"
 )]
 
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
+use tauri_plugin_stronghold::stronghold::Stronghold as NativeStronghold;
+
+const STRONGHOLD_PROFILE_CLIENT: &[u8] = b"tachyon-ui-auth";
+const AUTH_PROFILE_RECORD: &[u8] = b"auth_profile";
+const STRONGHOLD_PROFILE_KEY_BYTES: usize = 32;
+const MFA_SESSION_TTL_SECONDS: u64 = 20 * 60;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +93,124 @@ struct SecureAuthProfile {
     custom_ca: Option<Vec<u8>>,
 }
 
+struct StrongholdAuthStore {
+    inner: Mutex<NativeStronghold>,
+}
+
+#[derive(Default)]
+struct MfaSessionState {
+    inner: Mutex<Option<MfaSessionToken>>,
+}
+
+#[derive(Clone)]
+struct MfaSessionToken {
+    token: String,
+    expires_at: u64,
+}
+
+impl StrongholdAuthStore {
+    fn new(snapshot_path: PathBuf, key: Vec<u8>) -> Result<Self, String> {
+        let stronghold = NativeStronghold::new(snapshot_path, key)
+            .map_err(|error| format!("failed to initialize Stronghold auth store: {error}"))?;
+        Ok(Self {
+            inner: Mutex::new(stronghold),
+        })
+    }
+
+    fn get_record(&self, record: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let stronghold = self
+            .inner
+            .lock()
+            .map_err(|_| "Stronghold auth store lock is poisoned".to_owned())?;
+        let client = load_or_create_stronghold_client(&stronghold)?;
+        client
+            .store()
+            .get(record)
+            .map_err(|error| format!("failed to read Stronghold auth record: {error}"))
+    }
+
+    fn insert_record(&self, record: &[u8], bytes: Vec<u8>) -> Result<(), String> {
+        let stronghold = self
+            .inner
+            .lock()
+            .map_err(|_| "Stronghold auth store lock is poisoned".to_owned())?;
+        let client = load_or_create_stronghold_client(&stronghold)?;
+        client
+            .store()
+            .insert(record.to_vec(), bytes, None)
+            .map_err(|error| format!("failed to write Stronghold auth record: {error}"))?;
+        stronghold
+            .save()
+            .map_err(|error| format!("failed to persist Stronghold auth snapshot: {error}"))
+    }
+
+    fn remove_record(&self, record: &[u8]) -> Result<(), String> {
+        let stronghold = self
+            .inner
+            .lock()
+            .map_err(|_| "Stronghold auth store lock is poisoned".to_owned())?;
+        let client = load_or_create_stronghold_client(&stronghold)?;
+        client
+            .store()
+            .delete(record)
+            .map_err(|error| format!("failed to delete Stronghold auth record: {error}"))?;
+        stronghold
+            .save()
+            .map_err(|error| format!("failed to persist Stronghold auth snapshot: {error}"))
+    }
+}
+
+impl MfaSessionState {
+    fn set(&self, token: tachyon_client::MfaSessionToken) -> Result<(), String> {
+        let fallback_expires_at = current_unix_seconds()?.saturating_add(MFA_SESSION_TTL_SECONDS);
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "MFA session lock is poisoned".to_owned())?;
+        *guard = Some(MfaSessionToken {
+            token: token.mfa_session_token,
+            expires_at: token.expires_at.max(fallback_expires_at),
+        });
+        Ok(())
+    }
+
+    fn require_valid(&self) -> Result<(), String> {
+        let now = current_unix_seconds()?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "MFA session lock is poisoned".to_owned())?;
+        match guard.as_ref() {
+            Some(session) if !session.token.trim().is_empty() && session.expires_at > now => Ok(()),
+            Some(_) => {
+                *guard = None;
+                Err(
+                    "MFA session expired; verify TOTP again before sealing configuration"
+                        .to_owned(),
+                )
+            }
+            None => Err("MFA step-up is required before sealing configuration".to_owned()),
+        }
+    }
+}
+
+fn current_unix_seconds() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())
+        .map(|duration| duration.as_secs())
+}
+
+fn load_or_create_stronghold_client(
+    stronghold: &NativeStronghold,
+) -> Result<iota_stronghold::Client, String> {
+    stronghold
+        .get_client(STRONGHOLD_PROFILE_CLIENT)
+        .or_else(|_| stronghold.load_client(STRONGHOLD_PROFILE_CLIENT))
+        .or_else(|_| stronghold.create_client(STRONGHOLD_PROFILE_CLIENT))
+        .map_err(|error| format!("failed to open Stronghold auth client: {error}"))
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplyConfigurationResponse {
@@ -96,10 +222,47 @@ struct ApplyConfigurationResponse {
 
 #[allow(dead_code)]
 mod wit_contracts {
-    wit_bindgen::generate!({
-        path: "../wit/config-routing.wit",
-        world: "traffic-management-config",
-    });
+    pub mod routing {
+        wit_bindgen::generate!({
+            path: "../wit/config-routing.wit",
+            world: "traffic-management-config",
+        });
+    }
+
+    pub mod resilience {
+        wit_bindgen::generate!({
+            path: "../wit/config-resilience.wit",
+            world: "resilience-chaos-config",
+        });
+    }
+
+    pub mod ai {
+        wit_bindgen::generate!({
+            path: "../wit/config-ai.wit",
+            world: "ai-orchestration-config",
+        });
+    }
+
+    pub mod observability {
+        wit_bindgen::generate!({
+            path: "../wit/config-observability.wit",
+            world: "observability-compute-config",
+        });
+    }
+
+    pub mod storage {
+        wit_bindgen::generate!({
+            path: "../wit/config-storage.wit",
+            world: "storage-state-config",
+        });
+    }
+
+    pub mod fleet {
+        wit_bindgen::generate!({
+            path: "../wit/config-fleet.wit",
+            world: "fleet-profile-config",
+        });
+    }
 }
 
 #[tauri::command]
@@ -380,6 +543,7 @@ async fn delete_resource(name: String) -> Result<(), String> {
 async fn apply_configuration(
     domain: String,
     payload: Value,
+    dry_run: Option<bool>,
 ) -> Result<ApplyConfigurationResponse, String> {
     let payload_for_staging = payload.clone();
     let response = match domain.as_str() {
@@ -411,6 +575,18 @@ async fn apply_configuration(
         });
     }
 
+    if dry_run.unwrap_or(false) {
+        return Ok(ApplyConfigurationResponse {
+            success: true,
+            message: format!(
+                "{} Dry-run only; no overlay state changed.",
+                response.message
+            ),
+            staged: false,
+            requires_seal: false,
+        });
+    }
+
     tachyon_client::stage_configuration_overlay(&domain, payload_for_staging)
         .await
         .map_err(|error| error.to_string())?;
@@ -427,7 +603,13 @@ async fn apply_configuration(
 }
 
 #[tauri::command]
-async fn seal_and_apply_manifest() -> Result<tachyon_client::SealApplyOutcome, String> {
+async fn seal_and_apply_manifest(
+    app: tauri::AppHandle,
+) -> Result<tachyon_client::SealApplyOutcome, String> {
+    let state = app
+        .try_state::<MfaSessionState>()
+        .ok_or_else(|| "MFA session backend is unavailable".to_owned())?;
+    state.require_valid()?;
     tachyon_client::seal_and_apply_manifest()
         .await
         .map_err(|error| error.to_string())
@@ -479,12 +661,16 @@ async fn load_credentials(app: tauri::AppHandle) -> Result<Option<SavedCredentia
 
 #[tauri::command]
 async fn delete_credentials(app: tauri::AppHandle) -> Result<(), String> {
-    let path = secure_profile_path(&app)?;
+    let store = app
+        .try_state::<StrongholdAuthStore>()
+        .ok_or_else(|| "Stronghold auth backend is unavailable".to_owned())?;
+    store.remove_record(AUTH_PROFILE_RECORD)?;
+    let path = legacy_secure_profile_path(&app)?;
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
-            "failed to delete Stronghold auth profile `{}`: {error}",
+            "failed to delete legacy auth profile `{}`: {error}",
             path.display()
         )),
     }
@@ -518,39 +704,21 @@ async fn verify_session_totp(app: tauri::AppHandle, code: String) -> Result<(), 
         return Err("MFA code must contain exactly 6 digits".to_owned());
     }
 
-    let profile = read_secure_profile(&app)
-        .await?
-        .ok_or_else(|| {
-            "Step-up cannot complete without remembered credentials. Sign in with the remember toggle enabled, then retry the action.".to_owned()
-        })?;
-
-    if profile.url.is_empty() || profile.username.is_empty() || profile.password.is_empty() {
-        return Err(
-            "Step-up requires the workstation profile to contain a node URL, username, and password.".to_owned(),
-        );
-    }
-
-    let staged = tachyon_client::authn_login(
-        &profile.url,
-        &profile.username,
-        &profile.password,
-        profile.custom_ca.clone(),
-    )
-    .await
-    .map_err(|error| format!("step-up login staging failed: {error}"))?;
-
-    let session_id = staged.session_id.ok_or_else(|| {
-        "Step-up login staging did not return an MFA session id; refresh credentials and retry."
-            .to_owned()
-    })?;
-
-    tachyon_client::finalize_login(&profile.url, &session_id, trimmed, profile.custom_ca)
+    let token = tachyon_client::verify_session_totp(trimmed)
         .await
-        .map(|_| ())
-        .map_err(|error| format!("step-up TOTP verification failed: {error}"))
+        .map_err(|error| format!("step-up TOTP verification failed: {error}"))?;
+    let state = app
+        .try_state::<MfaSessionState>()
+        .ok_or_else(|| "MFA session backend is unavailable".to_owned())?;
+    state.set(token)
 }
 
-fn secure_profile_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+#[tauri::command]
+async fn stronghold_available(app: tauri::AppHandle) -> Result<bool, String> {
+    Ok(app.try_state::<StrongholdAuthStore>().is_some())
+}
+
+fn legacy_secure_profile_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
         .app_local_data_dir()
@@ -559,7 +727,16 @@ fn secure_profile_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 async fn read_secure_profile(app: &tauri::AppHandle) -> Result<Option<SecureAuthProfile>, String> {
-    let path = secure_profile_path(app)?;
+    let store = app
+        .try_state::<StrongholdAuthStore>()
+        .ok_or_else(|| "Stronghold auth backend is unavailable".to_owned())?;
+    if let Some(bytes) = store.get_record(AUTH_PROFILE_RECORD)? {
+        return serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("failed to decode Stronghold auth profile: {error}"));
+    }
+
+    let path = legacy_secure_profile_path(app)?;
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -570,35 +747,37 @@ async fn read_secure_profile(app: &tauri::AppHandle) -> Result<Option<SecureAuth
             ));
         }
     };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| format!("failed to decode Stronghold auth profile: {error}"))
+    let profile: SecureAuthProfile = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to decode legacy auth profile: {error}"))?;
+    store.insert_record(
+        AUTH_PROFILE_RECORD,
+        serde_json::to_vec(&profile).map_err(|error| {
+            format!("failed to encode migrated Stronghold auth profile: {error}")
+        })?,
+    )?;
+    let _ = tokio::fs::remove_file(&path).await;
+    Ok(Some(profile))
 }
 
 async fn write_secure_profile(
     app: &tauri::AppHandle,
     profile: &SecureAuthProfile,
 ) -> Result<(), String> {
-    let path = secure_profile_path(app)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("invalid Stronghold auth profile path `{}`", path.display()))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(|error| format!("failed to create Stronghold auth directory: {error}"))?;
-    let bytes = serde_json::to_vec_pretty(profile)
+    let store = app
+        .try_state::<StrongholdAuthStore>()
+        .ok_or_else(|| "Stronghold auth backend is unavailable".to_owned())?;
+    let bytes = serde_json::to_vec(profile)
         .map_err(|error| format!("failed to encode Stronghold auth profile: {error}"))?;
-    tokio::fs::write(&path, bytes).await.map_err(|error| {
-        format!(
-            "failed to write Stronghold auth profile `{}`: {error}",
-            path.display()
-        )
-    })
+    store.insert_record(AUTH_PROFILE_RECORD, bytes)
 }
 
 fn validate_traffic_config(config: &Value) -> ApiResponse {
-    let gateways = array_len(config, &["gateways", "spec.gateways"]);
-    let routes = array_len(config, &["routes", "spec.routes"]);
+    let traffic = match traffic_configuration_from_json(config) {
+        Ok(traffic) => traffic,
+        Err(message) => return failed(&message),
+    };
+    let gateways = traffic.gateways.len();
+    let routes = traffic.routes.len();
     if gateways == 0 && routes == 0 {
         return failed("WIT validation failed: gateways or routes are required");
     }
@@ -608,6 +787,10 @@ fn validate_traffic_config(config: &Value) -> ApiResponse {
 }
 
 fn validate_resilience_config(config: &Value) -> ApiResponse {
+    let _wit_config =
+        wit_contracts::resilience::exports::tachyon::resilience_config::config_resilience::ResilienceConfiguration {
+            policies: Vec::new(),
+        };
     let policies = array_len(config, &["policies"]);
     if policies == 0 && !config.is_object() {
         return failed("Resilience validation failed: payload must be an object");
@@ -618,12 +801,15 @@ fn validate_resilience_config(config: &Value) -> ApiResponse {
 }
 
 fn validate_ai_config(config: &Value) -> ApiResponse {
+    let wit_config = wit_contracts::ai::exports::tachyon::ai_config::config_ai::AiConfiguration {
+        deployments: Vec::new(),
+    };
     if let Some(kv_cache_size) = config.get("kv_cache_size").and_then(Value::as_u64) {
         if !(8..=128).contains(&kv_cache_size) {
             return failed("AI WIT validation failed: kv_cache_size must be between 8 and 128 GB");
         }
     }
-    let deployments = array_len(config, &["deployments"]);
+    let deployments = array_len(config, &["deployments"]).max(wit_config.deployments.len());
     passed(format!(
         "AI WIT validation passed: {deployments} deployment(s)."
     ))
@@ -658,10 +844,28 @@ fn validate_workloads_panel_config(config: &Value) -> ApiResponse {
 }
 
 fn validate_observability_panel_config(config: &Value) -> ApiResponse {
-    if let Some(endpoint) = nested_string(config, "telemetry.traces.otlp_endpoint")
+    let endpoint = nested_string(config, "telemetry.traces.otlp_endpoint")
         .or_else(|| nested_string(config, "telemetry.traces.otlp-endpoint"))
         .or_else(|| config.get("otlp_endpoint").and_then(Value::as_str))
-    {
+        .map(str::to_owned);
+    let _wit_config =
+        wit_contracts::observability::exports::tachyon::observability_config::config_observability::OpsConfiguration {
+            telemetry: wit_contracts::observability::exports::tachyon::observability_config::config_observability::TelemetryConfig {
+                logs: wit_contracts::observability::exports::tachyon::observability_config::config_observability::LogPolicy {
+                    global_level: wit_contracts::observability::exports::tachyon::observability_config::config_observability::LogLevel::Info,
+                },
+                traces: wit_contracts::observability::exports::tachyon::observability_config::config_observability::TracePolicy {
+                    otlp_endpoint: endpoint.clone(),
+                    sample_rate: config
+                        .get("sample_rate")
+                        .or_else(|| nested_value(config, "telemetry.traces.sample_rate"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0),
+                },
+            },
+            quotas: Vec::new(),
+        };
+    if let Some(endpoint) = endpoint.as_deref() {
         if !endpoint.is_empty()
             && !endpoint.starts_with("https://")
             && !endpoint.starts_with("http://")
@@ -675,6 +879,12 @@ fn validate_observability_panel_config(config: &Value) -> ApiResponse {
 }
 
 fn validate_storage_panel_config(config: &Value) -> ApiResponse {
+    let _wit_config =
+        wit_contracts::storage::exports::tachyon::storage_config::config_storage::StorageConfiguration {
+            volumes: Vec::new(),
+            s3_backends: Vec::new(),
+            kv_partitions: Vec::new(),
+        };
     let volumes = array_len(config, &["volumes"]);
     let s3 = array_len(config, &["s3_backends", "s3Backends", "s3-backends"]);
     let kv = array_len(config, &["kv_partitions", "kvPartitions", "kv-partitions"]);
@@ -684,7 +894,11 @@ fn validate_storage_panel_config(config: &Value) -> ApiResponse {
 }
 
 fn validate_fleet_panel_config(config: &Value) -> ApiResponse {
-    let profiles = array_len(config, &["profiles"]);
+    let wit_config =
+        wit_contracts::fleet::exports::tachyon::fleet_config::config_fleet::FleetConfiguration {
+            profiles: Vec::new(),
+        };
+    let profiles = array_len(config, &["profiles"]).max(wit_config.profiles.len());
     passed(format!(
         "Fleet WIT validation passed: {profiles} profile(s)."
     ))
@@ -704,6 +918,68 @@ fn validate_supply_chain_panel_config(config: &Value) -> ApiResponse {
     ))
 }
 
+fn traffic_configuration_from_json(
+    config: &Value,
+) -> Result<
+    wit_contracts::routing::exports::tachyon::routing::config_routing::TrafficConfiguration,
+    String,
+> {
+    use wit_contracts::routing::exports::tachyon::routing::config_routing::{
+        AccelMode, GatewayConfig, RouteConfig, TrafficConfiguration,
+    };
+
+    let gateway_values = array_values(config, &["gateways", "spec.gateways"]);
+    let route_values = array_values(config, &["routes", "spec.routes"]);
+    let gateways = gateway_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let name = string_field(value, &["name"], &format!("gateway-{index}"));
+            let protocol = string_field(value, &["proto", "protocol"], "http");
+            let bind_address = string_field(
+                value,
+                &["bind_address", "bindAddress", "bind-address"],
+                "0.0.0.0:80",
+            );
+            Ok(GatewayConfig {
+                name,
+                proto: protocol_from_string(&protocol)?,
+                bind_address,
+                accel: AccelMode::Userspace,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let routes = route_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let name = string_field(value, &["name"], &format!("route-{index}"));
+            let gateway_refs =
+                string_array_field(value, &["gateway_refs", "gatewayRefs", "gateway-refs"]);
+            Ok(RouteConfig { name, gateway_refs })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(TrafficConfiguration { gateways, routes })
+}
+
+fn protocol_from_string(
+    value: &str,
+) -> Result<wit_contracts::routing::exports::tachyon::routing::config_routing::Protocol, String> {
+    use wit_contracts::routing::exports::tachyon::routing::config_routing::Protocol;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "tcp" => Ok(Protocol::Tcp),
+        "udp" => Ok(Protocol::Udp),
+        "http" => Ok(Protocol::Http),
+        "https" => Ok(Protocol::Https),
+        "grpc" => Ok(Protocol::Grpc),
+        "uds" => Ok(Protocol::Uds),
+        other => Err(format!(
+            "WIT validation failed: unsupported routing protocol `{other}`"
+        )),
+    }
+}
+
 fn array_len(config: &Value, paths: &[&str]) -> usize {
     paths
         .iter()
@@ -713,6 +989,38 @@ fn array_len(config: &Value, paths: &[&str]) -> usize {
                 .map(Vec::len)
         })
         .unwrap_or(0)
+}
+
+fn array_values<'a>(config: &'a Value, paths: &[&str]) -> Vec<&'a Value> {
+    paths
+        .iter()
+        .find_map(|path| nested_value(config, path).and_then(Value::as_array))
+        .map(|values| values.iter().collect())
+        .unwrap_or_default()
+}
+
+fn string_field(value: &Value, keys: &[&str], fallback: &str) -> String {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn string_array_field(value: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_array))
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn nested_string<'a>(config: &'a Value, path: &str) -> Option<&'a str> {
@@ -738,6 +1046,32 @@ fn passed(message: impl Into<String>) -> ApiResponse {
     }
 }
 
+fn stronghold_profile_key(data_dir: &std::path::Path) -> Result<Vec<u8>, String> {
+    let key_path = data_dir.join("stronghold-profile.key");
+    match std::fs::read(&key_path) {
+        Ok(bytes) if bytes.len() == STRONGHOLD_PROFILE_KEY_BYTES => Ok(bytes),
+        Ok(_) => Err(format!(
+            "Stronghold profile key `{}` has an invalid length",
+            key_path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = key_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("failed to create Stronghold key dir: {error}"))?;
+            }
+            let mut key = vec![0_u8; STRONGHOLD_PROFILE_KEY_BYTES];
+            OsRng.fill_bytes(&mut key);
+            std::fs::write(&key_path, &key)
+                .map_err(|error| format!("failed to write Stronghold profile key: {error}"))?;
+            Ok(key)
+        }
+        Err(error) => Err(format!(
+            "failed to read Stronghold profile key `{}`: {error}",
+            key_path.display()
+        )),
+    }
+}
+
 fn main() {
     let result = tauri::Builder::default()
         .setup(|app| {
@@ -749,6 +1083,15 @@ fn main() {
             // integrity.lock without relying on the compile-time CARGO_MANIFEST_DIR.
             std::env::set_var("TACHYON_WORKSPACE_ROOT", &data_dir);
             let salt_path = data_dir.join("stronghold-salt.txt");
+            let profile_key = stronghold_profile_key(&data_dir)
+                .map_err(|error| tauri::Error::Anyhow(std::io::Error::other(error).into()))?;
+            let profile_store = StrongholdAuthStore::new(
+                data_dir.join("tachyon-auth-profile.stronghold"),
+                profile_key,
+            )
+            .map_err(|error| tauri::Error::Anyhow(std::io::Error::other(error).into()))?;
+            app.manage(profile_store);
+            app.manage(MfaSessionState::default());
             app.handle()
                 .plugin(tauri_plugin_stronghold::Builder::with_argon2(&salt_path).build())?;
             Ok(())
@@ -795,7 +1138,8 @@ fn main() {
             save_custom_ca,
             load_custom_ca,
             clear_custom_ca,
-            verify_session_totp
+            verify_session_totp,
+            stronghold_available
         ])
         .run(tauri::generate_context!());
 

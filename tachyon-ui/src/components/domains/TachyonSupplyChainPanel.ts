@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 export class TachyonSupplyChainPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
@@ -58,13 +53,10 @@ export class TachyonSupplyChainPanel extends TachyonConfigDashboard {
 
   private async applySupplyChainConfig(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "supply_chain",
-        payload: {
+      const response = await applyAndSeal("supply_chain", {
           signature_key: this.value("signature-key", ""),
           air_gapped:
             (this.root.getElementById("air-gapped") as HTMLInputElement | null)?.checked ?? false,
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

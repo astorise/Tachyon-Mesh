@@ -1,9 +1,4 @@
-import { resilientInvoke as invoke } from "../utils/network";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
+import { applyAndSeal } from "../utils/network";
 
 type RoutingPayload = {
   api_version: "routing.tachyon.io/v1alpha1";
@@ -42,10 +37,7 @@ export class RoutingController {
   }
 
   private static async deploy(): Promise<void> {
-    const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-      domain: "config-routing",
-      payload: RoutingController.buildPayload(),
-    });
+    const response = await applyAndSeal("config-routing", RoutingController.buildPayload());
 
     const level = response.success ? "info" : "error";
     console[level](`[routing] ${response.message}`);

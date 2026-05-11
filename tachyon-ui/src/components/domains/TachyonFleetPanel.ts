@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 export class TachyonFleetPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
@@ -60,12 +55,9 @@ export class TachyonFleetPanel extends TachyonConfigDashboard {
 
   private async applyFleetConfig(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "fleet",
-        payload: {
+      const response = await applyAndSeal("fleet", {
           selector_tags: this.value("selector-tags", ""),
           node_profile: this.value("node-profile", "edge-light"),
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

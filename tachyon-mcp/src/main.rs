@@ -1,36 +1,51 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     env,
+    path::PathBuf,
     sync::Mutex,
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-const WRITE_LIMIT_PER_MINUTE: u32 = 5;
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+const RATE_LIMIT_PERSIST_SECS: u64 = 10;
 
 struct McpContext {
-    _token: String,
-    write_limiter: Mutex<TokenBucket>,
+    token: String,
+    url: String,
+    rate_limiter: ToolRateLimiter,
+    enforce_remote_auth: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitSpec {
+    limit: u32,
+    window_secs: u64,
 }
 
 struct TokenBucket {
+    limit: u32,
     tokens: u32,
-    last_refill: Instant,
+    last_refill_unix: u64,
 }
 
 impl TokenBucket {
-    fn new() -> Self {
+    fn new(spec: RateLimitSpec, now: u64) -> Self {
         Self {
-            tokens: WRITE_LIMIT_PER_MINUTE,
-            last_refill: Instant::now(),
+            limit: spec.limit,
+            tokens: spec.limit,
+            last_refill_unix: now,
         }
     }
 
-    fn allow(&mut self) -> bool {
-        if self.last_refill.elapsed() >= Duration::from_secs(60) {
-            self.tokens = WRITE_LIMIT_PER_MINUTE;
-            self.last_refill = Instant::now();
+    fn allow(&mut self, spec: RateLimitSpec, now: u64) -> bool {
+        self.limit = spec.limit;
+        if now.saturating_sub(self.last_refill_unix) >= spec.window_secs {
+            self.tokens = spec.limit;
+            self.last_refill_unix = now;
         }
         if self.tokens == 0 {
             return false;
@@ -40,18 +55,164 @@ impl TokenBucket {
     }
 }
 
+struct ToolRateLimiter {
+    state_path: PathBuf,
+    state: Mutex<ToolRateLimiterState>,
+}
+
+struct ToolRateLimiterState {
+    buckets: HashMap<String, TokenBucket>,
+    last_persist_unix: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedRateLimitState {
+    buckets: HashMap<String, PersistedTokenBucket>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedTokenBucket {
+    limit: u32,
+    tokens: u32,
+    last_refill_unix: u64,
+}
+
+impl ToolRateLimiter {
+    fn new() -> Self {
+        Self::new_with_path(env::temp_dir().join("tachyon-mcp-rate-limits.state"))
+    }
+
+    fn new_with_path(state_path: PathBuf) -> Self {
+        let now = unix_now();
+        let buckets = load_rate_limit_state(&state_path)
+            .unwrap_or_default()
+            .buckets
+            .into_iter()
+            .map(|(name, bucket)| {
+                (
+                    name,
+                    TokenBucket {
+                        limit: bucket.limit,
+                        tokens: bucket.tokens,
+                        last_refill_unix: bucket.last_refill_unix,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            state_path,
+            state: Mutex::new(ToolRateLimiterState {
+                buckets,
+                last_persist_unix: now,
+            }),
+        }
+    }
+
+    fn allow(&self, tool_name: &str) -> Result<bool> {
+        let Some(spec) = rate_limit_spec(tool_name) else {
+            return Ok(true);
+        };
+        let now = unix_now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MCP rate limiter lock is poisoned"))?;
+        let allowed = state
+            .buckets
+            .entry(tool_name.to_owned())
+            .or_insert_with(|| TokenBucket::new(spec, now))
+            .allow(spec, now);
+        if !allowed || now.saturating_sub(state.last_persist_unix) >= RATE_LIMIT_PERSIST_SECS {
+            persist_rate_limit_state(&self.state_path, &state.buckets)?;
+            state.last_persist_unix = now;
+        }
+        Ok(allowed)
+    }
+}
+
+impl McpContext {
+    fn new(token: String, url: String) -> Self {
+        Self {
+            token,
+            url,
+            rate_limiter: ToolRateLimiter::new(),
+            enforce_remote_auth: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(state_path: PathBuf) -> Self {
+        Self {
+            token: "test-token".to_owned(),
+            url: "http://127.0.0.1:1".to_owned(),
+            rate_limiter: ToolRateLimiter::new_with_path(state_path),
+            enforce_remote_auth: false,
+        }
+    }
+}
+
+fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
+    let limit = match tool_name {
+        "tachyon_apply_manifest" | "tachyon_seal_overlay" => 1,
+        "tachyon_get_metrics" | "tachyon_tail_logs" => 30,
+        "tachyon_register_resource" => 10,
+        _ => return None,
+    };
+    Some(RateLimitSpec {
+        limit,
+        window_secs: RATE_LIMIT_WINDOW_SECS,
+    })
+}
+
+fn load_rate_limit_state(path: &PathBuf) -> Result<PersistedRateLimitState> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("failed to read MCP rate-limit state `{}`", path.display()))?;
+    serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to decode MCP rate-limit state `{}`", path.display()))
+}
+
+fn persist_rate_limit_state(path: &PathBuf, buckets: &HashMap<String, TokenBucket>) -> Result<()> {
+    let persisted = PersistedRateLimitState {
+        buckets: buckets
+            .iter()
+            .map(|(name, bucket)| {
+                (
+                    name.clone(),
+                    PersistedTokenBucket {
+                        limit: bucket.limit,
+                        tokens: bucket.tokens,
+                        last_refill_unix: bucket.last_refill_unix,
+                    },
+                )
+            })
+            .collect(),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create MCP rate-limit state directory `{}`",
+                parent.display()
+            )
+        })?;
+    }
+    let tmp = path.with_extension("state.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&persisted)?)
+        .with_context(|| format!("failed to write MCP rate-limit state `{}`", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to commit MCP rate-limit state `{}`", path.display()))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let context = McpContext {
-        _token: load_required_token()?,
-        write_limiter: Mutex::new(TokenBucket::new()),
-    };
-    if let Ok(url) = env::var("TACHYON_MCP_URL") {
-        tachyon_client::set_connection(url, context._token.clone(), None)
-            .await
-            .map_err(anyhow::Error::msg)
-            .context("failed to validate TACHYON_MCP_PAT against TACHYON_MCP_URL")?;
-    }
+    let context = McpContext::new(load_required_token()?, load_required_url()?);
 
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
@@ -119,6 +280,15 @@ fn load_required_token() -> Result<String> {
     Ok(token)
 }
 
+fn load_required_url() -> Result<String> {
+    let url = env::var("TACHYON_MCP_URL")
+        .context("tachyon-mcp requires TACHYON_MCP_URL before accepting requests")?;
+    if url.trim().is_empty() {
+        anyhow::bail!("TACHYON_MCP_URL must not be empty");
+    }
+    Ok(url)
+}
+
 async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> {
     let request: Value =
         serde_json::from_str(line).with_context(|| format!("invalid JSON-RPC payload: {line}"))?;
@@ -130,6 +300,12 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
 
     if id.is_none() {
         return Ok(None);
+    }
+
+    if method != "initialize" {
+        if let Err(error) = validate_request_auth(context).await {
+            return Ok(Some(error_response(id, -32603, &error.to_string())));
+        }
     }
 
     let result = match method {
@@ -327,7 +503,20 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 }
             ]
         }),
-        "tools/call" => handle_tool_call(request.get("params"), context).await?,
+        "tools/call" => {
+            let result = handle_tool_call(request.get("params"), context).await?;
+            if result.get("jsonrpc").is_some() && result.get("error").is_some() {
+                return Ok(Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": result.get("error").cloned().unwrap_or_else(|| json!({
+                        "code": -32603,
+                        "message": "unknown MCP tool error"
+                    })),
+                })));
+            }
+            result
+        }
         "ping" => json!({}),
         other => {
             return Ok(Some(error_response(
@@ -345,18 +534,31 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
     })))
 }
 
+async fn validate_request_auth(context: &McpContext) -> Result<()> {
+    if !context.enforce_remote_auth {
+        return Ok(());
+    }
+    tachyon_client::set_connection(context.url.clone(), context.token.clone(), None)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("failed to validate TACHYON_MCP_PAT against TACHYON_MCP_URL")
+}
+
 async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Result<Value> {
     let name = params
         .and_then(|value| value.get("name"))
         .and_then(Value::as_str)
         .context("missing tool name")?;
 
+    if !allow_tool(context, name)? {
+        return Ok(error_response(
+            None,
+            -32000,
+            &format!("Rate limit exceeded for `{name}`"),
+        ));
+    }
+
     match name {
-        "tachyon_register_resource" | "tachyon_seal_overlay" | "tachyon_apply_manifest"
-            if !allow_write(context) =>
-        {
-            Ok(error_response(None, -32000, "Rate limit exceeded"))
-        }
         "tachyon_mesh_status" => {
             let status = tachyon_client::get_engine_status().await?;
             Ok(json!({
@@ -548,12 +750,8 @@ async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Resul
     }
 }
 
-fn allow_write(context: &McpContext) -> bool {
-    context
-        .write_limiter
-        .lock()
-        .expect("write limiter should not be poisoned")
-        .allow()
+fn allow_tool(context: &McpContext, tool_name: &str) -> Result<bool> {
+    context.rate_limiter.allow(tool_name)
 }
 
 fn text_tool_result(value: &impl serde::Serialize) -> Result<Value> {
@@ -576,4 +774,67 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> Value {
             "message": message
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "tachyon-mcp-{name}-{}-{}.state",
+            std::process::id(),
+            unix_now()
+        ))
+    }
+
+    #[tokio::test]
+    async fn initialize_round_trips_json_rpc() {
+        let context = McpContext::new_for_tests(test_state_path("initialize"));
+        let response = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+            &context,
+        )
+        .await
+        .expect("initialize should parse")
+        .expect("initialize returns a response");
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["serverInfo"]["name"], "tachyon-mcp");
+    }
+
+    #[test]
+    fn per_tool_rate_limit_denies_second_apply_manifest_call() {
+        let limiter = ToolRateLimiter::new_with_path(test_state_path("apply-limit"));
+
+        assert!(limiter
+            .allow("tachyon_apply_manifest")
+            .expect("first request should be allowed"));
+        assert!(!limiter
+            .allow("tachyon_apply_manifest")
+            .expect("second request should be denied"));
+        assert!(limiter
+            .allow("tachyon_get_metrics")
+            .expect("read tool should have an independent bucket"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_returns_json_rpc_rate_limit_error() {
+        let context = McpContext::new_for_tests(test_state_path("rpc-limit"));
+        let request = r#"{"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"tachyon_apply_manifest","arguments":{}}}"#;
+
+        assert!(context
+            .rate_limiter
+            .allow("tachyon_apply_manifest")
+            .expect("preflight call should consume the apply_manifest bucket"));
+        let denied = handle_line(request, &context)
+            .await
+            .expect("second call should produce a JSON-RPC response")
+            .expect("rate-limited request returns a response");
+
+        assert_eq!(denied["jsonrpc"], "2.0");
+        assert_eq!(denied["id"], "a");
+        assert_eq!(denied["error"]["code"], -32000);
+    }
 }

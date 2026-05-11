@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 export class TachyonIdentityPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
@@ -57,12 +52,9 @@ export class TachyonIdentityPanel extends TachyonConfigDashboard {
 
   private async applyIdentityConfiguration(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "config-security",
-        payload: {
+      const response = await applyAndSeal("config-security", {
           jwt_issuer: this.value("jwt-issuer"),
           crdt_quota: this.numberValue("crdt-quota", 10000),
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

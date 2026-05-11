@@ -15,6 +15,7 @@ use tokio::io::AsyncReadExt;
 const ADMIN_STATUS_PATH: &str = "/admin/status";
 const ADMIN_RECOVERY_CODES_PATH: &str = "/admin/security/recovery-codes";
 const ADMIN_ACCOUNT_SECURITY_PATH: &str = "/admin/security/2fa/regenerate";
+const ADMIN_STEP_UP_PATH: &str = "/admin/security/step-up";
 const ADMIN_PAT_PATH: &str = "/admin/security/pats";
 const ADMIN_ENROLLMENT_START_PATH: &str = "/admin/enrollment/start";
 const ADMIN_IAM_USERS_PATH: &str = "/admin/iam/users";
@@ -276,6 +277,12 @@ struct FinalizeEnrollmentResponse {
     username: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StepUpSessionRequest<'a> {
+    totp_code: &'a str,
+}
+
 #[derive(Debug, Deserialize)]
 struct AssetUploadResponse {
     asset_uri: String,
@@ -484,6 +491,13 @@ pub struct ChaosScenarioOutcome {
     pub accepted: bool,
     pub scenario: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MfaSessionToken {
+    pub mfa_session_token: String,
+    pub expires_at: u64,
 }
 
 fn connection_state() -> &'static RwLock<Option<InstanceConfig>> {
@@ -1791,6 +1805,19 @@ pub async fn finalize_login(
         requires_mfa: false,
         session_id: None,
     })
+}
+
+pub async fn verify_session_totp(totp_code: &str) -> Result<MfaSessionToken> {
+    let trimmed = totp_code.trim();
+    if trimmed.len() != 6 || !trimmed.chars().all(|digit| digit.is_ascii_digit()) {
+        anyhow::bail!("MFA code must contain exactly 6 digits");
+    }
+
+    post_admin_json(
+        ADMIN_STEP_UP_PATH,
+        &StepUpSessionRequest { totp_code: trimmed },
+    )
+    .await
 }
 
 pub async fn validate_registration_token(
