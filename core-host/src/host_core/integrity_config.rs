@@ -234,6 +234,26 @@ pub(crate) struct ConfigUpdateEvent {
 
 pub(crate) type ConfigUpdate = ConfigUpdateEvent;
 
+/// `GET /admin/manifest` — returns the active `IntegrityConfig` as JSON.
+/// This is the canonical way for connected clients to obtain the live topology
+/// without depending on a local `integrity.lock` file.
+pub(crate) async fn admin_get_manifest_handler(State(state): State<AppState>) -> Response {
+    let config = state.runtime.load().config.clone();
+    match serde_json::to_vec(&config) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize active config: {error}"),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /admin/manifest` body: the same `IntegrityManifest` shape as the
 /// on-disk file (so admin tooling can hand the file's bytes through unchanged).
 /// The payload's signature is verified against the same trust root as the
