@@ -495,14 +495,12 @@ fn operator_state() -> &'static RwLock<Option<String>> {
 }
 
 fn is_not_found(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .map(|e| e.kind() == std::io::ErrorKind::NotFound)
-                .unwrap_or(false)
-        })
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|e| e.kind() == std::io::ErrorKind::NotFound)
+            .unwrap_or(false)
+    })
 }
 
 pub fn workspace_root() -> PathBuf {
@@ -684,25 +682,40 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         .context("failed to parse sealed config payload")?;
 
     let status = if let Some(config) = current.as_ref() {
-        fetch_remote_status(config).await.unwrap_or_else(|_| "offline".to_owned())
+        fetch_remote_status(config)
+            .await
+            .unwrap_or_else(|_| "offline".to_owned())
     } else {
         parse_engine_status(&raw_lockfile).unwrap_or_else(|_| "offline".to_owned())
     };
 
     // ── Node construction ─────────────────────────────────────────────────────
     // Track type-row indices for auto-layout.
-    let type_order = ["endpoint", "system-faas", "llm", "kv-cache", "custom-wasm", "message-broker", "storage", "external-resource"];
-    let mut type_counters: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let type_order = [
+        "endpoint",
+        "system-faas",
+        "llm",
+        "kv-cache",
+        "custom-wasm",
+        "message-broker",
+        "storage",
+        "external-resource",
+    ];
+    let mut type_counters: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut nodes: Vec<TopologyNodeSpec> = Vec::new();
     let mut edges: Vec<TopologyEdgeSpec> = Vec::new();
     let mut edge_counter: usize = 0;
 
     // Map route path → node id for edge construction.
-    let mut path_to_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut path_to_id: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // Routes → endpoint / system-faas / llm / custom-wasm nodes
     for route in &sealed.routes {
-        let Some(path) = route.get("path").and_then(|v| v.as_str()) else { continue };
+        let Some(path) = route.get("path").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let name = route
             .get("name")
             .and_then(|v| v.as_str())
@@ -745,7 +758,10 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             }
             "custom-wasm" => {
                 data.insert("capabilityName".to_owned(), name.to_owned());
-                let version = route.get("version").and_then(|v| v.as_str()).unwrap_or("^1.0.0");
+                let version = route
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("^1.0.0");
                 data.insert("semver".to_owned(), version.to_owned());
                 if !module_name.is_empty() {
                     data.insert("assetSource".to_owned(), module_name.to_owned());
@@ -763,7 +779,14 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         }
 
         let (x, y) = topology_layout_position(node_type, &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec { id: id.clone(), node_type: node_type.to_owned(), label: name.to_owned(), x, y, data });
+        nodes.push(TopologyNodeSpec {
+            id: id.clone(),
+            node_type: node_type.to_owned(),
+            label: name.to_owned(),
+            x,
+            y,
+            data,
+        });
 
         // Collect dependency edges (route path → other route path).
         if let Some(deps) = route.get("dependencies").and_then(|v| v.as_object()) {
@@ -780,8 +803,13 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
 
     // kv_caches → kv-cache nodes
     for cache in &sealed.kv_caches {
-        let Some(name) = cache.get("name").and_then(|v| v.as_str()) else { continue };
-        let model_ref = cache.get("model_ref").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(name) = cache.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let model_ref = cache
+            .get("model_ref")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let capacity = cache
             .get("capacity_mb")
             .and_then(|v| v.as_u64())
@@ -790,11 +818,22 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
 
         let id = format!("kvcache:{name}");
         let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        if !capacity.is_empty() { data.insert("capacityGb".to_owned(), capacity); }
-        if !model_ref.is_empty() { data.insert("modelRef".to_owned(), model_ref.to_owned()); }
+        if !capacity.is_empty() {
+            data.insert("capacityGb".to_owned(), capacity);
+        }
+        if !model_ref.is_empty() {
+            data.insert("modelRef".to_owned(), model_ref.to_owned());
+        }
 
         let (x, y) = topology_layout_position("kv-cache", &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec { id: id.clone(), node_type: "kv-cache".to_owned(), label: name.to_owned(), x, y, data });
+        nodes.push(TopologyNodeSpec {
+            id: id.clone(),
+            node_type: "kv-cache".to_owned(),
+            label: name.to_owned(),
+            x,
+            y,
+            data,
+        });
 
         // Edge: kv-cache depends on its bound LLM node.
         if !model_ref.is_empty() {
@@ -811,16 +850,31 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
 
     // External resources → external-resource nodes
     for (name, resource) in &sealed.resources {
-        let target = resource.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        let target = resource
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let id = format!("resource:{name}");
         let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         data.insert("targetUrl".to_owned(), target.to_owned());
 
         let (x, y) = topology_layout_position("external-resource", &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec { id, node_type: "external-resource".to_owned(), label: name.clone(), x, y, data });
+        nodes.push(TopologyNodeSpec {
+            id,
+            node_type: "external-resource".to_owned(),
+            label: name.clone(),
+            x,
+            y,
+            data,
+        });
     }
 
-    Ok(TopologyGraphSpec { nodes, edges, source, status })
+    Ok(TopologyGraphSpec {
+        nodes,
+        edges,
+        source,
+        status,
+    })
 }
 
 /// Assign a canvas position based on node type, grouping same-type nodes in rows.
