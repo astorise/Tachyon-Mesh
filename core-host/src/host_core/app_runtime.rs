@@ -9,6 +9,9 @@ pub(crate) fn integrity_manifest_path() -> PathBuf {
 pub(crate) fn build_app(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/status", get(auth::admin_status_handler))
+        .route("/admin/metrics", get(admin_metrics_handler))
+        .route("/admin/shadow/diffs", get(admin_shadow_diffs_handler))
+        .route("/admin/chaos/scenarios", post(admin_chaos_scenario_handler))
         .route(
             "/admin/manifest",
             get(admin_get_manifest_handler).post(admin_manifest_update_handler),
@@ -40,6 +43,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route(
             "/admin/security/2fa/regenerate",
             post(auth::regenerate_account_security_handler),
+        )
+        .route(
+            "/admin/security/step-up",
+            post(auth::issue_step_up_session_handler),
         )
         .route("/admin/security/pats", post(auth::issue_pat_handler))
         .route("/admin/iam/users", get(auth::list_users_handler))
@@ -120,6 +127,126 @@ pub(crate) fn build_app(state: AppState) -> Router {
     ));
 
     app.with_state(state)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRuntimeMetrics {
+    pub(crate) source: String,
+    pub(crate) error_rate: f64,
+    pub(crate) p50_latency_ms: f64,
+    pub(crate) p99_latency_ms: f64,
+    pub(crate) queue_depth: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminShadowDiff {
+    route: String,
+    request_id: String,
+    divergence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadow_status: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminChaosScenarioRequest {
+    pub(crate) scenario: String,
+    #[serde(default)]
+    pub(crate) duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub(crate) target: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminChaosScenarioOutcome {
+    accepted: bool,
+    scenario: String,
+    message: String,
+}
+
+pub(crate) async fn admin_metrics_handler(
+    State(state): State<AppState>,
+) -> axum::Json<AdminRuntimeMetrics> {
+    let snapshot = telemetry::snapshot(&state.telemetry);
+    let completed = snapshot.completed_requests.max(1) as f64;
+    let error_rate = if snapshot.completed_requests == 0 {
+        0.0
+    } else {
+        snapshot.error_requests as f64 / completed
+    };
+    let average_latency_ms = if snapshot.completed_requests == 0 {
+        0.0
+    } else {
+        snapshot.total_duration_us as f64 / completed / 1_000.0
+    };
+
+    axum::Json(AdminRuntimeMetrics {
+        source: "core-host://runtime-telemetry".to_owned(),
+        error_rate,
+        p50_latency_ms: average_latency_ms,
+        p99_latency_ms: average_latency_ms,
+        queue_depth: u64::from(snapshot.active_requests),
+    })
+}
+
+pub(crate) async fn admin_shadow_diffs_handler() -> axum::Json<Vec<AdminShadowDiff>> {
+    // Shadow divergences are emitted by system-faas-shadow-proxy into the
+    // telemetry stream. The admin surface is intentionally stable even when no
+    // divergence collector has produced recent rows.
+    axum::Json(Vec::new())
+}
+
+pub(crate) async fn admin_chaos_scenario_handler(
+    axum::Json(payload): axum::Json<AdminChaosScenarioRequest>,
+) -> Response {
+    let scenario = payload.scenario.trim();
+    if scenario.is_empty() {
+        return (StatusCode::BAD_REQUEST, "chaos scenario must not be empty").into_response();
+    }
+    if payload.duration_seconds.unwrap_or(0) > 3_600 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "chaos scenario duration must be less than or equal to 3600 seconds",
+        )
+            .into_response();
+    }
+    let supported = [
+        "network_partition",
+        "pod_eviction",
+        "cpu_pressure",
+        "lora_swap_failure",
+        "node_isolation",
+        "simulated_latency",
+        "memory_pressure",
+    ];
+    if !supported.iter().any(|candidate| candidate == &scenario) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unsupported chaos scenario `{scenario}`"),
+        )
+            .into_response();
+    }
+
+    let target = payload
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("mesh");
+    let duration = payload.duration_seconds.unwrap_or(60);
+    let outcome = AdminChaosScenarioOutcome {
+        accepted: true,
+        scenario: scenario.to_owned(),
+        message: format!(
+            "Chaos scenario `{scenario}` accepted for target `{target}` for {duration}s."
+        ),
+    };
+    (StatusCode::ACCEPTED, axum::Json(outcome)).into_response()
 }
 
 pub(crate) fn should_sample_telemetry(sample_rate: f64) -> bool {

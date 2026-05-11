@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 type RuntimeMetrics = {
   source: string;
@@ -182,12 +177,9 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
 
   private async applyObservabilityConfig(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "observability",
-        payload: {
+      const response = await applyAndSeal("observability", {
           otlp_endpoint: this.value("otlp-endpoint", ""),
           log_level: this.value("log-level", "info"),
-        },
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {

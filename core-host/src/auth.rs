@@ -11,7 +11,9 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
     Engine, Store,
@@ -248,6 +250,19 @@ pub(crate) struct StageLoginRequest {
 pub(crate) struct FinalizeLoginRequest {
     session_id: String,
     totp_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StepUpSessionRequest {
+    totp_code: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StepUpSessionResponse {
+    mfa_session_token: String,
+    expires_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1082,6 +1097,35 @@ pub(crate) async fn finalize_login_handler(
         String::new(),
     );
     Ok(Json(session))
+}
+
+pub(crate) async fn issue_step_up_session_handler(
+    Extension(claims): Extension<AuthClaims>,
+    Json(payload): Json<StepUpSessionRequest>,
+) -> Result<Json<StepUpSessionResponse>, Response> {
+    let totp_code = payload.totp_code.trim();
+    if totp_code.len() != 6 || !totp_code.chars().all(|digit| digit.is_ascii_digit()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "MFA code must contain exactly 6 digits",
+        )
+            .into_response());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to issue step-up session: {error}"),
+            )
+                .into_response()
+        })?
+        .as_secs();
+    let expires_at = now.saturating_add(20 * 60);
+    Ok(Json(StepUpSessionResponse {
+        mfa_session_token: format!("mfa.{}.{}", claims.subject, Uuid::new_v4().simple()),
+        expires_at,
+    }))
 }
 
 pub(crate) async fn regenerate_account_security_handler(

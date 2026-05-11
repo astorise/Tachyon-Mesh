@@ -1,11 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
 
 type MeshRouteSummary = {
   name: string;
@@ -86,10 +81,7 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
 
   private async applyRoute(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "config-routing",
-        payload: this.buildPayload(),
-      });
+      const response = await applyAndSeal("config-routing", this.buildPayload());
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {
       this.showFeedback("error", error instanceof Error ? error.message : String(error));

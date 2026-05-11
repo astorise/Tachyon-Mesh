@@ -57,3 +57,23 @@ The `tachyon-mcp` binary SHALL register a `tachyon_register_resource` JSON-RPC t
 - **THEN** the server returns a JSON-RPC error describing the violated rule
 - **AND** the overlay file `tachyon.resources.json` is left unchanged
 
+### Requirement: MCP validates configured PATs for every JSON-RPC request
+The `tachyon-mcp` binary SHALL require both `TACHYON_MCP_URL` and a PAT before accepting non-initialization requests, and SHALL validate the PAT against the configured host per request.
+
+#### Scenario: MCP handles a tool call
+- **WHEN** the server receives a JSON-RPC request after initialization
+- **THEN** it verifies the configured PAT against `TACHYON_MCP_URL`
+- **AND** expired, missing, or rejected tokens produce a JSON-RPC error instead of allowing tool execution
+
+### Requirement: MCP applies per-tool rate limits
+The `tachyon-mcp` binary SHALL rate-limit write-heavy tools independently from read-oriented tools and SHALL persist short-lived bucket state under the system temporary directory.
+
+#### Scenario: Heavy manifest apply exceeds its bucket
+- **WHEN** `tachyon_apply_manifest` is called more than once in its one-minute bucket
+- **THEN** the server returns a JSON-RPC rate-limit error
+- **AND** calls to read-oriented tools use independent buckets
+
+#### Scenario: Rate limiter lock is poisoned
+- **WHEN** the rate limiter mutex cannot be acquired cleanly
+- **THEN** the server returns a structured JSON-RPC internal error
+- **AND** it does not panic or terminate the process

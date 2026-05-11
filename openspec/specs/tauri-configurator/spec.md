@@ -110,3 +110,40 @@ The Rust Tauri backend SHALL NOT act as a simple passthrough proxy for JSON payl
 - **AND** the backend returns a safe, handled failure response to the UI
 - **AND** the data-plane remains untouched.
 
+### Requirement: Remembered desktop credentials use Stronghold storage
+The Tauri backend SHALL store remembered credentials in a Stronghold snapshot and SHALL NOT write passwords or PATs to a plaintext JSON profile.
+
+#### Scenario: Operator stores credentials
+- **WHEN** the operator enables remembered credentials
+- **THEN** the backend writes the serialized profile to the Stronghold auth record
+- **AND** any legacy plaintext profile is migrated or removed
+
+#### Scenario: Stronghold is unavailable
+- **WHEN** the operator attempts to enable remembered credentials without a Stronghold backend
+- **THEN** the UI disables the toggle
+- **AND** it shows an error notification instead of persisting credentials
+
+### Requirement: Step-up MFA uses short-lived host-issued sessions
+The desktop step-up MFA flow SHALL use a short-lived session token issued by the host rather than reusing a locally remembered password.
+
+#### Scenario: Operator completes step-up MFA
+- **WHEN** the operator submits a valid six-digit MFA code during a sensitive action
+- **THEN** the Tauri backend requests a host step-up session token
+- **AND** the local password profile is not read or replayed
+
+### Requirement: UI configuration apply is atomic
+Configuration panels SHALL use an atomic `applyAndSeal(domain, payload)` flow for validated changes.
+
+#### Scenario: Operator applies configuration
+- **WHEN** a configuration panel submits a payload
+- **THEN** the frontend performs a dry-run validation
+- **AND** prompts the operator with the pending payload
+- **AND** runs step-up MFA before staging, sealing, and applying the manifest
+
+### Requirement: Additional config WIT bindings are wired
+The Tauri backend SHALL generate and reference WIT bindings for routing plus the additional AI, resilience, observability, storage, and fleet configuration contracts.
+
+#### Scenario: A panel validates a configured domain
+- **WHEN** a supported panel submits a domain payload
+- **THEN** the backend uses generated WIT contract types in the validation path
+- **AND** unsupported domains are rejected explicitly

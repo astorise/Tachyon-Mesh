@@ -1,10 +1,5 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { resilientInvoke as invoke } from "../../utils/network";
-
-type ApplyConfigurationResponse = {
-  success: boolean;
-  message: string;
-};
+import { applyAndSeal } from "../../utils/network";
 
 export class TachyonRoutingDashboard extends TachyonConfigDashboard {
   connectedCallback(): void {
@@ -66,10 +61,7 @@ export class TachyonRoutingDashboard extends TachyonConfigDashboard {
 
   private async applyConfiguration(): Promise<void> {
     try {
-      const response = await invoke<ApplyConfigurationResponse>("apply_configuration", {
-        domain: "config-routing",
-        payload: this.buildPayload(),
-      });
+      const response = await applyAndSeal("config-routing", this.buildPayload());
       this.showFeedback(response.success ? "success" : "error", response.message);
       this.dispatchEvent(
         new CustomEvent(response.success ? "config:applied" : "config:error", {

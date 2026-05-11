@@ -96,6 +96,37 @@ async fn router_emits_async_telemetry_metrics() {
 }
 
 #[tokio::test]
+async fn admin_metrics_endpoint_returns_runtime_snapshot() {
+    let telemetry = telemetry::init_test_telemetry();
+    let _guard = telemetry::begin_request(&telemetry);
+    let state = build_test_state(IntegrityConfig::default_sealed(), telemetry);
+
+    let response = admin_metrics_handler(State(state)).await.0;
+
+    assert_eq!(response.source, "core-host://runtime-telemetry");
+    assert_eq!(response.queue_depth, 1);
+}
+
+#[tokio::test]
+async fn admin_shadow_diffs_endpoint_returns_json_array() {
+    let response = admin_shadow_diffs_handler().await.0;
+
+    assert!(response.is_empty());
+}
+
+#[tokio::test]
+async fn admin_chaos_endpoint_accepts_supported_scenario() {
+    let response = admin_chaos_scenario_handler(axum::Json(AdminChaosScenarioRequest {
+        scenario: "cpu_pressure".to_owned(),
+        duration_seconds: Some(30),
+        target: Some("node-a".to_owned()),
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn router_skips_telemetry_export_for_unsampled_requests() {
     use std::{
         sync::{Arc, Mutex},

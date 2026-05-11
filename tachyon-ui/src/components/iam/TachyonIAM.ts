@@ -523,8 +523,16 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private async persistCredentialsPreference(): Promise<void> {
-    if (!this.input("remember-credentials")?.checked) {
+    const remember = this.input("remember-credentials");
+    if (!remember?.checked) {
       await invoke("delete_credentials");
+      return;
+    }
+    const strongholdAvailable = await invoke<boolean>("stronghold_available").catch(() => false);
+    if (!strongholdAvailable) {
+      remember.checked = false;
+      this.notify("error", t("iam.credentials.stronghold-unavailable"));
+      await invoke("delete_credentials").catch(() => undefined);
       return;
     }
     this.notify("success", t("iam.credentials.stronghold-stored"));
