@@ -79,6 +79,9 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::unwrap_used
 
+      - name: Cross-Layer Validation
+        run: bash scripts/validate_cross_layer.sh
+
       - name: Build guest artifacts
         run: bash scripts/build-guest-artifacts.sh
 

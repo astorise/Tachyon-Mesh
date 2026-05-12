@@ -16,8 +16,9 @@ const tourCompletedKey = "tachyon_tour_completed";
 const steps: TourStep[] = [
   { target: "#shell-user", titleKey: "tour.auth.title", contentKey: "tour.auth.desc" },
   { target: "#shell-header", titleKey: "tour.header.title", contentKey: "tour.header.desc" },
-  { target: "#btn-seal-apply", titleKey: "tour.seal.title", contentKey: "tour.seal.desc" },
   { target: '[data-route-panel="dynamic"] [data-metric="nodes"]', titleKey: "tour.overview.title", contentKey: "tour.overview.desc" },
+  { target: '[data-route="supply-chain"]', titleKey: "tour.registry.title", contentKey: "tour.registry.desc" },
+  { target: "#btn-seal-apply", titleKey: "tour.seal.title", contentKey: "tour.seal.desc" },
   { target: '[data-route="observability"]', titleKey: "tour.observability.title", contentKey: "tour.observability.desc" },
 ];
 

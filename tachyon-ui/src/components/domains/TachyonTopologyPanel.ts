@@ -758,7 +758,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
       .join("");
 
     const sourceBanner = this.liveSource
-      ? `<span class="ml-2 text-[10px] text-emerald-400 font-mono">${t("topology.live-banner")} ${this.liveSource}</span>`
+      ? `<span class="ml-2 text-[10px] text-emerald-400 font-mono">${t("topology.live-banner")} ${this.escapeHtml(this.liveSource)}</span>`
       : `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">${t("topology.offline-banner")}</span>`;
 
     const btnClass = "rounded border border-slate-700 bg-slate-800/60 px-2 py-1 text-xs text-slate-300 hover:bg-slate-700 transition-colors";
@@ -809,7 +809,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
             ${(Object.keys(NODE_THEMES) as TopologyNodeType[])
               .map((type) => {
                 const theme = NODE_THEMES[type];
-                return `<div class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950/40 p-2"><span class="inline-flex h-6 w-6 items-center justify-center rounded ${theme.iconBg}">${theme.glyph}</span><span class="${theme.badge}">${this.escapeAttr(t(`topology.type.${type}`))}</span></div>`;
+                return `<div class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950/40 p-2"><span class="inline-flex h-6 w-6 items-center justify-center rounded ${theme.iconBg}">${theme.glyph}</span><span class="${theme.badge}">${this.escapeHtml(t(`topology.type.${type}`))}</span></div>`;
               })
               .join("")}
           </div>
@@ -987,6 +987,15 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
 
   private escapeAttr(value: string): string {
     return value.replace(/"/g, "&quot;");
+  }
+
+  private escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 }
 
