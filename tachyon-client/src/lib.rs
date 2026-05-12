@@ -24,6 +24,7 @@ const ADMIN_MANIFEST_BUNDLE_PATH: &str = "/admin/manifest/bundle";
 const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
 const ADMIN_METRICS_PATH: &str = "/admin/metrics";
 const ADMIN_CANARY_PATH: &str = "/admin/canary";
+const ADMIN_SCHEMA_MANIFEST_PATH: &str = "/admin/schema/manifest";
 const ADMIN_LOGS_PATH: &str = "/admin/logs";
 const ADMIN_SHADOW_DIFFS_PATH: &str = "/admin/shadow/diffs";
 const ADMIN_CHAOS_SCENARIOS_PATH: &str = "/admin/chaos/scenarios";
@@ -1670,6 +1671,16 @@ pub async fn fetch_canary_status() -> Result<Vec<CanaryStatusEntry>> {
         return Ok(Vec::new());
     }
     get_admin_json(ADMIN_CANARY_PATH).await
+}
+
+/// Fetch the JSON Schema document that describes the `IntegrityConfig` manifest
+/// format accepted by `POST /admin/manifest`. Returns `None` when not connected
+/// or when the host does not expose the schema endpoint.
+pub async fn get_manifest_schema() -> Result<serde_json::Value> {
+    if current_connection().is_none() {
+        return Ok(serde_json::json!({ "type": "object" }));
+    }
+    get_admin_json(ADMIN_SCHEMA_MANIFEST_PATH).await
 }
 
 pub async fn abort_canary_rollout(route_path: &str) -> Result<()> {

@@ -101,3 +101,16 @@ The PAT validation against `core-host` SHALL happen at most once per MCP server 
 - **WHEN** the agent sends multiple consecutive requests
 - **THEN** `set_connection` is called exactly once
 - **AND** subsequent requests skip the HTTP round-trip and reuse the cached state
+
+### Requirement: Dynamic manifest schema injection
+The `tachyon_dryrun_manifest` tool definition SHALL include the full `IntegrityConfig` JSON Schema in its `inputSchema.properties.manifest` field, fetched from `GET /admin/schema/manifest`.
+
+#### Scenario: Schema is available after first authenticated request
+- **GIVEN** the MCP server has completed its initial `set_connection` call
+- **WHEN** an agent sends `tools/list`
+- **THEN** the `tachyon_dryrun_manifest` tool's `inputSchema` contains the full IntegrityConfig schema as the `manifest` property
+
+#### Scenario: Schema is unavailable at startup
+- **GIVEN** the MCP server has not yet authenticated (no first request)
+- **WHEN** `tools/list` is called
+- **THEN** `manifest` falls back to a generic `{"type": "object"}` schema

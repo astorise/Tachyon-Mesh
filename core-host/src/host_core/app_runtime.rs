@@ -10,6 +10,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/status", get(auth::admin_status_handler))
         .route("/admin/metrics", get(admin_metrics_handler))
+        .route("/admin/schema/manifest", get(admin_manifest_schema_handler))
         .route(
             "/admin/canary",
             get(admin_canary_status_handler).post(admin_abort_canary_handler),
@@ -203,6 +204,94 @@ pub(crate) async fn admin_metrics_handler(
         vram_utilization_pct: state.memory_governor.vram_utilization_pct(),
         ram_offload_active: state.memory_governor.ram_offload_active(),
     })
+}
+
+/// Returns a JSON Schema document describing the `IntegrityConfig` manifest
+/// format accepted by `POST /admin/manifest`. LLM agents and MCP clients can
+/// fetch this schema to validate manifest payloads before submission.
+pub(crate) async fn admin_manifest_schema_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "IntegrityConfig",
+        "description": "Tachyon Mesh sealed manifest configuration accepted by POST /admin/manifest.",
+        "type": "object",
+        "required": ["hostAddress", "maxStdoutBytes", "guestFuelBudget", "guestMemoryLimitBytes", "resourceLimitResponse", "routes"],
+        "properties": {
+            "hostAddress":               { "type": "string", "description": "Bind address for the core-host HTTP server (e.g. 0.0.0.0:8080)." },
+            "advertiseIp":               { "type": ["string", "null"] },
+            "tlsAddress":                { "type": ["string", "null"] },
+            "maxStdoutBytes":            { "type": "integer", "minimum": 1 },
+            "guestFuelBudget":           { "type": "integer", "minimum": 1, "description": "Wasmtime fuel budget per guest invocation." },
+            "guestMemoryLimitBytes":     { "type": "integer", "minimum": 1 },
+            "resourceLimitResponse":     { "type": "string" },
+            "telemetrySampleRate":       { "type": "number", "minimum": 0, "maximum": 1 },
+            "configVersion":             { "type": "integer", "minimum": 0 },
+            "enrollmentEndpoint":        { "type": ["string", "null"] },
+            "cloudSyncEndpoint":         { "type": ["string", "null"] },
+            "instancePoolMaxMemoryBytes":{ "type": ["integer", "null"] },
+            "trustedSigners":            { "type": "array", "items": { "type": "string" } },
+            "routes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["path", "version"],
+                    "properties": {
+                        "path":               { "type": "string", "description": "HTTP path prefix for this route (e.g. /api/my-function)." },
+                        "role":               { "type": "string", "enum": ["user", "system"] },
+                        "name":               { "type": "string" },
+                        "version":            { "type": "string", "description": "SemVer version string." },
+                        "dependencies":       { "type": "object", "additionalProperties": { "type": "string" } },
+                        "requiresCredentials":{ "type": "array", "items": { "type": "string" } },
+                        "middleware":         { "type": ["string", "null"] },
+                        "env":               { "type": "object", "additionalProperties": { "type": "string" } },
+                        "allowedSecrets":     { "type": "array", "items": { "type": "string" } },
+                        "minInstances":       { "type": "integer", "minimum": 0 },
+                        "maxConcurrency":     { "type": "integer", "minimum": 1 },
+                        "syncToCloud":        { "type": "boolean" },
+                        "requiresTee":        { "type": "boolean" },
+                        "allowOverflow":      { "type": "boolean" },
+                        "shadowTarget":       { "type": ["string", "null"] },
+                        "adapterId":          { "type": ["string", "null"] },
+                        "resiliency": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "timeoutMs":   { "type": ["integer", "null"] },
+                                "retryPolicy": {
+                                    "type": ["object", "null"],
+                                    "properties": {
+                                        "maxRetries": { "type": "integer", "minimum": 0 },
+                                        "retryOn":    { "type": "array", "items": { "type": "integer" } }
+                                    }
+                                }
+                            }
+                        },
+                        "resourcePolicy": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "minRamGb":          { "type": ["integer", "null"] },
+                                "minRamMb":          { "type": ["integer", "null"] },
+                                "minVramMb":         { "type": ["integer", "null"] },
+                                "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"] }
+                            }
+                        },
+                        "canary": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "nextVersion":  { "type": "string" },
+                                "stepWeight":   { "type": "integer", "minimum": 1, "maximum": 100 },
+                                "intervalSecs": { "type": "integer", "minimum": 1 },
+                                "maxErrorRate": { "type": "number", "minimum": 0, "maximum": 1 }
+                            },
+                            "required": ["nextVersion", "maxErrorRate"]
+                        }
+                    }
+                }
+            },
+            "batchTargets": { "type": "array", "items": { "type": "object" } },
+            "resources":    { "type": "object" },
+            "kvCaches":     { "type": "array", "items": { "type": "object" } }
+        }
+    }))
 }
 
 pub(crate) async fn admin_shadow_diffs_handler() -> axum::Json<Vec<AdminShadowDiff>> {

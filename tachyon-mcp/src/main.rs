@@ -15,6 +15,12 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// inside `tachyon_client`'s global connection registry.
 static CONNECTION_INITIALIZED: OnceLock<()> = OnceLock::new();
 
+/// Cached JSON Schema for the `IntegrityConfig` manifest, fetched once from
+/// `GET /admin/schema/manifest` immediately after the connection is established.
+/// Injected into the `tachyon_dryrun_manifest` tool definition so that agents
+/// receive precise field-level guidance directly in the tool schema.
+static MANIFEST_SCHEMA: OnceLock<Value> = OnceLock::new();
+
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_PERSIST_SECS: u64 = 10;
 
@@ -432,10 +438,10 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                         "type": "object",
                         "required": ["manifest"],
                         "properties": {
-                            "manifest": {
+                            "manifest": MANIFEST_SCHEMA.get().cloned().unwrap_or_else(|| json!({
                                 "type": "object",
-                                "description": "Either a sealed manifest with configPayload/config_payload, or the raw config payload object."
-                            }
+                                "description": "IntegrityConfig payload. Connect to a running core-host to receive the full JSON Schema."
+                            }))
                         }
                     }
                 },
@@ -554,6 +560,11 @@ async fn validate_request_auth(context: &McpContext) -> Result<()> {
         .await
         .map_err(anyhow::Error::msg)
         .context("failed to validate TACHYON_MCP_PAT against TACHYON_MCP_URL")?;
+    // Best-effort: fetch and cache the manifest schema so tool definitions are
+    // enriched on the first tools/list response.  A failure here is non-fatal.
+    if let Ok(schema) = tachyon_client::get_manifest_schema().await {
+        let _ = MANIFEST_SCHEMA.set(schema);
+    }
     let _ = CONNECTION_INITIALIZED.set(());
     Ok(())
 }

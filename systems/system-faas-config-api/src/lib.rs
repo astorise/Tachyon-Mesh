@@ -113,7 +113,154 @@ mod rbac_contract {
     });
 }
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// ── Structured validation types ───────────────────────────────────────────────
+
+/// A single validation error produced during a manifest dry-run.
+/// `path` follows JSONPointer notation (e.g. `routes/0/maxConcurrency`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationError {
+    /// JSONPointer-style path to the offending field (e.g. `routes/0/minRamMb`).
+    pub path: String,
+    /// Human-readable description of the problem.
+    pub message: String,
+    /// Machine-readable error code (e.g. `INVALID_TYPE`, `MISSING_FIELD`,
+    /// `CONSTRAINT_VIOLATION`).
+    pub error_code: String,
+}
+
+/// Result returned by the manifest dry-run validation pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DryRunResult {
+    /// `true` when the payload passes all validation checks.
+    pub valid: bool,
+    /// Ordered list of validation errors; empty when `valid` is `true`.
+    pub errors: Vec<ValidationError>,
+    /// Optional diff snapshot showing what would change if the manifest
+    /// were applied. `None` when validation fails or no diff is available.
+    pub diff: Option<Value>,
+}
+
+impl DryRunResult {
+    /// Convenience constructor for a successful validation with no errors.
+    pub fn ok(diff: Option<Value>) -> Self {
+        Self { valid: true, errors: Vec::new(), diff }
+    }
+
+    /// Convenience constructor for a failed validation.
+    pub fn fail(errors: Vec<ValidationError>) -> Self {
+        Self { valid: false, errors, diff: None }
+    }
+}
+
+/// Validate a raw manifest JSON value against the known `IntegrityConfig`
+/// structural constraints. Returns a [`DryRunResult`] describing any errors.
+///
+/// This performs structural, not semantic, validation: required fields must
+/// be present and have the correct JSON type. Full semantic validation
+/// (e.g. signature verification, version ordering) is performed by the
+/// `core-host` when the manifest is submitted.
+pub fn validate_manifest_payload(payload: &Value) -> DryRunResult {
+    let mut errors: Vec<ValidationError> = Vec::new();
+
+    let obj = match payload.as_object() {
+        Some(o) => o,
+        None => {
+            return DryRunResult::fail(vec![ValidationError {
+                path: "/".to_owned(),
+                message: "manifest must be a JSON object".to_owned(),
+                error_code: "INVALID_TYPE".to_owned(),
+            }]);
+        }
+    };
+
+    // Required top-level string fields.
+    for field in &["hostAddress", "resourceLimitResponse"] {
+        match obj.get(*field) {
+            None => errors.push(ValidationError {
+                path: format!("/{field}"),
+                message: format!("`{field}` is required"),
+                error_code: "MISSING_FIELD".to_owned(),
+            }),
+            Some(v) if !v.is_string() => errors.push(ValidationError {
+                path: format!("/{field}"),
+                message: format!("`{field}` must be a string"),
+                error_code: "INVALID_TYPE".to_owned(),
+            }),
+            _ => {}
+        }
+    }
+
+    // Required top-level integer fields.
+    for field in &["maxStdoutBytes", "guestFuelBudget", "guestMemoryLimitBytes"] {
+        match obj.get(*field) {
+            None => errors.push(ValidationError {
+                path: format!("/{field}"),
+                message: format!("`{field}` is required"),
+                error_code: "MISSING_FIELD".to_owned(),
+            }),
+            Some(v) if !v.is_number() => errors.push(ValidationError {
+                path: format!("/{field}"),
+                message: format!("`{field}` must be an integer"),
+                error_code: "INVALID_TYPE".to_owned(),
+            }),
+            _ => {}
+        }
+    }
+
+    // `routes` must be an array.
+    match obj.get("routes") {
+        None => errors.push(ValidationError {
+            path: "/routes".to_owned(),
+            message: "`routes` array is required".to_owned(),
+            error_code: "MISSING_FIELD".to_owned(),
+        }),
+        Some(v) if !v.is_array() => errors.push(ValidationError {
+            path: "/routes".to_owned(),
+            message: "`routes` must be an array".to_owned(),
+            error_code: "INVALID_TYPE".to_owned(),
+        }),
+        Some(Value::Array(routes)) => {
+            for (i, route) in routes.iter().enumerate() {
+                if let Some(route_obj) = route.as_object() {
+                    for field in &["path", "version"] {
+                        if route_obj.get(*field).map_or(true, |v| !v.is_string()) {
+                            errors.push(ValidationError {
+                                path: format!("/routes/{i}/{field}"),
+                                message: format!("route `{field}` must be a non-empty string"),
+                                error_code: if route_obj.contains_key(*field) {
+                                    "INVALID_TYPE"
+                                } else {
+                                    "MISSING_FIELD"
+                                }
+                                .to_owned(),
+                            });
+                        }
+                    }
+                    // maxConcurrency must be a positive integer if present.
+                    if let Some(v) = route_obj.get("maxConcurrency") {
+                        if v.as_u64().map_or(true, |n| n == 0) {
+                            errors.push(ValidationError {
+                                path: format!("/routes/{i}/maxConcurrency"),
+                                message: "`maxConcurrency` must be a positive integer".to_owned(),
+                                error_code: "CONSTRAINT_VIOLATION".to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if errors.is_empty() {
+        DryRunResult::ok(None)
+    } else {
+        DryRunResult::fail(errors)
+    }
+}
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
 const DEFAULT_BROKER_ROUTE: &str = "/system/gitops-broker";
