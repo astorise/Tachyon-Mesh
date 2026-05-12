@@ -1,0 +1,24 @@
+{
+  "env": {
+    "browser": true,
+    "es2022": true
+  },
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "module"
+  },
+  "rules": {
+    "no-restricted-properties": [
+      2,
+      {
+        "property": "innerHTML",
+        "message": "Direct innerHTML assignment risks XSS. Use textContent for plain text, replaceChildren() with DOM nodes for structured content, or ensure all interpolated values pass through escapeHtml() first."
+      },
+      {
+        "property": "outerHTML",
+        "message": "Direct outerHTML assignment risks XSS. Use DOM manipulation methods instead."
+      }
+    ]
+  }
+}

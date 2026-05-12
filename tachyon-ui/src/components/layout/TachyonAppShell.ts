@@ -24,6 +24,15 @@ import { listComponentRoutes, resolveComponentTag } from "../../registry/Compone
 import { getLanguage, setLanguage, t } from "../../utils/i18n";
 import { resilientInvoke as invoke } from "../../utils/network";
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 type AuthenticatedDetail = {
   user: string;
   role: string;
@@ -158,7 +167,7 @@ export class TachyonAppShell extends HTMLElement {
     const configLinks = listComponentRoutes()
       .map(
         (entry) =>
-          `<button data-route="${entry.route}" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">${t(`nav.${entry.route}`) || entry.label}</button>`,
+          `<button data-route="${escapeHtml(entry.route)}" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">${escapeHtml(t(`nav.${entry.route}`) || entry.label)}</button>`,
       )
       .join("");
     this.root.innerHTML = `
