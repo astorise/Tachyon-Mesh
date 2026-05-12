@@ -141,6 +141,11 @@ pub(crate) struct AdminRuntimeMetrics {
     pub(crate) p50_latency_ms: f64,
     pub(crate) p99_latency_ms: f64,
     pub(crate) queue_depth: u64,
+    /// Current VRAM utilization (0–100). Updated by the AI inference runtime.
+    pub(crate) vram_utilization_pct: u8,
+    /// `true` when VRAM has exceeded the critical threshold and KV-cache
+    /// tensors are being spilled to pinned host RAM via PCIe.
+    pub(crate) ram_offload_active: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +200,8 @@ pub(crate) async fn admin_metrics_handler(
         p50_latency_ms: average_latency_ms,
         p99_latency_ms: average_latency_ms,
         queue_depth: u64::from(snapshot.active_requests),
+        vram_utilization_pct: state.memory_governor.vram_utilization_pct(),
+        ram_offload_active: state.memory_governor.ram_offload_active(),
     })
 }
 
@@ -1876,6 +1883,13 @@ pub(crate) async fn execute_route_request(
         return Ok(rejection);
     }
 
+    // VRAM-aware admission: AI inference routes are gated on accelerator headroom.
+    if !route.models.is_empty() {
+        if let Some(rejection) = enforce_vram_admission(state, route) {
+            return Ok(rejection);
+        }
+    }
+
     let semaphore = runtime
         .concurrency_limits
         .get(&route.path)
@@ -2077,6 +2091,59 @@ pub(crate) async fn enforce_resource_admission(
         fuel_consumed: None,
         completion_guard: None,
     }))
+}
+
+/// Returns a rejection `RouteExecutionResult` when VRAM pressure is critical
+/// for routes that drive AI inference, or `None` to allow the request through.
+///
+/// * **High pressure (>80 %)** — logs a routing warning; request proceeds
+///   normally and may be forwarded to a peer with more headroom by the existing
+///   `MeshRetry` admission strategy.
+/// * **Critical pressure (>90 %)** — returns HTTP 503 with
+///   `Retry-After: 5` and `x-tachyon-reason: vram-saturated`.  The caller
+///   should not queue the request locally because the bounded buffering path
+///   in the `TimedOut` permit branch already provides local queuing.
+pub(crate) fn enforce_vram_admission(
+    state: &AppState,
+    route: &IntegrityRoute,
+) -> Option<RouteExecutionResult> {
+    match state.memory_governor.vram_pressure() {
+        memory_governor::MemoryPressure::Critical => {
+            tracing::warn!(
+                route = %route.path,
+                vram_pct = state.memory_governor.vram_utilization_pct(),
+                "VRAM critical: queuing inference request"
+            );
+            let mut response = GuestHttpResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "route `{}` inference deferred: VRAM utilization {}% exceeds critical threshold",
+                    route.path,
+                    state.memory_governor.vram_utilization_pct(),
+                ),
+            );
+            response
+                .headers
+                .push(("retry-after".to_owned(), "5".to_owned()));
+            response
+                .headers
+                .push(("x-tachyon-reason".to_owned(), "vram-saturated".to_owned()));
+            Some(RouteExecutionResult {
+                response,
+                fuel_consumed: None,
+                completion_guard: None,
+            })
+        }
+        memory_governor::MemoryPressure::High => {
+            tracing::debug!(
+                route = %route.path,
+                vram_pct = state.memory_governor.vram_utilization_pct(),
+                "VRAM high: applying routing penalty"
+            );
+            None
+        }
+        memory_governor::MemoryPressure::Normal => None,
+    }
 }
 
 impl ResourcePolicy {
