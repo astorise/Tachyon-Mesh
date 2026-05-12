@@ -1410,6 +1410,143 @@ fn quantizable_fixture_values(value_count: usize) -> Vec<f32> {
         .collect()
 }
 
+// ── Semantic Context Flattener ────────────────────────────────────────────────
+
+/// Well-known JSON field names that carry semantic context identity.
+const ROLE_FIELD: &str = "role";
+const TURN_ID_FIELD: &str = "turn_id";
+const ID_FIELD: &str = "id";
+const CONTENT_FIELD: &str = "content";
+
+/// Recognised conversation roles that carry semantic significance for
+/// KV-cache key assignment.
+const ROLE_SYSTEM: &str = "system";
+const ROLE_USER: &str = "user";
+const ROLE_ASSISTANT: &str = "assistant";
+
+/// A semantic boundary found inside the inference context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContextMarker {
+    SystemPromptBoundary,
+    ConversationTurnStart { turn_id: String },
+    AssistantResponse { turn_id: String },
+}
+
+/// A text chunk paired with a KV-cache key derived from its semantic position.
+/// Keys are assigned so that logically contiguous sequences produce adjacent
+/// B-Tree entries in the KV-cache, maximising cache locality.
+#[derive(Clone, Debug)]
+pub(crate) struct FlattenedChunk {
+    pub(crate) text: String,
+    /// Semantically ordered cache key, e.g. `sys:0`, `usr:1:node42`, `ast:1`.
+    pub(crate) cache_key: String,
+    pub(crate) markers: Vec<ContextMarker>,
+}
+
+/// Replaces the previous depth-based JSON traversal of AI context messages
+/// with **semantic inlining**: known conversation roles and turn identifiers
+/// are extracted and used to assign ordered cache keys, ensuring contiguous
+/// logical sequences produce adjacent entries in the redb KV-cache and
+/// maximising cache-hit rates across multi-turn conversations.
+pub(crate) struct SemanticContextFlattener;
+
+impl SemanticContextFlattener {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    /// Flattens the `messages` array inside `context_json` into an ordered
+    /// list of [`FlattenedChunk`]s.  Each chunk gets a stable, semantically
+    /// ordered cache key rather than a key derived from arbitrary JSON depth.
+    pub(crate) fn flatten(&self, context_json: &serde_json::Value) -> Vec<FlattenedChunk> {
+        let messages = match context_json.get("messages").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => return self.flatten_legacy(context_json),
+        };
+
+        let mut chunks = Vec::with_capacity(messages.len());
+        let mut user_turn: u32 = 0;
+
+        for message in messages {
+            let role = message
+                .get(ROLE_FIELD)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = message
+                .get(TURN_ID_FIELD)
+                .or_else(|| message.get(ID_FIELD))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let text = message
+                .get(CONTENT_FIELD)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+
+            let (cache_key, markers) = match role {
+                ROLE_SYSTEM => {
+                    let key = format!("sys:0:{}", turn_id.as_deref().unwrap_or("0"));
+                    (key, vec![ContextMarker::SystemPromptBoundary])
+                }
+                ROLE_USER => {
+                    user_turn = user_turn.saturating_add(1);
+                    let tid = turn_id
+                        .clone()
+                        .unwrap_or_else(|| format!("{user_turn}"));
+                    let key = format!("usr:{user_turn}:{tid}");
+                    (
+                        key,
+                        vec![ContextMarker::ConversationTurnStart {
+                            turn_id: tid,
+                        }],
+                    )
+                }
+                ROLE_ASSISTANT => {
+                    let tid = turn_id
+                        .clone()
+                        .unwrap_or_else(|| format!("{user_turn}"));
+                    let key = format!("ast:{user_turn}:{tid}");
+                    (
+                        key,
+                        vec![ContextMarker::AssistantResponse { turn_id: tid }],
+                    )
+                }
+                _ => {
+                    // Unknown role: keep a stable sequential key so unknown
+                    // turns don't disrupt the ordering of subsequent entries.
+                    let key = format!(
+                        "unk:{user_turn}:{}",
+                        turn_id.as_deref().unwrap_or("0")
+                    );
+                    (key, vec![])
+                }
+            };
+
+            chunks.push(FlattenedChunk {
+                text,
+                cache_key,
+                markers,
+            });
+        }
+
+        chunks
+    }
+
+    /// Fallback for legacy context payloads that don't use the `messages`
+    /// structure: emits a single chunk with a generic cache key.
+    fn flatten_legacy(&self, context_json: &serde_json::Value) -> Vec<FlattenedChunk> {
+        let text = context_json
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| context_json.to_string());
+        vec![FlattenedChunk {
+            cache_key: "legacy:0".to_owned(),
+            text,
+            markers: vec![],
+        }]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1844,5 +1981,38 @@ mod tests {
             routes: vec![route],
             ..IntegrityConfig::default_sealed()
         }
+    }
+
+    #[test]
+    fn semantic_flattener_assigns_ordered_cache_keys() {
+        let ctx = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "You are a helpful assistant." },
+                { "role": "user",      "turn_id": "t1", "content": "Hello" },
+                { "role": "assistant", "turn_id": "t1", "content": "Hi there!" },
+                { "role": "user",      "turn_id": "t2", "content": "How are you?" },
+            ]
+        });
+        let flattener = SemanticContextFlattener::new();
+        let chunks = flattener.flatten(&ctx);
+
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks[0].cache_key, "sys:0:0");
+        assert!(chunks[0].markers.contains(&ContextMarker::SystemPromptBoundary));
+        assert_eq!(chunks[1].cache_key, "usr:1:t1");
+        assert!(chunks[1]
+            .markers
+            .contains(&ContextMarker::ConversationTurnStart { turn_id: "t1".to_owned() }));
+        assert_eq!(chunks[2].cache_key, "ast:1:t1");
+        assert_eq!(chunks[3].cache_key, "usr:2:t2");
+    }
+
+    #[test]
+    fn semantic_flattener_falls_back_to_legacy_for_plain_string() {
+        let ctx = serde_json::json!("just a plain prompt");
+        let flattener = SemanticContextFlattener::new();
+        let chunks = flattener.flatten(&ctx);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].cache_key, "legacy:0");
     }
 }

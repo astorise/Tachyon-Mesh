@@ -453,6 +453,10 @@ pub struct RuntimeMetrics {
     pub p50_latency_ms: f64,
     pub p99_latency_ms: f64,
     pub queue_depth: u64,
+    #[serde(default)]
+    pub vram_utilization_pct: u8,
+    #[serde(default)]
+    pub ram_offload_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

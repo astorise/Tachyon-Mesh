@@ -1,21 +1,43 @@
 import gsap from "gsap";
 
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
+type RuntimeMetrics = {
+  source: string;
+  errorRate: number;
+  p50LatencyMs: number;
+  p99LatencyMs: number;
+  queueDepth: number;
+  vramUtilizationPct: number;
+  ramOffloadActive: boolean;
+};
+
 export class TachyonAIPanel extends TachyonConfigDashboard {
+  private metrics: RuntimeMetrics | null = null;
   private readonly onLanguageChanged = () => { this.render(); this.bindEvents(); };
 
-  connectedCallback(): void {
+  async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindEvents();
     this.animateGlitchEntrance();
+    await this.refreshMetrics();
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
+  }
+
+  private async refreshMetrics(): Promise<void> {
+    try {
+      this.metrics = await invoke<RuntimeMetrics>("get_metrics");
+    } catch {
+      this.metrics = null;
+    }
+    this.render();
+    this.bindEvents();
   }
 
   private render(): void {
@@ -31,6 +53,8 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
             <span class="font-mono text-xs text-emerald-400">${t("ai.status.value")}</span>
           </div>
         </header>
+
+        ${this.renderVramMetrics()}
 
         <form class="space-y-6">
           <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -70,6 +94,37 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
     `);
   }
 
+  private renderVramMetrics(): string {
+    const vram = this.metrics?.vramUtilizationPct ?? 0;
+    const offload = this.metrics?.ramOffloadActive ?? false;
+    const barColor = vram >= 90 ? "bg-red-500" : vram >= 80 ? "bg-amber-400" : "bg-cyan-400";
+    const textColor = vram >= 90 ? "text-red-400" : vram >= 80 ? "text-amber-400" : "text-cyan-400";
+
+    return `
+      <div data-stagger-panel class="rounded border border-slate-700 bg-slate-800/40 p-4 space-y-3">
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-[10px] font-bold uppercase tracking-widest text-slate-400">${t("ai.vram.title")}</span>
+          <div class="flex items-center gap-2">
+            ${offload ? `<span class="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-bold uppercase text-amber-300 animate-pulse">${t("ai.vram.offload.active")}</span>` : ""}
+            <button id="btn-refresh-vram" type="button" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-300 hover:bg-slate-700">${t("ai.vram.refresh")}</button>
+          </div>
+        </div>
+        <div>
+          <div class="mb-1 flex justify-between text-[11px]">
+            <span class="text-slate-400">${t("ai.vram.utilization")}</span>
+            <span class="font-mono ${textColor}">${vram}%</span>
+          </div>
+          <div class="h-2 w-full overflow-hidden rounded-full bg-slate-700">
+            <div class="h-full rounded-full transition-all ${barColor}" style="width:${vram}%"></div>
+          </div>
+        </div>
+        ${offload ? `
+        <p class="text-[11px] text-amber-400/80">${t("ai.vram.offload.desc")}</p>
+        ` : ""}
+      </div>
+    `;
+  }
+
   private bindEvents(): void {
     const range = this.root.getElementById("kv-cache-range") as HTMLInputElement | null;
     const cacheValue = this.root.getElementById("cache-val");
@@ -82,6 +137,10 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
     this.root.querySelector("form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.applyConfiguration();
+    });
+
+    this.root.getElementById("btn-refresh-vram")?.addEventListener("click", () => {
+      void this.refreshMetrics();
     });
   }
 

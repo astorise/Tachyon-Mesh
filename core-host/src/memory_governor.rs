@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -12,6 +12,12 @@ use tokio::time::MissedTickBehavior;
 const DEFAULT_SOFT_PERCENT: u8 = 75;
 const DEFAULT_HARD_PERCENT: u8 = 90;
 const GOVERNOR_INTERVAL: Duration = Duration::from_millis(500);
+
+/// VRAM utilization threshold above which a routing penalty is applied (80%).
+pub(crate) const VRAM_HIGH_THRESHOLD_PCT: u8 = 80;
+/// VRAM utilization threshold above which KV-cache tensors spill to pinned
+/// host RAM via PCIe and new large-context requests are queued (90%).
+pub(crate) const VRAM_CRITICAL_THRESHOLD_PCT: u8 = 90;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum MemoryPressure {
@@ -27,6 +33,11 @@ pub(crate) struct MemoryGovernor {
     rss_bytes: AtomicU64,
     soft_limit_bytes: u64,
     hard_limit_bytes: u64,
+    /// Current VRAM utilization as a percentage (0–100).
+    vram_utilization_pct: AtomicU8,
+    /// Set to `true` when `vram_utilization_pct` exceeds `VRAM_CRITICAL_THRESHOLD_PCT`,
+    /// indicating KV-cache tensors are spilling into pinned host RAM via PCIe.
+    ram_offload_active: AtomicBool,
 }
 
 impl MemoryGovernor {
@@ -38,6 +49,8 @@ impl MemoryGovernor {
             rss_bytes: AtomicU64::new(0),
             soft_limit_bytes: percent_of(total_memory_bytes, soft_percent),
             hard_limit_bytes: percent_of(total_memory_bytes, hard_percent),
+            vram_utilization_pct: AtomicU8::new(0),
+            ram_offload_active: AtomicBool::new(false),
         }
     }
 
@@ -53,6 +66,36 @@ impl MemoryGovernor {
 
     pub(crate) fn pressure(&self) -> MemoryPressure {
         pressure_from_u8(self.pressure.load(Ordering::Relaxed))
+    }
+
+    /// Updates the tracked VRAM utilization. Activates PCIe host-RAM offloading
+    /// when `pct >= VRAM_CRITICAL_THRESHOLD_PCT`. Called by the AI inference
+    /// runtime each time it updates its accelerator load metrics.
+    pub(crate) fn set_vram_utilization(&self, pct: u8) {
+        let pct = pct.min(100);
+        self.vram_utilization_pct.store(pct, Ordering::Relaxed);
+        let offload = pct >= VRAM_CRITICAL_THRESHOLD_PCT;
+        self.ram_offload_active.store(offload, Ordering::Release);
+    }
+
+    pub(crate) fn vram_utilization_pct(&self) -> u8 {
+        self.vram_utilization_pct.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn ram_offload_active(&self) -> bool {
+        self.ram_offload_active.load(Ordering::Acquire)
+    }
+
+    /// Returns the VRAM pressure level used for routing and admission decisions.
+    pub(crate) fn vram_pressure(&self) -> MemoryPressure {
+        let pct = self.vram_utilization_pct();
+        if pct >= VRAM_CRITICAL_THRESHOLD_PCT {
+            MemoryPressure::Critical
+        } else if pct >= VRAM_HIGH_THRESHOLD_PCT {
+            MemoryPressure::High
+        } else {
+            MemoryPressure::Normal
+        }
     }
 
     #[cfg(test)]
@@ -133,5 +176,29 @@ mod tests {
         assert_eq!(governor.sample_rss_bytes(750), MemoryPressure::High);
         assert_eq!(governor.sample_rss_bytes(900), MemoryPressure::Critical);
         assert_eq!(governor.rss_bytes(), 900);
+    }
+
+    #[test]
+    fn vram_tracking_and_offload_flag() {
+        let governor = MemoryGovernor::new(1_000, 75, 90);
+
+        assert_eq!(governor.vram_pressure(), MemoryPressure::Normal);
+        assert!(!governor.ram_offload_active());
+
+        governor.set_vram_utilization(79);
+        assert_eq!(governor.vram_pressure(), MemoryPressure::Normal);
+        assert!(!governor.ram_offload_active());
+
+        governor.set_vram_utilization(80);
+        assert_eq!(governor.vram_pressure(), MemoryPressure::High);
+        assert!(!governor.ram_offload_active());
+
+        governor.set_vram_utilization(90);
+        assert_eq!(governor.vram_pressure(), MemoryPressure::Critical);
+        assert!(governor.ram_offload_active());
+
+        governor.set_vram_utilization(100);
+        assert_eq!(governor.vram_utilization_pct(), 100);
+        assert!(governor.ram_offload_active());
     }
 }
