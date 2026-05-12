@@ -44,3 +44,25 @@ The `<tachyon-iam>` component SHALL render a Stage New Operator form and invoke 
 - **WHEN** `stage_signup` rejects the submitted staging payload
 - **THEN** `<tachyon-iam>` dispatches an error notification
 - **AND** the component remains interactive
+
+### Requirement: Bounded reconnection with user feedback
+The UI network layer SHALL stop automatic reconnection after a fixed number of attempts and expose a manual retry control.
+
+#### Scenario: Reconnect loop runs up to MAX_RETRIES
+- **GIVEN** the cluster becomes unreachable
+- **WHEN** the reconnect loop starts
+- **THEN** it probes `get_engine_status` at most 5 times with exponential backoff
+- **AND** each attempt updates `connectionStore` with `attempt` and `maxAttempts`
+- **AND** `NetworkStatus` displays `"Reconnecting (N/5)"`
+
+#### Scenario: Terminal disconnected state after exhausted retries
+- **GIVEN** all 5 reconnect attempts have failed
+- **WHEN** the reconnect loop finishes
+- **THEN** `connectionStore.status` is set to `"disconnected"`
+- **AND** `NetworkStatus` shows `"Cluster unreachable"` with a Retry button
+
+#### Scenario: Manual retry starts a fresh cycle
+- **GIVEN** the terminal disconnected state is active
+- **WHEN** the operator clicks the Retry button
+- **THEN** `connectionStore.manualRetry()` resets `attempt` to 0
+- **AND** a new bounded cycle of up to 5 attempts begins

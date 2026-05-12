@@ -2,12 +2,6 @@ import gsap from "gsap";
 
 import { connectionStore, type ConnectionState } from "../stores/connectionStore";
 
-const statusCopy: Record<ConnectionState, string> = {
-  connected: "Connected",
-  disconnected: "Offline",
-  reconnecting: "Reconnecting",
-};
-
 const statusColors: Record<ConnectionState, string> = {
   connected: "#22c55e",
   disconnected: "#ef4444",
@@ -17,20 +11,43 @@ const statusColors: Record<ConnectionState, string> = {
 export function mountNetworkStatus(host: HTMLElement): void {
   const root = document.createElement("div");
   root.className = "network-status inline-flex items-center gap-2 rounded border border-slate-700 px-3 py-1 text-xs";
-  root.innerHTML = `
-    <span class="network-status-dot h-2.5 w-2.5 rounded-full bg-green-500"></span>
-    <span class="network-status-label font-medium text-slate-200">Connected</span>
-  `;
+
+  const dot = document.createElement("span");
+  dot.className = "network-status-dot h-2.5 w-2.5 rounded-full bg-green-500";
+
+  const label = document.createElement("span");
+  label.className = "network-status-label font-medium text-slate-200";
+  label.textContent = "Connected";
+
+  const retryBtn = document.createElement("button");
+  retryBtn.type = "button";
+  retryBtn.className =
+    "network-retry-btn hidden rounded border border-red-500/50 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-300 hover:bg-red-500/20";
+  retryBtn.textContent = "Retry";
+  retryBtn.addEventListener("click", () => {
+    connectionStore.getState().manualRetry();
+  });
+
+  root.appendChild(dot);
+  root.appendChild(label);
+  root.appendChild(retryBtn);
   host.appendChild(root);
 
-  const dot = root.querySelector<HTMLElement>(".network-status-dot");
-  const label = root.querySelector<HTMLElement>(".network-status-label");
+  const render = (status: ConnectionState, attempt: number, maxAttempts: number) => {
+    const isTerminal = status === "disconnected" && maxAttempts > 0 && attempt >= maxAttempts;
 
-  const render = (status: ConnectionState, retryCount: number) => {
-    if (!dot || !label) {
-      return;
+    if (status === "reconnecting") {
+      label.textContent = `Reconnecting (${attempt}/${maxAttempts})`;
+    } else if (isTerminal) {
+      label.textContent = "Cluster unreachable";
+    } else if (status === "disconnected") {
+      label.textContent = "Offline";
+    } else {
+      label.textContent = "Connected";
     }
-    label.textContent = status === "reconnecting" ? `${statusCopy[status]} ${retryCount}` : statusCopy[status];
+
+    retryBtn.classList.toggle("hidden", status !== "disconnected");
+
     gsap.to(dot, {
       backgroundColor: statusColors[status],
       scale: status === "reconnecting" ? 1.15 : 1,
@@ -39,6 +56,7 @@ export function mountNetworkStatus(host: HTMLElement): void {
     });
   };
 
-  render(connectionStore.getState().status, connectionStore.getState().retryCount);
-  connectionStore.subscribe((state) => render(state.status, state.retryCount));
+  const { status, attempt, maxAttempts } = connectionStore.getState();
+  render(status, attempt, maxAttempts);
+  connectionStore.subscribe((state) => render(state.status, state.attempt, state.maxAttempts));
 }
