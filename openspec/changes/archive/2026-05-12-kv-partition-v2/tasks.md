@@ -1,0 +1,4 @@
+- [x] **Task 1: WIT Update.** Update `wit/ai/kv-partition.wit` (or the relevant WIT file) to define the `resource table` and its methods (`get`, `set`, `delete`, `batch-set`, `get-range`).
+- [x] **Task 2: Host Implementation (Wasmtime).** Refactor the host-side WIT bindings in `core-host` to implement the `HostTable` trait. Use Wasmtime's `ResourceTable` in the `TachyonCtx` to safely map the Wasm resource handles to active `redb` table sessions/transactions.
+- [x] **Task 3: Redb Logic.** Implement the `get-range` logic using `redb::Range` and `batch-set` using a single `WriteTransaction`. Ensure Wasm OOM protection by strictly respecting the `limit` parameter.
+- [x] **Task 4: SDK Updates.** Update `faas-sdk` (Rust) to expose the new object-oriented API (e.g., `let table = Table::new("my-namespace"); table.batch_set(...);`).

@@ -1,0 +1,26 @@
+package tachyon:mesh@1.0.0;
+
+/// Native B-Tree key-value partition interface. Provides memory-safe, object-
+/// oriented table handles with auto-Drop and IPC-optimised range queries.
+/// Each resource handle maps to a named redb table on the host.
+interface kv-partition {
+    resource table {
+        /// Opens or creates a named partition in the route's redb instance.
+        constructor(name: string);
+
+        get: func(key: string) -> result<list<u8>, string>;
+        set: func(key: string, value: list<u8>) -> result<_, string>;
+        delete: func(key: string) -> result<_, string>;
+
+        /// Performs an atomic batch insert within a single write transaction.
+        batch-set: func(entries: list<tuple<string, list<u8>>>) -> result<_, string>;
+
+        /// Native B-Tree range query with pagination to prevent Wasm OOM.
+        get-range: func(
+            start-key: string,
+            end-key: string,
+            limit: u32,
+            offset: u32,
+        ) -> result<list<tuple<string, list<u8>>>, string>;
+    }
+}

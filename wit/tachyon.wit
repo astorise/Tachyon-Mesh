@@ -217,11 +217,28 @@ interface secrets-vault {
     get-secret: func(name: string) -> result<string, error>;
 }
 
+interface kv-partition {
+    resource table {
+        constructor(name: string);
+        get: func(key: string) -> result<list<u8>, string>;
+        set: func(key: string, value: list<u8>) -> result<_, string>;
+        delete: func(key: string) -> result<_, string>;
+        batch-set: func(entries: list<tuple<string, list<u8>>>) -> result<_, string>;
+        get-range: func(
+            start-key: string,
+            end-key: string,
+            limit: u32,
+            offset: u32,
+        ) -> result<list<tuple<string, list<u8>>>, string>;
+    }
+}
+
 world faas-guest {
     import bridge-controller;
     import secrets-vault;
     import vector;
     import training;
+    import kv-partition;
     export handler;
 }
 

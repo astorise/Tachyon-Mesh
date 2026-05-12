@@ -754,6 +754,135 @@ impl CoreStore {
         };
         serde_json::from_slice(&payload).context("failed to deserialize vector index")
     }
+
+    // ── Guest KV-partition operations ────────────────────────────────────────
+
+    pub(crate) fn kv_partition_get(&self, table_name: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let table_key = format!("kv_partition::{table_name}");
+        let table_def: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new(&table_key);
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("kv_partition_get: failed to begin read transaction")?;
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e).context("kv_partition_get: failed to open table"),
+        };
+        Ok(table
+            .get(key)
+            .context("kv_partition_get: read failed")?
+            .map(|v| v.value().to_owned()))
+    }
+
+    pub(crate) fn kv_partition_set(
+        &self,
+        table_name: &str,
+        key: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        let table_key = format!("kv_partition::{table_name}");
+        let table_def: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new(&table_key);
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("kv_partition_set: failed to begin write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(table_def)
+                .context("kv_partition_set: failed to open table")?;
+            table
+                .insert(key, value)
+                .context("kv_partition_set: insert failed")?;
+        }
+        write_txn
+            .commit()
+            .context("kv_partition_set: failed to commit")
+    }
+
+    pub(crate) fn kv_partition_delete(&self, table_name: &str, key: &str) -> Result<()> {
+        let table_key = format!("kv_partition::{table_name}");
+        let table_def: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new(&table_key);
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("kv_partition_delete: failed to begin write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(table_def)
+                .context("kv_partition_delete: failed to open table")?;
+            table
+                .remove(key)
+                .context("kv_partition_delete: remove failed")?;
+        }
+        write_txn
+            .commit()
+            .context("kv_partition_delete: failed to commit")
+    }
+
+    pub(crate) fn kv_partition_batch_set(
+        &self,
+        table_name: &str,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        let table_key = format!("kv_partition::{table_name}");
+        let table_def: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new(&table_key);
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("kv_partition_batch_set: failed to begin write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(table_def)
+                .context("kv_partition_batch_set: failed to open table")?;
+            for (key, value) in entries {
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .context("kv_partition_batch_set: insert failed")?;
+            }
+        }
+        write_txn
+            .commit()
+            .context("kv_partition_batch_set: failed to commit")
+    }
+
+    pub(crate) fn kv_partition_get_range(
+        &self,
+        table_name: &str,
+        start_key: &str,
+        end_key: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let table_key = format!("kv_partition::{table_name}");
+        let table_def: redb::TableDefinition<&str, &[u8]> =
+            redb::TableDefinition::new(&table_key);
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("kv_partition_get_range: failed to begin read transaction")?;
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(e).context("kv_partition_get_range: failed to open table")
+            }
+        };
+        let results: std::result::Result<Vec<_>, _> = table
+            .range(start_key..end_key)
+            .context("kv_partition_get_range: range scan failed")?
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|result| {
+                result.map(|(k, v)| (k.value().to_owned(), v.value().to_owned()))
+            })
+            .collect();
+        results.context("kv_partition_get_range: failed to collect range results")
+    }
 }
 
 // ── KV-cache support types and helpers ──────────────────────────────────────
