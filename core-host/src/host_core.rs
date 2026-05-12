@@ -85,7 +85,7 @@ pub(crate) use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, Once, OnceLock,
     },
     task::{Context as TaskContext, Poll},
@@ -96,7 +96,7 @@ pub(crate) use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
 pub(crate) use tokio::net::UnixListener;
 pub(crate) use tokio::sync::Mutex as TokioMutex;
 pub(crate) use tokio::sync::{
-    broadcast, mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError,
+    broadcast, mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError,
 };
 pub(crate) use tokio_rustls::LazyConfigAcceptor;
 pub(crate) use uuid::Uuid;

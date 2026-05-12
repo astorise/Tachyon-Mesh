@@ -445,6 +445,20 @@ async fn fetch_user_audit_log(
 }
 
 #[tauri::command]
+async fn fetch_canary_status() -> Result<Vec<tachyon_client::CanaryStatusEntry>, String> {
+    tachyon_client::fetch_canary_status()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn abort_canary_rollout(route_path: String) -> Result<(), String> {
+    tachyon_client::abort_canary_rollout(&route_path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn iam_regen_mfa(username: String) -> Result<Vec<String>, String> {
     tachyon_client::iam_regen_mfa(&username)
         .await
@@ -1116,6 +1130,8 @@ fn main() {
             iam_upsert_group,
             iam_delete_group,
             fetch_user_audit_log,
+            fetch_canary_status,
+            abort_canary_rollout,
             iam_regen_mfa,
             generate_recovery_codes,
             regenerate_account_security,

@@ -22,11 +22,24 @@ interface config-workloads {
         secret-ref: string,
     }
 
+    variant deployment-strategy {
+        rolling,
+        canary,
+    }
+
+    record canary-config {
+        step-weight: u32,
+        interval-secs: u64,
+        max-error-rate: float32,
+    }
+
     record workload-spec {
         name: string,
         runtime: runtime-type,
         endpoint: option<string>,
         secret-mounts: list<secret-mount>,
+        strategy: option<deployment-strategy>,
+        canary: option<canary-config>,
     }
 
     record workload-configuration {

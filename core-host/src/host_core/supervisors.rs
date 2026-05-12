@@ -446,6 +446,7 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         .await;
     let runtime = Arc::new(runtime);
     state.runtime.store(Arc::clone(&runtime));
+    spawn_canary_evaluators(&runtime.config);
     run_draining_runtime_reaper_tick(state);
     tracing::info!(
         manifest = %state.manifest_path.display(),

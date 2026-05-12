@@ -74,6 +74,7 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
         host_capabilities,
         Arc::clone(&host_load),
     );
+    spawn_canary_evaluators(&runtime.config);
 
     let state = AppState {
         runtime: Arc::new(ArcSwap::from_pointee(runtime.clone())),
