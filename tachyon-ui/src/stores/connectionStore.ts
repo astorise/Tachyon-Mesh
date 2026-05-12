@@ -8,10 +8,20 @@ type ConnectionStore = {
   status: ConnectionState;
   retryCount: number;
   lastMfaTimestamp: number;
+  /** Current reconnection attempt number (0 = not retrying or not yet started). */
+  attempt: number;
+  /** Maximum attempts for the current cycle (0 = cycle limit not yet set). */
+  maxAttempts: number;
   setStatus: (status: ConnectionState) => void;
   incrementRetry: () => void;
   resetRetry: () => void;
   setLastMfaTimestamp: (timestamp: number) => void;
+  /** Called by the reconnect loop on each failed attempt. Sets status to
+   * `"reconnecting"` and records the current attempt index and cycle limit. */
+  setReconnectionAttempt: (attempt: number, max: number) => void;
+  /** Resets the attempt counter and dispatches `"network:manual-retry"` so the
+   * network layer starts a fresh bounded retry cycle. */
+  manualRetry: () => void;
 };
 
 function readLastMfaTimestamp(): number {
@@ -39,12 +49,20 @@ export const connectionStore = createStore<ConnectionStore>((set) => ({
   status: "connected",
   retryCount: 0,
   lastMfaTimestamp: readLastMfaTimestamp(),
+  attempt: 0,
+  maxAttempts: 0,
   setStatus: (status) => set({ status }),
   incrementRetry: () => set((state) => ({ retryCount: state.retryCount + 1 })),
-  resetRetry: () => set({ retryCount: 0 }),
+  resetRetry: () => set({ retryCount: 0, attempt: 0 }),
   setLastMfaTimestamp: (lastMfaTimestamp) => {
     persistLastMfaTimestamp(lastMfaTimestamp);
     set({ lastMfaTimestamp });
+  },
+  setReconnectionAttempt: (attempt, maxAttempts) =>
+    set({ status: "reconnecting", attempt, maxAttempts }),
+  manualRetry: () => {
+    set({ attempt: 0, status: "disconnected" });
+    window.dispatchEvent(new CustomEvent("network:manual-retry"));
   },
 }));
 

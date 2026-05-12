@@ -4,10 +4,18 @@ import { connectionStore } from "../stores/connectionStore";
 import { ensureMfa } from "./authSudo";
 import { translateBackendError } from "./i18n";
 
+const MAX_RETRIES = 5;
+
 export const reconnectDelayMs = (retryCount: number): number => Math.min(1000 * 2 ** retryCount, 30000);
 
 const sleep = (delayMs: number) => new Promise((resolve) => window.setTimeout(resolve, delayMs));
 let reconnectLoop: Promise<void> | null = null;
+
+// Allow the store's manualRetry() to kick off a fresh cycle.
+window.addEventListener("network:manual-retry", () => {
+  reconnectLoop = null;
+  startReconnectLoop();
+});
 
 type ApplyConfigurationResponse = {
   success: boolean;
@@ -122,20 +130,23 @@ function startReconnectLoop(): void {
     return;
   }
   reconnectLoop = (async () => {
-    while (connectionStore.getState().status !== "connected") {
-      const retryCount = connectionStore.getState().retryCount;
-      connectionStore.getState().setStatus("reconnecting");
-      console.info(`tachyon-ui reconnect attempt ${retryCount + 1}; waiting ${reconnectDelayMs(retryCount)}ms`);
-      await sleep(reconnectDelayMs(retryCount));
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      connectionStore.getState().setReconnectionAttempt(attempt, MAX_RETRIES);
+      await sleep(reconnectDelayMs(attempt - 1));
       try {
         await tauriInvoke("get_engine_status");
         connectionStore.getState().resetRetry();
         connectionStore.getState().setStatus("connected");
+        reconnectLoop = null;
+        return;
       } catch {
-        connectionStore.getState().incrementRetry();
-        connectionStore.getState().setStatus("disconnected");
+        // Continue to next attempt.
       }
     }
+    // All attempts exhausted: enter terminal disconnected state.
+    // Leave attempt === MAX_RETRIES so the UI can distinguish this from
+    // a transient disconnect that hasn't started retrying yet.
+    connectionStore.getState().setStatus("disconnected");
     reconnectLoop = null;
   })();
 }
