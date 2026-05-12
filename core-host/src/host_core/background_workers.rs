@@ -210,6 +210,141 @@ pub(crate) fn run_background_tick_loop(
     }
 }
 
+/// Stops any running canary evaluators, then spawns a new evaluator tokio task
+/// for every route in `config` that carries a `canary` deployment config.
+/// Must be called from an async context (i.e., after `reload_runtime_from_disk`).
+pub(crate) fn spawn_canary_evaluators(config: &IntegrityConfig) {
+    let registry = canary_rollouts();
+
+    // Signal all existing evaluators to stop.
+    {
+        let guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+        for state in guard.values() {
+            let _ = state.stop_tx.send(true);
+        }
+    }
+
+    // Rebuild the registry from the new config.
+    let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+    guard.clear();
+
+    for route in &config.routes {
+        let Some(canary_cfg) = &route.canary else {
+            continue;
+        };
+
+        let initial_weight = canary_cfg.step_weight.min(100);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let rollout = Arc::new(CanaryRolloutState {
+            route_path: route.path.clone(),
+            current_version: route.name.clone(),
+            next_version: canary_cfg.next_version.clone(),
+            weight_pct: AtomicU32::new(initial_weight),
+            step_weight: canary_cfg.step_weight,
+            interval_secs: canary_cfg.interval_secs,
+            max_error_rate: canary_cfg.max_error_rate,
+            phase: Mutex::new(CanaryPhase::Stepping),
+            next_req_count: AtomicU64::new(0),
+            next_err_count: AtomicU64::new(0),
+            stop_tx,
+        });
+
+        guard.insert(route.path.clone(), Arc::clone(&rollout));
+        tokio::spawn(run_canary_evaluator(rollout, stop_rx));
+
+        tracing::info!(
+            route = %route.path,
+            next_version = %canary_cfg.next_version,
+            initial_weight = initial_weight,
+            "canary rollout started"
+        );
+    }
+}
+
+async fn run_canary_evaluator(
+    state: Arc<CanaryRolloutState>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let interval = Duration::from_secs(state.interval_secs);
+
+    loop {
+        // Wait for the configured interval or an explicit stop signal.
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            result = stop_rx.changed() => {
+                if result.is_err() || *stop_rx.borrow() {
+                    break;
+                }
+            }
+        }
+
+        // Exit if already in a terminal phase.
+        {
+            let phase = state.phase.lock().unwrap_or_else(|p| p.into_inner());
+            if !matches!(*phase, CanaryPhase::Stepping) {
+                break;
+            }
+        }
+
+        // Compute cumulative error rate for next_version traffic.
+        let total_req = state.next_req_count.load(Ordering::Relaxed);
+        let total_err = state.next_err_count.load(Ordering::Relaxed);
+        let error_rate = if total_req > 0 {
+            total_err as f32 / total_req as f32
+        } else {
+            0.0
+        };
+
+        if error_rate > state.max_error_rate {
+            // Atomic rollback: reset traffic weight and record phase.
+            state.weight_pct.store(0, Ordering::SeqCst);
+            let reason = format!(
+                "error rate {:.1}% exceeded threshold {:.1}%",
+                error_rate * 100.0,
+                state.max_error_rate * 100.0,
+            );
+            {
+                let mut phase = state.phase.lock().unwrap_or_else(|p| p.into_inner());
+                *phase = CanaryPhase::RolledBack {
+                    reason: reason.clone(),
+                };
+            }
+            tracing::error!(
+                route = %state.route_path,
+                version = %state.next_version,
+                error_rate,
+                threshold = state.max_error_rate,
+                "CANARY ROLLBACK: {}",
+                reason,
+            );
+            break;
+        }
+
+        // Step up traffic weight toward 100%.
+        let current = state.weight_pct.load(Ordering::Relaxed);
+        let new_weight = current.saturating_add(state.step_weight).min(100);
+        state.weight_pct.store(new_weight, Ordering::SeqCst);
+
+        if new_weight >= 100 {
+            let mut phase = state.phase.lock().unwrap_or_else(|p| p.into_inner());
+            *phase = CanaryPhase::Promoted;
+            tracing::info!(
+                route = %state.route_path,
+                version = %state.next_version,
+                "CANARY PROMOTED: 100% traffic shifted to next version"
+            );
+            break;
+        }
+
+        tracing::info!(
+            route = %state.route_path,
+            version = %state.next_version,
+            weight_pct = new_weight,
+            "canary rollout step complete"
+        );
+    }
+}
+
 pub(crate) fn wait_for_background_tick(stop_requested: &AtomicBool) -> bool {
     let deadline = Instant::now() + AUTOSCALING_TICK_INTERVAL;
 

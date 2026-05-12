@@ -10,6 +10,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/status", get(auth::admin_status_handler))
         .route("/admin/metrics", get(admin_metrics_handler))
+        .route(
+            "/admin/canary",
+            get(admin_canary_status_handler).post(admin_abort_canary_handler),
+        )
         .route("/admin/shadow/diffs", get(admin_shadow_diffs_handler))
         .route("/admin/chaos/scenarios", post(admin_chaos_scenario_handler))
         .route(
@@ -199,6 +203,78 @@ pub(crate) async fn admin_shadow_diffs_handler() -> axum::Json<Vec<AdminShadowDi
     // telemetry stream. The admin surface is intentionally stable even when no
     // divergence collector has produced recent rows.
     axum::Json(Vec::new())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CanaryStatusEntry {
+    pub(crate) route_path: String,
+    pub(crate) current_version: String,
+    pub(crate) next_version: String,
+    pub(crate) weight_pct: u32,
+    pub(crate) phase: String,
+    pub(crate) next_req_count: u64,
+    pub(crate) next_err_count: u64,
+}
+
+pub(crate) async fn admin_canary_status_handler() -> axum::Json<Vec<CanaryStatusEntry>> {
+    let registry = canary_rollouts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entries = registry
+        .values()
+        .map(|s| {
+            let phase = s.phase.lock().unwrap_or_else(|p| p.into_inner());
+            let phase_str = match &*phase {
+                CanaryPhase::Stepping => "stepping".to_owned(),
+                CanaryPhase::Promoted => "promoted".to_owned(),
+                CanaryPhase::RolledBack { reason } => format!("rolled_back:{reason}"),
+            };
+            CanaryStatusEntry {
+                route_path: s.route_path.clone(),
+                current_version: s.current_version.clone(),
+                next_version: s.next_version.clone(),
+                weight_pct: s.weight_pct.load(Ordering::Relaxed),
+                phase: phase_str,
+                next_req_count: s.next_req_count.load(Ordering::Relaxed),
+                next_err_count: s.next_err_count.load(Ordering::Relaxed),
+            }
+        })
+        .collect();
+    axum::Json(entries)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminAbortCanaryRequest {
+    pub(crate) route_path: String,
+}
+
+pub(crate) async fn admin_abort_canary_handler(
+    axum::Json(payload): axum::Json<AdminAbortCanaryRequest>,
+) -> Response {
+    let registry = canary_rollouts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(rollout) = registry.get(&payload.route_path) {
+        rollout.weight_pct.store(0, Ordering::SeqCst);
+        let mut phase = rollout.phase.lock().unwrap_or_else(|p| p.into_inner());
+        *phase = CanaryPhase::RolledBack {
+            reason: "manually aborted by operator".to_owned(),
+        };
+        let _ = rollout.stop_tx.send(true);
+        tracing::warn!(
+            route = %payload.route_path,
+            "canary rollout manually aborted by operator"
+        );
+        (StatusCode::OK, "rollout aborted").into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            format!("no active canary rollout for route `{}`", payload.route_path),
+        )
+            .into_response()
+    }
 }
 
 pub(crate) async fn admin_chaos_scenario_handler(
@@ -1767,6 +1843,33 @@ pub(crate) async fn execute_route_request(
                 .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
         })?;
 
+    // Canary fractional routing: if an active rollout exists for this route,
+    // override the selected module probabilistically.
+    let (selected_module, canary_tracking) = {
+        let registry = canary_rollouts()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(rollout) = registry.get(&route.path) {
+            let is_stepping = rollout
+                .phase
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .eq(&CanaryPhase::Stepping);
+            if is_stepping {
+                let weight = rollout.weight_pct.load(Ordering::Relaxed);
+                if weight > 0 && rand::rng().random_range(0u32..100) < weight {
+                    (rollout.next_version.clone(), Some(Arc::clone(rollout)))
+                } else {
+                    (selected_module, None)
+                }
+            } else {
+                (selected_module, None)
+            }
+        } else {
+            (selected_module, None)
+        }
+    };
+
     if let Some(rejection) =
         enforce_resource_admission(state, route, headers, method, body, hop_limit, runtime).await?
     {
@@ -1785,7 +1888,7 @@ pub(crate) async fn execute_route_request(
         })?;
     match acquire_route_permit(Arc::clone(&semaphore)).await {
         Ok(permit) => {
-            execute_route_request_with_acquired_permit(
+            let result = execute_route_request_with_acquired_permit(
                 state,
                 runtime,
                 route,
@@ -1801,7 +1904,18 @@ pub(crate) async fn execute_route_request(
                 semaphore,
                 permit,
             )
-            .await
+            .await;
+            // Update per-rollout error counters for canary requests.
+            if let Some(ref rollout) = canary_tracking {
+                rollout.next_req_count.fetch_add(1, Ordering::Relaxed);
+                let is_error = result
+                    .as_ref()
+                    .map_or(true, |r| r.response.status.as_u16() >= 500);
+                if is_error {
+                    rollout.next_err_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            result
         }
         Err(RoutePermitError::Closed) => Err((
             StatusCode::SERVICE_UNAVAILABLE,

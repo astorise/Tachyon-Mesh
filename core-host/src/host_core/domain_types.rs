@@ -118,6 +118,70 @@ pub(crate) static LORA_TRAINING_QUEUE: OnceLock<Arc<LoraTrainingQueue>> = OnceLo
 pub(crate) static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInferenceJobStatus>>>> =
     OnceLock::new();
 
+// ── Canary deployment types ───────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeploymentStrategy {
+    #[default]
+    Rolling,
+    Canary,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct CanaryConfig {
+    /// Module name of the next version to roll traffic to.
+    pub(crate) next_version: String,
+    /// Percentage of traffic to shift per evaluation step (1–100).
+    #[serde(default = "default_canary_step_weight")]
+    pub(crate) step_weight: u32,
+    /// Seconds between evaluation steps.
+    #[serde(default = "default_canary_interval_secs")]
+    pub(crate) interval_secs: u64,
+    /// Error rate above which an automatic rollback is triggered (0.0–1.0).
+    pub(crate) max_error_rate: f32,
+}
+
+pub(crate) fn default_canary_step_weight() -> u32 {
+    10
+}
+pub(crate) fn default_canary_interval_secs() -> u64 {
+    60
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CanaryPhase {
+    Stepping,
+    Promoted,
+    RolledBack { reason: String },
+}
+
+pub(crate) struct CanaryRolloutState {
+    pub(crate) route_path: String,
+    pub(crate) current_version: String,
+    pub(crate) next_version: String,
+    /// Current percentage of traffic directed to `next_version` (0–100).
+    pub(crate) weight_pct: AtomicU32,
+    pub(crate) step_weight: u32,
+    pub(crate) interval_secs: u64,
+    pub(crate) max_error_rate: f32,
+    pub(crate) phase: Mutex<CanaryPhase>,
+    /// Cumulative requests routed to `next_version` on this node.
+    pub(crate) next_req_count: AtomicU64,
+    /// Cumulative 5xx / wasm-trap responses from `next_version` on this node.
+    pub(crate) next_err_count: AtomicU64,
+    /// Send `true` to stop the evaluator task for this rollout.
+    pub(crate) stop_tx: tokio::sync::watch::Sender<bool>,
+}
+
+pub(crate) static CANARY_ROLLOUTS: OnceLock<
+    Arc<Mutex<HashMap<String, Arc<CanaryRolloutState>>>>,
+> = OnceLock::new();
+
+pub(crate) fn canary_rollouts() -> &'static Arc<Mutex<HashMap<String, Arc<CanaryRolloutState>>>> {
+    CANARY_ROLLOUTS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
 pub(crate) struct LoraTrainingQueue {
     pub(crate) sender: std::sync::mpsc::Sender<LoraTrainingJob>,
     pub(crate) statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
@@ -384,6 +448,11 @@ pub(crate) struct IntegrityRoute {
     /// at inference time. Per-call overrides may be passed via the inference WIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) adapter_id: Option<String>,
+    /// When set, enables an automated canary rollout for this route. The host
+    /// gradually shifts traffic from the current module (`name`) to
+    /// `canary.next_version` according to the configured step schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) canary: Option<CanaryConfig>,
 }
 
 impl Default for IntegrityRoute {
@@ -413,6 +482,7 @@ impl Default for IntegrityRoute {
             distributed_rate_limit: None,
             shadow_target: None,
             adapter_id: None,
+            canary: None,
         }
     }
 }

@@ -143,3 +143,45 @@ reloads and propagates via gossip.
 - **THEN** the written `integrity.lock` contains `asset_versions: { "toto": "2.3.5" }`
 - **AND** a subsequent bundle apply for `toto` uses this entry as the cluster baseline
 
+### Requirement: Fractional canary routing
+The routing table SHALL maintain `(current_version, next_version, current_weight_percentage)` during a canary rollout. For each incoming request, the host generates a random number `n` in `[0, 100)`: if `n < current_weight_percentage` the request is dispatched to `next_version`, otherwise to `current_version`.
+
+#### Scenario: Request is routed to next version
+- **GIVEN** a canary rollout is active with `weight_pct = 40`
+- **WHEN** a random draw of 27 is produced for an incoming request
+- **THEN** the request is dispatched to `next_version`
+
+#### Scenario: Request stays on current version
+- **GIVEN** a canary rollout is active with `weight_pct = 40`
+- **WHEN** a random draw of 65 is produced for an incoming request
+- **THEN** the request is dispatched to `current_version`
+
+### Requirement: Telemetry-driven canary evaluator
+The background evaluator SHALL loop at the configured `interval-secs`, compute the error rate for `next_version` as `(5xx_responses + wasm_traps) / total_invocations`, and step up the traffic fraction by `step-weight` if the rate is below `max-error-rate`.
+
+#### Scenario: Error rate within threshold — step up
+- **GIVEN** the evaluator runs its interval and error rate is below `max_error_rate`
+- **WHEN** the evaluation completes
+- **THEN** `weight_pct` increases by `step_weight` (capped at 100)
+
+#### Scenario: Error rate exceeds threshold — rollback
+- **GIVEN** the evaluator runs its interval and error rate exceeds `max_error_rate`
+- **WHEN** the evaluation completes
+- **THEN** `weight_pct` is atomically set to `0`
+- **AND** phase transitions to `RolledBack`
+- **AND** a critical event is emitted to the system log
+
+### Requirement: Canary UI in TachyonWorkloadsPanel
+The Workloads panel SHALL expose canary configuration fields in the deployment form and display a live progress bar for active rollouts with an abort button.
+
+#### Scenario: Operator configures a canary rollout
+- **GIVEN** the operator selects "Canary" in the Strategy selector
+- **WHEN** the canary config fields appear
+- **THEN** the submitted JSON payload includes `canary.next_version`, `canary.step_weight`, `canary.interval_secs`, `canary.max_error_rate`
+
+#### Scenario: Operator aborts an active rollout
+- **GIVEN** an active canary rollout is displayed with weight > 0
+- **WHEN** the operator clicks "Abort Rollout" and confirms
+- **THEN** `POST /admin/canary` is called with the route path
+- **AND** `weight_pct` resets to `0` on the host
+

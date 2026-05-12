@@ -23,6 +23,7 @@ const ADMIN_IAM_GROUPS_PATH: &str = "/admin/iam/groups";
 const ADMIN_MANIFEST_BUNDLE_PATH: &str = "/admin/manifest/bundle";
 const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
 const ADMIN_METRICS_PATH: &str = "/admin/metrics";
+const ADMIN_CANARY_PATH: &str = "/admin/canary";
 const ADMIN_LOGS_PATH: &str = "/admin/logs";
 const ADMIN_SHADOW_DIFFS_PATH: &str = "/admin/shadow/diffs";
 const ADMIN_CHAOS_SCENARIOS_PATH: &str = "/admin/chaos/scenarios";
@@ -1646,6 +1647,34 @@ pub async fn get_metrics() -> Result<RuntimeMetrics> {
         p99_latency_ms: 0.0,
         queue_depth: graph.batch_targets.len() as u64,
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanaryStatusEntry {
+    pub route_path: String,
+    pub current_version: String,
+    pub next_version: String,
+    pub weight_pct: u32,
+    pub phase: String,
+    pub next_req_count: u64,
+    pub next_err_count: u64,
+}
+
+pub async fn fetch_canary_status() -> Result<Vec<CanaryStatusEntry>> {
+    if current_connection().is_none() {
+        return Ok(Vec::new());
+    }
+    get_admin_json(ADMIN_CANARY_PATH).await
+}
+
+pub async fn abort_canary_rollout(route_path: &str) -> Result<()> {
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+    let payload = serde_json::json!({ "routePath": route_path });
+    post_admin_json::<serde_json::Value>(ADMIN_CANARY_PATH, &payload).await?;
+    Ok(())
 }
 
 pub async fn tail_logs(lines: usize) -> Result<Vec<LogLine>> {
