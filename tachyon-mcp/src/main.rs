@@ -5,10 +5,15 @@ use std::{
     collections::HashMap,
     env,
     path::PathBuf,
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// Set once per process on the first authenticated request; subsequent requests
+/// skip the `set_connection` HTTP round-trip and reuse the cached state held
+/// inside `tachyon_client`'s global connection registry.
+static CONNECTION_INITIALIZED: OnceLock<()> = OnceLock::new();
 
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_PERSIST_SECS: u64 = 10;
@@ -343,7 +348,9 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                     &format!("unsupported resource `{uri}`"),
                 )));
             }
-            let status = tachyon_client::read_local_hardware_status();
+            let status = tokio::task::spawn_blocking(tachyon_client::read_local_hardware_status)
+                .await
+                .context("hardware status task panicked")?;
             json!({
                 "contents": [
                     {
@@ -442,12 +449,11 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_tail_logs",
-                    "description": "Fetch recent logs and expose them as MCP notifications/message payloads for clients that want to stream them.",
+                    "description": "Fetch the last N log lines from the audit log. Returns a fixed snapshot; continuous streaming is not supported over stdio MCP.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "lines": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                            "follow": { "type": "boolean" }
+                            "lines": { "type": "integer", "minimum": 1, "maximum": 1000 }
                         }
                     }
                 },
@@ -538,10 +544,18 @@ async fn validate_request_auth(context: &McpContext) -> Result<()> {
     if !context.enforce_remote_auth {
         return Ok(());
     }
+    // Only call set_connection once per process lifetime to avoid an HTTP
+    // round-trip on every JSON-RPC message. The global tachyon_client state
+    // persists across calls within the same process.
+    if CONNECTION_INITIALIZED.get().is_some() {
+        return Ok(());
+    }
     tachyon_client::set_connection(context.url.clone(), context.token.clone(), None)
         .await
         .map_err(anyhow::Error::msg)
-        .context("failed to validate TACHYON_MCP_PAT against TACHYON_MCP_URL")
+        .context("failed to validate TACHYON_MCP_PAT against TACHYON_MCP_URL")?;
+    let _ = CONNECTION_INITIALIZED.set(());
+    Ok(())
 }
 
 async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Result<Value> {
@@ -664,36 +678,14 @@ async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Resul
                 .and_then(Value::as_u64)
                 .unwrap_or(100)
                 .min(1_000) as usize;
-            let follow = arguments
-                .get("follow")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
             let logs = tachyon_client::tail_logs(lines).await?;
-            let notifications: Vec<Value> = logs
-                .iter()
-                .map(|line| {
-                    json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/message",
-                        "params": {
-                            "level": line.level,
-                            "logger": line.target,
-                            "data": line
-                        }
-                    })
-                })
-                .collect();
             Ok(json!({
                 "content": [
                     {
                         "type": "text",
                         "text": serde_json::to_string_pretty(&logs)?
                     }
-                ],
-                "structuredContent": {
-                    "followRequested": follow,
-                    "notifications": notifications
-                }
+                ]
             }))
         }
         "tachyon_get_shadow_diffs" => {
@@ -711,7 +703,9 @@ async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Resul
             Ok(text_tool_result(&outcome)?)
         }
         "tachyon_hardware_status" => {
-            let status = tachyon_client::read_local_hardware_status();
+            let status = tokio::task::spawn_blocking(tachyon_client::read_local_hardware_status)
+                .await
+                .context("hardware status task panicked")?;
             let body = serde_json::to_string_pretty(&status)
                 .context("failed to encode hardware status")?;
             Ok(json!({

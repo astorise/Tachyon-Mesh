@@ -77,3 +77,27 @@ The `tachyon-mcp` binary SHALL rate-limit write-heavy tools independently from r
 - **WHEN** the rate limiter mutex cannot be acquired cleanly
 - **THEN** the server returns a structured JSON-RPC internal error
 - **AND** it does not panic or terminate the process
+
+### Requirement: Bounded tool contract — no unimplemented streaming
+The `tachyon_tail_logs` tool schema MUST NOT advertise a `follow` parameter that is not implemented.
+
+#### Scenario: Agent calls tachyon_tail_logs
+- **WHEN** an agent invokes `tachyon_tail_logs` with or without a `lines` argument
+- **THEN** the server returns a fixed snapshot of the last N log lines
+- **AND** the response contains no `followRequested` field
+
+### Requirement: Non-blocking hardware status
+The `resources/read` hardware resource handler and the `tachyon_hardware_status` tool MUST offload the synchronous sysinfo call to a Tokio blocking thread to avoid stalling the async executor.
+
+#### Scenario: Hardware status is requested under load
+- **GIVEN** the MCP server is handling requests
+- **WHEN** `hardware://local/status` or `tachyon_hardware_status` is called
+- **THEN** `read_local_hardware_status` runs on the Tokio blocking thread pool
+
+### Requirement: Connection initialized once per process
+The PAT validation against `core-host` SHALL happen at most once per MCP server process lifetime.
+
+#### Scenario: Agent sends multiple tool calls in a session
+- **WHEN** the agent sends multiple consecutive requests
+- **THEN** `set_connection` is called exactly once
+- **AND** subsequent requests skip the HTTP round-trip and reuse the cached state
