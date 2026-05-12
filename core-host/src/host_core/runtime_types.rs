@@ -619,3 +619,11 @@ pub(crate) struct PropagatedHeader {
     pub(crate) name: String,
     pub(crate) value: String,
 }
+
+/// Host-side tracking state for a WIT `kv-partition::table` resource handle.
+/// Stored in the `ComponentHostState::table` `ResourceTable`; dropped
+/// automatically when the Wasm guest lets the handle go out of scope.
+pub(crate) struct RedbTableResource {
+    pub(crate) table_name: String,
+    pub(crate) core_store: Arc<store::CoreStore>,
+}
