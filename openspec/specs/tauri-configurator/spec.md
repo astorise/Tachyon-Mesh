@@ -147,3 +147,25 @@ The Tauri backend SHALL generate and reference WIT bindings for routing plus the
 - **WHEN** a supported panel submits a domain payload
 - **THEN** the backend uses generated WIT contract types in the validation path
 - **AND** unsupported domains are rejected explicitly
+
+### Requirement: Strict Content Security Policy
+The Tauri WebView SHALL enforce a strict Content Security Policy that blocks inline scripts and evals while permitting Tauri IPC, local WebSockets, and data URI images.
+
+#### Scenario: CSP blocks inline script injection
+- **GIVEN** the Tauri application is running
+- **WHEN** a script is injected inline via a compromised DOM node
+- **THEN** the CSP `script-src 'self'` directive blocks its execution
+
+#### Scenario: QR code images are rendered without innerHTML
+- **GIVEN** a TOTP enrollment or operator invite flow displays a QR code
+- **WHEN** the QRCode library generates the code
+- **THEN** it is rendered as a PNG data URI set on an `<img>` `src` attribute
+- **AND** no SVG HTML is inserted via `innerHTML`
+
+### Requirement: DOM manipulation safety
+All dynamic data inserted into the DOM via `innerHTML` in the Tachyon UI MUST either be escaped through `escapeHtml()` or replaced with safe DOM APIs (`textContent`, `replaceChildren`).
+
+#### Scenario: Nav link labels are HTML-escaped
+- **GIVEN** the AppShell renders navigation links from the ComponentRegistry
+- **WHEN** an entry label or route string contains HTML metacharacters
+- **THEN** those characters are escaped before insertion into `innerHTML`

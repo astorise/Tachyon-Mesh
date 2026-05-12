@@ -235,12 +235,16 @@ export class TachyonIAM extends HTMLElement {
         session.textContent = invite.sessionId;
       }
       if (qr) {
-        qr.innerHTML = await QRCode.toString(invite.qrPayload, {
-          type: "svg",
+        const dataUrl = await QRCode.toDataURL(invite.qrPayload, {
           margin: 1,
           width: 180,
           color: { dark: "#020617", light: "#ffffff" },
         });
+        const img = document.createElement("img");
+        img.src = dataUrl;
+        img.alt = "Enrollment QR code";
+        img.width = 180;
+        qr.replaceChildren(img);
       }
       container?.classList.remove("hidden");
       container?.classList.add("flex");
@@ -426,15 +430,16 @@ export class TachyonIAM extends HTMLElement {
     }
 
     try {
-      qr.innerHTML = await QRCode.toString(session.provisioningUri, {
-        type: "svg",
+      const dataUrl = await QRCode.toDataURL(session.provisioningUri, {
         margin: 1,
         width: 256,
-        color: {
-          dark: "#e2e8f0",
-          light: "#0f172a",
-        },
+        color: { dark: "#e2e8f0", light: "#0f172a" },
       });
+      const img = document.createElement("img");
+      img.src = dataUrl;
+      img.alt = "TOTP provisioning QR code";
+      img.width = 256;
+      qr.replaceChildren(img);
       qr.className =
         "flex min-h-64 items-center justify-center rounded-2xl border border-slate-700 bg-slate-900 p-4";
     } catch (error) {
