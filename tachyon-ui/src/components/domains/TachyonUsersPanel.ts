@@ -122,7 +122,7 @@ export class TachyonUsersPanel extends TachyonConfigDashboard {
         const roles = user.roles.length === 0 ? "—" : user.roles.map((r) => this.escape(r)).join(", ");
         const toggleLabel = user.disabledAt ? t("users.action.enable") : t("users.action.disable");
         return `
-          <tr data-user="${this.escape(user.username)}" class="border-t border-slate-800">
+          <tr data-user="${this.escapeAttr(user.username)}" class="border-t border-slate-800">
             <td class="py-2 pr-4 font-mono text-cyan-300">${this.escape(user.username)}</td>
             <td class="py-2 pr-4">${status}</td>
             <td class="py-2 pr-4 text-slate-300">${groups}</td>
@@ -130,11 +130,11 @@ export class TachyonUsersPanel extends TachyonConfigDashboard {
             <td class="py-2 pr-4 font-mono text-slate-400">${last}</td>
             <td class="py-2 text-right">
               <div class="flex flex-wrap justify-end gap-1">
-                <button data-action="toggle-disabled" data-target="${this.escape(user.username)}" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700">${toggleLabel}</button>
-                <button data-action="edit-groups" data-target="${this.escape(user.username)}" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700">${t("users.action.edit-groups")}</button>
-                <button data-action="edit-roles" data-target="${this.escape(user.username)}" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700">${t("users.action.edit-roles")}</button>
-                <button data-action="view-audit" data-target="${this.escape(user.username)}" class="rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-1 text-[11px] text-cyan-200 hover:bg-cyan-500/20">${t("users.action.view-audit")}</button>
-                <button data-action="delete" data-target="${this.escape(user.username)}" class="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-200 hover:bg-red-500/20">${t("users.action.delete")}</button>
+                <button data-action="toggle-disabled" data-target="${this.escapeAttr(user.username)}" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700">${toggleLabel}</button>
+                <button data-action="edit-groups" data-target="${this.escapeAttr(user.username)}" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700">${t("users.action.edit-groups")}</button>
+                <button data-action="edit-roles" data-target="${this.escapeAttr(user.username)}" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700">${t("users.action.edit-roles")}</button>
+                <button data-action="view-audit" data-target="${this.escapeAttr(user.username)}" class="rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-1 text-[11px] text-cyan-200 hover:bg-cyan-500/20">${t("users.action.view-audit")}</button>
+                <button data-action="delete" data-target="${this.escapeAttr(user.username)}" class="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-200 hover:bg-red-500/20">${t("users.action.delete")}</button>
               </div>
             </td>
           </tr>
@@ -172,8 +172,8 @@ export class TachyonUsersPanel extends TachyonConfigDashboard {
                     <span class="ml-2 text-[10px] uppercase tracking-widest text-slate-500">${group.memberCount} ${t("groups.members")}</span>
                   </div>
                   <div class="flex gap-1">
-                    <button data-group-action="edit" data-target="${this.escape(group.name)}" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700">${t("groups.action.edit")}</button>
-                    <button data-group-action="delete" data-target="${this.escape(group.name)}" class="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-200 hover:bg-red-500/20">${t("groups.action.delete")}</button>
+                    <button data-group-action="edit" data-target="${this.escapeAttr(group.name)}" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700">${t("groups.action.edit")}</button>
+                    <button data-group-action="delete" data-target="${this.escapeAttr(group.name)}" class="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-200 hover:bg-red-500/20">${t("groups.action.delete")}</button>
                   </div>
                 </div>
                 <p class="mt-1 text-xs text-slate-400">${this.escape(group.description) || `<span class="italic text-slate-600">${t("groups.no-description")}</span>`}</p>
@@ -429,6 +429,10 @@ export class TachyonUsersPanel extends TachyonConfigDashboard {
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#039;");
+  }
+
+  private escapeAttr(value: string): string {
+    return this.escape(value);
   }
 }
 

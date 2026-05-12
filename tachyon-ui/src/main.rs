@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
-use tauri_plugin_stronghold::stronghold::Stronghold as NativeStronghold;
+use tauri_plugin_stronghold::stronghold::Stronghold;
 
 const STRONGHOLD_PROFILE_CLIENT: &[u8] = b"tachyon-ui-auth";
 const AUTH_PROFILE_RECORD: &[u8] = b"auth_profile";
@@ -94,7 +94,7 @@ struct SecureAuthProfile {
 }
 
 struct StrongholdAuthStore {
-    inner: Mutex<NativeStronghold>,
+    inner: Mutex<Stronghold>,
 }
 
 #[derive(Default)]
@@ -110,7 +110,7 @@ struct MfaSessionToken {
 
 impl StrongholdAuthStore {
     fn new(snapshot_path: PathBuf, key: Vec<u8>) -> Result<Self, String> {
-        let stronghold = NativeStronghold::new(snapshot_path, key)
+        let stronghold = Stronghold::new(snapshot_path, key)
             .map_err(|error| format!("failed to initialize Stronghold auth store: {error}"))?;
         Ok(Self {
             inner: Mutex::new(stronghold),
@@ -202,7 +202,7 @@ fn current_unix_seconds() -> Result<u64, String> {
 }
 
 fn load_or_create_stronghold_client(
-    stronghold: &NativeStronghold,
+    stronghold: &Stronghold,
 ) -> Result<iota_stronghold::Client, String> {
     stronghold
         .get_client(STRONGHOLD_PROFILE_CLIENT)
