@@ -134,6 +134,31 @@ curl --request POST http://127.0.0.1:8080/api/guest-ai \
 
 `ai-inference` is intentionally optional because the host machine must provide ONNX Runtime dynamic libraries for the selected execution provider.
 
+## 🤖 Quickstart: LLM Agents (MCP)
+
+Tachyon Mesh ships a [Model Context Protocol](https://modelcontextprotocol.io/) server that lets Claude Desktop, Cursor, and other MCP-compatible agents query the cluster directly — no glue code required.
+
+**Full setup instructions:** [docs/mcp-setup.md](docs/mcp-setup.md)
+
+**1-minute example for Claude Desktop** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "tachyon-mesh": {
+      "command": "cargo",
+      "args": ["run", "--manifest-path", "/path/to/tachyon-mesh/Cargo.toml", "--bin", "tachyon-mcp"],
+      "env": {
+        "TACHYON_MCP_URL": "http://127.0.0.1:8080",
+        "TACHYON_MCP_PAT": "your-personal-access-token"
+      }
+    }
+  }
+}
+```
+
+Available tools include `tachyon_mesh_status`, `tachyon_tail_logs`, `tachyon_get_metrics`, `tachyon_validate_manifest`, `tachyon_run_chaos_scenario`, and more. See the [setup guide](docs/mcp-setup.md) for the full list.
+
 ## Performance & Benchmarks
 
 The reproducible benchmark harness lives in [`bench/`](bench/README.md). It provisions a clean k3d cluster, deploys a neutral echo workload behind Istio Ambient, Linkerd, and Tachyon Mesh adapters, runs Fortio load tests, captures Kubernetes resource snapshots, and renders Markdown tables from raw JSON output.
