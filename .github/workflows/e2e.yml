@@ -1,0 +1,96 @@
+name: E2E Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  mcp-e2e:
+    name: MCP stdio E2E
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-wasip2
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux system dependencies for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev
+
+      - name: Build tachyon-mcp (release)
+        run: cargo build -p tachyon-mcp --release
+
+      - name: Run MCP stdio E2E tests (offline — no cluster required)
+        run: cargo test -p tachyon-mcp --test mcp_e2e_runner -- --test-threads=1
+
+      - name: Build guest artifacts for integration smoke
+        run: bash scripts/build-guest-artifacts.sh
+
+      - name: Build core-host (release)
+        run: cargo build -p core-host --release
+
+      - name: Run MCP live-cluster tests (requires E2E_CLUSTER_URL secret)
+        if: ${{ env.E2E_CLUSTER_URL != '' }}
+        env:
+          E2E_CLUSTER_URL: ${{ secrets.E2E_CLUSTER_URL }}
+          E2E_CLUSTER_PAT: ${{ secrets.E2E_CLUSTER_PAT }}
+        run: cargo test -p tachyon-mcp --test mcp_e2e_runner test_tools_list_against_live_cluster -- --test-threads=1
+
+  playwright-ui:
+    name: Playwright UI E2E
+    runs-on: ubuntu-latest
+    # Playwright tests require a running Vite dev server; skip on CI unless
+    # the ENABLE_PLAYWRIGHT_CI environment variable is explicitly set.
+    if: ${{ vars.ENABLE_PLAYWRIGHT_CI == 'true' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+
+      - name: Install npm dependencies
+        working-directory: tachyon-ui
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: tachyon-ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        working-directory: tachyon-ui
+        run: npx playwright test
+        env:
+          CI: "true"
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report-${{ github.sha }}
+          path: tachyon-ui/playwright-report/
+          if-no-files-found: ignore

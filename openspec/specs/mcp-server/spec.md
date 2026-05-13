@@ -159,3 +159,23 @@ The MCP server SHALL expose tools for deploying and managing WASM functions, rea
 - **THEN** the live rollout weight is updated to the specified percentage via `PATCH /admin/canary`
 - **WHEN** `tachyon_canary_split` is called with `weight_pct = 0`
 - **THEN** the rollout is aborted and traffic reverts to the stable version
+
+### Requirement: tachyon-mcp MUST have a stdio E2E test harness
+A Rust integration test at `tachyon-mcp/tests/mcp_e2e_runner.rs` SHALL spawn the compiled `tachyon-mcp` binary, drive it via stdin/stdout, and assert that: (1) `initialize` returns the correct MCP protocol version; (2) `tools/list` returns a structurally valid JSON-RPC response; (3) with a live cluster, the core tools are present and read-only calls do not return `-32603`.
+
+#### Scenario: initialize returns protocol version without a cluster
+- **GIVEN** the binary is spawned with an unreachable cluster URL
+- **WHEN** `{"jsonrpc":"2.0","id":1,"method":"initialize"}` is sent on stdin
+- **THEN** stdout contains a JSON-RPC response with `result.protocolVersion = "2025-03-26"`
+
+#### Scenario: tools/list is structurally valid even when the cluster is unreachable
+- **GIVEN** no live cluster is available
+- **WHEN** `tools/list` is sent after `initialize`
+- **THEN** the response contains either `result.tools` (array) or `error.code` in `[-32001, -32002, -32600, -32602, -32603]`
+- **AND** the response is never malformed JSON
+
+#### Scenario: Live-cluster test asserts critical tool presence
+- **GIVEN** `E2E_CLUSTER_URL` and `E2E_CLUSTER_PAT` are set
+- **WHEN** `tools/list` is called
+- **THEN** `tachyon_hardware_status`, `tachyon_topology_snapshot`, and `tachyon_dryrun_manifest` are in the tools array
+- **AND** `tachyon_dryrun_manifest.inputSchema.properties` is a non-empty object (dynamic manifest schema injected)

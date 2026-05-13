@@ -1652,6 +1652,8 @@ pub async fn get_metrics() -> Result<RuntimeMetrics> {
         p50_latency_ms: 0.0,
         p99_latency_ms: 0.0,
         queue_depth: graph.batch_targets.len() as u64,
+        vram_utilization_pct: 0,
+        ram_offload_active: false,
     })
 }
 
@@ -1689,7 +1691,7 @@ pub async fn abort_canary_rollout(route_path: &str) -> Result<()> {
         return Err(anyhow::anyhow!("not connected to a node"));
     }
     let payload = serde_json::json!({ "routePath": route_path });
-    post_admin_json::<serde_json::Value>(ADMIN_CANARY_PATH, &payload).await?;
+    post_admin_json::<serde_json::Value, serde_json::Value>(ADMIN_CANARY_PATH, &payload).await?;
     Ok(())
 }
 
@@ -1701,7 +1703,7 @@ pub async fn kv_get(namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     let path = format!("{ADMIN_KV_PATH}/{namespace}/{key}");
-    let config = current_connection_config()?;
+    let config = require_connection()?;
     let client = build_http_client(&config)?;
     let url = build_endpoint_url(&config.url, &path)?;
     let response = client
@@ -1724,7 +1726,7 @@ pub async fn kv_put(namespace: &str, key: &str, value: &[u8]) -> Result<()> {
         return Err(anyhow::anyhow!("not connected to a node"));
     }
     let path = format!("{ADMIN_KV_PATH}/{namespace}/{key}");
-    let config = current_connection_config()?;
+    let config = require_connection()?;
     let client = build_http_client(&config)?;
     let url = build_endpoint_url(&config.url, &path)?;
     let response = client
@@ -1745,7 +1747,7 @@ pub async fn kv_delete(namespace: &str, key: &str) -> Result<()> {
         return Err(anyhow::anyhow!("not connected to a node"));
     }
     let path = format!("{ADMIN_KV_PATH}/{namespace}/{key}");
-    let config = current_connection_config()?;
+    let config = require_connection()?;
     let client = build_http_client(&config)?;
     let url = build_endpoint_url(&config.url, &path)?;
     let response = client
@@ -1833,7 +1835,7 @@ pub async fn set_canary_split(route_path: &str, weight_pct: u8) -> Result<()> {
     if weight_pct == 0 {
         return abort_canary_rollout(route_path).await;
     }
-    let config = current_connection_config()?;
+    let config = require_connection()?;
     let client = build_http_client(&config)?;
     let url = build_endpoint_url(&config.url, ADMIN_CANARY_PATH)?;
     let payload = serde_json::json!({
