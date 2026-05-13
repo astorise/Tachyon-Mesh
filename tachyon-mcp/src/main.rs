@@ -619,6 +619,97 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                             "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"] }
                         }
                     }
+                },
+                {
+                    "name": "tachyon_deploy_function",
+                    "description": "Deploy a pre-compiled WASM artifact to the mesh. Reads the file from disk, uploads it as a named asset, and stages a workload configuration overlay. Use tachyon_seal_overlay to activate.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["function_name", "artifact_path"],
+                        "properties": {
+                            "function_name": { "type": "string", "description": "Logical name for the function, used as its route alias." },
+                            "artifact_path": { "type": "string", "description": "Absolute or relative path to the .wasm artifact on disk." },
+                            "memory_mb":   { "type": "integer", "default": 128, "minimum": 16, "description": "RAM budget for the function in MiB." },
+                            "gpu_vram_mb": { "type": "integer", "default": 0,   "minimum": 0,  "description": "Required VRAM in MiB (0 = CPU-only)." }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_list_functions",
+                    "description": "List all deployed functions (routes) in the active sealed manifest.",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "tachyon_delete_function",
+                    "description": "Remove a deployed function from the overlay configuration. Use tachyon_seal_overlay to persist the removal.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["function_name"],
+                        "properties": {
+                            "function_name": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_function_logs",
+                    "description": "Fetch recent stdout/stderr log lines for a specific deployed function, filtered by function name.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["function_name"],
+                        "properties": {
+                            "function_name": { "type": "string" },
+                            "lines": { "type": "integer", "default": 100, "minimum": 1, "maximum": 1000 }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_kv_get",
+                    "description": "Read a value from the distributed KV-Partition V2 store.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["namespace", "key"],
+                        "properties": {
+                            "namespace": { "type": "string", "description": "Partition namespace (e.g. 'agent-context')." },
+                            "key":       { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_kv_put",
+                    "description": "Write a key-value pair to the distributed KV-Partition V2 store.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["namespace", "key", "value"],
+                        "properties": {
+                            "namespace": { "type": "string" },
+                            "key":       { "type": "string" },
+                            "value":     { "type": "string", "description": "UTF-8 string value (JSON-stringified for structured data)." }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_kv_delete",
+                    "description": "Delete a key from the distributed KV-Partition V2 store.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["namespace", "key"],
+                        "properties": {
+                            "namespace": { "type": "string" },
+                            "key":       { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_canary_split",
+                    "description": "Adjust the live traffic-split weight for an active canary rollout. Set weight_pct to 0 to abort and roll back to the stable version.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path", "weight_pct"],
+                        "properties": {
+                            "route_path": { "type": "string", "description": "HTTP route path of the function under rollout." },
+                            "weight_pct": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Percentage of traffic to send to the canary version (0 = abort)." }
+                        }
+                    }
                 }
             ]
         }),
@@ -868,6 +959,152 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 ]
             }))
         }
+        // ── WASM function lifecycle ───────────────────────────────────────────
+        "tachyon_deploy_function" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let function_name = arguments
+                .get("function_name")
+                .and_then(Value::as_str)
+                .context("missing function_name")?;
+            let artifact_path = arguments
+                .get("artifact_path")
+                .and_then(Value::as_str)
+                .context("missing artifact_path")?;
+            let memory_mb = arguments
+                .get("memory_mb")
+                .and_then(Value::as_u64)
+                .unwrap_or(128);
+            let gpu_vram_mb = arguments
+                .get("gpu_vram_mb")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let wasm_bytes = tokio::fs::read(artifact_path)
+                .await
+                .with_context(|| format!("cannot read WASM artifact `{artifact_path}`"))?;
+            let result =
+                tachyon_client::deploy_function(function_name, wasm_bytes, memory_mb, gpu_vram_mb)
+                    .await?;
+            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result)? }] }))
+        }
+        "tachyon_list_functions" => {
+            let functions = tachyon_client::list_functions().await?;
+            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&functions)? }] }))
+        }
+        "tachyon_delete_function" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let function_name = arguments
+                .get("function_name")
+                .and_then(Value::as_str)
+                .context("missing function_name")?;
+            tachyon_client::delete_function(function_name).await?;
+            Ok(json!({ "content": [{ "type": "text", "text": format!("function `{function_name}` removed from overlay") }] }))
+        }
+        "tachyon_function_logs" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let function_name = arguments
+                .get("function_name")
+                .and_then(Value::as_str)
+                .context("missing function_name")?;
+            let lines = arguments
+                .get("lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .min(1_000) as usize;
+            let logs = tachyon_client::function_logs(function_name, lines).await?;
+            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&logs)? }] }))
+        }
+
+        // ── KV-Partition V2 ───────────────────────────────────────────────────
+        "tachyon_kv_get" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let namespace = arguments
+                .get("namespace")
+                .and_then(Value::as_str)
+                .context("missing namespace")?;
+            let key = arguments
+                .get("key")
+                .and_then(Value::as_str)
+                .context("missing key")?;
+            let value = tachyon_client::kv_get(namespace, key).await?;
+            let text = match value {
+                Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                None => "(key not found)".to_owned(),
+            };
+            Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+        }
+        "tachyon_kv_put" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let namespace = arguments
+                .get("namespace")
+                .and_then(Value::as_str)
+                .context("missing namespace")?;
+            let key = arguments
+                .get("key")
+                .and_then(Value::as_str)
+                .context("missing key")?;
+            let value = arguments
+                .get("value")
+                .and_then(Value::as_str)
+                .context("missing value")?;
+            tachyon_client::kv_put(namespace, key, value.as_bytes()).await?;
+            Ok(json!({ "content": [{ "type": "text", "text": format!("written {namespace}/{key}") }] }))
+        }
+        "tachyon_kv_delete" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let namespace = arguments
+                .get("namespace")
+                .and_then(Value::as_str)
+                .context("missing namespace")?;
+            let key = arguments
+                .get("key")
+                .and_then(Value::as_str)
+                .context("missing key")?;
+            tachyon_client::kv_delete(namespace, key).await?;
+            Ok(json!({ "content": [{ "type": "text", "text": format!("deleted {namespace}/{key}") }] }))
+        }
+
+        // ── Canary traffic split ──────────────────────────────────────────────
+        "tachyon_canary_split" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let weight_pct = arguments
+                .get("weight_pct")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(100) as u8;
+            tachyon_client::set_canary_split(route_path, weight_pct).await?;
+            let msg = if weight_pct == 0 {
+                format!("canary rollout for `{route_path}` aborted")
+            } else {
+                format!("canary weight for `{route_path}` set to {weight_pct}%")
+            };
+            Ok(json!({ "content": [{ "type": "text", "text": msg }] }))
+        }
+
         other => Err(anyhow::anyhow!("unsupported tool `{other}`")),
     }
 }

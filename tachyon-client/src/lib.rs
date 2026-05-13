@@ -25,6 +25,7 @@ const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
 const ADMIN_METRICS_PATH: &str = "/admin/metrics";
 const ADMIN_CANARY_PATH: &str = "/admin/canary";
 const ADMIN_SCHEMA_MANIFEST_PATH: &str = "/admin/schema/manifest";
+const ADMIN_KV_PATH: &str = "/admin/kv";
 const ADMIN_LOGS_PATH: &str = "/admin/logs";
 const ADMIN_SHADOW_DIFFS_PATH: &str = "/admin/shadow/diffs";
 const ADMIN_CHAOS_SCENARIOS_PATH: &str = "/admin/chaos/scenarios";
@@ -1689,6 +1690,165 @@ pub async fn abort_canary_rollout(route_path: &str) -> Result<()> {
     }
     let payload = serde_json::json!({ "routePath": route_path });
     post_admin_json::<serde_json::Value>(ADMIN_CANARY_PATH, &payload).await?;
+    Ok(())
+}
+
+// ── KV-Partition V2 admin operations ─────────────────────────────────────────
+
+/// Read a value from the KV-Partition V2 store.
+pub async fn kv_get(namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
+    if current_connection().is_none() {
+        return Ok(None);
+    }
+    let path = format!("{ADMIN_KV_PATH}/{namespace}/{key}");
+    let config = current_connection_config()?;
+    let client = build_http_client(&config)?;
+    let url = build_endpoint_url(&config.url, &path)?;
+    let response = client
+        .get(url)
+        .bearer_auth(&config.token)
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        anyhow::bail!("kv_get failed: HTTP {}", response.status());
+    }
+    Ok(Some(response.bytes().await?.to_vec()))
+}
+
+/// Write a value to the KV-Partition V2 store.
+pub async fn kv_put(namespace: &str, key: &str, value: &[u8]) -> Result<()> {
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+    let path = format!("{ADMIN_KV_PATH}/{namespace}/{key}");
+    let config = current_connection_config()?;
+    let client = build_http_client(&config)?;
+    let url = build_endpoint_url(&config.url, &path)?;
+    let response = client
+        .put(url)
+        .bearer_auth(&config.token)
+        .body(value.to_vec())
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("kv_put failed: HTTP {}", response.status());
+    }
+    Ok(())
+}
+
+/// Delete a key from the KV-Partition V2 store.
+pub async fn kv_delete(namespace: &str, key: &str) -> Result<()> {
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+    let path = format!("{ADMIN_KV_PATH}/{namespace}/{key}");
+    let config = current_connection_config()?;
+    let client = build_http_client(&config)?;
+    let url = build_endpoint_url(&config.url, &path)?;
+    let response = client
+        .delete(url)
+        .bearer_auth(&config.token)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("kv_delete failed: HTTP {}", response.status());
+    }
+    Ok(())
+}
+
+// ── WASM function lifecycle ───────────────────────────────────────────────────
+
+/// List deployed functions (routes) by reading the live mesh graph.
+pub async fn list_functions() -> Result<Vec<MeshRouteSummary>> {
+    if current_connection().is_none() {
+        return Ok(Vec::new());
+    }
+    let graph = get_mesh_graph().await?;
+    Ok(graph.routes)
+}
+
+/// Deploy a pre-compiled WASM artifact to the mesh.
+/// Uploads the bytes as a named asset, then stages a workload configuration
+/// overlay that the operator can seal and apply via `tachyon_seal_overlay`.
+pub async fn deploy_function(
+    function_name: &str,
+    wasm_bytes: Vec<u8>,
+    memory_mb: u64,
+    gpu_vram_mb: u64,
+) -> Result<serde_json::Value> {
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+    let asset_path = push_asset_bytes(function_name, &wasm_bytes).await?;
+    let payload = serde_json::json!({
+        "engine": "wasmtime",
+        "function_name": function_name,
+        "artifact_path": asset_path,
+        "memory_mb": memory_mb,
+        "gpu_vram_mb": gpu_vram_mb,
+    });
+    stage_configuration_overlay("workloads", payload).await?;
+    Ok(serde_json::json!({
+        "function_name": function_name,
+        "asset_path": asset_path,
+        "status": "staged",
+        "note": "Run tachyon_seal_overlay to activate the deployment"
+    }))
+}
+
+/// Remove a deployed function from the overlay.
+pub async fn delete_function(function_name: &str) -> Result<()> {
+    remove_overlay_resource(function_name).await
+}
+
+/// Fetch recent logs for a specific deployed function.
+/// Filters the global audit log by target/route containing `function_name`.
+pub async fn function_logs(function_name: &str, lines: usize) -> Result<Vec<LogLine>> {
+    if current_connection().is_none() {
+        return Ok(Vec::new());
+    }
+    let limit = lines.clamp(1, 1_000);
+    let params = [
+        ("lines", (limit * 4).to_string()),
+        ("target", function_name.to_owned()),
+    ];
+    let all: Vec<LogLine> = get_admin_json_with_query(ADMIN_LOGS_PATH, &params).await?;
+    Ok(all
+        .into_iter()
+        .filter(|l| l.target.contains(function_name) || l.message.contains(function_name))
+        .take(limit)
+        .collect())
+}
+
+/// Update the live traffic-split weight for a canary rollout on `route_path`.
+/// If `weight_pct` is 0 the rollout is aborted via the abort endpoint;
+/// otherwise the weight is updated directly via `PATCH /admin/canary`.
+pub async fn set_canary_split(route_path: &str, weight_pct: u8) -> Result<()> {
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+    if weight_pct == 0 {
+        return abort_canary_rollout(route_path).await;
+    }
+    let config = current_connection_config()?;
+    let client = build_http_client(&config)?;
+    let url = build_endpoint_url(&config.url, ADMIN_CANARY_PATH)?;
+    let payload = serde_json::json!({
+        "routePath": route_path,
+        "weightPct": weight_pct,
+    });
+    let response = client
+        .patch(url)
+        .bearer_auth(&config.token)
+        .json(&payload)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("set_canary_split failed: HTTP {}", response.status());
+    }
     Ok(())
 }
 
