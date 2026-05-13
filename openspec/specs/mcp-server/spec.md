@@ -179,3 +179,18 @@ A Rust integration test at `tachyon-mcp/tests/mcp_e2e_runner.rs` SHALL spawn the
 - **WHEN** `tools/list` is called
 - **THEN** `tachyon_hardware_status`, `tachyon_topology_snapshot`, and `tachyon_dryrun_manifest` are in the tools array
 - **AND** `tachyon_dryrun_manifest.inputSchema.properties` is a non-empty object (dynamic manifest schema injected)
+
+### Requirement: tachyon_hardware_status MUST include GPU topology in its response
+The `tachyon_hardware_status` MCP tool SHALL return a JSON payload that includes a `gpus` array. Each entry SHALL carry `id`, `model`, `vramTotalMb`, `vramUsedMb`, and `computeUtilization`. When no GPU management library is linked, VRAM values SHALL default to 0 rather than being omitted.
+
+#### Scenario: Response includes gpus array
+- **GIVEN** the cluster node has `CUDA_VISIBLE_DEVICES=0` set
+- **WHEN** an agent calls `tachyon_hardware_status`
+- **THEN** the response JSON contains a non-empty `gpus` array with an entry for `id: "cuda:0"`
+- **AND** the entry has `vramTotalMb` and `vramUsedMb` fields (may be 0)
+
+#### Scenario: Response includes gpus array even without GPU
+- **GIVEN** no CUDA or HIP environment variables are set
+- **WHEN** an agent calls `tachyon_hardware_status`
+- **THEN** the response JSON contains `"gpus": []`
+- **AND** `accelerators` contains only `"cpu"`

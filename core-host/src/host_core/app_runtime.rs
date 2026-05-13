@@ -281,10 +281,12 @@ pub(crate) async fn admin_manifest_schema_handler() -> axum::Json<serde_json::Va
                         "resourcePolicy": {
                             "type": ["object", "null"],
                             "properties": {
-                                "minRamGb":          { "type": ["integer", "null"] },
-                                "minRamMb":          { "type": ["integer", "null"] },
-                                "minVramMb":         { "type": ["integer", "null"] },
-                                "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"] }
+                                "minRamGb":          { "type": ["integer", "null"], "description": "Minimum host RAM required in GiB." },
+                                "minRamMb":          { "type": ["integer", "null"], "description": "Minimum host RAM required in MiB (takes precedence over minRamGb when both are set)." },
+                                "minVramMb":         { "type": ["integer", "null"], "description": "Minimum GPU VRAM required in MiB. Alias for vram_mb." },
+                                "vramMb":            { "type": ["integer", "null"], "description": "GPU VRAM reservation for the FaaS workload in MiB. The scheduler will only place the function on nodes where free VRAM ≥ vramMb." },
+                                "gpuAffinity":       { "type": ["string", "null"], "description": "Optional GPU device affinity selector (e.g. 'cuda:0', 'hip:1', or a model substring like 'RTX 4090'). When set, the scheduler restricts placement to matching GPUs." },
+                                "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"], "description": "How the host handles admission when the resource constraints cannot be met." }
                             }
                         },
                         "canary": {

@@ -503,6 +503,12 @@ pub(crate) struct ResourcePolicy {
     pub(crate) min_ram_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) min_vram_mb: Option<u64>,
+    /// GPU VRAM reservation for the workload in MiB (scheduler-enforced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vram_mb: Option<u64>,
+    /// Optional GPU device affinity selector (e.g. "cuda:0", "hip:1", or a model substring).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gpu_affinity: Option<String>,
     #[serde(default, skip_serializing_if = "is_default_admission_strategy")]
     pub(crate) admission_strategy: AdmissionStrategy,
 }
