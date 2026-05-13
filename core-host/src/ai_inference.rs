@@ -1472,11 +1472,7 @@ impl LayerWiseMappedModel {
                 .with_context(|| format!("failed to mmap `{}`", path.display()))?
         };
         let map_len = mmap.len();
-        let bytes_per_layer = if num_layers > 0 {
-            map_len / num_layers
-        } else {
-            map_len
-        };
+        let bytes_per_layer = map_len.checked_div(num_layers).unwrap_or(map_len);
         let base_ptr = mmap.as_ptr();
         Ok(Self {
             _mmap: mmap,
@@ -1587,7 +1583,7 @@ impl PrefillBatch {
                 .unwrap_or_else(|_| vec![vec![0.0f32; self.hidden_dim]; self.prompt_len]);
             kv_cpu_cache.push(KvCacheSlice {
                 layer_idx,
-                keys: kv_values.iter().map(|row| row.clone()).collect(),
+                keys: kv_values.iter().cloned().collect(),
                 values: kv_values,
             });
 
@@ -1702,7 +1698,7 @@ impl LayerPipeline {
         &mut self,
         loader: &LayerWiseMappedModel,
         mut hidden_states: CandleTensor,
-        kv_cache: &mut Vec<KvCacheSlice>,
+        kv_cache: &mut [KvCacheSlice],
         max_tokens: usize,
     ) -> Result<Vec<f32>> {
         let mut output_logits: Vec<f32> = Vec::with_capacity(max_tokens);
@@ -2369,8 +2365,8 @@ mod tests {
     #[test]
     fn layer_ring_buffer_push_get_evict() {
         let mut buf = LayerRingBuffer::new(3);
-        let t0 = CandleTensor::zeros((4,), DType::F32, &Device::Cpu).unwrap();
-        let t1 = CandleTensor::ones((4,), DType::F32, &Device::Cpu).unwrap();
+        let t0 = CandleTensor::zeros((4,), DType::F32, &Device::Cpu).expect("create zeros tensor");
+        let t1 = CandleTensor::ones((4,), DType::F32, &Device::Cpu).expect("create ones tensor");
         buf.push(t0);
         buf.push(t1);
         assert!(buf.get(0).is_some());
