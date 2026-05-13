@@ -54,6 +54,63 @@ export abstract class TachyonConfigDashboard extends HTMLElement {
     }
   }
 
+  /**
+   * Wraps an async data-fetch task with skeleton loading UI.
+   *
+   * While `task` is pending the shadow root (or the element matched by
+   * `containerSelector`) shows shimmer skeleton blocks.  On success the result
+   * is returned; on failure `handlePanelError` is called, which fires an
+   * actionable error toast with an inline Retry button.
+   */
+  protected async withLoadingState<T>(
+    task: () => Promise<T>,
+    containerSelector?: string,
+  ): Promise<T | undefined> {
+    const container: Element | null = containerSelector
+      ? this.root.querySelector(containerSelector)
+      : this.root.firstElementChild;
+
+    if (container) {
+      container.innerHTML = `
+        <div class="p-6 w-full space-y-3" aria-busy="true" aria-label="Loading…">
+          <div class="skeleton-text w-1/3"></div>
+          <div class="skeleton-block"></div>
+          <div class="skeleton-text w-1/2"></div>
+          <div class="skeleton-text w-2/3 mt-4"></div>
+        </div>
+      `;
+    }
+
+    try {
+      return await task();
+    } catch (error) {
+      this.handlePanelError(error, task);
+      return undefined;
+    }
+  }
+
+  /**
+   * Clears the skeleton and dispatches an actionable error toast.
+   * If `retryTask` is provided the toast includes a "Retry" button that
+   * re-invokes `withLoadingState` from scratch.
+   */
+  protected handlePanelError(error: unknown, retryTask?: () => Promise<unknown>): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const action = retryTask
+      ? {
+          label: "Retry",
+          onClick: () => {
+            void this.withLoadingState(retryTask);
+          },
+        }
+      : undefined;
+    window.dispatchEvent(
+      new CustomEvent("toast", {
+        detail: { type: "error", message, action },
+      }),
+    );
+  }
+
   protected animateEntrance(): void {
     const panels = this.root.querySelectorAll<HTMLElement>("[data-stagger-panel]");
     if (panels.length === 0) {

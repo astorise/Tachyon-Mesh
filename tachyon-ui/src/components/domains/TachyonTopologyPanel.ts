@@ -724,7 +724,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
   }
 
   private async loadLiveTopology(): Promise<void> {
-    try {
+    await this.withLoadingState(async () => {
       const graph = await invoke<{
         nodes: Array<{ id: string; nodeType: string; label: string; x: number; y: number; data: Record<string, string> }>;
         edges: Array<{ id: string; from: string; to: string }>;
@@ -747,9 +747,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
       this.render();
       this.bindEvents();
       this.pushGraphToCanvas();
-    } catch {
-      // offline or Tauri not available — keep sample nodes
-    }
+    });
   }
 
   private render(): void {

@@ -52,7 +52,7 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
     this.status = t("overview.loading");
     this.render(this.metrics, this.status);
     this.animateEntrance();
-    try {
+    await this.withLoadingState(async () => {
       const snapshot = await invoke<MeshGraphSnapshot>("get_mesh_graph");
       let runtime: RuntimeMetrics | null = null;
       try {
@@ -65,13 +65,7 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
       this.render(this.metrics, this.status);
       this.animateEntrance();
       this.animateCounters();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.metrics = this.initialMetrics();
-      this.status = t("overview.failed");
-      this.render(this.metrics, this.status);
-      window.dispatchEvent(new CustomEvent("app:notify", { detail: { type: "error", message: `${t("overview.failedToast")}: ${message}` } }));
-    }
+    });
   }
 
   disconnectedCallback(): void {

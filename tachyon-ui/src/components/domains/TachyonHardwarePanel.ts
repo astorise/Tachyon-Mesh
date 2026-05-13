@@ -1,15 +1,27 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
+type HardwareStatus = {
+  totalRamMb: number;
+  availableRamMb: number;
+  accelerators: string[];
+};
+
 export class TachyonHardwarePanel extends TachyonConfigDashboard {
+  private liveStatus: HardwareStatus | null = null;
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
 
-  connectedCallback(): void {
+  async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindForm();
     this.animateEntrance();
+    await this.withLoadingState(async () => {
+      this.liveStatus = await invoke<HardwareStatus>("get_hardware_status");
+      this.render();
+      this.bindForm();
+    });
   }
 
   disconnectedCallback(): void {
@@ -19,7 +31,8 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
   private render(): void {
     this.renderTemplate(`
       <section class="p-6 space-y-6 text-slate-300">
-        <div data-stagger-panel class="border-l-4 border-cyan-500 pl-4">
+        <div data-stagger-panel class="border-l-4 border-cyan-500 pl-4 flex flex-col gap-1">
+          ${this.liveStatus ? `<span class="text-[10px] font-mono text-emerald-400/80">RAM: ${this.liveStatus.availableRamMb} / ${this.liveStatus.totalRamMb} MiB free · GPU: ${this.liveStatus.accelerators.join(", ") || "—"}</span>` : ""}
           <h2 class="text-2xl font-bold text-slate-100">${t("hardware.title")}</h2>
           <p class="text-sm font-mono text-slate-400">${t("hardware.subtitle")}</p>
         </div>
