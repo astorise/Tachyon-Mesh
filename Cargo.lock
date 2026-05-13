@@ -7945,6 +7945,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-faas-openapi"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "system-faas-otel"
 version = "0.1.0"
 dependencies = [

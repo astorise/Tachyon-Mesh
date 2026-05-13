@@ -1,0 +1,78 @@
+name: E2E K8s Operator
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "manifests/**"
+      - "core-host/**"
+      - "Dockerfile"
+  pull_request:
+    paths:
+      - "manifests/**"
+      - "Dockerfile"
+
+permissions:
+  contents: read
+
+jobs:
+  test-k8s-deployment:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential libssl-dev cmake nasm
+
+      - name: Build core-host release binary
+        run: cargo build --release --bin core-host
+
+      - name: Build local Docker image
+        run: docker build -t tachyon-mesh:local .
+
+      - name: Set up k3d cluster
+        uses: AbsaOSS/k3d-action@v2
+        with:
+          cluster-name: tachyon-test
+          args: >-
+            --agents 1
+            --no-lb
+            --k3s-arg "--no-deploy=traefik@server:*"
+
+      - name: Import local image into k3d
+        run: k3d image import tachyon-mesh:local -c tachyon-test
+
+      - name: Patch manifest to use local image
+        run: |
+          sed 's|ghcr.io/astorise/tachyon-mesh:latest|tachyon-mesh:local|g; s|imagePullPolicy: Always|imagePullPolicy: Never|g' \
+            manifests/deploy.yaml > /tmp/deploy-local.yaml
+
+      - name: Apply deploy manifest
+        run: kubectl apply -f /tmp/deploy-local.yaml
+
+      - name: Wait for tachyon-host pod readiness
+        run: |
+          kubectl wait --for=condition=ready pod \
+            -l app=tachyon-host \
+            --timeout=120s
+
+      - name: Basic API healthcheck
+        run: |
+          kubectl port-forward svc/tachyon-service 8080:8080 &
+          PF_PID=$!
+          sleep 4
+          curl -f --retry 5 --retry-delay 2 http://localhost:8080/admin/status && echo "healthcheck passed"
+          kill $PF_PID 2>/dev/null || true
