@@ -138,7 +138,7 @@ export class TachyonAppShell extends HTMLElement {
     const shell = this.root.getElementById("shell");
     const sidebar = this.root.getElementById("shell-sidebar");
     const header = this.root.getElementById("shell-header");
-    const content = this.root.getElementById("router-view");
+    const content = this.root.getElementById("main-content");
     const user = this.root.getElementById("shell-user");
     if (!shell || !sidebar || !header || !content || !user) {
       return;
@@ -172,25 +172,26 @@ export class TachyonAppShell extends HTMLElement {
       .join("");
     this.root.innerHTML = `
       <section id="shell" class="hidden fixed inset-0 z-30 h-screen w-screen bg-slate-950 text-slate-300">
-        <aside id="shell-sidebar" class="w-64 bg-slate-900 border-r border-slate-800 flex flex-col opacity-0">
+        <a href="#main-content" class="skip-nav">${t("shell.skip-nav")}</a>
+        <aside id="shell-sidebar" class="w-64 bg-slate-900 border-r border-slate-800 flex flex-col opacity-0" aria-label="${t("shell.sidebar-label")}">
           <div class="h-16 flex items-center px-6 border-b border-slate-800">
-            <div class="w-3 h-3 bg-cyan-400 rounded-full mr-3 shadow-[0_0_10px_rgba(34,211,238,0.8)]"></div>
+            <div class="w-3 h-3 bg-cyan-400 rounded-full mr-3 shadow-[0_0_10px_rgba(34,211,238,0.8)]" aria-hidden="true"></div>
             <h1 class="text-xl font-bold text-white tracking-wider">TACHYON<span class="text-cyan-400">MESH</span></h1>
           </div>
-          <nav class="flex-1 p-4 space-y-2">
+          <nav class="flex-1 p-4 space-y-2" aria-label="${t("shell.nav-label")}">
             <button data-route="dashboard" class="nav-link w-full text-left block px-4 py-2 rounded-md bg-slate-800 text-cyan-400 font-medium transition-colors">${t("nav.dashboard")}</button>
             ${configLinks}
           </nav>
-          <div class="p-4 border-t border-slate-800 text-xs text-slate-500">${t("shell.version")}</div>
+          <div class="p-4 border-t border-slate-800 text-xs text-slate-500" aria-hidden="true">${t("shell.version")}</div>
         </aside>
         <div class="flex min-w-0 flex-1 flex-col">
-          <header id="shell-header" class="h-16 border-b border-slate-800 flex items-center justify-between px-8 bg-slate-900/50 backdrop-blur-md opacity-0">
+          <header id="shell-header" class="h-16 border-b border-slate-800 flex items-center justify-between px-8 bg-slate-900/50 backdrop-blur-md opacity-0" aria-label="${t("shell.header-label")}">
             <div>
               <h2 class="text-lg font-semibold text-white">${t("shell.title")}</h2>
               <p class="text-xs text-slate-500">${t("shell.subtitle")}</p>
             </div>
             <div class="flex items-center gap-3">
-              <button id="btn-seal-apply" type="button" class="${this.requiresSeal ? "inline-flex" : "hidden"} items-center rounded border border-amber-400/60 bg-amber-400/15 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-amber-200 shadow-[0_0_18px_rgba(251,191,36,0.24)] transition-colors hover:bg-amber-400/25 disabled:cursor-wait disabled:opacity-70">
+              <button id="btn-seal-apply" type="button" aria-live="polite" class="${this.requiresSeal ? "inline-flex" : "hidden"} items-center rounded border border-amber-400/60 bg-amber-400/15 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-amber-200 shadow-[0_0_18px_rgba(251,191,36,0.24)] transition-colors hover:bg-amber-400/25 disabled:cursor-wait disabled:opacity-70">
                 ${this.applyingSeal ? "Applying..." : "Pending Changes: Seal & Apply"}
               </button>
               <label class="flex items-center gap-2 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-400">
@@ -201,11 +202,11 @@ export class TachyonAppShell extends HTMLElement {
                 </select>
               </label>
               <button id="btn-help-tour" type="button" class="inline-flex h-8 w-8 items-center justify-center rounded border border-cyan-500/40 bg-cyan-500/10 font-mono text-sm font-semibold text-cyan-300 hover:bg-cyan-500/20" title="${t("shell.help")}" aria-label="${t("shell.help")}">?</button>
-              <span class="text-xs uppercase tracking-[0.2em] text-slate-500">${t("shell.operator")}</span>
-              <span id="shell-user" class="text-sm text-cyan-300 font-mono">${this.activeUser}</span>
+              <span class="text-xs uppercase tracking-[0.2em] text-slate-500" aria-hidden="true">${t("shell.operator")}</span>
+              <span id="shell-user" class="text-sm text-cyan-300 font-mono" aria-label="${t("shell.user-label")}: ${this.activeUser}">${this.activeUser}</span>
             </div>
           </header>
-          <main id="router-view" class="min-h-0 flex-1 overflow-y-auto p-8 opacity-0">
+          <main id="main-content" tabindex="-1" class="min-h-0 flex-1 overflow-y-auto p-8 opacity-0" aria-label="${t("shell.main-label")}">
             <section data-route-panel="dashboard" class="route-panel space-y-6">
               <div class="grid grid-cols-1 gap-6 md:grid-cols-3">
                 <div class="rounded-xl border border-slate-800 bg-slate-900 p-6">
@@ -277,7 +278,7 @@ export class TachyonAppShell extends HTMLElement {
       return;
     }
 
-    const routerView = this.root.getElementById("router-view");
+    const routerView = this.root.getElementById("main-content");
     if (!routerView) {
       return;
     }
@@ -318,7 +319,7 @@ export class TachyonAppShell extends HTMLElement {
     const shell = this.root.getElementById("shell");
     const sidebar = this.root.getElementById("shell-sidebar");
     const header = this.root.getElementById("shell-header");
-    const content = this.root.getElementById("router-view");
+    const content = this.root.getElementById("main-content");
     const user = this.root.getElementById("shell-user");
     shell?.classList.remove("hidden");
     shell?.classList.add("flex");

@@ -33,15 +33,16 @@ export class TachyonMfaPrompt extends HTMLElement {
 
   private render(): void {
     this.root.innerHTML = `
-      <dialog id="mfa-dialog" class="bg-transparent p-0 backdrop:bg-slate-950/80 backdrop:backdrop-blur-sm open:flex fixed inset-0 z-[100] h-screen w-screen items-center justify-center">
+      <dialog id="mfa-dialog" role="dialog" aria-modal="true" aria-labelledby="mfa-title" aria-describedby="mfa-desc" class="bg-transparent p-0 backdrop:bg-slate-950/80 backdrop:backdrop-blur-sm open:flex fixed inset-0 z-[100] h-screen w-screen items-center justify-center">
         <form id="mfa-form" class="w-full max-w-sm rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-2xl">
           <div class="mb-2 flex items-center gap-3 text-amber-500">
-            <span class="inline-flex h-6 w-6 items-center justify-center rounded border border-amber-500/50 text-sm">!</span>
-            <h3 class="text-lg font-medium">${t("mfa.title")}</h3>
+            <span class="inline-flex h-6 w-6 items-center justify-center rounded border border-amber-500/50 text-sm" aria-hidden="true">!</span>
+            <h3 id="mfa-title" class="text-lg font-medium">${t("mfa.title")}</h3>
           </div>
-          <p class="mb-4 text-sm text-slate-400">${t("mfa.body")}</p>
-          <input type="text" id="mfa-input" placeholder="000000" maxlength="6" pattern="[0-9]{6}" class="mb-6 w-full rounded-md border border-slate-700 bg-slate-950 px-4 py-3 text-center text-2xl font-mono tracking-[0.5em] text-cyan-300 focus:border-cyan-500 focus:outline-none" required autocomplete="off">
-          <div id="mfa-error" class="mb-4 hidden rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"></div>
+          <p id="mfa-desc" class="mb-4 text-sm text-slate-400">${t("mfa.body")}</p>
+          <label for="mfa-input" class="sr-only">${t("mfa.code-label")}</label>
+          <input type="text" id="mfa-input" placeholder="000000" maxlength="6" pattern="[0-9]{6}" aria-required="true" aria-label="${t("mfa.code-label")}" aria-describedby="mfa-error" autocomplete="one-time-code" inputmode="numeric" class="mb-6 w-full rounded-md border border-slate-700 bg-slate-950 px-4 py-3 text-center text-2xl font-mono tracking-[0.5em] text-cyan-300 focus:border-cyan-500 focus:outline-none" required>
+          <div id="mfa-error" role="alert" class="mb-4 hidden rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"></div>
           <div class="flex justify-end gap-3">
             <button type="button" id="mfa-cancel" class="px-4 py-2 text-sm text-slate-400 hover:text-white">${t("mfa.cancel")}</button>
             <button type="submit" class="rounded-md border border-cyan-500/50 bg-cyan-500/20 px-4 py-2 text-sm text-cyan-300">${t("mfa.verify")}</button>

@@ -75,3 +75,43 @@ Every domain panel that performs a remote data fetch SHALL display a shimmer ske
 - **AND** clicking the button invokes `action.onClick` then dismisses the toast
 - **AND** the toast remains visible for 8 seconds instead of the default 4
 
+### Requirement: Keyboard accessibility — focus visibility
+Every interactive element (button, link, input, select) SHALL display a visible `:focus-visible` outline.
+
+#### Scenario: Keyboard user reaches a button
+- **WHEN** a user navigates to any interactive element via keyboard
+- **THEN** a 2px blue ring appears around the element with a slate-900 offset
+
+### Requirement: Semantic layout and skip navigation
+The app shell SHALL expose landmark roles and a skip-navigation link.
+
+#### Scenario: Screen reader user lands on the application
+- **WHEN** the application shell renders
+- **THEN** `<aside>`, `<nav>`, `<header>`, and `<main>` elements are present with `aria-label` attributes
+- **AND** a skip link targeting `#main-content` is the first focusable element
+- **AND** `<main id="main-content" tabindex="-1">` accepts programmatic focus
+
+### Requirement: Labelled form inputs
+Every form `<input>` SHALL have an associated label visible to screen readers.
+
+#### Scenario: Screen reader user fills the login form
+- **GIVEN** TachyonIAM renders in login mode
+- **WHEN** the user navigates to any input field
+- **THEN** the input has an associated `<label class="sr-only">` and `aria-required="true"`
+
+### Requirement: ARIA live region for connection status
+The NetworkStatus component SHALL announce connection state changes via an ARIA live region.
+
+#### Scenario: Connection drops
+- **WHEN** the network status changes to "Disconnected"
+- **THEN** the `role="status"` / `aria-live="polite"` container announces the change without interrupting the user
+
+### Requirement: Modal dialog accessibility
+Overlay dialogs SHALL carry `role="dialog"`, `aria-modal="true"`, a labelled heading, and a keyboard focus trap.
+
+#### Scenario: Conflict modal opens
+- **WHEN** TachyonBundleConflictModal renders with conflicts
+- **THEN** the backdrop has `role="dialog"` and `aria-modal="true"`
+- **AND** focus is moved inside the modal
+- **AND** Tab/Shift+Tab cycles only through the modal's focusable elements
+

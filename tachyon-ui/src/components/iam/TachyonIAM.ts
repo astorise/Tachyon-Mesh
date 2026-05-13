@@ -75,11 +75,14 @@ export class TachyonIAM extends HTMLElement {
           <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-600 to-blue-500"></div>
           <h2 class="text-white text-2xl font-bold mb-1">${t("iam.title")}</h2>
           <p class="text-slate-400 text-sm mb-6">${t("iam.subtitle")}</p>
-          <form id="auth-step-login" class="auth-step space-y-3">
-            <input type="text" id="auth-url" placeholder="${t("iam.placeholder.url")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
-            <input type="text" id="auth-username" placeholder="${t("iam.placeholder.username")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+          <form id="auth-step-login" class="auth-step space-y-3" aria-label="${t("iam.login.form-label")}">
+            <label for="auth-url" class="sr-only">${t("iam.placeholder.url")}</label>
+            <input type="text" id="auth-url" placeholder="${t("iam.placeholder.url")}" aria-required="true" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
+            <label for="auth-username" class="sr-only">${t("iam.placeholder.username")}</label>
+            <input type="text" id="auth-username" placeholder="${t("iam.placeholder.username")}" aria-required="true" autocomplete="username" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
             <div class="flex gap-2">
-              <input type="password" id="auth-password" placeholder="${t("iam.placeholder.password")}" class="min-w-0 flex-1 bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
+              <label for="auth-password" class="sr-only">${t("iam.placeholder.password")}</label>
+              <input type="password" id="auth-password" placeholder="${t("iam.placeholder.password")}" aria-required="true" autocomplete="current-password" class="min-w-0 flex-1 bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm" />
               <button type="button" id="btn-toggle-login-password" class="rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm text-slate-300">${t("iam.password.show")}</button>
             </div>
             <label class="flex items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-xs text-slate-300">
@@ -97,15 +100,18 @@ export class TachyonIAM extends HTMLElement {
               <button type="button" id="btn-open-signup" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">${t("iam.register")}</button>
             </div>
           </form>
-          <form id="auth-step-mfa" class="auth-step hidden space-y-4">
-            <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">${t("iam.mfa.prompt")}</div>
-            <input type="text" id="auth-mfa-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
+          <form id="auth-step-mfa" class="auth-step hidden space-y-4" aria-label="${t("iam.mfa.form-label")}">
+            <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200" role="status">${t("iam.mfa.prompt")}</div>
+            <label for="auth-mfa-code" class="sr-only">${t("iam.mfa.code-label")}</label>
+            <input type="text" id="auth-mfa-code" placeholder="000000" maxlength="6" aria-required="true" aria-label="${t("iam.mfa.code-label")}" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
             <button id="btn-mfa-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">${t("iam.mfa.verify")}</button>
           </form>
-          <form id="auth-step-signup-token" class="auth-step hidden space-y-4">
+          <form id="auth-step-signup-token" class="auth-step hidden space-y-4" aria-label="${t("iam.signup.form-label")}">
             <div class="rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-200">${t("iam.signup.intro")}</div>
-            <input type="text" id="signup-auth-url" placeholder="${t("iam.placeholder.url")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
-            <input type="password" id="signup-token" placeholder="${t("iam.placeholder.invite")}" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
+            <label for="signup-auth-url" class="sr-only">${t("iam.placeholder.url")}</label>
+            <input type="text" id="signup-auth-url" placeholder="${t("iam.placeholder.url")}" aria-required="true" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
+            <label for="signup-token" class="sr-only">${t("iam.placeholder.invite")}</label>
+            <input type="password" id="signup-token" placeholder="${t("iam.placeholder.invite")}" aria-required="true" class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
             <div class="grid gap-3 md:grid-cols-2">
               <button type="button" id="btn-signup-token-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">${t("iam.signup.back-to-login")}</button>
               <button id="btn-signup-token-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">${t("iam.signup.validate-invite")}</button>
