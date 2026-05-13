@@ -122,6 +122,7 @@ pub(crate) static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInfere
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub(crate) enum DeploymentStrategy {
     #[default]
     Rolling,
@@ -174,6 +175,7 @@ pub(crate) struct CanaryRolloutState {
     pub(crate) stop_tx: tokio::sync::watch::Sender<bool>,
 }
 
+#[allow(clippy::type_complexity)]
 pub(crate) static CANARY_ROLLOUTS: OnceLock<Arc<Mutex<HashMap<String, Arc<CanaryRolloutState>>>>> =
     OnceLock::new();
 

@@ -815,6 +815,7 @@ impl CoreStore {
             .context("kv_partition_delete: failed to commit")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn kv_partition_batch_set(
         &self,
         table_name: &str,
@@ -841,6 +842,7 @@ impl CoreStore {
             .context("kv_partition_batch_set: failed to commit")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn kv_partition_get_range(
         &self,
         table_name: &str,

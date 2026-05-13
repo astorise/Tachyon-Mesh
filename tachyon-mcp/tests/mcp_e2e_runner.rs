@@ -13,11 +13,11 @@ fn mcp_binary() -> std::path::PathBuf {
     // Prefer a pre-built release binary; fall back to the debug build.
     let release = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .unwrap()
+        .expect("CARGO_MANIFEST_DIR has a parent directory")
         .join("target/release/tachyon-mcp");
     let debug = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .unwrap()
+        .expect("CARGO_MANIFEST_DIR has a parent directory")
         .join("target/debug/tachyon-mcp");
 
     #[cfg(target_os = "windows")]
@@ -226,7 +226,8 @@ fn test_tools_list_against_live_cluster() {
         &mut stdout_reader,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     );
-    let resp: serde_json::Value = serde_json::from_str(&resp_raw).unwrap();
+    let resp: serde_json::Value =
+        serde_json::from_str(&resp_raw).expect("tools/list response is valid JSON");
     let tools = resp["result"]["tools"]
         .as_array()
         .expect("tools/list succeeded");
@@ -260,7 +261,8 @@ fn test_tools_list_against_live_cluster() {
         &mut stdout_reader,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tachyon_hardware_status","arguments":{}}}"#,
     );
-    let hw: serde_json::Value = serde_json::from_str(&hw_raw).unwrap();
+    let hw: serde_json::Value =
+        serde_json::from_str(&hw_raw).expect("hardware status response is valid JSON");
     if let Some(err) = hw["error"].as_object() {
         let code = err["code"].as_i64().unwrap_or(0);
         assert_ne!(

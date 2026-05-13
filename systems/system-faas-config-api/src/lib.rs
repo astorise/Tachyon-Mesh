@@ -234,7 +234,7 @@ pub fn validate_manifest_payload(payload: &Value) -> DryRunResult {
             for (i, route) in routes.iter().enumerate() {
                 if let Some(route_obj) = route.as_object() {
                     for field in &["path", "version"] {
-                        if route_obj.get(*field).map_or(true, |v| !v.is_string()) {
+                        if route_obj.get(*field).is_none_or(|v| !v.is_string()) {
                             errors.push(ValidationError {
                                 path: format!("/routes/{i}/{field}"),
                                 message: format!("route `{field}` must be a non-empty string"),
@@ -249,7 +249,7 @@ pub fn validate_manifest_payload(payload: &Value) -> DryRunResult {
                     }
                     // maxConcurrency must be a positive integer if present.
                     if let Some(v) = route_obj.get("maxConcurrency") {
-                        if v.as_u64().map_or(true, |n| n == 0) {
+                        if v.as_u64().is_none_or(|n| n == 0) {
                             errors.push(ValidationError {
                                 path: format!("/routes/{i}/maxConcurrency"),
                                 message: "`maxConcurrency` must be a positive integer".to_owned(),

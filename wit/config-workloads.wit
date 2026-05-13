@@ -30,7 +30,7 @@ interface config-workloads {
     record canary-config {
         step-weight: u32,
         interval-secs: u64,
-        max-error-rate: float32,
+        max-error-rate: f32,
     }
 
     record workload-spec {
