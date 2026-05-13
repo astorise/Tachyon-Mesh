@@ -128,6 +128,19 @@ The sidebar navigation SHALL be extracted into `TachyonAppShellNav` (`tachyon-ap
 - **THEN** a `shell:navigate` CustomEvent bubbles with `detail.route` matching the link's `data-route`
 - **AND** `window.location.hash` is updated to the same route
 
+### Requirement: Playwright E2E tests MUST cover the critical auth-to-apply path
+The `tachyon-ui` package SHALL include a Playwright test suite under `e2e/` that covers: (1) the credentials form rendering inside `auth-step-credentials` shadow DOM; (2) the app shell visibility after the `iam:authenticated` event; (3) the seal button visibility toggle on `config:staged`.
+
+#### Scenario: Playwright locates shadow DOM inputs
+- **GIVEN** Playwright navigates to the Vite dev server at port 1420
+- **WHEN** the test resolves `tachyon-iam > auth-step-credentials > #cred-url`
+- **THEN** the input is found and visible
+
+#### Scenario: Seal button toggles on config:staged
+- **GIVEN** the app shell is visible after a synthetic `iam:authenticated` event
+- **WHEN** `config:staged` is dispatched on the window
+- **THEN** `#btn-seal-apply` loses the `hidden` class
+
 ### Requirement: AppShell modal overlays MUST be managed by a standalone Web Component
 All z-stack overlays (toast manager, guided tour, bundle conflict modal) SHALL be owned by `TachyonAppShellModalRoot` (`tachyon-app-shell-modal-root`). It SHALL listen to the `topology:conflict` window event and expose `openConflictModal`, `startTour`, and `startTourIfFirstVisit`.
 
