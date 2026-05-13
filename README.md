@@ -35,27 +35,36 @@ Tachyon is built on three core layers:
 ## 🚀 Quick Start
 
 ### Prerequisites
-* Rust (latest stable)
-* Node.js & npm (for the UI)
-* WASM Target: `rustup target add wasm32-wasip2`
+* Rust (latest stable) — install from [rustup.rs](https://rustup.rs)
+* Node.js & npm — install from [nodejs.org](https://nodejs.org)
 
-### 1. Clone and Build
+### One-Command Bootstrap
+
 ```bash
 git clone https://github.com/astorise/tachyon-mesh.git
 cd tachyon-mesh
-cargo build --release
+./scripts/setup.sh
 ```
 
-### 2. Run the Core-Host
+The script verifies prerequisites, installs WASM targets, builds all binaries and FaaS guests, installs UI dependencies, runs cross-layer validation, and prints the exact commands and MCP config snippet you need.
+
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/astorise/tachyon-mesh.git
+cd tachyon-mesh
+.\scripts\setup.ps1
+```
+
+Optional flags: `--skip-guests` / `-SkipGuests` to skip the FaaS guest build (faster iteration), `--skip-ui` / `-SkipUI` to skip npm install.
+
+### After Setup
+
 ```bash
+# Terminal 1 — start the mesh
 ./target/release/core-host
-```
 
-### 3. Launch Tachyon-UI (Studio)
-```bash
-cd tachyon-ui
-npm install
-npm run tauri dev
+# Terminal 2 — launch the operator UI
+cd tachyon-ui && npm run tauri dev
 ```
 
 ---
