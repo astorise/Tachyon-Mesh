@@ -8,6 +8,84 @@ on:
       - "v*"
 
 jobs:
+  # ── Server-side binary tarballs (core-host + tachyon-mcp) ────────────────────
+  # Published only on version tags; used by scripts/get-tachyon.sh.
+  publish-server-binaries:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            os_name: linux
+            arch: x86_64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            os_name: linux
+            arch: aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            os_name: darwin
+            arch: x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            os_name: darwin
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (aarch64 Linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Linux system deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev cmake nasm
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build core-host and tachyon-mcp
+        run: |
+          cargo build --release --bin core-host --bin tachyon-mcp --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          OS="${{ matrix.os_name }}"
+          ARCH="${{ matrix.arch }}"
+          TARBALL="tachyon-mesh-${VERSION}-${OS}-${ARCH}.tar.gz"
+          BINDIR="target/${{ matrix.target }}/release"
+          tar -czf "${TARBALL}" \
+            -C "${BINDIR}" core-host tachyon-mcp \
+            --transform "s|^|tachyon-mesh-${VERSION}/|" 2>/dev/null || \
+          tar -czf "${TARBALL}" -C "${BINDIR}" core-host tachyon-mcp
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+
+      - name: Upload tarball to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TARBALL }}
+
   publish-tauri:
     permissions:
       contents: write
