@@ -51,3 +51,27 @@ Tachyon UI SHALL provide a component registry that maps sidebar route slugs to c
 - **THEN** the App Shell mounts the registered component in `#router-view`
 - **AND** unknown route slugs are handled without throwing.
 
+### Requirement: Skeleton loading states
+Every domain panel that performs a remote data fetch SHALL display a shimmer skeleton while the fetch is pending.
+
+#### Scenario: Panel displays skeleton during data load
+- **GIVEN** a domain panel is mounted and its async fetch has not yet resolved
+- **WHEN** the panel's `connectedCallback` calls `withLoadingState`
+- **THEN** the panel content area shows `.skeleton-pulse` shimmer blocks
+
+#### Scenario: Fetch failure triggers actionable toast
+- **GIVEN** `withLoadingState` task throws
+- **WHEN** `handlePanelError` is called with the error and the retry task
+- **THEN** a toast is dispatched with `type: "error"` and an inline "Retry" button
+- **AND** clicking Retry re-invokes `withLoadingState` from the beginning
+
+### Requirement: Actionable error toasts
+`TachyonToastManager` SHALL render an inline action button when `ToastDetail.action` is provided.
+
+#### Scenario: Toast with action button
+- **GIVEN** a `"toast"` event is dispatched with `action: { label, onClick }`
+- **WHEN** `TachyonToastManager` processes the event
+- **THEN** the toast element includes a button labeled with `action.label`
+- **AND** clicking the button invokes `action.onClick` then dismisses the toast
+- **AND** the toast remains visible for 8 seconds instead of the default 4
+
