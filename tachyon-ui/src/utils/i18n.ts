@@ -702,7 +702,6 @@ const dictionaries: Record<SupportedLanguage, Dictionary> = {
     "bundle.conflict.use-cluster": "Utiliser la version cluster",
     "bundle.conflict.force-local": "Forcer la version locale",
     "bundle.conflict.cancel": "Annuler",
-    "bundle.conflict.retry": "Relancer l'application du bundle",
     "bundle.conflict.list-label": "Conflits de dépendances",
     "bundle.conflict.actions-label": "Actions de la boîte de dialogue",
     "bundle.conflict.retry": "Re-appliquer le bundle",

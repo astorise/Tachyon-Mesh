@@ -3,7 +3,6 @@ import { listen } from "@tauri-apps/api/event";
 import "./style.css";
 import "./components/iam/TachyonIAM";
 import "./components/layout/TachyonAppShell";
-import "./components/layout/TachyonToastManager";
 import { connectionStore } from "./stores/connectionStore";
 
 document.addEventListener("DOMContentLoaded", () => {

@@ -411,6 +411,19 @@ above.
 - **THEN** the response status is 401
 - **AND** the audit ring buffer records nothing for the caller
 
+### Requirement: Login credentials MUST be owned by a standalone Web Component
+The login form (cluster URL, username, password, CA certificate, remember-me) SHALL be extracted into `TachyonAuthStepCredentials` (`auth-step-credentials`). It SHALL emit `credentials:submitted` with `{ url, username, password, cert }` on form submit, and `credentials:url-changed` with `{ url }` on URL input. It SHALL self-restore saved credentials and the custom CA via `invoke("load_credentials")` and `invoke("load_custom_ca")` on `connectedCallback`.
+
+#### Scenario: Credentials submission delegates to the parent orchestrator
+- **WHEN** an operator fills in the login form and clicks Authenticate
+- **THEN** `TachyonAuthStepCredentials` emits `credentials:submitted` with the form values
+- **AND** `TachyonIAM` calls `authn_login` using those values without re-reading the shadow DOM
+
+#### Scenario: URL change propagates to signup form
+- **WHEN** the operator types in the URL field of `auth-step-credentials`
+- **THEN** a `credentials:url-changed` event bubbles with the current URL value
+- **AND** `TachyonIAM` syncs the signup URL input to that value
+
 ### Requirement: IAM Audit Ring Buffer
 The core host SHALL maintain an in-memory ring buffer of IAM lifecycle
 events bounded at 1024 entries. Each successful or failed IAM admin
