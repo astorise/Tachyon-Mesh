@@ -11,6 +11,10 @@ const statusColors: Record<ConnectionState, string> = {
 export function mountNetworkStatus(host: HTMLElement): void {
   const root = document.createElement("div");
   root.className = "network-status inline-flex items-center gap-2 rounded border border-slate-700 px-3 py-1 text-xs";
+  root.setAttribute("role", "status");
+  root.setAttribute("aria-live", "polite");
+  root.setAttribute("aria-atomic", "true");
+  root.setAttribute("aria-label", "Connection status");
 
   const dot = document.createElement("span");
   dot.className = "network-status-dot h-2.5 w-2.5 rounded-full bg-green-500";

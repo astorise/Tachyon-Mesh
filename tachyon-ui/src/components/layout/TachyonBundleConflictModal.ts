@@ -2,6 +2,38 @@ import stylesheetText from "../../style.css?inline";
 import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
+/**
+ * Traps keyboard focus inside `container` while the modal is open.
+ * Pressing Tab or Shift+Tab cycles through focusable descendants only.
+ * Returns a cleanup function that removes the listener.
+ */
+function trapFocus(container: HTMLElement | null): () => void {
+  if (!container) return () => undefined;
+  const focusable = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  const handler = (event: KeyboardEvent): void => {
+    if (event.key !== "Tab") return;
+    const items = Array.from(container.querySelectorAll<HTMLElement>(focusable)).filter(
+      (el) => !el.closest("[disabled]"),
+    );
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (event.shiftKey) {
+      if (document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      }
+    } else {
+      if (document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  };
+  container.addEventListener("keydown", handler);
+  return () => container.removeEventListener("keydown", handler);
+}
+
 export type BundleConflict = {
   name: string;
   bundledVersion: string;
@@ -32,6 +64,7 @@ export class TachyonBundleConflictModal extends HTMLElement {
   private conflicts: BundleConflict[] = [];
   private resolutions = new Map<string, Resolution>();
   private busy = false;
+  private removeFocusTrap: () => void = () => undefined;
 
   constructor() {
     super();
@@ -52,6 +85,7 @@ export class TachyonBundleConflictModal extends HTMLElement {
 
   private render(): void {
     if (this.conflicts.length === 0) {
+      this.removeFocusTrap();
       this.root.innerHTML = `<aside class="hidden"></aside>`;
       return;
     }
@@ -76,20 +110,30 @@ export class TachyonBundleConflictModal extends HTMLElement {
       .join("");
     const allResolved = this.conflicts.every((conflict) => this.resolutions.has(conflict.name));
     this.root.innerHTML = `
-      <div class="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/85 backdrop-blur-sm">
-        <div class="w-[min(40rem,calc(100vw-2rem))] rounded-lg border border-amber-500/40 bg-slate-900 p-5 shadow-[0_0_28px_rgba(251,191,36,0.18)]">
+      <div class="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/85 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="conflict-modal-title">
+        <div class="w-[min(40rem,calc(100vw-2rem))] rounded-lg border border-amber-500/40 bg-slate-900 p-5 shadow-[0_0_28px_rgba(251,191,36,0.18)]" id="conflict-modal-panel">
           <header class="mb-3">
-            <h3 class="text-amber-300 text-base font-semibold">${t("bundle.conflict.title")}</h3>
+            <h3 id="conflict-modal-title" class="text-amber-300 text-base font-semibold">${t("bundle.conflict.title")}</h3>
             <p class="text-xs text-slate-400 mt-1">${t("bundle.conflict.intro")}</p>
           </header>
-          <ul class="space-y-2 mb-4">${rows}</ul>
-          <div class="flex justify-end gap-2 text-xs">
+          <ul class="space-y-2 mb-4" aria-label="${t("bundle.conflict.list-label")}">${rows}</ul>
+          <div class="flex justify-end gap-2 text-xs" role="group" aria-label="${t("bundle.conflict.actions-label")}">
             <button id="btn-cancel" class="rounded border border-slate-700 bg-slate-800 px-3 py-2 text-slate-300 hover:bg-slate-700">${t("bundle.conflict.cancel")}</button>
-            <button id="btn-retry" ${!allResolved || this.busy ? "disabled" : ""} class="rounded border border-cyan-500/50 bg-cyan-500/15 px-3 py-2 text-cyan-200 hover:bg-cyan-500/25 disabled:opacity-50 disabled:cursor-not-allowed">${this.busy ? t("bundle.feedback.applying") : t("bundle.conflict.retry")}</button>
+            <button id="btn-retry" ${!allResolved || this.busy ? "disabled" : ""} aria-disabled="${!allResolved || this.busy}" class="rounded border border-cyan-500/50 bg-cyan-500/15 px-3 py-2 text-cyan-200 hover:bg-cyan-500/25 disabled:opacity-50 disabled:cursor-not-allowed">${this.busy ? t("bundle.feedback.applying") : t("bundle.conflict.retry")}</button>
           </div>
         </div>
       </div>
     `;
+
+    // Install a keyboard focus trap and move initial focus into the modal.
+    this.removeFocusTrap();
+    this.removeFocusTrap = trapFocus(this.root.querySelector<HTMLElement>('[role="dialog"]'));
+    window.requestAnimationFrame(() => {
+      const panel = this.root.getElementById("conflict-modal-panel");
+      if (panel) {
+        (panel.querySelector<HTMLElement>("button:not([disabled]), [tabindex]") ?? panel).focus?.();
+      }
+    });
 
     this.root.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((button) => {
       button.addEventListener("click", () => {
