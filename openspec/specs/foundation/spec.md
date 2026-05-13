@@ -142,6 +142,14 @@ The repository SHALL provide `scripts/get-tachyon.sh` that downloads pre-compile
 - **WHEN** the download script is run
 - **THEN** the script exits 1 with a message directing the user to `./scripts/setup.sh`
 
+### Requirement: A K8s operator E2E workflow MUST test the local-image deployment path
+`.github/workflows/e2e-k8s.yml` SHALL build a local Docker image, import it into a k3d cluster, patch `manifests/deploy.yaml` to use the local image with `imagePullPolicy: Never`, apply the manifest, wait for pod readiness via `kubectl wait -l app=tachyon-host`, and assert `GET /admin/status` responds 200.
+
+#### Scenario: E2E workflow passes on a manifests-only PR
+- **GIVEN** a PR modifies `manifests/deploy.yaml`
+- **WHEN** the e2e-k8s job runs
+- **THEN** the patched manifest is applied, the pod reaches Ready, and the healthcheck curl exits 0
+
 ### Requirement: Release workflow MUST publish server-binary tarballs on version tags
 On `v*` tag pushes, `.github/workflows/release.yml` SHALL build and attach `tachyon-mesh-VERSION-OS-ARCH.tar.gz` tarballs for linux/x86_64, linux/aarch64, darwin/x86_64, and darwin/aarch64 to the GitHub release.
 

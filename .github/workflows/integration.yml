@@ -45,7 +45,11 @@ jobs:
 
       - name: Deploy workload
         run: |
-          kubectl apply -f manifests/deploy.yaml
+          # Patch to use locally-built test images (CI cannot pull from GHCR)
+          sed \
+            -e 's|ghcr.io/astorise/tachyon-mesh:latest|tachyon-mesh:test|g' \
+            -e 's|imagePullPolicy: Always|imagePullPolicy: Never|g' \
+            manifests/deploy.yaml | kubectl apply -f -
           kubectl rollout status deployment/tachyon-host --timeout=300s
           kubectl rollout status deployment/legacy-deployment --timeout=300s
 
