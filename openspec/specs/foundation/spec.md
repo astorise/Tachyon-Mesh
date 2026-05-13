@@ -128,6 +128,22 @@ The sidebar navigation SHALL be extracted into `TachyonAppShellNav` (`tachyon-ap
 - **THEN** a `shell:navigate` CustomEvent bubbles with `detail.route` matching the link's `data-route`
 - **AND** `window.location.hash` is updated to the same route
 
+### Requirement: A one-command bootstrap script MUST exist for new contributors
+The repository SHALL provide `scripts/setup.sh` (Linux/macOS) and `scripts/setup.ps1` (Windows) that check prerequisites (Rust, npm), add WASM targets, build core binaries and guest artifacts, install UI dependencies, run cross-layer validation, and print a success banner with startup commands and an MCP JSON snippet. Both scripts SHALL accept `--skip-guests` / `-SkipGuests` and `--skip-ui` / `-SkipUI` flags.
+
+#### Scenario: Missing prerequisite exits with helpful message
+- **GIVEN** `cargo` is not on PATH
+- **WHEN** `./scripts/setup.sh` is run
+- **THEN** the script exits with code 1 and prints the rustup install URL
+
+#### Scenario: Idempotent re-run does not fail
+- **GIVEN** setup has already been run once
+- **WHEN** `./scripts/setup.sh` is run again
+- **THEN** the script completes successfully (WASM target add and npm install are idempotent)
+
+### Requirement: README Quick Start MUST lead with the bootstrap script
+The `README.md` Quick Start section SHALL present `./scripts/setup.sh` (and the PowerShell equivalent) as the single first step, replacing the previous multi-command manual flow.
+
 ### Requirement: Playwright E2E tests MUST cover the critical auth-to-apply path
 The `tachyon-ui` package SHALL include a Playwright test suite under `e2e/` that covers: (1) the credentials form rendering inside `auth-step-credentials` shadow DOM; (2) the app shell visibility after the `iam:authenticated` event; (3) the seal button visibility toggle on `config:staged`.
 
