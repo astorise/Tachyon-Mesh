@@ -1,0 +1,5 @@
+- [x] **Task 1: WIT Definition.** Add `wit/store/graph.wit` containing the `workspace-graph` resource and its methods (`add-edges`, `delete-edges`, `traverse`). Update `wit-bindgen` macros in the host.
+- [x] **Task 2: Redb Hexastore Schema.** In `core-host/src/host_core/`, create the schema definitions for the graph tables. Implement at least the `SPO` (Subject-Predicate-Object) and `OSP` (Object-Subject-Predicate) `TableDefinition`s using composite byte keys.
+- [x] **Task 3: Mutation Logic.** Implement `add_edges` and `delete_edges` within a single `redb::WriteTransaction`. Each edge must be atomically inserted/removed from both the SPO and OSP index tables.
+- [x] **Task 4: Traversal Algorithm.** Implement the `traverse` function in Rust. It must recursively query the `SPO` table up to the requested `depth`, maintaining a `visited` set to prevent infinite loops in cyclic graphs.
+- [x] **Task 5: Wasmtime Bindings.** Bind the `workspace-graph` resource to the `TachyonCtx` using Wasmtime's `ResourceTable`, ensuring proper Drop semantics when the FaaS disconnects.
