@@ -128,6 +128,23 @@ The sidebar navigation SHALL be extracted into `TachyonAppShellNav` (`tachyon-ap
 - **THEN** a `shell:navigate` CustomEvent bubbles with `detail.route` matching the link's `data-route`
 - **AND** `window.location.hash` is updated to the same route
 
+### Requirement: A zero-build installer script MUST exist for operators
+The repository SHALL provide `scripts/get-tachyon.sh` that downloads pre-compiled `core-host` and `tachyon-mcp` binaries from the latest GitHub release without requiring a Rust toolchain. It SHALL accept `--version` and `--dir` flags, detect OS and architecture, and print a success banner with the MCP config snippet. It SHALL exit 1 with a build-from-source hint when the download fails.
+
+#### Scenario: Operator downloads latest release
+- **GIVEN** a GitHub release exists for the repository
+- **WHEN** `curl -fsSL .../get-tachyon.sh | bash` is run on a supported platform
+- **THEN** `core-host` and `tachyon-mcp` are extracted to the current directory
+- **AND** the script exits 0 and prints the binary paths
+
+#### Scenario: No release exists — graceful failure
+- **GIVEN** no GitHub release exists (pre-launch)
+- **WHEN** the download script is run
+- **THEN** the script exits 1 with a message directing the user to `./scripts/setup.sh`
+
+### Requirement: Release workflow MUST publish server-binary tarballs on version tags
+On `v*` tag pushes, `.github/workflows/release.yml` SHALL build and attach `tachyon-mesh-VERSION-OS-ARCH.tar.gz` tarballs for linux/x86_64, linux/aarch64, darwin/x86_64, and darwin/aarch64 to the GitHub release.
+
 ### Requirement: A one-command bootstrap script MUST exist for new contributors
 The repository SHALL provide `scripts/setup.sh` (Linux/macOS) and `scripts/setup.ps1` (Windows) that check prerequisites (Rust, npm), add WASM targets, build core binaries and guest artifacts, install UI dependencies, run cross-layer validation, and print a success banner with startup commands and an MCP JSON snippet. Both scripts SHALL accept `--skip-guests` / `-SkipGuests` and `--skip-ui` / `-SkipUI` flags.
 

@@ -34,31 +34,46 @@ Tachyon is built on three core layers:
 
 ## 🚀 Quick Start
 
-### Prerequisites
-* Rust (latest stable) — install from [rustup.rs](https://rustup.rs)
-* Node.js & npm — install from [nodejs.org](https://nodejs.org)
+### Path A — Operators (Zero-Build)
 
-### One-Command Bootstrap
+Run Tachyon-Mesh in under a minute without a Rust toolchain.
 
+**Local binary (Linux / macOS):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/get-tachyon.sh | bash
+./core-host
+```
+
+Optional: pin a version with `--version v1.2.3` or choose an install directory with `--dir /usr/local/bin`.
+
+**Kubernetes (single node or homelab):**
+```bash
+kubectl apply -f https://raw.githubusercontent.com/astorise/tachyon-mesh/main/manifests/deploy.yaml
+```
+
+---
+
+### Path B — Contributors (Build from Source)
+
+Modify the core engine, UI, or FaaS guests.
+
+**Linux / macOS** (requires Rust + Node.js):
 ```bash
 git clone https://github.com/astorise/tachyon-mesh.git
 cd tachyon-mesh
 ./scripts/setup.sh
 ```
 
-The script verifies prerequisites, installs WASM targets, builds all binaries and FaaS guests, installs UI dependencies, runs cross-layer validation, and prints the exact commands and MCP config snippet you need.
-
-**Windows (PowerShell):**
+**Windows (PowerShell)**:
 ```powershell
 git clone https://github.com/astorise/tachyon-mesh.git
 cd tachyon-mesh
 .\scripts\setup.ps1
 ```
 
-Optional flags: `--skip-guests` / `-SkipGuests` to skip the FaaS guest build (faster iteration), `--skip-ui` / `-SkipUI` to skip npm install.
+The setup script verifies prerequisites, installs WASM targets, builds all binaries and FaaS guests, installs UI dependencies, runs cross-layer validation, and prints the exact commands and MCP config snippet you need.
 
-### After Setup
-
+After setup:
 ```bash
 # Terminal 1 — start the mesh
 ./target/release/core-host
