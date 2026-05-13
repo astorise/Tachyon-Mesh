@@ -12,6 +12,11 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/admin/metrics", get(admin_metrics_handler))
         .route("/admin/schema/manifest", get(admin_manifest_schema_handler))
         .route(
+            "/admin/schema/openapi.json",
+            get(admin_openapi_schema_handler),
+        )
+        .route("/admin/docs", get(admin_openapi_docs_handler))
+        .route(
             "/admin/kv/{namespace}/{key}",
             get(admin_kv_get_handler)
                 .put(admin_kv_put_handler)
@@ -142,7 +147,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
     app.with_state(state)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminRuntimeMetrics {
     pub(crate) source: String,
@@ -300,6 +305,26 @@ pub(crate) async fn admin_manifest_schema_handler() -> axum::Json<serde_json::Va
             "kvCaches":     { "type": "array", "items": { "type": "object" } }
         }
     }))
+}
+
+/// Serves the OpenAPI 3.1 JSON document generated from the compile-time `ApiDoc`.
+pub(crate) async fn admin_openapi_schema_handler() -> impl IntoResponse {
+    let json = crate::host_core::openapi::get_base_openapi_schema();
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json,
+    )
+}
+
+/// Serves the Swagger UI HTML pointing at `/admin/schema/openapi.json`.
+pub(crate) async fn admin_openapi_docs_handler() -> impl IntoResponse {
+    const HTML: &str = include_str!("swagger-ui.html");
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        HTML,
+    )
 }
 
 pub(crate) async fn admin_kv_get_handler(

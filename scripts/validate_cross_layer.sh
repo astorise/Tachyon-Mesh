@@ -28,6 +28,19 @@ if grep -q 'tauri-plugin-stronghold' "${ui_cargo}" && ! grep -q 'Stronghold::' "
     failures=$((failures + 1))
 fi
 
+openapi_routes=(
+    "/admin/schema/openapi.json"
+    "/admin/docs"
+    "/admin/manifest"
+    "/admin/iam/users"
+)
+for route in "${openapi_routes[@]}"; do
+    if ! grep -Fq "\"${route}\"" "${router_file}" && ! grep -Fq "\"${route}/" "${router_file}"; then
+        echo "missing core-host route for OpenAPI contract: ${route}" >&2
+        failures=$((failures + 1))
+    fi
+done
+
 if [[ "${failures}" -ne 0 ]]; then
     echo "${failures} cross-layer validation failure(s) found." >&2
     exit 1

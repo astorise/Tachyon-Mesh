@@ -1300,16 +1300,14 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
     fn new(
         &mut self,
         name: String,
-    ) -> wasmtime::Result<
-        wasmtime::component::Resource<component_bindings::tachyon::mesh::kv_partition::Table>,
-    > {
+    ) -> wasmtime::component::Resource<component_bindings::tachyon::mesh::kv_partition::Table> {
         let resource = RedbTableResource {
             table_name: name,
             core_store: Arc::clone(&self.storage_broker.core_store),
         };
         let owned: wasmtime::component::Resource<RedbTableResource> =
-            self.table.push(resource)?;
-        Ok(wasmtime::component::Resource::new_own(owned.rep()))
+            self.table.push(resource).expect("resource table push failed");
+        wasmtime::component::Resource::new_own(owned.rep())
     }
 
     fn get(
@@ -1318,15 +1316,14 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
             component_bindings::tachyon::mesh::kv_partition::Table,
         >,
         key: String,
-    ) -> wasmtime::Result<std::result::Result<Vec<u8>, String>> {
+    ) -> std::result::Result<Vec<u8>, String> {
         let handle =
             wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
-        let res = self.table.get(&handle)?;
-        Ok(res
-            .core_store
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        res.core_store
             .kv_partition_get(&res.table_name, &key)
             .map_err(|e| format!("{e:#}"))
-            .and_then(|opt| opt.ok_or_else(|| format!("key `{key}` not found"))))
+            .and_then(|opt| opt.ok_or_else(|| format!("key `{key}` not found")))
     }
 
     fn set(
@@ -1336,14 +1333,13 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         >,
         key: String,
         value: Vec<u8>,
-    ) -> wasmtime::Result<std::result::Result<(), String>> {
+    ) -> std::result::Result<(), String> {
         let handle =
             wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
-        let res = self.table.get(&handle)?;
-        Ok(res
-            .core_store
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        res.core_store
             .kv_partition_set(&res.table_name, &key, &value)
-            .map_err(|e| format!("{e:#}")))
+            .map_err(|e| format!("{e:#}"))
     }
 
     fn delete(
@@ -1352,14 +1348,13 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
             component_bindings::tachyon::mesh::kv_partition::Table,
         >,
         key: String,
-    ) -> wasmtime::Result<std::result::Result<(), String>> {
+    ) -> std::result::Result<(), String> {
         let handle =
             wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
-        let res = self.table.get(&handle)?;
-        Ok(res
-            .core_store
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        res.core_store
             .kv_partition_delete(&res.table_name, &key)
-            .map_err(|e| format!("{e:#}")))
+            .map_err(|e| format!("{e:#}"))
     }
 
     fn batch_set(
@@ -1368,14 +1363,13 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
             component_bindings::tachyon::mesh::kv_partition::Table,
         >,
         entries: Vec<(String, Vec<u8>)>,
-    ) -> wasmtime::Result<std::result::Result<(), String>> {
+    ) -> std::result::Result<(), String> {
         let handle =
             wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
-        let res = self.table.get(&handle)?;
-        Ok(res
-            .core_store
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        res.core_store
             .kv_partition_batch_set(&res.table_name, &entries)
-            .map_err(|e| format!("{e:#}")))
+            .map_err(|e| format!("{e:#}"))
     }
 
     fn get_range(
@@ -1387,14 +1381,13 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         end_key: String,
         limit: u32,
         offset: u32,
-    ) -> wasmtime::Result<std::result::Result<Vec<(String, Vec<u8>)>, String>> {
+    ) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
         let handle =
             wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
-        let res = self.table.get(&handle)?;
-        Ok(res
-            .core_store
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        res.core_store
             .kv_partition_get_range(&res.table_name, &start_key, &end_key, limit, offset)
-            .map_err(|e| format!("{e:#}")))
+            .map_err(|e| format!("{e:#}"))
     }
 
     fn drop(

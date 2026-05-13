@@ -31,6 +31,7 @@ cargo build -p system-faas-s3-proxy --target wasm32-wasip2 --release
 cargo build -p system-faas-shadow-proxy --target wasm32-wasip2 --release
 cargo build -p system-faas-sqs --target wasm32-wasip2 --release
 cargo build -p system-faas-storage-broker --target wasm32-wasip2 --release
+cargo build -p system-faas-openapi --target wasm32-wasip2 --release
 cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 cargo build -p guest-loop --target wasm32-wasip1 --release
 cargo build -p guest-malicious --target wasm32-wasip1 --release
