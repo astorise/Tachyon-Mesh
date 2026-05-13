@@ -1216,7 +1216,10 @@ mod tests {
         assert!(retry_ms <= RATE_LIMIT_WINDOW_SECS * 1_000);
         let err = JsonRpcError::rate_limited(retry_ms);
         assert_eq!(err.code, -32002);
-        assert_eq!(err.data.unwrap()["retry_after_ms"], retry_ms);
+        assert_eq!(
+            err.data.expect("rate_limited error has data")["retry_after_ms"],
+            retry_ms
+        );
     }
 
     #[tokio::test]
