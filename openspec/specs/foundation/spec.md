@@ -115,3 +115,24 @@ Overlay dialogs SHALL carry `role="dialog"`, `aria-modal="true"`, a labelled hea
 - **AND** focus is moved inside the modal
 - **AND** Tab/Shift+Tab cycles only through the modal's focusable elements
 
+### Requirement: AppShell navigation MUST be a standalone Web Component
+The sidebar navigation SHALL be extracted into `TachyonAppShellNav` (`tachyon-app-shell-nav`). It SHALL observe the `active-route` attribute and emit `shell:navigate` (bubbles, composed) with `{ route }` on link clicks.
+
+#### Scenario: Active route attribute drives highlight
+- **GIVEN** `<tachyon-app-shell-nav active-route="topology">` is rendered
+- **WHEN** `attributeChangedCallback` fires
+- **THEN** the topology button has the active CSS classes and all other buttons do not
+
+#### Scenario: Link click dispatches navigation event
+- **WHEN** an operator clicks a sidebar link
+- **THEN** a `shell:navigate` CustomEvent bubbles with `detail.route` matching the link's `data-route`
+- **AND** `window.location.hash` is updated to the same route
+
+### Requirement: AppShell modal overlays MUST be managed by a standalone Web Component
+All z-stack overlays (toast manager, guided tour, bundle conflict modal) SHALL be owned by `TachyonAppShellModalRoot` (`tachyon-app-shell-modal-root`). It SHALL listen to the `topology:conflict` window event and expose `openConflictModal`, `startTour`, and `startTourIfFirstVisit`.
+
+#### Scenario: topology:conflict event opens the conflict modal
+- **WHEN** `topology:conflict` fires with `{ conflicts: [...] }`
+- **THEN** `TachyonAppShellModalRoot` calls `openConflictModal(conflicts)`
+- **AND** the bundle conflict modal becomes visible
+

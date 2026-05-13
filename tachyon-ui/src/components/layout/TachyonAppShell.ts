@@ -13,9 +13,9 @@ import "../domains/TachyonStoragePanel";
 import "../domains/TachyonSupplyChainPanel";
 import "../domains/TachyonWorkloadsPanel";
 import "../iam/TachyonIAM";
-import "./TachyonBundleConflictModal";
-import "./TachyonGuidedTour";
-import "./TachyonToastManager";
+import "../iam/TachyonAuthStepCredentials";
+import "./TachyonAppShellNav";
+import "./TachyonAppShellModalRoot";
 import "../routing/TachyonRoutingDashboard";
 import "../traffic/TachyonResiliencePanel";
 import "../traffic/TachyonRoutingPanel";
@@ -39,11 +39,6 @@ type AuthenticatedDetail = {
   token: string;
 };
 
-type GuidedTourElement = HTMLElement & {
-  start: () => void;
-  startIfFirstVisit: () => void;
-};
-
 type SealApplyOutcome = {
   success: boolean;
   message: string;
@@ -64,8 +59,10 @@ type BundleApplyOutcome = {
   requiresResolution: boolean;
 };
 
-type BundleConflictModalElement = HTMLElement & {
-  open: (conflicts: BundleConflict[]) => void;
+type TachyonAppShellModalRootElement = HTMLElement & {
+  openConflictModal: (conflicts: BundleConflict[]) => void;
+  startTour: () => void;
+  startTourIfFirstVisit: () => void;
 };
 
 const appShellStylesheet = new CSSStyleSheet();
@@ -101,12 +98,6 @@ export class TachyonAppShell extends HTMLElement {
     this.updateNavigation(route);
     this.showRoute(route);
   };
-  private readonly onTopologyConflict = (event: Event) => {
-    const conflicts = (event as CustomEvent<{ conflicts: BundleConflict[] }>).detail.conflicts;
-    const modal = this.root.querySelector<BundleConflictModalElement>("tachyon-bundle-conflict-modal");
-    modal?.open(conflicts);
-  };
-
   constructor() {
     super();
     this.root = this.attachShadow({ mode: "open" });
@@ -119,7 +110,6 @@ export class TachyonAppShell extends HTMLElement {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     window.addEventListener("config:staged", this.onConfigStaged);
     window.addEventListener("hashchange", this.onHashChange);
-    window.addEventListener("topology:conflict", this.onTopologyConflict);
   }
 
   disconnectedCallback(): void {
@@ -127,7 +117,6 @@ export class TachyonAppShell extends HTMLElement {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
     window.removeEventListener("config:staged", this.onConfigStaged);
     window.removeEventListener("hashchange", this.onHashChange);
-    window.removeEventListener("topology:conflict", this.onTopologyConflict);
   }
 
   async startTransition(userData: AuthenticatedDetail): Promise<void> {
@@ -160,30 +149,16 @@ export class TachyonAppShell extends HTMLElement {
       .fromTo(header, { y: -20, opacity: 0 }, { y: 0, opacity: 1, duration: 0.22 }, "-=0.12")
       .fromTo(content, { opacity: 0 }, { opacity: 1, duration: 0.22 }, "-=0.08");
     await timeline.then();
-    this.guidedTour()?.startIfFirstVisit();
+    this.modalRoot()?.startTourIfFirstVisit();
   }
 
   private render(): void {
-    const configLinks = listComponentRoutes()
-      .map(
-        (entry) =>
-          `<button data-route="${escapeHtml(entry.route)}" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">${escapeHtml(t(`nav.${entry.route}`) || entry.label)}</button>`,
-      )
-      .join("");
+    // configLinks are now rendered by TachyonAppShellNav; the variable is kept
+    // for reference during incremental adoption but is no longer inserted here.
     this.root.innerHTML = `
       <section id="shell" class="hidden fixed inset-0 z-30 h-screen w-screen bg-slate-950 text-slate-300">
         <a href="#main-content" class="skip-nav">${t("shell.skip-nav")}</a>
-        <aside id="shell-sidebar" class="w-64 bg-slate-900 border-r border-slate-800 flex flex-col opacity-0" aria-label="${t("shell.sidebar-label")}">
-          <div class="h-16 flex items-center px-6 border-b border-slate-800">
-            <div class="w-3 h-3 bg-cyan-400 rounded-full mr-3 shadow-[0_0_10px_rgba(34,211,238,0.8)]" aria-hidden="true"></div>
-            <h1 class="text-xl font-bold text-white tracking-wider">TACHYON<span class="text-cyan-400">MESH</span></h1>
-          </div>
-          <nav class="flex-1 p-4 space-y-2" aria-label="${t("shell.nav-label")}">
-            <button data-route="dashboard" class="nav-link w-full text-left block px-4 py-2 rounded-md bg-slate-800 text-cyan-400 font-medium transition-colors">${t("nav.dashboard")}</button>
-            ${configLinks}
-          </nav>
-          <div class="p-4 border-t border-slate-800 text-xs text-slate-500" aria-hidden="true">${t("shell.version")}</div>
-        </aside>
+        <tachyon-app-shell-nav id="shell-sidebar" active-route="${this.activeRoute}" class="flex flex-col opacity-0"></tachyon-app-shell-nav>
         <div class="flex min-w-0 flex-1 flex-col">
           <header id="shell-header" class="h-16 border-b border-slate-800 flex items-center justify-between px-8 bg-slate-900/50 backdrop-blur-md opacity-0" aria-label="${t("shell.header-label")}">
             <div>
@@ -230,9 +205,7 @@ export class TachyonAppShell extends HTMLElement {
             </section>
           </main>
         </div>
-        <tachyon-guided-tour></tachyon-guided-tour>
-        <tachyon-toast-manager></tachyon-toast-manager>
-        <tachyon-bundle-conflict-modal></tachyon-bundle-conflict-modal>
+        <tachyon-app-shell-modal-root id="shell-modal-root"></tachyon-app-shell-modal-root>
       </section>
     `;
 
@@ -251,7 +224,11 @@ export class TachyonAppShell extends HTMLElement {
       setLanguage((event.target as HTMLSelectElement).value);
     });
     this.root.getElementById("btn-help-tour")?.addEventListener("click", () => {
-      this.guidedTour()?.start();
+      this.modalRoot()?.startTour();
+    });
+    this.root.getElementById("shell-sidebar")?.addEventListener("shell:navigate", (event) => {
+      const route = (event as CustomEvent<{ route: string }>).detail.route;
+      this.updateNavigation(route);
     });
     this.root.getElementById("btn-seal-apply")?.addEventListener("click", () => {
       void this.sealAndApply();
@@ -259,12 +236,8 @@ export class TachyonAppShell extends HTMLElement {
   }
 
   private updateNavigation(route: string): void {
-    this.root.querySelectorAll<HTMLButtonElement>("[data-route]").forEach((button) => {
-      const active = button.dataset.route === route;
-      button.classList.toggle("bg-slate-800", active);
-      button.classList.toggle("text-cyan-400", active);
-      button.classList.toggle("text-slate-300", !active);
-    });
+    const nav = this.root.getElementById("shell-sidebar");
+    nav?.setAttribute("active-route", route);
   }
 
   private showRoute(route: string): void {
@@ -311,8 +284,8 @@ export class TachyonAppShell extends HTMLElement {
     return panel;
   }
 
-  private guidedTour(): GuidedTourElement | null {
-    return this.root.querySelector<GuidedTourElement>("tachyon-guided-tour");
+  private modalRoot(): TachyonAppShellModalRootElement | null {
+    return this.root.querySelector<TachyonAppShellModalRootElement>("tachyon-app-shell-modal-root");
   }
 
   private restoreStartedState(): void {
@@ -363,10 +336,7 @@ export class TachyonAppShell extends HTMLElement {
         dependencies: [],
       });
       if (result.requiresResolution && result.conflicts.length > 0) {
-        const modal = this.root.querySelector<BundleConflictModalElement>(
-          "tachyon-bundle-conflict-modal",
-        );
-        modal?.open(result.conflicts);
+        this.modalRoot()?.openConflictModal(result.conflicts);
         window.dispatchEvent(
           new CustomEvent("app:notify", {
             detail: { type: "error", message: result.message },
