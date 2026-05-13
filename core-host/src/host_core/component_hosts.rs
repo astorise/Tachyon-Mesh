@@ -1296,6 +1296,104 @@ impl component_bindings::tachyon::mesh::training::Host for ComponentHostState {
 
 impl component_bindings::tachyon::mesh::kv_partition::Host for ComponentHostState {}
 
+// ── graph::workspace-graph Wasmtime host bindings ────────────────────────────
+
+impl component_bindings::tachyon::mesh::graph::Host for ComponentHostState {}
+
+impl component_bindings::tachyon::mesh::graph::HostWorkspaceGraph for ComponentHostState {
+    fn new(
+        &mut self,
+        name: String,
+    ) -> wasmtime::component::Resource<component_bindings::tachyon::mesh::graph::WorkspaceGraph>
+    {
+        let resource = WorkspaceGraphResource {
+            graph_name: name,
+            core_store: Arc::clone(&self.storage_broker.core_store),
+        };
+        let owned: wasmtime::component::Resource<WorkspaceGraphResource> = self
+            .table
+            .push(resource)
+            .expect("resource table push failed");
+        wasmtime::component::Resource::new_own(owned.rep())
+    }
+
+    fn add_edges(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::graph::WorkspaceGraph,
+        >,
+        edges: Vec<component_bindings::tachyon::mesh::graph::Edge>,
+    ) -> std::result::Result<(), String> {
+        let handle =
+            wasmtime::component::Resource::<WorkspaceGraphResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        let graph_edges: Vec<GraphEdge> = edges
+            .into_iter()
+            .map(|e| GraphEdge {
+                subject: e.subject,
+                predicate: e.predicate,
+                object: e.object,
+                properties: e.properties,
+            })
+            .collect();
+        res.core_store
+            .graph_add_edges(&res.graph_name, &graph_edges)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn delete_edges(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::graph::WorkspaceGraph,
+        >,
+        edges: Vec<component_bindings::tachyon::mesh::graph::Edge>,
+    ) -> std::result::Result<(), String> {
+        let handle =
+            wasmtime::component::Resource::<WorkspaceGraphResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        let graph_edges: Vec<GraphEdge> = edges
+            .into_iter()
+            .map(|e| GraphEdge {
+                subject: e.subject,
+                predicate: e.predicate,
+                object: e.object,
+                properties: e.properties,
+            })
+            .collect();
+        res.core_store
+            .graph_delete_edges(&res.graph_name, &graph_edges)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn traverse(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::graph::WorkspaceGraph,
+        >,
+        subject: String,
+        predicate: String,
+        depth: u32,
+    ) -> std::result::Result<Vec<String>, String> {
+        let handle =
+            wasmtime::component::Resource::<WorkspaceGraphResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        res.core_store
+            .graph_traverse(&res.graph_name, &subject, &predicate, depth)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn drop(
+        &mut self,
+        rep: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::graph::WorkspaceGraph,
+        >,
+    ) -> wasmtime::Result<()> {
+        self.table
+            .delete(wasmtime::component::Resource::<WorkspaceGraphResource>::new_own(rep.rep()))?;
+        Ok(())
+    }
+}
+
 impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHostState {
     fn new(
         &mut self,

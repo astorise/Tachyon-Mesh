@@ -873,6 +873,185 @@ impl CoreStore {
     }
 }
 
+// ── Semantic graph store (hexastore) ─────────────────────────────────────────
+
+#[allow(dead_code)]
+const GRAPH_SEP: u8 = b'\0';
+
+#[allow(dead_code)]
+fn graph_spo_key(subject: &str, predicate: &str, object: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(subject.len() + predicate.len() + object.len() + 2);
+    k.extend_from_slice(subject.as_bytes());
+    k.push(GRAPH_SEP);
+    k.extend_from_slice(predicate.as_bytes());
+    k.push(GRAPH_SEP);
+    k.extend_from_slice(object.as_bytes());
+    k
+}
+
+#[allow(dead_code)]
+fn graph_osp_key(object: &str, subject: &str, predicate: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(object.len() + subject.len() + predicate.len() + 2);
+    k.extend_from_slice(object.as_bytes());
+    k.push(GRAPH_SEP);
+    k.extend_from_slice(subject.as_bytes());
+    k.push(GRAPH_SEP);
+    k.extend_from_slice(predicate.as_bytes());
+    k
+}
+
+#[allow(dead_code)]
+fn graph_spo_prefix_range(subject: &str, predicate: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut start = Vec::with_capacity(subject.len() + predicate.len() + 2);
+    start.extend_from_slice(subject.as_bytes());
+    start.push(GRAPH_SEP);
+    start.extend_from_slice(predicate.as_bytes());
+    start.push(GRAPH_SEP);
+    let mut end = start.clone();
+    if let Some(last) = end.last_mut() {
+        *last = last.saturating_add(1);
+    } else {
+        end.push(1);
+    }
+    (start, end)
+}
+
+/// An edge in the semantic graph.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct GraphEdge {
+    pub(crate) subject: String,
+    pub(crate) predicate: String,
+    pub(crate) object: String,
+    pub(crate) properties: String,
+}
+
+#[allow(dead_code)]
+const GRAPH_TRAVERSE_LIMIT: usize = 10_000;
+
+#[allow(dead_code)]
+impl CoreStore {
+    fn graph_spo_table(name: &str) -> String {
+        format!("graph_{name}_spo")
+    }
+    fn graph_osp_table(name: &str) -> String {
+        format!("graph_{name}_osp")
+    }
+
+    pub(crate) fn graph_add_edges(&self, graph_name: &str, edges: &[GraphEdge]) -> Result<()> {
+        let spo_name = Self::graph_spo_table(graph_name);
+        let osp_name = Self::graph_osp_table(graph_name);
+        let spo_def: redb::TableDefinition<&[u8], &str> = redb::TableDefinition::new(&spo_name);
+        let osp_def: redb::TableDefinition<&[u8], &str> = redb::TableDefinition::new(&osp_name);
+        let wtxn = self
+            .db
+            .begin_write()
+            .context("graph_add_edges: begin write")?;
+        {
+            let mut spo = wtxn
+                .open_table(spo_def)
+                .context("graph_add_edges: open SPO")?;
+            let mut osp = wtxn
+                .open_table(osp_def)
+                .context("graph_add_edges: open OSP")?;
+            for e in edges {
+                spo.insert(
+                    graph_spo_key(&e.subject, &e.predicate, &e.object).as_slice(),
+                    e.properties.as_str(),
+                )
+                .context("graph_add_edges: insert SPO")?;
+                osp.insert(
+                    graph_osp_key(&e.object, &e.subject, &e.predicate).as_slice(),
+                    e.properties.as_str(),
+                )
+                .context("graph_add_edges: insert OSP")?;
+            }
+        }
+        wtxn.commit().context("graph_add_edges: commit")
+    }
+
+    pub(crate) fn graph_delete_edges(&self, graph_name: &str, edges: &[GraphEdge]) -> Result<()> {
+        let spo_name = Self::graph_spo_table(graph_name);
+        let osp_name = Self::graph_osp_table(graph_name);
+        let spo_def: redb::TableDefinition<&[u8], &str> = redb::TableDefinition::new(&spo_name);
+        let osp_def: redb::TableDefinition<&[u8], &str> = redb::TableDefinition::new(&osp_name);
+        let wtxn = self
+            .db
+            .begin_write()
+            .context("graph_delete_edges: begin write")?;
+        {
+            let mut spo = wtxn
+                .open_table(spo_def)
+                .context("graph_delete_edges: open SPO")?;
+            let mut osp = wtxn
+                .open_table(osp_def)
+                .context("graph_delete_edges: open OSP")?;
+            for e in edges {
+                spo.remove(graph_spo_key(&e.subject, &e.predicate, &e.object).as_slice())
+                    .context("graph_delete_edges: remove SPO")?;
+                osp.remove(graph_osp_key(&e.object, &e.subject, &e.predicate).as_slice())
+                    .context("graph_delete_edges: remove OSP")?;
+            }
+        }
+        wtxn.commit().context("graph_delete_edges: commit")
+    }
+
+    pub(crate) fn graph_traverse(
+        &self,
+        graph_name: &str,
+        subject: &str,
+        predicate: &str,
+        depth: u32,
+    ) -> Result<Vec<String>> {
+        if depth == 0 {
+            return Ok(Vec::new());
+        }
+        let spo_name = Self::graph_spo_table(graph_name);
+        let spo_def: redb::TableDefinition<&[u8], &str> = redb::TableDefinition::new(&spo_name);
+        let rtxn = self.db.begin_read().context("graph_traverse: begin read")?;
+        let spo = rtxn
+            .open_table(spo_def)
+            .context("graph_traverse: open SPO")?;
+
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(subject.to_owned());
+        let mut queue: std::collections::VecDeque<(String, u32)> =
+            std::collections::VecDeque::new();
+        queue.push_back((subject.to_owned(), 0));
+        let mut results: Vec<String> = Vec::new();
+
+        while let Some((node, cur_depth)) = queue.pop_front() {
+            if cur_depth >= depth {
+                continue;
+            }
+            let (start, end) = graph_spo_prefix_range(&node, predicate);
+            let range = spo
+                .range::<&[u8]>(start.as_slice()..end.as_slice())
+                .context("graph_traverse: range scan")?;
+            for item in range {
+                let (key_guard, _) = item.context("graph_traverse: read row")?;
+                let key = key_guard.value();
+                let prefix_len = node.len() + 1 + predicate.len() + 1;
+                if key.len() <= prefix_len {
+                    continue;
+                }
+                let object = match std::str::from_utf8(&key[prefix_len..]) {
+                    Ok(s) => s.to_owned(),
+                    Err(_) => continue,
+                };
+                if results.len() >= GRAPH_TRAVERSE_LIMIT {
+                    return Ok(results);
+                }
+                if visited.insert(object.clone()) {
+                    results.push(object.clone());
+                    queue.push_back((object, cur_depth + 1));
+                }
+            }
+        }
+        Ok(results)
+    }
+}
+
 // ── KV-cache support types and helpers ──────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -217,6 +217,22 @@ interface secrets-vault {
     get-secret: func(name: string) -> result<string, error>;
 }
 
+interface graph {
+    record edge {
+        subject: string,
+        predicate: string,
+        object: string,
+        properties: string,
+    }
+
+    resource workspace-graph {
+        constructor(name: string);
+        add-edges: func(edges: list<edge>) -> result<_, string>;
+        delete-edges: func(edges: list<edge>) -> result<_, string>;
+        traverse: func(subject: string, predicate: string, depth: u32) -> result<list<string>, string>;
+    }
+}
+
 interface kv-partition {
     resource table {
         constructor(name: string);
@@ -239,6 +255,7 @@ world faas-guest {
     import vector;
     import training;
     import kv-partition;
+    import graph;
     export handler;
 }
 

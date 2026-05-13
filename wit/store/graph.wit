@@ -1,0 +1,25 @@
+package tachyon:mesh@1.0.0;
+
+interface graph {
+    record edge {
+        subject: string,
+        predicate: string,
+        object: string,
+        /// Serialised JSON properties attached to this edge.
+        properties: string,
+    }
+
+    resource workspace-graph {
+        constructor(name: string);
+
+        /// Atomically insert all given edges into the SPO and OSP indices.
+        add-edges: func(edges: list<edge>) -> result<_, string>;
+
+        /// Atomically remove all given edges from the SPO and OSP indices.
+        delete-edges: func(edges: list<edge>) -> result<_, string>;
+
+        /// Multi-hop BFS traversal from `subject` following `predicate` edges
+        /// up to `depth` hops. Returns the distinct object URIs reached.
+        traverse: func(subject: string, predicate: string, depth: u32) -> result<list<string>, string>;
+    }
+}
