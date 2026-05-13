@@ -23,7 +23,10 @@ impl Guest for Component {
         match path {
             "/admin/docs" => Response {
                 status: 200,
-                headers: vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())],
+                headers: vec![(
+                    "content-type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                )],
                 body: SWAGGER_UI_HTML.as_bytes().to_vec(),
                 trailers: vec![],
             },

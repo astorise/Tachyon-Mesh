@@ -1471,7 +1471,11 @@ impl LayerWiseMappedModel {
                 .with_context(|| format!("failed to mmap `{}`", path.display()))?
         };
         let map_len = mmap.len();
-        let bytes_per_layer = if num_layers > 0 { map_len / num_layers } else { map_len };
+        let bytes_per_layer = if num_layers > 0 {
+            map_len / num_layers
+        } else {
+            map_len
+        };
         let base_ptr = mmap.as_ptr();
         Ok(Self {
             _mmap: mmap,
@@ -1487,7 +1491,10 @@ impl LayerWiseMappedModel {
     /// allocation is performed for the weight bytes themselves.
     pub(crate) fn load_layer(&self, layer_idx: usize) -> Result<LayerWeightSlice> {
         if layer_idx >= self.num_layers {
-            anyhow::bail!("layer {layer_idx} is out of range (model has {} layers)", self.num_layers);
+            anyhow::bail!(
+                "layer {layer_idx} is out of range (model has {} layers)",
+                self.num_layers
+            );
         }
         let offset = layer_idx * self.bytes_per_layer;
         let end = (offset + self.bytes_per_layer).min(self.map_len);
@@ -1534,7 +1541,10 @@ pub(crate) struct PrefillBatch {
 
 impl PrefillBatch {
     pub(crate) fn new(prompt_len: usize, hidden_dim: usize) -> Self {
-        Self { prompt_len, hidden_dim }
+        Self {
+            prompt_len,
+            hidden_dim,
+        }
     }
 
     /// Execute the full prefill sweep. Returns the final hidden states and the
@@ -1571,7 +1581,8 @@ impl PrefillBatch {
 
             // KV-Cache: extract the current layer's key-value pair from hidden states
             // and immediately page it to CPU (Host RAM) before releasing layer weights.
-            let kv_values = hidden_states.to_vec2::<f32>()
+            let kv_values = hidden_states
+                .to_vec2::<f32>()
                 .unwrap_or_else(|_| vec![vec![0.0f32; self.hidden_dim]; self.prompt_len]);
             kv_cpu_cache.push(KvCacheSlice {
                 layer_idx,
@@ -1582,7 +1593,10 @@ impl PrefillBatch {
             // `layer_slice` is dropped here — weights are freed from (simulated) VRAM.
         }
 
-        Ok(PrefillOutput { hidden_states, kv_cpu_cache })
+        Ok(PrefillOutput {
+            hidden_states,
+            kv_cpu_cache,
+        })
     }
 }
 
@@ -1833,34 +1847,22 @@ impl SemanticContextFlattener {
                 }
                 ROLE_USER => {
                     user_turn = user_turn.saturating_add(1);
-                    let tid = turn_id
-                        .clone()
-                        .unwrap_or_else(|| format!("{user_turn}"));
+                    let tid = turn_id.clone().unwrap_or_else(|| format!("{user_turn}"));
                     let key = format!("usr:{user_turn}:{tid}");
                     (
                         key,
-                        vec![ContextMarker::ConversationTurnStart {
-                            turn_id: tid,
-                        }],
+                        vec![ContextMarker::ConversationTurnStart { turn_id: tid }],
                     )
                 }
                 ROLE_ASSISTANT => {
-                    let tid = turn_id
-                        .clone()
-                        .unwrap_or_else(|| format!("{user_turn}"));
+                    let tid = turn_id.clone().unwrap_or_else(|| format!("{user_turn}"));
                     let key = format!("ast:{user_turn}:{tid}");
-                    (
-                        key,
-                        vec![ContextMarker::AssistantResponse { turn_id: tid }],
-                    )
+                    (key, vec![ContextMarker::AssistantResponse { turn_id: tid }])
                 }
                 _ => {
                     // Unknown role: keep a stable sequential key so unknown
                     // turns don't disrupt the ordering of subsequent entries.
-                    let key = format!(
-                        "unk:{user_turn}:{}",
-                        turn_id.as_deref().unwrap_or("0")
-                    );
+                    let key = format!("unk:{user_turn}:{}", turn_id.as_deref().unwrap_or("0"));
                     (key, vec![])
                 }
             };
@@ -2341,11 +2343,15 @@ mod tests {
 
         assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0].cache_key, "sys:0:0");
-        assert!(chunks[0].markers.contains(&ContextMarker::SystemPromptBoundary));
+        assert!(chunks[0]
+            .markers
+            .contains(&ContextMarker::SystemPromptBoundary));
         assert_eq!(chunks[1].cache_key, "usr:1:t1");
         assert!(chunks[1]
             .markers
-            .contains(&ContextMarker::ConversationTurnStart { turn_id: "t1".to_owned() }));
+            .contains(&ContextMarker::ConversationTurnStart {
+                turn_id: "t1".to_owned()
+            }));
         assert_eq!(chunks[2].cache_key, "ast:1:t1");
         assert_eq!(chunks[3].cache_key, "usr:2:t2");
     }

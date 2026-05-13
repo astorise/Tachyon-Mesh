@@ -136,11 +136,16 @@ fn test_tools_list_is_valid_jsonrpc() {
     // Either a result or a structured error is acceptable
     let has_result = resp["result"].is_object();
     let has_error = resp["error"].is_object();
-    assert!(has_result || has_error, "response must have result or error");
+    assert!(
+        has_result || has_error,
+        "response must have result or error"
+    );
 
     if has_error {
         // Error code must be a known JSON-RPC error
-        let code = resp["error"]["code"].as_i64().expect("error.code is integer");
+        let code = resp["error"]["code"]
+            .as_i64()
+            .expect("error.code is integer");
         assert!(
             [-32001i64, -32002, -32600, -32602, -32603].contains(&code),
             "unexpected error code {code}"
@@ -155,7 +160,10 @@ fn test_tools_list_is_valid_jsonrpc() {
         // Verify every tool entry has required MCP schema fields
         for tool in tools {
             assert!(tool["name"].is_string(), "tool.name is string");
-            assert!(tool["description"].is_string(), "tool.description is string");
+            assert!(
+                tool["description"].is_string(),
+                "tool.description is string"
+            );
             assert!(
                 tool["inputSchema"].is_object(),
                 "tool.inputSchema is object"
@@ -223,10 +231,7 @@ fn test_tools_list_against_live_cluster() {
         .as_array()
         .expect("tools/list succeeded");
 
-    let tool_names: Vec<&str> = tools
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     for expected in &[
         "tachyon_hardware_status",
@@ -258,7 +263,10 @@ fn test_tools_list_against_live_cluster() {
     let hw: serde_json::Value = serde_json::from_str(&hw_raw).unwrap();
     if let Some(err) = hw["error"].as_object() {
         let code = err["code"].as_i64().unwrap_or(0);
-        assert_ne!(code, -32603, "tachyon_hardware_status must not return internal_error");
+        assert_ne!(
+            code, -32603,
+            "tachyon_hardware_status must not return internal_error"
+        );
     }
 
     drop(stdin);
