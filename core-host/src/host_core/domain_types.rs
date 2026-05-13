@@ -388,7 +388,7 @@ pub(crate) struct IntegrityUdpBinding {
     pub(crate) target: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct IntegrityRoute {
     pub(crate) path: String,
     pub(crate) role: RouteRole,

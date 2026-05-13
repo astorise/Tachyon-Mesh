@@ -71,7 +71,7 @@ pub(crate) use reqwest::Client;
 pub(crate) use semver::{Version, VersionReq};
 pub(crate) use serde::Deserialize;
 pub(crate) use serde::Serialize;
-pub(crate) use serde_json::{Map, Value};
+pub(crate) use serde_json::{json, Map, Value};
 pub(crate) use sha2::{Digest, Sha256};
 #[cfg(unix)]
 pub(crate) use std::os::unix::fs::PermissionsExt;
@@ -118,6 +118,7 @@ pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;
 
 mod app_runtime;
 mod background_workers;
+pub(crate) mod openapi;
 mod bridge;
 mod component_hosts;
 mod config_impls;
@@ -137,6 +138,7 @@ mod uds_fast_path;
 mod volumes;
 
 pub(crate) use app_runtime::*;
+pub(crate) use background_workers::*;
 pub(crate) use bridge::*;
 pub(crate) use component_hosts::*;
 pub(crate) use constants::*;

@@ -872,6 +872,7 @@ pub(crate) fn validate_integrity_route(route: IntegrityRoute) -> Result<Integrit
         distributed_rate_limit: route.distributed_rate_limit,
         shadow_target: route.shadow_target,
         adapter_id: route.adapter_id,
+        canary: route.canary,
     })
 }
 

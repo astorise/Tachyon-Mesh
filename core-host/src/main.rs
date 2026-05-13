@@ -1,4 +1,5 @@
 #![deny(clippy::unwrap_used)]
+#![recursion_limit = "256"]
 
 #[cfg(feature = "ai-inference")]
 mod ai_inference;

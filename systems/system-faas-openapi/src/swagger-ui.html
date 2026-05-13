@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Tachyon Mesh Admin API</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({
+      url: "/admin/schema/openapi.json",
+      dom_id: "#swagger-ui",
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+      layout: "StandaloneLayout",
+      deepLinking: true,
+      tryItOutEnabled: true,
+      requestInterceptor: function(request) {
+        var token = document.getElementById("bearer-token-input");
+        if (token && token.value) {
+          request.headers["Authorization"] = "Bearer " + token.value;
+        }
+        return request;
+      }
+    });
+  </script>
+  <div style="position:fixed;top:8px;right:12px;z-index:9999;display:flex;gap:8px;align-items:center;">
+    <label for="bearer-token-input" style="color:#fff;font-size:13px;font-family:monospace;">Bearer Token:</label>
+    <input id="bearer-token-input" type="password" placeholder="paste token here"
+      style="font-family:monospace;font-size:13px;padding:4px 8px;background:#1a202c;color:#a0e4ff;border:1px solid #4a5568;border-radius:4px;width:260px;">
+  </div>
+</body>
+</html>
