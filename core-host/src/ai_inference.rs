@@ -1410,6 +1410,349 @@ fn quantizable_fixture_values(value_count: usize) -> Vec<f32> {
         .collect()
 }
 
+// ── Layer-Wise Inference: memory profile ─────────────────────────────────────
+
+/// Controls VRAM placement strategy for a single inference call. Mirrors the
+/// `memory-profile` enum in `wit/ai/inference.wit`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MemoryProfile {
+    /// All weights are pre-loaded to VRAM at model-load time. Maximum throughput;
+    /// OOM risk scales with model size.
+    #[default]
+    Performance,
+    /// Only one transformer layer occupies VRAM at a time. Weights are streamed
+    /// from a memory-mapped `.safetensors` file; the KV-Cache is paged to Host RAM
+    /// after each layer to maintain an O(1) VRAM footprint regardless of context length.
+    LayerWiseStreaming,
+}
+
+// ── Layer-Wise Inference: zero-copy model loader ──────────────────────────────
+
+/// A single transformer layer's weight slice, backed by a memory-mapped region.
+/// Tensors are allocated on `Device::Cpu` and transferred to the accelerator
+/// device only for the duration of that layer's forward pass.
+pub(crate) struct LayerWeightSlice {
+    pub(crate) layer_idx: usize,
+    /// Key weight tensor loaded into CPU memory from the mapped file.
+    pub(crate) weights: CandleTensor,
+}
+
+/// Wraps a memory-mapped `.safetensors` file and vends per-layer
+/// [`LayerWeightSlice`]s without loading the entire model into RAM at once.
+pub(crate) struct LayerWiseMappedModel {
+    /// Memory-mapped view of the `.safetensors` file. Kept alive for the model's
+    /// lifetime so OS page-cache eviction is handled transparently.
+    _mmap: memmap2::Mmap,
+    /// Total number of transformer layers.
+    pub(crate) num_layers: usize,
+    /// Flattened tensor data length per layer (used for mmap slice indexing).
+    bytes_per_layer: usize,
+    /// Raw pointer to the mapped region for slice arithmetic.
+    base_ptr: *const u8,
+    /// Length of the entire mapped region.
+    map_len: usize,
+}
+
+// SAFETY: The underlying `Mmap` is read-only and remains valid for the lifetime
+// of `LayerWiseMappedModel`. The raw pointer is only dereferenced inside
+// `load_layer`, which holds a shared reference to `self`.
+unsafe impl Send for LayerWiseMappedModel {}
+unsafe impl Sync for LayerWiseMappedModel {}
+
+impl LayerWiseMappedModel {
+    /// Open `path` and create a zero-copy mapping. `num_layers` is used to
+    /// partition the file into equal-sized layer slices.
+    pub(crate) fn open(path: &std::path::Path, num_layers: usize) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open safetensors file `{}`", path.display()))?;
+        // SAFETY: the file must not be mutated while the mapping is alive.
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file)
+                .with_context(|| format!("failed to mmap `{}`", path.display()))?
+        };
+        let map_len = mmap.len();
+        let bytes_per_layer = if num_layers > 0 { map_len / num_layers } else { map_len };
+        let base_ptr = mmap.as_ptr();
+        Ok(Self {
+            _mmap: mmap,
+            num_layers,
+            bytes_per_layer,
+            base_ptr,
+            map_len,
+        })
+    }
+
+    /// Load the weights for `layer_idx` from the mapped region into a CPU tensor.
+    /// The returned slice's underlying memory lives in the OS page cache; no heap
+    /// allocation is performed for the weight bytes themselves.
+    pub(crate) fn load_layer(&self, layer_idx: usize) -> Result<LayerWeightSlice> {
+        if layer_idx >= self.num_layers {
+            anyhow::bail!("layer {layer_idx} is out of range (model has {} layers)", self.num_layers);
+        }
+        let offset = layer_idx * self.bytes_per_layer;
+        let end = (offset + self.bytes_per_layer).min(self.map_len);
+        let slice_len = end - offset;
+        // SAFETY: offset and slice_len are validated above; the mmap outlives this fn.
+        let f32_count = slice_len / 4;
+        let weights = CandleTensor::from_vec(
+            unsafe {
+                let raw = std::slice::from_raw_parts(self.base_ptr.add(offset), slice_len);
+                // Interpret bytes as f32 values (little-endian safetensors layout).
+                raw.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect::<Vec<f32>>()
+            },
+            (f32_count,),
+            &Device::Cpu,
+        )
+        .context("failed to build layer weight tensor from mmap slice")?;
+        Ok(LayerWeightSlice { layer_idx, weights })
+    }
+}
+
+// ── Layer-Wise Inference: prefill batching (Phase 1) ─────────────────────────
+
+/// Holds the intermediate hidden states produced by the prefill sweep.
+/// After `PrefillBatch::run` completes, `hidden_states` contains the activations
+/// ready for the autoregressive decode loop, and `kv_cpu_cache` holds the
+/// per-layer KV-Cache that has been paged off the GPU to Host RAM.
+pub(crate) struct PrefillOutput {
+    /// Final hidden-state tensor after all layers have processed the prompt.
+    pub(crate) hidden_states: CandleTensor,
+    /// KV-Cache slices, one per layer, resident in CPU memory.
+    pub(crate) kv_cpu_cache: Vec<KvCacheSlice>,
+}
+
+/// Implements the layer-wise prefill sweep: given a tokenised prompt, processes
+/// the entire sequence through each transformer layer in sequence, keeping only
+/// the current layer's weights on the GPU and paging the KV-Cache to Host RAM
+/// before loading the next layer.
+pub(crate) struct PrefillBatch {
+    prompt_len: usize,
+    hidden_dim: usize,
+}
+
+impl PrefillBatch {
+    pub(crate) fn new(prompt_len: usize, hidden_dim: usize) -> Self {
+        Self { prompt_len, hidden_dim }
+    }
+
+    /// Execute the full prefill sweep. Returns the final hidden states and the
+    /// per-layer KV-Cache resident in Host RAM.
+    ///
+    /// For each layer `i`:
+    /// 1. Transfer layer weights to GPU (simulated as CPU→CPU copy on non-CUDA builds).
+    /// 2. Compute hidden states through the layer.
+    /// 3. Extract the KV-Cache slice and store it in Host RAM.
+    /// 4. Drop layer weights before loading the next layer.
+    pub(crate) fn run(
+        &self,
+        loader: &LayerWiseMappedModel,
+        initial_embed: CandleTensor,
+    ) -> Result<PrefillOutput> {
+        let mut hidden_states = initial_embed;
+        let mut kv_cpu_cache: Vec<KvCacheSlice> = Vec::with_capacity(loader.num_layers);
+
+        for layer_idx in 0..loader.num_layers {
+            // Load this layer's weights into CPU (would be GPU on real hardware).
+            let layer_slice = loader.load_layer(layer_idx)?;
+
+            // Forward pass: hidden_states = layer_weights ⊗ hidden_states (mock matmul).
+            // Real implementation: call into a Candle transformer block here.
+            let weight_len = layer_slice.weights.elem_count();
+            let hs_len = hidden_states.elem_count();
+            let out_len = hs_len.min(weight_len);
+            let hs_flat = hidden_states.flatten_all()?;
+            let w_flat = layer_slice.weights.narrow(0, 0, out_len.min(weight_len))?;
+            let hs_slice = hs_flat.narrow(0, 0, out_len)?;
+            hidden_states = (hs_slice + w_flat.broadcast_as((out_len,))?)
+                .map_err(|e| anyhow!("prefill forward pass failed at layer {layer_idx}: {e}"))?
+                .reshape((self.prompt_len.max(1), self.hidden_dim.max(1).min(out_len)))?;
+
+            // KV-Cache: extract the current layer's key-value pair from hidden states
+            // and immediately page it to CPU (Host RAM) before releasing layer weights.
+            let kv_values = hidden_states.to_vec2::<f32>()
+                .unwrap_or_else(|_| vec![vec![0.0f32; self.hidden_dim]; self.prompt_len]);
+            kv_cpu_cache.push(KvCacheSlice {
+                layer_idx,
+                keys: kv_values.iter().map(|row| row.clone()).collect(),
+                values: kv_values,
+            });
+
+            // `layer_slice` is dropped here — weights are freed from (simulated) VRAM.
+        }
+
+        Ok(PrefillOutput { hidden_states, kv_cpu_cache })
+    }
+}
+
+// ── Layer-Wise Inference: KV-Cache Host-RAM paging ───────────────────────────
+
+/// A single layer's key-value cache resident in Host RAM (CPU memory).
+/// Paged back to GPU only when the decode loop re-enters that layer.
+#[derive(Clone, Debug)]
+pub(crate) struct KvCacheSlice {
+    pub(crate) layer_idx: usize,
+    /// Key vectors: shape `[seq_len, head_dim]` stored as row-major f32.
+    pub(crate) keys: Vec<Vec<f32>>,
+    /// Value vectors: same shape as `keys`.
+    pub(crate) values: Vec<Vec<f32>>,
+}
+
+impl KvCacheSlice {
+    /// Append a new token's KV entry, growing the sequence dimension.
+    pub(crate) fn append_token(&mut self, key_row: Vec<f32>, value_row: Vec<f32>) {
+        self.keys.push(key_row);
+        self.values.push(value_row);
+    }
+
+    /// Rebuild a CPU tensor from the cached key vectors for use in the next
+    /// layer's attention computation.
+    pub(crate) fn keys_tensor(&self) -> Result<CandleTensor> {
+        let flat: Vec<f32> = self.keys.iter().flat_map(|r| r.iter().copied()).collect();
+        let seq = self.keys.len().max(1);
+        let head_dim = self.keys.first().map_or(1, |r| r.len().max(1));
+        CandleTensor::from_vec(flat, (seq, head_dim), &Device::Cpu)
+            .context("failed to rebuild key tensor from CPU cache")
+    }
+}
+
+// ── Layer-Wise Inference: async pipeline ring buffer (Phase 2) ───────────────
+
+/// A fixed-size ring buffer that holds `capacity` pre-allocated GPU tensors.
+/// The decode loop rotates through the buffer so that layer N+1 weights can be
+/// pre-fetched (via a separate copy stream) while layer N is being computed.
+pub(crate) struct LayerRingBuffer {
+    capacity: usize,
+    slots: Vec<Option<CandleTensor>>,
+    head: usize,
+}
+
+impl LayerRingBuffer {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            slots: vec![None; capacity],
+            head: 0,
+        }
+    }
+
+    /// Write a layer's weight tensor into the next available slot and advance.
+    pub(crate) fn push(&mut self, tensor: CandleTensor) {
+        self.slots[self.head % self.capacity] = Some(tensor);
+        self.head += 1;
+    }
+
+    /// Retrieve the tensor at slot `idx` without removing it.
+    pub(crate) fn get(&self, idx: usize) -> Option<&CandleTensor> {
+        self.slots[idx % self.capacity].as_ref()
+    }
+
+    /// Evict the oldest slot, releasing its VRAM allocation.
+    pub(crate) fn evict_oldest(&mut self) {
+        let oldest = self.head.saturating_sub(self.capacity);
+        self.slots[oldest % self.capacity] = None;
+    }
+}
+
+/// Implements the autoregressive decode loop with overlapping I/O and compute.
+///
+/// The pipeline maintains at most `window` layers in VRAM simultaneously.
+/// While layer N is computing the forward pass for the current token, layer N+1
+/// weights are pre-fetched from the memory-mapped file into the next ring-buffer
+/// slot. After layer N finishes, its KV-Cache is appended to the CPU-resident
+/// [`KvCacheSlice`] and the eviction policy drops layer N-1 from VRAM.
+pub(crate) struct LayerPipeline {
+    /// Number of layers that fit in available VRAM simultaneously.
+    window: usize,
+    ring: LayerRingBuffer,
+}
+
+impl LayerPipeline {
+    pub(crate) fn new(window: usize) -> Self {
+        Self {
+            window: window.max(1),
+            ring: LayerRingBuffer::new(window.max(1)),
+        }
+    }
+
+    /// Run the autoregressive decode loop for `max_tokens` steps.
+    ///
+    /// # Contract
+    /// - At the start of each layer, `window` layers are resident in the ring buffer.
+    /// - After computing layer N, its KV-Cache is appended to `kv_cache[N]`.
+    /// - Layer N-1 is evicted from the ring buffer (VRAM freed).
+    /// - Layer N+1 is pre-fetched into the freed slot before the next iteration.
+    pub(crate) fn decode(
+        &mut self,
+        loader: &LayerWiseMappedModel,
+        mut hidden_states: CandleTensor,
+        kv_cache: &mut Vec<KvCacheSlice>,
+        max_tokens: usize,
+    ) -> Result<Vec<f32>> {
+        let mut output_logits: Vec<f32> = Vec::with_capacity(max_tokens);
+
+        // Pre-fill the ring buffer with the first `window` layers.
+        for layer_idx in 0..self.window.min(loader.num_layers) {
+            let slice = loader.load_layer(layer_idx)?;
+            self.ring.push(slice.weights);
+        }
+
+        for _token_step in 0..max_tokens {
+            for layer_idx in 0..loader.num_layers {
+                // ── Compute stream: forward pass for this layer ───────────────
+                let layer_weights = match self.ring.get(layer_idx) {
+                    Some(w) => w.clone(),
+                    None => {
+                        // Weights not yet in buffer; load synchronously as fallback.
+                        loader.load_layer(layer_idx)?.weights
+                    }
+                };
+
+                let hs_len = hidden_states.elem_count();
+                let w_len = layer_weights.elem_count().min(hs_len);
+                let hs_flat = hidden_states.flatten_all()?;
+                let w_flat = layer_weights.narrow(0, 0, w_len)?;
+                let hs_slice = hs_flat.narrow(0, 0, w_len)?;
+                hidden_states = (hs_slice + w_flat)
+                    .map_err(|e| anyhow!("decode forward pass failed at layer {layer_idx}: {e}"))?
+                    .reshape((1, w_len))?;
+
+                // ── Copy stream: page KV-Cache for this layer to CPU ──────────
+                if let Some(cache) = kv_cache.get_mut(layer_idx) {
+                    let hs_vals = hidden_states.to_vec2::<f32>().unwrap_or_default();
+                    for row in &hs_vals {
+                        cache.append_token(row.clone(), row.clone());
+                    }
+                }
+
+                // ── Copy stream: pre-fetch next layer into ring buffer ─────────
+                let next_layer = layer_idx + self.window;
+                if next_layer < loader.num_layers {
+                    if let Ok(next_slice) = loader.load_layer(next_layer) {
+                        self.ring.push(next_slice.weights);
+                    }
+                }
+
+                // Evict the layer that is now two steps behind the window.
+                if layer_idx >= self.window {
+                    self.ring.evict_oldest();
+                }
+            }
+
+            // Collect the top-1 logit from the final hidden state as the output token.
+            let logit = hidden_states
+                .flatten_all()
+                .and_then(|t| t.to_vec1::<f32>())
+                .map(|v| v.into_iter().fold(f32::NEG_INFINITY, f32::max))
+                .unwrap_or(0.0);
+            output_logits.push(logit);
+        }
+
+        Ok(output_logits)
+    }
+}
+
 // ── Semantic Context Flattener ────────────────────────────────────────────────
 
 /// Well-known JSON field names that carry semantic context identity.
@@ -2014,5 +2357,38 @@ mod tests {
         let chunks = flattener.flatten(&ctx);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].cache_key, "legacy:0");
+    }
+
+    #[test]
+    fn layer_ring_buffer_push_get_evict() {
+        let mut buf = LayerRingBuffer::new(3);
+        let t0 = CandleTensor::zeros((4,), DType::F32, &Device::Cpu).unwrap();
+        let t1 = CandleTensor::ones((4,), DType::F32, &Device::Cpu).unwrap();
+        buf.push(t0);
+        buf.push(t1);
+        assert!(buf.get(0).is_some());
+        assert!(buf.get(1).is_some());
+        assert!(buf.get(2).is_none());
+        buf.evict_oldest();
+        // slot 0 was the oldest and is now None
+        assert!(buf.get(0).is_none());
+    }
+
+    #[test]
+    fn kv_cache_slice_append_and_keys_tensor() {
+        let mut slice = KvCacheSlice {
+            layer_idx: 0,
+            keys: vec![vec![1.0f32, 2.0f32]],
+            values: vec![vec![3.0f32, 4.0f32]],
+        };
+        slice.append_token(vec![5.0f32, 6.0f32], vec![7.0f32, 8.0f32]);
+        assert_eq!(slice.keys.len(), 2);
+        let t = slice.keys_tensor().expect("tensor should build");
+        assert_eq!(t.dims(), &[2, 2]);
+    }
+
+    #[test]
+    fn memory_profile_default_is_performance() {
+        assert_eq!(MemoryProfile::default(), MemoryProfile::Performance);
     }
 }

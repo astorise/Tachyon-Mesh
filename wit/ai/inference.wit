@@ -25,7 +25,31 @@ interface inference {
         fuel-consumed: u64,
     }
 
+    /// Controls how model weights and the KV-cache are placed relative to VRAM.
+    enum memory-profile {
+        /// Default: load all weights to VRAM at startup. Maximum throughput; OOM
+        /// risk proportional to model size.
+        performance,
+        /// Layer-wise streaming: keep only one transformer layer in VRAM at a time.
+        /// Each layer is loaded from a memory-mapped `.safetensors` file on demand
+        /// and dropped after its forward pass. The KV-Cache is paged to Host RAM
+        /// after each layer, maintaining an O(1) VRAM footprint.
+        layer-wise-streaming,
+    }
+
+    /// Per-call tuning knobs that override the model-level defaults.
+    record inference-options {
+        temperature: f32,
+        max-tokens: u32,
+        /// Selects the VRAM placement strategy for this call.
+        profile: memory-profile,
+    }
+
     /// Run a single inference call. The host honours `adapter-id` by hot-applying the
     /// adapter weights via Candle, then removing the overlay before returning.
     infer: func(req: inference-request) -> result<inference-response, string>;
+
+    /// Run a call with explicit per-call options. Falls back to `infer` semantics
+    /// when `options.profile` is `performance`.
+    infer-with-options: func(req: inference-request, options: inference-options) -> result<inference-response, string>;
 }
