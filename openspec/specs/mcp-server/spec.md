@@ -139,3 +139,23 @@ The MCP server SHALL return typed JSON-RPC errors with machine-readable codes an
 - **GIVEN** a tool call fails for an unclassified reason
 - **WHEN** `JsonRpcError::from_anyhow` classifies the error
 - **THEN** the response error code is `-32603`
+
+### Requirement: Advanced MCP tools — WASM lifecycle and KV operations
+The MCP server SHALL expose tools for deploying and managing WASM functions, reading/writing the KV-Partition V2 store, and adjusting canary traffic splits.
+
+#### Scenario: Agent deploys a WASM artifact
+- **WHEN** `tachyon_deploy_function` is called with `function_name` and `artifact_path`
+- **THEN** the artifact is read from disk and uploaded as a named mesh asset
+- **AND** a workload configuration overlay is staged
+- **AND** the response advises the agent to run `tachyon_seal_overlay`
+
+#### Scenario: Agent reads a KV-Partition value
+- **WHEN** `tachyon_kv_get` is called with `namespace` and `key`
+- **THEN** the UTF-8 string value is returned, or `(key not found)` if absent
+
+#### Scenario: Agent adjusts canary traffic split
+- **GIVEN** an active canary rollout exists for `route_path`
+- **WHEN** `tachyon_canary_split` is called with `weight_pct > 0`
+- **THEN** the live rollout weight is updated to the specified percentage via `PATCH /admin/canary`
+- **WHEN** `tachyon_canary_split` is called with `weight_pct = 0`
+- **THEN** the rollout is aborted and traffic reverts to the stable version

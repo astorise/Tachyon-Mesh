@@ -12,8 +12,16 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/admin/metrics", get(admin_metrics_handler))
         .route("/admin/schema/manifest", get(admin_manifest_schema_handler))
         .route(
+            "/admin/kv/{namespace}/{key}",
+            get(admin_kv_get_handler)
+                .put(admin_kv_put_handler)
+                .delete(admin_kv_delete_handler),
+        )
+        .route(
             "/admin/canary",
-            get(admin_canary_status_handler).post(admin_abort_canary_handler),
+            get(admin_canary_status_handler)
+                .post(admin_abort_canary_handler)
+                .patch(admin_set_canary_weight_handler),
         )
         .route("/admin/shadow/diffs", get(admin_shadow_diffs_handler))
         .route("/admin/chaos/scenarios", post(admin_chaos_scenario_handler))
@@ -294,6 +302,52 @@ pub(crate) async fn admin_manifest_schema_handler() -> axum::Json<serde_json::Va
     }))
 }
 
+pub(crate) async fn admin_kv_get_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((namespace, key)): axum::extract::Path<(String, String)>,
+) -> Response {
+    match state
+        .core_store
+        .kv_partition_get(&namespace, &key)
+    {
+        Ok(Some(bytes)) => (
+            StatusCode::OK,
+            [("content-type", "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "key not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub(crate) async fn admin_kv_put_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((namespace, key)): axum::extract::Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    match state
+        .core_store
+        .kv_partition_set(&namespace, &key, &body)
+    {
+        Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub(crate) async fn admin_kv_delete_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((namespace, key)): axum::extract::Path<(String, String)>,
+) -> Response {
+    match state
+        .core_store
+        .kv_partition_delete(&namespace, &key)
+    {
+        Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 pub(crate) async fn admin_shadow_diffs_handler() -> axum::Json<Vec<AdminShadowDiff>> {
     // Shadow divergences are emitted by system-faas-shadow-proxy into the
     // telemetry stream. The admin surface is intentionally stable even when no
@@ -364,6 +418,42 @@ pub(crate) async fn admin_abort_canary_handler(
             "canary rollout manually aborted by operator"
         );
         (StatusCode::OK, "rollout aborted").into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            format!("no active canary rollout for route `{}`", payload.route_path),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminSetCanaryWeightRequest {
+    pub(crate) route_path: String,
+    /// Desired traffic percentage for `next_version` (0–100).
+    pub(crate) weight_pct: u8,
+}
+
+pub(crate) async fn admin_set_canary_weight_handler(
+    axum::Json(payload): axum::Json<AdminSetCanaryWeightRequest>,
+) -> Response {
+    let registry = canary_rollouts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(rollout) = registry.get(&payload.route_path) {
+        let weight = payload.weight_pct.min(100);
+        rollout.weight_pct.store(u32::from(weight), Ordering::SeqCst);
+        if weight >= 100 {
+            let mut phase = rollout.phase.lock().unwrap_or_else(|p| p.into_inner());
+            *phase = CanaryPhase::Promoted;
+        }
+        tracing::info!(
+            route = %payload.route_path,
+            weight_pct = weight,
+            "canary weight updated by operator"
+        );
+        (StatusCode::OK, format!("weight set to {weight}%")).into_response()
     } else {
         (
             StatusCode::NOT_FOUND,
