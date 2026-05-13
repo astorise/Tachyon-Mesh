@@ -1583,7 +1583,7 @@ impl PrefillBatch {
                 .unwrap_or_else(|_| vec![vec![0.0f32; self.hidden_dim]; self.prompt_len]);
             kv_cpu_cache.push(KvCacheSlice {
                 layer_idx,
-                keys: kv_values.iter().cloned().collect(),
+                keys: kv_values.to_vec(),
                 values: kv_values,
             });
 
