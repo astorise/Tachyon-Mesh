@@ -174,9 +174,8 @@ pub(crate) struct CanaryRolloutState {
     pub(crate) stop_tx: tokio::sync::watch::Sender<bool>,
 }
 
-pub(crate) static CANARY_ROLLOUTS: OnceLock<
-    Arc<Mutex<HashMap<String, Arc<CanaryRolloutState>>>>,
-> = OnceLock::new();
+pub(crate) static CANARY_ROLLOUTS: OnceLock<Arc<Mutex<HashMap<String, Arc<CanaryRolloutState>>>>> =
+    OnceLock::new();
 
 pub(crate) fn canary_rollouts() -> &'static Arc<Mutex<HashMap<String, Arc<CanaryRolloutState>>>> {
     CANARY_ROLLOUTS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))

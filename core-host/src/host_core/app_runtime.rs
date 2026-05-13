@@ -333,10 +333,7 @@ pub(crate) async fn admin_kv_get_handler(
     State(state): State<AppState>,
     axum::extract::Path((namespace, key)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    match state
-        .core_store
-        .kv_partition_get(&namespace, &key)
-    {
+    match state.core_store.kv_partition_get(&namespace, &key) {
         Ok(Some(bytes)) => (
             StatusCode::OK,
             [("content-type", "application/octet-stream")],
@@ -353,10 +350,7 @@ pub(crate) async fn admin_kv_put_handler(
     axum::extract::Path((namespace, key)): axum::extract::Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    match state
-        .core_store
-        .kv_partition_set(&namespace, &key, &body)
-    {
+    match state.core_store.kv_partition_set(&namespace, &key, &body) {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -366,10 +360,7 @@ pub(crate) async fn admin_kv_delete_handler(
     State(state): State<AppState>,
     axum::extract::Path((namespace, key)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    match state
-        .core_store
-        .kv_partition_delete(&namespace, &key)
-    {
+    match state.core_store.kv_partition_delete(&namespace, &key) {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -448,7 +439,10 @@ pub(crate) async fn admin_abort_canary_handler(
     } else {
         (
             StatusCode::NOT_FOUND,
-            format!("no active canary rollout for route `{}`", payload.route_path),
+            format!(
+                "no active canary rollout for route `{}`",
+                payload.route_path
+            ),
         )
             .into_response()
     }
@@ -470,7 +464,9 @@ pub(crate) async fn admin_set_canary_weight_handler(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(rollout) = registry.get(&payload.route_path) {
         let weight = payload.weight_pct.min(100);
-        rollout.weight_pct.store(u32::from(weight), Ordering::SeqCst);
+        rollout
+            .weight_pct
+            .store(u32::from(weight), Ordering::SeqCst);
         if weight >= 100 {
             let mut phase = rollout.phase.lock().unwrap_or_else(|p| p.into_inner());
             *phase = CanaryPhase::Promoted;
@@ -484,7 +480,10 @@ pub(crate) async fn admin_set_canary_weight_handler(
     } else {
         (
             StatusCode::NOT_FOUND,
-            format!("no active canary rollout for route `{}`", payload.route_path),
+            format!(
+                "no active canary rollout for route `{}`",
+                payload.route_path
+            ),
         )
             .into_response()
     }

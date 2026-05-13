@@ -261,10 +261,7 @@ pub(crate) fn spawn_canary_evaluators(config: &IntegrityConfig) {
     }
 }
 
-async fn run_canary_evaluator(
-    state: Arc<CanaryRolloutState>,
-    mut stop_rx: watch::Receiver<bool>,
-) {
+async fn run_canary_evaluator(state: Arc<CanaryRolloutState>, mut stop_rx: watch::Receiver<bool>) {
     let interval = Duration::from_secs(state.interval_secs);
 
     loop {

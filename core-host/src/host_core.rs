@@ -118,7 +118,6 @@ pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;
 
 mod app_runtime;
 mod background_workers;
-pub(crate) mod openapi;
 mod bridge;
 mod component_hosts;
 mod config_impls;
@@ -129,6 +128,7 @@ mod guest_output;
 mod guest_runtime;
 mod integrity_config;
 pub(crate) mod kv_cache;
+pub(crate) mod openapi;
 mod peer_pressure;
 mod prewarm;
 mod runtime_types;

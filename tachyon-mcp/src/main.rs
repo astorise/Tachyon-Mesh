@@ -455,10 +455,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
             if uri != "hardware://local/status" {
                 return Ok(Some(json_rpc_error_response(
                     id,
-                    &JsonRpcError::invalid_params(
-                        "unsupported resource",
-                        json!({ "uri": uri }),
-                    ),
+                    &JsonRpcError::invalid_params("unsupported resource", json!({ "uri": uri })),
                 )));
             }
             let status = tokio::task::spawn_blocking(tachyon_client::read_local_hardware_status)
@@ -790,7 +787,10 @@ async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Resul
     .unwrap_or_else(|_| Err(anyhow::anyhow!("__TIMEOUT__")));
 
     tool_result.or_else(|err| {
-        Ok(json_rpc_error_response(None, &JsonRpcError::from_anyhow(&err)))
+        Ok(json_rpc_error_response(
+            None,
+            &JsonRpcError::from_anyhow(&err),
+        ))
     })
 }
 
@@ -987,11 +987,15 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
             let result =
                 tachyon_client::deploy_function(function_name, wasm_bytes, memory_mb, gpu_vram_mb)
                     .await?;
-            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result)? }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result)? }] }),
+            )
         }
         "tachyon_list_functions" => {
             let functions = tachyon_client::list_functions().await?;
-            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&functions)? }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&functions)? }] }),
+            )
         }
         "tachyon_delete_function" => {
             let arguments = params
@@ -1003,7 +1007,9 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 .and_then(Value::as_str)
                 .context("missing function_name")?;
             tachyon_client::delete_function(function_name).await?;
-            Ok(json!({ "content": [{ "type": "text", "text": format!("function `{function_name}` removed from overlay") }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": format!("function `{function_name}` removed from overlay") }] }),
+            )
         }
         "tachyon_function_logs" => {
             let arguments = params
@@ -1020,7 +1026,9 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 .unwrap_or(100)
                 .min(1_000) as usize;
             let logs = tachyon_client::function_logs(function_name, lines).await?;
-            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&logs)? }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&logs)? }] }),
+            )
         }
 
         // ── KV-Partition V2 ───────────────────────────────────────────────────
@@ -1062,7 +1070,9 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 .and_then(Value::as_str)
                 .context("missing value")?;
             tachyon_client::kv_put(namespace, key, value.as_bytes()).await?;
-            Ok(json!({ "content": [{ "type": "text", "text": format!("written {namespace}/{key}") }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": format!("written {namespace}/{key}") }] }),
+            )
         }
         "tachyon_kv_delete" => {
             let arguments = params
@@ -1078,7 +1088,9 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 .and_then(Value::as_str)
                 .context("missing key")?;
             tachyon_client::kv_delete(namespace, key).await?;
-            Ok(json!({ "content": [{ "type": "text", "text": format!("deleted {namespace}/{key}") }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": format!("deleted {namespace}/{key}") }] }),
+            )
         }
 
         // ── Canary traffic split ──────────────────────────────────────────────
@@ -1172,10 +1184,13 @@ mod tests {
     fn per_tool_rate_limit_denies_second_apply_manifest_call() {
         let limiter = ToolRateLimiter::new_with_path(test_state_path("apply-limit"));
 
-        assert!(limiter
-            .allow("tachyon_apply_manifest")
-            .expect("first request should succeed")
-            .is_none(), "first request should not be rate-limited");
+        assert!(
+            limiter
+                .allow("tachyon_apply_manifest")
+                .expect("first request should succeed")
+                .is_none(),
+            "first request should not be rate-limited"
+        );
         let retry_ms = limiter
             .allow("tachyon_apply_manifest")
             .expect("second request result should not error");

@@ -1305,8 +1305,10 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
             table_name: name,
             core_store: Arc::clone(&self.storage_broker.core_store),
         };
-        let owned: wasmtime::component::Resource<RedbTableResource> =
-            self.table.push(resource).expect("resource table push failed");
+        let owned: wasmtime::component::Resource<RedbTableResource> = self
+            .table
+            .push(resource)
+            .expect("resource table push failed");
         wasmtime::component::Resource::new_own(owned.rep())
     }
 
@@ -1317,8 +1319,7 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         >,
         key: String,
     ) -> std::result::Result<Vec<u8>, String> {
-        let handle =
-            wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
         res.core_store
             .kv_partition_get(&res.table_name, &key)
@@ -1334,8 +1335,7 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         key: String,
         value: Vec<u8>,
     ) -> std::result::Result<(), String> {
-        let handle =
-            wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
         res.core_store
             .kv_partition_set(&res.table_name, &key, &value)
@@ -1349,8 +1349,7 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         >,
         key: String,
     ) -> std::result::Result<(), String> {
-        let handle =
-            wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
         res.core_store
             .kv_partition_delete(&res.table_name, &key)
@@ -1364,8 +1363,7 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         >,
         entries: Vec<(String, Vec<u8>)>,
     ) -> std::result::Result<(), String> {
-        let handle =
-            wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
         res.core_store
             .kv_partition_batch_set(&res.table_name, &entries)
@@ -1382,8 +1380,7 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         limit: u32,
         offset: u32,
     ) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
-        let handle =
-            wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
         res.core_store
             .kv_partition_get_range(&res.table_name, &start_key, &end_key, limit, offset)
@@ -1392,12 +1389,12 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
 
     fn drop(
         &mut self,
-        rep: wasmtime::component::Resource<
-            component_bindings::tachyon::mesh::kv_partition::Table,
-        >,
+        rep: wasmtime::component::Resource<component_bindings::tachyon::mesh::kv_partition::Table>,
     ) -> wasmtime::Result<()> {
         self.table
-            .delete(wasmtime::component::Resource::<RedbTableResource>::new_own(rep.rep()))?;
+            .delete(wasmtime::component::Resource::<RedbTableResource>::new_own(
+                rep.rep(),
+            ))?;
         Ok(())
     }
 }

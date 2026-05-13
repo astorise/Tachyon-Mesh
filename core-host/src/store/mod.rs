@@ -759,8 +759,7 @@ impl CoreStore {
 
     pub(crate) fn kv_partition_get(&self, table_name: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let table_key = format!("kv_partition::{table_name}");
-        let table_def: redb::TableDefinition<&str, &[u8]> =
-            redb::TableDefinition::new(&table_key);
+        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let read_txn = self
             .db
             .begin_read()
@@ -776,15 +775,9 @@ impl CoreStore {
             .map(|v| v.value().to_owned()))
     }
 
-    pub(crate) fn kv_partition_set(
-        &self,
-        table_name: &str,
-        key: &str,
-        value: &[u8],
-    ) -> Result<()> {
+    pub(crate) fn kv_partition_set(&self, table_name: &str, key: &str, value: &[u8]) -> Result<()> {
         let table_key = format!("kv_partition::{table_name}");
-        let table_def: redb::TableDefinition<&str, &[u8]> =
-            redb::TableDefinition::new(&table_key);
+        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let write_txn = self
             .db
             .begin_write()
@@ -804,8 +797,7 @@ impl CoreStore {
 
     pub(crate) fn kv_partition_delete(&self, table_name: &str, key: &str) -> Result<()> {
         let table_key = format!("kv_partition::{table_name}");
-        let table_def: redb::TableDefinition<&str, &[u8]> =
-            redb::TableDefinition::new(&table_key);
+        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let write_txn = self
             .db
             .begin_write()
@@ -829,8 +821,7 @@ impl CoreStore {
         entries: &[(String, Vec<u8>)],
     ) -> Result<()> {
         let table_key = format!("kv_partition::{table_name}");
-        let table_def: redb::TableDefinition<&str, &[u8]> =
-            redb::TableDefinition::new(&table_key);
+        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let write_txn = self
             .db
             .begin_write()
@@ -859,8 +850,7 @@ impl CoreStore {
         offset: u32,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let table_key = format!("kv_partition::{table_name}");
-        let table_def: redb::TableDefinition<&str, &[u8]> =
-            redb::TableDefinition::new(&table_key);
+        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let read_txn = self
             .db
             .begin_read()
@@ -868,18 +858,14 @@ impl CoreStore {
         let table = match read_txn.open_table(table_def) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(e).context("kv_partition_get_range: failed to open table")
-            }
+            Err(e) => return Err(e).context("kv_partition_get_range: failed to open table"),
         };
         let results: std::result::Result<Vec<_>, _> = table
             .range(start_key..end_key)
             .context("kv_partition_get_range: range scan failed")?
             .skip(offset as usize)
             .take(limit as usize)
-            .map(|result| {
-                result.map(|(k, v)| (k.value().to_owned(), v.value().to_owned()))
-            })
+            .map(|result| result.map(|(k, v)| (k.value().to_owned(), v.value().to_owned())))
             .collect();
         results.context("kv_partition_get_range: failed to collect range results")
     }

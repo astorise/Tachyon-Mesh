@@ -146,12 +146,20 @@ pub struct DryRunResult {
 impl DryRunResult {
     /// Convenience constructor for a successful validation with no errors.
     pub fn ok(diff: Option<Value>) -> Self {
-        Self { valid: true, errors: Vec::new(), diff }
+        Self {
+            valid: true,
+            errors: Vec::new(),
+            diff,
+        }
     }
 
     /// Convenience constructor for a failed validation.
     pub fn fail(errors: Vec<ValidationError>) -> Self {
-        Self { valid: false, errors, diff: None }
+        Self {
+            valid: false,
+            errors,
+            diff: None,
+        }
     }
 }
 

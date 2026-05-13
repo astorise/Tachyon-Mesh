@@ -1757,11 +1757,7 @@ pub async fn kv_get(namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
     let config = require_connection()?;
     let client = build_http_client(&config)?;
     let url = build_endpoint_url(&config.url, &path)?;
-    let response = client
-        .get(url)
-        .bearer_auth(&config.token)
-        .send()
-        .await?;
+    let response = client.get(url).bearer_auth(&config.token).send().await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -1801,11 +1797,7 @@ pub async fn kv_delete(namespace: &str, key: &str) -> Result<()> {
     let config = require_connection()?;
     let client = build_http_client(&config)?;
     let url = build_endpoint_url(&config.url, &path)?;
-    let response = client
-        .delete(url)
-        .bearer_auth(&config.token)
-        .send()
-        .await?;
+    let response = client.delete(url).bearer_auth(&config.token).send().await?;
     if !response.status().is_success() {
         anyhow::bail!("kv_delete failed: HTTP {}", response.status());
     }
