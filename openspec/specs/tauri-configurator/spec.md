@@ -169,3 +169,29 @@ All dynamic data inserted into the DOM via `innerHTML` in the Tachyon UI MUST ei
 - **GIVEN** the AppShell renders navigation links from the ComponentRegistry
 - **WHEN** an entry label or route string contains HTML metacharacters
 - **THEN** those characters are escaped before insertion into `innerHTML`
+
+### Requirement: Hardware panel MUST display per-GPU VRAM progress bars
+`TachyonHardwarePanel` SHALL fetch both `get_hardware_status` and `get_metrics` on mount and render a VRAM section with one progress bar per detected GPU (or a single cluster-wide bar from `vramUtilizationPct`). The bar colour SHALL be cyan < 80 %, amber 80–90 %, red ≥ 90 %.
+
+#### Scenario: VRAM section appears when metrics are available
+- **GIVEN** `get_metrics` returns `vramUtilizationPct: 85`
+- **WHEN** the hardware panel mounts
+- **THEN** an amber progress bar at 85 % width is rendered inside the VRAM section
+
+#### Scenario: RAM offload badge appears when active
+- **GIVEN** `get_metrics` returns `ramOffloadActive: true`
+- **WHEN** the hardware panel renders
+- **THEN** the offload badge is visible in the VRAM section
+
+### Requirement: Storage panel MUST include a KV-Partition V2 Explorer
+`TachyonStoragePanel` SHALL render a KV Explorer section with namespace and key inputs, a Get button calling `invoke("kv_get")`, a Delete button calling `invoke("kv_delete")`, and an inline result zone. Values that parse as JSON SHALL be pretty-printed. Both buttons SHALL be disabled during in-flight requests.
+
+#### Scenario: Get returns and displays the stored value
+- **GIVEN** a key `sessions/user:alice:prefs` exists in the KV store
+- **WHEN** the operator enters the namespace and key and clicks Get
+- **THEN** the result zone renders the value pretty-printed
+
+#### Scenario: Delete dispatches a success toast
+- **GIVEN** a key exists in the KV store
+- **WHEN** the operator clicks Delete
+- **THEN** a `toast` CustomEvent with `type: "success"` is dispatched on the window

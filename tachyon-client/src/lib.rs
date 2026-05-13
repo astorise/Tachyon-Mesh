@@ -404,10 +404,21 @@ pub struct MeshResourceInput {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GpuStats {
+    pub id: String,
+    pub model: String,
+    pub vram_total_mb: u64,
+    pub vram_used_mb: u64,
+    pub compute_utilization: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HardwareStatus {
     pub total_ram_mb: u64,
     pub available_ram_mb: u64,
     pub accelerators: Vec<String>,
+    pub gpus: Vec<GpuStats>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -589,13 +600,53 @@ pub fn read_local_hardware_status() -> HardwareStatus {
     let mut system = System::new();
     system.refresh_memory();
     let mut accelerators = vec!["cpu".to_owned()];
-    if std::env::var_os("CUDA_VISIBLE_DEVICES").is_some() {
+    let mut gpus = Vec::new();
+
+    // Detect NVIDIA GPUs from CUDA_VISIBLE_DEVICES; ROCm GPUs from HIP_VISIBLE_DEVICES.
+    // Without a GPU management library, VRAM values are reported as zero until the
+    // AI inference runtime updates the memory governor and exposes them via /admin/metrics.
+    let cuda = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    let hip = std::env::var("HIP_VISIBLE_DEVICES").ok();
+
+    if let Some(ref devices) = cuda {
         accelerators.push("gpu".to_owned());
+        for (idx, device_id) in devices.split(',').filter(|s| !s.is_empty()).enumerate() {
+            gpus.push(GpuStats {
+                id: format!("cuda:{device_id}"),
+                model: format!("NVIDIA GPU #{}", idx),
+                vram_total_mb: 0,
+                vram_used_mb: 0,
+                compute_utilization: 0.0,
+            });
+        }
+        if gpus.is_empty() {
+            // "all" or unset count — report one entry
+            gpus.push(GpuStats {
+                id: "cuda:0".to_owned(),
+                model: "NVIDIA GPU".to_owned(),
+                vram_total_mb: 0,
+                vram_used_mb: 0,
+                compute_utilization: 0.0,
+            });
+        }
+    } else if let Some(ref devices) = hip {
+        accelerators.push("gpu".to_owned());
+        for (idx, device_id) in devices.split(',').filter(|s| !s.is_empty()).enumerate() {
+            gpus.push(GpuStats {
+                id: format!("hip:{device_id}"),
+                model: format!("AMD GPU #{}", idx),
+                vram_total_mb: 0,
+                vram_used_mb: 0,
+                compute_utilization: 0.0,
+            });
+        }
     }
+
     HardwareStatus {
         total_ram_mb: system.total_memory() / 1024 / 1024,
         available_ram_mb: system.available_memory() / 1024 / 1024,
         accelerators,
+        gpus,
     }
 }
 
