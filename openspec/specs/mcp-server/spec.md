@@ -114,3 +114,28 @@ The `tachyon_dryrun_manifest` tool definition SHALL include the full `IntegrityC
 - **GIVEN** the MCP server has not yet authenticated (no first request)
 - **WHEN** `tools/list` is called
 - **THEN** `manifest` falls back to a generic `{"type": "object"}` schema
+
+### Requirement: Structured JSON-RPC error taxonomy
+The MCP server SHALL return typed JSON-RPC errors with machine-readable codes and structured `data` fields instead of a flat string message.
+
+#### Scenario: Tool call times out
+- **GIVEN** `TACHYON_MCP_TIMEOUT_MS` is set (or defaults to 5 000 ms)
+- **WHEN** a tachyon_client call exceeds the deadline
+- **THEN** the response error code is `-32001` with `message` referencing the timeout duration
+
+#### Scenario: Rate limit exceeded
+- **GIVEN** a tool's per-minute bucket is exhausted
+- **WHEN** another call arrives for that tool
+- **THEN** the response error code is `-32002`
+- **AND** `error.data.retry_after_ms` contains the milliseconds until the window resets
+
+#### Scenario: Invalid manifest payload
+- **GIVEN** a tachyon_dryrun_manifest call fails structural validation
+- **WHEN** `JsonRpcError::from_anyhow` classifies the error
+- **THEN** the response error code is `-32602`
+- **AND** `error.data.detail` carries the validation message
+
+#### Scenario: Unexpected internal failure
+- **GIVEN** a tool call fails for an unclassified reason
+- **WHEN** `JsonRpcError::from_anyhow` classifies the error
+- **THEN** the response error code is `-32603`

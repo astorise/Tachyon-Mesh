@@ -23,6 +23,102 @@ static MANIFEST_SCHEMA: OnceLock<Value> = OnceLock::new();
 
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_PERSIST_SECS: u64 = 10;
+const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+
+/// Returns the per-request timeout for tachyon_client calls from the optional
+/// `TACHYON_MCP_TIMEOUT_MS` environment variable, falling back to 5 000 ms.
+fn mcp_timeout() -> Duration {
+    let ms = env::var("TACHYON_MCP_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
+// ── Structured JSON-RPC error taxonomy ───────────────────────────────────────
+
+/// Structured JSON-RPC 2.0 error object.
+/// Serialises to `{ "code": …, "message": "…", "data": … }` and is embedded
+/// inside the top-level `error` field of a JSON-RPC error response.
+#[derive(Debug, Serialize)]
+pub(crate) struct JsonRpcError {
+    pub(crate) code: i32,
+    pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) data: Option<Value>,
+}
+
+impl JsonRpcError {
+    /// `-32602 Invalid params` — caller supplied a payload that fails
+    /// structural or semantic validation.
+    pub(crate) fn invalid_params(msg: &str, details: Value) -> Self {
+        Self {
+            code: -32602,
+            message: msg.to_owned(),
+            data: Some(details),
+        }
+    }
+
+    /// `-32001 Cluster unreachable` — the tachyon_client call timed out or
+    /// could not reach core-host.
+    pub(crate) fn cluster_unreachable(msg: &str) -> Self {
+        Self {
+            code: -32001,
+            message: msg.to_owned(),
+            data: None,
+        }
+    }
+
+    /// `-32002 Rate limited` — includes `retry_after_ms` in the `data` field.
+    pub(crate) fn rate_limited(retry_after_ms: u64) -> Self {
+        Self {
+            code: -32002,
+            message: "Rate limit exceeded. Retry after the indicated delay.".to_owned(),
+            data: Some(json!({ "retry_after_ms": retry_after_ms })),
+        }
+    }
+
+    /// `-32603 Internal error` — unexpected failure with a human-readable
+    /// message forwarded from the underlying error.
+    pub(crate) fn internal_error(msg: &str) -> Self {
+        Self {
+            code: -32603,
+            message: msg.to_owned(),
+            data: None,
+        }
+    }
+
+    /// Classify an `anyhow::Error` into the appropriate `JsonRpcError` variant.
+    /// Checks the error chain for well-known signal strings produced by
+    /// `tokio::time::timeout` and tachyon_client network failures.
+    pub(crate) fn from_anyhow(error: &anyhow::Error) -> Self {
+        let msg = error.to_string();
+        if msg.contains("__TIMEOUT__") || msg.contains("timed out") || msg.contains("deadline") {
+            Self::cluster_unreachable(&format!(
+                "core-host did not respond within {}ms",
+                DEFAULT_TIMEOUT_MS
+            ))
+        } else if msg.contains("connection refused")
+            || msg.contains("failed to connect")
+            || msg.contains("unreachable")
+        {
+            Self::cluster_unreachable(&msg)
+        } else if msg.contains("validation") || msg.contains("invalid") || msg.contains("schema") {
+            Self::invalid_params("Manifest validation failed", json!({ "detail": msg }))
+        } else {
+            Self::internal_error(&msg)
+        }
+    }
+}
+
+/// Build a complete JSON-RPC 2.0 error response from a [`JsonRpcError`].
+fn json_rpc_error_response(id: Option<Value>, err: &JsonRpcError) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": err,
+    })
+}
 
 struct McpContext {
     token: String,
@@ -52,17 +148,22 @@ impl TokenBucket {
         }
     }
 
-    fn allow(&mut self, spec: RateLimitSpec, now: u64) -> bool {
+    /// Returns `None` when the call is permitted, or `Some(retry_after_ms)`
+    /// when the bucket is exhausted. `retry_after_ms` is the number of
+    /// milliseconds until the current window resets.
+    fn allow(&mut self, spec: RateLimitSpec, now: u64) -> Option<u64> {
         self.limit = spec.limit;
         if now.saturating_sub(self.last_refill_unix) >= spec.window_secs {
             self.tokens = spec.limit;
             self.last_refill_unix = now;
         }
         if self.tokens == 0 {
-            return false;
+            let reset_at = self.last_refill_unix + spec.window_secs;
+            let retry_after_ms = reset_at.saturating_sub(now).saturating_mul(1_000);
+            return Some(retry_after_ms);
         }
         self.tokens -= 1;
-        true
+        None
     }
 }
 
@@ -120,25 +221,28 @@ impl ToolRateLimiter {
         }
     }
 
-    fn allow(&self, tool_name: &str) -> Result<bool> {
+    /// Returns `None` when the call is permitted, or `Some(retry_after_ms)`
+    /// when the tool's bucket is exhausted.
+    fn allow(&self, tool_name: &str) -> Result<Option<u64>> {
         let Some(spec) = rate_limit_spec(tool_name) else {
-            return Ok(true);
+            return Ok(None);
         };
         let now = unix_now();
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("MCP rate limiter lock is poisoned"))?;
-        let allowed = state
+        let denied_ms = state
             .buckets
             .entry(tool_name.to_owned())
             .or_insert_with(|| TokenBucket::new(spec, now))
             .allow(spec, now);
-        if !allowed || now.saturating_sub(state.last_persist_unix) >= RATE_LIMIT_PERSIST_SECS {
+        let was_denied = denied_ms.is_some();
+        if was_denied || now.saturating_sub(state.last_persist_unix) >= RATE_LIMIT_PERSIST_SECS {
             persist_rate_limit_state(&self.state_path, &state.buckets)?;
             state.last_persist_unix = now;
         }
-        Ok(allowed)
+        Ok(denied_ms)
     }
 }
 
@@ -315,7 +419,8 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
 
     if method != "initialize" {
         if let Err(error) = validate_request_auth(context).await {
-            return Ok(Some(error_response(id, -32603, &error.to_string())));
+            let rpc_err = JsonRpcError::cluster_unreachable(&error.to_string());
+            return Ok(Some(json_rpc_error_response(id, &rpc_err)));
         }
     }
 
@@ -348,10 +453,12 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 .and_then(Value::as_str)
                 .context("missing resource uri")?;
             if uri != "hardware://local/status" {
-                return Ok(Some(error_response(
+                return Ok(Some(json_rpc_error_response(
                     id,
-                    -32602,
-                    &format!("unsupported resource `{uri}`"),
+                    &JsonRpcError::invalid_params(
+                        "unsupported resource",
+                        json!({ "uri": uri }),
+                    ),
                 )));
             }
             let status = tokio::task::spawn_blocking(tachyon_client::read_local_hardware_status)
@@ -531,10 +638,13 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
         }
         "ping" => json!({}),
         other => {
-            return Ok(Some(error_response(
+            return Ok(Some(json_rpc_error_response(
                 id,
-                -32601,
-                &format!("unsupported method `{other}`"),
+                &JsonRpcError {
+                    code: -32601,
+                    message: format!("unsupported method `{other}`"),
+                    data: None,
+                },
             )));
         }
     };
@@ -575,14 +685,25 @@ async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Resul
         .and_then(Value::as_str)
         .context("missing tool name")?;
 
-    if !allow_tool(context, name)? {
-        return Ok(error_response(
-            None,
-            -32000,
-            &format!("Rate limit exceeded for `{name}`"),
-        ));
+    if let Some(rate_err) = check_rate_limit(context, name)? {
+        return Ok(json_rpc_error_response(None, &rate_err));
     }
 
+    // Wrap the entire tool dispatch in a per-request timeout. An `Elapsed` error
+    // surfaces as `__TIMEOUT__` via the string sentinel so `JsonRpcError::from_anyhow`
+    // can classify it as `-32001 cluster_unreachable`.
+    let tool_result = tokio::time::timeout(mcp_timeout(), async {
+        handle_tool_dispatch(name, params).await
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("__TIMEOUT__")));
+
+    tool_result.or_else(|err| {
+        Ok(json_rpc_error_response(None, &JsonRpcError::from_anyhow(&err)))
+    })
+}
+
+async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Value> {
     match name {
         "tachyon_mesh_status" => {
             let status = tachyon_client::get_engine_status().await?;
@@ -747,16 +868,17 @@ async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Resul
                 ]
             }))
         }
-        other => Ok(error_response(
-            None,
-            -32602,
-            &format!("unsupported tool `{other}`"),
-        )),
+        other => Err(anyhow::anyhow!("unsupported tool `{other}`")),
     }
 }
 
-fn allow_tool(context: &McpContext, tool_name: &str) -> Result<bool> {
-    context.rate_limiter.allow(tool_name)
+/// Returns `None` when the call is permitted, or `Some(JsonRpcError)` with
+/// code `-32002` and `retry_after_ms` when the tool's rate-limit is exceeded.
+fn check_rate_limit(context: &McpContext, tool_name: &str) -> Result<Option<JsonRpcError>> {
+    Ok(context
+        .rate_limiter
+        .allow(tool_name)?
+        .map(JsonRpcError::rate_limited))
 }
 
 fn text_tool_result(value: &impl serde::Serialize) -> Result<Value> {
@@ -815,13 +937,34 @@ mod tests {
 
         assert!(limiter
             .allow("tachyon_apply_manifest")
-            .expect("first request should be allowed"));
-        assert!(!limiter
+            .expect("first request should succeed")
+            .is_none(), "first request should not be rate-limited");
+        let retry_ms = limiter
             .allow("tachyon_apply_manifest")
-            .expect("second request should be denied"));
-        assert!(limiter
-            .allow("tachyon_get_metrics")
-            .expect("read tool should have an independent bucket"));
+            .expect("second request result should not error");
+        assert!(retry_ms.is_some(), "second request should be rate-limited");
+        assert!(
+            limiter
+                .allow("tachyon_get_metrics")
+                .expect("read tool should have an independent bucket")
+                .is_none(),
+            "read tool should not be rate-limited"
+        );
+    }
+
+    #[test]
+    fn rate_limited_response_includes_retry_after_ms() {
+        let limiter = ToolRateLimiter::new_with_path(test_state_path("retry-after"));
+        let _ = limiter.allow("tachyon_apply_manifest");
+        let retry_ms = limiter
+            .allow("tachyon_apply_manifest")
+            .expect("second call should return retry_after_ms")
+            .expect("second call should be denied with retry info");
+        // retry_after_ms should be ≤ RATE_LIMIT_WINDOW_SECS * 1000
+        assert!(retry_ms <= RATE_LIMIT_WINDOW_SECS * 1_000);
+        let err = JsonRpcError::rate_limited(retry_ms);
+        assert_eq!(err.code, -32002);
+        assert_eq!(err.data.unwrap()["retry_after_ms"], retry_ms);
     }
 
     #[tokio::test]
@@ -829,10 +972,11 @@ mod tests {
         let context = McpContext::new_for_tests(test_state_path("rpc-limit"));
         let request = r#"{"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"tachyon_apply_manifest","arguments":{}}}"#;
 
-        assert!(context
+        // Consume the one allowed call.
+        let _ = context
             .rate_limiter
             .allow("tachyon_apply_manifest")
-            .expect("preflight call should consume the apply_manifest bucket"));
+            .expect("preflight call should consume the apply_manifest bucket");
         let denied = handle_line(request, &context)
             .await
             .expect("second call should produce a JSON-RPC response")
@@ -840,6 +984,7 @@ mod tests {
 
         assert_eq!(denied["jsonrpc"], "2.0");
         assert_eq!(denied["id"], "a");
-        assert_eq!(denied["error"]["code"], -32000);
+        assert_eq!(denied["error"]["code"], -32002);
+        assert!(denied["error"]["data"]["retry_after_ms"].is_number());
     }
 }
