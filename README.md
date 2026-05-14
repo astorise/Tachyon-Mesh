@@ -84,6 +84,14 @@ cd tachyon-ui && npm run tauri dev
 
 ---
 
+## 🔧 Troubleshooting
+
+Encountering build errors, port conflicts, missing GPU detection, or `-32001 Cluster Unreachable` from the MCP server?
+
+See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** for the full guide covering 15 common failure modes across build, runtime, UI, MCP, and Kubernetes/GPU domains.
+
+---
+
 ## 🤖 LLM Agent Integration (MCP)
 
 Tachyon exposes its cluster capabilities to AI agents via the **Model Context Protocol**. This allows your development tools to deploy functions, validate manifests, or check cluster telemetry using natural language.

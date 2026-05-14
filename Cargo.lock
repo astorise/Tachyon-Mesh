@@ -8083,6 +8083,7 @@ dependencies = [
  "serde_json",
  "tachyon-client",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

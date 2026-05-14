@@ -108,3 +108,6 @@ The desktop release workflow SHALL build the Tauri bundles from the `tachyon-ui`
 - **THEN** `projectPath` points to `tachyon-ui`
 - **AND** frontend dependencies are installed from the `tachyon-ui` directory
 
+
+### Requirement: Release workflow MUST publish Windows binaries as .zip
+The `publish-server-binaries` matrix SHALL include `windows-latest / x86_64-pc-windows-msvc`. The packaging step SHALL produce `tachyon-mesh-VERSION-windows-x86_64.zip` containing `core-host.exe` and `tachyon-mcp.exe`.

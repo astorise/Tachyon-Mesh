@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use tracing::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -489,7 +490,8 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 ]
             })
         }
-        "tools/list" => json!({
+        "tools/list" => {
+            let mut tools_result = json!({
             "tools": [
                 {
                     "name": "tachyon_mesh_status",
@@ -727,7 +729,16 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                     }
                 }
             ]
-        }),
+            });
+            if MANIFEST_SCHEMA.get().is_none() {
+                tools_result["data"] = json!({
+                    "warnings": [
+                        "Dynamic manifest JSON schema unavailable — connect to a running core-host to enrich tachyon_dryrun_manifest tool definitions."
+                    ]
+                });
+            }
+            tools_result
+        },
         "tools/call" => {
             let result = handle_tool_call(request.get("params"), context).await?;
             if result.get("jsonrpc").is_some() && result.get("error").is_some() {
@@ -778,8 +789,16 @@ async fn validate_request_auth(context: &McpContext) -> Result<()> {
         .context("failed to validate TACHYON_MCP_PAT against TACHYON_MCP_URL")?;
     // Best-effort: fetch and cache the manifest schema so tool definitions are
     // enriched on the first tools/list response.  A failure here is non-fatal.
-    if let Ok(schema) = tachyon_client::get_manifest_schema().await {
-        let _ = MANIFEST_SCHEMA.set(schema);
+    match tachyon_client::get_manifest_schema().await {
+        Ok(schema) => {
+            let _ = MANIFEST_SCHEMA.set(schema);
+        }
+        Err(e) => {
+            warn!(
+                "Failed to fetch dynamic manifest schema from core-host: {e:#}. \
+                 Falling back to generic object type — agentic manifest generation may be degraded."
+            );
+        }
     }
     let _ = CONNECTION_INITIALIZED.set(());
     Ok(())

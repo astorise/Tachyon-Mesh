@@ -34,6 +34,10 @@ jobs:
             target: aarch64-apple-darwin
             os_name: darwin
             arch: aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            os_name: windows
+            arch: x86_64
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
@@ -67,21 +71,35 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
-      - name: Package tarball
+      - name: Package archive (tar.gz on Linux/macOS, zip on Windows)
         shell: bash
         run: |
           VERSION="${{ github.ref_name }}"
           OS="${{ matrix.os_name }}"
           ARCH="${{ matrix.arch }}"
-          TARBALL="tachyon-mesh-${VERSION}-${OS}-${ARCH}.tar.gz"
           BINDIR="target/${{ matrix.target }}/release"
-          tar -czf "${TARBALL}" \
-            -C "${BINDIR}" core-host tachyon-mcp \
-            --transform "s|^|tachyon-mesh-${VERSION}/|" 2>/dev/null || \
-          tar -czf "${TARBALL}" -C "${BINDIR}" core-host tachyon-mcp
-          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+          if [ "$OS" = "windows" ]; then
+            ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}.zip"
+            # PowerShell Compress-Archive is not available in bash; use 7z or zip
+            if command -v 7z >/dev/null 2>&1; then
+              7z a "${ARCHIVE}" \
+                "${BINDIR}/core-host.exe" \
+                "${BINDIR}/tachyon-mcp.exe"
+            else
+              zip "${ARCHIVE}" \
+                "${BINDIR}/core-host.exe" \
+                "${BINDIR}/tachyon-mcp.exe"
+            fi
+          else
+            ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}.tar.gz"
+            tar -czf "${ARCHIVE}" \
+              -C "${BINDIR}" core-host tachyon-mcp \
+              --transform "s|^|tachyon-mesh-${VERSION}/|" 2>/dev/null || \
+            tar -czf "${ARCHIVE}" -C "${BINDIR}" core-host tachyon-mcp
+          fi
+          echo "TARBALL=${ARCHIVE}" >> "$GITHUB_ENV"
 
-      - name: Upload tarball to GitHub release
+      - name: Upload archive to GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.TARBALL }}
