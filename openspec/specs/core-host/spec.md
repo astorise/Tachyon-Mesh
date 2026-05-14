@@ -60,3 +60,12 @@ The `validate_cross_layer.sh` script SHALL assert that the four core OpenAPI con
 #### Scenario: Validation fails when a contract route is removed
 - **WHEN** one of the checked routes is removed from the Axum router
 - **THEN** `validate_cross_layer.sh` exits with a non-zero status and names the missing route
+### Requirement: OpenAPI schema MUST cover all ~35 admin routes
+The `ApiDoc` struct SHALL declare `#[utoipa::path]` stubs for all admin routes including KV-Partition V2, canary management, shadow diffs, chaos scenarios, enrollment, security (MFA/PAT/step-up), full IAM CRUD, KV-cache, and asset/model upload. At least 35 operations SHALL appear in the generated OpenAPI document.
+
+### Requirement: `GET /admin/schema/integrity-lock` MUST return a JSON Schema for the lock file
+A new endpoint `GET /admin/schema/integrity-lock` SHALL return a JSON Schema (Draft-07) document describing the `integrity.lock` file format including route entries, `resourcePolicy` (with `vramMb`, `gpuAffinity`), and canary config sub-schemas.
+
+#### Scenario: Agent fetches integrity lock schema
+- **WHEN** an agent calls `GET /admin/schema/integrity-lock`
+- **THEN** the response is JSON with `$schema`, `title: "IntegrityLock"`, and a `routes` array property

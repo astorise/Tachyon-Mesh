@@ -15,6 +15,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/admin/schema/openapi.json",
             get(admin_openapi_schema_handler),
         )
+        .route(
+            "/admin/schema/integrity-lock",
+            get(admin_integrity_lock_schema_handler),
+        )
         .route("/admin/docs", get(admin_openapi_docs_handler))
         .route(
             "/admin/kv/{namespace}/{key}",
@@ -316,6 +320,67 @@ pub(crate) async fn admin_openapi_schema_handler() -> impl IntoResponse {
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         json,
+    )
+}
+
+/// Serves a JSON Schema describing the `integrity.lock` file format.
+pub(crate) async fn admin_integrity_lock_schema_handler() -> impl IntoResponse {
+    let schema = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "IntegrityLock",
+        "description": "Tachyon Mesh sealed integrity lock file (`integrity.lock`). Produced by `POST /admin/manifest` and validated before every WASM guest invocation.",
+        "type": "object",
+        "required": ["configVersion", "hostAddress", "routes"],
+        "properties": {
+            "configVersion":          { "type": "integer", "minimum": 0, "description": "Monotonically increasing version counter incremented on each successful seal." },
+            "hostAddress":            { "type": "string", "description": "Bind address of the core-host HTTP server." },
+            "advertiseIp":            { "type": ["string", "null"] },
+            "tlsAddress":             { "type": ["string", "null"] },
+            "maxStdoutBytes":         { "type": "integer", "minimum": 1 },
+            "guestFuelBudget":        { "type": "integer", "minimum": 1 },
+            "guestMemoryLimitBytes":  { "type": "integer", "minimum": 1 },
+            "resourceLimitResponse":  { "type": "string" },
+            "telemetrySampleRate":    { "type": "number", "minimum": 0, "maximum": 1 },
+            "enrollmentEndpoint":     { "type": ["string", "null"] },
+            "routes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["path", "version"],
+                    "properties": {
+                        "path":     { "type": "string" },
+                        "version":  { "type": "string" },
+                        "name":     { "type": "string" },
+                        "role":     { "type": "string", "enum": ["user", "system"] },
+                        "resourcePolicy": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "minRamMb":    { "type": ["integer", "null"] },
+                                "minVramMb":   { "type": ["integer", "null"] },
+                                "vramMb":      { "type": ["integer", "null"], "description": "GPU VRAM reservation in MiB." },
+                                "gpuAffinity": { "type": ["string", "null"], "description": "GPU device affinity selector." },
+                                "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"] }
+                            }
+                        },
+                        "canary": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "nextVersion":  { "type": "string" },
+                                "stepWeight":   { "type": "integer", "minimum": 1, "maximum": 100 },
+                                "intervalSecs": { "type": "integer", "minimum": 1 },
+                                "maxErrorRate": { "type": "number", "minimum": 0, "maximum": 1 }
+                            }
+                        }
+                    }
+                }
+            },
+            "resources": { "type": "object", "additionalProperties": { "type": "object" } }
+        }
+    });
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        schema.to_string(),
     )
 }
 
