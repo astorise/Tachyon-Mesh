@@ -202,3 +202,6 @@ All z-stack overlays (toast manager, guided tour, bundle conflict modal) SHALL b
 - **THEN** `TachyonAppShellModalRoot` calls `openConflictModal(conflicts)`
 - **AND** the bundle conflict modal becomes visible
 
+
+### Requirement: A TROUBLESHOOTING.md MUST cover the 15 most common failure modes
+The repository SHALL contain a `TROUBLESHOOTING.md` in the root covering build failures (wasm target, MSVC, NASM), runtime errors (port conflict, integrity.lock signature, ONNX), UI errors (WebKitGTK), MCP errors (-32001, -32002, degraded schema), and Kubernetes/GPU issues (VRAM scheduling, GPU detection). `README.md` SHALL link to it.

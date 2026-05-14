@@ -208,3 +208,6 @@ The MCP server SHALL apply per-tool rate limits: `tachyon_canary_split` ≤ 2/mi
 
 ### Requirement: The legacy error_response() function MUST be removed
 The `error_response(id, code, message)` function SHALL be deleted in favour of `json_rpc_error_response(id, &JsonRpcError)`, which produces a fully structured error object consistent with all other error paths.
+
+### Requirement: Schema fetch failure MUST emit a tracing warning and populate tools/list warnings
+When `get_manifest_schema()` fails, `tachyon-mcp` SHALL emit a `tracing::warn!` describing the degradation. The `tools/list` response SHALL include `data.warnings` when `MANIFEST_SCHEMA` is unpopulated.
