@@ -1,6 +1,7 @@
 import "./TachyonBundleConflictModal";
 import "./TachyonGuidedTour";
 import "./TachyonToastManager";
+import { trapFocus } from "../../utils/a11y";
 import { tachyonSharedStylesheet } from "../../styles/shared-sheets";
 
 type BundleConflict = {
@@ -56,9 +57,14 @@ export class TachyonAppShellModalRoot extends HTMLElement {
     window.removeEventListener("topology:conflict", this.onTopologyConflict);
   }
 
-  /** Open the bundle conflict resolution modal. */
+  /** Open the bundle conflict resolution modal and trap keyboard focus inside it. */
   openConflictModal(conflicts: BundleConflict[]): void {
-    this.conflictModal()?.open(conflicts);
+    const modal = this.conflictModal();
+    if (!modal) return;
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.open(conflicts);
+    trapFocus(modal);
   }
 
   /** Start the guided tour from step 0. */

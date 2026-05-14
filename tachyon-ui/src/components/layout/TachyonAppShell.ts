@@ -324,6 +324,38 @@ export class TachyonAppShell extends HTMLElement {
     return listComponentRoutes().some((entry) => entry.route === normalized) ? normalized : "dashboard";
   }
 
+  private showApplyLoader(): HTMLElement | null {
+    const mainContent = this.root.getElementById("main-content");
+    if (!mainContent) return null;
+    mainContent.setAttribute("aria-busy", "true");
+    mainContent.classList.add("pointer-events-none", "opacity-50");
+    const loader = document.createElement("div");
+    loader.id = "global-apply-loader";
+    loader.setAttribute("role", "status");
+    loader.setAttribute("aria-label", "Applying configuration…");
+    loader.className =
+      "absolute inset-0 flex items-center justify-center z-50 bg-slate-950/40";
+    loader.innerHTML = `
+      <div class="flex flex-col items-center gap-3">
+        <div class="h-12 w-12 rounded-full border-4 border-slate-700 border-t-cyan-400 animate-spin"></div>
+        <span class="text-xs font-mono text-slate-400">Applying…</span>
+      </div>
+    `;
+    mainContent.style.position = "relative";
+    mainContent.appendChild(loader);
+    return loader;
+  }
+
+  private hideApplyLoader(): void {
+    const mainContent = this.root.getElementById("main-content");
+    if (mainContent) {
+      mainContent.removeAttribute("aria-busy");
+      mainContent.classList.remove("pointer-events-none", "opacity-50");
+      mainContent.style.position = "";
+    }
+    this.root.getElementById("global-apply-loader")?.remove();
+  }
+
   private async sealAndApply(): Promise<void> {
     if (this.applyingSeal) {
       return;
@@ -331,6 +363,7 @@ export class TachyonAppShell extends HTMLElement {
     this.applyingSeal = true;
     this.render();
     this.restoreStartedState();
+    this.showApplyLoader();
     try {
       const result = await invoke<BundleApplyOutcome>("bundle_and_apply_manifest", {
         dependencies: [],
@@ -396,6 +429,7 @@ export class TachyonAppShell extends HTMLElement {
         );
       }
     } finally {
+      this.hideApplyLoader();
       this.applyingSeal = false;
       this.render();
       this.restoreStartedState();
