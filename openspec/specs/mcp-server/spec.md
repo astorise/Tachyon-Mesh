@@ -194,3 +194,17 @@ The `tachyon_hardware_status` MCP tool SHALL return a JSON payload that includes
 - **WHEN** an agent calls `tachyon_hardware_status`
 - **THEN** the response JSON contains `"gpus": []`
 - **AND** `accelerators` contains only `"cpu"`
+
+### Requirement: Mutator tools MUST have stricter rate limits than read-only tools
+The MCP server SHALL apply per-tool rate limits: `tachyon_canary_split` ≤ 2/min, `tachyon_deploy_function`/`tachyon_delete_function` ≤ 5/min, KV mutators ≤ 30/min, read-only tools ≤ 100/min. Exceeding any limit returns `-32002` with `retry_after_ms`.
+
+#### Scenario: Canary split is rate-limited to 2/min
+- **GIVEN** an agent has already called `tachyon_canary_split` twice in one minute
+- **WHEN** it calls a third time
+- **THEN** the response contains `error.code = -32002` and `error.data.retry_after_ms`
+
+### Requirement: Mutator tool descriptions MUST include explicit LLM guidance
+`tachyon_deploy_function` description SHALL state that `artifact_path` must be an absolute local path on the MCP host. `tachyon_kv_put` description SHALL mandate JSON-stringified values. `tachyon_canary_split` description SHALL explain that `weight_pct=0` performs an immediate rollback.
+
+### Requirement: The legacy error_response() function MUST be removed
+The `error_response(id, code, message)` function SHALL be deleted in favour of `json_rpc_error_response(id, &JsonRpcError)`, which produces a fully structured error object consistent with all other error paths.
