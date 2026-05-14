@@ -44,7 +44,15 @@ curl -fsSL https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/
 ./core-host
 ```
 
-Optional: pin a version with `--version v1.2.3` or choose an install directory with `--dir /usr/local/bin`.
+Optional: pin a version with `--version v1.2.3` or choose a directory with `--dir /usr/local/bin`.
+
+**Local binary (Windows — PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/get-tachyon.ps1 | iex
+.\core-host.exe
+```
+
+Optional: `-Version v1.2.3` or `-Dir C:\Tools\tachyon`.
 
 **Kubernetes (single node or homelab):**
 ```bash
@@ -101,6 +109,28 @@ To see all available versions:
 ```bash
 wkg list ghcr.io/astorise/tachyon-mesh-wit
 ```
+
+---
+
+## 🛠️ IDE Integration & Schema Validation
+
+While `core-host` is running, it serves live JSON Schema documents for its configuration files — enabling real-time validation and autocompletion in VS Code, JetBrains, and Neovim without copying schema files.
+
+**VS Code quick setup** (`.vscode/settings.json`):
+```json
+{
+  "json.schemas": [
+    { "fileMatch": ["**/integrity.lock"], "url": "http://127.0.0.1:8080/admin/schema/integrity-lock" }
+  ]
+}
+```
+
+**YAML modeline:**
+```yaml
+# yaml-language-server: $schema=http://127.0.0.1:8080/admin/schema/manifest
+```
+
+See **[docs/ide-integration.md](docs/ide-integration.md)** for JetBrains, Neovim, HTTP Client, and offline/air-gapped setups.
 
 ---
 
