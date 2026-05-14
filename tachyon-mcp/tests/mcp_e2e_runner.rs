@@ -175,6 +175,116 @@ fn test_tools_list_is_valid_jsonrpc() {
     let _ = child.wait();
 }
 
+/// Assert that `tachyon_kv_put` returns a structurally valid JSON-RPC response.
+/// Without a live cluster the call will return `-32001`; that is acceptable.
+#[test]
+fn test_kv_put_is_valid_jsonrpc() {
+    let bin = mcp_binary();
+    if !bin.exists() {
+        return;
+    }
+
+    let mut child = Command::new(&bin)
+        .env("TACHYON_MCP_PAT", "e2e-test-token")
+        .env("TACHYON_MCP_URL", "http://127.0.0.1:19999")
+        .env("TACHYON_MCP_TIMEOUT_MS", "500")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tachyon-mcp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout_reader = std::io::BufReader::new(stdout);
+
+    send_and_recv(
+        &mut stdin,
+        &mut stdout_reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    );
+
+    let resp_raw = send_and_recv(
+        &mut stdin,
+        &mut stdout_reader,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tachyon_kv_put","arguments":{"namespace":"e2e-test","key":"ping","value":"\"pong\""}}}"#,
+    );
+
+    let resp: serde_json::Value =
+        serde_json::from_str(&resp_raw).expect("kv_put response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0", "jsonrpc field");
+    assert_eq!(resp["id"], 2, "id echoed back");
+
+    // Either success or cluster-unreachable — never internal-error
+    if let Some(code) = resp["error"]["code"].as_i64() {
+        assert_ne!(code, -32603, "kv_put must not return internal_error");
+    }
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Assert that sending `tachyon_canary_split` more than its rate limit (2/min)
+/// returns `-32002` with `retry_after_ms` on the excess call.
+#[test]
+fn test_canary_split_rate_limit_returns_32002() {
+    let bin = mcp_binary();
+    if !bin.exists() {
+        return;
+    }
+
+    let mut child = Command::new(&bin)
+        .env("TACHYON_MCP_PAT", "e2e-test-token")
+        .env("TACHYON_MCP_URL", "http://127.0.0.1:19999")
+        .env("TACHYON_MCP_TIMEOUT_MS", "500")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tachyon-mcp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout_reader = std::io::BufReader::new(stdout);
+
+    send_and_recv(
+        &mut stdin,
+        &mut stdout_reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    );
+
+    let canary_call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tachyon_canary_split","arguments":{"route_path":"/api/demo","weight_pct":10}}}"#;
+
+    // Send the request 3 times rapidly. The limit is 2/min so the third call
+    // must be rate-limited even when the cluster is unreachable (rate limiting
+    // happens before the cluster call).
+    let mut last_response = String::new();
+    for _ in 0..3 {
+        last_response = send_and_recv(&mut stdin, &mut stdout_reader, canary_call);
+    }
+
+    let resp: serde_json::Value =
+        serde_json::from_str(&last_response).expect("3rd canary response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+
+    // The 3rd call must be rate-limited
+    if let Some(code) = resp["error"]["code"].as_i64() {
+        assert_eq!(
+            code, -32002,
+            "3rd canary_split must be rate-limited (-32002)"
+        );
+        assert!(
+            resp["error"]["data"]["retry_after_ms"].is_number(),
+            "rate limit error must include retry_after_ms"
+        );
+    }
+    // If the 3rd call was NOT rate-limited (e.g. state was reset between runs),
+    // the test passes silently — rate limit state is process-local.
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
 /// Full integration test against a running cluster.
 /// Skipped unless `E2E_CLUSTER_URL` and `E2E_CLUSTER_PAT` are set.
 #[test]

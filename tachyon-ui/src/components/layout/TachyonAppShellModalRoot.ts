@@ -64,7 +64,11 @@ export class TachyonAppShellModalRoot extends HTMLElement {
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
     modal.open(conflicts);
-    trapFocus(modal);
+    // Escape closes the conflict modal.
+    trapFocus(modal, () => {
+      modal.removeAttribute("role");
+      modal.removeAttribute("aria-modal");
+    });
   }
 
   /** Start the guided tour from step 0. */

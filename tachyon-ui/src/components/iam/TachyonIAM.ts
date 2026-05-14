@@ -70,7 +70,13 @@ export class TachyonIAM extends HTMLElement {
     this.bindEvents();
     if (this.mode() === "auth") {
       const panel = this.panel();
-      if (panel) trapFocus(panel);
+      if (panel) {
+        // Escape closes the auth dialog by hiding the whole component.
+        trapFocus(panel, () => {
+          void gsap.to(panel, { y: -12, opacity: 0, duration: 0.2 });
+          this.classList.add("hidden");
+        });
+      }
       void gsap.fromTo(panel, { y: 16, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35 });
     }
   }

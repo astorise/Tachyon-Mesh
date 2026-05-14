@@ -104,6 +104,18 @@ wkg list ghcr.io/astorise/tachyon-mesh-wit
 
 ---
 
+## 🖥️ GPU / Homelab Kubernetes Deployment
+
+For hardware-accelerated clusters (NVIDIA GPU nodes, model-cache PVC, Prometheus ServiceMonitor):
+
+```bash
+kubectl apply -f manifests/deploy-gpu-homelab.yaml
+```
+
+See **[manifests/deploy-gpu-homelab.yaml](manifests/deploy-gpu-homelab.yaml)** for the full manifest including `nodeSelector`, GPU resource limits, model-cache PVC, and Prometheus ServiceMonitor placeholder.
+
+---
+
 ## 🔧 Troubleshooting
 
 Encountering build errors, port conflicts, missing GPU detection, or `-32001 Cluster Unreachable` from the MCP server?
