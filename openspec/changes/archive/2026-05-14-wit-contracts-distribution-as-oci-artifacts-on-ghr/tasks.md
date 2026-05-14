@@ -1,0 +1,4 @@
+- [x] **Task 1: GitHub Actions Update.** Modify `.github/workflows/publish-sdks.yml` (or `.github/workflows/release.yml`) to include a new job dedicated to publishing the WIT contracts.
+- [x] **Task 2: GHCR Authentication.** In the pipeline, ensure the job has `packages: write` permissions and authenticates to `ghcr.io` using the standard `GITHUB_TOKEN`.
+- [x] **Task 3: Wasm Package (`wkg`) Integration.** Download and execute the `wkg` CLI within the runner to package the `./wit` directory and push it to `ghcr.io/astorise/tachyon-mesh-wit`.
+- [x] **Task 4: Documentation (README).** Add a small snippet to the core `README.md` or FaaS documentation explaining to guest developers how to consume the OCI artifact in their `Cargo.toml` using `package.metadata.component.dependencies`.

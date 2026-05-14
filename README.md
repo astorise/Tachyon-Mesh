@@ -84,6 +84,26 @@ cd tachyon-ui && npm run tauri dev
 
 ---
 
+## 🧩 Building FaaS Guests — WIT Contracts via OCI
+
+Tachyon publishes its WebAssembly Interface Types (WIT) contracts as OCI artifacts to GitHub Container Registry. Guest developers do **not** need to copy `.wit` files locally.
+
+Add the following to your component's `Cargo.toml` (requires [`cargo-component`](https://github.com/bytecodealliance/cargo-component)):
+
+```toml
+[package.metadata.component.dependencies]
+"tachyon:mesh" = { registry = "oci", package = "ghcr.io/astorise/tachyon-mesh-wit", version = "1.0.0" }
+```
+
+`cargo-component build` will automatically fetch and resolve the WIT interfaces during compilation. Replace `1.0.0` with the release tag you are targeting.
+
+To see all available versions:
+```bash
+wkg list ghcr.io/astorise/tachyon-mesh-wit
+```
+
+---
+
 ## 🔧 Troubleshooting
 
 Encountering build errors, port conflicts, missing GPU detection, or `-32001 Cluster Unreachable` from the MCP server?
