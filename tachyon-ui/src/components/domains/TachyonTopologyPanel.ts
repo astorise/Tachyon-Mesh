@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
+import { el } from "../../utils/dom-safe";
 import { t } from "../../utils/i18n";
 import stylesheetText from "../../style.css?inline";
 
@@ -278,48 +279,64 @@ export class TachyonTopologyCanvas extends HTMLElement {
     });
   }
 
-  private renderNode(node: TopologyNode): string {
+  private renderNode(node: TopologyNode): HTMLElement {
     const theme = themeFor(node.type);
     const isSelected = node.id === this.selectedId;
-    const ring = isSelected ? "ring-2 ring-cyan-300" : "";
+    const ring = isSelected ? " ring-2 ring-cyan-300" : "";
+
     if (this.compactMode) {
-      return `<button data-node-id="${this.escape(node.id)}" type="button"
-        title="${this.escape(node.label || node.id)}"
-        class="absolute flex items-center justify-center rounded-full border-2 touch-none select-none ${theme.card} ${ring}"
-        style="left:${node.x}px;top:${node.y}px;width:48px;height:48px;cursor:grab;">
-        <span style="font-size:18px;line-height:1">${theme.glyph}</span>
-      </button>`;
+      const glyph = el("span", { style: "font-size:18px;line-height:1" }, theme.glyph);
+      const btn = el("button", {
+        "data-node-id": node.id,
+        type: "button",
+        title: node.label || node.id,
+        class: `absolute flex items-center justify-center rounded-full border-2 touch-none select-none ${theme.card}${ring}`,
+        style: `left:${node.x}px;top:${node.y}px;width:48px;height:48px;cursor:grab;`,
+      }, glyph);
+      return btn;
     }
-    return `<button data-node-id="${this.escape(node.id)}" type="button"
-      class="absolute p-3 rounded-xl border-2 backdrop-blur-md w-64 touch-none select-none text-left ${theme.card} ${ring}"
-      style="left:${node.x}px;top:${node.y}px;cursor:grab;">
-      <div class="flex items-center gap-3 mb-2">
-        <span class="inline-flex h-8 w-8 items-center justify-center rounded ${theme.iconBg} font-bold">${theme.glyph}</span>
-        <div class="flex-1">
-          <div class="text-[10px] uppercase tracking-widest text-slate-500">${this.escape(t(`topology.type.${node.type}`))}</div>
-          <h4 class="${theme.badge} font-semibold text-sm truncate">${this.escape(node.label || node.id)}</h4>
-        </div>
-      </div>
-      <div class="bg-slate-950/50 rounded px-2 py-1 flex justify-between items-center text-xs">
-        <span class="text-slate-500">${this.escape(t(`topology.badge.${node.type}`))}</span>
-        <span class="font-mono ${theme.badge} truncate ml-2">${this.escape(badgeValueFor(node))}</span>
-      </div>
-    </button>`;
+
+    return el("button", {
+      "data-node-id": node.id,
+      type: "button",
+      class: `absolute p-3 rounded-xl border-2 backdrop-blur-md w-64 touch-none select-none text-left ${theme.card}${ring}`,
+      style: `left:${node.x}px;top:${node.y}px;cursor:grab;`,
+    },
+      el("div", { class: "flex items-center gap-3 mb-2" },
+        el("span", { class: `inline-flex h-8 w-8 items-center justify-center rounded ${theme.iconBg} font-bold` }, theme.glyph),
+        el("div", { class: "flex-1" },
+          el("div", { class: "text-[10px] uppercase tracking-widest text-slate-500" }, t(`topology.type.${node.type}`)),
+          el("h4", { class: `${theme.badge} font-semibold text-sm truncate` }, node.label || node.id),
+        ),
+      ),
+      el("div", { class: "bg-slate-950/50 rounded px-2 py-1 flex justify-between items-center text-xs" },
+        el("span", { class: "text-slate-500" }, t(`topology.badge.${node.type}`)),
+        el("span", { class: `font-mono ${theme.badge} truncate ml-2` }, badgeValueFor(node)),
+      ),
+    );
   }
 
   private render(): void {
-    const nodeBlocks = this.nodes.map((n) => this.renderNode(n)).join("");
-    const edgeSvg = this.buildEdgeSvg();
     const transform = `translate(${this.panX}px,${this.panY}px) scale(${this.zoom})`;
 
+    // Static structure — edges and nodes are appended via DOM API below.
     this.root.innerHTML = `
       <div id="canvas-outer" class="relative h-[540px] w-full overflow-hidden rounded-lg border border-slate-800 bg-slate-950/60 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.08),transparent_50%)]" style="cursor:grab;">
         <div id="canvas-viewport" style="position:absolute;transform-origin:0 0;width:${VIRTUAL_W}px;height:${VIRTUAL_H}px;transform:${transform};">
-          <svg class="absolute inset-0 pointer-events-none" width="${VIRTUAL_W}" height="${VIRTUAL_H}">${edgeSvg}</svg>
-          ${nodeBlocks}
+          <svg class="absolute inset-0 pointer-events-none" width="${VIRTUAL_W}" height="${VIRTUAL_H}"></svg>
         </div>
       </div>
     `;
+
+    // Populate edges (SVG lines) and nodes via DOM API so user-controlled
+    // strings go through createTextNode / setAttribute rather than innerHTML.
+    this.populateEdges();
+    const viewport = this.root.getElementById("canvas-viewport");
+    if (viewport) {
+      for (const node of this.nodes) {
+        viewport.appendChild(this.renderNode(node));
+      }
+    }
 
     this.wireViewport();
     this.wireFileDrop();
@@ -435,17 +452,29 @@ export class TachyonTopologyCanvas extends HTMLElement {
       : { x: node.x + CARD_W / 2, y: node.y + CARD_H / 2 };
   }
 
-  private buildEdgeSvg(): string {
-    return this.edges
-      .map((edge) => {
-        const from = this.nodes.find((n) => n.id === edge.from);
-        const to = this.nodes.find((n) => n.id === edge.to);
-        if (!from || !to) return "";
-        const fc = this.edgeCenter(from);
-        const tc = this.edgeCenter(to);
-        return `<line data-edge-id="${this.escape(edge.id)}" x1="${fc.x}" y1="${fc.y}" x2="${tc.x}" y2="${tc.y}" stroke="rgba(34,211,238,0.5)" stroke-width="1.5" stroke-dasharray="4 3"/>`;
-      })
-      .join("");
+  private populateEdges(): void {
+    const svg = this.root.querySelector<SVGElement>("#canvas-viewport > svg");
+    if (!svg) return;
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const lines: SVGLineElement[] = [];
+    for (const edge of this.edges) {
+      const from = this.nodes.find((n) => n.id === edge.from);
+      const to = this.nodes.find((n) => n.id === edge.to);
+      if (!from || !to) continue;
+      const fc = this.edgeCenter(from);
+      const tc = this.edgeCenter(to);
+      const line = document.createElementNS(SVG_NS, "line");
+      line.setAttribute("data-edge-id", edge.id);
+      line.setAttribute("x1", String(fc.x));
+      line.setAttribute("y1", String(fc.y));
+      line.setAttribute("x2", String(tc.x));
+      line.setAttribute("y2", String(tc.y));
+      line.setAttribute("stroke", "rgba(34,211,238,0.5)");
+      line.setAttribute("stroke-width", "1.5");
+      line.setAttribute("stroke-dasharray", "4 3");
+      lines.push(line);
+    }
+    svg.replaceChildren(...lines);
   }
 
   private updateEdgeSvgLive(): void {
@@ -462,15 +491,6 @@ export class TachyonTopologyCanvas extends HTMLElement {
       line.setAttribute("x2", String((parseFloat(toBtn.style.left) || 0) + offset));
       line.setAttribute("y2", String((parseFloat(toBtn.style.top) || 0) + offsetY));
     });
-  }
-
-  private escape(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
   }
 }
 
@@ -511,14 +531,14 @@ export class TachyonNodeEditor extends HTMLElement {
         <header class="flex items-center justify-between mb-5">
           <div>
             <div class="text-[10px] uppercase tracking-widest text-slate-500">${t(`topology.type.${this.node.type}`)}</div>
-            <h3 class="${theme.badge} text-lg font-semibold">${this.escape(this.node.label || this.node.id)}</h3>
+            <h3 id="node-title" class="${theme.badge} text-lg font-semibold"></h3>
           </div>
           <button id="btn-close-editor" type="button" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-300 hover:bg-slate-700">${t("topology.editor.close")}</button>
         </header>
 
         <form id="node-form" class="space-y-3 text-sm">
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.editor.label")}
-            <input id="node-label" type="text" value="${this.escape(this.node.label)}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 outline-none focus:border-cyan-400" />
+            <input id="node-label" type="text" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 outline-none focus:border-cyan-400" />
           </label>
           ${this.renderTypeFields()}
           <div class="flex items-center justify-between gap-2 pt-3">
@@ -528,6 +548,12 @@ export class TachyonNodeEditor extends HTMLElement {
         </form>
       </aside>
     `;
+
+    // Populate user-controlled values via DOM API (textContent / .value property)
+    // so they never reach innerHTML.
+    const title = this.root.getElementById("node-title");
+    if (title) title.textContent = this.node.label || this.node.id;
+    this.populateFieldValues();
 
     this.root.getElementById("btn-close-editor")?.addEventListener("click", () => {
       this.dispatchEvent(
@@ -561,7 +587,7 @@ export class TachyonNodeEditor extends HTMLElement {
       case "llm":
         return `
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.modelName")}
-            <input id="field-modelName" type="text" value="${this.escape(this.node.data.modelName ?? "")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
+            <input id="field-modelName" type="text" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
           </label>
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.quantization")}
             <select id="field-quantization" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200">
@@ -579,7 +605,7 @@ export class TachyonNodeEditor extends HTMLElement {
       case "kv-cache":
         return `
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.capacityGb")}
-            <input id="field-capacityGb" type="number" min="1" value="${this.escape(this.node.data.capacityGb ?? "32")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
+            <input id="field-capacityGb" type="number" min="1" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
           </label>
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.evictionPolicy")}
             <select id="field-evictionPolicy" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200">
@@ -590,7 +616,7 @@ export class TachyonNodeEditor extends HTMLElement {
       case "external-resource":
         return `
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.targetUrl")}
-            <input id="field-targetUrl" type="url" value="${this.escape(this.node.data.targetUrl ?? "")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
+            <input id="field-targetUrl" type="url" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
           </label>
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.authType")}
             <select id="field-authType" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200">
@@ -600,18 +626,18 @@ export class TachyonNodeEditor extends HTMLElement {
             </select>
           </label>
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.timeoutMs")}
-            <input id="field-timeoutMs" type="number" min="100" value="${this.escape(this.node.data.timeoutMs ?? "5000")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
+            <input id="field-timeoutMs" type="number" min="100" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
           </label>`;
       case "custom-wasm":
         return `
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.capabilityName")}
-            <input id="field-capabilityName" type="text" value="${this.escape(this.node.data.capabilityName ?? "")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
+            <input id="field-capabilityName" type="text" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
           </label>
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.semver")}
-            <input id="field-semver" type="text" value="${this.escape(this.node.data.semver ?? "^1.0.0")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 font-mono" />
+            <input id="field-semver" type="text" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 font-mono" />
           </label>
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.assetSource")}
-            <input id="field-assetSource" type="text" value="${this.escape(this.node.data.assetSource ?? "")}" placeholder="./assets/example.wasm" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 font-mono" />
+            <input id="field-assetSource" type="text" placeholder="./assets/example.wasm" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 font-mono" />
           </label>`;
       case "endpoint":
         return `
@@ -624,22 +650,22 @@ export class TachyonNodeEditor extends HTMLElement {
             </select>
           </label>
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.port")}
-            <input id="field-port" type="number" value="${this.escape(this.node.data.port ?? "443")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 font-mono" />
+            <input id="field-port" type="number" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 font-mono" />
           </label>`;
       case "storage":
         return `
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.mountPath")}
-            <input id="field-mountPath" type="text" value="${this.escape(this.node.data.mountPath ?? "/data")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 font-mono" />
+            <input id="field-mountPath" type="text" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 font-mono" />
           </label>`;
       case "message-broker":
         return `
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.queueName")}
-            <input id="field-queueName" type="text" value="${this.escape(this.node.data.queueName ?? "")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
+            <input id="field-queueName" type="text" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
           </label>`;
       case "system-faas":
         return `
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.field.component")}
-            <input id="field-component" type="text" value="${this.escape(this.node.data.component ?? "")}" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
+            <input id="field-component" type="text" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200" />
           </label>`;
       default:
         return "";
@@ -669,14 +695,35 @@ export class TachyonNodeEditor extends HTMLElement {
     );
   }
 
-  private escape(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
+  /** Sets input/select values via the `.value` property so user data never
+   *  reaches innerHTML. Called immediately after the form is rendered. */
+  private populateFieldValues(): void {
+    if (!this.node) return;
+    const labelInput = this.root.getElementById("node-label") as HTMLInputElement | null;
+    if (labelInput) labelInput.value = this.node.label;
+
+    // Type-specific field defaults
+    const defaults: Record<string, string> = {
+      modelName: "",
+      capacityGb: "32",
+      targetUrl: "",
+      timeoutMs: "5000",
+      capabilityName: "",
+      semver: "^1.0.0",
+      assetSource: "",
+      port: "443",
+      mountPath: "/data",
+      queueName: "",
+      component: "",
+    };
+    this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[id^='field-']").forEach((field) => {
+      const key = field.id.replace(/^field-/, "");
+      const raw = this.node!.data[key];
+      const value = raw === undefined || raw === null || raw === "" ? defaults[key] ?? "" : String(raw);
+      field.value = value;
+    });
   }
+
 }
 
 customElements.define("tachyon-node-editor", TachyonNodeEditor);
@@ -755,8 +802,9 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
       .map((type) => `<option value="${type}">${t(`topology.type.${type}`)}</option>`)
       .join("");
 
+    // Source banner — `this.liveSource` is populated via DOM API after innerHTML.
     const sourceBanner = this.liveSource
-      ? `<span class="ml-2 text-[10px] text-emerald-400 font-mono">${t("topology.live-banner")} ${this.escapeHtml(this.liveSource)}</span>`
+      ? `<span class="ml-2 text-[10px] text-emerald-400 font-mono">${t("topology.live-banner")} <span id="topology-live-source"></span></span>`
       : `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">${t("topology.offline-banner")}</span>`;
 
     const btnClass = "rounded border border-slate-700 bg-slate-800/60 px-2 py-1 text-xs text-slate-300 hover:bg-slate-700 transition-colors";
@@ -807,7 +855,8 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
             ${(Object.keys(NODE_THEMES) as TopologyNodeType[])
               .map((type) => {
                 const theme = NODE_THEMES[type];
-                return `<div class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950/40 p-2"><span class="inline-flex h-6 w-6 items-center justify-center rounded ${theme.iconBg}">${theme.glyph}</span><span class="${theme.badge}">${this.escapeHtml(t(`topology.type.${type}`))}</span></div>`;
+                // t() returns trusted strings from the static i18n dictionary.
+                return `<div class="flex items-center gap-2 rounded border border-slate-800 bg-slate-950/40 p-2"><span class="inline-flex h-6 w-6 items-center justify-center rounded ${theme.iconBg}">${theme.glyph}</span><span class="${theme.badge}">${t(`topology.type.${type}`)}</span></div>`;
               })
               .join("")}
           </div>
@@ -816,6 +865,11 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">${t("topology.feedback.empty")}</div>
       </section>
     `);
+    // Populate the live-source label via textContent — user-controlled URL.
+    if (this.liveSource) {
+      const liveSourceEl = this.root.getElementById("topology-live-source");
+      if (liveSourceEl) liveSourceEl.textContent = this.liveSource;
+    }
   }
 
   private bindEvents(): void {
@@ -981,19 +1035,6 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
 
   private editor(): TachyonNodeEditor | null {
     return this.root.querySelector<TachyonNodeEditor>("tachyon-node-editor");
-  }
-
-  private escapeAttr(value: string): string {
-    return value.replace(/"/g, "&quot;");
-  }
-
-  private escapeHtml(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
   }
 }
 

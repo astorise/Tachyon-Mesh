@@ -223,3 +223,14 @@ The `#global-apply-loader` element SHALL carry `aria-live="polite"` and `aria-at
 
 ### Requirement: IDE integration guide MUST document live schema binding
 `docs/ide-integration.md` SHALL document VS Code `json.schemas` binding and YAML modeline, JetBrains JSON Schema Mappings, Neovim LSP config, and offline snapshot procedure for all three schema endpoints (`/admin/schema/manifest`, `/admin/schema/integrity-lock`, `/admin/schema/openapi.json`).
+
+### Requirement: Dynamic user data MUST be rendered via DOM API, not innerHTML
+A shared `tachyon-ui/src/utils/dom-safe.ts` module SHALL export `el(tag, attrs, ...children)` and `frag(...children)` helpers that build DOM nodes using `createElement`, `textContent`, and `setAttribute`. Every render path that previously interpolated user-controlled values into `innerHTML` template literals SHALL use this helper or set values via the corresponding DOM property (`element.value = …`, `element.textContent = …`).
+
+### Requirement: No escapeHtml-style functions MUST exist in tachyon-ui
+The `tachyon-ui/src/` tree SHALL NOT contain any `escapeHtml`, `escape`, or `escapeAttr` function definitions or usages. A grep across `tachyon-ui/src/` for these names SHALL return zero matches (excluding the `dom-safe.ts` module itself which has no such function).
+
+#### Scenario: Build verification passes
+- **WHEN** `cd tachyon-ui && npm run build` is run
+- **THEN** `tsc --noEmit` and `vite build` both exit 0
+- **AND** no file in `tachyon-ui/src/` defines or imports `escapeHtml`/`escape`/`escapeAttr`

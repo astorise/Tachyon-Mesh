@@ -24,15 +24,6 @@ import { listComponentRoutes, resolveComponentTag } from "../../registry/Compone
 import { getLanguage, setLanguage, t } from "../../utils/i18n";
 import { resilientInvoke as invoke } from "../../utils/network";
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
 type AuthenticatedDetail = {
   user: string;
   role: string;

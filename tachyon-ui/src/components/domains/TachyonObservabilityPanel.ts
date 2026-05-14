@@ -1,4 +1,5 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
+import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
@@ -94,6 +95,7 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
         <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">${t("observability.feedback.empty")}</div>
       </section>
     `);
+    this.populateObservability();
   }
 
   private bindEvents(): void {
@@ -110,14 +112,14 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
     if (!this.metrics) {
       return `<p class="text-xs text-slate-500">${t("observability.metrics.empty")}</p>`;
     }
-    const m = this.metrics;
+    // Static structure — source field populated via DOM API.
     return `
       <dl class="grid grid-cols-2 gap-4 text-xs md:grid-cols-5">
-        <div><dt class="text-slate-500">${t("observability.metrics.source")}</dt><dd class="font-mono text-cyan-300 break-all">${this.escape(m.source)}</dd></div>
-        <div><dt class="text-slate-500">${t("observability.metrics.error-rate")}</dt><dd class="font-mono text-slate-200">${(m.errorRate * 100).toFixed(2)}%</dd></div>
-        <div><dt class="text-slate-500">${t("observability.metrics.p50")}</dt><dd class="font-mono text-slate-200">${m.p50LatencyMs.toFixed(1)}</dd></div>
-        <div><dt class="text-slate-500">${t("observability.metrics.p99")}</dt><dd class="font-mono text-slate-200">${m.p99LatencyMs.toFixed(1)}</dd></div>
-        <div><dt class="text-slate-500">${t("observability.metrics.queue")}</dt><dd class="font-mono text-slate-200">${m.queueDepth}</dd></div>
+        <div><dt class="text-slate-500">${t("observability.metrics.source")}</dt><dd id="metrics-source" class="font-mono text-cyan-300 break-all"></dd></div>
+        <div><dt class="text-slate-500">${t("observability.metrics.error-rate")}</dt><dd class="font-mono text-slate-200">${(this.metrics.errorRate * 100).toFixed(2)}%</dd></div>
+        <div><dt class="text-slate-500">${t("observability.metrics.p50")}</dt><dd class="font-mono text-slate-200">${this.metrics.p50LatencyMs.toFixed(1)}</dd></div>
+        <div><dt class="text-slate-500">${t("observability.metrics.p99")}</dt><dd class="font-mono text-slate-200">${this.metrics.p99LatencyMs.toFixed(1)}</dd></div>
+        <div><dt class="text-slate-500">${t("observability.metrics.queue")}</dt><dd class="font-mono text-slate-200">${this.metrics.queueDepth}</dd></div>
       </dl>
     `;
   }
@@ -126,32 +128,60 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
     if (this.logs.length === 0) {
       return `<p class="text-xs text-slate-500">${t("observability.logs.empty")}</p>`;
     }
-    return `
-      <ul class="max-h-64 space-y-1 overflow-y-auto font-mono text-xs">
-        ${this.logs
-          .map(
-            (line) => `<li class="border-b border-slate-800 py-1"><span class="text-slate-500">${this.escape(line.timestamp)}</span> <span class="text-cyan-300">[${this.escape(line.level)}]</span> <span class="text-slate-400">${this.escape(line.target)}</span> ${this.escape(line.message)}</li>`,
-          )
-          .join("")}
-      </ul>
-    `;
+    return `<ul id="observability-logs" class="max-h-64 space-y-1 overflow-y-auto font-mono text-xs"></ul>`;
   }
 
   private renderShadow(): string {
     if (this.shadow.length === 0) {
       return `<p class="text-xs text-slate-500">${t("observability.shadow.empty")}</p>`;
     }
-    return `
-      <ul class="space-y-2 font-mono text-xs">
-        ${this.shadow
-          .map((diff) => {
-            const primary = diff.primaryStatus !== undefined ? diff.primaryStatus : "—";
-            const shadow = diff.shadowStatus !== undefined ? diff.shadowStatus : "—";
-            return `<li class="rounded border border-slate-800 bg-slate-950/50 px-3 py-2"><div class="flex justify-between"><span class="text-cyan-300">${this.escape(diff.route)}</span><span class="text-slate-500">${this.escape(diff.requestId)}</span></div><div class="text-slate-400">${this.escape(diff.divergence)} (primary=${primary}, shadow=${shadow})</div></li>`;
-          })
-          .join("")}
-      </ul>
-    `;
+    return `<ul id="observability-shadow" class="space-y-2 font-mono text-xs"></ul>`;
+  }
+
+  private populateObservability(): void {
+    // Metrics source (user data)
+    if (this.metrics) {
+      const sourceEl = this.root.getElementById("metrics-source");
+      if (sourceEl) sourceEl.textContent = this.metrics.source;
+    }
+
+    // Log lines
+    const logsHost = this.root.getElementById("observability-logs");
+    if (logsHost) {
+      logsHost.replaceChildren(
+        ...this.logs.map((line) =>
+          el("li", { class: "border-b border-slate-800 py-1" },
+            el("span", { class: "text-slate-500" }, line.timestamp),
+            " ",
+            el("span", { class: "text-cyan-300" }, `[${line.level}]`),
+            " ",
+            el("span", { class: "text-slate-400" }, line.target),
+            " ",
+            line.message,
+          ),
+        ),
+      );
+    }
+
+    // Shadow diffs
+    const shadowHost = this.root.getElementById("observability-shadow");
+    if (shadowHost) {
+      shadowHost.replaceChildren(
+        ...this.shadow.map((diff) => {
+          const primary = diff.primaryStatus !== undefined ? String(diff.primaryStatus) : "—";
+          const shadow = diff.shadowStatus !== undefined ? String(diff.shadowStatus) : "—";
+          return el("li", { class: "rounded border border-slate-800 bg-slate-950/50 px-3 py-2" },
+            el("div", { class: "flex justify-between" },
+              el("span", { class: "text-cyan-300" }, diff.route),
+              el("span", { class: "text-slate-500" }, diff.requestId),
+            ),
+            el("div", { class: "text-slate-400" },
+              diff.divergence, ` (primary=${primary}, shadow=${shadow})`,
+            ),
+          );
+        }),
+      );
+    }
   }
 
   private async refreshTelemetry(): Promise<void> {
@@ -190,15 +220,6 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
   private value(id: string, fallback: string): string {
     const value = (this.root.getElementById(id) as HTMLInputElement | HTMLSelectElement | null)?.value.trim();
     return value ? value : fallback;
-  }
-
-  private escape(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
   }
 }
 
