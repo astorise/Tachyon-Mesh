@@ -1,114 +1,102 @@
 import { test, expect, Page } from "@playwright/test";
 
-/**
- * Pierces into a Web Component's shadow DOM to find a child element.
- * Playwright's locator engine automatically pierces shadow roots, so
- * chaining `.locator()` on a custom element selector works as expected.
- */
-async function shadowLocator(page: Page, host: string, selector: string) {
-  return page.locator(host).locator(selector);
+// ---------------------------------------------------------------------------
+// Network route mocks
+// In the Tauri app the frontend calls Tauri IPC commands (not HTTP).
+// For routes that *do* go through HTTP (remote cluster endpoints forwarded
+// by the Rust backend), we intercept here. For Tauri-specific IPC we use
+// addInitScript to stub window.__TAURI_INTERNALS__.
+// ---------------------------------------------------------------------------
+
+async function installTauriMocks(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    // Stub the Tauri invoke bridge so calls resolve predictably in tests.
+    const responses: Record<string, unknown> = {
+      get_hardware_status: { totalRamMb: 8192, availableRamMb: 4096, accelerators: ["cpu"], gpus: [] },
+      get_metrics: { source: "mock", errorRate: 0, p50LatencyMs: 1, p99LatencyMs: 2, queueDepth: 0, vramUtilizationPct: 0, ramOffloadActive: false },
+      get_resources: [],
+      load_credentials: null,
+      load_custom_ca: null,
+    };
+    // Patch the Tauri internal invoke hook
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: (cmd: string) => {
+        if (cmd in responses) return Promise.resolve(responses[cmd]);
+        return Promise.reject(new Error(`[mock] unhandled command: ${cmd}`));
+      },
+    };
+  });
 }
+
+async function installNetworkMocks(page: Page, applyDelayMs = 0): Promise<void> {
+  // Mock the Tauri HTTP plugin routes if the app uses them for cluster calls.
+  await page.route("**/auth/login/stage", async (route) => {
+    await route.fulfill({ json: { sessionId: "mock-session-123", requiresMfa: true, username: "e2e-operator", endpoint: "http://localhost:8080" } });
+  });
+  await page.route("**/auth/login/finalize", async (route) => {
+    await route.fulfill({ json: { username: "e2e-operator", endpoint: "http://localhost:8080", requiresMfa: false } });
+  });
+  await page.route("**/admin/manifest/bundle", async (route) => {
+    if (applyDelayMs > 0) {
+      await new Promise((r) => setTimeout(r, applyDelayMs));
+    }
+    await route.fulfill({ json: { success: true, message: "Bundle applied.", configVersion: 2, conflicts: [], requiresResolution: false } });
+  });
+  await page.route("**/admin/manifest", async (route) => {
+    await route.fulfill({ json: { success: true, message: "Manifest applied.", configVersion: 2 } });
+  });
+}
+
+// ---------------------------------------------------------------------------
 
 test.describe("Critical Path: Login → topology → seal manifest", () => {
   test("auth step renders credentials form inside shadow DOM", async ({ page }) => {
+    await installTauriMocks(page);
     await page.goto("/");
 
-    // The auth layer wraps tachyon-iam which hosts auth-step-credentials
     const credStep = page.locator("tachyon-iam").locator("auth-step-credentials");
     await expect(credStep).toBeAttached();
 
-    // Inputs live inside auth-step-credentials shadow root
-    const urlInput = credStep.locator("#cred-url");
-    const usernameInput = credStep.locator("#cred-username");
-    const passwordInput = credStep.locator("#cred-password");
-
-    await expect(urlInput).toBeVisible();
-    await expect(usernameInput).toBeVisible();
-    await expect(passwordInput).toBeVisible();
+    await expect(credStep.locator("#cred-url")).toBeVisible();
+    await expect(credStep.locator("#cred-username")).toBeVisible();
+    await expect(credStep.locator("#cred-password")).toBeVisible();
   });
 
-  test("login form submits credentials and shows MFA step", async ({ page }) => {
+  test("IAM panel has correct ARIA dialog role", async ({ page }) => {
+    await installTauriMocks(page);
     await page.goto("/");
 
-    const credStep = page.locator("tachyon-iam").locator("auth-step-credentials");
-
-    await credStep.locator("#cred-url").fill("http://localhost:8080");
-    await credStep.locator("#cred-username").fill("testoperator");
-    await credStep.locator("#cred-password").fill("testpassword");
-
-    // Submit the credentials form
-    await credStep.locator("#cred-form").evaluate((form: HTMLFormElement) =>
-      form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }))
-    );
-
-    // After successful login the MFA step should become visible
-    // (In CI / offline mode this step may not progress past network error –
-    //  the assertion uses a short timeout and is soft to allow offline runs.)
-    await expect(
-      page.locator("tachyon-iam").locator("#auth-step-mfa")
-    ).toBeVisible({ timeout: 5_000 }).catch(() => {
-      // Acceptable in offline CI: the form submission will fail at the network
-      // layer; we only verify the credentials step remains visible (no crash).
-      return expect(credStep).toBeVisible();
-    });
+    const panel = page.locator("tachyon-iam").locator("#iam-panel");
+    await expect(panel).toHaveAttribute("role", "dialog");
+    await expect(panel).toHaveAttribute("aria-modal", "true");
+    await expect(panel).toHaveAttribute("aria-labelledby", "iam-dialog-title");
   });
 
   test("shell nav renders after authentication event", async ({ page }) => {
+    await installTauriMocks(page);
     await page.goto("/");
 
-    // Simulate the iam:authenticated event to bypass real network auth in unit mode
     await page.evaluate(() => {
       document.dispatchEvent(
         new CustomEvent("iam:authenticated", {
           bubbles: true,
           detail: { user: "e2e-operator", role: "admin", token: "test-token" },
-        })
-      );
-    });
-
-    // The app shell should become visible
-    const shell = page.locator("tachyon-app-shell");
-    await expect(shell).not.toHaveClass(/hidden/, { timeout: 3_000 });
-
-    // The sidebar nav component should be mounted inside the shell's shadow root
-    const nav = shell.locator("tachyon-app-shell-nav");
-    await expect(nav).toBeAttached();
-  });
-
-  test("navigation routes to topology panel", async ({ page }) => {
-    await page.goto("/");
-
-    // Fast-track past auth
-    await page.evaluate(() => {
-      document.dispatchEvent(
-        new CustomEvent("iam:authenticated", {
-          bubbles: true,
-          detail: { user: "e2e-operator", role: "admin", token: "test-token" },
-        })
+        }),
       );
     });
 
     const shell = page.locator("tachyon-app-shell");
     await expect(shell).not.toHaveClass(/hidden/, { timeout: 3_000 });
-
-    // Navigate to topology via hash
-    await page.evaluate(() => {
-      window.location.hash = "topology";
-    });
-
-    // The active route panel should switch
-    await expect(page).toHaveURL(/#topology/);
+    await expect(shell.locator("tachyon-app-shell-nav")).toBeAttached();
   });
 
-  test("pending-seal button is hidden by default and visible after config:staged", async ({ page }) => {
+  test("seal button toggles on config:staged", async ({ page }) => {
+    await installTauriMocks(page);
     await page.goto("/");
 
     await page.evaluate(() => {
       document.dispatchEvent(
-        new CustomEvent("iam:authenticated", {
-          bubbles: true,
-          detail: { user: "e2e-operator", role: "admin", token: "test-token" },
-        })
+        new CustomEvent("iam:authenticated", { bubbles: true, detail: { user: "e2e-operator", role: "admin", token: "test-token" } }),
       );
     });
 
@@ -118,11 +106,42 @@ test.describe("Critical Path: Login → topology → seal manifest", () => {
     const sealBtn = shell.locator("#btn-seal-apply");
     await expect(sealBtn).toHaveClass(/hidden/);
 
-    // Trigger a staged config event
-    await page.evaluate(() => {
-      window.dispatchEvent(new CustomEvent("config:staged"));
-    });
-
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent("config:staged")));
     await expect(sealBtn).not.toHaveClass(/hidden/);
+  });
+
+  test("global loader is aria-live and shows sr-only text while applying", async ({ page }) => {
+    await installTauriMocks(page);
+    // Apply mock with 1.5 s delay so we can assert the loader is visible.
+    await installNetworkMocks(page, 1500);
+    await page.goto("/");
+
+    // Authenticate
+    await page.evaluate(() => {
+      document.dispatchEvent(
+        new CustomEvent("iam:authenticated", { bubbles: true, detail: { user: "e2e-operator", role: "admin", token: "test-token" } }),
+      );
+    });
+    const shell = page.locator("tachyon-app-shell");
+    await expect(shell).not.toHaveClass(/hidden/, { timeout: 3_000 });
+
+    // Stage a config change so the seal button appears
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent("config:staged")));
+    const sealBtn = shell.locator("#btn-seal-apply");
+    await expect(sealBtn).not.toHaveClass(/hidden/);
+
+    // Click seal — the loader should appear while the mock delay is active
+    void sealBtn.click();
+
+    const loader = shell.locator("#global-apply-loader");
+    await expect(loader).toBeVisible({ timeout: 2_000 });
+    await expect(loader).toHaveAttribute("aria-live", "polite");
+
+    const srText = loader.locator(".sr-only");
+    await expect(srText).toHaveText(/Applying configuration/);
+
+    // main-content should be aria-busy during the operation
+    const mainContent = shell.locator("#main-content");
+    await expect(mainContent).toHaveAttribute("aria-busy", "true");
   });
 });

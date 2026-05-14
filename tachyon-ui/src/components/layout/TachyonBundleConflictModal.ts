@@ -1,38 +1,7 @@
 import stylesheetText from "../../style.css?inline";
+import { trapFocus } from "../../utils/a11y";
 import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
-
-/**
- * Traps keyboard focus inside `container` while the modal is open.
- * Pressing Tab or Shift+Tab cycles through focusable descendants only.
- * Returns a cleanup function that removes the listener.
- */
-function trapFocus(container: HTMLElement | null): () => void {
-  if (!container) return () => undefined;
-  const focusable = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
-  const handler = (event: KeyboardEvent): void => {
-    if (event.key !== "Tab") return;
-    const items = Array.from(container.querySelectorAll<HTMLElement>(focusable)).filter(
-      (el) => !el.closest("[disabled]"),
-    );
-    if (items.length === 0) return;
-    const first = items[0];
-    const last = items[items.length - 1];
-    if (event.shiftKey) {
-      if (document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      }
-    } else {
-      if (document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    }
-  };
-  container.addEventListener("keydown", handler);
-  return () => container.removeEventListener("keydown", handler);
-}
 
 export type BundleConflict = {
   name: string;
@@ -125,15 +94,16 @@ export class TachyonBundleConflictModal extends HTMLElement {
       </div>
     `;
 
-    // Install a keyboard focus trap and move initial focus into the modal.
+    // Install the shared focus trap; Escape cancels the conflict dialog.
     this.removeFocusTrap();
-    this.removeFocusTrap = trapFocus(this.root.querySelector<HTMLElement>('[role="dialog"]'));
-    window.requestAnimationFrame(() => {
-      const panel = this.root.getElementById("conflict-modal-panel");
-      if (panel) {
-        (panel.querySelector<HTMLElement>("button:not([disabled]), [tabindex]") ?? panel).focus?.();
-      }
-    });
+    const dialog = this.root.querySelector<HTMLElement>('[role="dialog"]');
+    if (dialog) {
+      this.removeFocusTrap = trapFocus(dialog, () => {
+        this.conflicts = [];
+        this.resolutions.clear();
+        this.root.innerHTML = "";
+      });
+    }
 
     this.root.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((button) => {
       button.addEventListener("click", () => {

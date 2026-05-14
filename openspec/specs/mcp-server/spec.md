@@ -211,3 +211,6 @@ The `error_response(id, code, message)` function SHALL be deleted in favour of `
 
 ### Requirement: Schema fetch failure MUST emit a tracing warning and populate tools/list warnings
 When `get_manifest_schema()` fails, `tachyon-mcp` SHALL emit a `tracing::warn!` describing the degradation. The `tools/list` response SHALL include `data.warnings` when `MANIFEST_SCHEMA` is unpopulated.
+
+### Requirement: Hardware status retrieval MUST be a named async helper
+The `tachyon_hardware_status` tool dispatch SHALL delegate to a `get_hardware_status() -> Result<Value>` async function rather than embedding the spawn_blocking call inline.

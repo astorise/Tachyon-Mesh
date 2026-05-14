@@ -1,4 +1,5 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
+import { trapFocus } from "../../utils/a11y";
 import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
@@ -215,10 +216,10 @@ export class TachyonUsersPanel extends TachyonConfigDashboard {
             })
             .join("");
     return `
-      <div id="audit-modal-overlay" class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur-sm">
+      <div id="audit-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="audit-modal-title" class="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur-sm">
         <div class="w-[min(48rem,calc(100vw-2rem))] rounded-lg border border-slate-700 bg-slate-900 p-5">
           <div class="mb-3 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-cyan-300">${t("users.audit.title")} <span class="ml-2 font-mono text-slate-300">${this.escape(this.auditTarget ?? "")}</span></h3>
+            <h3 id="audit-modal-title" class="text-sm font-semibold text-cyan-300">${t("users.audit.title")} <span class="ml-2 font-mono text-slate-300">${this.escape(this.auditTarget ?? "")}</span></h3>
             <button id="btn-close-audit" type="button" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-300 hover:bg-slate-700">${t("users.audit.close")}</button>
           </div>
           <div class="max-h-[60vh] overflow-y-auto">
@@ -357,6 +358,16 @@ export class TachyonUsersPanel extends TachyonConfigDashboard {
     }
     this.render();
     this.bindEvents();
+    // Trap focus inside the audit dialog; Escape closes it.
+    const overlay = this.root.getElementById("audit-modal-overlay");
+    if (overlay) {
+      trapFocus(overlay, () => {
+        this.auditTarget = null;
+        this.auditEntries = [];
+        this.render();
+        this.bindEvents();
+      });
+    }
   }
 
   private async deleteGroup(name: string): Promise<void> {

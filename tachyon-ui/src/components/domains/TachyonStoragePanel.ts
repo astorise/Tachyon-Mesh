@@ -126,43 +126,56 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
     const zone = this.root.getElementById("kv-result-zone");
     if (!zone) return;
     if (!this.kvResult) {
-      zone.innerHTML = "";
+      zone.replaceChildren();
       return;
     }
     const r = this.kvResult;
-    if (r.error) {
-      zone.innerHTML = `
-        <div class="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300 font-mono flex items-start justify-between gap-2">
-          <span>${escapeHtml(r.error)}</span>
-          <button id="btn-kv-inspect-close" type="button" class="text-slate-500 hover:text-slate-300 shrink-0">✕</button>
-        </div>
-      `;
-    } else if (r.value === null) {
-      zone.innerHTML = `
-        <div class="rounded border border-slate-600 bg-slate-800/50 px-3 py-2 text-xs text-slate-400 font-mono flex items-start justify-between gap-2">
-          <span>(key not found)</span>
-          <button id="btn-kv-inspect-close" type="button" class="text-slate-500 hover:text-slate-300 shrink-0">✕</button>
-        </div>
-      `;
-    } else {
-      let display = r.value;
-      try {
-        display = JSON.stringify(JSON.parse(r.value), null, 2);
-      } catch { /* not JSON, show raw */ }
-      zone.innerHTML = `
-        <div class="rounded border border-emerald-500/30 bg-emerald-500/5 p-3 space-y-1">
-          <div class="flex items-center justify-between">
-            <span class="text-[10px] font-mono text-emerald-400/70">${escapeHtml(r.namespace)} / ${escapeHtml(r.key)} · ${r.value.length} bytes</span>
-            <button id="btn-kv-inspect-close" type="button" class="text-slate-500 hover:text-slate-300 text-xs">✕</button>
-          </div>
-          <pre class="text-xs text-slate-300 font-mono whitespace-pre-wrap break-all max-h-48 overflow-y-auto">${escapeHtml(display)}</pre>
-        </div>
-      `;
-    }
-    this.root.getElementById("btn-kv-inspect-close")?.addEventListener("click", () => {
+    const onClose = () => {
       this.kvResult = null;
       this.renderKvResult();
-    });
+    };
+
+    // Build the container using DOM APIs so user-controlled values go through
+    // textContent and never reach innerHTML — no escaping needed.
+    const container = document.createElement("div");
+    const closeBtn = document.createElement("button");
+    closeBtn.id = "btn-kv-inspect-close";
+    closeBtn.type = "button";
+    closeBtn.textContent = "✕";
+    closeBtn.addEventListener("click", onClose);
+
+    if (r.error) {
+      container.className =
+        "rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300 font-mono flex items-start justify-between gap-2";
+      const msg = document.createElement("span");
+      msg.textContent = r.error;
+      closeBtn.className = "text-slate-500 hover:text-slate-300 shrink-0";
+      container.append(msg, closeBtn);
+    } else if (r.value === null) {
+      container.className =
+        "rounded border border-slate-600 bg-slate-800/50 px-3 py-2 text-xs text-slate-400 font-mono flex items-start justify-between gap-2";
+      const msg = document.createElement("span");
+      msg.textContent = "(key not found)";
+      closeBtn.className = "text-slate-500 hover:text-slate-300 shrink-0";
+      container.append(msg, closeBtn);
+    } else {
+      let display = r.value;
+      try { display = JSON.stringify(JSON.parse(r.value), null, 2); } catch { /* raw */ }
+      container.className = "rounded border border-emerald-500/30 bg-emerald-500/5 p-3 space-y-1";
+      const header = document.createElement("div");
+      header.className = "flex items-center justify-between";
+      const meta = document.createElement("span");
+      meta.className = "text-[10px] font-mono text-emerald-400/70";
+      meta.textContent = `${r.namespace} / ${r.key} · ${r.value.length} bytes`;
+      closeBtn.className = "text-slate-500 hover:text-slate-300 text-xs";
+      header.append(meta, closeBtn);
+      const pre = document.createElement("pre");
+      pre.className = "text-xs text-slate-300 font-mono whitespace-pre-wrap break-all max-h-48 overflow-y-auto";
+      pre.textContent = display;
+      container.append(header, pre);
+    }
+
+    zone.replaceChildren(container);
   }
 
   private renderResources(): string {

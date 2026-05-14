@@ -205,3 +205,15 @@ All z-stack overlays (toast manager, guided tour, bundle conflict modal) SHALL b
 
 ### Requirement: A TROUBLESHOOTING.md MUST cover the 15 most common failure modes
 The repository SHALL contain a `TROUBLESHOOTING.md` in the root covering build failures (wasm target, MSVC, NASM), runtime errors (port conflict, integrity.lock signature, ONNX), UI errors (WebKitGTK), MCP errors (-32001, -32002, degraded schema), and Kubernetes/GPU issues (VRAM scheduling, GPU detection). `README.md` SHALL link to it.
+
+### Requirement: trapFocus MUST support an Escape key onClose callback
+`trapFocus(element, onClose?)` SHALL invoke `onClose` when the Escape key is pressed inside the trapped element, preventing default browser behaviour.
+
+### Requirement: All modal dialogs MUST wire Escape to their close action
+`TachyonIAM`, `TachyonAppShellModalRoot`, `TachyonBundleConflictModal`, and `TachyonUsersPanel` audit modal SHALL pass their close/dismiss callbacks to `trapFocus`.
+
+### Requirement: Global loader MUST be announced by screen readers
+The `#global-apply-loader` element SHALL carry `aria-live="polite"` and `aria-atomic="true"`. A `.sr-only` span with "Applying configuration, please wait…" SHALL be the first child; visual elements SHALL carry `aria-hidden="true"`.
+
+### Requirement: KV result rendering MUST use DOM APIs not innerHTML
+`TachyonStoragePanel.renderKvResult()` SHALL build the result zone using `createElement`, `textContent`, and `replaceChildren` so user-controlled namespace/key/value strings never pass through innerHTML.

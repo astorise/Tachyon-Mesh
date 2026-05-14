@@ -332,13 +332,15 @@ export class TachyonAppShell extends HTMLElement {
     const loader = document.createElement("div");
     loader.id = "global-apply-loader";
     loader.setAttribute("role", "status");
-    loader.setAttribute("aria-label", "Applying configuration…");
+    loader.setAttribute("aria-live", "polite");
+    loader.setAttribute("aria-atomic", "true");
     loader.className =
       "absolute inset-0 flex items-center justify-center z-50 bg-slate-950/40";
     loader.innerHTML = `
       <div class="flex flex-col items-center gap-3">
-        <div class="h-12 w-12 rounded-full border-4 border-slate-700 border-t-cyan-400 animate-spin"></div>
-        <span class="text-xs font-mono text-slate-400">Applying…</span>
+        <span class="sr-only">Applying configuration, please wait…</span>
+        <div class="h-12 w-12 rounded-full border-4 border-slate-700 border-t-cyan-400 animate-spin" aria-hidden="true"></div>
+        <span class="text-xs font-mono text-slate-400" aria-hidden="true">Applying…</span>
       </div>
     `;
     mainContent.style.position = "relative";

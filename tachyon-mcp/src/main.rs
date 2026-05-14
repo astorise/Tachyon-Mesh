@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use tracing::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -10,6 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing::warn;
 
 /// Set once per process on the first authenticated request; subsequent requests
 /// skip the `set_connection` HTTP round-trip and reuse the cached state held
@@ -738,7 +738,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 });
             }
             tools_result
-        },
+        }
         "tools/call" => {
             let result = handle_tool_call(request.get("params"), context).await?;
             if result.get("jsonrpc").is_some() && result.get("error").is_some() {
@@ -802,6 +802,19 @@ async fn validate_request_auth(context: &McpContext) -> Result<()> {
     }
     let _ = CONNECTION_INITIALIZED.set(());
     Ok(())
+}
+
+/// Reads local hardware status on a blocking thread and returns it as a
+/// JSON-RPC tool result. Extracted from the `handle_tool_call` dispatch to
+/// keep that function readable and to make this path independently testable.
+async fn get_hardware_status() -> Result<Value> {
+    let status = tokio::task::spawn_blocking(tachyon_client::read_local_hardware_status)
+        .await
+        .context("hardware status task panicked")?;
+    let body = serde_json::to_string_pretty(&status).context("failed to encode hardware status")?;
+    Ok(json!({
+        "content": [{ "type": "text", "text": body }]
+    }))
 }
 
 async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Result<Value> {
@@ -962,21 +975,7 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
             let outcome = tachyon_client::run_chaos_scenario(request).await?;
             Ok(text_tool_result(&outcome)?)
         }
-        "tachyon_hardware_status" => {
-            let status = tokio::task::spawn_blocking(tachyon_client::read_local_hardware_status)
-                .await
-                .context("hardware status task panicked")?;
-            let body = serde_json::to_string_pretty(&status)
-                .context("failed to encode hardware status")?;
-            Ok(json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": body
-                    }
-                ]
-            }))
-        }
+        "tachyon_hardware_status" => Ok(get_hardware_status().await?),
         "validate_faas_capabilities" => {
             let arguments = params
                 .and_then(|value| value.get("arguments"))
