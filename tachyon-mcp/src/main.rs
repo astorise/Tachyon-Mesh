@@ -269,9 +269,27 @@ impl McpContext {
 
 fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
     let limit = match tool_name {
+        // Critical mutators — very tight budget to prevent accidental canary misconfiguration.
+        "tachyon_canary_split" => 2,
+        // Deployment / deletion mutators — moderate budget.
         "tachyon_apply_manifest" | "tachyon_seal_overlay" => 1,
-        "tachyon_get_metrics" | "tachyon_tail_logs" => 30,
+        "tachyon_deploy_function" | "tachyon_delete_function" => 5,
         "tachyon_register_resource" => 10,
+        // KV mutators and log fetches — generous but bounded.
+        "tachyon_kv_put" | "tachyon_kv_delete" | "tachyon_function_logs" => 30,
+        // Read-only telemetry tools.
+        "tachyon_get_metrics" | "tachyon_tail_logs" => 30,
+        // All remaining read-only tools — high throughput allowed.
+        "tachyon_mesh_status"
+        | "tachyon_lockfile"
+        | "tachyon_topology_snapshot"
+        | "tachyon_hardware_status"
+        | "tachyon_list_resources"
+        | "tachyon_list_functions"
+        | "tachyon_kv_get"
+        | "tachyon_dryrun_manifest"
+        | "validate_faas_capabilities"
+        | "run_chaos_scenario" => 100,
         _ => return None,
     };
     Some(RateLimitSpec {
@@ -353,7 +371,7 @@ async fn main() -> Result<()> {
             Ok(None) => {}
             Err(error) => {
                 eprintln!("tachyon-mcp error: {error:#}");
-                let response = error_response(None, -32603, &error.to_string());
+                let response = json_rpc_error_response(None, &JsonRpcError::from_anyhow(&error));
                 stdout
                     .write_all(response.to_string().as_bytes())
                     .await
@@ -619,13 +637,13 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_deploy_function",
-                    "description": "Deploy a pre-compiled WASM artifact to the mesh. Reads the file from disk, uploads it as a named asset, and stages a workload configuration overlay. Use tachyon_seal_overlay to activate.",
+                    "description": "Deploys a pre-compiled WASM artifact to the mesh. You MUST provide the absolute local path to the .wasm file on the host machine where this MCP server is running. The file is read from disk, uploaded as a named asset, and staged in the workload overlay. Call tachyon_seal_overlay then tachyon_apply_manifest to activate.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["function_name", "artifact_path"],
                         "properties": {
-                            "function_name": { "type": "string", "description": "Logical name for the function, used as its route alias." },
-                            "artifact_path": { "type": "string", "description": "Absolute or relative path to the .wasm artifact on disk." },
+                            "function_name": { "type": "string", "description": "Unique identifier for the function, used as its HTTP route alias." },
+                            "artifact_path": { "type": "string", "description": "Absolute local file path to the compiled .wasm artifact on the MCP host machine (e.g. '/home/user/project/target/wasm32-wasip2/release/my_fn.wasm')." },
                             "memory_mb":   { "type": "integer", "default": 128, "minimum": 16, "description": "RAM budget for the function in MiB." },
                             "gpu_vram_mb": { "type": "integer", "default": 0,   "minimum": 0,  "description": "Required VRAM in MiB (0 = CPU-only)." }
                         }
@@ -673,38 +691,38 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_kv_put",
-                    "description": "Write a key-value pair to the distributed KV-Partition V2 store.",
+                    "description": "Writes a key-value pair to the distributed KV-Partition V2 store. The value MUST be a valid JSON-stringified representation of your data (e.g. use JSON.stringify or serde_json::to_string). Plain strings must also be quoted.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["namespace", "key", "value"],
                         "properties": {
-                            "namespace": { "type": "string" },
-                            "key":       { "type": "string" },
-                            "value":     { "type": "string", "description": "UTF-8 string value (JSON-stringified for structured data)." }
+                            "namespace": { "type": "string", "description": "The KV partition namespace (e.g. 'global', 'auth', 'agent-context')." },
+                            "key":       { "type": "string", "description": "Key within the namespace." },
+                            "value":     { "type": "string", "description": "JSON-stringified value (e.g. '{\"status\":\"active\",\"count\":3}'). Must be valid UTF-8." }
                         }
                     }
                 },
                 {
                     "name": "tachyon_kv_delete",
-                    "description": "Delete a key from the distributed KV-Partition V2 store.",
+                    "description": "Deletes a key from the distributed KV-Partition V2 store. This operation is permanent — the key cannot be recovered after deletion.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["namespace", "key"],
                         "properties": {
-                            "namespace": { "type": "string" },
-                            "key":       { "type": "string" }
+                            "namespace": { "type": "string", "description": "The KV partition namespace." },
+                            "key":       { "type": "string", "description": "Key to delete within the namespace." }
                         }
                     }
                 },
                 {
                     "name": "tachyon_canary_split",
-                    "description": "Adjust the live traffic-split weight for an active canary rollout. Set weight_pct to 0 to abort and roll back to the stable version.",
+                    "description": "Adjusts traffic routing weights between the stable and canary versions of a deployed function. Set weight_pct=0 to perform an immediate rollback — all traffic drains back to the stable version and the canary rollout is aborted. Values 1-100 shift that percentage of live traffic to the canary. Use incrementally (e.g. 10→25→50→100) for a safe progressive rollout.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["route_path", "weight_pct"],
                         "properties": {
-                            "route_path": { "type": "string", "description": "HTTP route path of the function under rollout." },
-                            "weight_pct": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Percentage of traffic to send to the canary version (0 = abort)." }
+                            "route_path": { "type": "string", "description": "HTTP route path of the function under canary rollout (e.g. '/api/my-function')." },
+                            "weight_pct": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Percentage of traffic to route to the canary version. 0 = abort and roll back; 100 = full promotion." }
                         }
                     }
                 }
@@ -1139,17 +1157,6 @@ fn text_tool_result(value: &impl serde::Serialize) -> Result<Value> {
             }
         ]
     }))
-}
-
-fn error_response(id: Option<Value>, code: i64, message: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message
-        }
-    })
 }
 
 #[cfg(test)]
