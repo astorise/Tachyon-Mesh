@@ -1,4 +1,5 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
+import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
@@ -15,15 +16,6 @@ type KvResult = {
   value: string | null;
   error: string | null;
 };
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
 
 export class TachyonStoragePanel extends TachyonConfigDashboard {
   private resources: MeshResource[] = [];
@@ -119,6 +111,7 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
         <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">Awaiting storage configuration.</div>
       </section>
     `);
+    this.populateResourceRows();
     this.renderKvResult();
   }
 
@@ -182,20 +175,32 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
     if (this.resources.length === 0) {
       return `<p class="text-xs text-slate-500">${t("storage.preview.empty")}</p>`;
     }
-    const rows = this.resources
-      .map(
-        (resource) =>
-          `<tr><td class="py-1 pr-4 text-cyan-300">${escapeHtml(resource.name)}</td><td class="py-1 pr-4 text-slate-300">${escapeHtml(resource.type)}</td><td class="py-1 pr-4 font-mono text-slate-300">${escapeHtml(resource.target)}</td><td class="py-1 text-slate-300">${resource.pending ? "yes" : "no"}</td></tr>`,
-      )
-      .join("");
+    // Static structure — rows are populated via DOM API in populateResourceRows().
     return `
       <table class="w-full text-xs">
         <thead class="text-slate-500 uppercase tracking-widest">
           <tr><th class="text-left pb-2 pr-4">${t("storage.preview.column.name")}</th><th class="text-left pb-2 pr-4">${t("storage.preview.column.kind")}</th><th class="text-left pb-2 pr-4">${t("storage.preview.column.target")}</th><th class="text-left pb-2">${t("storage.preview.column.pending")}</th></tr>
         </thead>
-        <tbody>${rows}</tbody>
+        <tbody id="resource-rows"></tbody>
       </table>
     `;
+  }
+
+  private populateResourceRows(): void {
+    const tbody = this.root.getElementById("resource-rows");
+    if (!tbody) return;
+    tbody.replaceChildren(
+      ...this.resources.map((resource) =>
+        el(
+          "tr",
+          {},
+          el("td", { class: "py-1 pr-4 text-cyan-300" }, resource.name),
+          el("td", { class: "py-1 pr-4 text-slate-300" }, resource.type),
+          el("td", { class: "py-1 pr-4 font-mono text-slate-300" }, resource.target),
+          el("td", { class: "py-1 text-slate-300" }, resource.pending ? "yes" : "no"),
+        ),
+      ),
+    );
   }
 
   private async kvGet(): Promise<void> {

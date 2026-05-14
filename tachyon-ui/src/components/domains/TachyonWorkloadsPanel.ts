@@ -1,4 +1,5 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
+import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
@@ -106,67 +107,84 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
     if (activeRollouts.length === 0 && this.rollouts.length === 0) {
       return "";
     }
-
-    const entries = this.rollouts.map((r) => {
-      const phaseBadge = this.phaseBadge(r.phase);
-      const errorRate = r.nextReqCount > 0
-        ? ((r.nextErrCount / r.nextReqCount) * 100).toFixed(1)
-        : "0.0";
-      const isActive = r.phase === "stepping";
-      return `
-        <div class="rounded-lg border ${isActive ? "border-amber-500/40 bg-amber-500/5" : "border-slate-700 bg-slate-900"} p-4 space-y-3">
-          <div class="flex items-center justify-between gap-3">
-            <div>
-              <span class="font-mono text-sm text-cyan-300">${this.escape(r.routePath)}</span>
-              <span class="ml-2 text-[10px] text-slate-500">${this.escape(r.currentVersion)} → ${this.escape(r.nextVersion)}</span>
-            </div>
-            <div class="flex items-center gap-2">
-              ${phaseBadge}
-              ${isActive ? `<button data-abort-route="${this.escape(r.routePath)}" class="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-300 hover:bg-red-500/20">${t("workloads.canary.abort")}</button>` : ""}
-            </div>
-          </div>
-          ${isActive ? `
-          <div>
-            <div class="mb-1 flex justify-between text-[11px] text-slate-400">
-              <span>${t("workloads.canary.traffic")}: ${r.weightPct}%</span>
-              <span>${t("workloads.canary.errorRate")}: ${errorRate}%</span>
-            </div>
-            <div class="h-2 w-full overflow-hidden rounded-full bg-slate-700">
-              <div class="h-full rounded-full bg-amber-400 transition-all" style="width:${r.weightPct}%"></div>
-            </div>
-          </div>` : ""}
-        </div>
-      `;
-    }).join("");
-
+    // Static structure — entries populated via DOM API in populateRollouts().
     return `
       <article data-stagger-panel class="space-y-3">
         <div class="flex items-center justify-between">
           <h3 class="text-sm font-semibold uppercase tracking-widest text-amber-400">${t("workloads.canary.statusTitle")}</h3>
           <button id="btn-refresh-rollouts" type="button" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-[11px] text-slate-300 hover:bg-slate-700">${t("workloads.canary.refresh")}</button>
         </div>
-        ${entries || `<p class="text-xs text-slate-500">${t("workloads.canary.noRollouts")}</p>`}
+        <div id="rollouts-list"></div>
       </article>
     `;
   }
 
-  private phaseBadge(phase: string): string {
-    if (phase === "stepping") {
-      return `<span class="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] text-amber-300">${t("workloads.canary.phase.stepping")}</span>`;
+  private populateRollouts(): void {
+    const host = this.root.getElementById("rollouts-list");
+    if (!host) return;
+
+    if (this.rollouts.length === 0) {
+      host.replaceChildren(el("p", { class: "text-xs text-slate-500" }, t("workloads.canary.noRollouts")));
+      return;
     }
-    if (phase === "promoted") {
-      return `<span class="rounded bg-emerald-500/20 px-2 py-0.5 text-[10px] text-emerald-300">${t("workloads.canary.phase.promoted")}</span>`;
-    }
-    return `<span class="rounded bg-red-500/20 px-2 py-0.5 text-[10px] text-red-300">${t("workloads.canary.phase.rolledBack")}</span>`;
+
+    host.replaceChildren(
+      ...this.rollouts.map((r) => {
+        const errorRate = r.nextReqCount > 0
+          ? ((r.nextErrCount / r.nextReqCount) * 100).toFixed(1)
+          : "0.0";
+        const isActive = r.phase === "stepping";
+        const containerClass = "rounded-lg border " +
+          (isActive ? "border-amber-500/40 bg-amber-500/5" : "border-slate-700 bg-slate-900") +
+          " p-4 space-y-3";
+
+        const phaseBadgeNode = this.phaseBadgeNode(r.phase);
+
+        const headerRight = el("div", { class: "flex items-center gap-2" }, phaseBadgeNode);
+        if (isActive) {
+          headerRight.appendChild(
+            el("button", {
+              "data-abort-route": r.routePath,
+              class: "rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-300 hover:bg-red-500/20",
+            }, t("workloads.canary.abort")),
+          );
+        }
+
+        const header = el("div", { class: "flex items-center justify-between gap-3" },
+          el("div", {},
+            el("span", { class: "font-mono text-sm text-cyan-300" }, r.routePath),
+            el("span", { class: "ml-2 text-[10px] text-slate-500" }, `${r.currentVersion} → ${r.nextVersion}`),
+          ),
+          headerRight,
+        );
+
+        const body = el("div", { class: containerClass }, header);
+        if (isActive) {
+          body.appendChild(
+            el("div", {},
+              el("div", { class: "mb-1 flex justify-between text-[11px] text-slate-400" },
+                el("span", {}, `${t("workloads.canary.traffic")}: ${r.weightPct}%`),
+                el("span", {}, `${t("workloads.canary.errorRate")}: ${errorRate}%`),
+              ),
+              el("div", { class: "h-2 w-full overflow-hidden rounded-full bg-slate-700" },
+                el("div", { class: "h-full rounded-full bg-amber-400 transition-all", style: `width:${r.weightPct}%` }),
+              ),
+            ),
+          );
+        }
+        return body;
+      }),
+    );
   }
 
-  private escape(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
+  private phaseBadgeNode(phase: string): HTMLElement {
+    if (phase === "stepping") {
+      return el("span", { class: "rounded bg-amber-500/20 px-2 py-0.5 text-[10px] text-amber-300" }, t("workloads.canary.phase.stepping"));
+    }
+    if (phase === "promoted") {
+      return el("span", { class: "rounded bg-emerald-500/20 px-2 py-0.5 text-[10px] text-emerald-300" }, t("workloads.canary.phase.promoted"));
+    }
+    return el("span", { class: "rounded bg-red-500/20 px-2 py-0.5 text-[10px] text-red-300" }, t("workloads.canary.phase.rolledBack"));
   }
 
   private bindForm(): void {

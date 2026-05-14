@@ -1,15 +1,7 @@
 import { tachyonSharedStylesheet } from "../../styles/shared-sheets";
 import { listComponentRoutes } from "../../registry/ComponentRegistry";
+import { el } from "../../utils/dom-safe";
 import { t } from "../../utils/i18n";
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
 
 /**
  * Sidebar navigation component extracted from TachyonAppShell.
@@ -52,26 +44,51 @@ export class TachyonAppShellNav extends HTMLElement {
 
   private render(): void {
     const active = this.activeRoute;
-    const configLinks = listComponentRoutes()
-      .map(
-        (entry) =>
-          `<button data-route="${escapeHtml(entry.route)}" class="nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors">${escapeHtml(t(`nav.${entry.route}`) || entry.label)}</button>`,
-      )
-      .join("");
 
+    // Static structural HTML — no user data.
     this.root.innerHTML = `
       <aside class="w-64 bg-slate-900 border-r border-slate-800 flex flex-col h-screen" aria-label="${t("shell.sidebar-label")}">
         <div class="h-16 flex items-center px-6 border-b border-slate-800">
           <div class="w-3 h-3 bg-cyan-400 rounded-full mr-3 shadow-[0_0_10px_rgba(34,211,238,0.8)]" aria-hidden="true"></div>
           <h1 class="text-xl font-bold text-white tracking-wider">TACHYON<span class="text-cyan-400">MESH</span></h1>
         </div>
-        <nav class="flex-1 p-4 space-y-2" aria-label="${t("shell.nav-label")}">
-          <button data-route="dashboard" class="nav-link w-full text-left block px-4 py-2 rounded-md ${active === "dashboard" ? "bg-slate-800 text-cyan-400 font-medium" : "text-slate-300"} transition-colors">${t("nav.dashboard")}</button>
-          ${configLinks}
-        </nav>
+        <nav id="nav-links" class="flex-1 p-4 space-y-2" aria-label="${t("shell.nav-label")}"></nav>
         <div class="p-4 border-t border-slate-800 text-xs text-slate-500" aria-hidden="true">${t("shell.version")}</div>
       </aside>
     `;
+
+    // Build nav buttons via DOM API — route strings come from the registry
+    // (developer-controlled) but we never trust them with HTML interpolation.
+    const nav = this.root.getElementById("nav-links");
+    if (nav) {
+      const dashboardActive = active === "dashboard";
+      nav.appendChild(
+        el(
+          "button",
+          {
+            "data-route": "dashboard",
+            class:
+              "nav-link w-full text-left block px-4 py-2 rounded-md transition-colors " +
+              (dashboardActive ? "bg-slate-800 text-cyan-400 font-medium" : "text-slate-300"),
+          },
+          t("nav.dashboard"),
+        ),
+      );
+      for (const entry of listComponentRoutes()) {
+        const label = t(`nav.${entry.route}`) || entry.label;
+        nav.appendChild(
+          el(
+            "button",
+            {
+              "data-route": entry.route,
+              class:
+                "nav-link w-full text-left block px-4 py-2 rounded-md text-slate-300 hover:bg-slate-800/50 transition-colors",
+            },
+            label,
+          ),
+        );
+      }
+    }
 
     this.root.querySelectorAll<HTMLButtonElement>("[data-route]").forEach((button) => {
       button.addEventListener("click", () => {

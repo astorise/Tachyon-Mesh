@@ -1,4 +1,5 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
+import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
@@ -77,6 +78,7 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
         <div id="feedback-zone" data-stagger-panel class="mt-4 rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">Awaiting route deployment.</div>
       </section>
     `);
+    this.populateSnapshotRows();
   }
 
   private async applyRoute(): Promise<void> {
@@ -127,34 +129,35 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
     if (!this.snapshot || this.snapshot.routes.length === 0) {
       return `<p class="text-xs text-slate-500">${t("routing.preview.empty")}</p>`;
     }
-    const rows = this.snapshot.routes
-      .map(
-        (route) =>
-          `<tr><td class="py-1 pr-4 text-cyan-300">${this.escape(route.name)}</td><td class="py-1 pr-4 font-mono text-slate-300">${this.escape(route.path)}</td><td class="py-1 pr-4 text-slate-300">${route.targetCount}</td><td class="py-1 text-slate-300">${route.requiresTee ? "yes" : "no"}</td></tr>`,
-      )
-      .join("");
+    // Static structure — rows populated via DOM API in populateSnapshotRows().
     return `
       <table class="w-full text-xs">
         <thead class="text-slate-500 uppercase tracking-widest">
           <tr><th class="text-left pb-2 pr-4">${t("routing.preview.column.name")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.path")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.targets")}</th><th class="text-left pb-2">${t("routing.preview.column.tee")}</th></tr>
         </thead>
-        <tbody>${rows}</tbody>
+        <tbody id="routing-snapshot-rows"></tbody>
       </table>
     `;
+  }
+
+  private populateSnapshotRows(): void {
+    const tbody = this.root.getElementById("routing-snapshot-rows");
+    if (!tbody || !this.snapshot) return;
+    tbody.replaceChildren(
+      ...this.snapshot.routes.map((route) =>
+        el("tr", {},
+          el("td", { class: "py-1 pr-4 text-cyan-300" }, route.name),
+          el("td", { class: "py-1 pr-4 font-mono text-slate-300" }, route.path),
+          el("td", { class: "py-1 pr-4 text-slate-300" }, String(route.targetCount)),
+          el("td", { class: "py-1 text-slate-300" }, route.requiresTee ? "yes" : "no"),
+        ),
+      ),
+    );
   }
 
   private value(id: string, fallback: string): string {
     const value = (this.root.getElementById(id) as HTMLInputElement | null)?.value.trim();
     return value ? value : fallback;
-  }
-
-  private escape(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
   }
 }
 

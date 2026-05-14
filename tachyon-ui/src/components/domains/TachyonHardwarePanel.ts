@@ -1,4 +1,5 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
+import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
@@ -82,6 +83,7 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
         <div id="feedback-zone" data-stagger-panel class="mt-4 rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">${t("hardware.feedback.empty")}</div>
       </section>
     `);
+    this.populateGpuBars();
   }
 
   private renderVramSection(): string {
@@ -97,25 +99,12 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
       ? vramPct >= 90 ? "bg-red-500" : vramPct >= 80 ? "bg-amber-400" : "bg-purple-500"
       : "bg-purple-500";
 
-    // Per-GPU bars (when per-GPU data is available)
-    const gpuBars = gpus.map((gpu) => {
-      const used = gpu.vramUsedMb;
-      const total = gpu.vramTotalMb;
-      const pct = total > 0 ? Math.round((used / total) * 100) : (vramPct ?? 0);
-      const color = pct >= 90 ? "bg-red-500" : pct >= 80 ? "bg-amber-400" : "bg-purple-500";
-      const label = total > 0 ? `${used} / ${total} MB` : `${pct}%`;
-      return `
-        <div class="mb-3">
-          <div class="flex justify-between text-xs text-slate-400 mb-1">
-            <span class="font-mono">${this.escape(gpu.model)} <span class="text-slate-600">(${this.escape(gpu.id)})</span></span>
-            <span class="font-mono">${label}</span>
-          </div>
-          <div class="w-full bg-slate-700 rounded-full h-2">
-            <div class="${color} h-2 rounded-full transition-all" style="width: ${pct}%"></div>
-          </div>
-        </div>
-      `;
-    }).join("");
+    // Per-GPU bars are rendered as a placeholder; populated by
+    // populateGpuBars() via the DOM API so user-controlled `gpu.model`
+    // and `gpu.id` go through textContent and never innerHTML.
+    const gpuBarsPlaceholder = gpus.length > 0
+      ? `<div id="gpu-bars"></div>`
+      : "";
 
     // Cluster-wide VRAM bar (always shown when we have metrics)
     const clusterBar = vramPct !== null ? `
@@ -142,10 +131,38 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
           <h3 class="text-sm font-semibold uppercase tracking-widest text-purple-300">${t("ai.vram.title")}</h3>
           <button id="btn-vram-refresh" type="button" class="text-xs text-slate-500 hover:text-cyan-300 transition-colors">${t("ai.vram.refresh")}</button>
         </div>
-        ${gpuBars || clusterBar}
+        ${gpuBarsPlaceholder || clusterBar}
         ${offloadBadge}
       </div>
     `;
+  }
+
+  private populateGpuBars(): void {
+    const host = this.root.getElementById("gpu-bars");
+    if (!host) return;
+    const vramPct = this.metrics?.vramUtilizationPct ?? null;
+    const gpus = this.liveStatus?.gpus ?? [];
+    host.replaceChildren(
+      ...gpus.map((gpu) => {
+        const used = gpu.vramUsedMb;
+        const total = gpu.vramTotalMb;
+        const pct = total > 0 ? Math.round((used / total) * 100) : vramPct ?? 0;
+        const color = pct >= 90 ? "bg-red-500" : pct >= 80 ? "bg-amber-400" : "bg-purple-500";
+        const label = total > 0 ? `${used} / ${total} MB` : `${pct}%`;
+
+        const bar = el("div", { class: "w-full bg-slate-700 rounded-full h-2" },
+          el("div", { class: `${color} h-2 rounded-full transition-all`, style: `width: ${pct}%` }),
+        );
+
+        const idSpan = el("span", { class: "text-slate-600" }, ` (${gpu.id})`);
+        const header = el("div", { class: "flex justify-between text-xs text-slate-400 mb-1" },
+          el("span", { class: "font-mono" }, gpu.model, " ", idSpan),
+          el("span", { class: "font-mono" }, label),
+        );
+
+        return el("div", { class: "mb-3" }, header, bar);
+      }),
+    );
   }
 
   private bindForm(): void {
@@ -189,14 +206,6 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
     return value ? value : fallback;
   }
 
-  private escape(value: string): string {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
 }
 
 customElements.define("tachyon-hardware-panel", TachyonHardwarePanel);
