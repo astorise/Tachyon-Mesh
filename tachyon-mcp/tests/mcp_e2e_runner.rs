@@ -9,6 +9,17 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
+fn rate_limit_state_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "tachyon-mcp-e2e-{name}-{}-{}.state",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos()
+    ))
+}
+
 fn mcp_binary() -> std::path::PathBuf {
     // Prefer a pre-built release binary; fall back to the debug build.
     let release = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -237,6 +248,10 @@ fn test_canary_split_rate_limit_returns_32002() {
         .env("TACHYON_MCP_PAT", "e2e-test-token")
         .env("TACHYON_MCP_URL", "http://127.0.0.1:19999")
         .env("TACHYON_MCP_TIMEOUT_MS", "500")
+        .env(
+            "TACHYON_MCP_RATE_LIMIT_STATE",
+            rate_limit_state_path("canary-split"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -193,7 +193,10 @@ struct PersistedTokenBucket {
 
 impl ToolRateLimiter {
     fn new() -> Self {
-        Self::new_with_path(env::temp_dir().join("tachyon-mcp-rate-limits.state"))
+        let state_path = env::var_os("TACHYON_MCP_RATE_LIMIT_STATE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::temp_dir().join("tachyon-mcp-rate-limits.state"));
+        Self::new_with_path(state_path)
     }
 
     fn new_with_path(state_path: PathBuf) -> Self {
@@ -434,6 +437,17 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
 
     if id.is_none() {
         return Ok(None);
+    }
+
+    if method == "tools/call" {
+        let tool_name = request
+            .get("params")
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str)
+            .context("missing tool name")?;
+        if let Some(rate_err) = check_rate_limit(context, tool_name)? {
+            return Ok(Some(json_rpc_error_response(id, &rate_err)));
+        }
     }
 
     if method != "initialize" {
@@ -740,7 +754,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
             tools_result
         }
         "tools/call" => {
-            let result = handle_tool_call(request.get("params"), context).await?;
+            let result = handle_tool_call(request.get("params")).await?;
             if result.get("jsonrpc").is_some() && result.get("error").is_some() {
                 return Ok(Some(json!({
                     "jsonrpc": "2.0",
@@ -817,15 +831,11 @@ async fn get_hardware_status() -> Result<Value> {
     }))
 }
 
-async fn handle_tool_call(params: Option<&Value>, context: &McpContext) -> Result<Value> {
+async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
     let name = params
         .and_then(|value| value.get("name"))
         .and_then(Value::as_str)
         .context("missing tool name")?;
-
-    if let Some(rate_err) = check_rate_limit(context, name)? {
-        return Ok(json_rpc_error_response(None, &rate_err));
-    }
 
     // Wrap the entire tool dispatch in a per-request timeout. An `Elapsed` error
     // surfaces as `__TIMEOUT__` via the string sentinel so `JsonRpcError::from_anyhow`
