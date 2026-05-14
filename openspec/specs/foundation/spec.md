@@ -128,6 +128,18 @@ The sidebar navigation SHALL be extracted into `TachyonAppShellNav` (`tachyon-ap
 - **THEN** a `shell:navigate` CustomEvent bubbles with `detail.route` matching the link's `data-route`
 - **AND** `window.location.hash` is updated to the same route
 
+### Requirement: A reusable focus trap utility MUST exist for modal dialogs
+`tachyon-ui/src/utils/a11y.ts` SHALL export `trapFocus(element): () => void` that cycles Tab/Shift+Tab focus within the container, moves focus to the first focusable child on call, and returns a cleanup function.
+
+### Requirement: IAM dialog MUST carry ARIA dialog role and focus trap
+`TachyonIAM.ts` SHALL render `#iam-panel` with `role="dialog"`, `aria-modal="true"`, and `aria-labelledby="iam-dialog-title"`. `trapFocus` SHALL be called on the panel immediately after rendering.
+
+### Requirement: Bundle conflict modal MUST carry ARIA dialog role and focus trap
+`TachyonAppShellModalRoot.openConflictModal()` SHALL set `role="dialog"` and `aria-modal="true"` on the conflict modal element and call `trapFocus` after opening it.
+
+### Requirement: Seal-and-apply operation MUST show an accessible global loader
+During `sealAndApply()`, `TachyonAppShell` SHALL set `aria-busy="true"` on `#main-content`, overlay a spinner with `role="status"`, and remove both in the `finally` block.
+
 ### Requirement: A zero-build installer script MUST exist for operators
 The repository SHALL provide `scripts/get-tachyon.sh` that downloads pre-compiled `core-host` and `tachyon-mcp` binaries from the latest GitHub release without requiring a Rust toolchain. It SHALL accept `--version` and `--dir` flags, detect OS and architecture, and print a success banner with the MCP config snippet. It SHALL exit 1 with a build-from-source hint when the download fails.
 

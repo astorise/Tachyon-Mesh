@@ -4,6 +4,7 @@ import QRCode from "qrcode";
 import "./TachyonAuthStepCredentials";
 import type { CredentialsSubmittedDetail } from "./TachyonAuthStepCredentials";
 import stylesheetText from "../../style.css?inline";
+import { trapFocus } from "../../utils/a11y";
 import { t } from "../../utils/i18n";
 import { resilientInvoke as invoke } from "../../utils/network";
 
@@ -68,7 +69,9 @@ export class TachyonIAM extends HTMLElement {
     this.render();
     this.bindEvents();
     if (this.mode() === "auth") {
-      void gsap.fromTo(this.panel(), { y: 16, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35 });
+      const panel = this.panel();
+      if (panel) trapFocus(panel);
+      void gsap.fromTo(panel, { y: 16, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35 });
     }
   }
 
@@ -79,9 +82,9 @@ export class TachyonIAM extends HTMLElement {
     }
     this.root.innerHTML = `
       <section class="fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center text-slate-300">
-        <div id="iam-panel" class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-2xl shadow-2xl relative overflow-hidden">
+        <div id="iam-panel" role="dialog" aria-modal="true" aria-labelledby="iam-dialog-title" class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-2xl shadow-2xl relative overflow-hidden">
           <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-600 to-blue-500"></div>
-          <h2 class="text-white text-2xl font-bold mb-1">${t("iam.title")}</h2>
+          <h2 id="iam-dialog-title" class="text-white text-2xl font-bold mb-1">${t("iam.title")}</h2>
           <p class="text-slate-400 text-sm mb-6">${t("iam.subtitle")}</p>
           <div id="auth-step-login" class="auth-step space-y-3">
             <auth-step-credentials id="cred-step"></auth-step-credentials>
