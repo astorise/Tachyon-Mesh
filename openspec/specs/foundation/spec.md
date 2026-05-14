@@ -217,3 +217,9 @@ The `#global-apply-loader` element SHALL carry `aria-live="polite"` and `aria-at
 
 ### Requirement: KV result rendering MUST use DOM APIs not innerHTML
 `TachyonStoragePanel.renderKvResult()` SHALL build the result zone using `createElement`, `textContent`, and `replaceChildren` so user-controlled namespace/key/value strings never pass through innerHTML.
+
+### Requirement: A Windows PowerShell zero-build installer MUST exist
+`scripts/get-tachyon.ps1` SHALL accept `-Version` and `-Dir` parameters, download `tachyon-mesh-{VERSION}-windows-x86_64.zip` from GitHub Releases, extract `core-host.exe` and `tachyon-mcp.exe`, and print a success banner with MCP JSON config.
+
+### Requirement: IDE integration guide MUST document live schema binding
+`docs/ide-integration.md` SHALL document VS Code `json.schemas` binding and YAML modeline, JetBrains JSON Schema Mappings, Neovim LSP config, and offline snapshot procedure for all three schema endpoints (`/admin/schema/manifest`, `/admin/schema/integrity-lock`, `/admin/schema/openapi.json`).
