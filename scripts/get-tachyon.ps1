@@ -31,7 +31,8 @@ Write-Ok "Version: $Version"
 #   tachyon-mesh-{VERSION}-windows-x86_64.zip
 $VersionNoV = $Version -replace '^v', ''
 $ZipName    = "tachyon-mesh-${VersionNoV}-windows-x86_64.zip"
-$DownloadUrl = "https://github.com/$Repo/releases/download/$Version/$ZipName"
+$DownloadUrl    = "https://github.com/$Repo/releases/download/$Version/$ZipName"
+$ChecksumUrl    = "$DownloadUrl.sha256"
 
 Write-Info "Downloading $ZipName..."
 
@@ -45,6 +46,24 @@ try {
     Write-Fail "Download failed (HTTP $status).`n  URL: $DownloadUrl`n`n  If no release exists yet, build from source:`n    git clone https://github.com/$Repo && cd tachyon-mesh && .\scripts\setup.ps1"
 }
 Write-Ok "Downloaded ($('{0:N1} MB' -f ((Get-Item $TmpZip).Length / 1MB)))"
+
+# ── 3b. Verify SHA-256 checksum ───────────────────────────────────────────────
+Write-Info "Verifying SHA-256 checksum..."
+$TmpChksum = Join-Path $env:TEMP "tachyon-mesh-$([System.IO.Path]::GetRandomFileName()).sha256"
+try {
+    Invoke-WebRequest -Uri $ChecksumUrl -OutFile $TmpChksum -UseBasicParsing
+} catch {
+    Remove-Item $TmpZip -Force -ErrorAction SilentlyContinue
+    Write-Fail "Could not fetch checksum file. Aborting for safety.`n  URL: $ChecksumUrl"
+}
+$ExpectedHash = (Get-Content $TmpChksum -Raw).Trim().ToUpper()
+$ActualHash   = (Get-FileHash -Path $TmpZip -Algorithm SHA256).Hash.ToUpper()
+Remove-Item $TmpChksum -Force -ErrorAction SilentlyContinue
+if ($ActualHash -ne $ExpectedHash) {
+    Remove-Item $TmpZip -Force -ErrorAction SilentlyContinue
+    Write-Fail "SHA-256 checksum mismatch — the archive is corrupt or tampered with.`n  Expected: $ExpectedHash`n  Got:      $ActualHash"
+}
+Write-Ok "Checksum verified"
 
 # ── 4. Extract ────────────────────────────────────────────────────────────────
 Write-Info "Extracting to $Dir..."

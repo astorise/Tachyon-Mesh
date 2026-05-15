@@ -54,6 +54,8 @@ irm https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/get-tac
 
 Optional: `-Version v1.2.3` or `-Dir C:\Tools\tachyon`.
 
+> **Security:** Binaries are automatically verified via SHA-256 upon download. Cosign signatures (`.bundle`) and SBOMs (`.spdx.json`) are available in the [GitHub Releases](https://github.com/astorise/tachyon-mesh/releases) for each version tag.
+
 **Kubernetes (single node or homelab):**
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/astorise/tachyon-mesh/main/manifests/deploy.yaml

@@ -14,6 +14,7 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -72,6 +73,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Package archive (tar.gz on Linux/macOS, zip on Windows)
+        id: pkg
         shell: bash
         run: |
           VERSION="${{ github.ref_name }}"
@@ -97,12 +99,47 @@ jobs:
               --transform "s|^|tachyon-mesh-${VERSION}/|" 2>/dev/null || \
             tar -czf "${ARCHIVE}" -C "${BINDIR}" core-host tachyon-mcp
           fi
-          echo "TARBALL=${ARCHIVE}" >> "$GITHUB_ENV"
+          echo "tarball=${ARCHIVE}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload archive to GitHub release
+      - name: Calculate SHA-256 checksum
+        id: checksum
+        shell: bash
+        run: |
+          TARBALL="${{ steps.pkg.outputs.tarball }}"
+          sha256sum "${TARBALL}" | awk '{print $1}' > "${TARBALL}.sha256"
+          echo "checksum_file=${TARBALL}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        if: runner.os != 'Windows'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign binary archive with cosign (keyless OIDC)
+        id: sign
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          TARBALL="${{ steps.pkg.outputs.tarball }}"
+          cosign sign-blob --yes "${TARBALL}" --bundle "${TARBALL}.bundle"
+          echo "bundle_file=${TARBALL}.bundle" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SBOM (Linux only)
+        id: sbom
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          cargo install cargo-sbom --locked
+          SBOM="${{ steps.pkg.outputs.tarball }}-sbom.spdx.json"
+          cargo sbom --output-format spdx_json_2_3 > "${SBOM}"
+          echo "sbom_file=${SBOM}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archive and supply-chain artifacts to GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.TARBALL }}
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.checksum.outputs.checksum_file }}
+            ${{ steps.sign.outputs.bundle_file }}
+            ${{ steps.sbom.outputs.sbom_file }}
 
   publish-tauri:
     permissions:
