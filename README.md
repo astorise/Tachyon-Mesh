@@ -94,6 +94,20 @@ cd tachyon-ui && npm run tauri dev
 
 ---
 
+## 🔒 Enterprise Security Posture
+
+Tachyon-Mesh is built for zero-trust environments.
+
+- **Verified Binaries:** Installation scripts (`get-tachyon.sh` / `get-tachyon.ps1`) automatically verify SHA-256 checksums before extraction — no silent MITM risk.
+- **Cryptographic Signatures:** Release artifacts are keylessly signed via [Sigstore/Cosign](https://docs.sigstore.dev/) using GitHub OIDC. Rekor transparency-log bundles are attached to every release.
+- **SBOM:** SPDX 2.3 Software Bill of Materials are generated per release for supply-chain vulnerability scanning (Trivy, Grype).
+- **Kubernetes:** `manifests/deploy-gpu-homelab-hardened.yaml` enforces Pod Security Standards (Restricted) with zero-root privileges, read-only root filesystem, and default-deny NetworkPolicy for highly-regulated clusters.
+- **XSS Immunity:** The operator UI uses exclusively native DOM APIs — no `innerHTML` interpolation of user data.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full v1.0.0 security and supply-chain feature list.
+
+---
+
 ## 🧩 Building FaaS Guests — WIT Contracts via OCI
 
 Tachyon publishes its WebAssembly Interface Types (WIT) contracts as OCI artifacts to GitHub Container Registry. Guest developers do **not** need to copy `.wit` files locally.
