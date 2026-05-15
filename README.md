@@ -146,6 +146,12 @@ kubectl apply -f manifests/deploy-gpu-homelab.yaml
 
 See **[manifests/deploy-gpu-homelab.yaml](manifests/deploy-gpu-homelab.yaml)** for the full manifest including `nodeSelector`, GPU resource limits, model-cache PVC, and Prometheus ServiceMonitor placeholder.
 
+> **Enterprise / regulated environments:** Use the hardened manifest which enforces strict Pod Security Standards (Restricted) and NetworkPolicies.
+> ```bash
+> kubectl apply -f manifests/deploy-gpu-homelab-hardened.yaml
+> ```
+> It adds a dedicated `ServiceAccount`, `readOnlyRootFilesystem: true`, dropped capabilities, `seccompProfile: RuntimeDefault`, and a zero-trust `NetworkPolicy`. See **[manifests/deploy-gpu-homelab-hardened.yaml](manifests/deploy-gpu-homelab-hardened.yaml)** for details.
+
 ---
 
 ## 🔧 Troubleshooting
