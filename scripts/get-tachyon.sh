@@ -61,6 +61,7 @@ esac
 
 TARBALL="tachyon-mesh-${VERSION}-${OS}-${ARCH}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
+CHECKSUM_URL="${URL}.sha256"
 ok "Platform: ${OS}/${ARCH}"
 
 # ── Download ──────────────────────────────────────────────────────────────────
@@ -77,6 +78,16 @@ if [[ "$HTTP_CODE" != "200" ]]; then
     git clone https://github.com/${REPO}.git && cd tachyon-mesh && ./scripts/setup.sh"
 fi
 ok "Downloaded ($(du -sh "${TMP}/${TARBALL}" | cut -f1))"
+
+# ── Verify SHA-256 checksum ───────────────────────────────────────────────────
+info "Verifying SHA-256 checksum..."
+CHKSUM_CODE=$(curl -fsSL -w "%{http_code}" -o "${TMP}/${TARBALL}.sha256" "$CHECKSUM_URL" 2>&1) || true
+if [[ "$CHKSUM_CODE" != "200" ]]; then
+  die "Could not fetch checksum file (HTTP ${CHKSUM_CODE}). Aborting for safety."
+fi
+(cd "$TMP" && echo "$(cat "${TARBALL}.sha256")  ${TARBALL}" | sha256sum -c --status) \
+  || die "SHA-256 checksum mismatch — the archive is corrupt or tampered with."
+ok "Checksum verified"
 
 # ── Extract ───────────────────────────────────────────────────────────────────
 info "Extracting to ${TARGET_DIR}..."
