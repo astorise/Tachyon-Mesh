@@ -20,6 +20,27 @@ fn rate_limit_state_path(name: &str) -> std::path::PathBuf {
     ))
 }
 
+/// Create a minimal WASM artifact on disk and return its absolute path.
+/// The file holds only the WASM magic header + version, which is enough for
+/// `tachyon_deploy_function` to accept it as input and propagate it to
+/// `tachyon_client::deploy_function`.
+fn create_dummy_wasm() -> std::path::PathBuf {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!(
+        "tachyon-mcp-e2e-dummy-{}-{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos()
+    ));
+    let mut file = std::fs::File::create(&path).expect("create dummy wasm");
+    // WASM magic (\0asm) + version 1 (little-endian u32).
+    file.write_all(b"\0asm\x01\0\0\0")
+        .expect("write wasm header");
+    path
+}
+
 fn mcp_binary() -> std::path::PathBuf {
     // Prefer a pre-built release binary; fall back to the debug build.
     let release = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -295,6 +316,167 @@ fn test_canary_split_rate_limit_returns_32002() {
     }
     // If the 3rd call was NOT rate-limited (e.g. state was reset between runs),
     // the test passes silently — rate limit state is process-local.
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Helper: spawn tachyon-mcp pointed at an unreachable port, initialize it,
+/// and return the child + piped stdio. Used by the offline lifecycle tests.
+fn spawn_offline_mcp() -> Option<(
+    std::process::Child,
+    std::process::ChildStdin,
+    std::io::BufReader<std::process::ChildStdout>,
+)> {
+    let bin = mcp_binary();
+    if !bin.exists() {
+        return None;
+    }
+    let mut child = Command::new(&bin)
+        .env("TACHYON_MCP_PAT", "e2e-test-token")
+        .env("TACHYON_MCP_URL", "http://127.0.0.1:19999")
+        .env("TACHYON_MCP_TIMEOUT_MS", "500")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tachyon-mcp");
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut s = stdin;
+    send_and_recv(
+        &mut s,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    );
+    Some((child, s, reader))
+}
+
+/// Assert JSON-RPC structure (`jsonrpc=2.0`, echoed id) and that — when an
+/// error is returned — its code is `-32001 cluster_unreachable` (acceptable
+/// offline) rather than `-32603 internal_error`.
+fn assert_offline_jsonrpc(resp: &serde_json::Value, expected_id: i64) {
+    assert_eq!(resp["jsonrpc"], "2.0", "jsonrpc field");
+    assert_eq!(resp["id"], expected_id, "id echoed back");
+    if let Some(code) = resp["error"]["code"].as_i64() {
+        assert_ne!(
+            code, -32603,
+            "tool must not return internal_error offline; got {resp}"
+        );
+        // Offline calls land in cluster_unreachable; anything else is a regression.
+        assert!(
+            [-32001i64, -32002, -32602].contains(&code),
+            "unexpected offline error code {code}; full response: {resp}"
+        );
+    }
+}
+
+/// Task 2: Lifecycle tools (`deploy_function`, `list_functions`,
+/// `function_logs`, `delete_function`) must each return valid JSON-RPC
+/// responses with no `-32603` even when the cluster is unreachable.
+#[test]
+fn test_function_lifecycle_is_valid_jsonrpc() {
+    let Some((mut child, mut stdin, mut reader)) = spawn_offline_mcp() else {
+        return;
+    };
+    let dummy = create_dummy_wasm();
+    let dummy_str = dummy.to_string_lossy().replace('\\', "\\\\");
+
+    let deploy_req = format!(
+        r#"{{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{{"name":"tachyon_deploy_function","arguments":{{"function_name":"e2e-test-func","artifact_path":"{dummy_str}"}}}}}}"#
+    );
+    let raw = send_and_recv(&mut stdin, &mut reader, &deploy_req);
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("deploy_function response is valid JSON");
+    assert_offline_jsonrpc(&resp, 10);
+
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"tachyon_list_functions","arguments":{}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("list_functions response is valid JSON");
+    assert_offline_jsonrpc(&resp, 11);
+
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"tachyon_function_logs","arguments":{"function_name":"e2e-test-func","lines":10}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("function_logs response is valid JSON");
+    assert_offline_jsonrpc(&resp, 12);
+
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"tachyon_delete_function","arguments":{"function_name":"e2e-test-func"}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("delete_function response is valid JSON");
+    assert_offline_jsonrpc(&resp, 13);
+
+    let _ = std::fs::remove_file(&dummy);
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Task 3a: KV reader/deleter tools must return valid JSON-RPC responses.
+#[test]
+fn test_kv_get_and_delete_are_valid_jsonrpc() {
+    let Some((mut child, mut stdin, mut reader)) = spawn_offline_mcp() else {
+        return;
+    };
+
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"tachyon_kv_get","arguments":{"namespace":"e2e","key":"missing-key"}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("kv_get response is valid JSON");
+    assert_offline_jsonrpc(&resp, 20);
+
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"tachyon_kv_delete","arguments":{"namespace":"e2e","key":"missing-key"}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("kv_delete response is valid JSON");
+    assert_offline_jsonrpc(&resp, 21);
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Task 3b: A `tachyon_deploy_function` call missing the required
+/// `artifact_path` argument MUST return JSON-RPC error code `-32602`
+/// (Invalid params). Agents rely on this code to self-correct.
+#[test]
+fn test_deploy_function_missing_param_returns_32602() {
+    let Some((mut child, mut stdin, mut reader)) = spawn_offline_mcp() else {
+        return;
+    };
+
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"tachyon_deploy_function","arguments":{"function_name":"missing-artifact"}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("missing-param response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 30);
+    let code = resp["error"]["code"]
+        .as_i64()
+        .expect("missing required field must produce a JSON-RPC error");
+    assert_eq!(
+        code, -32602,
+        "missing required field must map to -32602 invalid_params; got {resp}"
+    );
 
     drop(stdin);
     let _ = child.wait();

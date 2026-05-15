@@ -106,6 +106,9 @@ impl JsonRpcError {
             Self::cluster_unreachable(&msg)
         } else if msg.contains("validation") || msg.contains("invalid") || msg.contains("schema") {
             Self::invalid_params("Manifest validation failed", json!({ "detail": msg }))
+        } else if msg.starts_with("missing ") || msg.contains(": missing ") {
+            // `.context("missing X")?` propagation: caller omitted a required field.
+            Self::invalid_params("Missing required field", json!({ "detail": msg }))
         } else {
             Self::internal_error(&msg)
         }
@@ -268,6 +271,46 @@ impl McpContext {
             rate_limiter: ToolRateLimiter::new_with_path(state_path),
             enforce_remote_auth: false,
         }
+    }
+}
+
+/// Returns the names of any required arguments missing from the `arguments`
+/// payload of a `tools/call` request. Mirrors the `required` arrays declared
+/// in `tools/list` inputSchemas. Returning `None` means "all required fields
+/// are present" (or that the tool has no required fields).
+///
+/// This check runs before auth/network so missing fields surface as
+/// `-32602 invalid_params` rather than `-32001 cluster_unreachable`.
+fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<Vec<String>> {
+    let required: &[&str] = match tool_name {
+        "tachyon_deploy_function" => &["function_name", "artifact_path"],
+        "tachyon_delete_function" => &["function_name"],
+        "tachyon_function_logs" => &["function_name"],
+        "tachyon_kv_get" => &["namespace", "key"],
+        "tachyon_kv_put" => &["namespace", "key", "value"],
+        "tachyon_kv_delete" => &["namespace", "key"],
+        "tachyon_canary_split" => &["route_path", "weight_pct"],
+        "tachyon_register_resource" => &["name", "type", "target"],
+        "tachyon_dryrun_manifest" => &["manifest"],
+        "tachyon_run_chaos_scenario" => &["scenario"],
+        _ => return None,
+    };
+    let obj = match arguments.and_then(Value::as_object) {
+        Some(map) => map,
+        None => {
+            // No arguments object at all → every required field is missing.
+            return Some(required.iter().map(|s| (*s).to_owned()).collect());
+        }
+    };
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|field| !obj.contains_key(**field))
+        .map(|s| (*s).to_owned())
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
     }
 }
 
@@ -447,6 +490,19 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
             .context("missing tool name")?;
         if let Some(rate_err) = check_rate_limit(context, tool_name)? {
             return Ok(Some(json_rpc_error_response(id, &rate_err)));
+        }
+        // Validate required tool arguments BEFORE auth/network so malformed
+        // requests surface a precise `-32602 invalid_params` regardless of
+        // cluster reachability. Agents rely on this exact code to self-correct.
+        let arguments = request
+            .get("params")
+            .and_then(|value| value.get("arguments"));
+        if let Some(missing) = missing_required_args(tool_name, arguments) {
+            let rpc_err = JsonRpcError::invalid_params(
+                "Missing required field",
+                json!({ "tool": tool_name, "missing": missing }),
+            );
+            return Ok(Some(json_rpc_error_response(id, &rpc_err)));
         }
     }
 
