@@ -49,7 +49,7 @@ export class TachyonToastManager extends HTMLElement {
 
   private render(): void {
     this.root.innerHTML = `
-      <div id="toast-container" class="fixed bottom-6 right-6 z-[120] flex max-w-[min(28rem,calc(100vw-3rem))] flex-col gap-3 pointer-events-none"></div>
+      <div id="toast-container" role="status" aria-live="polite" aria-atomic="false" class="fixed bottom-6 right-6 z-[120] flex max-w-[min(28rem,calc(100vw-3rem))] flex-col gap-3 pointer-events-none"></div>
     `;
   }
 
