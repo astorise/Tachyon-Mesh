@@ -6,9 +6,15 @@ const FOCUSABLE =
  * - Tab / Shift+Tab cycle through focusable children.
  * - Escape calls `onClose()` if provided.
  * - Immediately focuses the first focusable child.
- * Returns a cleanup function that removes the keydown listener.
+ * - On cleanup, restores focus to the element that was active before trapping.
+ * Returns a cleanup function that removes the keydown listener and restores focus.
+ *
+ * ⚠️ Do NOT use with native `<dialog>` elements — the browser's built-in focus
+ * trap conflicts with this utility and produces duplicate or unpredictable behaviour.
+ * Use `<dialog>.showModal()` directly for native dialogs.
  */
 export function trapFocus(element: HTMLElement, onClose?: () => void): () => void {
+  const previousFocus = document.activeElement as HTMLElement | null;
   const getFocusable = (): HTMLElement[] =>
     Array.from(element.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
       (el) => !el.closest("[hidden]") && el.offsetParent !== null,
@@ -50,5 +56,8 @@ export function trapFocus(element: HTMLElement, onClose?: () => void): () => voi
     firstFocusable.focus();
   }
 
-  return () => element.removeEventListener("keydown", handleKeyDown);
+  return () => {
+    element.removeEventListener("keydown", handleKeyDown);
+    previousFocus?.focus();
+  };
 }
