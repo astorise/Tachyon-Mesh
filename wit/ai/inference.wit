@@ -72,6 +72,11 @@ interface layer-execution {
 
     /// Safely cleans up the tensor representation on the host side.
     drop-tensor: func(handle: tensor-handle);
+
+    /// Samples the next token from a final logits tensor, constrained by an
+    /// optional JSON Schema. When no schema is provided, the host samples from the
+    /// unmasked logits.
+    sample-constrained: func(logits: tensor-handle, json-schema: option<string>) -> result<u32, string>;
 }
 
 world inference-host {

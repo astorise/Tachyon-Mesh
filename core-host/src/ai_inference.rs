@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[path = "ai_inference/samplers.rs"]
+pub(crate) mod samplers;
+
 use anyhow::{anyhow, Context, Result};
 use candle_core::{
     bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
