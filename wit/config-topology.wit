@@ -1,4 +1,4 @@
-package tachyon:topology-config@1.0.0;
+package tachyon:topology-config@1.1.0;
 
 interface config-topology {
     enum enrollment-strategy {

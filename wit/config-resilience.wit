@@ -1,4 +1,4 @@
-package tachyon:resilience-config@1.0.0;
+package tachyon:resilience-config@1.1.0;
 
 interface config-resilience {
     enum fault-type {

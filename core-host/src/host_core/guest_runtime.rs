@@ -9,9 +9,7 @@ pub(crate) fn execute_guest(
 ) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
     #[cfg(not(feature = "ai-inference"))]
     if requires_ai_inference_feature(function_name) {
-        return Err(ExecutionError::Internal(format!(
-            "guest `{function_name}` requires `core-host` to be built with `--features ai-inference`"
-        )));
+        return Err(ai_inference_feature_unavailable_error(function_name));
     }
 
     let module_path =
@@ -1601,6 +1599,13 @@ pub(crate) fn build_linker(
 #[cfg_attr(feature = "ai-inference", allow(dead_code))]
 pub(crate) fn requires_ai_inference_feature(function_name: &str) -> bool {
     normalize_target_module_name(function_name) == "guest-ai"
+}
+
+#[cfg(not(feature = "ai-inference"))]
+pub(crate) fn ai_inference_feature_unavailable_error(function_name: &str) -> ExecutionError {
+    ExecutionError::Internal(format!(
+        "guest `{function_name}` requires `core-host` to be built with `--features ai-inference`"
+    ))
 }
 
 pub(crate) fn resolve_function_name(path: &str) -> Option<String> {
