@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = ["ring"]
-ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
+ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:llm-samplers", "dep:lru", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
 ebpf-loader = ["dep:aya"]
 fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
@@ -40,6 +40,8 @@ hex = "0.4"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio", "http1", "http2"] }
+llm-samplers = { version = "0.0.7", optional = true }
+lru = { version = "0.12", optional = true }
 ort = { version = "=2.0.0-rc.10", optional = true, default-features = false }
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.10"
