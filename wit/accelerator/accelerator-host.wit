@@ -1,4 +1,4 @@
-package tachyon:accelerator@1.0.0;
+package tachyon:accelerator@1.1.0;
 
 world host {
     import cpu;

@@ -1,4 +1,4 @@
-package tachyon:fleet-config@1.0.0;
+package tachyon:fleet-config@1.1.0;
 
 interface config-fleet {
     enum rollout-strategy {

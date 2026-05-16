@@ -1,4 +1,4 @@
-package tachyon:workload-config@1.0.0;
+package tachyon:workload-config@1.1.0;
 
 interface config-workloads {
     enum runtime-type {

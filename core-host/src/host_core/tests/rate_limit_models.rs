@@ -818,6 +818,20 @@ fn guest_ai_is_gated_behind_ai_inference_feature() {
     assert!(!requires_ai_inference_feature("guest-example"));
 }
 
+#[cfg(not(feature = "ai-inference"))]
+#[test]
+fn test_inference_stubs_no_feature() {
+    let error = ai_inference_feature_unavailable_error("guest-ai");
+
+    match error {
+        ExecutionError::Internal(message) => {
+            assert!(message.contains("guest `guest-ai` requires `core-host`"));
+            assert!(message.contains("--features ai-inference"));
+        }
+        other => unreachable!("unexpected error variant: {other:?}"),
+    }
+}
+
 #[test]
 fn legacy_guest_program_name_is_a_guest_visible_relative_path() {
     let program_name = legacy_guest_program_name(Path::new("/app/guest-modules/guest_csharp.wasm"));
