@@ -243,6 +243,7 @@ pub(crate) fn spawn_canary_evaluators(config: &IntegrityConfig) {
             step_weight: canary_cfg.step_weight,
             interval_secs: canary_cfg.interval_secs,
             max_error_rate: canary_cfg.max_error_rate,
+            metric_thresholds: canary_cfg.metrics.clone(),
             phase: Mutex::new(CanaryPhase::Stepping),
             next_req_count: AtomicU64::new(0),
             next_err_count: AtomicU64::new(0),
@@ -294,23 +295,28 @@ async fn run_canary_evaluator(state: Arc<CanaryRolloutState>, mut stop_rx: watch
 
         if error_rate > state.max_error_rate {
             // Atomic rollback: reset traffic weight and record phase.
-            state.weight_pct.store(0, Ordering::SeqCst);
             let reason = format!(
                 "error rate {:.1}% exceeded threshold {:.1}%",
                 error_rate * 100.0,
                 state.max_error_rate * 100.0,
             );
-            {
-                let mut phase = state.phase.lock().unwrap_or_else(|p| p.into_inner());
-                *phase = CanaryPhase::RolledBack {
-                    reason: reason.clone(),
-                };
-            }
+            rollback_canary(&state, reason.clone());
             tracing::error!(
                 route = %state.route_path,
                 version = %state.next_version,
                 error_rate,
                 threshold = state.max_error_rate,
+                "CANARY ROLLBACK: {}",
+                reason,
+            );
+            break;
+        }
+
+        if let Some(reason) = custom_metric_rollback_reason(&state) {
+            rollback_canary(&state, reason.clone());
+            tracing::error!(
+                route = %state.route_path,
+                version = %state.next_version,
                 "CANARY ROLLBACK: {}",
                 reason,
             );
@@ -340,6 +346,50 @@ async fn run_canary_evaluator(state: Arc<CanaryRolloutState>, mut stop_rx: watch
             "canary rollout step complete"
         );
     }
+}
+
+fn rollback_canary(state: &CanaryRolloutState, reason: String) {
+    state.weight_pct.store(0, Ordering::SeqCst);
+    let mut phase = state.phase.lock().unwrap_or_else(|p| p.into_inner());
+    *phase = CanaryPhase::RolledBack { reason };
+}
+
+fn custom_metric_rollback_reason(state: &CanaryRolloutState) -> Option<String> {
+    state.metric_thresholds.iter().find_map(|metric| {
+        let observed = telemetry::custom_metric_value(&metric.name)?;
+        if threshold_is_violated(observed, &metric.threshold) {
+            Some(format!(
+                "custom metric `{}` value {} violated threshold `{}`",
+                metric.name, observed, metric.threshold
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+fn threshold_is_violated(value: f64, threshold: &str) -> bool {
+    let Some((operator, expected)) = parse_threshold(threshold) else {
+        return false;
+    };
+    match operator {
+        "<" => value >= expected,
+        "<=" => value > expected,
+        ">" => value <= expected,
+        ">=" => value < expected,
+        _ => false,
+    }
+}
+
+fn parse_threshold(input: &str) -> Option<(&str, f64)> {
+    let trimmed = input.trim();
+    let operator = [">=", "<=", ">", "<"]
+        .into_iter()
+        .find(|operator| trimmed.starts_with(operator))?;
+    let raw_value = trimmed[operator.len()..].trim();
+    let multiplier = if raw_value.ends_with('%') { 0.01 } else { 1.0 };
+    let numeric = raw_value.trim_end_matches('%').trim().parse::<f64>().ok()?;
+    Some((operator, numeric * multiplier))
 }
 
 pub(crate) fn wait_for_background_tick(stop_requested: &AtomicBool) -> bool {

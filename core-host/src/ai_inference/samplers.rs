@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
-use candle_core::{DType, Tensor as CandleTensor};
 #[cfg(test)]
 use candle_core::Device;
+use candle_core::{DType, Tensor as CandleTensor};
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 use std::{
@@ -38,7 +38,11 @@ impl CompiledFsm {
         collect_ascii_enum_tokens(&value, &mut allowed_tokens);
 
         if allowed_tokens.is_empty() {
-            allowed_tokens.extend(b"{}[]:,\"0123456789truefalsenull \n\r\t".iter().map(|b| *b as u32));
+            allowed_tokens.extend(
+                b"{}[]:,\"0123456789truefalsenull \n\r\t"
+                    .iter()
+                    .map(|b| *b as u32),
+            );
         }
 
         Ok(Self {
@@ -90,7 +94,11 @@ impl FsmLogitProcessor {
                 }
             })
             .collect::<Vec<_>>();
-        Ok(CandleTensor::from_vec(masked, logits.dims(), logits.device())?)
+        Ok(CandleTensor::from_vec(
+            masked,
+            logits.dims(),
+            logits.device(),
+        )?)
     }
 
     pub(crate) fn sample(&mut self, logits: &CandleTensor) -> Result<u32> {
