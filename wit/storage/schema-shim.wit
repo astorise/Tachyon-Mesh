@@ -1,0 +1,9 @@
+package tachyon:storage@1.1.0;
+
+interface schema-shim {
+  transform-read: func(schema-version: u32, raw-data: list<u8>) -> result<list<u8>, string>;
+}
+
+world schema-shim-host {
+  export schema-shim;
+}

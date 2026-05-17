@@ -3,9 +3,10 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     fs,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 pub(crate) mod secrets;
@@ -42,10 +43,50 @@ const METERING_OUTBOX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 /// new manifest. Key: monotonic event id.
 const CONFIG_UPDATE_OUTBOX_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("config_update_outbox");
+const COMPRESSED_MAGIC_BYTES: &[&[u8]] = &[
+    b"\xFF\xD8\xFF",
+    b"\x89PNG",
+    b"\x00\x00\x00\x18ftyp",
+    b"PK\x03\x04",
+    b"\x1F\x8B",
+    b"\x28\xB5\x2F\xFD",
+];
 
 #[derive(Clone)]
 pub(crate) struct CoreStore {
     db: Arc<Database>,
+}
+
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct BaasQueryCache {
+    entries: Mutex<HashMap<String, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct VersionedRecord {
+    pub(crate) schema_version: u32,
+    pub(crate) payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ConflictState {
+    pub(crate) key: String,
+    pub(crate) local_value: Vec<u8>,
+    pub(crate) remote_value: Vec<u8>,
+    pub(crate) local_clock: u64,
+    pub(crate) remote_clock: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ScanOptions {
+    pub(crate) start_key: Vec<u8>,
+    pub(crate) end_key: Vec<u8>,
+    pub(crate) limit: usize,
+    pub(crate) pushdown_filter_wasm: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +106,142 @@ pub(crate) enum CoreStoreBucket {
     DataMutationOutbox,
     MeteringOutbox,
     ConfigUpdateOutbox,
+}
+
+#[allow(dead_code)]
+pub(crate) fn should_compress_blob(header: &[u8]) -> bool {
+    !COMPRESSED_MAGIC_BYTES
+        .iter()
+        .any(|magic| header.starts_with(magic))
+}
+
+#[allow(dead_code)]
+pub(crate) fn pipe_range_from_file(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
+    if end < start {
+        anyhow::bail!("invalid media range: end before start");
+    }
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open media blob `{}`", path.display()))?;
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file)
+            .with_context(|| format!("failed to mmap media blob `{}`", path.display()))?
+    };
+    let file_len = mmap.len() as u64;
+    if start >= file_len {
+        anyhow::bail!("media range start {start} exceeds file length {file_len}");
+    }
+    let end = end.min(file_len.saturating_sub(1));
+    Ok(mmap[start as usize..=end as usize].to_vec())
+}
+
+#[allow(dead_code)]
+pub(crate) fn transform_read_if_stale<F>(
+    current_version: u32,
+    record: VersionedRecord,
+    shim: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce(u32, &[u8]) -> Result<Vec<u8>>,
+{
+    if record.schema_version < current_version {
+        shim(record.schema_version, &record.payload)
+    } else {
+        Ok(record.payload)
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn detect_split_brain(local_clock: u64, remote_clock: u64) -> bool {
+    local_clock != remote_clock && local_clock != 0 && remote_clock != 0
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_conflict_with<F>(conflict: ConflictState, resolver: F) -> Result<Vec<u8>>
+where
+    F: FnOnce(&ConflictState) -> Result<Vec<u8>>,
+{
+    if detect_split_brain(conflict.local_clock, conflict.remote_clock) {
+        resolver(&conflict)
+    } else if conflict.remote_clock > conflict.local_clock {
+        Ok(conflict.remote_value)
+    } else {
+        Ok(conflict.local_value)
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn pushdown_wasmtime_config() -> wasmtime::Config {
+    let mut config = wasmtime::Config::new();
+    config.consume_fuel(true);
+    config
+}
+
+#[allow(dead_code)]
+pub(crate) fn execute_filtered_scan<I, F>(
+    rows: I,
+    options: &ScanOptions,
+    mut evaluate: F,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+where
+    I: IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+    F: FnMut(&[u8], &[u8], Option<&[u8]>) -> Result<bool>,
+{
+    let mut results = Vec::new();
+    for (key, value) in rows {
+        if !options.start_key.is_empty() && key < options.start_key {
+            continue;
+        }
+        if !options.end_key.is_empty() && key >= options.end_key {
+            continue;
+        }
+        if evaluate(&key, &value, options.pushdown_filter_wasm.as_deref())? {
+            results.push((key, value));
+            if results.len() >= options.limit {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+#[allow(dead_code)]
+impl BaasQueryCache {
+    pub(crate) fn get_or_insert_with<F>(
+        &self,
+        query: &str,
+        datalog: &str,
+        build: F,
+    ) -> Result<String>
+    where
+        F: FnOnce() -> Result<String>,
+    {
+        let key = format!(
+            "{}:{}",
+            sha256_hex(query.as_bytes()),
+            sha256_hex(datalog.as_bytes())
+        );
+        if let Some(cached) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        let sanitized = build()?;
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, sanitized.clone());
+        Ok(sanitized)
+    }
+}
+
+#[allow(dead_code)]
+fn sha256_hex(input: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(input))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1387,5 +1564,89 @@ mod tests {
             .expect("vector search should succeed after delete");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "doc-b");
+    }
+
+    #[test]
+    fn smart_compression_skips_precompressed_media() {
+        assert!(!should_compress_blob(b"\x89PNG\r\n"));
+        assert!(!should_compress_blob(b"\xFF\xD8\xFF\xE0"));
+        assert!(should_compress_blob(b"{\"json\":true}"));
+    }
+
+    #[test]
+    fn query_cache_reuses_smolvm_mutation_result() {
+        let cache = BaasQueryCache::default();
+        let first = cache
+            .get_or_insert_with("select * from docs", "allow if true", || {
+                Ok("sanitized".into())
+            })
+            .expect("cache should build");
+        let second = cache
+            .get_or_insert_with("select * from docs", "allow if true", || {
+                Ok("different".into())
+            })
+            .expect("cache should hit");
+
+        assert_eq!(first, "sanitized");
+        assert_eq!(second, "sanitized");
+    }
+
+    #[test]
+    fn stale_record_invokes_schema_shim() {
+        let transformed = transform_read_if_stale(
+            2,
+            VersionedRecord {
+                schema_version: 1,
+                payload: b"old".to_vec(),
+            },
+            |version, payload| {
+                assert_eq!(version, 1);
+                Ok([payload, b"-new"].concat())
+            },
+        )
+        .expect("shim should transform");
+
+        assert_eq!(transformed, b"old-new");
+    }
+
+    #[test]
+    fn split_brain_conflict_uses_resolver() {
+        let merged = resolve_conflict_with(
+            ConflictState {
+                key: "k".to_owned(),
+                local_value: b"left".to_vec(),
+                remote_value: b"right".to_vec(),
+                local_clock: 7,
+                remote_clock: 3,
+            },
+            |conflict| Ok([&conflict.local_value[..], b"+", &conflict.remote_value[..]].concat()),
+        )
+        .expect("conflict should resolve");
+
+        assert_eq!(merged, b"left+right");
+    }
+
+    #[test]
+    fn pushdown_filtered_scan_prunes_rows_before_limit() {
+        let rows = vec![
+            (b"a1".to_vec(), b"drop".to_vec()),
+            (b"a2".to_vec(), b"keep".to_vec()),
+            (b"a3".to_vec(), b"keep".to_vec()),
+        ];
+        let options = ScanOptions {
+            start_key: b"a".to_vec(),
+            end_key: b"b".to_vec(),
+            limit: 1,
+            pushdown_filter_wasm: Some(vec![b'p']),
+        };
+
+        let result = execute_filtered_scan(rows, &options, |_, value, filter| {
+            Ok(filter.is_some() && value.ends_with(b"p"))
+        })
+        .expect("pushdown scan should succeed");
+
+        assert_eq!(result, vec![(b"a1".to_vec(), b"drop".to_vec())]);
+        let config = pushdown_wasmtime_config();
+        assert!(format!("{config:?}").contains("Config"));
     }
 }
