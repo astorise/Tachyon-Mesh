@@ -1,0 +1,23 @@
+package tachyon:telemetry@1.1.0;
+
+interface custom-metrics {
+  enum metric-type {
+    counter,
+    gauge,
+    histogram,
+  }
+
+  record metric {
+    name: string,
+    value: f64,
+    kind: metric-type,
+    tags: list<tuple<string, string>>,
+  }
+
+  /// Submits a domain-specific metric to the host observability plane.
+  push: func(data: metric) -> result<_, string>;
+}
+
+world metrics-host {
+  export custom-metrics;
+}

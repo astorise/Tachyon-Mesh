@@ -141,6 +141,14 @@ pub(crate) struct CanaryConfig {
     pub(crate) interval_secs: u64,
     /// Error rate above which an automatic rollback is triggered (0.0–1.0).
     pub(crate) max_error_rate: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) metrics: Vec<CanaryMetricThreshold>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct CanaryMetricThreshold {
+    pub(crate) name: String,
+    pub(crate) threshold: String,
 }
 
 pub(crate) fn default_canary_step_weight() -> u32 {
@@ -166,6 +174,7 @@ pub(crate) struct CanaryRolloutState {
     pub(crate) step_weight: u32,
     pub(crate) interval_secs: u64,
     pub(crate) max_error_rate: f32,
+    pub(crate) metric_thresholds: Vec<CanaryMetricThreshold>,
     pub(crate) phase: Mutex<CanaryPhase>,
     /// Cumulative requests routed to `next_version` on this node.
     pub(crate) next_req_count: AtomicU64,
