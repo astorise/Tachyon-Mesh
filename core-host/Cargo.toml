@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["ring"]
 ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:llm-samplers", "dep:lru", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
+baas-auth = ["dep:biscuit-auth"]
 ebpf-loader = ["dep:aya"]
 fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
@@ -22,6 +23,7 @@ anyhow = "1"
 async-trait = "0.1"
 arc-swap = "1.7"
 axum = "0.8"
+biscuit-auth = { version = "6.0.0", optional = true }
 bytes = "1.5"
 candle-core = { version = "0.10.0", optional = true }
 candle-nn = { version = "0.10.0", optional = true }

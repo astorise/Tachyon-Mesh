@@ -1,0 +1,9 @@
+package tachyon:mesh@1.1.0;
+
+interface routing {
+  get-primary-node: func(key: string) -> string;
+}
+
+world mesh-routing-host {
+  export routing;
+}
