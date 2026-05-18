@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #[path = "ai_inference/samplers.rs"]
 pub(crate) mod samplers;
+#[path = "ai_inference/vram_manager.rs"]
+pub(crate) mod vram_manager;
 
 use anyhow::{anyhow, Context, Result};
 use candle_core::{
@@ -1430,6 +1432,8 @@ pub(crate) enum MemoryProfile {
     LayerWiseStreaming,
 }
 
+pub(crate) use vram_manager::VramPriority;
+
 // ── Layer-Wise Inference: zero-copy model loader ──────────────────────────────
 
 /// A single transformer layer's weight slice, backed by a memory-mapped region.
@@ -1439,6 +1443,8 @@ pub(crate) struct LayerWeightSlice {
     pub(crate) layer_idx: usize,
     /// Key weight tensor loaded into CPU memory from the mapped file.
     pub(crate) weights: CandleTensor,
+    /// Scheduling priority assigned to the VRAM residency backing this layer.
+    pub(crate) priority: VramPriority,
 }
 
 /// Wraps a memory-mapped `.safetensors` file and vends per-layer
@@ -1490,6 +1496,17 @@ impl LayerWiseMappedModel {
     /// The returned slice's underlying memory lives in the OS page cache; no heap
     /// allocation is performed for the weight bytes themselves.
     pub(crate) fn load_layer(&self, layer_idx: usize) -> Result<LayerWeightSlice> {
+        self.load_layer_with_priority(layer_idx, VramPriority::Active)
+    }
+
+    /// Load the weights for `layer_idx` and tag the resulting residency with a
+    /// VRAM priority. Predictive callers use `Volatile` so live requests can
+    /// reclaim the backing memory immediately.
+    pub(crate) fn load_layer_with_priority(
+        &self,
+        layer_idx: usize,
+        priority: VramPriority,
+    ) -> Result<LayerWeightSlice> {
         if layer_idx >= self.num_layers {
             anyhow::bail!(
                 "layer {layer_idx} is out of range (model has {} layers)",
@@ -1513,7 +1530,11 @@ impl LayerWiseMappedModel {
             &Device::Cpu,
         )
         .context("failed to build layer weight tensor from mmap slice")?;
-        Ok(LayerWeightSlice { layer_idx, weights })
+        Ok(LayerWeightSlice {
+            layer_idx,
+            weights,
+            priority,
+        })
     }
 }
 

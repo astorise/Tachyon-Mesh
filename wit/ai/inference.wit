@@ -61,8 +61,18 @@ interface layer-execution {
     type tensor-handle = u32;
     type model-id = string;
 
+    /// Residency priority for weights loaded into VRAM.
+    enum vram-priority {
+        active,
+        hot,
+        volatile,
+    }
+
     /// Instructs the host to slide the mmap window over specific safetensors blocks.
     load-layer: func(model: model-id, layer-index: u32) -> result<_, string>;
+
+    /// Instructs the host to load a layer with an explicit VRAM eviction priority.
+    load-layer-with-priority: func(model: model-id, layer-index: u32, priority: vram-priority) -> result<_, string>;
 
     /// Evicts the specified layer weights from memory/VRAM.
     unload-layer: func(model: model-id, layer-index: u32);
