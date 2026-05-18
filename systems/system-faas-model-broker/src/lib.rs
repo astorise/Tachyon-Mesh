@@ -23,6 +23,11 @@ const INIT_PATH: &str = "/admin/models/init";
 const UPLOAD_PREFIX: &str = "/admin/models/upload/";
 const COMMIT_PREFIX: &str = "/admin/models/commit/";
 const ABORT_PREFIX: &str = "/admin/models/abort/";
+const AUTH_SESSION_CDC_PATH: &str = "/internal/model-broker/cdc/auth-session";
+const PROMPT_FINISHED_PATH: &str = "/internal/model-broker/prompt-finished";
+const STANDARD_VRAM_TTL_SECONDS: u64 = 300;
+const EXTENDED_VRAM_TTL_SECONDS: u64 = 1_800;
+const HIGH_FOLLOWUP_PROBABILITY: f32 = 0.8;
 
 struct Component;
 
@@ -42,6 +47,47 @@ struct CommitUploadResponse {
     model_path: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CdcMutationEvent {
+    namespace: String,
+    #[allow(dead_code)]
+    key: String,
+    op: String,
+    #[serde(default, alias = "new-value", alias = "newValue")]
+    new_value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct PrewarmInstruction {
+    model: String,
+    layer_index: u32,
+    priority: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct PrewarmResponse {
+    prewarm: Option<PrewarmInstruction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptFinishedRequest {
+    tenant_id: String,
+    #[serde(default)]
+    historical_prompts_at_hour: u32,
+    #[serde(default)]
+    observed_days: u32,
+    #[serde(default)]
+    probability: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct PromptTtlResponse {
+    tenant_id: String,
+    probability: f32,
+    ttl_seconds: u64,
+    priority: &'static str,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingUpload {
     expected_hash: String,
@@ -54,8 +100,15 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
     fn handle_request(
         req: bindings::exports::tachyon::mesh::handler::Request,
     ) -> bindings::exports::tachyon::mesh::handler::Response {
-        let result = if req.method.eq_ignore_ascii_case("POST") && route_path(&req.uri) == INIT_PATH
+        let result = if req.method.eq_ignore_ascii_case("POST")
+            && route_path(&req.uri) == AUTH_SESSION_CDC_PATH
         {
+            handle_auth_session_cdc(&req.body)
+        } else if req.method.eq_ignore_ascii_case("POST")
+            && route_path(&req.uri) == PROMPT_FINISHED_PATH
+        {
+            handle_prompt_finished(&req.body)
+        } else if req.method.eq_ignore_ascii_case("POST") && route_path(&req.uri) == INIT_PATH {
             init_upload(&req.body)
                 .and_then(|upload_id| response_json(200, &InitUploadResponse { upload_id }))
         } else if req.method.eq_ignore_ascii_case("PUT")
@@ -80,6 +133,96 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             Ok(response) => response,
             Err(error) => map_error_response(error),
         }
+    }
+}
+
+fn handle_auth_session_cdc(
+    body: &[u8],
+) -> Result<bindings::exports::tachyon::mesh::handler::Response, String> {
+    let event: CdcMutationEvent = serde_json::from_slice(body)
+        .map_err(|error| format!("failed to decode auth session CDC event: {error}"))?;
+    let prewarm = jit_prewarm_from_event(&event);
+    let status = if prewarm.is_some() { 202 } else { 204 };
+    response_json(status, &PrewarmResponse { prewarm })
+}
+
+fn handle_prompt_finished(
+    body: &[u8],
+) -> Result<bindings::exports::tachyon::mesh::handler::Response, String> {
+    let request: PromptFinishedRequest = serde_json::from_slice(body)
+        .map_err(|error| format!("failed to decode prompt-finished payload: {error}"))?;
+    if request.tenant_id.trim().is_empty() {
+        return Err("prompt-finished payload must include a tenant_id".to_owned());
+    }
+
+    let probability = followup_probability(&request);
+    response_json(
+        200,
+        &PromptTtlResponse {
+            tenant_id: request.tenant_id,
+            probability,
+            ttl_seconds: calculate_dynamic_ttl_seconds(probability),
+            priority: "volatile",
+        },
+    )
+}
+
+fn jit_prewarm_from_event(event: &CdcMutationEvent) -> Option<PrewarmInstruction> {
+    if !event.namespace.contains("auth") {
+        return None;
+    }
+    if !event.op.eq_ignore_ascii_case("insert")
+        && !event.op.eq_ignore_ascii_case("session_started")
+        && !event.op.eq_ignore_ascii_case("session-issued")
+    {
+        return None;
+    }
+
+    let tenant_id = tenant_id_from_event(event)?;
+    Some(PrewarmInstruction {
+        model: resolve_tenant_adapter(&tenant_id),
+        layer_index: 0,
+        priority: "volatile",
+    })
+}
+
+fn tenant_id_from_event(event: &CdcMutationEvent) -> Option<String> {
+    let value = event.new_value.as_ref()?;
+    tenant_id_from_value(value).or_else(|| {
+        value
+            .as_str()
+            .and_then(|encoded| serde_json::from_str::<serde_json::Value>(encoded).ok())
+            .and_then(|decoded| tenant_id_from_value(&decoded))
+    })
+}
+
+fn tenant_id_from_value(value: &serde_json::Value) -> Option<String> {
+    ["tenant_id", "tenantId", "x-tenant-id"]
+        .iter()
+        .find_map(|key| value.get(key)?.as_str())
+        .map(str::trim)
+        .filter(|tenant| !tenant.is_empty())
+        .map(str::to_owned)
+}
+
+fn resolve_tenant_adapter(tenant_id: &str) -> String {
+    format!("lora:{tenant_id}:default")
+}
+
+fn followup_probability(request: &PromptFinishedRequest) -> f32 {
+    if let Some(probability) = request.probability {
+        return probability.clamp(0.0, 1.0);
+    }
+
+    let observed_days = request.observed_days.max(1) as f32;
+    (request.historical_prompts_at_hour as f32 / observed_days).clamp(0.0, 1.0)
+}
+
+fn calculate_dynamic_ttl_seconds(probability: f32) -> u64 {
+    if probability > HIGH_FOLLOWUP_PROBABILITY {
+        EXTENDED_VRAM_TTL_SECONDS
+    } else {
+        STANDARD_VRAM_TTL_SECONDS
     }
 }
 
@@ -412,5 +555,65 @@ mod tests {
         // it is also invoked from the hash-mismatch error path where the staging
         // file may already be gone (e.g. concurrent gc).
         cleanup_staging("upload-that-never-existed");
+    }
+
+    #[test]
+    fn auth_session_event_generates_volatile_prewarm_instruction() {
+        let event = CdcMutationEvent {
+            namespace: "auth:sessions".to_owned(),
+            key: "session-1".to_owned(),
+            op: "insert".to_owned(),
+            new_value: Some(serde_json::json!({
+                "tenant_id": "tenant-a",
+                "subject": "user-1"
+            })),
+        };
+
+        let instruction = jit_prewarm_from_event(&event).expect("session should prewarm LoRA");
+
+        assert_eq!(
+            instruction,
+            PrewarmInstruction {
+                model: "lora:tenant-a:default".to_owned(),
+                layer_index: 0,
+                priority: "volatile",
+            }
+        );
+    }
+
+    #[test]
+    fn non_auth_cdc_events_do_not_prewarm() {
+        let event = CdcMutationEvent {
+            namespace: "billing:invoices".to_owned(),
+            key: "invoice-1".to_owned(),
+            op: "insert".to_owned(),
+            new_value: Some(serde_json::json!({ "tenant_id": "tenant-a" })),
+        };
+
+        assert!(jit_prewarm_from_event(&event).is_none());
+    }
+
+    #[test]
+    fn dynamic_ttl_extends_when_followup_probability_is_high() {
+        assert_eq!(
+            calculate_dynamic_ttl_seconds(0.81),
+            EXTENDED_VRAM_TTL_SECONDS
+        );
+        assert_eq!(
+            calculate_dynamic_ttl_seconds(0.8),
+            STANDARD_VRAM_TTL_SECONDS
+        );
+    }
+
+    #[test]
+    fn followup_probability_uses_timeseries_hour_density() {
+        let request = PromptFinishedRequest {
+            tenant_id: "tenant-a".to_owned(),
+            historical_prompts_at_hour: 24,
+            observed_days: 30,
+            probability: None,
+        };
+
+        assert_eq!(followup_probability(&request), 0.8);
     }
 }
