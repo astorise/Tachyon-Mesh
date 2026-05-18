@@ -1,15 +1,18 @@
-#![allow(dead_code)]
+use std::sync::Mutex;
 
-use crate::core_error::{poisoned_lock, CoreResult};
-use std::sync::{Mutex, MutexGuard};
-
+// Future helpers awaiting the typed-error and draining-runtime migrations.
+// Gated behind `experimental` until the call-sites switch over.
+#[cfg(feature = "experimental")]
 pub(crate) fn lock<'a, T>(
     mutex: &'a Mutex<T>,
     name: &'static str,
-) -> CoreResult<MutexGuard<'a, T>> {
-    mutex.lock().map_err(|_| poisoned_lock(name))
+) -> crate::core_error::CoreResult<std::sync::MutexGuard<'a, T>> {
+    mutex
+        .lock()
+        .map_err(|_| crate::core_error::poisoned_lock(name))
 }
 
+#[cfg(feature = "experimental")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeGenerationState {
     Active,
@@ -77,6 +80,7 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    #[allow(dead_code)] // used by integration tests (host_core/tests/integrity_admin.rs)
     pub(crate) fn subscribe_config_updates(&self) -> broadcast::Receiver<ConfigUpdate> {
         self.config_updates.subscribe()
     }

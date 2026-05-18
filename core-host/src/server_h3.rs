@@ -32,12 +32,12 @@ const QUIC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 // downstream consumer. A small bound is intentional: it keeps the host's RSS independent
 // of the request body's total size, which is the whole point of streaming.
 const BODY_CHANNEL_DEPTH: usize = 8;
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 const SAFETENSORS_PREFIX_LEN: usize = 8;
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 const SAFETENSORS_CHUNK_HEADER_LEN: usize = 12;
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SafetensorsHeader {
     pub(crate) header_len: u64,
@@ -264,7 +264,7 @@ where
         .context("failed to finish HTTP/3 stream")
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn parse_safetensors_header_prefix(input: &[u8]) -> Result<SafetensorsHeader> {
     if input.len() < SAFETENSORS_PREFIX_LEN {
         return Err(anyhow!(
@@ -310,7 +310,7 @@ pub(crate) fn parse_safetensors_header_prefix(input: &[u8]) -> Result<Safetensor
     })
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn prepare_tensor_landing_zone(
     path: impl AsRef<Path>,
     total_size: u64,
@@ -325,7 +325,7 @@ pub(crate) fn prepare_tensor_landing_zone(
     unsafe { memmap2::MmapMut::map_mut(&file) }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn encode_safetensors_chunk(offset: u64, payload: &[u8]) -> Result<Vec<u8>> {
     let payload_len = u32::try_from(payload.len()).context("chunk exceeds u32::MAX bytes")?;
     let mut encoded = Vec::with_capacity(SAFETENSORS_CHUNK_HEADER_LEN + payload.len());
@@ -335,7 +335,7 @@ pub(crate) fn encode_safetensors_chunk(offset: u64, payload: &[u8]) -> Result<Ve
     Ok(encoded)
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn apply_safetensors_chunk(
     mmap: &mut memmap2::MmapMut,
     encoded: &[u8],
@@ -366,7 +366,7 @@ pub(crate) fn apply_safetensors_chunk(
     Ok((offset, length))
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn safetensors_chunks(
     path: impl AsRef<Path>,
     chunk_size: usize,
@@ -391,7 +391,7 @@ pub(crate) fn safetensors_chunks(
     Ok(chunks)
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn verify_safetensors_blake3(
     path: impl AsRef<Path>,
     expected_hex: &str,

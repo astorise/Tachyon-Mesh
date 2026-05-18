@@ -1,13 +1,19 @@
+#[cfg(feature = "experimental")]
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "experimental")]
 const DEFAULT_REMOTE_RATIO: u64 = 10;
+#[cfg(feature = "experimental")]
 const DEFAULT_MIN_REMOTE_HITS: u64 = 1_000;
+#[cfg(feature = "experimental")]
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(300);
+#[cfg(feature = "experimental")]
 const MAX_TRACKED_SUBSPACE_PEERS: usize = 10_000;
 
+#[cfg(feature = "experimental")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GeoMigrationPlan {
     pub(crate) subspace: String,
@@ -15,7 +21,7 @@ pub(crate) struct GeoMigrationPlan {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) struct SubspaceAccessTracker {
     local_peer_id: String,
     counts: HashMap<(String, String), u64>,
@@ -25,7 +31,7 @@ pub(crate) struct SubspaceAccessTracker {
     cooldown: Duration,
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 impl SubspaceAccessTracker {
     pub(crate) fn new(local_peer_id: impl Into<String>) -> Self {
         Self {
@@ -112,12 +118,12 @@ impl SubspaceAccessTracker {
 }
 
 #[derive(Debug, Default)]
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) struct SubspaceRoutingTable {
     primaries: HashMap<String, String>,
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 impl SubspaceRoutingTable {
     pub(crate) fn apply_update_route(&mut self, subspace: &str, primary_peer: &str) {
         self.primaries
@@ -133,7 +139,7 @@ impl SubspaceRoutingTable {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental"))]
 mod tests {
     use super::*;
 

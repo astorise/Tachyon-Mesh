@@ -12,6 +12,6 @@
   - Implement HTTP `206 Partial Content` response formatting.
   - Parse the incoming `Range` header, calculate boundaries, and invoke `pipe-range-to-socket`.
 
-- [x] **Task 4: Implement `system-faas-olap-engine`**
+- [ ] **Task 4: Implement `system-faas-olap-engine`**
   - Create the new Wasm component.
   - Implement a basic columnar aggregator in Rust (compiled to Wasm) that processes streamed dataset chunks to execute analytical functions safely isolated from the `core-host` memory space.

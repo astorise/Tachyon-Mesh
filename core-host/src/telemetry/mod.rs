@@ -32,7 +32,6 @@ fn recover_poisoned<'a, T>(
 
 const TELEMETRY_CHANNEL_CAPACITY: usize = 10_000;
 const ERROR_STATUS_THRESHOLD: u16 = 400;
-#[allow(dead_code)]
 const CUSTOM_METRIC_HELP: &str = "Custom Tachyon FaaS metric submitted through WIT telemetry.";
 
 #[derive(Clone)]
@@ -85,7 +84,6 @@ pub(crate) enum TelemetryEvent {
     },
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CustomMetricType {
     Counter,
@@ -93,7 +91,6 @@ pub(crate) enum CustomMetricType {
     Histogram,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CustomMetric {
     pub(crate) name: String,
@@ -139,7 +136,6 @@ type TelemetryEmitter = Arc<dyn Fn(String) -> bool + Send + Sync>;
 /// Strongly typed handle to a custom-metric Prometheus collector. We deliberately
 /// avoid `Box<dyn Any>` here so the registry can be read without unchecked
 /// downcasts — every collector exposes the same `record(value, labels)` API.
-#[allow(dead_code)]
 #[derive(Clone)]
 enum CustomCollector {
     Counter(prometheus::CounterVec),
@@ -147,8 +143,8 @@ enum CustomCollector {
     Histogram(prometheus::HistogramVec),
 }
 
-#[allow(dead_code)]
 impl CustomCollector {
+    #[cfg(feature = "experimental")]
     fn metric_type(&self) -> CustomMetricType {
         match self {
             Self::Counter(_) => CustomMetricType::Counter,
@@ -159,14 +155,13 @@ impl CustomCollector {
 }
 
 static CUSTOM_METRICS: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
-#[allow(dead_code)]
 static PROMETHEUS_COLLECTORS: OnceLock<Mutex<HashMap<String, CustomCollector>>> = OnceLock::new();
 
 pub(crate) struct ActiveRequestGuard {
     active_requests: Arc<AtomicUsize>,
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn init_telemetry() -> TelemetryHandle {
     init_telemetry_with_emitter(|line| {
         println!("{line}");
@@ -199,7 +194,6 @@ pub(crate) fn snapshot(handle: &TelemetryHandle) -> TelemetrySnapshot {
     handle.snapshot.snapshot()
 }
 
-#[allow(dead_code)]
 pub(crate) fn push_custom_metric(metric: CustomMetric) -> Result<(), String> {
     let normalized_name = normalize_metric_name(&metric.name)?;
     let label_keys: Vec<String> = metric
@@ -309,19 +303,16 @@ pub(crate) fn custom_metric_value(name: &str) -> Option<f64> {
     .copied()
 }
 
-#[allow(dead_code)]
 fn register_collector(collector: Box<dyn prometheus::core::Collector>) -> Result<(), String> {
     prometheus::default_registry()
         .register(collector)
         .map_err(|error| error.to_string())
 }
 
-#[allow(dead_code)]
 fn collector_key(metric_type: CustomMetricType, name: &str, label_keys: &[String]) -> String {
     format!("{metric_type:?}:{name}:{}", label_keys.join(","))
 }
 
-#[allow(dead_code)]
 fn normalize_metric_name(name: &str) -> Result<String, String> {
     let normalized = name
         .trim()
@@ -338,7 +329,6 @@ fn normalize_metric_name(name: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-#[allow(dead_code)]
 fn normalize_label_name(name: &str) -> Result<String, String> {
     let normalized = name
         .trim()
@@ -355,7 +345,6 @@ fn normalize_label_name(name: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-#[allow(dead_code)]
 fn validate_prometheus_ident(value: &str, kind: &str) -> Result<(), String> {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {

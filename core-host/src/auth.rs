@@ -138,7 +138,7 @@ impl AuthDecisionCache {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
+    #[cfg(feature = "experimental")]
     pub(crate) fn entry_count(&self) -> u64 {
         self.inner.run_pending_tasks();
         self.inner.entry_count()
@@ -776,7 +776,7 @@ impl AuthzPurgeEvent {
     /// Helper used by `system-faas-authz` mutation paths (and by tests) to
     /// serialize and durably append a purge event. The redb append returns the
     /// monotonic key; on host crash the row survives and is replayed on next boot.
-    #[allow(dead_code)]
+    #[cfg(feature = "experimental")]
     pub(crate) fn enqueue(&self, store: &crate::store::CoreStore) -> Result<String> {
         let payload = serde_json::to_vec(self).context("failed to serialize authz purge event")?;
         store
@@ -809,7 +809,7 @@ pub(crate) fn apply_authz_purge(cache: &AuthDecisionCache, event: &AuthzPurgeEve
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) async fn authorize_admin_headers(
     state: &crate::AppState,
     method: &str,
@@ -1634,6 +1634,7 @@ fn string_error_to_response(error: anyhow::Error) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "experimental")]
     use crate::store::CoreStore;
 
     fn fresh_claims(subject: &str, roles: &[&str]) -> AuthClaims {
@@ -1644,6 +1645,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "experimental")]
     fn token_hash_hex(token: &str) -> String {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(token.as_bytes());
@@ -1698,6 +1700,7 @@ mod tests {
         assert!(cache.get("tok-b1", "GET", "/api/x").is_some());
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn enqueue_round_trips_through_outbox_and_apply_evicts() {
         let dir = tempdir();
@@ -1732,19 +1735,23 @@ mod tests {
     }
 
     // Tiny inline tempdir helper. Keeps the test file from pulling in `tempfile`.
+    #[cfg(feature = "experimental")]
     struct TempDir {
         path: std::path::PathBuf,
     }
+    #[cfg(feature = "experimental")]
     impl TempDir {
         fn path(&self) -> &Path {
             &self.path
         }
     }
+    #[cfg(feature = "experimental")]
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
+    #[cfg(feature = "experimental")]
     fn tempdir() -> TempDir {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()

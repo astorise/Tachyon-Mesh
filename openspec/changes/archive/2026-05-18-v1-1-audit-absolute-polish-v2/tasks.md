@@ -1,6 +1,6 @@
 # Implementation Tasks
 
-- [x] **Task 1: Complete Integration Test Suite**
+- [ ] **Task 1: Complete Integration Test Suite**
   - Scaffold `core-host/tests/view_builder_test.rs` with a basic host-guest instantiation test.
   - Scaffold `core-host/tests/sql_engine_test.rs` with a basic instantiation test.
   - Scaffold `core-host/tests/vector_search_test.rs` with a basic instantiation test.

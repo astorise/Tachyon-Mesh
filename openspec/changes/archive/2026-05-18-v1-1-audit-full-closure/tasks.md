@@ -13,6 +13,6 @@
   - Open `systems/system-faas-gitops-broker/src/lib.rs`.
   - Replace static mock responses with an execution loop that parses or validates canary thresholds against live data metrics retrieved from the host registry.
 
-- [x] **Task 4: Implement Host-Guest Integration Test Suite**
+- [ ] **Task 4: Implement Host-Guest Integration Test Suite**
   - Create the test manifest file `core-host/tests/host_guest_integration_test.rs`.
   - Write an integration test executing a guest component, invoking the custom metrics host boundary, and asserting metric state storage persistence on the host side.

@@ -1,14 +1,17 @@
-#![allow(dead_code)]
-
+// Tracing target identifiers reserved for future per-module log filtering.
+// Gated behind `experimental` until the tracing subscriber adopts them.
 pub(crate) mod authn {
+    #[cfg(feature = "experimental")]
     pub(crate) const MODULE: &str = "identity::authn";
 }
 
 pub(crate) mod authz {
+    #[cfg(feature = "experimental")]
     pub(crate) const MODULE: &str = "identity::authz";
 }
 
 pub(crate) mod enrollment {
+    #[cfg(feature = "experimental")]
     pub(crate) const MODULE: &str = "identity::enrollment";
 }
 

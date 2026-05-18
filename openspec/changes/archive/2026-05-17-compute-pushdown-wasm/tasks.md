@@ -10,5 +10,5 @@
 - [x] **Task 3: RedDB API Extension**
   - Update the `tachyon:storage/reddb-direct` WIT contract so FaaS modules can pass the `pushdown_filter_wasm` byte array alongside standard `scan` requests.
 
-- [x] **Task 4: Proof of Concept (Logical Plane)**
+- [ ] **Task 4: Proof of Concept (Logical Plane)**
   - Update a single FaaS (e.g., `system-faas-sql-engine`) to pass a pre-compiled dummy filter (e.g., a filter that only returns true if the key ends with a specific byte) to validate the network I/O reduction metrics.
