@@ -1230,7 +1230,6 @@ impl WasiNnBackend for TpuBackend {
     }
 }
 
-#[cfg(feature = "experimental")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KvPrecision {
     Q8_0,
@@ -1515,7 +1514,7 @@ impl LayerWiseMappedModel {
         };
         // Parse the safetensors header; if it's malformed we still fall back
         // to an equal partition so legacy `.bin` style payloads keep working.
-        let header = SafetensorsHeader::parse(&mmap).unwrap_or_else(|_| SafetensorsHeader {
+        let header = SafetensorsHeader::parse(&mmap).unwrap_or(SafetensorsHeader {
             header_len: 0,
             data_start: 0,
             header: serde_json::Value::Null,

@@ -1,5 +1,16 @@
 #![deny(clippy::unwrap_used)]
 #![recursion_limit = "256"]
+// Items behind `#[cfg(feature = "experimental")]` and the bulk of the
+// `ai_inference` module (layer-wise inference, predictive VRAM, semantic
+// context flattening) are intentional v1.2 scaffolding that remain
+// unwired until their OpenSpec proposals land. Compiling them under
+// `--all-features` or `--features ai-inference` should not regress CI;
+// default builds keep `-D dead_code` strict via RUSTFLAGS so production
+// paths can't hide unused code.
+#![cfg_attr(
+    any(feature = "experimental", feature = "ai-inference"),
+    allow(dead_code)
+)]
 
 #[cfg(feature = "ai-inference")]
 mod ai_inference;
