@@ -72,10 +72,10 @@ mod tests {
         let result = aggregate_sum_by_group(
             br#"[{"group":"a","value":2.5},{"group":"a","value":1.5},{"group":"b","value":4}]"#,
         )
-        .unwrap();
+        .expect("valid grouped rows should aggregate");
 
         assert_eq!(
-            std::str::from_utf8(&result).unwrap(),
+            std::str::from_utf8(&result).expect("aggregate response should be utf-8"),
             r#"{"a":4.0,"b":4.0}"#
         );
     }

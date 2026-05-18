@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn parses_byte_range() {
-        assert_eq!(parse_range_header("bytes=10-42").unwrap(), (10, 42));
+        assert_eq!(
+            parse_range_header("bytes=10-42").expect("valid range should parse"),
+            (10, 42)
+        );
         assert!(parse_range_header("bytes=42-10").is_err());
     }
 }
