@@ -100,7 +100,9 @@ mod tests {
     #[test]
     fn returns_best_cosine_match() {
         let body = br#"{"query":[1,0],"top_k":1,"embeddings":[{"id":"x","embedding":[0,1]},{"id":"y","embedding":[1,0]}]}"#;
-        let results: Vec<SearchResult> = serde_json::from_slice(&search(body).unwrap()).unwrap();
+        let encoded = search(body).expect("valid search request should encode");
+        let results: Vec<SearchResult> =
+            serde_json::from_slice(&encoded).expect("search response should decode");
 
         assert_eq!(
             results,

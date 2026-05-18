@@ -9,14 +9,15 @@ use bytes::Buf;
 use h3::{quic::SendStream, server::RequestResolver};
 use http_body_util::BodyExt;
 use quinn::crypto::rustls::QuicServerConfig;
+#[cfg(feature = "experimental")]
 use serde_json::Value;
+#[cfg(feature = "experimental")]
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Read},
+    io::Read,
     path::Path,
-    sync::Arc,
-    time::Duration,
 };
+use std::{io, sync::Arc, time::Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
 
@@ -162,6 +163,9 @@ async fn handle_http3_request(
         .await
         .context("failed to decode HTTP/3 request")?;
     let (parts, _) = request.into_parts();
+    #[cfg(not(feature = "experimental"))]
+    let _ = &state;
+    #[cfg(feature = "experimental")]
     if let Some(response) = crate::auth::authorize_admin_headers(
         &state,
         parts.method.as_str(),
@@ -413,7 +417,9 @@ pub(crate) fn verify_safetensors_blake3(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "experimental")]
     use super::*;
+    #[cfg(feature = "experimental")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -432,6 +438,7 @@ mod tests {
         assert!(super::BODY_CHANNEL_DEPTH <= 32);
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn safetensors_header_parser_uses_offsets_for_total_size() {
         let header = br#"{"layer.weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
@@ -446,6 +453,7 @@ mod tests {
         assert_eq!(parsed.total_size, 8 + header.len() as u64 + 8);
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn chunk_apply_writes_to_absolute_offset() {
         let path = unique_test_path("chunk-apply.safetensors");
@@ -460,6 +468,7 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn safetensors_hash_verifies_reconstructed_file() {
         let path = unique_test_path("hash.safetensors");
@@ -471,6 +480,7 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[cfg(feature = "experimental")]
     fn unique_test_path(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

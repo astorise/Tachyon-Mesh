@@ -30,7 +30,7 @@ pub(crate) struct MtlsGatewayListenerHandle {
 }
 
 pub(crate) struct Http3ListenerHandle {
-    #[cfg(feature = "experimental")]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) local_addr: SocketAddr,
     pub(crate) join_handle: tokio::task::JoinHandle<()>,
 }
