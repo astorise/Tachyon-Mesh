@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-const ARTIFACT_RELATIVE_PATH: &str = "../target/wasm32-wasip2/release/system_faas_media_server.wasm";
+const ARTIFACT_RELATIVE_PATH: &str =
+    "../target/wasm32-wasip2/release/system_faas_media_server.wasm";
 
 #[test]
 fn media_server_wasm_artifact_is_present_if_built() {

@@ -133,9 +133,8 @@ pub(crate) fn pipe_range_from_file_in_root(
     let canonical = fs::canonicalize(path)
         .with_context(|| format!("failed to canonicalize media path `{}`", path.display()))?;
     if let Some(root) = root {
-        let canonical_root = fs::canonicalize(root).with_context(|| {
-            format!("failed to canonicalize media root `{}`", root.display())
-        })?;
+        let canonical_root = fs::canonicalize(root)
+            .with_context(|| format!("failed to canonicalize media root `{}`", root.display()))?;
         if !canonical.starts_with(&canonical_root) {
             anyhow::bail!(
                 "media path `{}` escapes allowed root `{}`",
