@@ -11,6 +11,8 @@ mod bindings {
 
 use serde::Deserialize;
 
+const MAX_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+
 struct Component;
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +35,13 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
 }
 
 fn aggregate_sum_by_group(input: &[u8]) -> Result<Vec<u8>, String> {
+    // Bound the JSON payload before deserialization to prevent memory amplification
+    // attacks via deeply nested or massive arrays.
+    if input.len() > MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "OLAP payload exceeds {MAX_PAYLOAD_BYTES} byte limit",
+        ));
+    }
     let rows: Vec<Row> =
         serde_json::from_slice(input).map_err(|error| format!("invalid OLAP rows: {error}"))?;
     let mut groups = std::collections::BTreeMap::<String, f64>::new();
@@ -69,5 +78,13 @@ mod tests {
             std::str::from_utf8(&result).unwrap(),
             r#"{"a":4.0,"b":4.0}"#
         );
+    }
+
+    #[test]
+    fn rejects_oversized_payloads() {
+        let body = vec![b'a'; MAX_PAYLOAD_BYTES + 1];
+        let response =
+            aggregate_sum_by_group(&body).expect_err("oversized payload should be refused");
+        assert!(response.contains("byte limit"));
     }
 }

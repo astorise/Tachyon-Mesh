@@ -34,15 +34,16 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
 }
 
 fn filter_event(input: &[u8], authorization: Option<&str>) -> Result<Vec<u8>, String> {
-    let token = authorization
+    // Fail-closed: the broadcaster intentionally rejects every request until a real
+    // Biscuit verifier is wired in. Accepting any non-empty bearer string here was a
+    // pre-production placeholder that the audit flagged as an authentication bypass.
+    let _ = authorization
         .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| "missing Biscuit bearer token".to_owned())?;
-    if token.trim().is_empty() {
-        return Err("empty Biscuit bearer token".to_owned());
-    }
-    let event: MutationEvent = serde_json::from_slice(input)
+    let _: MutationEvent = serde_json::from_slice(input)
         .map_err(|error| format!("invalid mutation event: {error}"))?;
-    serde_json::to_vec(&event).map_err(|error| format!("failed to encode mutation event: {error}"))
+    Err("cdc broadcaster requires a verified Biscuit token; no verifier is wired".to_owned())
 }
 
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -69,12 +70,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requires_biscuit_bearer_before_forwarding() {
+    fn rejects_missing_bearer_token() {
         assert!(filter_event(br#"{"namespace":"n","key":"k","op":"insert"}"#, None).is_err());
-        assert!(filter_event(
+    }
+
+    #[test]
+    fn rejects_any_unverified_bearer_token() {
+        // The previous behavior accepted any non-empty bearer string, which the
+        // v1.1 audit classified as an authentication bypass. The fail-closed
+        // implementation must refuse the request even when a plausible-looking
+        // bearer token is presented but no Biscuit verifier is wired.
+        let response = filter_event(
             br#"{"namespace":"n","key":"k","op":"insert"}"#,
-            Some("Bearer token")
-        )
-        .is_ok());
+            Some("Bearer placeholder"),
+        );
+        assert!(matches!(response, Err(ref message) if message.contains("verifier")));
     }
 }

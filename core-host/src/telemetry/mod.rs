@@ -1,14 +1,34 @@
 use serde_json::json;
 use std::{
-    any::Any,
     collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
     },
     time::Instant,
 };
 use tokio::sync::mpsc;
+
+/// Recover from a poisoned telemetry lock while leaving an audit trail. The lock
+/// is intentionally treated as recoverable (we would rather drop one inconsistent
+/// snapshot than wedge the request path) but every poison event SHALL be logged
+/// so silent corruption never goes unnoticed.
+fn recover_poisoned<'a, T>(
+    registry: &'static str,
+    result: Result<MutexGuard<'a, T>, PoisonError<MutexGuard<'a, T>>>,
+) -> MutexGuard<'a, T> {
+    match result {
+        Ok(guard) => guard,
+        Err(poison) => {
+            tracing::warn!(
+                target: "tachyon::telemetry",
+                registry = registry,
+                "telemetry registry mutex was poisoned; continuing with recovered guard"
+            );
+            poison.into_inner()
+        }
+    }
+}
 
 const TELEMETRY_CHANNEL_CAPACITY: usize = 10_000;
 const ERROR_STATUS_THRESHOLD: u16 = 400;
@@ -115,13 +135,32 @@ struct CompletedRequest {
 }
 
 type TelemetryEmitter = Arc<dyn Fn(String) -> bool + Send + Sync>;
+
+/// Strongly typed handle to a custom-metric Prometheus collector. We deliberately
+/// avoid `Box<dyn Any>` here so the registry can be read without unchecked
+/// downcasts — every collector exposes the same `record(value, labels)` API.
 #[allow(dead_code)]
-type PrometheusCollector = Box<dyn Any + Send + Sync>;
+#[derive(Clone)]
+enum CustomCollector {
+    Counter(prometheus::CounterVec),
+    Gauge(prometheus::GaugeVec),
+    Histogram(prometheus::HistogramVec),
+}
+
+#[allow(dead_code)]
+impl CustomCollector {
+    fn metric_type(&self) -> CustomMetricType {
+        match self {
+            Self::Counter(_) => CustomMetricType::Counter,
+            Self::Gauge(_) => CustomMetricType::Gauge,
+            Self::Histogram(_) => CustomMetricType::Histogram,
+        }
+    }
+}
 
 static CUSTOM_METRICS: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
 #[allow(dead_code)]
-static PROMETHEUS_COLLECTORS: OnceLock<Mutex<HashMap<String, PrometheusCollector>>> =
-    OnceLock::new();
+static PROMETHEUS_COLLECTORS: OnceLock<Mutex<HashMap<String, CustomCollector>>> = OnceLock::new();
 
 pub(crate) struct ActiveRequestGuard {
     active_requests: Arc<AtomicUsize>,
@@ -176,75 +215,98 @@ pub(crate) fn push_custom_metric(metric: CustomMetric) -> Result<(), String> {
         .collect();
     let cache_key = collector_key(metric.metric_type, &normalized_name, &label_keys);
     let collectors = PROMETHEUS_COLLECTORS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut collectors = collectors
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut collectors = recover_poisoned("prometheus_collectors", collectors.lock());
 
     match metric.metric_type {
         CustomMetricType::Counter => {
-            if !collectors.contains_key(&cache_key) {
-                let opts = prometheus::Opts::new(&normalized_name, CUSTOM_METRIC_HELP);
-                let counter = prometheus::CounterVec::new(opts, &label_key_refs)
-                    .map_err(|error| error.to_string())?;
-                register_collector(Box::new(counter.clone()))?;
-                collectors.insert(cache_key.clone(), Box::new(counter));
-            }
-            let counter = collectors
-                .get(&cache_key)
-                .and_then(|collector| collector.downcast_ref::<prometheus::CounterVec>())
-                .ok_or_else(|| format!("custom metric `{}` has incompatible type", metric.name))?;
-            counter
+            let collector = match collectors.get(&cache_key) {
+                Some(CustomCollector::Counter(counter)) => counter.clone(),
+                Some(_) => {
+                    return Err(format!(
+                        "custom metric `{}` is already registered with a different type",
+                        metric.name
+                    ));
+                }
+                None => {
+                    let opts = prometheus::Opts::new(&normalized_name, CUSTOM_METRIC_HELP);
+                    let counter = prometheus::CounterVec::new(opts, &label_key_refs)
+                        .map_err(|error| error.to_string())?;
+                    register_collector(Box::new(counter.clone()))?;
+                    collectors.insert(cache_key.clone(), CustomCollector::Counter(counter.clone()));
+                    counter
+                }
+            };
+            collector
                 .with_label_values(&label_values)
                 .inc_by(metric.value.max(0.0));
         }
         CustomMetricType::Gauge => {
-            if !collectors.contains_key(&cache_key) {
-                let opts = prometheus::Opts::new(&normalized_name, CUSTOM_METRIC_HELP);
-                let gauge = prometheus::GaugeVec::new(opts, &label_key_refs)
-                    .map_err(|error| error.to_string())?;
-                register_collector(Box::new(gauge.clone()))?;
-                collectors.insert(cache_key.clone(), Box::new(gauge));
-            }
-            let gauge = collectors
-                .get(&cache_key)
-                .and_then(|collector| collector.downcast_ref::<prometheus::GaugeVec>())
-                .ok_or_else(|| format!("custom metric `{}` has incompatible type", metric.name))?;
-            gauge.with_label_values(&label_values).set(metric.value);
+            let collector = match collectors.get(&cache_key) {
+                Some(CustomCollector::Gauge(gauge)) => gauge.clone(),
+                Some(_) => {
+                    return Err(format!(
+                        "custom metric `{}` is already registered with a different type",
+                        metric.name
+                    ));
+                }
+                None => {
+                    let opts = prometheus::Opts::new(&normalized_name, CUSTOM_METRIC_HELP);
+                    let gauge = prometheus::GaugeVec::new(opts, &label_key_refs)
+                        .map_err(|error| error.to_string())?;
+                    register_collector(Box::new(gauge.clone()))?;
+                    collectors.insert(cache_key.clone(), CustomCollector::Gauge(gauge.clone()));
+                    gauge
+                }
+            };
+            collector.with_label_values(&label_values).set(metric.value);
         }
         CustomMetricType::Histogram => {
-            if !collectors.contains_key(&cache_key) {
-                let opts = prometheus::HistogramOpts::new(&normalized_name, CUSTOM_METRIC_HELP);
-                let histogram = prometheus::HistogramVec::new(opts, &label_key_refs)
-                    .map_err(|error| error.to_string())?;
-                register_collector(Box::new(histogram.clone()))?;
-                collectors.insert(cache_key.clone(), Box::new(histogram));
-            }
-            let histogram = collectors
-                .get(&cache_key)
-                .and_then(|collector| collector.downcast_ref::<prometheus::HistogramVec>())
-                .ok_or_else(|| format!("custom metric `{}` has incompatible type", metric.name))?;
-            histogram
+            let collector = match collectors.get(&cache_key) {
+                Some(CustomCollector::Histogram(histogram)) => histogram.clone(),
+                Some(_) => {
+                    return Err(format!(
+                        "custom metric `{}` is already registered with a different type",
+                        metric.name
+                    ));
+                }
+                None => {
+                    let opts = prometheus::HistogramOpts::new(&normalized_name, CUSTOM_METRIC_HELP);
+                    let histogram = prometheus::HistogramVec::new(opts, &label_key_refs)
+                        .map_err(|error| error.to_string())?;
+                    register_collector(Box::new(histogram.clone()))?;
+                    collectors.insert(
+                        cache_key.clone(),
+                        CustomCollector::Histogram(histogram.clone()),
+                    );
+                    histogram
+                }
+            };
+            collector
                 .with_label_values(&label_values)
                 .observe(metric.value);
         }
     }
     drop(collectors);
 
-    CUSTOM_METRICS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(metric.name, metric.value);
+    recover_poisoned(
+        "custom_metrics",
+        CUSTOM_METRICS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock(),
+    )
+    .insert(metric.name, metric.value);
     Ok(())
 }
 
 pub(crate) fn custom_metric_value(name: &str) -> Option<f64> {
-    CUSTOM_METRICS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(name)
-        .copied()
+    recover_poisoned(
+        "custom_metrics",
+        CUSTOM_METRICS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock(),
+    )
+    .get(name)
+    .copied()
 }
 
 #[allow(dead_code)]
@@ -429,18 +491,12 @@ impl Default for TelemetrySnapshotStore {
 
 impl TelemetrySnapshotStore {
     fn record_request_started(&self) {
-        let mut metrics = self
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metrics = recover_poisoned("telemetry_snapshot", self.metrics.lock());
         metrics.total_requests = metrics.total_requests.saturating_add(1);
     }
 
     fn record_request_completed(&self, completed: &CompletedRequest) {
-        let mut metrics = self
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metrics = recover_poisoned("telemetry_snapshot", self.metrics.lock());
 
         metrics.completed_requests = metrics.completed_requests.saturating_add(1);
         metrics.last_status = completed.status;
@@ -459,18 +515,12 @@ impl TelemetrySnapshotStore {
     }
 
     fn record_dropped_event(&self) {
-        let mut metrics = self
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metrics = recover_poisoned("telemetry_snapshot", self.metrics.lock());
         metrics.dropped_events = metrics.dropped_events.saturating_add(1);
     }
 
     fn snapshot(&self) -> TelemetrySnapshot {
-        let metrics = self
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let metrics = recover_poisoned("telemetry_snapshot", self.metrics.lock());
 
         TelemetrySnapshot {
             total_requests: metrics.total_requests,

@@ -46,6 +46,24 @@ interface websocket {
     }
 }
 
+interface custom-metrics {
+    enum metric-type {
+        counter,
+        gauge,
+        histogram,
+    }
+
+    record metric {
+        name: string,
+        value: f64,
+        kind: metric-type,
+        tags: list<tuple<string, string>>,
+    }
+
+    /// Submits a domain-specific metric to the host observability plane.
+    push: func(data: metric) -> result<_, string>;
+}
+
 interface telemetry-reader {
     record metrics-snapshot {
         total-requests: u64,
@@ -256,6 +274,7 @@ world faas-guest {
     import training;
     import kv-partition;
     import graph;
+    import custom-metrics;
     export handler;
 }
 
@@ -274,6 +293,7 @@ world websocket-faas-guest {
 world system-faas-guest {
     import bridge-controller;
     import telemetry-reader;
+    import custom-metrics;
     import scaling-metrics;
     import storage-broker;
     import outbound-http;
@@ -283,6 +303,7 @@ world system-faas-guest {
 world background-system-faas {
     import scaling-metrics;
     import telemetry-reader;
+    import custom-metrics;
     import outbound-http;
     import outbox-store;
     import routing-control;
@@ -291,6 +312,7 @@ world background-system-faas {
 
 world control-plane-faas {
     import telemetry-reader;
+    import custom-metrics;
     import scaling-metrics;
     import outbound-http;
     import routing-control;

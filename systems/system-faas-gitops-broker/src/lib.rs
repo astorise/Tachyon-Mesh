@@ -9,12 +9,13 @@ mod bindings {
     export!(Component);
 }
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const CONFIG_STORE_PATH_ENV: &str = "CONFIG_STORE_PATH";
 const DEFAULT_CONFIG_STORE_PATH: &str = "/var/lib/tachyon/config-store";
 const CONFIG_STORE_PATH_HEADER: &str = "x-tachyon-config-store-path";
+const CANARY_EVAL_PATH: &str = "/canary/evaluate";
 
 struct Component;
 
@@ -25,10 +26,40 @@ pub struct RepositoryInfo {
     initialized: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CanaryEvaluationRequest {
+    pub thresholds: Vec<CanaryThreshold>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CanaryThreshold {
+    pub metric: CanaryMetric,
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryMetric {
+    ErrorRate,
+    LastStatus,
+    TotalRequests,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CanaryEvaluation {
+    pub advance: bool,
+    pub violations: Vec<String>,
+}
+
 impl bindings::exports::tachyon::mesh::handler::Guest for Component {
     fn handle_request(
         req: bindings::exports::tachyon::mesh::handler::Request,
     ) -> bindings::exports::tachyon::mesh::handler::Response {
+        if req.uri.ends_with(CANARY_EVAL_PATH) || req.uri.contains(&format!("{CANARY_EVAL_PATH}?"))
+        {
+            return handle_canary_evaluation(&req);
+        }
+
         if !req.method.eq_ignore_ascii_case("POST") {
             return response(405, "Method Not Allowed", &[]);
         }
@@ -39,6 +70,77 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             Err(error) => response(500, error, &[]),
         }
     }
+}
+
+fn handle_canary_evaluation(
+    req: &bindings::exports::tachyon::mesh::handler::Request,
+) -> bindings::exports::tachyon::mesh::handler::Response {
+    if !req.method.eq_ignore_ascii_case("POST") {
+        return response(405, "Method Not Allowed", &[]);
+    }
+    let request: CanaryEvaluationRequest = match serde_json::from_slice(&req.body) {
+        Ok(value) => value,
+        Err(error) => return response(400, format!("invalid evaluation request: {error}"), &[]),
+    };
+    let snapshot = bindings::tachyon::mesh::telemetry_reader::get_metrics();
+    let evaluation = evaluate_canary(&request, &snapshot);
+    json_response(200, &evaluation)
+}
+
+pub fn evaluate_canary(
+    request: &CanaryEvaluationRequest,
+    snapshot: &bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot,
+) -> CanaryEvaluation {
+    let mut violations = Vec::new();
+    for threshold in &request.thresholds {
+        let observed = current_metric_value(threshold.metric, snapshot);
+        if let Some(reason) = evaluate_threshold(observed, &threshold.expression) {
+            violations.push(format!(
+                "{:?}={observed} violates `{}`: {reason}",
+                threshold.metric, threshold.expression
+            ));
+        }
+    }
+    CanaryEvaluation {
+        advance: violations.is_empty(),
+        violations,
+    }
+}
+
+fn current_metric_value(
+    metric: CanaryMetric,
+    snapshot: &bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot,
+) -> f64 {
+    match metric {
+        CanaryMetric::ErrorRate => {
+            if snapshot.completed_requests == 0 {
+                0.0
+            } else {
+                snapshot.error_requests as f64 / snapshot.completed_requests as f64
+            }
+        }
+        CanaryMetric::LastStatus => snapshot.last_status as f64,
+        CanaryMetric::TotalRequests => snapshot.total_requests as f64,
+    }
+}
+
+fn evaluate_threshold(observed: f64, expression: &str) -> Option<String> {
+    let trimmed = expression.trim();
+    let operator = [">=", "<=", ">", "<"]
+        .into_iter()
+        .find(|operator| trimmed.starts_with(operator))?;
+    let raw = trimmed[operator.len()..].trim();
+    let multiplier = if raw.ends_with('%') { 0.01 } else { 1.0 };
+    let numeric: f64 = raw.trim_end_matches('%').trim().parse().ok()?;
+    let expected = numeric * multiplier;
+    let violated = match operator {
+        "<" => observed >= expected,
+        "<=" => observed > expected,
+        ">" => observed <= expected,
+        ">=" => observed < expected,
+        _ => false,
+    };
+    violated.then(|| format!("observed {observed} not {operator} {expected}"))
 }
 
 pub fn initialize_git_repo(path: impl AsRef<Path>) -> Result<RepositoryInfo, String> {
@@ -147,6 +249,15 @@ mod tests {
         )]);
 
         assert_eq!(path, PathBuf::from("/tmp/tachyon-config-store"));
+    }
+
+    #[test]
+    fn canary_threshold_violation_blocks_advance() {
+        let violated = evaluate_threshold(0.12, "<5%");
+        assert!(violated.is_some());
+
+        let ok = evaluate_threshold(0.02, "<5%");
+        assert!(ok.is_none());
     }
 
     fn unique_test_dir() -> PathBuf {
