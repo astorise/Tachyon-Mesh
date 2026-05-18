@@ -1,8 +1,9 @@
 use super::super::*;
-use crate::store::secrets::{clear_secrets, register_secret};
+use crate::store::secrets::{clear_secrets, register_secret, test_registry_guard};
 
 #[test]
 fn outbound_secret_interceptor_rewrites_allowed_headers_and_body() {
+    let _guard = test_registry_guard();
     clear_secrets().expect("registry should clear");
     let id =
         Uuid::parse_str("550e8400-e29b-41d4-a716-446655440100").expect("static UUID should parse");
@@ -30,6 +31,7 @@ fn outbound_secret_interceptor_rewrites_allowed_headers_and_body() {
 
 #[test]
 fn outbound_secret_interceptor_keeps_placeholder_for_disallowed_host() {
+    let _guard = test_registry_guard();
     clear_secrets().expect("registry should clear");
     let id =
         Uuid::parse_str("550e8400-e29b-41d4-a716-446655440101").expect("static UUID should parse");
