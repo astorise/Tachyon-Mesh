@@ -1,14 +1,15 @@
-#![allow(dead_code)]
-
 pub(crate) mod layer4 {
+    #[cfg(feature = "experimental")]
     pub(crate) const MODULE: &str = "network::layer4";
 }
 
 pub(crate) mod layer7 {
+    #[cfg(feature = "experimental")]
     pub(crate) const MODULE: &str = "network::layer7";
 }
 
 pub(crate) mod http3 {
+    #[cfg(feature = "experimental")]
     pub(crate) const MODULE: &str = "network::http3";
 }
 
@@ -21,6 +22,9 @@ pub(crate) mod ebpf {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum EbpfFastPathStatus {
+        // `Loaded` is only constructed inside the `ebpf-loader` feature build.
+        // In default builds the variant is reserved but unreachable.
+        #[cfg_attr(not(feature = "ebpf-loader"), allow(dead_code))]
         Loaded,
         NoRules,
         Unsupported,

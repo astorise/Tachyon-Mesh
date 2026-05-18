@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 #[path = "ai_inference/vram_manager.rs"]
 pub(crate) mod vram_manager;
 
@@ -1231,7 +1230,7 @@ impl WasiNnBackend for TpuBackend {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KvPrecision {
     Q8_0,

@@ -12,6 +12,6 @@
   - In `core-host/src/ai_inference.rs`, write the logic to read the first 8 bytes (as little-endian u64) to get the JSON header length.
   - Parse the subsequent bytes as a JSON string to extract `shape`, `dtype`, and `data_offsets`.
 
-- [x] **Task 4: Expand Integration Test Suite**
+- [ ] **Task 4: Expand Integration Test Suite**
   - Create `core-host/tests/cdc_broadcaster_test.rs` and write a basic lifecycle test.
   - Create `core-host/tests/olap_engine_test.rs` and write a basic lifecycle test validating the memory-bound JSON payload limits implemented in Phase 1.

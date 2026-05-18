@@ -122,7 +122,7 @@ pub(crate) static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInfere
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) enum DeploymentStrategy {
     #[default]
     Rolling,
@@ -225,6 +225,8 @@ pub(crate) enum AiInferenceJobStatus {
     Completed {
         output: String,
     },
+    // Produced by serde Deserialize from job-status JSON returned by the
+    // ai-inference subsystem; not constructed by Rust code directly.
     #[allow(dead_code)]
     Failed {
         message: String,

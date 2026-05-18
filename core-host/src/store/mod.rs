@@ -3,11 +3,13 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::HashMap,
     fs,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
+
+#[cfg(feature = "experimental")]
+use std::{collections::HashMap, sync::Mutex};
 
 pub(crate) mod secrets;
 
@@ -43,6 +45,7 @@ const METERING_OUTBOX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 /// new manifest. Key: monotonic event id.
 const CONFIG_UPDATE_OUTBOX_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("config_update_outbox");
+#[cfg(feature = "experimental")]
 const COMPRESSED_MAGIC_BYTES: &[&[u8]] = &[
     b"\xFF\xD8\xFF",
     b"\x89PNG",
@@ -58,20 +61,20 @@ pub(crate) struct CoreStore {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) struct BaasQueryCache {
     entries: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) struct VersionedRecord {
     pub(crate) schema_version: u32,
     pub(crate) payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) struct ConflictState {
     pub(crate) key: String,
     pub(crate) local_value: Vec<u8>,
@@ -81,7 +84,7 @@ pub(crate) struct ConflictState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) struct ScanOptions {
     pub(crate) start_key: Vec<u8>,
     pub(crate) end_key: Vec<u8>,
@@ -98,29 +101,26 @@ pub(crate) enum CoreStoreBucket {
     // Wired by follow-up changes (HNSW vector RAG / authz cache invalidation /
     // edge-to-cloud CDC sync). Schema lives here so the redb file is forward-
     // compatible — no migration is needed when those changes land.
-    #[allow(dead_code)]
     VectorIndices,
-    #[allow(dead_code)]
     AuthzPurgeOutbox,
-    #[allow(dead_code)]
     DataMutationOutbox,
     MeteringOutbox,
     ConfigUpdateOutbox,
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn should_compress_blob(header: &[u8]) -> bool {
     !COMPRESSED_MAGIC_BYTES
         .iter()
         .any(|magic| header.starts_with(magic))
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn pipe_range_from_file(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
     pipe_range_from_file_in_root(None, path, start, end)
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn pipe_range_from_file_in_root(
     root: Option<&Path>,
     path: &Path,
@@ -157,7 +157,7 @@ pub(crate) fn pipe_range_from_file_in_root(
     Ok(mmap[start as usize..=end as usize].to_vec())
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn transform_read_if_stale<F>(
     current_version: u32,
     record: VersionedRecord,
@@ -173,12 +173,12 @@ where
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn detect_split_brain(local_clock: u64, remote_clock: u64) -> bool {
     local_clock != remote_clock && local_clock != 0 && remote_clock != 0
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn resolve_conflict_with<F>(conflict: ConflictState, resolver: F) -> Result<Vec<u8>>
 where
     F: FnOnce(&ConflictState) -> Result<Vec<u8>>,
@@ -192,14 +192,14 @@ where
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn pushdown_wasmtime_config() -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
     config.consume_fuel(true);
     config
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn execute_filtered_scan<I, F>(
     rows: I,
     options: &ScanOptions,
@@ -227,7 +227,7 @@ where
     Ok(results)
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 impl BaasQueryCache {
     pub(crate) fn get_or_insert_with<F>(
         &self,
@@ -246,7 +246,14 @@ impl BaasQueryCache {
         if let Some(cached) = self
             .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    target: "tachyon::store",
+                    registry = "BaasQueryCache",
+                    "store mutex was poisoned on read; continuing with recovered guard"
+                );
+                poisoned.into_inner()
+            })
             .get(&key)
             .cloned()
         {
@@ -255,13 +262,20 @@ impl BaasQueryCache {
         let sanitized = build()?;
         self.entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    target: "tachyon::store",
+                    registry = "BaasQueryCache",
+                    "store mutex was poisoned on write; continuing with recovered guard"
+                );
+                poisoned.into_inner()
+            })
             .insert(key, sanitized.clone());
         Ok(sanitized)
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 fn sha256_hex(input: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(input))
@@ -640,7 +654,6 @@ impl CoreStore {
     /// order. Each yielded row is `(key, payload)`; the caller is expected to call
     /// `delete(bucket, key)` once it has durably handled the row, matching the
     /// at-least-once delivery semantics the proposals call out.
-    #[allow(dead_code)]
     pub(crate) fn peek_outbox(
         &self,
         bucket: CoreStoreBucket,
@@ -1015,7 +1028,7 @@ impl CoreStore {
             .context("kv_partition_delete: failed to commit")
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reached via WIT host bindings (component_hosts.rs)
     pub(crate) fn kv_partition_batch_set(
         &self,
         table_name: &str,
@@ -1042,7 +1055,7 @@ impl CoreStore {
             .context("kv_partition_batch_set: failed to commit")
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reached via WIT host bindings (component_hosts.rs)
     pub(crate) fn kv_partition_get_range(
         &self,
         table_name: &str,
@@ -1074,6 +1087,10 @@ impl CoreStore {
 }
 
 // ── Semantic graph store (hexastore) ─────────────────────────────────────────
+// All items in this section are reached through the `HostWorkspaceGraph` WIT
+// host binding dispatched by Wasmtime — invisible to the dead-code lint. The
+// `#[allow(dead_code)]` annotations below are tool-chain workarounds, NOT
+// experimental-feature placebos.
 
 #[allow(dead_code)]
 const GRAPH_SEP: u8 = b'\0';
@@ -1589,6 +1606,7 @@ mod tests {
         assert_eq!(matches[0].id, "doc-b");
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn smart_compression_skips_precompressed_media() {
         assert!(!should_compress_blob(b"\x89PNG\r\n"));
@@ -1596,6 +1614,7 @@ mod tests {
         assert!(should_compress_blob(b"{\"json\":true}"));
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn query_cache_reuses_smolvm_mutation_result() {
         let cache = BaasQueryCache::default();
@@ -1614,6 +1633,7 @@ mod tests {
         assert_eq!(second, "sanitized");
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn stale_record_invokes_schema_shim() {
         let transformed = transform_read_if_stale(
@@ -1632,6 +1652,7 @@ mod tests {
         assert_eq!(transformed, b"old-new");
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn split_brain_conflict_uses_resolver() {
         let merged = resolve_conflict_with(
@@ -1649,6 +1670,7 @@ mod tests {
         assert_eq!(merged, b"left+right");
     }
 
+    #[cfg(feature = "experimental")]
     #[test]
     fn pushdown_filtered_scan_prunes_rows_before_limit() {
         let rows = vec![

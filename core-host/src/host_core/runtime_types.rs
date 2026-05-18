@@ -30,7 +30,7 @@ pub(crate) struct MtlsGatewayListenerHandle {
 }
 
 pub(crate) struct Http3ListenerHandle {
-    #[allow(dead_code)]
+    #[cfg(feature = "experimental")]
     pub(crate) local_addr: SocketAddr,
     pub(crate) join_handle: tokio::task::JoinHandle<()>,
 }
@@ -623,6 +623,10 @@ pub(crate) struct PropagatedHeader {
 /// Host-side tracking state for a WIT `kv-partition::table` resource handle.
 /// Stored in the `ComponentHostState::table` `ResourceTable`; dropped
 /// automatically when the Wasm guest lets the handle go out of scope.
+///
+/// `#[allow(dead_code)]`: same justification as `WorkspaceGraphResource` —
+/// constructed inside WIT host bindings and stored type-erased in a
+/// `ResourceTable`. Not an experimental-feature placebo.
 #[allow(dead_code)]
 pub(crate) struct RedbTableResource {
     pub(crate) table_name: String,
