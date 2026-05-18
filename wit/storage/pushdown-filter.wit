@@ -1,0 +1,9 @@
+package tachyon:storage@1.1.0;
+
+interface pushdown-filter {
+  evaluate: func(key: list<u8>, value: list<u8>) -> bool;
+}
+
+world filter-module {
+  export pushdown-filter;
+}

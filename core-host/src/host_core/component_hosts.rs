@@ -1757,6 +1757,102 @@ impl system_component_bindings::tachyon::mesh::scaling_metrics::Host for Compone
     }
 }
 
+impl component_bindings::tachyon::mesh::custom_metrics::Host for ComponentHostState {
+    fn push(
+        &mut self,
+        data: component_bindings::tachyon::mesh::custom_metrics::Metric,
+    ) -> std::result::Result<(), String> {
+        push_custom_metric(CustomMetric {
+            name: data.name,
+            value: data.value,
+            metric_type: match data.kind {
+                component_bindings::tachyon::mesh::custom_metrics::MetricType::Counter => {
+                    CustomMetricType::Counter
+                }
+                component_bindings::tachyon::mesh::custom_metrics::MetricType::Gauge => {
+                    CustomMetricType::Gauge
+                }
+                component_bindings::tachyon::mesh::custom_metrics::MetricType::Histogram => {
+                    CustomMetricType::Histogram
+                }
+            },
+            tags: data.tags,
+        })
+    }
+}
+
+impl system_component_bindings::tachyon::mesh::custom_metrics::Host for ComponentHostState {
+    fn push(
+        &mut self,
+        data: system_component_bindings::tachyon::mesh::custom_metrics::Metric,
+    ) -> std::result::Result<(), String> {
+        push_custom_metric(CustomMetric {
+            name: data.name,
+            value: data.value,
+            metric_type: match data.kind {
+                system_component_bindings::tachyon::mesh::custom_metrics::MetricType::Counter => {
+                    CustomMetricType::Counter
+                }
+                system_component_bindings::tachyon::mesh::custom_metrics::MetricType::Gauge => {
+                    CustomMetricType::Gauge
+                }
+                system_component_bindings::tachyon::mesh::custom_metrics::MetricType::Histogram => {
+                    CustomMetricType::Histogram
+                }
+            },
+            tags: data.tags,
+        })
+    }
+}
+
+impl background_component_bindings::tachyon::mesh::custom_metrics::Host for ComponentHostState {
+    fn push(
+        &mut self,
+        data: background_component_bindings::tachyon::mesh::custom_metrics::Metric,
+    ) -> std::result::Result<(), String> {
+        push_custom_metric(CustomMetric {
+            name: data.name,
+            value: data.value,
+            metric_type: match data.kind {
+                background_component_bindings::tachyon::mesh::custom_metrics::MetricType::Counter => {
+                    CustomMetricType::Counter
+                }
+                background_component_bindings::tachyon::mesh::custom_metrics::MetricType::Gauge => {
+                    CustomMetricType::Gauge
+                }
+                background_component_bindings::tachyon::mesh::custom_metrics::MetricType::Histogram => {
+                    CustomMetricType::Histogram
+                }
+            },
+            tags: data.tags,
+        })
+    }
+}
+
+impl control_plane_component_bindings::tachyon::mesh::custom_metrics::Host for ComponentHostState {
+    fn push(
+        &mut self,
+        data: control_plane_component_bindings::tachyon::mesh::custom_metrics::Metric,
+    ) -> std::result::Result<(), String> {
+        push_custom_metric(CustomMetric {
+            name: data.name,
+            value: data.value,
+            metric_type: match data.kind {
+                control_plane_component_bindings::tachyon::mesh::custom_metrics::MetricType::Counter => {
+                    CustomMetricType::Counter
+                }
+                control_plane_component_bindings::tachyon::mesh::custom_metrics::MetricType::Gauge => {
+                    CustomMetricType::Gauge
+                }
+                control_plane_component_bindings::tachyon::mesh::custom_metrics::MetricType::Histogram => {
+                    CustomMetricType::Histogram
+                }
+            },
+            tags: data.tags,
+        })
+    }
+}
+
 impl control_plane_component_bindings::tachyon::mesh::scaling_metrics::Host for ComponentHostState {
     fn get_pending_queue_size(&mut self, route_path: String) -> u32 {
         self.pending_queue_size(&route_path)

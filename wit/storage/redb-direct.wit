@@ -1,0 +1,24 @@
+package tachyon:storage@1.1.0;
+
+interface redb-direct {
+  record kv-entry {
+    key: string,
+    value: list<u8>,
+  }
+
+  record scan-options {
+    start-key: string,
+    end-key: string,
+    limit: u32,
+    pushdown-filter-wasm: option<list<u8>>,
+  }
+
+  get: func(table: string, key: string) -> result<option<list<u8>>, string>;
+  put: func(table: string, key: string, value: list<u8>) -> result<_, string>;
+  scan: func(table: string, start-key: string, end-key: string, limit: u32) -> result<list<kv-entry>, string>;
+  scan-filtered: func(table: string, options: scan-options) -> result<list<kv-entry>, string>;
+}
+
+world redb-direct-host {
+  export redb-direct;
+}

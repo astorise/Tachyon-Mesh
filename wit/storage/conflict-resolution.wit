@@ -1,0 +1,17 @@
+package tachyon:storage@1.1.0;
+
+interface conflict-resolution {
+  record conflicting-state {
+    key: string,
+    local-value: list<u8>,
+    remote-value: list<u8>,
+    local-clock: u64,
+    remote-clock: u64,
+  }
+
+  resolve: func(conflict: conflicting-state) -> result<list<u8>, string>;
+}
+
+world conflict-resolution-host {
+  export conflict-resolution;
+}

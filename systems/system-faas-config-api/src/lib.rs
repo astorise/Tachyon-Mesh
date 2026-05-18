@@ -257,6 +257,7 @@ pub fn validate_manifest_payload(payload: &Value) -> DryRunResult {
                             });
                         }
                     }
+                    validate_canary_metrics(route_obj.get("canary"), i, &mut errors);
                 }
             }
         }
@@ -268,6 +269,69 @@ pub fn validate_manifest_payload(payload: &Value) -> DryRunResult {
     } else {
         DryRunResult::fail(errors)
     }
+}
+
+fn validate_canary_metrics(
+    canary: Option<&Value>,
+    route_index: usize,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(canary) = canary.and_then(Value::as_object) else {
+        return;
+    };
+    let Some(metrics) = canary.get("metrics") else {
+        return;
+    };
+    let Some(metrics) = metrics.as_array() else {
+        errors.push(ValidationError {
+            path: format!("/routes/{route_index}/canary/metrics"),
+            message: "`canary.metrics` must be an array".to_owned(),
+            error_code: "INVALID_TYPE".to_owned(),
+        });
+        return;
+    };
+
+    for (metric_index, metric) in metrics.iter().enumerate() {
+        let Some(metric) = metric.as_object() else {
+            errors.push(ValidationError {
+                path: format!("/routes/{route_index}/canary/metrics/{metric_index}"),
+                message: "canary metric threshold must be an object".to_owned(),
+                error_code: "INVALID_TYPE".to_owned(),
+            });
+            continue;
+        };
+        if metric
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(ValidationError {
+                path: format!("/routes/{route_index}/canary/metrics/{metric_index}/name"),
+                message: "canary metric `name` must be a non-empty string".to_owned(),
+                error_code: "CONSTRAINT_VIOLATION".to_owned(),
+            });
+        }
+        let threshold = metric.get("threshold").and_then(Value::as_str);
+        if threshold.is_none_or(|value| parse_metric_threshold(value).is_none()) {
+            errors.push(ValidationError {
+                path: format!("/routes/{route_index}/canary/metrics/{metric_index}/threshold"),
+                message:
+                    "canary metric `threshold` must use '<', '<=', '>' or '>=' with a numeric value"
+                        .to_owned(),
+                error_code: "CONSTRAINT_VIOLATION".to_owned(),
+            });
+        }
+    }
+}
+
+fn parse_metric_threshold(input: &str) -> Option<(&str, f64)> {
+    let trimmed = input.trim();
+    let operator = [">=", "<=", ">", "<"]
+        .into_iter()
+        .find(|operator| trimmed.starts_with(operator))?;
+    let raw_value = trimmed[operator.len()..].trim();
+    let numeric = raw_value.trim_end_matches('%').trim().parse::<f64>().ok()?;
+    Some((operator, numeric))
 }
 
 const BROKER_ROUTE_ENV: &str = "GITOPS_BROKER_ROUTE";
@@ -529,6 +593,56 @@ mod tests {
             .expect_err("slash should be rejected");
 
         assert!(error.contains("environment"));
+    }
+
+    #[test]
+    fn manifest_validation_accepts_canary_custom_metric_thresholds() {
+        let result = validate_manifest_payload(&serde_json::json!({
+            "hostAddress": "0.0.0.0:8080",
+            "maxStdoutBytes": 65536,
+            "guestFuelBudget": 500000,
+            "guestMemoryLimitBytes": 67108864,
+            "resourceLimitResponse": "limited",
+            "routes": [{
+                "path": "/checkout",
+                "version": "1.1.0",
+                "maxConcurrency": 10,
+                "canary": {
+                    "nextVersion": "checkout-v2",
+                    "maxErrorRate": 0.01,
+                    "metrics": [{
+                        "name": "piano.checkout_conversion",
+                        "threshold": "> 0.12"
+                    }]
+                }
+            }]
+        }));
+
+        assert!(result.valid, "{:?}", result.errors);
+    }
+
+    #[test]
+    fn manifest_validation_rejects_invalid_canary_metric_thresholds() {
+        let result = validate_manifest_payload(&serde_json::json!({
+            "hostAddress": "0.0.0.0:8080",
+            "maxStdoutBytes": 65536,
+            "guestFuelBudget": 500000,
+            "guestMemoryLimitBytes": 67108864,
+            "resourceLimitResponse": "limited",
+            "routes": [{
+                "path": "/checkout",
+                "version": "1.1.0",
+                "canary": {
+                    "metrics": [{
+                        "name": "",
+                        "threshold": "around 12"
+                    }]
+                }
+            }]
+        }));
+
+        assert!(!result.valid);
+        assert_eq!(result.errors.len(), 2);
     }
 
     #[test]

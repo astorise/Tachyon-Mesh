@@ -3,11 +3,13 @@
 ## Purpose
 Native B-Tree key-value partition for FaaS guests: Component Model resource handles, IPC-optimised pagination, and atomic batch transactions.
 
-## 1. The WIT Contract
-Codex must update the WIT definition for the Key-Value partition capability to strictly match the following interface using the Component Model `resource` semantic.
+## Requirements
+
+### Requirement: KV partition WIT contract MUST use Component Model resources
+The project SHALL update the WIT definition for the Key-Value partition capability to strictly match the following interface using the Component Model `resource` semantic.
 
 ```wit
-package tachyon:ai@1.0.0;
+package tachyon:ai@1.1.0;
 
 interface kv-partition {
     resource table {
@@ -32,16 +34,25 @@ interface kv-partition {
 }
 ```
 
-## 2. Core-Host Wasmtime Integration
-In `core-host/src/host_core/` (where the AI/KV bindings are implemented):
+#### Scenario: WIT exposes a table resource
+- **WHEN** the KV partition WIT is inspected
+- **THEN** it exposes a `table` resource with constructor, single-key operations, `batch-set`, and paginated `get-range`
+
+### Requirement: core-host MUST integrate KV partition resources with Wasmtime
+In `core-host/src/host_core/` (where the AI/KV bindings are implemented), the implementation SHALL:
 - The `TachyonCtx` (or equivalent Wasmtime `Store` state) must include a Wasmtime `ResourceTable`.
 - Implementing the `resource` requires defining a Rust struct (e.g., `RedbTableResource`) that holds the table name and a reference to the active `redb::Database`.
 - **`batch-set` Implementation:** Codex must open a `db.begin_write()`, iterate over the `entries`, insert them into the table, and then explicitly `.commit()`.
 - **`get-range` Implementation:** Codex must open a `db.begin_read()`, use `.range(start_key..end_key)`, apply `.skip(offset as usize).take(limit as usize)`, and collect the results into the returned `Vec<(String, Vec<u8>)>`. 
 - Provide detailed error mapping for Redb storage failures (e.g., corrupted database, serialization errors).
 
-## 3. Rust FaaS SDK Refactoring
-In `faas-sdk/src/`, Codex must update the API bindings so developers can use the resource ergonomically.
+#### Scenario: Batch writes and range reads use native storage transactions
+- **WHEN** a guest calls `batch-set`
+- **THEN** core-host performs the inserts in a single Redb write transaction and commits explicitly
+- **AND** `get-range` uses native B-Tree range iteration with limit and offset
+
+### Requirement: Rust FaaS SDK MUST expose ergonomic KV partition resources
+In `faas-sdk/src/`, the API bindings SHALL let developers use the resource ergonomically.
 
 **Target SDK Usage Example for Codex to ensure:**
 ```rust
@@ -62,3 +73,7 @@ pub fn execute_agent_logic() {
 }
 ```
 *Note: The Wasm runtime will automatically invoke the resource `drop` export when `context_table` goes out of scope, releasing host-side tracking.*
+
+#### Scenario: SDK consumers use table resource ergonomics
+- **WHEN** a Rust guest creates `Table::new("viking-context")`
+- **THEN** it can call `batch_set` and `get_range` without manually managing raw resource handles

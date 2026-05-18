@@ -122,7 +122,7 @@ pub(crate) static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInfere
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) enum DeploymentStrategy {
     #[default]
     Rolling,
@@ -141,6 +141,14 @@ pub(crate) struct CanaryConfig {
     pub(crate) interval_secs: u64,
     /// Error rate above which an automatic rollback is triggered (0.0–1.0).
     pub(crate) max_error_rate: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) metrics: Vec<CanaryMetricThreshold>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct CanaryMetricThreshold {
+    pub(crate) name: String,
+    pub(crate) threshold: String,
 }
 
 pub(crate) fn default_canary_step_weight() -> u32 {
@@ -166,6 +174,7 @@ pub(crate) struct CanaryRolloutState {
     pub(crate) step_weight: u32,
     pub(crate) interval_secs: u64,
     pub(crate) max_error_rate: f32,
+    pub(crate) metric_thresholds: Vec<CanaryMetricThreshold>,
     pub(crate) phase: Mutex<CanaryPhase>,
     /// Cumulative requests routed to `next_version` on this node.
     pub(crate) next_req_count: AtomicU64,
@@ -216,6 +225,8 @@ pub(crate) enum AiInferenceJobStatus {
     Completed {
         output: String,
     },
+    // Produced by serde Deserialize from job-status JSON returned by the
+    // ai-inference subsystem; not constructed by Rust code directly.
     #[allow(dead_code)]
     Failed {
         message: String,

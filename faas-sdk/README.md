@@ -7,7 +7,7 @@ This directory contains the FaaS SDK crate for building Rust guest functions tha
 ```toml
 # Cargo.toml
 [dependencies]
-tachyon-faas-sdk = "1.0.0"
+tachyon-faas-sdk = "1.1.0"
 ```
 
 ```rust
@@ -44,7 +44,7 @@ If you prefer to use [`cargo-component`](https://github.com/bytecodealliance/car
 2. Add the dependency to your `Cargo.toml`:
    ```toml
    [package.metadata.component.dependencies]
-   "tachyon:mesh" = { registry = "oci", package = "ghcr.io/astorise/tachyon-mesh-wit", version = "1.0.0" }
+   "tachyon:mesh" = { registry = "oci", package = "ghcr.io/astorise/tachyon-mesh-wit", version = "1.1.0" }
    ```
 
 3. Build your component:
@@ -62,7 +62,7 @@ If you prefer to use [`cargo-component`](https://github.com/bytecodealliance/car
 
 ### Pinning a specific version
 
-Replace `1.0.0` with the release tag you want to target, e.g. `0.9.0-rc.1`. To list all published versions:
+Replace `1.1.0` with the release tag you want to target, e.g. `0.9.0-rc.1`. To list all published versions:
 
 ```bash
 wkg list ghcr.io/astorise/tachyon-mesh-wit

@@ -166,7 +166,10 @@ pub(crate) fn get_base_openapi_schema() -> String {
 }
 
 // ── Path declarations ─────────────────────────────────────────────────────────
-// These stub functions carry utoipa metadata only. They are never called.
+// These stub functions carry `#[utoipa::path]` metadata that `#[derive(OpenApi)]`
+// on `ApiDoc` references via `paths(...)`. The macro expansion is invisible to
+// the dead-code lint, so each stub carries `#[allow(dead_code)]` — this is a
+// documented tool-chain exception, NOT an experimental-feature placebo.
 
 #[utoipa::path(get, path = "/admin/status", tag = "status",
     security(("bearer_token" = [])),

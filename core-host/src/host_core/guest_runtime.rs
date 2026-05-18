@@ -9,9 +9,7 @@ pub(crate) fn execute_guest(
 ) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
     #[cfg(not(feature = "ai-inference"))]
     if requires_ai_inference_feature(function_name) {
-        return Err(ExecutionError::Internal(format!(
-            "guest `{function_name}` requires `core-host` to be built with `--features ai-inference`"
-        )));
+        return Err(ai_inference_feature_unavailable_error(function_name));
     }
 
     let module_path =
@@ -323,6 +321,16 @@ pub(crate) fn execute_component_guest(
         guest_execution_error(
             error,
             "failed to add training functions to component linker",
+        )
+    })?;
+    component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add custom-metrics functions to component linker",
         )
     })?;
     #[cfg(feature = "ai-inference")]
@@ -750,6 +758,16 @@ pub(crate) fn execute_system_component_guest(
             "failed to add telemetry reader functions to system component linker",
         )
     })?;
+    control_plane_component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add custom-metrics functions to system component linker",
+        )
+    })?;
     control_plane_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
         ComponentHostState,
         ComponentHostState,
@@ -960,6 +978,16 @@ impl BackgroundTickRunner {
             guest_execution_error(
                 error,
                 "failed to add telemetry reader functions to background component linker",
+            )
+        })?;
+        background_component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(&mut linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to add custom-metrics functions to background component linker",
             )
         })?;
         background_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
@@ -1601,6 +1629,13 @@ pub(crate) fn build_linker(
 #[cfg_attr(feature = "ai-inference", allow(dead_code))]
 pub(crate) fn requires_ai_inference_feature(function_name: &str) -> bool {
     normalize_target_module_name(function_name) == "guest-ai"
+}
+
+#[cfg(not(feature = "ai-inference"))]
+pub(crate) fn ai_inference_feature_unavailable_error(function_name: &str) -> ExecutionError {
+    ExecutionError::Internal(format!(
+        "guest `{function_name}` requires `core-host` to be built with `--features ai-inference`"
+    ))
 }
 
 pub(crate) fn resolve_function_name(path: &str) -> Option<String> {

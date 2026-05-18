@@ -1,4 +1,4 @@
-package tachyon:routing@1.0.0;
+package tachyon:routing@1.1.0;
 
 interface config-routing {
     enum protocol {

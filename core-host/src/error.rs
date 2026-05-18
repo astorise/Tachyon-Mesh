@@ -1,8 +1,9 @@
-#![allow(dead_code)]
-
+#[cfg(feature = "experimental")]
 use thiserror::Error;
 
 // Shared error surface for incremental migration away from ad-hoc panics.
+// Gated behind `experimental` until call-sites migrate to typed errors.
+#[cfg(feature = "experimental")]
 #[derive(Debug, Error)]
 pub(crate) enum TachyonError {
     #[error("configuration error: {0}")]
@@ -19,4 +20,5 @@ pub(crate) enum TachyonError {
     Anyhow(#[from] anyhow::Error),
 }
 
+#[cfg(feature = "experimental")]
 pub(crate) type TachyonResult<T> = std::result::Result<T, TachyonError>;

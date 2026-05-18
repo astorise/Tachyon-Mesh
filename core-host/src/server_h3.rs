@@ -9,6 +9,14 @@ use bytes::Buf;
 use h3::{quic::SendStream, server::RequestResolver};
 use http_body_util::BodyExt;
 use quinn::crypto::rustls::QuicServerConfig;
+#[cfg(feature = "experimental")]
+use serde_json::Value;
+#[cfg(feature = "experimental")]
+use std::{
+    fs::{File, OpenOptions},
+    io::Read,
+    path::Path,
+};
 use std::{io, sync::Arc, time::Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::ServiceExt;
@@ -25,6 +33,18 @@ const QUIC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 // downstream consumer. A small bound is intentional: it keeps the host's RSS independent
 // of the request body's total size, which is the whole point of streaming.
 const BODY_CHANNEL_DEPTH: usize = 8;
+#[cfg(feature = "experimental")]
+const SAFETENSORS_PREFIX_LEN: usize = 8;
+#[cfg(feature = "experimental")]
+const SAFETENSORS_CHUNK_HEADER_LEN: usize = 12;
+
+#[cfg(feature = "experimental")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SafetensorsHeader {
+    pub(crate) header_len: u64,
+    pub(crate) total_size: u64,
+    pub(crate) header: Value,
+}
 
 pub(crate) async fn start_http3_listener(
     state: crate::AppState,
@@ -143,6 +163,9 @@ async fn handle_http3_request(
         .await
         .context("failed to decode HTTP/3 request")?;
     let (parts, _) = request.into_parts();
+    #[cfg(not(feature = "experimental"))]
+    let _ = &state;
+    #[cfg(feature = "experimental")]
     if let Some(response) = crate::auth::authorize_admin_headers(
         &state,
         parts.method.as_str(),
@@ -245,8 +268,160 @@ where
         .context("failed to finish HTTP/3 stream")
 }
 
+#[cfg(feature = "experimental")]
+pub(crate) fn parse_safetensors_header_prefix(input: &[u8]) -> Result<SafetensorsHeader> {
+    if input.len() < SAFETENSORS_PREFIX_LEN {
+        return Err(anyhow!(
+            "safetensors stream is missing 8-byte header length prefix"
+        ));
+    }
+    let header_len = u64::from_le_bytes(
+        input[..SAFETENSORS_PREFIX_LEN]
+            .try_into()
+            .expect("fixed prefix length"),
+    );
+    let header_end = SAFETENSORS_PREFIX_LEN
+        .checked_add(usize::try_from(header_len).context("header length exceeds usize")?)
+        .context("safetensors header length overflows")?;
+    if input.len() < header_end {
+        return Err(anyhow!(
+            "safetensors stream ended before full header: need {header_end} bytes, got {}",
+            input.len()
+        ));
+    }
+    let header: Value = serde_json::from_slice(&input[SAFETENSORS_PREFIX_LEN..header_end])
+        .context("failed to parse safetensors JSON header")?;
+    let max_tensor_end = header
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter(|(name, _)| name.as_str() != "__metadata__")
+        .filter_map(|(_, tensor)| tensor.get("data_offsets"))
+        .filter_map(Value::as_array)
+        .filter_map(|offsets| offsets.get(1))
+        .filter_map(Value::as_u64)
+        .max()
+        .unwrap_or_default();
+    let total_size = u64::try_from(SAFETENSORS_PREFIX_LEN)
+        .expect("prefix length fits u64")
+        .saturating_add(header_len)
+        .saturating_add(max_tensor_end);
+
+    Ok(SafetensorsHeader {
+        header_len,
+        total_size,
+        header,
+    })
+}
+
+#[cfg(feature = "experimental")]
+pub(crate) fn prepare_tensor_landing_zone(
+    path: impl AsRef<Path>,
+    total_size: u64,
+) -> io::Result<memmap2::MmapMut> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.set_len(total_size)?;
+    unsafe { memmap2::MmapMut::map_mut(&file) }
+}
+
+#[cfg(feature = "experimental")]
+pub(crate) fn encode_safetensors_chunk(offset: u64, payload: &[u8]) -> Result<Vec<u8>> {
+    let payload_len = u32::try_from(payload.len()).context("chunk exceeds u32::MAX bytes")?;
+    let mut encoded = Vec::with_capacity(SAFETENSORS_CHUNK_HEADER_LEN + payload.len());
+    encoded.extend_from_slice(&offset.to_le_bytes());
+    encoded.extend_from_slice(&payload_len.to_le_bytes());
+    encoded.extend_from_slice(payload);
+    Ok(encoded)
+}
+
+#[cfg(feature = "experimental")]
+pub(crate) fn apply_safetensors_chunk(
+    mmap: &mut memmap2::MmapMut,
+    encoded: &[u8],
+) -> Result<(u64, u32)> {
+    if encoded.len() < SAFETENSORS_CHUNK_HEADER_LEN {
+        return Err(anyhow!("safetensors chunk is missing offset/length header"));
+    }
+    let offset = u64::from_le_bytes(encoded[..8].try_into().expect("fixed offset length"));
+    let length = u32::from_le_bytes(encoded[8..12].try_into().expect("fixed length field"));
+    let payload = &encoded[SAFETENSORS_CHUNK_HEADER_LEN..];
+    if payload.len() != length as usize {
+        return Err(anyhow!(
+            "safetensors chunk length mismatch: header says {length}, payload has {}",
+            payload.len()
+        ));
+    }
+    let start = usize::try_from(offset).context("chunk offset exceeds usize")?;
+    let end = start
+        .checked_add(payload.len())
+        .context("chunk range overflows usize")?;
+    if end > mmap.len() {
+        return Err(anyhow!(
+            "safetensors chunk range {start}..{end} exceeds mmap length {}",
+            mmap.len()
+        ));
+    }
+    mmap[start..end].copy_from_slice(payload);
+    Ok((offset, length))
+}
+
+#[cfg(feature = "experimental")]
+pub(crate) fn safetensors_chunks(
+    path: impl AsRef<Path>,
+    chunk_size: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if chunk_size == 0 {
+        return Err(anyhow!("safetensors chunk size must be greater than zero"));
+    }
+    let mut file = File::open(path.as_ref())
+        .with_context(|| format!("failed to open `{}`", path.as_ref().display()))?;
+    let mut chunks = Vec::new();
+    let mut offset = 0_u64;
+    loop {
+        let mut buffer = vec![0; chunk_size];
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        buffer.truncate(read);
+        chunks.push(encode_safetensors_chunk(offset, &buffer)?);
+        offset = offset.saturating_add(read as u64);
+    }
+    Ok(chunks)
+}
+
+#[cfg(feature = "experimental")]
+pub(crate) fn verify_safetensors_blake3(
+    path: impl AsRef<Path>,
+    expected_hex: &str,
+) -> Result<bool> {
+    let mut file = File::open(path.as_ref())
+        .with_context(|| format!("failed to open `{}`", path.as_ref().display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = hasher.finalize().to_hex();
+    Ok(actual.as_str().eq_ignore_ascii_case(expected_hex))
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "experimental")]
+    use super::*;
+    #[cfg(feature = "experimental")]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn quic_transport_config_caps_are_applied() {
@@ -261,5 +436,56 @@ mod tests {
         // The body channel depth must stay small (constant memory), independent of the
         // request body's total size — the whole point of the streaming bridge.
         assert!(super::BODY_CHANNEL_DEPTH <= 32);
+    }
+
+    #[cfg(feature = "experimental")]
+    #[test]
+    fn safetensors_header_parser_uses_offsets_for_total_size() {
+        let header = br#"{"layer.weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        stream.extend_from_slice(header);
+        stream.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let parsed = parse_safetensors_header_prefix(&stream).expect("header should parse");
+
+        assert_eq!(parsed.header_len, header.len() as u64);
+        assert_eq!(parsed.total_size, 8 + header.len() as u64 + 8);
+    }
+
+    #[cfg(feature = "experimental")]
+    #[test]
+    fn chunk_apply_writes_to_absolute_offset() {
+        let path = unique_test_path("chunk-apply.safetensors");
+        let mut mmap = prepare_tensor_landing_zone(&path, 16).expect("mmap should initialize");
+        let encoded = encode_safetensors_chunk(4, b"abcd").expect("chunk should encode");
+
+        let (offset, length) =
+            apply_safetensors_chunk(&mut mmap, &encoded).expect("chunk should apply");
+
+        assert_eq!((offset, length), (4, 4));
+        assert_eq!(&mmap[4..8], b"abcd");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[cfg(feature = "experimental")]
+    #[test]
+    fn safetensors_hash_verifies_reconstructed_file() {
+        let path = unique_test_path("hash.safetensors");
+        std::fs::write(&path, b"tensor-bytes").expect("test file should write");
+        let expected = blake3::hash(b"tensor-bytes").to_hex().to_string();
+
+        assert!(verify_safetensors_blake3(&path, &expected).expect("hash should verify"));
+        assert!(!verify_safetensors_blake3(&path, "00").expect("hash should fail cleanly"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[cfg(feature = "experimental")]
+    fn unique_test_path(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("tachyon-quic-{nonce}-{name}"))
     }
 }

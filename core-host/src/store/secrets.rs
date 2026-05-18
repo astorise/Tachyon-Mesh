@@ -50,6 +50,15 @@ pub fn clear_secrets() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+pub fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_REGISTRY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_REGISTRY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("secret registry test lock should not be poisoned")
+}
+
 pub fn resolve_secret(placeholder: &str, target_host: &str) -> Result<String, String> {
     let id = parse_placeholder_id(placeholder)?;
     let target_host = normalize_host(target_host)
@@ -138,6 +147,7 @@ mod tests {
 
     #[test]
     fn resolve_secret_returns_plaintext_for_allowed_host() {
+        let _guard = test_registry_guard();
         clear_secrets().expect("registry should clear");
         let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
             .expect("static UUID should parse");
@@ -155,6 +165,7 @@ mod tests {
 
     #[test]
     fn resolve_secret_rejects_disallowed_host() {
+        let _guard = test_registry_guard();
         clear_secrets().expect("registry should clear");
         let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
             .expect("static UUID should parse");
