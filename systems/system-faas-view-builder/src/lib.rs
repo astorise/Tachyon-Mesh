@@ -73,10 +73,10 @@ mod tests {
 
     #[test]
     fn rebuilds_view_with_vector_clock() {
-        let view: MaterializedView = serde_json::from_slice(
-            &rebuild_view(br#"{"key":"dashboard:u1","vector_clock":7}"#, 3).unwrap(),
-        )
-        .unwrap();
+        let encoded = rebuild_view(br#"{"key":"dashboard:u1","vector_clock":7}"#, 3)
+            .expect("valid view input should rebuild");
+        let view: MaterializedView =
+            serde_json::from_slice(&encoded).expect("rebuilt view should decode");
 
         assert_eq!(
             view,
