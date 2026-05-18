@@ -111,7 +111,7 @@ jobs:
 
       - name: Install cosign
         if: runner.os != 'Windows'
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign binary archive with cosign (keyless OIDC)
         id: sign
@@ -133,7 +133,7 @@ jobs:
           echo "sbom_file=${SBOM}" >> "$GITHUB_OUTPUT"
 
       - name: Upload archive and supply-chain artifacts to GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ steps.pkg.outputs.tarball }}
