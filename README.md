@@ -116,10 +116,10 @@ Add the following to your component's `Cargo.toml` (requires [`cargo-component`]
 
 ```toml
 [package.metadata.component.dependencies]
-"tachyon:mesh" = { registry = "oci", package = "ghcr.io/astorise/tachyon-mesh-wit", version = "1.0.0" }
+"tachyon:mesh" = { registry = "oci", package = "ghcr.io/astorise/tachyon-mesh-wit", version = "1.1.0" }
 ```
 
-`cargo-component build` will automatically fetch and resolve the WIT interfaces during compilation. Replace `1.0.0` with the release tag you are targeting.
+`cargo-component build` will automatically fetch and resolve the WIT interfaces during compilation. Replace `1.1.0` with the release tag you are targeting.
 
 To see all available versions:
 ```bash

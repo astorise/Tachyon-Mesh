@@ -1,4 +1,4 @@
-package tachyon:mesh@1.0.0;
+package tachyon:mesh@1.1.0;
 
 /// Inference interface that accepts an optional per-call LoRA adapter. The default
 /// path (no adapter) matches the existing inference behaviour exactly.
@@ -52,4 +52,39 @@ interface inference {
     /// Run a call with explicit per-call options. Falls back to `infer` semantics
     /// when `options.profile` is `performance`.
     infer-with-options: func(req: inference-request, options: inference-options) -> result<inference-response, string>;
+}
+
+/// Zero-copy, handle-based layer manipulation contract for guests that orchestrate
+/// model execution while native host memory owns tensor storage.
+interface layer-execution {
+    /// Opaque resource identifier representing a native tensor on the host.
+    type tensor-handle = u32;
+    type model-id = string;
+
+    /// Residency priority for weights loaded into VRAM.
+    enum vram-priority {
+        active,
+        hot,
+        volatile,
+    }
+
+    /// Instructs the host to slide the mmap window over specific safetensors blocks.
+    load-layer: func(model: model-id, layer-index: u32) -> result<_, string>;
+
+    /// Instructs the host to load a layer with an explicit VRAM eviction priority.
+    load-layer-with-priority: func(model: model-id, layer-index: u32, priority: vram-priority) -> result<_, string>;
+
+    /// Evicts the specified layer weights from memory/VRAM.
+    unload-layer: func(model: model-id, layer-index: u32);
+
+    /// Processes a vector of state pointers through the active layer weights.
+    forward-layer: func(model: model-id, layer-index: u32, inputs: list<tensor-handle>) -> result<list<tensor-handle>, string>;
+
+    /// Safely cleans up the tensor representation on the host side.
+    drop-tensor: func(handle: tensor-handle);
+}
+
+world inference-host {
+    export inference;
+    export layer-execution;
 }

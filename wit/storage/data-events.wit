@@ -1,0 +1,23 @@
+package tachyon:storage@1.1.0;
+
+interface data-events {
+  enum operation {
+    insert,
+    update,
+    delete,
+  }
+
+  record mutation-event {
+    namespace: string,
+    key: string,
+    op: operation,
+    new-value: option<list<u8>>,
+    vector-clock: u64,
+  }
+
+  subscribe: func(namespace: string) -> result<list<mutation-event>, string>;
+}
+
+world data-events-host {
+  export data-events;
+}

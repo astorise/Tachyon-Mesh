@@ -102,3 +102,69 @@ SHALL clamp between 1 and 500, defaulting to 50 when omitted.
 - **THEN** the response contains the most recent 50 audit entries
 - **AND** the entries are not filtered by user
 
+### Requirement: Custom Telemetry Metrics WIT
+The mesh SHALL expose a `tachyon:telemetry@1.1.0/custom-metrics` WIT interface that lets trusted Wasm bridge components submit counter, gauge, and histogram metric samples with string labels.
+
+#### Scenario: Bridge component submits a custom metric
+- **WHEN** a bridge component calls `custom-metrics.push` with a metric name, value, metric type, and labels
+- **THEN** the host accepts the sample or returns a human-readable validation error
+- **AND** the WIT contract remains versioned under `tachyon:telemetry@1.1.0`
+
+### Requirement: Core Host Translates Custom Metrics To Prometheus
+The core host SHALL dynamically create and cache Prometheus collectors for custom metrics and register them in the default Prometheus registry.
+
+#### Scenario: Gauge metric is pushed repeatedly
+- **WHEN** two gauge samples with the same metric name and label keys are pushed
+- **THEN** the first call creates and registers the collector
+- **AND** the second call reuses the cached collector and updates the latest value
+
+### Requirement: Canary Evaluation Supports Business Metrics
+The canary evaluator SHALL evaluate custom metric thresholds declared on a route before stepping traffic forward.
+
+#### Scenario: Custom metric violates threshold
+- **GIVEN** a route canary declares a custom metric threshold
+- **WHEN** the latest observed metric value violates that threshold
+- **THEN** the evaluator sets the canary traffic weight to zero
+- **AND** the rollout phase records a rollback reason naming the metric
+
+### Requirement: Manifest Validation Accepts Canary Metric Thresholds
+The configuration API SHALL accept `canary.metrics` entries containing `name` and `threshold` fields, and SHALL reject malformed custom metric thresholds during dry-run validation.
+
+#### Scenario: Canary metrics are declared in a manifest
+- **WHEN** a manifest route contains `canary.metrics` with non-empty names and comparison thresholds
+- **THEN** validation succeeds
+- **AND** malformed threshold strings are reported as validation errors
+
+### Requirement: Gateway Routes Heavy BaaS Work To Ephemeral Compute
+The system gateway SHALL route media range requests and analytical query payloads to dedicated ephemeral FaaS components instead of the normal OLTP path.
+
+#### Scenario: Media range request is detected
+- **WHEN** an incoming request has a `Range` header and targets a media path
+- **THEN** the gateway forwards it to `system-faas-media-server`
+
+#### Scenario: Analytical query is detected
+- **WHEN** a query payload contains aggregation indicators such as `GROUP BY` or `SUM`
+- **THEN** the gateway forwards it to `system-faas-olap-engine`
+
+### Requirement: Zero-Copy Media Range WIT
+The mesh SHALL expose a `tachyon:storage@1.1.0/media-stream` WIT interface for piping file byte ranges from RustFS to an output socket handle.
+
+#### Scenario: Media server requests a byte range
+- **WHEN** a media FaaS asks the host to pipe `start-byte..end-byte`
+- **THEN** the host returns the number of bytes written or a string error
+
+### Requirement: Media Server Returns Partial Content
+The `system-faas-media-server` component SHALL parse HTTP byte range headers and format HTTP `206 Partial Content` responses with `Accept-Ranges`.
+
+#### Scenario: Valid byte range arrives
+- **WHEN** the component receives `Range: bytes=10-42`
+- **THEN** it returns status `206`
+- **AND** includes range response headers
+
+### Requirement: OLAP Engine Aggregates In Isolation
+The `system-faas-olap-engine` component SHALL execute bounded analytical aggregations inside its Wasm instance and return JSON results without loading the workload into core-host memory.
+
+#### Scenario: Grouped rows are aggregated
+- **WHEN** the OLAP engine receives rows with group and value fields
+- **THEN** it returns a grouped sum result as JSON
+

@@ -1,4 +1,4 @@
-package tachyon:observability-config@1.0.0;
+package tachyon:observability-config@1.1.0;
 
 interface config-observability {
     enum log-level {

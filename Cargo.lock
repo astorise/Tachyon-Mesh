@@ -533,6 +533,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq 0.4.2",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "core-host"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1170,6 +1184,7 @@ dependencies = [
  "async-trait",
  "axum",
  "aya",
+ "blake3",
  "bytes",
  "candle-core",
  "candle-nn",
@@ -1185,11 +1200,13 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lru",
  "memmap2",
  "mockall",
  "moka",
  "notify",
  "ort",
+ "prometheus",
  "proptest",
  "prost 0.14.3",
  "quinn",
@@ -2003,7 +2020,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
 name = "ebpf-probes"
-version = "1.0.0"
+version = "1.1.0-alpha"
 
 [[package]]
 name = "ecdsa"
@@ -2171,7 +2188,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
 name = "faas-sdk"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3833,7 +3850,7 @@ dependencies = [
 
 [[package]]
 name = "guest-ai"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -3842,25 +3859,25 @@ dependencies = [
 
 [[package]]
 name = "guest-call-legacy"
-version = "1.0.0"
+version = "1.1.0-alpha"
 
 [[package]]
 name = "guest-example"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-flaky"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-grpc"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "prost 0.13.5",
  "wit-bindgen 0.46.0",
@@ -3868,7 +3885,7 @@ dependencies = [
 
 [[package]]
 name = "guest-grpc-interop"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "prost 0.13.5",
  "wit-bindgen 0.57.1",
@@ -3876,37 +3893,37 @@ dependencies = [
 
 [[package]]
 name = "guest-log-storm"
-version = "1.0.0"
+version = "1.1.0-alpha"
 
 [[package]]
 name = "guest-loop"
-version = "1.0.0"
+version = "1.1.0-alpha"
 
 [[package]]
 name = "guest-malicious"
-version = "1.0.0"
+version = "1.1.0-alpha"
 
 [[package]]
 name = "guest-rag-vector"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-tcp-echo"
-version = "1.0.0"
+version = "1.1.0-alpha"
 
 [[package]]
 name = "guest-udp-echo"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-voip-gate"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -3915,14 +3932,14 @@ dependencies = [
 
 [[package]]
 name = "guest-volume"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-websocket-echo"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
@@ -4240,7 +4257,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4814,7 +4831,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "legacy-mock"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "anyhow",
  "axum",
@@ -4973,6 +4990,15 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+dependencies = [
+ "hashbrown 0.16.1",
+]
 
 [[package]]
 name = "lru-slab"
@@ -6205,6 +6231,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "protobuf",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "proptest"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6267,6 +6308,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "protobuf"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
+dependencies = [
+ "once_cell",
+ "protobuf-support",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf-support"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -7453,7 +7514,7 @@ checksum = "51d44cfb396c3caf6fbfd0ab422af02631b69ddd96d2eff0b0f0724f9024051b"
 
 [[package]]
 name = "smolvm"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "anyhow",
  "serde",
@@ -7763,7 +7824,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-authn"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -7778,14 +7839,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-authz"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-bridge"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -7794,7 +7855,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-buffer"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -7803,14 +7864,23 @@ dependencies = [
 
 [[package]]
 name = "system-faas-cdc"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
+name = "system-faas-cdc-broadcaster"
+version = "1.1.0-alpha"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "system-faas-cert-manager"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "rcgen",
  "serde",
@@ -7820,7 +7890,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-config-api"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -7829,7 +7899,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-dist-limiter"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -7838,7 +7908,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-enrollment"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -7851,18 +7921,18 @@ dependencies = [
 
 [[package]]
 name = "system-faas-gateway"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-gc"
-version = "1.0.0"
+version = "1.1.0-alpha"
 
 [[package]]
 name = "system-faas-gitops-broker"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "gix",
  "serde",
@@ -7872,7 +7942,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-gossip"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -7881,21 +7951,21 @@ dependencies = [
 
 [[package]]
 name = "system-faas-k8s-scaler"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-keda"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-logger"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -7903,8 +7973,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-faas-media-server"
+version = "1.1.0-alpha"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "system-faas-mesh-overlay"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "hex",
  "serde",
@@ -7915,7 +7992,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-metering"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde_json",
  "wit-bindgen 0.57.1",
@@ -7923,7 +8000,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-microvm-runner"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "anyhow",
  "serde",
@@ -7934,7 +8011,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-model-broker"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "hex",
  "serde",
@@ -7945,15 +8022,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-faas-olap-engine"
+version = "1.1.0-alpha"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "system-faas-openapi"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-otel"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -7962,14 +8048,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-prom"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-registry"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "hex",
  "serde",
@@ -7980,7 +8066,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-s3-proxy"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -7989,7 +8075,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-shadow-proxy"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "hex",
  "serde",
@@ -7999,8 +8085,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-faas-sql-engine"
+version = "1.1.0-alpha"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "system-faas-sqs"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -8009,14 +8104,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-storage-broker"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-tde"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "aes-gcm",
  "serde",
@@ -8026,7 +8121,25 @@ dependencies = [
 
 [[package]]
 name = "system-faas-tee-runtime"
-version = "1.0.0"
+version = "1.1.0-alpha"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "system-faas-vector-search"
+version = "1.1.0-alpha"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "system-faas-view-builder"
+version = "1.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -8051,7 +8164,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-client"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -8069,14 +8182,14 @@ dependencies = [
 
 [[package]]
 name = "tachyon-faas-sdk"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "tachyon-mcp"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "anyhow",
  "serde",
@@ -8088,7 +8201,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-ui"
-version = "1.0.0"
+version = "1.1.0-alpha"
 dependencies = [
  "iota_stronghold",
  "rand_core 0.6.4",
@@ -8957,7 +9070,7 @@ dependencies = [
 
 [[package]]
 name = "turboquant-sys"
-version = "1.0.0"
+version = "1.1.0-alpha"
 
 [[package]]
 name = "typed-path"

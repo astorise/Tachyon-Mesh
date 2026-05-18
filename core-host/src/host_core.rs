@@ -91,7 +91,10 @@ pub(crate) use std::{
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime},
 };
-pub(crate) use telemetry::{TelemetryEvent, TelemetryHandle, TelemetrySnapshot};
+pub(crate) use telemetry::{
+    push_custom_metric, CustomMetric, CustomMetricType, TelemetryEvent, TelemetryHandle,
+    TelemetrySnapshot,
+};
 #[cfg(unix)]
 pub(crate) use tokio::net::UnixListener;
 pub(crate) use tokio::sync::Mutex as TokioMutex;

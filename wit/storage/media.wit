@@ -1,0 +1,11 @@
+package tachyon:storage@1.1.0;
+
+interface media-stream {
+  type socket-handle = u32;
+
+  pipe-range-to-socket: func(file-id: string, start-byte: u64, end-byte: u64, out-socket: socket-handle) -> result<u64, string>;
+}
+
+world media-stream-host {
+  export media-stream;
+}

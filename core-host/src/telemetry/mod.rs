@@ -3,14 +3,36 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
     },
     time::Instant,
 };
 use tokio::sync::mpsc;
 
+/// Recover from a poisoned telemetry lock while leaving an audit trail. The lock
+/// is intentionally treated as recoverable (we would rather drop one inconsistent
+/// snapshot than wedge the request path) but every poison event SHALL be logged
+/// so silent corruption never goes unnoticed.
+fn recover_poisoned<'a, T>(
+    registry: &'static str,
+    result: Result<MutexGuard<'a, T>, PoisonError<MutexGuard<'a, T>>>,
+) -> MutexGuard<'a, T> {
+    match result {
+        Ok(guard) => guard,
+        Err(poison) => {
+            tracing::warn!(
+                target: "tachyon::telemetry",
+                registry = registry,
+                "telemetry registry mutex was poisoned; continuing with recovered guard"
+            );
+            poison.into_inner()
+        }
+    }
+}
+
 const TELEMETRY_CHANNEL_CAPACITY: usize = 10_000;
 const ERROR_STATUS_THRESHOLD: u16 = 400;
+const CUSTOM_METRIC_HELP: &str = "Custom Tachyon FaaS metric submitted through WIT telemetry.";
 
 #[derive(Clone)]
 pub(crate) struct TelemetryHandle {
@@ -62,6 +84,21 @@ pub(crate) enum TelemetryEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CustomMetricType {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CustomMetric {
+    pub(crate) name: String,
+    pub(crate) value: f64,
+    pub(crate) metric_type: CustomMetricType,
+    pub(crate) tags: Vec<(String, String)>,
+}
+
 #[derive(Default)]
 struct AggregatedMetrics {
     total_requests: u64,
@@ -96,11 +133,35 @@ struct CompletedRequest {
 
 type TelemetryEmitter = Arc<dyn Fn(String) -> bool + Send + Sync>;
 
+/// Strongly typed handle to a custom-metric Prometheus collector. We deliberately
+/// avoid `Box<dyn Any>` here so the registry can be read without unchecked
+/// downcasts — every collector exposes the same `record(value, labels)` API.
+#[derive(Clone)]
+enum CustomCollector {
+    Counter(prometheus::CounterVec),
+    Gauge(prometheus::GaugeVec),
+    Histogram(prometheus::HistogramVec),
+}
+
+impl CustomCollector {
+    #[cfg(feature = "experimental")]
+    fn metric_type(&self) -> CustomMetricType {
+        match self {
+            Self::Counter(_) => CustomMetricType::Counter,
+            Self::Gauge(_) => CustomMetricType::Gauge,
+            Self::Histogram(_) => CustomMetricType::Histogram,
+        }
+    }
+}
+
+static CUSTOM_METRICS: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
+static PROMETHEUS_COLLECTORS: OnceLock<Mutex<HashMap<String, CustomCollector>>> = OnceLock::new();
+
 pub(crate) struct ActiveRequestGuard {
     active_requests: Arc<AtomicUsize>,
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "experimental")]
 pub(crate) fn init_telemetry() -> TelemetryHandle {
     init_telemetry_with_emitter(|line| {
         println!("{line}");
@@ -131,6 +192,176 @@ pub(crate) fn active_requests(handle: &TelemetryHandle) -> usize {
 
 pub(crate) fn snapshot(handle: &TelemetryHandle) -> TelemetrySnapshot {
     handle.snapshot.snapshot()
+}
+
+pub(crate) fn push_custom_metric(metric: CustomMetric) -> Result<(), String> {
+    let normalized_name = normalize_metric_name(&metric.name)?;
+    let label_keys: Vec<String> = metric
+        .tags
+        .iter()
+        .map(|(key, _)| normalize_label_name(key))
+        .collect::<Result<_, _>>()?;
+    let label_key_refs: Vec<&str> = label_keys.iter().map(String::as_str).collect();
+    let label_values: Vec<&str> = metric
+        .tags
+        .iter()
+        .map(|(_, value)| value.as_str())
+        .collect();
+    let cache_key = collector_key(metric.metric_type, &normalized_name, &label_keys);
+    let collectors = PROMETHEUS_COLLECTORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut collectors = recover_poisoned("prometheus_collectors", collectors.lock());
+
+    match metric.metric_type {
+        CustomMetricType::Counter => {
+            let collector = match collectors.get(&cache_key) {
+                Some(CustomCollector::Counter(counter)) => counter.clone(),
+                Some(_) => {
+                    return Err(format!(
+                        "custom metric `{}` is already registered with a different type",
+                        metric.name
+                    ));
+                }
+                None => {
+                    let opts = prometheus::Opts::new(&normalized_name, CUSTOM_METRIC_HELP);
+                    let counter = prometheus::CounterVec::new(opts, &label_key_refs)
+                        .map_err(|error| error.to_string())?;
+                    register_collector(Box::new(counter.clone()))?;
+                    collectors.insert(cache_key.clone(), CustomCollector::Counter(counter.clone()));
+                    counter
+                }
+            };
+            collector
+                .with_label_values(&label_values)
+                .inc_by(metric.value.max(0.0));
+        }
+        CustomMetricType::Gauge => {
+            let collector = match collectors.get(&cache_key) {
+                Some(CustomCollector::Gauge(gauge)) => gauge.clone(),
+                Some(_) => {
+                    return Err(format!(
+                        "custom metric `{}` is already registered with a different type",
+                        metric.name
+                    ));
+                }
+                None => {
+                    let opts = prometheus::Opts::new(&normalized_name, CUSTOM_METRIC_HELP);
+                    let gauge = prometheus::GaugeVec::new(opts, &label_key_refs)
+                        .map_err(|error| error.to_string())?;
+                    register_collector(Box::new(gauge.clone()))?;
+                    collectors.insert(cache_key.clone(), CustomCollector::Gauge(gauge.clone()));
+                    gauge
+                }
+            };
+            collector.with_label_values(&label_values).set(metric.value);
+        }
+        CustomMetricType::Histogram => {
+            let collector = match collectors.get(&cache_key) {
+                Some(CustomCollector::Histogram(histogram)) => histogram.clone(),
+                Some(_) => {
+                    return Err(format!(
+                        "custom metric `{}` is already registered with a different type",
+                        metric.name
+                    ));
+                }
+                None => {
+                    let opts = prometheus::HistogramOpts::new(&normalized_name, CUSTOM_METRIC_HELP);
+                    let histogram = prometheus::HistogramVec::new(opts, &label_key_refs)
+                        .map_err(|error| error.to_string())?;
+                    register_collector(Box::new(histogram.clone()))?;
+                    collectors.insert(
+                        cache_key.clone(),
+                        CustomCollector::Histogram(histogram.clone()),
+                    );
+                    histogram
+                }
+            };
+            collector
+                .with_label_values(&label_values)
+                .observe(metric.value);
+        }
+    }
+    drop(collectors);
+
+    recover_poisoned(
+        "custom_metrics",
+        CUSTOM_METRICS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock(),
+    )
+    .insert(metric.name, metric.value);
+    Ok(())
+}
+
+pub(crate) fn custom_metric_value(name: &str) -> Option<f64> {
+    recover_poisoned(
+        "custom_metrics",
+        CUSTOM_METRICS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock(),
+    )
+    .get(name)
+    .copied()
+}
+
+fn register_collector(collector: Box<dyn prometheus::core::Collector>) -> Result<(), String> {
+    prometheus::default_registry()
+        .register(collector)
+        .map_err(|error| error.to_string())
+}
+
+fn collector_key(metric_type: CustomMetricType, name: &str, label_keys: &[String]) -> String {
+    format!("{metric_type:?}:{name}:{}", label_keys.join(","))
+}
+
+fn normalize_metric_name(name: &str) -> Result<String, String> {
+    let normalized = name
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    validate_prometheus_ident(&normalized, "metric name")?;
+    Ok(normalized)
+}
+
+fn normalize_label_name(name: &str) -> Result<String, String> {
+    let normalized = name
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    validate_prometheus_ident(&normalized, "label name")?;
+    Ok(normalized)
+}
+
+fn validate_prometheus_ident(value: &str, kind: &str) -> Result<(), String> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("{kind} must not be empty"));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_' || first == ':') {
+        return Err(format!(
+            "{kind} `{value}` must start with a letter, '_' or ':'"
+        ));
+    }
+    if chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':') {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind} `{value}` may only contain ASCII letters, digits, '_' or ':'"
+        ))
+    }
 }
 
 pub(crate) fn init_telemetry_with_emitter<F>(emitter: F) -> TelemetryHandle
@@ -249,18 +480,12 @@ impl Default for TelemetrySnapshotStore {
 
 impl TelemetrySnapshotStore {
     fn record_request_started(&self) {
-        let mut metrics = self
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metrics = recover_poisoned("telemetry_snapshot", self.metrics.lock());
         metrics.total_requests = metrics.total_requests.saturating_add(1);
     }
 
     fn record_request_completed(&self, completed: &CompletedRequest) {
-        let mut metrics = self
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metrics = recover_poisoned("telemetry_snapshot", self.metrics.lock());
 
         metrics.completed_requests = metrics.completed_requests.saturating_add(1);
         metrics.last_status = completed.status;
@@ -279,18 +504,12 @@ impl TelemetrySnapshotStore {
     }
 
     fn record_dropped_event(&self) {
-        let mut metrics = self
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut metrics = recover_poisoned("telemetry_snapshot", self.metrics.lock());
         metrics.dropped_events = metrics.dropped_events.saturating_add(1);
     }
 
     fn snapshot(&self) -> TelemetrySnapshot {
-        let metrics = self
-            .metrics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let metrics = recover_poisoned("telemetry_snapshot", self.metrics.lock());
 
         TelemetrySnapshot {
             total_requests: metrics.total_requests,
@@ -505,5 +724,31 @@ mod tests {
         }
 
         assert_eq!(active_requests(&telemetry), 0);
+    }
+
+    #[test]
+    fn custom_metric_push_tracks_latest_value() {
+        push_custom_metric(CustomMetric {
+            name: "checkout.conversion".to_owned(),
+            value: 0.12,
+            metric_type: CustomMetricType::Gauge,
+            tags: vec![("route".to_owned(), "/shop".to_owned())],
+        })
+        .expect("custom gauge should be accepted");
+
+        assert_eq!(custom_metric_value("checkout.conversion"), Some(0.12));
+    }
+
+    #[test]
+    fn invalid_metric_names_are_rejected() {
+        let error = push_custom_metric(CustomMetric {
+            name: "123-invalid".to_owned(),
+            value: 1.0,
+            metric_type: CustomMetricType::Counter,
+            tags: vec![],
+        })
+        .expect_err("invalid metric name should fail");
+
+        assert!(error.contains("metric name"));
     }
 }

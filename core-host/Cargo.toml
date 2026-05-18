@@ -1,12 +1,16 @@
 [package]
 name = "core-host"
-version = "1.0.0"
+version = "1.1.0-alpha"
 edition = "2021"
 
 [features]
 default = ["ring"]
-ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
+ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:lru", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
 ebpf-loader = ["dep:aya"]
+# `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
+# VRAM helpers, BaaS scratch tables) so they are excluded from the default build but
+# can still be exercised by integration tests or future wiring work.
+experimental = []
 fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
 mtls = []
@@ -22,6 +26,7 @@ anyhow = "1"
 async-trait = "0.1"
 arc-swap = "1.7"
 axum = "0.8"
+blake3 = "1.5"
 bytes = "1.5"
 candle-core = { version = "0.10.0", optional = true }
 candle-nn = { version = "0.10.0", optional = true }
@@ -40,7 +45,9 @@ hex = "0.4"
 http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio", "http1", "http2"] }
+lru = { version = "0.16", optional = true }
 ort = { version = "=2.0.0-rc.10", optional = true, default-features = false }
+prometheus = "0.14"
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
