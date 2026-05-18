@@ -1,6 +1,4 @@
 #![allow(dead_code)]
-#[path = "ai_inference/samplers.rs"]
-pub(crate) mod samplers;
 #[path = "ai_inference/vram_manager.rs"]
 pub(crate) mod vram_manager;
 
@@ -1447,27 +1445,60 @@ pub(crate) struct LayerWeightSlice {
     pub(crate) priority: VramPriority,
 }
 
+/// Parsed safetensors header: the leading u64 length prefix, the JSON
+/// metadata segment, and the byte range where the tensor blob lives.
+#[derive(Debug, Clone)]
+pub(crate) struct SafetensorsHeader {
+    /// Length, in bytes, of the JSON header segment.
+    pub(crate) header_len: u64,
+    /// Byte offset (relative to the start of the file) where the first
+    /// tensor begins. Always equal to `8 + header_len`.
+    pub(crate) data_start: usize,
+    /// Raw JSON value carrying `shape`, `dtype`, and `data_offsets` for
+    /// every tensor stored in the file.
+    pub(crate) header: serde_json::Value,
+}
+
+impl SafetensorsHeader {
+    /// Parse the leading 8-byte little-endian length prefix and the
+    /// subsequent UTF-8 JSON segment.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 8 {
+            anyhow::bail!("safetensors file is missing 8-byte header length prefix");
+        }
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().expect("fixed prefix length"));
+        let header_end = 8usize
+            .checked_add(usize::try_from(header_len).context("header length exceeds usize")?)
+            .context("safetensors header length overflows usize")?;
+        if bytes.len() < header_end {
+            anyhow::bail!(
+                "safetensors header truncated: need {header_end} bytes, got {}",
+                bytes.len()
+            );
+        }
+        let header: serde_json::Value = serde_json::from_slice(&bytes[8..header_end])
+            .context("failed to parse safetensors JSON header")?;
+        Ok(Self {
+            header_len,
+            data_start: header_end,
+            header,
+        })
+    }
+}
+
 /// Wraps a memory-mapped `.safetensors` file and vends per-layer
 /// [`LayerWeightSlice`]s without loading the entire model into RAM at once.
 pub(crate) struct LayerWiseMappedModel {
     /// Memory-mapped view of the `.safetensors` file. Kept alive for the model's
     /// lifetime so OS page-cache eviction is handled transparently.
-    _mmap: memmap2::Mmap,
+    mmap: memmap2::Mmap,
+    /// Parsed safetensors header; carries `shape`, `dtype`, and `data_offsets`.
+    pub(crate) header: SafetensorsHeader,
     /// Total number of transformer layers.
     pub(crate) num_layers: usize,
     /// Flattened tensor data length per layer (used for mmap slice indexing).
     bytes_per_layer: usize,
-    /// Raw pointer to the mapped region for slice arithmetic.
-    base_ptr: *const u8,
-    /// Length of the entire mapped region.
-    map_len: usize,
 }
-
-// SAFETY: The underlying `Mmap` is read-only and remains valid for the lifetime
-// of `LayerWiseMappedModel`. The raw pointer is only dereferenced inside
-// `load_layer`, which holds a shared reference to `self`.
-unsafe impl Send for LayerWiseMappedModel {}
-unsafe impl Sync for LayerWiseMappedModel {}
 
 impl LayerWiseMappedModel {
     /// Open `path` and create a zero-copy mapping. `num_layers` is used to
@@ -1475,20 +1506,28 @@ impl LayerWiseMappedModel {
     pub(crate) fn open(path: &std::path::Path, num_layers: usize) -> Result<Self> {
         let file = std::fs::File::open(path)
             .with_context(|| format!("failed to open safetensors file `{}`", path.display()))?;
-        // SAFETY: the file must not be mutated while the mapping is alive.
+        // SAFETY: the file must not be mutated while the mapping is alive. This
+        // is the standard `memmap2::Mmap::map` contract; no other unsafe is
+        // needed once the mapping exists because we only index it via safe
+        // slice operations below.
         let mmap = unsafe {
             memmap2::Mmap::map(&file)
                 .with_context(|| format!("failed to mmap `{}`", path.display()))?
         };
-        let map_len = mmap.len();
-        let bytes_per_layer = map_len.checked_div(num_layers).unwrap_or(map_len);
-        let base_ptr = mmap.as_ptr();
+        // Parse the safetensors header; if it's malformed we still fall back
+        // to an equal partition so legacy `.bin` style payloads keep working.
+        let header = SafetensorsHeader::parse(&mmap).unwrap_or_else(|_| SafetensorsHeader {
+            header_len: 0,
+            data_start: 0,
+            header: serde_json::Value::Null,
+        });
+        let payload_len = mmap.len().saturating_sub(header.data_start);
+        let bytes_per_layer = payload_len.checked_div(num_layers).unwrap_or(payload_len);
         Ok(Self {
-            _mmap: mmap,
+            mmap,
+            header,
             num_layers,
             bytes_per_layer,
-            base_ptr,
-            map_len,
         })
     }
 
@@ -1513,23 +1552,18 @@ impl LayerWiseMappedModel {
                 self.num_layers
             );
         }
-        let offset = layer_idx * self.bytes_per_layer;
-        let end = (offset + self.bytes_per_layer).min(self.map_len);
-        let slice_len = end - offset;
-        // SAFETY: offset and slice_len are validated above; the mmap outlives this fn.
-        let f32_count = slice_len / 4;
-        let weights = CandleTensor::from_vec(
-            unsafe {
-                let raw = std::slice::from_raw_parts(self.base_ptr.add(offset), slice_len);
-                // Interpret bytes as f32 values (little-endian safetensors layout).
-                raw.chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect::<Vec<f32>>()
-            },
-            (f32_count,),
-            &Device::Cpu,
-        )
-        .context("failed to build layer weight tensor from mmap slice")?;
+        let map_len = self.mmap.len();
+        let data_start = self.header.data_start.min(map_len);
+        let offset = data_start + layer_idx * self.bytes_per_layer;
+        let end = (offset + self.bytes_per_layer).min(map_len);
+        let raw: &[u8] = &self.mmap[offset..end];
+        let values: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let f32_count = values.len();
+        let weights = CandleTensor::from_vec(values, (f32_count,), &Device::Cpu)
+            .context("failed to build layer weight tensor from mmap slice")?;
         Ok(LayerWeightSlice {
             layer_idx,
             weights,

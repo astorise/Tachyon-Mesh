@@ -10,7 +10,6 @@ use h3::{quic::SendStream, server::RequestResolver};
 use http_body_util::BodyExt;
 use quinn::crypto::rustls::QuicServerConfig;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read},
@@ -393,13 +392,13 @@ pub(crate) fn safetensors_chunks(
 }
 
 #[allow(dead_code)]
-pub(crate) fn verify_safetensors_sha256(
+pub(crate) fn verify_safetensors_blake3(
     path: impl AsRef<Path>,
     expected_hex: &str,
 ) -> Result<bool> {
     let mut file = File::open(path.as_ref())
         .with_context(|| format!("failed to open `{}`", path.as_ref().display()))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
@@ -408,8 +407,8 @@ pub(crate) fn verify_safetensors_sha256(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual = hex::encode(hasher.finalize());
-    Ok(actual.eq_ignore_ascii_case(expected_hex))
+    let actual = hasher.finalize().to_hex();
+    Ok(actual.as_str().eq_ignore_ascii_case(expected_hex))
 }
 
 #[cfg(test)]
@@ -465,10 +464,10 @@ mod tests {
     fn safetensors_hash_verifies_reconstructed_file() {
         let path = unique_test_path("hash.safetensors");
         std::fs::write(&path, b"tensor-bytes").expect("test file should write");
-        let expected = hex::encode(Sha256::digest(b"tensor-bytes"));
+        let expected = blake3::hash(b"tensor-bytes").to_hex().to_string();
 
-        assert!(verify_safetensors_sha256(&path, &expected).expect("hash should verify"));
-        assert!(!verify_safetensors_sha256(&path, "00").expect("hash should fail cleanly"));
+        assert!(verify_safetensors_blake3(&path, &expected).expect("hash should verify"));
+        assert!(!verify_safetensors_blake3(&path, "00").expect("hash should fail cleanly"));
         std::fs::remove_file(path).ok();
     }
 

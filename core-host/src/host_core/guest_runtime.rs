@@ -323,6 +323,16 @@ pub(crate) fn execute_component_guest(
             "failed to add training functions to component linker",
         )
     })?;
+    component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add custom-metrics functions to component linker",
+        )
+    })?;
     #[cfg(feature = "ai-inference")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,
@@ -748,6 +758,16 @@ pub(crate) fn execute_system_component_guest(
             "failed to add telemetry reader functions to system component linker",
         )
     })?;
+    control_plane_component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add custom-metrics functions to system component linker",
+        )
+    })?;
     control_plane_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
         ComponentHostState,
         ComponentHostState,
@@ -958,6 +978,16 @@ impl BackgroundTickRunner {
             guest_execution_error(
                 error,
                 "failed to add telemetry reader functions to background component linker",
+            )
+        })?;
+        background_component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(&mut linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to add custom-metrics functions to background component linker",
             )
         })?;
         background_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<

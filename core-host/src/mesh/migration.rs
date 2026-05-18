@@ -6,6 +6,7 @@ use std::{
 const DEFAULT_REMOTE_RATIO: u64 = 10;
 const DEFAULT_MIN_REMOTE_HITS: u64 = 1_000;
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(300);
+const MAX_TRACKED_SUBSPACE_PEERS: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GeoMigrationPlan {
@@ -58,10 +59,14 @@ impl SubspaceAccessTracker {
         key_prefix: &str,
         requesting_peer: &str,
     ) -> Option<GeoMigrationPlan> {
-        *self
-            .counts
-            .entry((key_prefix.to_owned(), requesting_peer.to_owned()))
-            .or_default() += 1;
+        let key = (key_prefix.to_owned(), requesting_peer.to_owned());
+        if !self.counts.contains_key(&key) && self.counts.len() >= MAX_TRACKED_SUBSPACE_PEERS {
+            // Bound the tracker to keep memory predictable under adversarial peer fan-out.
+            // Drop the request rather than evicting unrelated samples so cooldowns remain
+            // accurate for the keys we already track.
+            return None;
+        }
+        *self.counts.entry(key).or_default() += 1;
         self.evaluate_migration(key_prefix, requesting_peer, Instant::now())
     }
 

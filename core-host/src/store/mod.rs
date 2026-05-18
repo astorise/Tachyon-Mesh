@@ -117,14 +117,38 @@ pub(crate) fn should_compress_blob(header: &[u8]) -> bool {
 
 #[allow(dead_code)]
 pub(crate) fn pipe_range_from_file(path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
+    pipe_range_from_file_in_root(None, path, start, end)
+}
+
+#[allow(dead_code)]
+pub(crate) fn pipe_range_from_file_in_root(
+    root: Option<&Path>,
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>> {
     if end < start {
         anyhow::bail!("invalid media range: end before start");
     }
-    let file = fs::File::open(path)
-        .with_context(|| format!("failed to open media blob `{}`", path.display()))?;
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize media path `{}`", path.display()))?;
+    if let Some(root) = root {
+        let canonical_root = fs::canonicalize(root).with_context(|| {
+            format!("failed to canonicalize media root `{}`", root.display())
+        })?;
+        if !canonical.starts_with(&canonical_root) {
+            anyhow::bail!(
+                "media path `{}` escapes allowed root `{}`",
+                canonical.display(),
+                canonical_root.display()
+            );
+        }
+    }
+    let file = fs::File::open(&canonical)
+        .with_context(|| format!("failed to open media blob `{}`", canonical.display()))?;
     let mmap = unsafe {
         memmap2::Mmap::map(&file)
-            .with_context(|| format!("failed to mmap media blob `{}`", path.display()))?
+            .with_context(|| format!("failed to mmap media blob `{}`", canonical.display()))?
     };
     let file_len = mmap.len() as u64;
     if start >= file_len {

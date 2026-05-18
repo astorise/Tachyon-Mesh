@@ -557,6 +557,16 @@ pub(crate) fn prewarm_system_component_instance(
             "failed to add telemetry reader functions to prewarm system component linker",
         )
     })?;
+    control_plane_component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add custom-metrics functions to prewarm system component linker",
+        )
+    })?;
     control_plane_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
         ComponentHostState,
         ComponentHostState,

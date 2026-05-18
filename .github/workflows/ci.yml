@@ -39,6 +39,10 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      # Refuse to merge isolated stubs introduced under `#[allow(dead_code)]`.
+      # Existing `#[allow(dead_code)]` annotations are still honored per-item;
+      # this flag fails the build on *new* unannotated dead symbols.
+      RUSTFLAGS: "-D dead_code"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -165,6 +169,7 @@ jobs:
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
       CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D dead_code"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
