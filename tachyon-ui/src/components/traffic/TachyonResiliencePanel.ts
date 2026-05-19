@@ -1,6 +1,7 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import "../base/TachyonPolicyFormBadge";
 
 export class TachyonResiliencePanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
@@ -20,7 +21,10 @@ export class TachyonResiliencePanel extends TachyonConfigDashboard {
     this.renderTemplate(`
       <section class="p-6 space-y-6 text-slate-300">
         <div data-stagger-panel class="border-l-4 border-cyan-500 pl-4">
-          <h2 class="text-2xl font-bold text-slate-100">${t("resilience.title")}</h2>
+          <div class="flex items-baseline gap-2">
+            <h2 class="text-2xl font-bold text-slate-100">${t("resilience.title")}</h2>
+            <tachyon-policy-form-badge></tachyon-policy-form-badge>
+          </div>
           <p class="text-slate-400 text-sm font-mono">${t("resilience.subtitle")}</p>
         </div>
 
