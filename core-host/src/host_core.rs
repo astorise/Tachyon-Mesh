@@ -33,7 +33,7 @@ pub(crate) use crate::state::{
 pub(crate) use crate::websocket_component_bindings;
 pub(crate) use crate::{
     auth, background_component_bindings, component_bindings, control_plane_component_bindings,
-    data_events, memory_governor, network, node_enrollment, store, system_component_bindings,
+    data_events, memory_governor, network, store, system_component_bindings,
     system_storage, telemetry, tls_runtime, udp_component_bindings,
 };
 

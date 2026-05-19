@@ -39,6 +39,9 @@ const EXPECTED_HASH_HEADER: &str = "x-tachyon-expected-sha256";
 const ADMIN_MODEL_INIT_PATH: &str = "/admin/models/init";
 const ADMIN_MODEL_UPLOAD_PATH: &str = "/admin/models/upload";
 const ADMIN_MODEL_COMMIT_PATH: &str = "/admin/models/commit";
+const ADMIN_NODES_PATH: &str = "/admin/nodes";
+const ADMIN_SYSTEMS_REGISTERED_PATH: &str = "/admin/systems/registered";
+const ADMIN_SYSTEMS_DEPLOYED_PATH: &str = "/admin/systems/deployed";
 const MODEL_CHUNK_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -402,7 +405,7 @@ pub struct MeshResourceInput {
     pub version_constraint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuStats {
     pub id: String,
@@ -410,6 +413,74 @@ pub struct GpuStats {
     pub vram_total_mb: u64,
     pub vram_used_mb: u64,
     pub compute_utilization: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSystem {
+    pub slug: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeCapabilities {
+    pub total_ram_mb: u64,
+    pub available_ram_mb: u64,
+    pub accelerators: Vec<String>,
+    pub gpus: Vec<GpuStats>,
+    pub active_systems: Vec<ActiveSystem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrolledNode {
+    pub node_id: String,
+    pub public_key: String,
+    pub status: String,
+    pub approved_at: u64,
+    pub last_seen: u64,
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    pub capabilities: NodeCapabilities,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredSystem {
+    pub slug: String,
+    pub crate_name: String,
+    pub version: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployedSystemNode {
+    pub node_id: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployedSystem {
+    pub slug: String,
+    pub catalog_version: String,
+    pub status: String,
+    pub host_node_count: usize,
+    pub has_drift: bool,
+    pub nodes: Vec<DeployedSystemNode>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterHardwareSummary {
+    pub source: String,
+    pub enrolled_count: usize,
+    pub online_count: usize,
+    pub stale_count: usize,
+    pub total_ram_mb: u64,
+    pub gpu_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -739,6 +810,67 @@ pub async fn get_mesh_graph() -> Result<MeshGraphSnapshot> {
             .iter()
             .filter_map(batch_target_name)
             .collect(),
+    })
+}
+
+pub async fn list_enrolled_nodes() -> Result<Vec<EnrolledNode>> {
+    match get_admin_json::<Vec<EnrolledNode>>(ADMIN_NODES_PATH).await {
+        Ok(nodes) => Ok(nodes),
+        Err(error) if current_connection().is_none() || error.to_string().contains("no active") => {
+            Ok(Vec::new())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn get_node_capabilities(node_id: &str) -> Result<NodeCapabilities> {
+    let nodes = list_enrolled_nodes().await?;
+    Ok(nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .map(|node| node.capabilities)
+        .unwrap_or_default())
+}
+
+pub async fn list_registered_systems() -> Result<Vec<RegisteredSystem>> {
+    match get_admin_json::<Vec<RegisteredSystem>>(ADMIN_SYSTEMS_REGISTERED_PATH).await {
+        Ok(systems) => Ok(systems),
+        Err(error) if current_connection().is_none() || error.to_string().contains("no active") => {
+            Ok(read_local_system_manifest())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn list_deployed_systems() -> Result<Vec<DeployedSystem>> {
+    match get_admin_json::<Vec<DeployedSystem>>(ADMIN_SYSTEMS_DEPLOYED_PATH).await {
+        Ok(systems) => Ok(systems),
+        Err(error) if current_connection().is_none() || error.to_string().contains("no active") => {
+            let nodes = list_enrolled_nodes().await.unwrap_or_default();
+            let registered = read_local_system_manifest();
+            Ok(registered
+                .into_iter()
+                .map(|system| deployed_system_from_nodes(&system, &nodes))
+                .collect())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn get_cluster_hardware_summary() -> Result<ClusterHardwareSummary> {
+    let nodes = list_enrolled_nodes().await?;
+    Ok(ClusterHardwareSummary {
+        source: current_connection()
+            .map(|config| config.url)
+            .unwrap_or_else(|| "offline".to_owned()),
+        enrolled_count: nodes.len(),
+        online_count: nodes.iter().filter(|node| node.status == "online").count(),
+        stale_count: nodes.iter().filter(|node| node.status == "stale").count(),
+        total_ram_mb: nodes
+            .iter()
+            .map(|node| node.capabilities.total_ram_mb)
+            .sum(),
+        gpu_count: nodes.iter().map(|node| node.capabilities.gpus.len()).sum(),
     })
 }
 
@@ -2631,6 +2763,78 @@ fn batch_target_name(batch_target: &serde_json::Value) -> Option<String> {
         .get("name")
         .and_then(|value| value.as_str())
         .map(str::to_owned)
+}
+
+fn read_local_system_manifest() -> Vec<RegisteredSystem> {
+    let path = workspace_root().join("systems").join("manifest.toml");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_system_manifest(&raw)
+}
+
+fn parse_system_manifest(raw: &str) -> Vec<RegisteredSystem> {
+    let mut systems = Vec::new();
+    let mut current = RegisteredSystem::default();
+    let mut in_entry = false;
+    for line in raw.lines().map(str::trim) {
+        if line == "[[system]]" {
+            if in_entry {
+                systems.push(current);
+                current = RegisteredSystem::default();
+            }
+            in_entry = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_owned();
+        match key.trim() {
+            "slug" => current.slug = value,
+            "crate_name" => current.crate_name = value,
+            "version" => current.version = value,
+            "description" => current.description = value,
+            _ => {}
+        }
+    }
+    if in_entry {
+        systems.push(current);
+    }
+    systems
+}
+
+fn deployed_system_from_nodes(system: &RegisteredSystem, nodes: &[EnrolledNode]) -> DeployedSystem {
+    let deployed_nodes = nodes
+        .iter()
+        .flat_map(|node| {
+            node.capabilities
+                .active_systems
+                .iter()
+                .filter(move |active| active.slug == system.slug)
+                .map(move |active| DeployedSystemNode {
+                    node_id: node.node_id.clone(),
+                    version: active.version.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let has_drift = deployed_nodes
+        .iter()
+        .any(|node| node.version != system.version);
+    DeployedSystem {
+        slug: system.slug.clone(),
+        catalog_version: system.version.clone(),
+        status: if deployed_nodes.is_empty() {
+            "not-deployed".to_owned()
+        } else if has_drift {
+            "version-drift".to_owned()
+        } else {
+            "deployed".to_owned()
+        },
+        host_node_count: deployed_nodes.len(),
+        has_drift,
+        nodes: deployed_nodes,
+    }
 }
 
 async fn fetch_remote_status(config: &InstanceConfig) -> Result<String> {

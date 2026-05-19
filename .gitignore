@@ -8,7 +8,7 @@
 tachyon-ui/dist/
 .codex-tmp/*
 .vscode/*
-
+.artifacts/*
 artifacts/*
 
 # Local runtime artifacts; never committed.

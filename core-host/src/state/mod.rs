@@ -71,7 +71,6 @@ pub(crate) struct AppState {
     pub(crate) mtls_gateway: Option<Arc<tls_runtime::MtlsGatewayConfig>>,
     pub(crate) auth_manager: Arc<auth::AuthManager>,
     pub(crate) iam_audit_log: crate::iam_audit::IamAuditLog,
-    pub(crate) enrollment_manager: Arc<node_enrollment::EnrollmentManager>,
     pub(crate) config_updates: broadcast::Sender<ConfigUpdate>,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     pub(crate) manifest_path: PathBuf,

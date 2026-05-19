@@ -532,6 +532,18 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                     "name": "Local hardware status",
                     "description": "Current local RAM and accelerator availability for sizing Tachyon FaaS manifests.",
                     "mimeType": "application/json"
+                },
+                {
+                    "uri": "hardware://mesh/cluster",
+                    "name": "Mesh hardware summary",
+                    "description": "Cluster-level enrolled-node, RAM, and GPU summary from the Tachyon node registry.",
+                    "mimeType": "application/json"
+                },
+                {
+                    "uri": "hardware://mesh/{node_id}/status",
+                    "name": "Mesh node hardware status",
+                    "description": "Per-node capabilities and GPU status from the Tachyon node registry. Replace {node_id} with an enrolled node id.",
+                    "mimeType": "application/json"
                 }
             ]
         }),
@@ -541,21 +553,34 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 .and_then(|value| value.get("uri"))
                 .and_then(Value::as_str)
                 .context("missing resource uri")?;
-            if uri != "hardware://local/status" {
+            let text = if uri == "hardware://local/status" {
+                let status =
+                    tokio::task::spawn_blocking(tachyon_client::read_local_hardware_status)
+                        .await
+                        .context("hardware status task panicked")?;
+                serde_json::to_string_pretty(&status)?
+            } else if uri == "hardware://mesh/cluster" {
+                let summary = tachyon_client::get_cluster_hardware_summary().await?;
+                serde_json::to_string_pretty(&summary)?
+            } else if let Some(node_id) = uri
+                .strip_prefix("hardware://mesh/")
+                .and_then(|value| value.strip_suffix("/status"))
+                .filter(|value| !value.trim().is_empty() && *value != "{node_id}")
+            {
+                let capabilities = tachyon_client::get_node_capabilities(node_id).await?;
+                serde_json::to_string_pretty(&capabilities)?
+            } else {
                 return Ok(Some(json_rpc_error_response(
                     id,
                     &JsonRpcError::invalid_params("unsupported resource", json!({ "uri": uri })),
                 )));
-            }
-            let status = tokio::task::spawn_blocking(tachyon_client::read_local_hardware_status)
-                .await
-                .context("hardware status task panicked")?;
+            };
             json!({
                 "contents": [
                     {
                         "uri": uri,
                         "mimeType": "application/json",
-                        "text": serde_json::to_string_pretty(&status)?
+                        "text": text
                     }
                 ]
             })

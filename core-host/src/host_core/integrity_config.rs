@@ -126,7 +126,7 @@ pub(crate) fn is_integrity_schema_violation(error: &anyhow::Error) -> bool {
     error.to_string().contains(ERR_INTEGRITY_SCHEMA_VIOLATION)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminEnrollmentStartRequest {
     pub(crate) node_public_key: String,
@@ -139,7 +139,7 @@ pub(crate) struct AdminEnrollmentStartResponse {
     pub(crate) pin: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminEnrollmentApproveRequest {
     pub(crate) session_id: String,
@@ -160,16 +160,21 @@ pub(crate) async fn admin_enrollment_start_handler(
     State(state): State<AppState>,
     axum::Json(payload): axum::Json<AdminEnrollmentStartRequest>,
 ) -> Response {
-    let node_pubkey = payload.node_public_key.trim().to_owned();
-    if node_pubkey.is_empty() {
+    if payload.node_public_key.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "nodePublicKey is required").into_response();
     }
-    let session = state.enrollment_manager.start_session(node_pubkey);
-    let body = AdminEnrollmentStartResponse {
-        session_id: session.session_id,
-        pin: session.pin,
-    };
-    (StatusCode::CREATED, axum::Json(body)).into_response()
+    match serde_json::to_vec(&payload) {
+        Ok(body) => {
+            forward_node_registry_faas(
+                state,
+                "POST",
+                "/admin/enrollment/start".to_owned(),
+                Bytes::from(body),
+            )
+            .await
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
 }
 
 /// `POST /admin/enrollment/approve` — operator-driven approval entered via
@@ -179,25 +184,17 @@ pub(crate) async fn admin_enrollment_approve_handler(
     State(state): State<AppState>,
     axum::Json(payload): axum::Json<AdminEnrollmentApproveRequest>,
 ) -> Response {
-    let cert_bytes = match hex::decode(&payload.signed_certificate_hex) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("signedCertificateHex must be valid hex: {error}"),
+    match serde_json::to_vec(&payload) {
+        Ok(body) => {
+            forward_node_registry_faas(
+                state,
+                "POST",
+                "/admin/enrollment/approve".to_owned(),
+                Bytes::from(body),
             )
-                .into_response();
+            .await
         }
-    };
-    match state
-        .enrollment_manager
-        .approve(&payload.session_id, &payload.pin, cert_bytes)
-    {
-        Ok(()) => (StatusCode::ACCEPTED, "enrollment approved").into_response(),
-        Err(reason) => {
-            // PIN mismatch / unknown / already-finalized are all caller errors.
-            (StatusCode::BAD_REQUEST, reason).into_response()
-        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
@@ -208,14 +205,350 @@ pub(crate) async fn admin_enrollment_poll_handler(
     State(state): State<AppState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> Response {
-    match state.enrollment_manager.poll_outcome(&session_id) {
-        None => StatusCode::NO_CONTENT.into_response(),
-        Some(node_enrollment::EnrollmentOutcome::Approved { signed_certificate }) => {
-            (StatusCode::OK, hex::encode(signed_certificate)).into_response()
+    forward_node_registry_faas(
+        state,
+        "GET",
+        format!("/admin/enrollment/poll/{session_id}"),
+        Bytes::new(),
+    )
+    .await
+}
+
+async fn forward_node_registry_faas(
+    state: AppState,
+    method: &'static str,
+    uri: String,
+    body: Bytes,
+) -> Response {
+    let runtime = state.runtime.load_full();
+    let engine = runtime.engine.clone();
+    let config = runtime.config.clone();
+    let route = IntegrityRoute {
+        path: "/admin/node-registry".to_owned(),
+        role: RouteRole::System,
+        name: "system-faas-node-registry".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        ..IntegrityRoute::default()
+    };
+    let request = GuestRequest::new(method, uri.clone(), body);
+    let runtime_telemetry = state.telemetry.clone();
+    let async_log_sender = state.async_log_sender.clone();
+    let host_identity = Arc::clone(&state.host_identity);
+    let storage_broker = Arc::clone(&state.storage_broker);
+    let bridge_manager = Arc::clone(&state.bridge_manager);
+    let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+    let route_overrides = Arc::clone(&state.route_overrides);
+    let host_load = Arc::clone(&state.host_load);
+    let instance_pool = Arc::clone(&runtime.instance_pool);
+    #[cfg(feature = "ai-inference")]
+    let ai_runtime = Arc::clone(&runtime.ai_runtime);
+
+    let result = tokio::task::spawn_blocking(move || {
+        execute_guest(
+            &engine,
+            "system-faas-node-registry",
+            request,
+            &route,
+            GuestExecutionContext {
+                config,
+                sampled_execution: false,
+                runtime_telemetry,
+                async_log_sender,
+                secret_access: SecretAccess::default(),
+                request_headers: HeaderMap::new(),
+                host_identity,
+                storage_broker,
+                bridge_manager,
+                telemetry: None,
+                concurrency_limits,
+                propagated_headers: Vec::new(),
+                route_overrides,
+                host_load,
+                #[cfg(feature = "ai-inference")]
+                ai_runtime,
+                instance_pool: Some(instance_pool),
+            },
+        )
+    })
+    .await;
+
+    let outcome = match result {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            error.log_if_needed("system-faas-node-registry");
+            let (status, message) = error.into_response(&runtime.config);
+            return (status, message).into_response();
         }
-        Some(node_enrollment::EnrollmentOutcome::Rejected { reason }) => {
-            (StatusCode::GONE, reason).into_response()
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("node registry FaaS task failed: {error}"),
+            )
+                .into_response();
         }
+    };
+
+    match outcome.output {
+        GuestExecutionOutput::Http(response) => guest_http_response_into_axum(response),
+        GuestExecutionOutput::LegacyStdout(stdout) => (StatusCode::OK, stdout).into_response(),
+    }
+}
+
+fn guest_http_response_into_axum(response: GuestHttpResponse) -> Response {
+    let mut builder = Response::builder().status(response.status);
+    for (name, value) in response.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(axum::body::Body::from(response.body))
+        .unwrap_or_else(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build node registry FaaS response: {error}"),
+            )
+                .into_response()
+        })
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RegistryGpuStats {
+    pub(crate) id: String,
+    pub(crate) model: String,
+    pub(crate) vram_total_mb: u64,
+    pub(crate) vram_used_mb: u64,
+    pub(crate) compute_utilization: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RegistryActiveSystem {
+    pub(crate) slug: String,
+    pub(crate) version: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RegistryNodeCapabilities {
+    pub(crate) total_ram_mb: u64,
+    pub(crate) available_ram_mb: u64,
+    pub(crate) accelerators: Vec<String>,
+    pub(crate) gpus: Vec<RegistryGpuStats>,
+    pub(crate) active_systems: Vec<RegistryActiveSystem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RegistryEnrolledNode {
+    pub(crate) node_id: String,
+    pub(crate) public_key: String,
+    pub(crate) status: String,
+    pub(crate) approved_at: u64,
+    pub(crate) last_seen: u64,
+    pub(crate) region: Option<String>,
+    pub(crate) zone: Option<String>,
+    pub(crate) capabilities: RegistryNodeCapabilities,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RegistrySystem {
+    pub(crate) slug: String,
+    pub(crate) crate_name: String,
+    pub(crate) version: String,
+    pub(crate) description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RegistryDeployedSystem {
+    pub(crate) slug: String,
+    pub(crate) catalog_version: String,
+    pub(crate) status: String,
+    pub(crate) host_node_count: usize,
+    pub(crate) has_drift: bool,
+    pub(crate) nodes: Vec<RegistryActiveSystemNode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RegistryActiveSystemNode {
+    pub(crate) node_id: String,
+    pub(crate) version: String,
+}
+
+pub(crate) async fn admin_nodes_handler(State(state): State<AppState>) -> Response {
+    match list_registry_nodes(&state.core_store) {
+        Ok(nodes) => (StatusCode::OK, axum::Json(nodes)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+pub(crate) async fn admin_node_capabilities_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(node_id): axum::extract::Path<String>,
+    axum::Json(capabilities): axum::Json<RegistryNodeCapabilities>,
+) -> Response {
+    let mut node = match state.core_store.kv_partition_get("node-registry", &node_id) {
+        Ok(Some(raw)) => {
+            serde_json::from_slice::<RegistryEnrolledNode>(&raw).unwrap_or_else(|_| {
+                RegistryEnrolledNode {
+                    node_id: node_id.clone(),
+                    public_key: String::new(),
+                    status: "awaiting-capabilities".to_owned(),
+                    ..RegistryEnrolledNode::default()
+                }
+            })
+        }
+        Ok(None) => RegistryEnrolledNode {
+            node_id: node_id.clone(),
+            public_key: String::new(),
+            status: "awaiting-capabilities".to_owned(),
+            ..RegistryEnrolledNode::default()
+        },
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    node.capabilities = capabilities;
+    node.status = "online".to_owned();
+    node.last_seen = current_unix_seconds();
+    let payload = match serde_json::to_vec(&node) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    match state
+        .core_store
+        .kv_partition_set("node-registry", &node_id, &payload)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+pub(crate) async fn admin_registered_systems_handler() -> Response {
+    (StatusCode::OK, axum::Json(read_system_manifest())).into_response()
+}
+
+pub(crate) async fn admin_deployed_systems_handler(State(state): State<AppState>) -> Response {
+    let nodes = match list_registry_nodes(&state.core_store) {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let systems = read_system_manifest()
+        .into_iter()
+        .map(|system| deployed_system_from_nodes(&system, &nodes))
+        .collect::<Vec<_>>();
+    (StatusCode::OK, axum::Json(systems)).into_response()
+}
+
+fn list_registry_nodes(core_store: &store::CoreStore) -> Result<Vec<RegistryEnrolledNode>> {
+    Ok(core_store
+        .kv_partition_get_range("node-registry", "", "\u{10ffff}", 10_000, 0)?
+        .into_iter()
+        .filter_map(|(_, value)| serde_json::from_slice::<RegistryEnrolledNode>(&value).ok())
+        .collect())
+}
+
+fn read_system_manifest() -> Vec<RegistrySystem> {
+    let Ok(raw) = std::fs::read_to_string(PathBuf::from("systems").join("manifest.toml")) else {
+        return Vec::new();
+    };
+    parse_system_manifest(&raw)
+}
+
+fn parse_system_manifest(raw: &str) -> Vec<RegistrySystem> {
+    let mut systems = Vec::new();
+    let mut current = RegistrySystem::default();
+    let mut in_entry = false;
+    for line in raw.lines().map(str::trim) {
+        if line == "[[system]]" {
+            if in_entry {
+                systems.push(current);
+                current = RegistrySystem::default();
+            }
+            in_entry = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_owned();
+        match key.trim() {
+            "slug" => current.slug = value,
+            "crate_name" => current.crate_name = value,
+            "version" => current.version = value,
+            "description" => current.description = value,
+            _ => {}
+        }
+    }
+    if in_entry {
+        systems.push(current);
+    }
+    systems
+}
+
+fn deployed_system_from_nodes(
+    system: &RegistrySystem,
+    nodes: &[RegistryEnrolledNode],
+) -> RegistryDeployedSystem {
+    let deployed_nodes = nodes
+        .iter()
+        .flat_map(|node| {
+            node.capabilities
+                .active_systems
+                .iter()
+                .filter(move |active| active.slug == system.slug)
+                .map(move |active| RegistryActiveSystemNode {
+                    node_id: node.node_id.clone(),
+                    version: active.version.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    let has_drift = deployed_nodes
+        .iter()
+        .any(|node| node.version != system.version);
+    RegistryDeployedSystem {
+        slug: system.slug.clone(),
+        catalog_version: system.version.clone(),
+        status: if deployed_nodes.is_empty() {
+            "not-deployed".to_owned()
+        } else if has_drift {
+            "version-drift".to_owned()
+        } else {
+            "deployed".to_owned()
+        },
+        host_node_count: deployed_nodes.len(),
+        has_drift,
+        nodes: deployed_nodes,
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn node_id_from_public_key(public_key: &str) -> String {
+    let suffix: String = public_key
+        .trim()
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if suffix.is_empty() {
+        "node-unknown".to_owned()
+    } else {
+        format!("node-{suffix}")
     }
 }
 

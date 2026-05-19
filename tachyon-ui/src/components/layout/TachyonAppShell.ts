@@ -7,6 +7,8 @@ import "../domains/TachyonHardwarePanel";
 import "../domains/TachyonIdentityPanel";
 import "../domains/TachyonObservabilityPanel";
 import "../domains/TachyonOverviewPanel";
+import "../domains/TachyonNodesPanel";
+import "../domains/TachyonSystemsPanel";
 import "../domains/TachyonRbacPanel";
 import "../domains/TachyonFleetPanel";
 import "../domains/TachyonStoragePanel";

@@ -23,7 +23,6 @@ pub mod identity;
 mod memory_governor;
 mod mesh;
 pub mod network;
-mod node_enrollment;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
 #[cfg(feature = "resiliency")]

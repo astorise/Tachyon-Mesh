@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added the node registry and systems catalog surfaces: `control-plane-faas` can now import `kv-partition`, `system-faas-node-registry` persists enrolled nodes, and the UI exposes read-only Nodes and Systems views.
+
 ## [v1.0.0] — General Availability (GA) · 2026-05-15
 
 Tachyon-Mesh v1.0.0 marks the transition to a production-ready, Enterprise-grade FaaS and AI orchestration mesh. This major release signals the stabilisation of our core API and MCP contracts. Following a rigorous multi-stage usability and security audit, it delivers robust supply-chain security, a hardened LLM agent interface, and full WCAG AAA accessibility.

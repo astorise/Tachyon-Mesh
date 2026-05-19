@@ -12,6 +12,8 @@ const routes: ComponentRoute[] = [
   { route: "resilience", label: "Resilience", tagName: "tachyon-resilience-panel" },
   { route: "ai", label: "AI Orchestration", tagName: "tachyon-ai-panel" },
   { route: "hardware", label: "Hardware", tagName: "tachyon-hardware-panel" },
+  { route: "nodes", label: "Nodes", tagName: "tachyon-nodes-panel" },
+  { route: "systems", label: "Systems", tagName: "tachyon-systems-panel" },
   { route: "identity-config", label: "Identity & Quotas", tagName: "tachyon-identity-panel" },
   { route: "rbac", label: "RBAC", tagName: "tachyon-rbac-panel" },
   { route: "workloads", label: "Workloads", tagName: "tachyon-workloads-panel" },

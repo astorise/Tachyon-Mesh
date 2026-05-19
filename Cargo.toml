@@ -45,6 +45,7 @@ members = [
     "systems/system-faas-media-server",
     "systems/system-faas-mesh-overlay",
     "systems/system-faas-microvm-runner",
+    "systems/system-faas-node-registry",
     "systems/system-faas-olap-engine",
     "systems/system-faas-buffer",
     "systems/system-faas-s3-proxy",

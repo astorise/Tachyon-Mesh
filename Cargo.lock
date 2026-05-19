@@ -8024,6 +8024,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-faas-node-registry"
+version = "1.1.0-alpha"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "system-faas-olap-engine"
 version = "1.1.0-alpha"
 dependencies = [
