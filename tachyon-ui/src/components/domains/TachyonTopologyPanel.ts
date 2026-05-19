@@ -158,16 +158,14 @@ export class TachyonTopologyCanvas extends HTMLElement {
   private nodes: TopologyNode[] = [];
   private edges: TopologyEdge[] = [];
   private selectedId: string | null = null;
-  // Drag state (node repositioning)
   private dragState: { nodeId: string; offsetX: number; offsetY: number } | null = null;
   private didDrag = false;
-  // Zoom / pan state
   private zoom = 1.0;
   private panX = 0;
   private panY = 0;
   private panState: { startX: number; startY: number; startPanX: number; startPanY: number } | null = null;
-  // View mode
   private compactMode = false;
+  private editable = true;
 
   constructor() {
     super();
@@ -199,6 +197,10 @@ export class TachyonTopologyCanvas extends HTMLElement {
     this.panX = 0;
     this.panY = 0;
     this.applyViewTransform();
+  }
+
+  setEditable(editable: boolean): void {
+    this.editable = editable;
   }
 
   toggleCompact(): void {
@@ -353,6 +355,7 @@ export class TachyonTopologyCanvas extends HTMLElement {
 
     this.root.querySelectorAll<HTMLButtonElement>("[data-node-id]").forEach((button) => {
       button.addEventListener("pointerdown", (event) => {
+        if (!this.editable) return;
         this.didDrag = false;
         this.dragState = {
           nodeId: button.dataset.nodeId ?? "",
@@ -429,6 +432,7 @@ export class TachyonTopologyCanvas extends HTMLElement {
       e.preventDefault();
       outer.style.borderColor = "";
       outer.style.boxShadow = "";
+      if (!this.editable) return;
       const rect = outer.getBoundingClientRect();
       const files = Array.from((e as DragEvent).dataTransfer?.files ?? []);
       for (const file of files) {
@@ -506,6 +510,7 @@ editorStylesheet.replaceSync(stylesheetText);
 export class TachyonNodeEditor extends HTMLElement {
   private readonly root: ShadowRoot;
   private node: TopologyNode | null = null;
+  private editable = true;
 
   constructor() {
     super();
@@ -516,6 +521,11 @@ export class TachyonNodeEditor extends HTMLElement {
   setNode(node: TopologyNode | null): void {
     this.node = node ? { ...node, data: { ...node.data } } : null;
     this.render();
+  }
+
+  setEditable(editable: boolean): void {
+    this.editable = editable;
+    if (this.node) this.render();
   }
 
   connectedCallback(): void {
@@ -540,6 +550,7 @@ export class TachyonNodeEditor extends HTMLElement {
           <button id="btn-close-editor" type="button" class="rounded border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-300 hover:bg-slate-700">${t("topology.editor.close")}</button>
         </header>
 
+        ${this.editable ? `
         <form id="node-form" class="space-y-3 text-sm">
           <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("topology.editor.label")}
             <input id="node-label" type="text" class="mt-1 w-full rounded border border-slate-700 bg-slate-900 p-2 text-slate-200 outline-none focus:border-cyan-400" />
@@ -549,15 +560,18 @@ export class TachyonNodeEditor extends HTMLElement {
             <button id="btn-delete-node" type="button" class="rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/20">${t("topology.editor.delete")}</button>
             <button type="submit" class="rounded border border-cyan-500/50 bg-cyan-500/15 px-3 py-2 text-xs font-medium text-cyan-200 hover:bg-cyan-500/25">${t("topology.editor.save")}</button>
           </div>
-        </form>
+        </form>` : `
+        <dl id="node-readonly" class="space-y-2 text-sm text-slate-400"></dl>`}
       </aside>
     `;
 
-    // Populate user-controlled values via DOM API (textContent / .value property)
-    // so they never reach innerHTML.
     const title = this.root.getElementById("node-title");
     if (title) title.textContent = this.node.label || this.node.id;
-    this.populateFieldValues();
+    if (this.editable) {
+      this.populateFieldValues();
+    } else {
+      this.populateReadOnlyView();
+    }
 
     this.root.getElementById("btn-close-editor")?.addEventListener("click", () => {
       this.dispatchEvent(
@@ -699,6 +713,32 @@ export class TachyonNodeEditor extends HTMLElement {
     );
   }
 
+  private populateReadOnlyView(): void {
+    if (!this.node) return;
+    const dl = this.root.getElementById("node-readonly");
+    if (!dl) return;
+    const entries: [string, string][] = [
+      ["id", this.node.id],
+      ["label", this.node.label],
+      ...Object.entries(this.node.data),
+    ];
+    dl.replaceChildren(
+      ...entries.map(([key, value]) => {
+        const div = document.createElement("div");
+        div.className = "flex justify-between gap-2 border-b border-slate-800 pb-1";
+        const dt = document.createElement("dt");
+        dt.className = "text-slate-500 text-xs font-mono";
+        dt.textContent = key;
+        const dd = document.createElement("dd");
+        dd.className = "text-slate-200 text-xs font-mono truncate";
+        dd.textContent = value || "—";
+        div.appendChild(dt);
+        div.appendChild(dd);
+        return div;
+      }),
+    );
+  }
+
   /** Sets input/select values via the `.value` property so user data never
    *  reaches innerHTML. Called immediately after the form is rendered. */
   private populateFieldValues(): void {
@@ -753,15 +793,20 @@ export const DEMO_EDGES: TopologyEdge[] = [
   { id: "e7", from: "auth-faas", to: "user-wasm" },
 ];
 
+const TOPOLOGY_MODE_KEY = "tachyon-ui:topology-mode";
+
 export class TachyonTopologyPanel extends TachyonConfigDashboard {
   private nodes: TopologyNode[] = isDemoTopologyEnabled() ? DEMO_NODES.map((n) => ({ ...n, data: { ...n.data } })) : [];
   private edges: TopologyEdge[] = isDemoTopologyEnabled() ? DEMO_EDGES.map((e) => ({ ...e })) : [];
   private selectedId: string | null = null;
   private applying = false;
-  private liveSource: string | null = null; // set when real data loaded
+  private liveSource: string | null = null;
+  private mode: "view" | "edit" = "view";
   private readonly onLanguageChanged = () => this.refresh();
 
   connectedCallback(): void {
+    const stored = sessionStorage.getItem(TOPOLOGY_MODE_KEY);
+    this.mode = stored === "edit" ? "edit" : "view";
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindEvents();
@@ -816,14 +861,25 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
       .map((type) => `<option value="${type}">${t(`topology.type.${type}`)}</option>`)
       .join("");
 
-    // Source banner — `this.liveSource` is populated via DOM API after innerHTML.
-    const sourceBanner = this.liveSource
-      ? `<span class="ml-2 text-[10px] text-emerald-400 font-mono">${t("topology.live-banner")} <span id="topology-live-source"></span></span>`
-      : isDemoTopologyEnabled()
-        ? `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">Demo data - not connected</span>`
-        : `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">${t("topology.offline-banner")}</span>`;
-
+    const modeLabel = this.mode === "edit" ? t("topology.mode.edit") : t("topology.mode.view");
     const btnClass = "rounded border border-slate-700 bg-slate-800/60 px-2 py-1 text-xs text-slate-300 hover:bg-slate-700 transition-colors";
+    const toggleBtnBase = "px-3 py-1 text-xs font-medium rounded border transition-colors";
+    const viewBtnClass = this.mode === "view"
+      ? `${toggleBtnBase} border-cyan-500/60 bg-cyan-500/15 text-cyan-200`
+      : `${toggleBtnBase} border-slate-700 bg-slate-800/60 text-slate-400 hover:bg-slate-700`;
+    const editBtnClass = this.mode === "edit"
+      ? `${toggleBtnBase} border-cyan-500/60 bg-cyan-500/15 text-cyan-200`
+      : `${toggleBtnBase} border-slate-700 bg-slate-800/60 text-slate-400 hover:bg-slate-700`;
+
+    // Source banner appended with current mode suffix.
+    const modeSuffix = `<span class="text-slate-500"> · ${modeLabel}</span>`;
+    const sourceBanner = this.liveSource
+      ? `<span class="ml-2 text-[10px] text-emerald-400 font-mono">${t("topology.live-banner")} <span id="topology-live-source"></span>${modeSuffix}</span>`
+      : isDemoTopologyEnabled()
+        ? `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">${t("topology.demo.banner")}${modeSuffix}</span>`
+        : `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">${t("topology.offline-banner")}${modeSuffix}</span>`;
+
+    const isEdit = this.mode === "edit";
 
     this.renderTemplate(`
       <section class="p-6 space-y-4 text-slate-300">
@@ -832,10 +888,15 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
             <h2 class="text-2xl font-bold text-slate-100">${t("topology.title")}${sourceBanner}</h2>
             <p class="text-sm font-mono text-slate-400">${t("topology.subtitle")}</p>
           </div>
-          <button id="btn-apply-topology" type="button" ${this.applying ? "disabled" : ""}
-            class="rounded-md border border-cyan-500/60 bg-cyan-600/20 px-4 py-2 text-xs font-bold text-cyan-200 hover:bg-cyan-600/30 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
-            ${this.applying ? `<span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent"></span>${t("topology.applying")}` : t("topology.apply-topology")}
-          </button>
+          <div class="flex items-center gap-2">
+            <button id="btn-mode-view" type="button" class="${viewBtnClass}">${t("topology.toggle.view")}</button>
+            <button id="btn-mode-edit" type="button" class="${editBtnClass}">${t("topology.toggle.edit")}</button>
+            ${isEdit ? `
+            <button id="btn-apply-topology" type="button" ${this.applying ? "disabled" : ""}
+              class="rounded-md border border-cyan-500/60 bg-cyan-600/20 px-4 py-2 text-xs font-bold text-cyan-200 hover:bg-cyan-600/30 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
+              ${this.applying ? `<span class="inline-block h-3 w-3 animate-spin rounded-full border-2 border-cyan-300 border-t-transparent"></span>${t("topology.applying")}` : t("topology.apply-topology")}
+            </button>` : ""}
+          </div>
         </header>
 
         <article data-stagger-panel>
@@ -847,10 +908,15 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
           </div>
           <tachyon-topology-canvas></tachyon-topology-canvas>
           <tachyon-node-editor></tachyon-node-editor>
-          ${this.nodes.length === 0 ? `<div class="mt-3 rounded-lg border border-slate-800 bg-slate-900 p-4 text-center text-sm text-slate-400">No live topology nodes reported. Open the Nodes view to enroll a host.</div>` : ""}
+          ${this.nodes.length === 0 && !isDemoTopologyEnabled() ? `
+            <div class="mt-4 rounded-lg border border-slate-800 bg-slate-900 p-6 text-center space-y-3">
+              <p class="text-sm text-slate-400">${t("topology.empty.title")}</p>
+              <button id="btn-goto-nodes" type="button" class="rounded border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-xs font-medium text-cyan-200 hover:bg-cyan-500/20">${t("topology.empty.cta")}</button>
+            </div>` : ""}
           <p class="mt-2 text-center text-[11px] text-slate-600 select-none">${t("topology.drop.hint")}</p>
         </article>
 
+        ${isEdit ? `
         <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-4">
           <h3 class="mb-3 text-xs uppercase tracking-widest text-cyan-300">${t("topology.add.title")}</h3>
           <form id="add-node-form" class="flex flex-wrap items-end gap-3">
@@ -864,7 +930,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
             </label>
             <button type="submit" class="rounded border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-200 hover:bg-cyan-500/20">${t("topology.add.submit")}</button>
           </form>
-        </article>
+        </article>` : ""}
 
         <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-4">
           <h3 class="mb-2 text-xs uppercase tracking-widest text-cyan-300">${t("topology.legend")}</h3>
@@ -889,9 +955,22 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
     }
   }
 
+  private setMode(mode: "view" | "edit"): void {
+    this.mode = mode;
+    sessionStorage.setItem(TOPOLOGY_MODE_KEY, mode);
+    this.refresh();
+  }
+
   private bindEvents(): void {
+    this.root.getElementById("btn-mode-view")?.addEventListener("click", () => this.setMode("view"));
+    this.root.getElementById("btn-mode-edit")?.addEventListener("click", () => this.setMode("edit"));
+
     this.root.getElementById("btn-apply-topology")?.addEventListener("click", () => {
       void this.applyTopology();
+    });
+
+    this.root.getElementById("btn-goto-nodes")?.addEventListener("click", () => {
+      window.location.hash = "nodes";
     });
 
     this.root.getElementById("btn-zoom-in")?.addEventListener("click", () => this.canvas()?.zoomIn());
@@ -1039,11 +1118,17 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
   }
 
   private pushGraphToCanvas(): void {
-    this.canvas()?.setGraph(
-      this.nodes.map((node) => ({ ...node, data: { ...node.data } })),
-      this.edges.map((edge) => ({ ...edge })),
-    );
-    this.canvas()?.setSelected(this.selectedId);
+    const editable = this.mode === "edit";
+    const canvas = this.canvas();
+    if (canvas) {
+      canvas.setGraph(
+        this.nodes.map((node) => ({ ...node, data: { ...node.data } })),
+        this.edges.map((edge) => ({ ...edge })),
+      );
+      canvas.setSelected(this.selectedId);
+      canvas.setEditable(editable);
+    }
+    this.editor()?.setEditable(editable);
   }
 
   private canvas(): TachyonTopologyCanvas | null {

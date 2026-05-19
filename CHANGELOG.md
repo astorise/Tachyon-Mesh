@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Added the node registry and systems catalog surfaces: `control-plane-faas` can now import `kv-partition`, `system-faas-node-registry` persists enrolled nodes, and the UI exposes read-only Nodes and Systems views.
+- Honest policy views: five write-only policy panels (resilience, identity-config, rbac, supply-chain, fleet) now display a "Policy form" badge; topology panel gains a View/Edit mode toggle (defaults to View) with session persistence.
 
 ## [v1.0.0] — General Availability (GA) · 2026-05-15
 
