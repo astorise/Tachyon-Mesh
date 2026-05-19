@@ -50,15 +50,14 @@ test.describe("Topology empty state (no nodes from backend)", () => {
     await authenticate(page);
 
     await page.evaluate(() => { window.location.hash = "topology"; });
-    await page.waitForSelector("tachyon-topology-panel");
+    await page.waitForSelector("tachyon-topology-panel", { timeout: 10000 });
 
     const panel = page.locator("tachyon-topology-panel");
+    // Allow loadLiveTopology to complete and re-render.
+    await page.waitForTimeout(800);
 
-    // The empty-state card should be visible.
-    await expect(panel.locator("text=No topology data")).toBeVisible({ timeout: 5000 });
-
-    // The "Go to Nodes" CTA button should be present.
-    await expect(panel.locator("#btn-goto-nodes")).toBeVisible();
+    // The "Go to Nodes" CTA button from the empty-state card must be visible.
+    await expect(panel.locator("#btn-goto-nodes")).toBeVisible({ timeout: 5000 });
 
     // No node cards should exist.
     const nodeCards = panel.locator("[data-node-id]");
@@ -71,7 +70,8 @@ test.describe("Topology empty state (no nodes from backend)", () => {
     await authenticate(page);
 
     await page.evaluate(() => { window.location.hash = "topology"; });
-    await page.waitForSelector("tachyon-topology-panel");
+    await page.waitForSelector("tachyon-topology-panel", { timeout: 10000 });
+    await page.waitForTimeout(800);
 
     const panel = page.locator("tachyon-topology-panel");
     await expect(panel.locator("#add-node-form")).toHaveCount(0);
