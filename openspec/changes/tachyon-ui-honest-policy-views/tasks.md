@@ -40,8 +40,8 @@
 ## 5. Verification and documentation
 
 - [x] 5.1 Run `npm run test` (Vitest) in `tachyon-ui/` and confirm green
-- [ ] 5.2 Run `npm run e2e` (Playwright) in `tachyon-ui/` and confirm green
-- [ ] 5.3 Manually verify the badge appears with correct copy on each of the five policy panels
-- [ ] 5.4 Manually verify Topology defaults to View, toggle persists across reload, banner shows the mode suffix
+- [x] 5.2 Run `npm run e2e` (Playwright) in `tachyon-ui/` and confirm green
+- [x] 5.3 Manually verify the badge appears with correct copy on each of the five policy panels
+- [x] 5.4 Manually verify Topology defaults to View, toggle persists across reload, banner shows the mode suffix
 - [x] 5.5 Update `CHANGELOG.md` with a one-line summary under the unreleased section
 - [x] 5.6 Verify `openspec status --change "tachyon-ui-honest-policy-views"` shows all artifacts done and `isComplete = true`
