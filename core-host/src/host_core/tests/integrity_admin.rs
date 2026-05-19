@@ -333,78 +333,10 @@ async fn admin_manifest_update_rejects_rollback() {
     assert!(rows.is_empty());
 }
 
-// The enrollment ceremony now runs inside the `system-faas-node-registry` WASM
-// component. The handlers are thin forwarders to `forward_node_registry_faas`;
-// without a full Wasmtime runtime loaded in the test state the FaaS cannot
-// respond and the test cannot validate the round-trip. The full scenario is
-// covered by the `e2e-mesh.yml` vcluster workflow (StatefulSet 3 replicas +
-// enrollment smoke test). The unit coverage below verifies what is testable
-// in isolation: that the handler does not panic and returns a non-5xx response
-// when the FaaS returns an error for an unknown route in the test state.
-#[tokio::test]
-#[ignore = "enrollment ceremony lives in system-faas-node-registry FaaS; tested by e2e-mesh.yml"]
-async fn enrollment_start_then_approve_then_poll_round_trips() {
-    let telemetry = telemetry::init_test_telemetry();
-    let state = build_test_state(IntegrityConfig::default_sealed(), telemetry);
-
-    let start = admin_enrollment_start_handler(
-        State(state.clone()),
-        axum::Json(AdminEnrollmentStartRequest {
-            node_public_key: "deadbeef".to_owned(),
-        }),
-    )
-    .await;
-    assert_eq!(start.status(), StatusCode::CREATED);
-    let body_bytes = axum::body::to_bytes(start.into_body(), 16 * 1024)
-        .await
-        .expect("body collects");
-    let start_body: AdminEnrollmentStartResponse =
-        serde_json::from_slice(&body_bytes).expect("response is JSON");
-
-    // Wrong PIN — caller error.
-    let bad = admin_enrollment_approve_handler(
-        State(state.clone()),
-        axum::Json(AdminEnrollmentApproveRequest {
-            session_id: start_body.session_id.clone(),
-            pin: "BAD-PIN".to_owned(),
-            signed_certificate_hex: "01020304".to_owned(),
-        }),
-    )
-    .await;
-    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-
-    // Right PIN — accepted.
-    let approve = admin_enrollment_approve_handler(
-        State(state.clone()),
-        axum::Json(AdminEnrollmentApproveRequest {
-            session_id: start_body.session_id.clone(),
-            pin: start_body.pin.clone(),
-            signed_certificate_hex: "01020304".to_owned(),
-        }),
-    )
-    .await;
-    assert_eq!(approve.status(), StatusCode::ACCEPTED);
-
-    // Pending node polls and gets the cert; subsequent polls return None
-    // because the session is consumed.
-    let poll = admin_enrollment_poll_handler(
-        State(state.clone()),
-        axum::extract::Path(start_body.session_id.clone()),
-    )
-    .await;
-    assert_eq!(poll.status(), StatusCode::OK);
-    let cert_bytes = axum::body::to_bytes(poll.into_body(), 1024)
-        .await
-        .expect("poll response body should be readable");
-    assert_eq!(cert_bytes.as_ref(), b"01020304");
-
-    let poll_again = admin_enrollment_poll_handler(
-        State(state.clone()),
-        axum::extract::Path(start_body.session_id),
-    )
-    .await;
-    assert_eq!(poll_again.status(), StatusCode::NO_CONTENT);
-}
+// The enrollment ceremony now lives in the `system-faas-node-registry` WASM
+// component. The handlers are thin forwarders; testing them requires a full
+// Wasmtime runtime which is not available in unit tests. Coverage is provided
+// by the `e2e-mesh.yml` vcluster workflow.
 
 #[tokio::test]
 async fn admin_manifest_update_rejects_tampered_signature() {

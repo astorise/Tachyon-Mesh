@@ -132,12 +132,6 @@ pub(crate) struct AdminEnrollmentStartRequest {
     pub(crate) node_public_key: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AdminEnrollmentStartResponse {
-    pub(crate) session_id: String,
-    pub(crate) pin: String,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -535,22 +529,6 @@ fn current_unix_seconds() -> u64 {
         .unwrap_or_default()
 }
 
-fn node_id_from_public_key(public_key: &str) -> String {
-    let suffix: String = public_key
-        .trim()
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    if suffix.is_empty() {
-        "node-unknown".to_owned()
-    } else {
-        format!("node-{suffix}")
-    }
-}
 
 /// Cluster-wide configuration update event written to `config_update_outbox`
 /// whenever a node accepts a signed manifest via `POST /admin/manifest`. The
