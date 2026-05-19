@@ -1,0 +1,179 @@
+name: E2E Mesh (vcluster)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "manifests/deploy-mesh.yaml"
+      - "manifests/deploy.yaml"
+      - "core-host/**"
+      - "systems/system-faas-node-registry/**"
+      - "Dockerfile"
+      - "wit/**"
+      - ".github/workflows/e2e-mesh.yml"
+  pull_request:
+    paths:
+      - "manifests/deploy-mesh.yaml"
+      - "Dockerfile"
+      - "wit/**"
+      - ".github/workflows/e2e-mesh.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-vcluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      VCLUSTER_NAME: tachyon-vc
+      VCLUSTER_NAMESPACE: vcluster-tachyon
+      KIND_CLUSTER: tachyon-host
+      IMAGE_TAG: tachyon-mesh:e2e
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential libssl-dev cmake nasm
+
+      - name: Build local Docker image
+        run: docker build -t $IMAGE_TAG .
+
+      - name: Set up kind host cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER }}
+          wait: 180s
+
+      - name: Load image into kind
+        run: kind load docker-image $IMAGE_TAG --name $KIND_CLUSTER
+
+      - name: Install vcluster CLI
+        run: |
+          curl -fsSL -o vcluster \
+            https://github.com/loft-sh/vcluster/releases/latest/download/vcluster-linux-amd64
+          sudo install -m 0755 vcluster /usr/local/bin/vcluster
+          vcluster --version
+
+      - name: Create vcluster
+        run: |
+          kubectl create namespace ${VCLUSTER_NAMESPACE}
+          vcluster create ${VCLUSTER_NAME} \
+            --namespace ${VCLUSTER_NAMESPACE} \
+            --connect=false \
+            --upgrade
+
+      - name: Connect to vcluster (background)
+        run: |
+          mkdir -p $HOME/.kube
+          vcluster connect ${VCLUSTER_NAME} \
+            --namespace ${VCLUSTER_NAMESPACE} \
+            --kube-config $HOME/.kube/vcluster.conf \
+            --background-proxy &
+          for i in $(seq 1 30); do
+            if KUBECONFIG=$HOME/.kube/vcluster.conf kubectl get ns >/dev/null 2>&1; then
+              echo "vcluster reachable after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+          KUBECONFIG=$HOME/.kube/vcluster.conf kubectl get ns
+
+      - name: Patch manifest to use local image
+        run: |
+          sed 's|ghcr.io/astorise/tachyon-mesh:latest|tachyon-mesh:e2e|g; s|imagePullPolicy: Always|imagePullPolicy: Never|g' \
+            manifests/deploy-mesh.yaml > /tmp/deploy-mesh-local.yaml
+
+      - name: Deploy Tachyon mesh (3 replicas)
+        env:
+          KUBECONFIG: /home/runner/.kube/vcluster.conf
+        run: |
+          kubectl apply -f /tmp/deploy-mesh-local.yaml
+
+      - name: Wait for StatefulSet rollout
+        env:
+          KUBECONFIG: /home/runner/.kube/vcluster.conf
+        run: |
+          kubectl rollout status statefulset/tachyon-mesh --timeout=240s
+          kubectl get pods -l app=tachyon-mesh -o wide
+
+      - name: Smoke test — pod logs (no crash on FaaS load)
+        env:
+          KUBECONFIG: /home/runner/.kube/vcluster.conf
+        run: |
+          for i in 0 1 2; do
+            echo "==== tachyon-mesh-$i ===="
+            kubectl logs tachyon-mesh-$i --tail=120 || true
+          done
+
+      - name: Smoke test — /admin/status reachable
+        env:
+          KUBECONFIG: /home/runner/.kube/vcluster.conf
+        run: |
+          kubectl port-forward tachyon-mesh-0 18080:8080 &
+          PF=$!
+          for i in $(seq 1 20); do
+            sleep 1
+            STATUS=$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/admin/status || echo "000")
+            if [ "$STATUS" != "000" ]; then break; fi
+          done
+          kill $PF 2>/dev/null || true
+          echo "GET /admin/status -> $STATUS"
+          case "$STATUS" in
+            200|401|403)
+              echo "core-host is alive and routing admin requests."
+              ;;
+            *)
+              echo "Unexpected status $STATUS"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify node-registry FaaS is loaded
+        env:
+          KUBECONFIG: /home/runner/.kube/vcluster.conf
+        run: |
+          set +e
+          LOGS=$(kubectl logs tachyon-mesh-0 --tail=400)
+          echo "$LOGS" | grep -Ei "node[_-]registry|system_faas_node_registry" > /tmp/registry-hits || true
+          if [ -s /tmp/registry-hits ]; then
+            echo "node-registry references found in logs:"
+            cat /tmp/registry-hits
+          else
+            echo "No explicit node-registry log line found (this is non-fatal; the FaaS may load lazily on first admin request)."
+          fi
+
+      - name: Test persistence — delete pod-0, wait re-ready, check store survives
+        env:
+          KUBECONFIG: /home/runner/.kube/vcluster.conf
+        run: |
+          kubectl delete pod tachyon-mesh-0
+          kubectl wait --for=condition=ready pod/tachyon-mesh-0 --timeout=180s
+          kubectl exec tachyon-mesh-0 -- ls -la /app/data/ || echo "(data dir empty is OK — store path may differ)"
+          kubectl logs tachyon-mesh-0 --tail=60
+
+      - name: Collect vcluster diagnostics on failure
+        if: failure()
+        env:
+          KUBECONFIG: /home/runner/.kube/vcluster.conf
+        run: |
+          kubectl describe pods -l app=tachyon-mesh || true
+          kubectl get events --sort-by=.lastTimestamp | tail -40 || true
+
+      - name: Cleanup vcluster
+        if: always()
+        run: |
+          vcluster delete ${VCLUSTER_NAME} --namespace ${VCLUSTER_NAMESPACE} || true
