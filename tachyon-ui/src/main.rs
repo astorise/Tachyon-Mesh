@@ -531,6 +531,43 @@ async fn get_hardware_status() -> Result<tachyon_client::HardwareStatus, String>
 }
 
 #[tauri::command]
+async fn list_enrolled_nodes() -> Result<Vec<tachyon_client::EnrolledNode>, String> {
+    tachyon_client::list_enrolled_nodes()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_node_capabilities(
+    node_id: String,
+) -> Result<tachyon_client::NodeCapabilities, String> {
+    tachyon_client::get_node_capabilities(&node_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_registered_systems() -> Result<Vec<tachyon_client::RegisteredSystem>, String> {
+    tachyon_client::list_registered_systems()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_deployed_systems() -> Result<Vec<tachyon_client::DeployedSystem>, String> {
+    tachyon_client::list_deployed_systems()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_cluster_hardware_summary() -> Result<tachyon_client::ClusterHardwareSummary, String> {
+    tachyon_client::get_cluster_hardware_summary()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn validate_hardware_policy(
     policy: tachyon_client::HardwarePolicy,
 ) -> Result<tachyon_client::HardwareValidation, String> {
@@ -1141,6 +1178,11 @@ fn main() {
             push_large_model,
             get_resources,
             get_hardware_status,
+            list_enrolled_nodes,
+            get_node_capabilities,
+            list_registered_systems,
+            list_deployed_systems,
+            get_cluster_hardware_summary,
             validate_hardware_policy,
             save_resource,
             delete_resource,

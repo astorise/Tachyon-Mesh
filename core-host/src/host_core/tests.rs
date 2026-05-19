@@ -8,6 +8,7 @@ mod integrity_admin;
 mod kv_cache;
 mod l4_tls_quic;
 mod mesh_control_plane;
+mod node_registry;
 mod rate_limit_models;
 mod reload_and_guest;
 mod routing_aliases;

@@ -89,6 +89,14 @@ The server speaks JSON-RPC 2.0 over stdin/stdout.
 | `TACHYON_MCP_URL` | Yes | Base URL of a running `core-host` (e.g. `http://127.0.0.1:8080`) |
 | `TACHYON_MCP_PAT` | Yes | Personal Access Token with operator privileges |
 
+## Available resources
+
+| URI | Description |
+| --- | --- |
+| `hardware://local/status` | Local RAM and accelerator snapshot from the MCP host. |
+| `hardware://mesh/cluster` | Enrolled-node, RAM, and GPU summary from the Tachyon node registry. |
+| `hardware://mesh/{node_id}/status` | Per-node hardware capabilities for an enrolled mesh node. |
+
 Both variables can also be passed as CLI arguments: `--url <url> --token <pat>`.
 
 ---

@@ -58,6 +58,19 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/admin/enrollment/poll/{session_id}",
             get(admin_enrollment_poll_handler),
         )
+        .route("/admin/nodes", get(admin_nodes_handler))
+        .route(
+            "/admin/nodes/{node_id}/capabilities",
+            post(admin_node_capabilities_handler),
+        )
+        .route(
+            "/admin/systems/registered",
+            get(admin_registered_systems_handler),
+        )
+        .route(
+            "/admin/systems/deployed",
+            get(admin_deployed_systems_handler),
+        )
         .route(
             "/admin/security/recovery-codes",
             post(auth::generate_recovery_codes_handler),

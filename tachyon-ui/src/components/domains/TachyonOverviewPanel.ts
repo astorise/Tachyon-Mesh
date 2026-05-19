@@ -36,6 +36,10 @@ type RuntimeMetrics = {
   queueDepth: number;
 };
 
+type ClusterHardwareSummary = {
+  enrolledCount: number;
+};
+
 export class TachyonOverviewPanel extends TachyonConfigDashboard {
   private metrics: OverviewMetric[] = this.initialMetrics();
   private status = t("overview.loading");
@@ -60,7 +64,13 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
       } catch {
         runtime = null;
       }
-      this.metrics = this.metricsFromSources(snapshot, runtime);
+      let hardware: ClusterHardwareSummary | null = null;
+      try {
+        hardware = await invoke<ClusterHardwareSummary>("get_cluster_hardware_summary");
+      } catch {
+        hardware = null;
+      }
+      this.metrics = this.metricsFromSources(snapshot, runtime, hardware);
       this.status = runtime?.source ? `${runtime.source}` : snapshot.status || t("overview.online");
       this.render(this.metrics, this.status);
       this.animateEntrance();
@@ -129,13 +139,14 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
     });
   }
 
-  private metricsFromSources(snapshot: MeshGraphSnapshot, runtime: RuntimeMetrics | null): OverviewMetric[] {
+  private metricsFromSources(snapshot: MeshGraphSnapshot, runtime: RuntimeMetrics | null, hardware: ClusterHardwareSummary | null): OverviewMetric[] {
     const sealedFallback = snapshot.routes.reduce((total, route) => total + Math.max(route.targetCount, 1), 0);
     const liveQueue = runtime?.queueDepth;
     const wasmInstances = typeof liveQueue === "number" && liveQueue > 0 ? liveQueue : sealedFallback;
     const gpuUtilization = this.gpuUtilizationFromMetrics(snapshot, runtime);
+    const enrolledNodes = hardware?.enrolledCount ?? snapshot.batchTargets.length;
     return [
-      { ...this.metricTemplate("nodes"), value: Math.max(snapshot.batchTargets.length, 0) },
+      { ...this.metricTemplate("nodes"), value: Math.max(enrolledNodes, 0) },
       { ...this.metricTemplate("wasm"), value: Math.round(wasmInstances) },
       { ...this.metricTemplate("gpu"), value: gpuUtilization },
     ];

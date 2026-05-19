@@ -45,6 +45,7 @@ const METERING_OUTBOX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 /// new manifest. Key: monotonic event id.
 const CONFIG_UPDATE_OUTBOX_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("config_update_outbox");
+const NODE_REGISTRY_KV_PARTITION: &str = "node-registry";
 #[cfg(feature = "experimental")]
 const COMPRESSED_MAGIC_BYTES: &[&[u8]] = &[
     b"\xFF\xD8\xFF",
@@ -971,7 +972,7 @@ impl CoreStore {
     // ── Guest KV-partition operations ────────────────────────────────────────
 
     pub(crate) fn kv_partition_get(&self, table_name: &str, key: &str) -> Result<Option<Vec<u8>>> {
-        let table_key = format!("kv_partition::{table_name}");
+        let table_key = kv_partition_table_key(table_name);
         let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let read_txn = self
             .db
@@ -989,7 +990,7 @@ impl CoreStore {
     }
 
     pub(crate) fn kv_partition_set(&self, table_name: &str, key: &str, value: &[u8]) -> Result<()> {
-        let table_key = format!("kv_partition::{table_name}");
+        let table_key = kv_partition_table_key(table_name);
         let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let write_txn = self
             .db
@@ -1009,7 +1010,7 @@ impl CoreStore {
     }
 
     pub(crate) fn kv_partition_delete(&self, table_name: &str, key: &str) -> Result<()> {
-        let table_key = format!("kv_partition::{table_name}");
+        let table_key = kv_partition_table_key(table_name);
         let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let write_txn = self
             .db
@@ -1034,7 +1035,7 @@ impl CoreStore {
         table_name: &str,
         entries: &[(String, Vec<u8>)],
     ) -> Result<()> {
-        let table_key = format!("kv_partition::{table_name}");
+        let table_key = kv_partition_table_key(table_name);
         let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let write_txn = self
             .db
@@ -1064,7 +1065,7 @@ impl CoreStore {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let table_key = format!("kv_partition::{table_name}");
+        let table_key = kv_partition_table_key(table_name);
         let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
         let read_txn = self
             .db
@@ -1083,6 +1084,13 @@ impl CoreStore {
             .map(|result| result.map(|(k, v)| (k.value().to_owned(), v.value().to_owned())))
             .collect();
         results.context("kv_partition_get_range: failed to collect range results")
+    }
+}
+
+fn kv_partition_table_key(table_name: &str) -> String {
+    match table_name {
+        NODE_REGISTRY_KV_PARTITION => "kv_partition::node-registry".to_owned(),
+        other => format!("kv_partition::{other}"),
     }
 }
 
@@ -1604,6 +1612,30 @@ mod tests {
             .expect("vector search should succeed after delete");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "doc-b");
+    }
+
+    #[test]
+    fn node_registry_kv_partition_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("tachyon-node-registry-{}.db", Uuid::new_v4()));
+        {
+            let store = CoreStore::open(&path).expect("store should open");
+            store
+                .kv_partition_set(
+                    NODE_REGISTRY_KV_PARTITION,
+                    "node-a",
+                    br#"{"status":"online"}"#,
+                )
+                .expect("node registry row should write");
+        }
+        let reopened = CoreStore::open(&path).expect("store should reopen");
+        assert_eq!(
+            reopened
+                .kv_partition_get(NODE_REGISTRY_KV_PARTITION, "node-a")
+                .expect("node registry row should read")
+                .as_deref(),
+            Some(&br#"{"status":"online"}"#[..])
+        );
     }
 
     #[cfg(feature = "experimental")]

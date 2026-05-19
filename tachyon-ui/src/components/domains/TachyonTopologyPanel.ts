@@ -149,6 +149,10 @@ const BUBBLE_R = 24; // radius → 48px diameter
 const canvasStylesheet = new CSSStyleSheet();
 canvasStylesheet.replaceSync(stylesheetText);
 
+function isDemoTopologyEnabled(): boolean {
+  return new URLSearchParams(window.location.search).get("demo") === "1";
+}
+
 export class TachyonTopologyCanvas extends HTMLElement {
   private readonly root: ShadowRoot;
   private nodes: TopologyNode[] = [];
@@ -728,7 +732,7 @@ export class TachyonNodeEditor extends HTMLElement {
 
 customElements.define("tachyon-node-editor", TachyonNodeEditor);
 
-const DEFAULT_NODES: TopologyNode[] = [
+export const DEMO_NODES: TopologyNode[] = [
   { id: "edge-gateway", type: "endpoint", label: "Public HTTPS", x: 24, y: 24, data: { protocol: "HTTPS", port: "443" } },
   { id: "auth-faas", type: "system-faas", label: "AuthN", x: 320, y: 24, data: { component: "system-faas-authn" } },
   { id: "infer-llm", type: "llm", label: "Inference Hub", x: 624, y: 24, data: { modelName: "mistral-7b-instruct", quantization: "INT8", loraMode: "dynamic" } },
@@ -739,7 +743,7 @@ const DEFAULT_NODES: TopologyNode[] = [
   { id: "user-wasm", type: "custom-wasm", label: "Recommendation", x: 624, y: 420, data: { capabilityName: "guest-reco", semver: "^1.0.0", assetSource: "./assets/guest-reco.wasm" } },
 ];
 
-const DEFAULT_EDGES: TopologyEdge[] = [
+export const DEMO_EDGES: TopologyEdge[] = [
   { id: "e1", from: "edge-gateway", to: "auth-faas" },
   { id: "e2", from: "auth-faas", to: "infer-llm" },
   { id: "e3", from: "infer-llm", to: "kv-shared" },
@@ -750,8 +754,8 @@ const DEFAULT_EDGES: TopologyEdge[] = [
 ];
 
 export class TachyonTopologyPanel extends TachyonConfigDashboard {
-  private nodes: TopologyNode[] = DEFAULT_NODES.map((n) => ({ ...n, data: { ...n.data } }));
-  private edges: TopologyEdge[] = DEFAULT_EDGES.map((e) => ({ ...e }));
+  private nodes: TopologyNode[] = isDemoTopologyEnabled() ? DEMO_NODES.map((n) => ({ ...n, data: { ...n.data } })) : [];
+  private edges: TopologyEdge[] = isDemoTopologyEnabled() ? DEMO_EDGES.map((e) => ({ ...e })) : [];
   private selectedId: string | null = null;
   private applying = false;
   private liveSource: string | null = null; // set when real data loaded
@@ -779,7 +783,17 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         status: string;
       }>("get_topology_graph");
 
-      if (graph.nodes.length === 0) return; // offline — keep sample
+      if (graph.nodes.length === 0) {
+        if (!isDemoTopologyEnabled()) {
+          this.nodes = [];
+          this.edges = [];
+          this.liveSource = graph.source;
+          this.render();
+          this.bindEvents();
+          this.pushGraphToCanvas();
+        }
+        return;
+      }
 
       this.nodes = graph.nodes.map((n) => ({
         id: n.id,
@@ -805,7 +819,9 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
     // Source banner — `this.liveSource` is populated via DOM API after innerHTML.
     const sourceBanner = this.liveSource
       ? `<span class="ml-2 text-[10px] text-emerald-400 font-mono">${t("topology.live-banner")} <span id="topology-live-source"></span></span>`
-      : `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">${t("topology.offline-banner")}</span>`;
+      : isDemoTopologyEnabled()
+        ? `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">Demo data - not connected</span>`
+        : `<span class="ml-2 text-[10px] text-amber-400/70 font-mono">${t("topology.offline-banner")}</span>`;
 
     const btnClass = "rounded border border-slate-700 bg-slate-800/60 px-2 py-1 text-xs text-slate-300 hover:bg-slate-700 transition-colors";
 
@@ -831,6 +847,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
           </div>
           <tachyon-topology-canvas></tachyon-topology-canvas>
           <tachyon-node-editor></tachyon-node-editor>
+          ${this.nodes.length === 0 ? `<div class="mt-3 rounded-lg border border-slate-800 bg-slate-900 p-4 text-center text-sm text-slate-400">No live topology nodes reported. Open the Nodes view to enroll a host.</div>` : ""}
           <p class="mt-2 text-center text-[11px] text-slate-600 select-none">${t("topology.drop.hint")}</p>
         </article>
 

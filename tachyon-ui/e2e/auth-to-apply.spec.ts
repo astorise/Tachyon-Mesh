@@ -13,17 +13,38 @@ async function installTauriMocks(page: Page): Promise<void> {
     // Stub the Tauri invoke bridge so calls resolve predictably in tests.
     const responses: Record<string, unknown> = {
       get_hardware_status: { totalRamMb: 8192, availableRamMb: 4096, accelerators: ["cpu"], gpus: [] },
+      get_cluster_hardware_summary: { source: "mock", enrolledCount: 0, onlineCount: 0, staleCount: 0, totalRamMb: 0, gpuCount: 0 },
+      get_mesh_graph: { source: "mock", status: "ready", routes: [], batchTargets: [] },
+      get_topology_graph: { source: "mock", status: "ready", nodes: [], edges: [] },
+      list_enrolled_nodes: [],
+      list_registered_systems: [],
+      list_deployed_systems: [],
       get_metrics: { source: "mock", errorRate: 0, p50LatencyMs: 1, p99LatencyMs: 2, queueDepth: 0, vramUtilizationPct: 0, ramOffloadActive: false },
       get_resources: [],
       load_credentials: null,
       load_custom_ca: null,
     };
     // Patch the Tauri internal invoke hook
+    let callbackId = 0;
+    const callbacks = new Map<number, unknown>();
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
       invoke: (cmd: string) => {
+        if (cmd === "plugin:event|listen") return Promise.resolve(callbackId++);
+        if (cmd === "plugin:event|unlisten") return Promise.resolve(null);
         if (cmd in responses) return Promise.resolve(responses[cmd]);
         return Promise.reject(new Error(`[mock] unhandled command: ${cmd}`));
       },
+      transformCallback: (callback: unknown) => {
+        const id = callbackId++;
+        callbacks.set(id, callback);
+        return id;
+      },
+      unregisterCallback: (id: number) => {
+        callbacks.delete(id);
+      },
+    };
+    (window as unknown as Record<string, unknown>).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+      unregisterListener: () => undefined,
     };
   });
 }

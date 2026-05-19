@@ -316,6 +316,7 @@ world control-plane-faas {
     import scaling-metrics;
     import outbound-http;
     import routing-control;
+    import kv-partition;
     export handler;
     export on-tick: func();
 }
