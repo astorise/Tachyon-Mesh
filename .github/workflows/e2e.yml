@@ -4,9 +4,15 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "tachyon-ui/**"
+      - ".github/workflows/e2e.yml"
   pull_request:
     branches:
       - main
+    paths:
+      - "tachyon-ui/**"
+      - ".github/workflows/e2e.yml"
 
 permissions:
   contents: read
@@ -60,9 +66,6 @@ jobs:
   playwright-ui:
     name: Playwright UI E2E
     runs-on: ubuntu-latest
-    # Playwright tests require a running Vite dev server; skip on CI unless
-    # the ENABLE_PLAYWRIGHT_CI environment variable is explicitly set.
-    if: ${{ vars.ENABLE_PLAYWRIGHT_CI == 'true' }}
 
     steps:
       - name: Checkout repository
