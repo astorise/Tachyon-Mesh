@@ -44,7 +44,7 @@ async function mount(tag: string): Promise<HTMLElement> {
 describe("tachyon-policy-form-badge presence", () => {
   beforeEach(() => {
     document.body.innerHTML = "";
-    vi.mocked(applyAndSeal).mockResolvedValue({ success: true, message: "" });
+    vi.mocked(applyAndSeal).mockResolvedValue({ success: true, message: "", configVersion: 1 });
     vi.mocked(resilientInvoke).mockResolvedValue([]);
   });
 
