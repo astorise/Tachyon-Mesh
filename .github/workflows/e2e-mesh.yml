@@ -76,21 +76,21 @@ jobs:
             --connect=false \
             --upgrade
 
-      - name: Connect to vcluster (background)
+      - name: Connect to vcluster
         run: |
-          mkdir -p $HOME/.kube
+          # --kube-config is deprecated in recent vcluster; use --background-proxy which
+          # updates ~/.kube/config and switches the active context automatically.
           vcluster connect ${VCLUSTER_NAME} \
             --namespace ${VCLUSTER_NAMESPACE} \
-            --kube-config $HOME/.kube/vcluster.conf \
-            --background-proxy &
+            --background-proxy
           for i in $(seq 1 30); do
-            if KUBECONFIG=$HOME/.kube/vcluster.conf kubectl get ns >/dev/null 2>&1; then
+            if kubectl get ns >/dev/null 2>&1; then
               echo "vcluster reachable after ${i}s"
               break
             fi
             sleep 2
           done
-          KUBECONFIG=$HOME/.kube/vcluster.conf kubectl get ns
+          kubectl get ns
 
       - name: Patch manifest to use local image
         run: |
@@ -99,20 +99,20 @@ jobs:
 
       - name: Deploy Tachyon mesh (3 replicas)
         env:
-          KUBECONFIG: /home/runner/.kube/vcluster.conf
+          KUBECONFIG: /home/runner/.kube/config
         run: |
           kubectl apply -f /tmp/deploy-mesh-local.yaml
 
       - name: Wait for StatefulSet rollout
         env:
-          KUBECONFIG: /home/runner/.kube/vcluster.conf
+          KUBECONFIG: /home/runner/.kube/config
         run: |
           kubectl rollout status statefulset/tachyon-mesh --timeout=240s
           kubectl get pods -l app=tachyon-mesh -o wide
 
       - name: Smoke test — pod logs (no crash on FaaS load)
         env:
-          KUBECONFIG: /home/runner/.kube/vcluster.conf
+          KUBECONFIG: /home/runner/.kube/config
         run: |
           for i in 0 1 2; do
             echo "==== tachyon-mesh-$i ===="
@@ -121,7 +121,7 @@ jobs:
 
       - name: Smoke test — /admin/status reachable
         env:
-          KUBECONFIG: /home/runner/.kube/vcluster.conf
+          KUBECONFIG: /home/runner/.kube/config
         run: |
           kubectl port-forward tachyon-mesh-0 18080:8080 &
           PF=$!
@@ -144,7 +144,7 @@ jobs:
 
       - name: Verify node-registry FaaS is loaded
         env:
-          KUBECONFIG: /home/runner/.kube/vcluster.conf
+          KUBECONFIG: /home/runner/.kube/config
         run: |
           set +e
           LOGS=$(kubectl logs tachyon-mesh-0 --tail=400)
@@ -158,7 +158,7 @@ jobs:
 
       - name: Test persistence — delete pod-0, wait re-ready, check store survives
         env:
-          KUBECONFIG: /home/runner/.kube/vcluster.conf
+          KUBECONFIG: /home/runner/.kube/config
         run: |
           kubectl delete pod tachyon-mesh-0
           kubectl wait --for=condition=ready pod/tachyon-mesh-0 --timeout=180s
@@ -168,7 +168,7 @@ jobs:
       - name: Collect vcluster diagnostics on failure
         if: failure()
         env:
-          KUBECONFIG: /home/runner/.kube/vcluster.conf
+          KUBECONFIG: /home/runner/.kube/config
         run: |
           kubectl describe pods -l app=tachyon-mesh || true
           kubectl get events --sort-by=.lastTimestamp | tail -40 || true
