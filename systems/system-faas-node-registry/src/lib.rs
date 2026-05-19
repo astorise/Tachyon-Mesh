@@ -215,6 +215,7 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
     Err(format!("unsupported node registry route `{method} {path}`"))
 }
 
+#[derive(Default)]
 pub struct Registry;
 
 impl Registry {
