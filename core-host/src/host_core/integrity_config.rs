@@ -132,7 +132,6 @@ pub(crate) struct AdminEnrollmentStartRequest {
     pub(crate) node_public_key: String,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminEnrollmentApproveRequest {
@@ -528,7 +527,6 @@ fn current_unix_seconds() -> u64 {
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
 }
-
 
 /// Cluster-wide configuration update event written to `config_update_outbox`
 /// whenever a node accepts a signed manifest via `POST /admin/manifest`. The
