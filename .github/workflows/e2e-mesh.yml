@@ -63,9 +63,9 @@ jobs:
 
       - name: Install vcluster CLI
         run: |
-          curl -fsSL -o vcluster \
+          curl -fsSL -o /tmp/vcluster \
             https://github.com/loft-sh/vcluster/releases/latest/download/vcluster-linux-amd64
-          sudo install -m 0755 vcluster /usr/local/bin/vcluster
+          sudo install -m 0755 /tmp/vcluster /usr/local/bin/vcluster
           vcluster --version
 
       - name: Create vcluster
