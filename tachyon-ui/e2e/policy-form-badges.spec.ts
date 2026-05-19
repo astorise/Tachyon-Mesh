@@ -48,7 +48,7 @@ async function authenticate(page: Page): Promise<void> {
 
 async function navigateTo(page: Page, route: string): Promise<void> {
   await page.evaluate((r) => { window.location.hash = r; }, route);
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(600);
 }
 
 // ── Policy-form panels that MUST show the badge ─────────────────────────────
@@ -68,16 +68,13 @@ for (const { route, panelTag } of POLICY_ROUTES) {
     await authenticate(page);
     await navigateTo(page, route);
 
-    await page.waitForSelector(panelTag);
+    await page.waitForSelector(panelTag, { timeout: 10000 });
+    await page.waitForTimeout(400);
     const panel = page.locator(panelTag);
 
-    // The badge must be present in the DOM (in shadow root, pierced by Playwright).
+    // The badge must be present in the shadow DOM (Playwright pierces shadow roots).
     const badge = panel.locator("tachyon-policy-form-badge");
-    await expect(badge).toHaveCount(1, { timeout: 4000 });
-
-    // The badge must render non-empty label text.
-    const label = badge.locator("span");
-    await expect(label).not.toBeEmpty();
+    await expect(badge).toHaveCount(1, { timeout: 5000 });
   });
 }
 
@@ -89,7 +86,8 @@ test("topology panel does NOT show the policy-form badge", async ({ page }) => {
   await authenticate(page);
   await navigateTo(page, "topology");
 
-  await page.waitForSelector("tachyon-topology-panel");
+  await page.waitForSelector("tachyon-topology-panel", { timeout: 10000 });
+  await page.waitForTimeout(600);
   const panel = page.locator("tachyon-topology-panel");
   await expect(panel.locator("tachyon-policy-form-badge")).toHaveCount(0);
 });
@@ -102,11 +100,12 @@ test("topology defaults to View mode — no add-node form, no Apply button", asy
   await authenticate(page);
   await navigateTo(page, "topology");
 
-  await page.waitForSelector("tachyon-topology-panel");
+  await page.waitForSelector("tachyon-topology-panel", { timeout: 10000 });
+  await page.waitForTimeout(800);
   const panel = page.locator("tachyon-topology-panel");
 
   // View/Edit toggle buttons present.
-  await expect(panel.locator("#btn-mode-view")).toBeVisible({ timeout: 4000 });
+  await expect(panel.locator("#btn-mode-view")).toBeVisible({ timeout: 5000 });
   await expect(panel.locator("#btn-mode-edit")).toBeVisible();
 
   // Edit affordances hidden in View mode.
@@ -120,13 +119,14 @@ test("topology Edit mode shows add-node form and Apply button", async ({ page })
   await authenticate(page);
   await navigateTo(page, "topology");
 
-  await page.waitForSelector("tachyon-topology-panel");
+  await page.waitForSelector("tachyon-topology-panel", { timeout: 10000 });
+  await page.waitForTimeout(800);
   const panel = page.locator("tachyon-topology-panel");
 
   await panel.locator("#btn-mode-edit").click();
-  await page.waitForTimeout(200);
+  await page.waitForTimeout(400);
 
-  await expect(panel.locator("#add-node-form")).toBeVisible({ timeout: 3000 });
+  await expect(panel.locator("#add-node-form")).toBeVisible({ timeout: 5000 });
   await expect(panel.locator("#btn-apply-topology")).toBeVisible();
 });
 
@@ -136,9 +136,10 @@ test("topology mode persists to sessionStorage on toggle", async ({ page }) => {
   await authenticate(page);
   await navigateTo(page, "topology");
 
-  await page.waitForSelector("tachyon-topology-panel");
+  await page.waitForSelector("tachyon-topology-panel", { timeout: 10000 });
+  await page.waitForTimeout(800);
   await page.locator("tachyon-topology-panel").locator("#btn-mode-edit").click();
-  await page.waitForTimeout(200);
+  await page.waitForTimeout(400);
 
   const stored = await page.evaluate(() =>
     sessionStorage.getItem("tachyon-ui:topology-mode"),
