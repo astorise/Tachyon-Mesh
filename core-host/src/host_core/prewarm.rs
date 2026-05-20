@@ -729,7 +729,12 @@ pub(crate) fn prewarm_legacy_route(
     let wasi = wasi.build_p1();
     let mut store = Store::new(
         &runtime.engine,
-        LegacyHostState::new(wasi, runtime.config.guest_memory_limit_bytes),
+        LegacyHostState::new(
+            wasi,
+            runtime.config.guest_memory_limit_bytes,
+            #[cfg(feature = "ai-inference")]
+            Arc::clone(&runtime.ai_runtime),
+        ),
     );
     store.limiter(|state| &mut state.limits);
     let _instance = linker.instantiate(&mut store, &module).map_err(|error| {

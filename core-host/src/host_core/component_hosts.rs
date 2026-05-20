@@ -1,12 +1,23 @@
 use super::*;
 
 impl LegacyHostState {
-    pub(crate) fn new(wasi: WasiP1Ctx, max_memory_bytes: usize) -> Self {
+    pub(crate) fn new(
+        wasi: WasiP1Ctx,
+        max_memory_bytes: usize,
+        #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+    ) -> Self {
         Self {
             wasi,
+            #[cfg(feature = "ai-inference")]
+            wasi_nn: build_wasi_nn_ctx(ai_runtime.as_ref()),
             limits: GuestResourceLimiter::new(max_memory_bytes),
         }
     }
+}
+
+#[cfg(feature = "ai-inference")]
+pub(crate) fn build_wasi_nn_ctx(runtime: &ai_inference::AiInferenceRuntime) -> WasiNnCtx {
+    runtime.build_wasi_nn_ctx()
 }
 
 impl SecretsVault {

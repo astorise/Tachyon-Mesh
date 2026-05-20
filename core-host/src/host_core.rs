@@ -116,6 +116,8 @@ pub(crate) use wasmtime_wasi::{
     p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult},
     DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
+#[cfg(feature = "ai-inference")]
+pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;
 
 mod app_runtime;
 mod background_workers;

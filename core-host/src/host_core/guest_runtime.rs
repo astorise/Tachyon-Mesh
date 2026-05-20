@@ -1159,7 +1159,12 @@ pub(crate) fn execute_legacy_guest(
     let wasi = wasi.build_p1();
     let mut store = Store::new(
         engine,
-        LegacyHostState::new(wasi, execution.config.guest_memory_limit_bytes),
+        LegacyHostState::new(
+            wasi,
+            execution.config.guest_memory_limit_bytes,
+            #[cfg(feature = "ai-inference")]
+            Arc::clone(&execution.ai_runtime),
+        ),
     );
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
@@ -1227,7 +1232,12 @@ pub(crate) fn execute_legacy_guest_with_stdio(
     let wasi = wasi.build_p1();
     let mut store = Store::new(
         engine,
-        LegacyHostState::new(wasi, execution.config.guest_memory_limit_bytes),
+        LegacyHostState::new(
+            wasi,
+            execution.config.guest_memory_limit_bytes,
+            #[cfg(feature = "ai-inference")]
+            Arc::clone(&execution.ai_runtime),
+        ),
     );
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
@@ -1618,6 +1628,11 @@ pub(crate) fn build_linker(
     p1::add_to_linker_sync(&mut linker, |state: &mut LegacyHostState| &mut state.wasi).map_err(
         |error| guest_execution_error(error, "failed to add WASI preview1 functions to linker"),
     )?;
+    #[cfg(feature = "ai-inference")]
+    wasmtime_wasi_nn::witx::add_to_linker(&mut linker, |state: &mut LegacyHostState| {
+        &mut state.wasi_nn
+    })
+    .map_err(|error| guest_execution_error(error, "failed to add WASI-NN functions to linker"))?;
     Ok(linker)
 }
 

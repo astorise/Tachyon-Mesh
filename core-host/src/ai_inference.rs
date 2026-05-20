@@ -1,3 +1,5 @@
+#[path = "ai_inference/candle_onnx_backend.rs"]
+mod candle_onnx_backend;
 #[path = "ai_inference/vram_manager.rs"]
 pub(crate) mod vram_manager;
 
@@ -22,6 +24,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc as tokio_mpsc;
+use wasmtime_wasi_nn::{
+    witx::WasiNnCtx, Backend as WasiNnProvider, Graph as WasiGraph, GraphRegistry,
+    Registry as WasiRegistry,
+};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TensorType {
     U8,
@@ -87,6 +93,18 @@ struct BackendModelSource {
 
 fn load_model_bytes(path: &str) -> Arc<[u8]> {
     fs::read(path).unwrap_or_default().into()
+}
+
+// Guests load ONNX models directly via graph_load(bytes). No pre-registered
+// named graphs are needed; the WASI-NN registry is intentionally empty.
+struct EmptyGraphRegistry;
+impl GraphRegistry for EmptyGraphRegistry {
+    fn get(&self, _name: &str) -> Option<&WasiGraph> {
+        None
+    }
+    fn get_mut(&mut self, _name: &str) -> Option<&mut WasiGraph> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -175,6 +193,13 @@ impl AiInferenceRuntime {
         let mut aliases = self.models.keys().cloned().collect::<Vec<_>>();
         aliases.sort();
         aliases
+    }
+
+    pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
+        let backends = [WasiNnProvider::from(
+            candle_onnx_backend::candle_onnx_backend(),
+        )];
+        WasiNnCtx::new(backends, WasiRegistry::from(EmptyGraphRegistry))
     }
 
     #[cfg(test)]
