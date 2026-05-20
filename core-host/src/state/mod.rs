@@ -103,7 +103,7 @@ pub(crate) struct RuntimeState {
     /// is dropped along with the rest of the runtime, so configuration
     /// changes propagate without a stale-module concern.
     pub(crate) instance_pool: Arc<moka::sync::Cache<PathBuf, Arc<Module>>>,
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }
 

@@ -426,7 +426,7 @@ impl Drop for TestTempDir {
     }
 }
 
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 pub(super) fn test_ai_runtime(config: &IntegrityConfig) -> Arc<ai_inference::AiInferenceRuntime> {
     Arc::new(
         ai_inference::AiInferenceRuntime::from_config(config)
@@ -810,7 +810,7 @@ pub(super) fn execute_legacy_guest_with_sync_file_capture(
         LegacyHostState::new(
             wasi,
             execution.config.guest_memory_limit_bytes,
-            #[cfg(feature = "ai-inference-onnx")]
+            #[cfg(feature = "ai-inference")]
             Arc::clone(&execution.ai_runtime),
         ),
     );

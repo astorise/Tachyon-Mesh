@@ -301,7 +301,7 @@ impl TlsManager {
         let route_overrides = Arc::clone(&state.route_overrides);
         let host_load = Arc::clone(&state.host_load);
         let async_log_sender = state.async_log_sender.clone();
-        #[cfg(feature = "ai-inference-onnx")]
+        #[cfg(feature = "ai-inference")]
         let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
         let response = tokio::task::spawn_blocking(move || {
@@ -325,7 +325,7 @@ impl TlsManager {
                     propagated_headers: Vec::new(),
                     route_overrides,
                     host_load,
-                    #[cfg(feature = "ai-inference-onnx")]
+                    #[cfg(feature = "ai-inference")]
                     ai_runtime,
                     instance_pool: None,
                 },

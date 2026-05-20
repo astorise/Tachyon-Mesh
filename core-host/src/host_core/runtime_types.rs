@@ -90,8 +90,6 @@ pub(crate) fn new_uds_fast_path_registry() -> UdsFastPathRegistry {
 
 pub(crate) struct LegacyHostState {
     pub(crate) wasi: WasiP1Ctx,
-    #[cfg(feature = "ai-inference-onnx")]
-    pub(crate) wasi_nn: WasiNnCtx,
     pub(crate) limits: GuestResourceLimiter,
 }
 
@@ -115,19 +113,19 @@ pub(crate) struct ComponentHostState {
     pub(crate) outbound_http_client: reqwest::blocking::Client,
     pub(crate) route_path: String,
     pub(crate) route_role: RouteRole,
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) allowed_model_aliases: BTreeSet<String>,
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) adapter_id: Option<String>,
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) next_accelerator_model_id: u32,
 }
 
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedAcceleratorModel {
     pub(crate) alias: String,
@@ -165,7 +163,7 @@ pub(crate) struct GuestExecutionContext {
     /// avoid the `Module::deserialize` cost on every request. Tests fill in
     /// `None`; production code clones it from `RuntimeState::instance_pool`.
     pub(crate) instance_pool: Option<Arc<moka::sync::Cache<PathBuf, Arc<Module>>>>,
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }
 

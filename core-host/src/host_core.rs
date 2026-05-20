@@ -1,6 +1,6 @@
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 pub(crate) use crate::accelerator_component_bindings;
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 pub(crate) use crate::ai_inference;
 #[cfg(test)]
 pub(crate) use crate::identity::CallerIdentityClaims;
@@ -116,8 +116,6 @@ pub(crate) use wasmtime_wasi::{
     p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult},
     DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
-#[cfg(feature = "ai-inference-onnx")]
-pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;
 
 mod app_runtime;
 mod background_workers;

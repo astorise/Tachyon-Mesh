@@ -226,7 +226,7 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         propagated_headers: Vec::new(),
         route_overrides: test_route_overrides(),
         host_load: test_host_load(),
-        #[cfg(feature = "ai-inference-onnx")]
+        #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         instance_pool: None,
     };
@@ -259,7 +259,7 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         propagated_headers: Vec::new(),
         route_overrides: test_route_overrides(),
         host_load: test_host_load(),
-        #[cfg(feature = "ai-inference-onnx")]
+        #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         instance_pool: None,
     };
@@ -378,7 +378,7 @@ async fn router_returns_service_unavailable_when_route_concurrency_is_exhausted(
                 .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
                 .build(),
         ),
-        #[cfg(feature = "ai-inference-onnx")]
+        #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         config,
     };
@@ -479,7 +479,7 @@ fn system_guest_requires_system_route_role() {
     let config = IntegrityConfig::default_sealed();
     let engine = build_test_engine(&config);
     let route = IntegrityRoute::user("/metrics");
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     let ai_runtime = test_ai_runtime(&config);
     let error = execute_guest(
         &engine,
@@ -501,7 +501,7 @@ fn system_guest_requires_system_route_role() {
             propagated_headers: Vec::new(),
             route_overrides: test_route_overrides(),
             host_load: test_host_load(),
-            #[cfg(feature = "ai-inference-onnx")]
+            #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
         },

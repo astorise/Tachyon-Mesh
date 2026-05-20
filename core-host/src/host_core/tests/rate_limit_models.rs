@@ -818,7 +818,7 @@ fn guest_ai_is_gated_behind_ai_inference_feature() {
     assert!(!requires_ai_inference_feature("guest-example"));
 }
 
-#[cfg(not(feature = "ai-inference-onnx"))]
+#[cfg(not(feature = "ai-inference"))]
 #[test]
 fn test_inference_stubs_no_feature() {
     let error = ai_inference_feature_unavailable_error("guest-ai");

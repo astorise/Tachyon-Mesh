@@ -5,12 +5,10 @@ edition = "2021"
 
 [features]
 default = ["ring"]
-# Candle + TurboQuant only — pure Rust, musl-compatible.
-ai-inference-candle = ["dep:candle-core", "dep:candle-nn", "dep:lru", "dep:turboquant-sys"]
-# Adds ORT (ONNX Runtime) and WASI-NN host support — requires glibc (not musl).
-ai-inference-onnx = ["ai-inference-candle", "dep:ort", "dep:wasmtime-wasi-nn"]
-# Backwards-compatible alias: activates the full stack including ORT.
-ai-inference = ["ai-inference-onnx"]
+# Candle + TurboQuant inference — pure Rust, musl-compatible.
+# ORT/WASI-NN removed: ONNX is an interchange format with no unique models;
+# all relevant models are available as safetensors/GGUF via candle.
+ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:lru", "dep:turboquant-sys"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
 # VRAM helpers, BaaS scratch tables) so they are excluded from the default build but
@@ -51,7 +49,6 @@ http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio", "http1", "http2"] }
 lru = { version = "0.18", optional = true }
-ort = { version = "=2.0.0-rc.10", optional = true, default-features = false }
 prometheus = "0.14"
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.10"
@@ -78,7 +75,6 @@ turboquant-sys = { path = "../turboquant-sys", optional = true }
 uuid = { version = "1", features = ["v4"] }
 wasmtime = { version = "44.0.1", features = ["component-model"] }
 wasmtime-wasi = { version = "44.0.1", features = ["p1"] }
-wasmtime-wasi-nn = { version = "44.0.1", optional = true, default-features = false, features = ["onnx-download"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13.1", optional = true }

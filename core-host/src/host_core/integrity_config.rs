@@ -233,7 +233,7 @@ async fn forward_node_registry_faas(
     let route_overrides = Arc::clone(&state.route_overrides);
     let host_load = Arc::clone(&state.host_load);
     let instance_pool = Arc::clone(&runtime.instance_pool);
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
     let result = tokio::task::spawn_blocking(move || {
@@ -257,7 +257,7 @@ async fn forward_node_registry_faas(
                 propagated_headers: Vec::new(),
                 route_overrides,
                 host_load,
-                #[cfg(feature = "ai-inference-onnx")]
+                #[cfg(feature = "ai-inference")]
                 ai_runtime,
                 instance_pool: Some(instance_pool),
             },

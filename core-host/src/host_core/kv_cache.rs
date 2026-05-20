@@ -25,7 +25,7 @@ fn tenant_from_headers(headers: &HeaderMap) -> String {
 /// Without the `ai-inference` feature the check always returns `false`
 /// (no model can be hot), so writes are rejected in that build.
 fn model_is_hot(state: &AppState, model_ref: &str) -> bool {
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     {
         state
             .runtime
@@ -35,7 +35,7 @@ fn model_is_hot(state: &AppState, model_ref: &str) -> bool {
             .iter()
             .any(|alias| alias == model_ref)
     }
-    #[cfg(not(feature = "ai-inference-onnx"))]
+    #[cfg(not(feature = "ai-inference"))]
     {
         let _ = (state, model_ref);
         false

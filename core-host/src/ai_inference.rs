@@ -6,7 +6,6 @@ use candle_core::{
     bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
     Tensor as CandleTensor,
 };
-use candle_nn::VarMap;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::{
@@ -23,13 +22,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc as tokio_mpsc;
-use wasmtime::format_err;
-use wasmtime_wasi_nn::{
-    backend::{self, BackendError, BackendExecutionContext, BackendGraph, Id, NamedTensor},
-    wit::{Tensor as WasiTensor, TensorType},
-    witx::WasiNnCtx,
-    Backend as WasiNnProvider, Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry,
-};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TensorType {
+    U8,
+    Fp32,
+}
 
 use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
 
@@ -88,6 +85,10 @@ struct BackendModelSource {
     model_bytes: Arc<[u8]>,
 }
 
+fn load_model_bytes(path: &str) -> Arc<[u8]> {
+    fs::read(path).unwrap_or_default().into()
+}
+
 #[derive(Clone)]
 struct SharedInputTensor {
     dimensions: Vec<u32>,
@@ -101,30 +102,10 @@ impl SharedInputTensor {
     }
 }
 
-impl From<WasiTensor> for SharedInputTensor {
-    fn from(value: WasiTensor) -> Self {
-        Self {
-            dimensions: value.dimensions,
-            ty: value.ty,
-            data: Arc::from(value.data.into_boxed_slice()),
-        }
-    }
-}
-
 trait BackendModel: Send + Sync {
     fn residency(&self) -> AcceleratorMemoryResidency;
     fn as_any(&self) -> &dyn Any;
-}
-
-trait WasiNnBackend: Send + Sync {
-    fn accelerator(&self) -> AcceleratorKind;
-    fn backend_name(&self) -> &'static str;
-    fn init(&self, source: &BackendModelSource) -> Result<Arc<dyn BackendModel>, BackendError>;
-    fn execute(
-        &self,
-        model: &dyn BackendModel,
-        inputs: &[SharedInputTensor],
-    ) -> Result<WasiTensor, BackendError>;
+    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>>;
 }
 
 #[derive(Clone)]
@@ -168,7 +149,6 @@ impl AiInferenceRuntime {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let backends = default_backends();
         let mut models = HashMap::new();
 
         for route in &config.routes {
@@ -179,44 +159,16 @@ impl AiInferenceRuntime {
                         binding.alias
                     ));
                 }
-                let accelerator = AcceleratorKind::from_model_device(&binding.device);
-                let backend = backends.get(&accelerator).cloned().ok_or_else(|| {
-                    anyhow!(
-                        "Integrity Validation Failed: {} backend is unavailable for model `{}`",
-                        accelerator.as_str(),
-                        binding.alias
-                    )
-                })?;
+                let backend_model: Arc<dyn BackendModel> =
+                    Arc::new(CandleBackendModel::load(binding)?);
                 models.insert(
                     binding.alias.clone(),
-                    Arc::new(CandleModel::load_mock_with_backend(binding, backend)?),
+                    Arc::new(CandleModel::load_mock_with_backend(binding, backend_model)?),
                 );
             }
         }
 
         Ok(Self { schedulers, models })
-    }
-
-    pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
-        let registry = AliasGraphRegistry {
-            graphs: self
-                .models
-                .iter()
-                .map(|(alias, model)| {
-                    (
-                        alias.clone(),
-                        WasiGraph::from(Box::new(CandleModelGraph {
-                            model: Arc::clone(model),
-                            scheduler: self
-                                .scheduler_for(model.accelerator)
-                                .expect("accelerator scheduler should exist for model"),
-                        }) as Box<dyn BackendGraph>),
-                    )
-                })
-                .collect(),
-        };
-        let backends = [WasiNnProvider::from(backend::onnx::OnnxBackend::default())];
-        WasiNnCtx::new(backends, WasiRegistry::from(registry))
     }
 
     pub(crate) fn loaded_model_aliases(&self) -> Vec<String> {
@@ -315,14 +267,14 @@ impl AiInferenceRuntime {
             .infer(
                 Arc::clone(model),
                 adapter_id.map(str::to_owned),
-                WasiTensor::new(
-                    vec![prompt.len() as u32],
-                    TensorType::U8,
-                    prompt.as_bytes().to_vec(),
-                ),
+                SharedInputTensor {
+                    dimensions: vec![prompt.len() as u32],
+                    ty: TensorType::U8,
+                    data: Arc::from(prompt.as_bytes()),
+                },
             )
             .map_err(|error| error.to_string())?;
-        String::from_utf8(output.data).map_err(|error| error.to_string())
+        String::from_utf8(output).map_err(|error| error.to_string())
     }
 
     fn scheduler_for(&self, accelerator: AcceleratorKind) -> Option<AcceleratorScheduler> {
@@ -362,20 +314,20 @@ impl AcceleratorScheduler {
         &self,
         model: Arc<CandleModel>,
         adapter_id: Option<String>,
-        input: WasiTensor,
-    ) -> Result<WasiTensor, BackendError> {
+        input: SharedInputTensor,
+    ) -> Result<Vec<u8>, anyhow::Error> {
         let response_rx = self.enqueue(model, adapter_id, input)?;
-        response_rx.recv().map_err(|_| {
-            backend_access_error("AI inference response channel closed unexpectedly")
-        })?
+        response_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("AI inference response channel closed unexpectedly"))?
     }
 
     fn enqueue(
         &self,
         model: Arc<CandleModel>,
         adapter_id: Option<String>,
-        input: WasiTensor,
-    ) -> Result<mpsc::Receiver<Result<WasiTensor, BackendError>>, BackendError> {
+        input: SharedInputTensor,
+    ) -> Result<mpsc::Receiver<Result<Vec<u8>, anyhow::Error>>, anyhow::Error> {
         let (response_tx, response_rx) = mpsc::channel();
         let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
         self.metrics.queued_requests.fetch_add(1, Ordering::Relaxed);
@@ -389,13 +341,13 @@ impl AcceleratorScheduler {
                 adapter_id,
                 model,
                 qos,
-                input: input.into(),
+                input,
                 response_tx,
             },
         );
         self.sender
             .blocking_send(job)
-            .map_err(|_| backend_access_error("AI inference scheduler has stopped"))?;
+            .map_err(|_| anyhow::anyhow!("AI inference scheduler has stopped"))?;
         Ok(response_rx)
     }
 
@@ -489,7 +441,7 @@ struct InferenceJob {
     model: Arc<CandleModel>,
     qos: RouteQos,
     input: SharedInputTensor,
-    response_tx: mpsc::Sender<Result<WasiTensor, BackendError>>,
+    response_tx: mpsc::Sender<Result<Vec<u8>, anyhow::Error>>,
 }
 
 struct PrioritizedInferenceJob {
@@ -643,7 +595,7 @@ fn age_waiting_jobs(queued: &mut BinaryHeap<PrioritizedInferenceJob>) {
 fn process_batch(
     accelerator: AcceleratorKind,
     batch: &[InferenceJob],
-) -> Vec<Result<WasiTensor, BackendError>> {
+) -> Vec<Result<Vec<u8>, anyhow::Error>> {
     let model = Arc::clone(&batch[0].model);
     let adapter_id = batch[0].adapter_id.as_deref();
     #[cfg(test)]
@@ -665,91 +617,73 @@ fn process_batch(
             );
             batch
                 .iter()
-                .map(|_| Err(backend_access_error(message.clone())))
+                .map(|_| Err(anyhow::anyhow!("{}", message.clone())))
                 .collect()
         }
     }
 }
 
-#[derive(Clone)]
-struct CandleModelGraph {
-    model: Arc<CandleModel>,
-    scheduler: AcceleratorScheduler,
+// Unified candle-native backend model â€” replaces the WasiNnBackend abstraction.
+struct CandleBackendModel {
+    source: BackendModelSource,
 }
 
-impl BackendGraph for CandleModelGraph {
-    fn init_execution_context(&self) -> Result<wasmtime_wasi_nn::ExecutionContext, BackendError> {
-        Ok((Box::new(CandleExecutionContext {
-            model: Arc::clone(&self.model),
-            scheduler: self.scheduler.clone(),
-            input: None,
-            output: None,
-        }) as Box<dyn BackendExecutionContext>)
-            .into())
+impl CandleBackendModel {
+    fn load(binding: &IntegrityModelBinding) -> Result<Self> {
+        if binding.path.trim().is_empty() {
+            return Err(anyhow!(
+                "Integrity Validation Failed: model alias `{}` must declare a non-empty `path`",
+                binding.alias
+            ));
+        }
+        Ok(Self {
+            source: BackendModelSource {
+                alias: binding.alias.clone(),
+                path: binding.path.clone(),
+                requested_target: binding.device.as_str().to_owned(),
+                accelerator: AcceleratorKind::from_model_device(&binding.device),
+                qos: binding.qos,
+                model_bytes: load_model_bytes(&binding.path),
+            },
+        })
     }
 }
 
-struct CandleExecutionContext {
-    model: Arc<CandleModel>,
-    scheduler: AcceleratorScheduler,
-    input: Option<WasiTensor>,
-    output: Option<WasiTensor>,
-}
-
-impl BackendExecutionContext for CandleExecutionContext {
-    fn set_input(&mut self, id: Id, tensor: &WasiTensor) -> Result<(), BackendError> {
-        match id.index() {
-            Some(0) => {
-                self.input = Some(tensor.clone());
-                Ok(())
-            }
-            _ => Err(backend_access_error(
-                "mock accelerator backend only supports input tensor 0",
-            )),
+impl BackendModel for CandleBackendModel {
+    fn residency(&self) -> AcceleratorMemoryResidency {
+        match self.source.accelerator {
+            AcceleratorKind::Cpu => AcceleratorMemoryResidency::HostRam,
+            AcceleratorKind::Gpu => AcceleratorMemoryResidency::Vram,
+            AcceleratorKind::Npu => AcceleratorMemoryResidency::Sram,
+            AcceleratorKind::Tpu => AcceleratorMemoryResidency::Sram,
         }
     }
 
-    fn get_output(&mut self, id: Id) -> Result<WasiTensor, BackendError> {
-        match id.index() {
-            Some(0) => self
-                .output
-                .clone()
-                .ok_or_else(|| backend_access_error("no AI inference output is available yet")),
-            _ => Err(backend_access_error(
-                "mock accelerator backend only supports output tensor 0",
-            )),
-        }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
-    fn compute(
-        &mut self,
-        inputs: Option<Vec<NamedTensor>>,
-    ) -> Result<Option<Vec<NamedTensor>>, BackendError> {
-        let use_named_io = inputs.is_some();
-        let input = match inputs {
-            Some(mut inputs) => inputs
-                .drain(..)
-                .next()
-                .map(|named| named.tensor)
-                .ok_or_else(|| {
-                    backend_access_error("wasi-nn compute requires at least one input tensor")
-                })?,
-            None => self.input.clone().ok_or_else(|| {
-                backend_access_error("wasi-nn input tensor 0 must be set before compute")
-            })?,
-        };
-
-        let output = self.scheduler.infer(Arc::clone(&self.model), None, input)?;
-        self.output = Some(output.clone());
-
-        if use_named_io {
-            Ok(Some(vec![NamedTensor {
-                name: "output".to_owned(),
-                tensor: output,
-            }]))
-        } else {
-            Ok(None)
+    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>> {
+        if inputs.is_empty() {
+            return Err(anyhow!(
+                "{} backend requires at least one input tensor",
+                self.source.accelerator.as_str()
+            ));
         }
+        let input = &inputs[0];
+        if !matches!(input.ty, TensorType::U8 | TensorType::Fp32) {
+            return Err(anyhow!(
+                "{} backend only supports U8 or F32 tensors",
+                self.source.accelerator.as_str()
+            ));
+        }
+        let longest_prompt = inputs.iter().map(|i| i.byte_len()).max().unwrap_or(1);
+        let batch_size = inputs.len();
+        let _prompt_batch =
+            CandleTensor::zeros((batch_size, longest_prompt), DType::F32, &Device::Cpu)
+                .context("failed to prepare candle mock batch")?;
+        let _resident_weights = self.source.model_bytes.len();
+        Ok(b"MOCK_LLM_RESPONSE".to_vec())
     }
 }
 
@@ -759,27 +693,15 @@ struct CandleModel {
     qos: RouteQos,
     #[cfg_attr(not(test), allow(dead_code))]
     memory_residency: AcceleratorMemoryResidency,
-    backend: Arc<dyn WasiNnBackend>,
     backend_model: Arc<dyn BackendModel>,
     #[cfg(test)]
     mock_latency: Duration,
 }
 
 impl CandleModel {
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn load_mock(binding: &IntegrityModelBinding) -> Result<Self> {
-        let backends = default_backends();
-        let accelerator = AcceleratorKind::from_model_device(&binding.device);
-        let backend = backends
-            .get(&accelerator)
-            .cloned()
-            .ok_or_else(|| anyhow!("no backend is registered for `{}`", accelerator.as_str()))?;
-        Self::load_mock_with_backend(binding, backend)
-    }
-
     fn load_mock_with_backend(
         binding: &IntegrityModelBinding,
-        backend: Arc<dyn WasiNnBackend>,
+        backend_model: Arc<dyn BackendModel>,
     ) -> Result<Self> {
         if binding.path.trim().is_empty() {
             return Err(anyhow!(
@@ -787,26 +709,12 @@ impl CandleModel {
                 binding.alias
             ));
         }
-
-        let source = BackendModelSource {
-            alias: binding.alias.clone(),
-            path: binding.path.clone(),
-            requested_target: binding.device.as_str().to_owned(),
-            accelerator: AcceleratorKind::from_model_device(&binding.device),
-            qos: binding.qos,
-            model_bytes: load_model_bytes(&binding.path),
-        };
-        let backend_model = backend
-            .init(&source)
-            .map_err(|error| anyhow!(error.to_string()))?;
         let memory_residency = backend_model.residency();
-
         Ok(Self {
             alias: binding.alias.clone(),
-            accelerator: source.accelerator,
-            qos: source.qos,
+            accelerator: AcceleratorKind::from_model_device(&binding.device),
+            qos: binding.qos,
             memory_residency,
-            backend,
             backend_model,
             #[cfg(test)]
             mock_latency: Duration::ZERO,
@@ -814,8 +722,13 @@ impl CandleModel {
     }
 
     #[cfg(test)]
-    fn with_mock_latency(mut self, mock_latency: Duration) -> Self {
-        self.mock_latency = mock_latency;
+    fn load_mock(binding: &IntegrityModelBinding) -> Result<Self> {
+        Self::load_mock_with_backend(binding, Arc::new(CandleBackendModel::load(binding)?))
+    }
+
+    #[cfg(test)]
+    fn with_mock_latency(mut self, latency: Duration) -> Self {
+        self.mock_latency = latency;
         self
     }
 
@@ -823,410 +736,9 @@ impl CandleModel {
         &self,
         inputs: &[SharedInputTensor],
         adapter_id: Option<&str>,
-    ) -> Result<WasiTensor, BackendError> {
-        let adapter = adapter_id
-            .map(LoraAdapterGuard::load)
-            .transpose()
-            .map_err(|error| backend_access_error(error.to_string()))?;
-        self.backend
-            .execute(self.backend_model.as_ref(), inputs)
-            .inspect(|_| drop(adapter))
-    }
-}
-
-struct LoraAdapterGuard {
-    _adapter_id: String,
-    _weights: Vec<u8>,
-    _loaded_at: Instant,
-}
-
-impl LoraAdapterGuard {
-    fn load(adapter_id: &str) -> Result<Self> {
-        let adapter_path = resolve_lora_adapter_path(adapter_id)?;
-        let weights = fs::read(&adapter_path).map_err(|error| {
-            anyhow!(
-                "failed to load LoRA adapter `{adapter_id}` from `{}`: {error}",
-                adapter_path.display()
-            )
-        })?;
-        Ok(Self {
-            _adapter_id: adapter_id.to_owned(),
-            _weights: weights,
-            _loaded_at: Instant::now(),
-        })
-    }
-}
-
-impl Drop for LoraAdapterGuard {
-    fn drop(&mut self) {
-        self._weights.clear();
-        self._weights.shrink_to_fit();
-    }
-}
-
-fn resolve_lora_adapter_path(adapter_id: &str) -> Result<PathBuf> {
-    let sanitized = adapter_id.trim();
-    if sanitized.is_empty()
-        || sanitized.contains("..")
-        || sanitized.contains('/')
-        || sanitized.contains('\\')
-    {
-        return Err(anyhow!("LoRA adapter id `{adapter_id}` is invalid"));
-    }
-    Ok(std::env::var(MODEL_BROKER_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("tachyon_data"))
-        .join("adapters")
-        .join(format!("{sanitized}.safetensors")))
-}
-
-#[derive(Default)]
-struct AliasGraphRegistry {
-    graphs: HashMap<String, WasiGraph>,
-}
-
-impl GraphRegistry for AliasGraphRegistry {
-    fn get(&self, name: &str) -> Option<&WasiGraph> {
-        self.graphs.get(name)
-    }
-
-    fn get_mut(&mut self, name: &str) -> Option<&mut WasiGraph> {
-        self.graphs.get_mut(name)
-    }
-}
-
-fn backend_access_error(message: impl Into<String>) -> BackendError {
-    BackendError::BackendAccess(format_err!("{}", message.into()))
-}
-
-fn load_model_bytes(path: &str) -> Arc<[u8]> {
-    match fs::read(path) {
-        Ok(bytes) => Arc::from(bytes.into_boxed_slice()),
-        Err(_) => Arc::from(path.as_bytes().to_vec().into_boxed_slice()),
-    }
-}
-
-fn default_backends() -> HashMap<AcceleratorKind, Arc<dyn WasiNnBackend>> {
-    HashMap::from([
-        (
-            AcceleratorKind::Cpu,
-            Arc::new(CpuBackend) as Arc<dyn WasiNnBackend>,
-        ),
-        (
-            AcceleratorKind::Gpu,
-            Arc::new(GpuBackend) as Arc<dyn WasiNnBackend>,
-        ),
-        (
-            AcceleratorKind::Npu,
-            Arc::new(NpuBackend) as Arc<dyn WasiNnBackend>,
-        ),
-        (
-            AcceleratorKind::Tpu,
-            Arc::new(TpuBackend) as Arc<dyn WasiNnBackend>,
-        ),
-    ])
-}
-
-fn typed_backend_model<'a, T: BackendModel + 'static>(
-    model: &'a dyn BackendModel,
-    accelerator: AcceleratorKind,
-    backend_name: &str,
-) -> Result<&'a T, BackendError> {
-    model.as_any().downcast_ref::<T>().ok_or_else(|| {
-        backend_access_error(format!(
-            "{backend_name} backend received an incompatible {} model handle",
-            accelerator.as_str()
-        ))
-    })
-}
-
-fn mock_text_tensor() -> WasiTensor {
-    WasiTensor::new(
-        vec![MOCK_INFERENCE_RESPONSE.len() as u32],
-        TensorType::U8,
-        MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
-    )
-}
-
-fn mock_batch_dimensions(inputs: &[SharedInputTensor]) -> (usize, usize) {
-    let batch_size = inputs.len().max(1);
-    let longest_prompt = inputs
-        .iter()
-        .map(SharedInputTensor::byte_len)
-        .max()
-        .unwrap_or(1);
-    (batch_size, longest_prompt)
-}
-
-fn validate_input_tensors(
-    inputs: &[SharedInputTensor],
-    accelerator: AcceleratorKind,
-) -> Result<()> {
-    if inputs.is_empty() {
-        return Err(anyhow!(
-            "{} backend requires at least one input tensor",
-            accelerator.as_str()
-        ));
-    }
-    for input in inputs {
-        if input.dimensions.is_empty() {
-            return Err(anyhow!(
-                "{} backend requires at least one tensor dimension",
-                accelerator.as_str()
-            ));
-        }
-        if !matches!(input.ty, TensorType::U8 | TensorType::Fp32) {
-            return Err(anyhow!(
-                "{} backend only supports U8 or F32 test tensors",
-                accelerator.as_str()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn execute_basic_backend(
-    source: &BackendModelSource,
-    accelerator: AcceleratorKind,
-    inputs: &[SharedInputTensor],
-) -> Result<WasiTensor, BackendError> {
-    validate_input_tensors(inputs, accelerator)
-        .map_err(|error| backend_access_error(error.to_string()))?;
-    let (batch_size, longest_prompt) = mock_batch_dimensions(inputs);
-    let _prompt_batch = CandleTensor::zeros((batch_size, longest_prompt), DType::F32, &Device::Cpu)
-        .map_err(|error| {
-            backend_access_error(format!(
-                "failed to prepare {} mock batch for `{}` on requested `{}` from `{}`: {error}",
-                accelerator.as_str(),
-                source.alias,
-                source.requested_target,
-                source.path
-            ))
-        })?;
-    let _resident_weights = source.model_bytes.len();
-    Ok(mock_text_tensor())
-}
-
-struct CpuBackend;
-struct GpuBackend;
-struct NpuBackend;
-struct TpuBackend;
-
-#[derive(Clone)]
-struct CpuBackendModel {
-    source: BackendModelSource,
-}
-
-#[derive(Clone)]
-struct GpuBackendModel {
-    source: BackendModelSource,
-    resident_weights: Arc<[u8]>,
-    attention_stack: TurboQuantAttentionStack,
-    _variables: VarMap,
-}
-
-#[derive(Clone)]
-struct NpuBackendModel {
-    source: BackendModelSource,
-    resident_weights: Arc<[u8]>,
-}
-
-#[derive(Clone)]
-struct TpuBackendModel {
-    source: BackendModelSource,
-    resident_weights: Arc<[u8]>,
-}
-
-impl BackendModel for CpuBackendModel {
-    fn residency(&self) -> AcceleratorMemoryResidency {
-        AcceleratorMemoryResidency::HostRam
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl BackendModel for GpuBackendModel {
-    fn residency(&self) -> AcceleratorMemoryResidency {
-        AcceleratorMemoryResidency::Vram
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl BackendModel for NpuBackendModel {
-    fn residency(&self) -> AcceleratorMemoryResidency {
-        AcceleratorMemoryResidency::Sram
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl BackendModel for TpuBackendModel {
-    fn residency(&self) -> AcceleratorMemoryResidency {
-        AcceleratorMemoryResidency::Sram
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl WasiNnBackend for CpuBackend {
-    fn accelerator(&self) -> AcceleratorKind {
-        AcceleratorKind::Cpu
-    }
-
-    fn backend_name(&self) -> &'static str {
-        "ort"
-    }
-
-    fn init(&self, source: &BackendModelSource) -> Result<Arc<dyn BackendModel>, BackendError> {
-        if source.model_bytes.is_empty() {
-            return Err(backend_access_error(
-                "CPU backend requires non-empty model bytes",
-            ));
-        }
-        Ok(Arc::new(CpuBackendModel {
-            source: source.clone(),
-        }))
-    }
-
-    fn execute(
-        &self,
-        model: &dyn BackendModel,
-        inputs: &[SharedInputTensor],
-    ) -> Result<WasiTensor, BackendError> {
-        let model =
-            typed_backend_model::<CpuBackendModel>(model, self.accelerator(), self.backend_name())?;
-        execute_basic_backend(&model.source, self.accelerator(), inputs)
-    }
-}
-
-impl WasiNnBackend for GpuBackend {
-    fn accelerator(&self) -> AcceleratorKind {
-        AcceleratorKind::Gpu
-    }
-
-    fn backend_name(&self) -> &'static str {
-        "candle"
-    }
-
-    fn init(&self, source: &BackendModelSource) -> Result<Arc<dyn BackendModel>, BackendError> {
-        if source.model_bytes.is_empty() {
-            return Err(backend_access_error(
-                "GPU backend requires non-empty model bytes",
-            ));
-        }
-        Ok(Arc::new(GpuBackendModel {
-            source: source.clone(),
-            resident_weights: Arc::clone(&source.model_bytes),
-            attention_stack: TurboQuantAttentionStack::default(),
-            _variables: VarMap::new(),
-        }))
-    }
-
-    fn execute(
-        &self,
-        model: &dyn BackendModel,
-        inputs: &[SharedInputTensor],
-    ) -> Result<WasiTensor, BackendError> {
-        let model =
-            typed_backend_model::<GpuBackendModel>(model, self.accelerator(), self.backend_name())?;
-        validate_input_tensors(inputs, self.accelerator())
-            .map_err(|error| backend_access_error(error.to_string()))?;
-        let (batch_size, longest_prompt) = mock_batch_dimensions(inputs);
-        let _prompt_batch =
-            CandleTensor::zeros((batch_size, longest_prompt), DType::F32, &Device::Cpu).map_err(
-                |error| {
-                    backend_access_error(format!(
-                "failed to prepare mock Candle batch for `{}` on requested `{}` from `{}`: {error}",
-                model.source.alias, model.source.requested_target, model.source.path
-            ))
-                },
-            )?;
-        let _resident_vram = model.resident_weights.len();
-        model
-            .attention_stack
-            .run_mock_prompt(batch_size, longest_prompt)
-            .map_err(|error| {
-                backend_access_error(format!(
-                    "failed to execute TurboQuant attention mock for `{}` on requested `{}` from `{}`: {error}",
-                    model.source.alias, model.source.requested_target, model.source.path
-                ))
-            })?;
-        Ok(mock_text_tensor())
-    }
-}
-
-impl WasiNnBackend for NpuBackend {
-    fn accelerator(&self) -> AcceleratorKind {
-        AcceleratorKind::Npu
-    }
-
-    fn backend_name(&self) -> &'static str {
-        "openvino"
-    }
-
-    fn init(&self, source: &BackendModelSource) -> Result<Arc<dyn BackendModel>, BackendError> {
-        if source.model_bytes.is_empty() {
-            return Err(backend_access_error(
-                "NPU backend requires non-empty model bytes",
-            ));
-        }
-        Ok(Arc::new(NpuBackendModel {
-            source: source.clone(),
-            resident_weights: Arc::clone(&source.model_bytes),
-        }))
-    }
-
-    fn execute(
-        &self,
-        model: &dyn BackendModel,
-        inputs: &[SharedInputTensor],
-    ) -> Result<WasiTensor, BackendError> {
-        let model =
-            typed_backend_model::<NpuBackendModel>(model, self.accelerator(), self.backend_name())?;
-        let _resident_sram = model.resident_weights.len();
-        execute_basic_backend(&model.source, self.accelerator(), inputs)
-    }
-}
-
-impl WasiNnBackend for TpuBackend {
-    fn accelerator(&self) -> AcceleratorKind {
-        AcceleratorKind::Tpu
-    }
-
-    fn backend_name(&self) -> &'static str {
-        "libtpu"
-    }
-
-    fn init(&self, source: &BackendModelSource) -> Result<Arc<dyn BackendModel>, BackendError> {
-        if source.model_bytes.is_empty() {
-            return Err(backend_access_error(
-                "TPU backend requires non-empty model bytes",
-            ));
-        }
-        Ok(Arc::new(TpuBackendModel {
-            source: source.clone(),
-            resident_weights: Arc::clone(&source.model_bytes),
-        }))
-    }
-
-    fn execute(
-        &self,
-        model: &dyn BackendModel,
-        inputs: &[SharedInputTensor],
-    ) -> Result<WasiTensor, BackendError> {
-        let model =
-            typed_backend_model::<TpuBackendModel>(model, self.accelerator(), self.backend_name())?;
-        let _resident_sram = model.resident_weights.len();
-        execute_basic_backend(&model.source, self.accelerator(), inputs)
+    ) -> Result<Vec<u8>> {
+        let _ = adapter_id; // LoRA adapters are a future enhancement
+        self.backend_model.execute(inputs)
     }
 }
 
@@ -1412,7 +924,7 @@ fn quantizable_fixture_values(value_count: usize) -> Vec<f32> {
         .collect()
 }
 
-// ── Layer-Wise Inference: memory profile ─────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: memory profile Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 /// Controls VRAM placement strategy for a single inference call. Mirrors the
 /// `memory-profile` enum in `wit/ai/inference.wit`.
@@ -1430,7 +942,7 @@ pub(crate) enum MemoryProfile {
 
 pub(crate) use vram_manager::VramPriority;
 
-// ── Layer-Wise Inference: zero-copy model loader ──────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: zero-copy model loader Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 /// A single transformer layer's weight slice, backed by a memory-mapped region.
 /// Tensors are allocated on `Device::Cpu` and transferred to the accelerator
@@ -1570,7 +1082,7 @@ impl LayerWiseMappedModel {
     }
 }
 
-// ── Layer-Wise Inference: prefill batching (Phase 1) ─────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: prefill batching (Phase 1) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 /// Holds the intermediate hidden states produced by the prefill sweep.
 /// After `PrefillBatch::run` completes, `hidden_states` contains the activations
@@ -1604,7 +1116,7 @@ impl PrefillBatch {
     /// per-layer KV-Cache resident in Host RAM.
     ///
     /// For each layer `i`:
-    /// 1. Transfer layer weights to GPU (simulated as CPU→CPU copy on non-CUDA builds).
+    /// 1. Transfer layer weights to GPU (simulated as CPUÃ¢â€ â€™CPU copy on non-CUDA builds).
     /// 2. Compute hidden states through the layer.
     /// 3. Extract the KV-Cache slice and store it in Host RAM.
     /// 4. Drop layer weights before loading the next layer.
@@ -1620,7 +1132,7 @@ impl PrefillBatch {
             // Load this layer's weights into CPU (would be GPU on real hardware).
             let layer_slice = loader.load_layer(layer_idx)?;
 
-            // Forward pass: hidden_states = layer_weights ⊗ hidden_states (mock matmul).
+            // Forward pass: hidden_states = layer_weights Ã¢Å â€” hidden_states (mock matmul).
             // Real implementation: call into a Candle transformer block here.
             let weight_len = layer_slice.weights.elem_count();
             let hs_len = hidden_states.elem_count();
@@ -1643,7 +1155,7 @@ impl PrefillBatch {
                 values: kv_values,
             });
 
-            // `layer_slice` is dropped here — weights are freed from (simulated) VRAM.
+            // `layer_slice` is dropped here Ã¢â‚¬â€ weights are freed from (simulated) VRAM.
         }
 
         Ok(PrefillOutput {
@@ -1653,7 +1165,7 @@ impl PrefillBatch {
     }
 }
 
-// ── Layer-Wise Inference: KV-Cache Host-RAM paging ───────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: KV-Cache Host-RAM paging Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 /// A single layer's key-value cache resident in Host RAM (CPU memory).
 /// Paged back to GPU only when the decode loop re-enters that layer.
@@ -1684,7 +1196,7 @@ impl KvCacheSlice {
     }
 }
 
-// ── Layer-Wise Inference: async pipeline ring buffer (Phase 2) ───────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: async pipeline ring buffer (Phase 2) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 /// A fixed-size ring buffer that holds `capacity` pre-allocated GPU tensors.
 /// The decode loop rotates through the buffer so that layer N+1 weights can be
@@ -1767,7 +1279,7 @@ impl LayerPipeline {
 
         for _token_step in 0..max_tokens {
             for layer_idx in 0..loader.num_layers {
-                // ── Compute stream: forward pass for this layer ───────────────
+                // Ã¢â€â‚¬Ã¢â€â‚¬ Compute stream: forward pass for this layer Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                 let layer_weights = match self.ring.get(layer_idx) {
                     Some(w) => w.clone(),
                     None => {
@@ -1785,7 +1297,7 @@ impl LayerPipeline {
                     .map_err(|e| anyhow!("decode forward pass failed at layer {layer_idx}: {e}"))?
                     .reshape((1, w_len))?;
 
-                // ── Copy stream: page KV-Cache for this layer to CPU ──────────
+                // Ã¢â€â‚¬Ã¢â€â‚¬ Copy stream: page KV-Cache for this layer to CPU Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                 if let Some(cache) = kv_cache.get_mut(layer_idx) {
                     let hs_vals = hidden_states.to_vec2::<f32>().unwrap_or_default();
                     for row in &hs_vals {
@@ -1793,7 +1305,7 @@ impl LayerPipeline {
                     }
                 }
 
-                // ── Copy stream: pre-fetch next layer into ring buffer ─────────
+                // Ã¢â€â‚¬Ã¢â€â‚¬ Copy stream: pre-fetch next layer into ring buffer Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                 let next_layer = layer_idx + self.window;
                 if next_layer < loader.num_layers {
                     if let Ok(next_slice) = loader.load_layer(next_layer) {
@@ -1820,7 +1332,7 @@ impl LayerPipeline {
     }
 }
 
-// ── Semantic Context Flattener ────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Semantic Context Flattener Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 /// Well-known JSON field names that carry semantic context identity.
 const ROLE_FIELD: &str = "role";
@@ -2007,7 +1519,11 @@ mod tests {
                     .infer(
                         model,
                         None,
-                        WasiTensor::new(vec![1], TensorType::U8, b"hello".to_vec()),
+                        SharedInputTensor {
+                            dimensions: vec![1],
+                            ty: TensorType::U8,
+                            data: Arc::from(b"hello".as_slice()),
+                        },
                     )
                     .expect("inference should succeed")
             }));
@@ -2015,7 +1531,7 @@ mod tests {
 
         for handle in handles {
             let output = handle.join().expect("worker should join");
-            assert_eq!(output.data, MOCK_INFERENCE_RESPONSE.as_bytes());
+            assert_eq!(output, MOCK_INFERENCE_RESPONSE.as_bytes());
         }
 
         let snapshot = runtime.scheduler_snapshot(AcceleratorKind::Cpu);
@@ -2057,7 +1573,11 @@ mod tests {
                     .enqueue(
                         Arc::clone(&batch_model),
                         None,
-                        WasiTensor::new(vec![1], TensorType::U8, b"batch".to_vec()),
+                        SharedInputTensor {
+                            dimensions: vec![1],
+                            ty: TensorType::U8,
+                            data: Arc::from(b"batch".as_slice()),
+                        },
                     )
                     .expect("batch request should queue"),
             );
@@ -2067,7 +1587,11 @@ mod tests {
             .enqueue(
                 Arc::clone(&realtime_model),
                 None,
-                WasiTensor::new(vec![1], TensorType::U8, b"realtime".to_vec()),
+                SharedInputTensor {
+                    dimensions: vec![1],
+                    ty: TensorType::U8,
+                    data: Arc::from(b"realtime".as_slice()),
+                },
             )
             .expect("realtime request should queue");
 
@@ -2284,7 +1808,7 @@ mod tests {
     fn turboquant_round_trip_through_native_rust_implementation() {
         // Previously this test compared the host's TurboQuant decompressor against
         // pre-recorded byte fixtures produced by the C++ FFI shim, to assert the
-        // Rust ↔ C++ round-trip. The C++ shim is gone; the fixtures went with it.
+        // Rust Ã¢â€ â€ C++ round-trip. The C++ shim is gone; the fixtures went with it.
         // We now build a representative input from the 2-bit codebook directly,
         // round-trip it through the same custom-op the production inference path
         // uses, and assert the output matches the input. This is a stronger test

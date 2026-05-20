@@ -1,23 +1,12 @@
 use super::*;
 
 impl LegacyHostState {
-    pub(crate) fn new(
-        wasi: WasiP1Ctx,
-        max_memory_bytes: usize,
-        #[cfg(feature = "ai-inference-onnx")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
-    ) -> Self {
+    pub(crate) fn new(wasi: WasiP1Ctx, max_memory_bytes: usize) -> Self {
         Self {
             wasi,
-            #[cfg(feature = "ai-inference-onnx")]
-            wasi_nn: build_wasi_nn_ctx(ai_runtime.as_ref()),
             limits: GuestResourceLimiter::new(max_memory_bytes),
         }
     }
-}
-
-#[cfg(feature = "ai-inference-onnx")]
-pub(crate) fn build_wasi_nn_ctx(runtime: &ai_inference::AiInferenceRuntime) -> WasiNnCtx {
-    runtime.build_wasi_nn_ctx()
 }
 
 impl SecretsVault {
@@ -104,19 +93,19 @@ impl ComponentHostState {
             outbound_http_client: blocking_outbound_http_client(),
             route_path: route.path.clone(),
             route_role: route.role,
-            #[cfg(feature = "ai-inference-onnx")]
+            #[cfg(feature = "ai-inference")]
             ai_runtime: None,
-            #[cfg(feature = "ai-inference-onnx")]
+            #[cfg(feature = "ai-inference")]
             allowed_model_aliases: route
                 .models
                 .iter()
                 .map(|binding| binding.alias.clone())
                 .collect(),
-            #[cfg(feature = "ai-inference-onnx")]
+            #[cfg(feature = "ai-inference")]
             adapter_id: route.adapter_id.clone(),
-            #[cfg(feature = "ai-inference-onnx")]
+            #[cfg(feature = "ai-inference")]
             accelerator_models: HashMap::new(),
-            #[cfg(feature = "ai-inference-onnx")]
+            #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
         })
     }
@@ -140,7 +129,7 @@ impl ComponentHostState {
     }
 
     pub(crate) fn hot_model_aliases(&self) -> Vec<String> {
-        #[cfg(feature = "ai-inference-onnx")]
+        #[cfg(feature = "ai-inference")]
         {
             self.ai_runtime
                 .as_ref()
@@ -148,14 +137,14 @@ impl ComponentHostState {
                 .unwrap_or_default()
         }
 
-        #[cfg(not(feature = "ai-inference-onnx"))]
+        #[cfg(not(feature = "ai-inference"))]
         {
             Vec::new()
         }
     }
 
     pub(crate) fn accelerator_queue_loads(&self) -> AcceleratorQueueLoads {
-        #[cfg(feature = "ai-inference-onnx")]
+        #[cfg(feature = "ai-inference")]
         {
             let Some(runtime) = self.ai_runtime.as_ref() else {
                 return AcceleratorQueueLoads::default();
@@ -180,7 +169,7 @@ impl ComponentHostState {
             }
         }
 
-        #[cfg(not(feature = "ai-inference-onnx"))]
+        #[cfg(not(feature = "ai-inference"))]
         {
             AcceleratorQueueLoads::default()
         }
@@ -254,7 +243,7 @@ impl ComponentHostState {
         }
     }
 
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) fn load_accelerator_model(
         &mut self,
         accelerator: ai_inference::AcceleratorKind,
@@ -276,7 +265,7 @@ impl ComponentHostState {
         Ok(model_id)
     }
 
-    #[cfg(feature = "ai-inference-onnx")]
+    #[cfg(feature = "ai-inference")]
     pub(crate) fn compute_accelerator_prompt(
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
@@ -1608,7 +1597,7 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     }
 }
 
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for ComponentHostState {
     fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
         self.load_accelerator_model(ai_inference::AcceleratorKind::Cpu, name)
@@ -1619,7 +1608,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
     }
 }
 
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for ComponentHostState {
     fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
         self.load_accelerator_model(ai_inference::AcceleratorKind::Gpu, name)
@@ -1630,7 +1619,7 @@ impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for Compone
     }
 }
 
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::npu::Host for ComponentHostState {
     fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
         self.load_accelerator_model(ai_inference::AcceleratorKind::Npu, name)
@@ -1641,7 +1630,7 @@ impl accelerator_component_bindings::tachyon::accelerator::npu::Host for Compone
     }
 }
 
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::tpu::Host for ComponentHostState {
     fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
         self.load_accelerator_model(ai_inference::AcceleratorKind::Tpu, name)

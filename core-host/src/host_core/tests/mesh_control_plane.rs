@@ -725,7 +725,7 @@ async fn capability_routing_returns_503_when_local_and_mesh_lack_requirements() 
     host_server.abort();
 }
 
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 #[tokio::test(flavor = "multi_thread")]
 async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
     use axum::{
@@ -835,7 +835,7 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
     peer_server.abort();
 }
 
-#[cfg(feature = "ai-inference-onnx")]
+#[cfg(feature = "ai-inference")]
 #[tokio::test(flavor = "multi_thread")]
 async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold() {
     use axum::{
