@@ -1,16 +1,23 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonIdentityPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
 
-  connectedCallback(): void {
+  async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindForm();
     this.animateEntrance();
+    try {
+      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "config-security" });
+      if (staged) {
+        this.setField("jwt-issuer", staged["jwt_issuer"]);
+        this.setField("crdt-quota", staged["crdt_quota"]);
+      }
+    } catch { /* staged config unavailable */ }
   }
 
   disconnectedCallback(): void {
@@ -74,6 +81,11 @@ export class TachyonIdentityPanel extends TachyonConfigDashboard {
     const input = this.root.getElementById(id) as HTMLInputElement | null;
     const value = input?.valueAsNumber ?? Number.NaN;
     return Number.isFinite(value) ? value : fallback;
+  }
+
+  private setField(id: string, value: unknown): void {
+    const el = this.root.getElementById(id) as HTMLInputElement | null;
+    if (el && value !== undefined && value !== null) el.value = String(value);
   }
 }
 

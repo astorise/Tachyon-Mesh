@@ -1401,6 +1401,17 @@ pub async fn stage_configuration_overlay(domain: &str, payload: serde_json::Valu
     Ok(())
 }
 
+/// Returns the staged (not-yet-sealed) payload for a given configuration domain,
+/// or `None` if no overlay has been staged for that domain.
+pub async fn get_staged_config(domain: &str) -> Result<Option<serde_json::Value>> {
+    let overlay = read_overlay_file().await?;
+    Ok(overlay
+        .configurations
+        .into_iter()
+        .find(|entry| entry.domain == domain)
+        .map(|entry| entry.payload))
+}
+
 pub async fn seal_overlay() -> Result<SealApplyOutcome> {
     let manifest = seal_overlay_manifest().await?;
     write_lockfile(&manifest).await?;
