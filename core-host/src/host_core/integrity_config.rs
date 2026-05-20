@@ -371,9 +371,59 @@ pub(crate) struct RegistryActiveSystemNode {
 }
 
 pub(crate) async fn admin_nodes_handler(State(state): State<AppState>) -> Response {
-    match list_registry_nodes(&state.core_store) {
-        Ok(nodes) => (StatusCode::OK, axum::Json(nodes)).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    let mut nodes = match list_registry_nodes(&state.core_store) {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let self_id = &state.host_identity.public_key_hex;
+    if !nodes.iter().any(|n| &n.node_id == self_id) {
+        nodes.push(self_registry_node(self_id, &state));
+    }
+    (StatusCode::OK, axum::Json(nodes)).into_response()
+}
+
+fn self_registry_node(node_id: &str, state: &AppState) -> RegistryEnrolledNode {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let total_ram_mb = sys.total_memory() / 1024 / 1024;
+    let available_ram_mb = sys.available_memory() / 1024 / 1024;
+    let accelerators = state.host_capabilities.names();
+    let gpus = detect_self_gpus(&state.host_capabilities);
+    RegistryEnrolledNode {
+        node_id: node_id.to_owned(),
+        public_key: node_id.to_owned(),
+        status: "online".to_owned(),
+        approved_at: unix_timestamp_seconds().unwrap_or(0),
+        last_seen: unix_timestamp_seconds().unwrap_or(0),
+        region: None,
+        zone: None,
+        capabilities: RegistryNodeCapabilities {
+            total_ram_mb,
+            available_ram_mb,
+            accelerators,
+            gpus,
+            active_systems: Vec::new(),
+        },
+    }
+}
+
+fn detect_self_gpus(capabilities: &Capabilities) -> Vec<RegistryGpuStats> {
+    // Report one placeholder GPU entry when CUDA acceleration is detected.
+    // Detailed per-GPU stats (VRAM, utilization) require NVML and are
+    // populated by the node-registry FaaS once a node reports capabilities.
+    if capabilities.supports(Capabilities::from_mask(Capabilities::ACCEL_CUDA)) {
+        vec![RegistryGpuStats {
+            id: "gpu:0".to_owned(),
+            model: "CUDA-capable device".to_owned(),
+            vram_total_mb: 0,
+            vram_used_mb: 0,
+            compute_utilization: 0.0,
+        }]
+    } else {
+        Vec::new()
     }
 }
 

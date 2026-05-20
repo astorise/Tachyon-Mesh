@@ -763,17 +763,32 @@ pub async fn get_mesh_graph() -> Result<MeshGraphSnapshot> {
         .map(|config| config.url.clone())
         .unwrap_or_else(|| "workspace://local".to_owned());
 
-    // When there is a remote connection, we can derive status without a local lockfile.
+    // When there is a remote connection, fetch the live sealed manifest so the
+    // Overview panel can count WASM instances from actual deployed routes.
     if let Some(config) = current.as_ref() {
         let status = match fetch_remote_status(config).await {
             Ok(s) => s,
             Err(_) => "offline".to_owned(),
         };
+        let sealed = get_admin_json::<SealedConfig>(ADMIN_MANIFEST_PATH)
+            .await
+            .ok();
         return Ok(MeshGraphSnapshot {
             source,
             status,
-            routes: Vec::new(),
-            batch_targets: Vec::new(),
+            routes: sealed
+                .as_ref()
+                .map(|s| s.routes.iter().filter_map(parse_route_summary).collect())
+                .unwrap_or_default(),
+            batch_targets: sealed
+                .as_ref()
+                .map(|s| {
+                    s.batch_targets
+                        .iter()
+                        .filter_map(batch_target_name)
+                        .collect()
+                })
+                .unwrap_or_default(),
         });
     }
 
