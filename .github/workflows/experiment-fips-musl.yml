@@ -1,0 +1,68 @@
+name: Experiment — fips + musl via cargo-zigbuild
+
+on:
+  push:
+    branches:
+      - experiment/fips-musl-zigbuild
+  workflow_dispatch:
+
+jobs:
+  fips-musl-zigbuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fips-musl-zigbuild
+
+      - name: Install system deps (cmake, nasm, musl-tools, linux-headers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm musl-tools linux-headers-generic
+
+      - name: Install cargo-zigbuild + Zig
+        run: |
+          pip install cargo-zigbuild ziglang
+          zig version
+
+      - name: Build core-host — fips + musl via cargo-zigbuild
+        run: |
+          cargo zigbuild -p core-host \
+            --target x86_64-unknown-linux-musl \
+            --no-default-features \
+            --features fips \
+            --release \
+            2>&1
+
+      - name: Inspect binary
+        if: success()
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/core-host
+          echo "=== File type ==="
+          file "$BIN"
+          echo "=== Dynamic deps ==="
+          ldd "$BIN" || echo "(static — no dynamic deps)"
+          echo "=== Size ==="
+          du -sh "$BIN"
+          echo "=== FIPS symbol check ==="
+          nm "$BIN" | grep -i "fips" | head -10 || echo "(no FIPS symbols visible — stripped)"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f target/x86_64-unknown-linux-musl/release/core-host ]; then
+            echo "✅ BUILD SUCCEEDED — fips + musl via cargo-zigbuild works"
+          else
+            echo "❌ BUILD FAILED — see logs above for root cause"
+          fi
