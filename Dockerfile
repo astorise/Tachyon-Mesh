@@ -5,6 +5,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
+    cmake \
     curl \
     file \
     libayatana-appindicator3-dev \
@@ -13,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwebkit2gtk-4.1-dev \
     libxdo-dev \
     musl-tools \
+    nasm \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -42,7 +44,15 @@ RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p guest-loop --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-ui --release
-RUN cargo build -p core-host --target x86_64-unknown-linux-musl --release
+# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=fips
+# to produce a feature-specific image variant.
+ARG CARGO_FEATURES=""
+RUN set -eux; \
+    if [ -n "${CARGO_FEATURES}" ]; then \
+      cargo build -p core-host --target x86_64-unknown-linux-musl --release --features "${CARGO_FEATURES}"; \
+    else \
+      cargo build -p core-host --target x86_64-unknown-linux-musl --release; \
+    fi
 
 FROM ubuntu:24.04 AS tinygo-builder
 
