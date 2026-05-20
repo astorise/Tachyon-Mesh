@@ -8,11 +8,11 @@
 // default builds keep `-D dead_code` strict via RUSTFLAGS so production
 // paths can't hide unused code.
 #![cfg_attr(
-    any(feature = "experimental", feature = "ai-inference"),
+    any(feature = "experimental", feature = "ai-inference-onnx"),
     allow(dead_code)
 )]
 
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "ai-inference-onnx")]
 mod ai_inference;
 mod auth;
 mod core_error;
@@ -83,7 +83,7 @@ mod control_plane_component_bindings {
     });
 }
 
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "ai-inference-onnx")]
 mod accelerator_component_bindings {
     wasmtime::component::bindgen!({
         path: "../wit/accelerator",

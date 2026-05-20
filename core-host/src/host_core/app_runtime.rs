@@ -1444,14 +1444,14 @@ pub(crate) fn requested_model_alias(
         })
 }
 
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "ai-inference-onnx")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RouteMeshQosProfile {
     pub(crate) accelerator: ai_inference::AcceleratorKind,
     pub(crate) qos: RouteQos,
 }
 
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "ai-inference-onnx")]
 pub(crate) fn route_mesh_qos_profile(
     route: &IntegrityRoute,
     requested_model: Option<&str>,
@@ -1470,7 +1470,7 @@ pub(crate) fn route_mesh_qos_profile(
     })
 }
 
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "ai-inference-onnx")]
 pub(crate) fn should_consult_mesh_qos_override(
     profile: RouteMeshQosProfile,
     local_load: u32,
@@ -1662,7 +1662,7 @@ pub(crate) async fn faas_handler(
                 let required_capabilities =
                     Capabilities::from_mask(selected_target.required_capability_mask);
                 let local_supports_target = state.host_capabilities.supports(required_capabilities);
-                #[cfg(feature = "ai-inference")]
+                #[cfg(feature = "ai-inference-onnx")]
                 let mesh_qos_destination = route_mesh_qos_profile(
                     &route,
                     requested_model.as_deref(),
@@ -1689,7 +1689,7 @@ pub(crate) async fn faas_handler(
                     })?
                 });
 
-                #[cfg(not(feature = "ai-inference"))]
+                #[cfg(not(feature = "ai-inference-onnx"))]
                 let mesh_qos_destination: Option<String> = None;
 
                 if let Some(destination) = mesh_qos_destination.or_else(|| {
@@ -2578,7 +2578,7 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
     let task_async_log_sender = state.async_log_sender.clone();
     let task_instance_pool = Arc::clone(&runtime.instance_pool);
     let route_requires_tee = route.requires_tee;
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
     let guest_request = GuestRequest {
         method: method.to_string(),
@@ -2612,7 +2612,7 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                 propagated_headers: task_propagated_headers,
                 route_overrides: task_route_overrides,
                 host_load: task_host_load,
-                #[cfg(feature = "ai-inference")]
+                #[cfg(feature = "ai-inference-onnx")]
                 ai_runtime: task_ai_runtime,
                 instance_pool: if route_requires_tee {
                     None

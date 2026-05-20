@@ -250,7 +250,7 @@ fn execute_guest_returns_component_response_payload() {
         .sealed_route("/api/guest-example")
         .expect("sealed route should exist")
         .clone();
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     let ai_runtime = test_ai_runtime(&config);
     let response = execute_guest(
         &engine,
@@ -272,7 +272,7 @@ fn execute_guest_returns_component_response_payload() {
             propagated_headers: Vec::new(),
             route_overrides: test_route_overrides(),
             host_load: test_host_load(),
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             ai_runtime,
             instance_pool: None,
         },
@@ -298,7 +298,7 @@ fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
     let config = IntegrityConfig::default_sealed();
     let engine = build_test_engine(&config);
     let route = IntegrityRoute::user("/api/guest-call-legacy");
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     let ai_runtime = test_ai_runtime(&config);
     let response = execute_guest(
         &engine,
@@ -320,7 +320,7 @@ fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
             propagated_headers: Vec::new(),
             route_overrides: test_route_overrides(),
             host_load: test_host_load(),
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             ai_runtime,
             instance_pool: None,
         },
@@ -343,7 +343,7 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
     let config = IntegrityConfig::default_sealed();
     let engine = build_test_engine(&config);
     let route = tcp_echo_test_route(1);
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     let ai_runtime = test_ai_runtime(&config);
     let response = execute_guest(
         &engine,
@@ -369,7 +369,7 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
             propagated_headers: Vec::new(),
             route_overrides: test_route_overrides(),
             host_load: test_host_load(),
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             ai_runtime,
             instance_pool: None,
         },
@@ -385,7 +385,7 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
     );
 }
 
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "ai-inference-onnx")]
 #[test]
 fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
     let mut route = IntegrityRoute::user("/api/guest-ai");
@@ -460,7 +460,7 @@ fn execute_guest_persists_volume_data_for_component_guest() {
         ..IntegrityConfig::default_sealed()
     };
     let engine = build_test_engine(&config);
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     let ai_runtime = test_ai_runtime(&config);
 
     let save_response = execute_guest(
@@ -483,7 +483,7 @@ fn execute_guest_persists_volume_data_for_component_guest() {
             propagated_headers: Vec::new(),
             route_overrides: test_route_overrides(),
             host_load: test_host_load(),
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             ai_runtime: Arc::clone(&ai_runtime),
             instance_pool: None,
         },
@@ -518,7 +518,7 @@ fn execute_guest_persists_volume_data_for_component_guest() {
             propagated_headers: Vec::new(),
             route_overrides: test_route_overrides(),
             host_load: test_host_load(),
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             ai_runtime,
             instance_pool: None,
         },

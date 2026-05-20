@@ -5,7 +5,12 @@ edition = "2021"
 
 [features]
 default = ["ring"]
-ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:lru", "dep:ort", "dep:turboquant-sys", "dep:wasmtime-wasi-nn"]
+# Candle + TurboQuant only — pure Rust, musl-compatible.
+ai-inference-candle = ["dep:candle-core", "dep:candle-nn", "dep:lru", "dep:turboquant-sys"]
+# Adds ORT (ONNX Runtime) and WASI-NN host support — requires glibc (not musl).
+ai-inference-onnx = ["ai-inference-candle", "dep:ort", "dep:wasmtime-wasi-nn"]
+# Backwards-compatible alias: activates the full stack including ORT.
+ai-inference = ["ai-inference-onnx"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
 # VRAM helpers, BaaS scratch tables) so they are excluded from the default build but

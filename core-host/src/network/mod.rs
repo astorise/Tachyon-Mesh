@@ -668,7 +668,7 @@ pub(crate) async fn handle_udp_layer4_datagram(
             propagated_headers: Vec::new(),
             route_overrides,
             host_load,
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
         };
@@ -794,7 +794,7 @@ pub(crate) async fn handle_websocket_connection(
             propagated_headers: Vec::new(),
             route_overrides,
             host_load,
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
         };
@@ -882,7 +882,7 @@ pub(crate) async fn handle_tcp_layer4_connection(
     let telemetry = state.telemetry.clone();
     let route_overrides = Arc::clone(&state.route_overrides);
     let host_load = Arc::clone(&state.host_load);
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
     let (result_tx, result_rx) = oneshot::channel();
@@ -902,7 +902,7 @@ pub(crate) async fn handle_tcp_layer4_connection(
             concurrency_limits,
             route_overrides,
             host_load,
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             ai_runtime,
         ));
     });
@@ -958,7 +958,7 @@ pub(crate) async fn handle_tls_wrapped_tcp_layer4_connection(
     let storage_broker = Arc::clone(&state.storage_broker);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let telemetry = state.telemetry.clone();
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
     let (result_tx, result_rx) = oneshot::channel();
@@ -985,7 +985,7 @@ pub(crate) async fn handle_tls_wrapped_tcp_layer4_connection(
                 concurrency_limits,
                 Arc::clone(&state.route_overrides),
                 Arc::clone(&state.host_load),
-                #[cfg(feature = "ai-inference")]
+                #[cfg(feature = "ai-inference-onnx")]
                 ai_runtime,
             )
         })();
@@ -1019,7 +1019,7 @@ pub(crate) fn execute_tcp_layer4_guest(
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
     route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
     host_load: Arc<HostLoadCounters>,
-    #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+    #[cfg(feature = "ai-inference-onnx")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 ) -> std::result::Result<(), ExecutionError> {
     let execution = GuestExecutionContext {
         config: config.clone(),
@@ -1036,7 +1036,7 @@ pub(crate) fn execute_tcp_layer4_guest(
         propagated_headers: Vec::new(),
         route_overrides,
         host_load,
-        #[cfg(feature = "ai-inference")]
+        #[cfg(feature = "ai-inference-onnx")]
         ai_runtime,
         instance_pool: None,
     };

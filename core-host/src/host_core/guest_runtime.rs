@@ -7,7 +7,7 @@ pub(crate) fn execute_guest(
     route: &IntegrityRoute,
     execution: GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
-    #[cfg(not(feature = "ai-inference"))]
+    #[cfg(not(feature = "ai-inference-onnx"))]
     if requires_ai_inference_feature(function_name) {
         return Err(ai_inference_feature_unavailable_error(function_name));
     }
@@ -333,7 +333,7 @@ pub(crate) fn execute_component_guest(
             "failed to add custom-metrics functions to component linker",
         )
     })?;
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,
         execution.ai_runtime.as_ref(),
@@ -354,7 +354,7 @@ pub(crate) fn execute_component_guest(
             execution.propagated_headers.clone(),
         )?,
     );
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     {
         store.data_mut().ai_runtime = Some(Arc::clone(&execution.ai_runtime));
     }
@@ -1162,7 +1162,7 @@ pub(crate) fn execute_legacy_guest(
         LegacyHostState::new(
             wasi,
             execution.config.guest_memory_limit_bytes,
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             Arc::clone(&execution.ai_runtime),
         ),
     );
@@ -1235,7 +1235,7 @@ pub(crate) fn execute_legacy_guest_with_stdio(
         LegacyHostState::new(
             wasi,
             execution.config.guest_memory_limit_bytes,
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             Arc::clone(&execution.ai_runtime),
         ),
     );
@@ -1628,7 +1628,7 @@ pub(crate) fn build_linker(
     p1::add_to_linker_sync(&mut linker, |state: &mut LegacyHostState| &mut state.wasi).map_err(
         |error| guest_execution_error(error, "failed to add WASI preview1 functions to linker"),
     )?;
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     wasmtime_wasi_nn::witx::add_to_linker(&mut linker, |state: &mut LegacyHostState| {
         &mut state.wasi_nn
     })
@@ -1636,12 +1636,15 @@ pub(crate) fn build_linker(
     Ok(linker)
 }
 
-#[cfg_attr(feature = "ai-inference", allow(dead_code))]
+#[cfg_attr(
+    any(feature = "ai-inference-onnx", feature = "ai-inference-onnx"),
+    allow(dead_code)
+)]
 pub(crate) fn requires_ai_inference_feature(function_name: &str) -> bool {
     normalize_target_module_name(function_name) == "guest-ai"
 }
 
-#[cfg(not(feature = "ai-inference"))]
+#[cfg(not(feature = "ai-inference-onnx"))]
 pub(crate) fn ai_inference_feature_unavailable_error(function_name: &str) -> ExecutionError {
     ExecutionError::Internal(format!(
         "guest `{function_name}` requires `core-host` to be built with `--features ai-inference`"

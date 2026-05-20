@@ -205,7 +205,7 @@ impl Capabilities {
         if cfg!(feature = "http3") {
             mask |= Self::FEATURE_HTTP3;
         }
-        if cfg!(feature = "ai-inference") {
+        if cfg!(feature = "ai-inference-candle") {
             mask |= Self::FEATURE_AI_INFERENCE
                 | Self::ACCEL_CUDA
                 | Self::ACCEL_OPENVINO

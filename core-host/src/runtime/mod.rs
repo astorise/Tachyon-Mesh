@@ -38,7 +38,7 @@ pub(crate) fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeStat
         batch_target_registry: Arc::new(BatchTargetRegistry::build(&config)?),
         concurrency_limits: build_concurrency_limits(&config),
         instance_pool,
-        #[cfg(feature = "ai-inference")]
+        #[cfg(feature = "ai-inference-onnx")]
         ai_runtime: Arc::new(ai_inference::AiInferenceRuntime::from_config(&config)?),
         config,
     })

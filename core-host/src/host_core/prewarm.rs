@@ -69,7 +69,7 @@ pub(crate) fn route_modules_for_prewarm(route: &IntegrityRoute) -> Vec<String> {
     modules.into_iter().collect()
 }
 
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "ai-inference-onnx")]
 pub(crate) fn add_accelerator_interfaces_to_component_linker(
     linker: &mut ComponentLinker<ComponentHostState>,
     ai_runtime: &ai_inference::AiInferenceRuntime,
@@ -277,7 +277,7 @@ pub(crate) fn prewarm_component_route(
             host_identity,
             storage_broker,
             Arc::clone(&runtime.concurrency_limits),
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             Arc::clone(&runtime.ai_runtime),
         ) {
             Ok(()) => return Ok(()),
@@ -304,7 +304,7 @@ pub(crate) fn prewarm_http_component_instance(
     host_identity: Arc<HostIdentity>,
     storage_broker: Arc<StorageBrokerManager>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
-    #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+    #[cfg(feature = "ai-inference-onnx")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 ) -> std::result::Result<(), ExecutionError> {
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
@@ -353,7 +353,7 @@ pub(crate) fn prewarm_http_component_instance(
             "failed to add training functions to prewarm HTTP component linker",
         )
     })?;
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,
         ai_runtime.as_ref(),
@@ -375,7 +375,7 @@ pub(crate) fn prewarm_http_component_instance(
             Vec::new(),
         )?,
     );
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "ai-inference-onnx")]
     {
         store.data_mut().ai_runtime = Some(ai_runtime);
     }
@@ -732,7 +732,7 @@ pub(crate) fn prewarm_legacy_route(
         LegacyHostState::new(
             wasi,
             runtime.config.guest_memory_limit_bytes,
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "ai-inference-onnx")]
             Arc::clone(&runtime.ai_runtime),
         ),
     );

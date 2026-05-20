@@ -342,7 +342,7 @@ pub(crate) enum RouteQos {
 }
 
 impl RouteQos {
-    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    #[cfg_attr(not(feature = "ai-inference-onnx"), allow(dead_code))]
     pub(crate) fn score(self) -> u16 {
         match self {
             Self::RealTime => 100,
@@ -368,7 +368,7 @@ pub(crate) enum ModelDevice {
 }
 
 impl ModelDevice {
-    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    #[cfg_attr(not(feature = "ai-inference-onnx"), allow(dead_code))]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
