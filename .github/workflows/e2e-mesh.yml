@@ -62,11 +62,9 @@ jobs:
         run: kind load docker-image $IMAGE_TAG --name $KIND_CLUSTER
 
       - name: Install vcluster CLI
-        run: |
-          curl -fsSL -o /tmp/vcluster \
-            https://github.com/loft-sh/vcluster/releases/latest/download/vcluster-linux-amd64
-          sudo install -m 0755 /tmp/vcluster /usr/local/bin/vcluster
-          vcluster --version
+        uses: loft-sh/setup-vcluster@v0.0.1
+        with:
+          version: v0.34.0
 
       - name: Create vcluster
         run: |
