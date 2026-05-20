@@ -1,6 +1,7 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import { loadPolicyConfig, configSourceBadge } from "../../utils/policy-config";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonResiliencePanel extends TachyonConfigDashboard {
@@ -11,14 +12,13 @@ export class TachyonResiliencePanel extends TachyonConfigDashboard {
     this.render();
     this.bindForm();
     this.animateEntrance();
-    try {
-      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "config-resilience" });
-      if (staged) {
-        this.setNumber("timeout-ms", staged["timeout_ms"]);
-        this.setNumber("retry-count", staged["retry_count"]);
-        this.setNumber("circuit-breaker-threshold", staged["circuit_breaker_threshold"]);
-      }
-    } catch { /* staged config unavailable — leave defaults */ }
+    const config = await loadPolicyConfig("config-resilience");
+    if (config) {
+      this.patchSourceBadge(configSourceBadge(config.source));
+      this.setNumber("timeout-ms", config.payload["timeout_ms"]);
+      this.setNumber("retry-count", config.payload["retry_count"]);
+      this.setNumber("circuit-breaker-threshold", config.payload["circuit_breaker_threshold"]);
+    }
   }
 
   disconnectedCallback(): void {
@@ -88,9 +88,12 @@ export class TachyonResiliencePanel extends TachyonConfigDashboard {
 
   private setNumber(id: string, value: unknown): void {
     const el = this.root.getElementById(id) as HTMLInputElement | null;
-    if (el && (typeof value === "number" || typeof value === "string")) {
-      el.value = String(value);
-    }
+    if (el && (typeof value === "number" || typeof value === "string")) el.value = String(value);
+  }
+
+  private patchSourceBadge(badge: string): void {
+    const header = this.root.querySelector(".flex.items-baseline.gap-2");
+    if (header) header.insertAdjacentHTML("beforeend", badge);
   }
 }
 

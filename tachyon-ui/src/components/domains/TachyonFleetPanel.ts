@@ -1,6 +1,7 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import { loadPolicyConfig, configSourceBadge } from "../../utils/policy-config";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonFleetPanel extends TachyonConfigDashboard {
@@ -11,15 +12,14 @@ export class TachyonFleetPanel extends TachyonConfigDashboard {
     this.render();
     this.bindForm();
     this.animateEntrance();
-    try {
-      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "fleet" });
-      if (staged) {
-        const sel = this.root.getElementById("selector-tags") as HTMLInputElement | null;
-        if (sel && typeof staged["selector_tags"] === "string") sel.value = staged["selector_tags"];
-        const profile = this.root.getElementById("node-profile") as HTMLSelectElement | null;
-        if (profile && typeof staged["node_profile"] === "string") profile.value = staged["node_profile"];
-      }
-    } catch { /* staged config unavailable */ }
+    const config = await loadPolicyConfig("fleet");
+    if (config) {
+      this.root.querySelector(".flex.items-baseline.gap-2")?.insertAdjacentHTML("beforeend", configSourceBadge(config.source));
+      const sel = this.root.getElementById("selector-tags") as HTMLInputElement | null;
+      if (sel && typeof config.payload["selector_tags"] === "string") sel.value = config.payload["selector_tags"];
+      const profile = this.root.getElementById("node-profile") as HTMLSelectElement | null;
+      if (profile && typeof config.payload["node_profile"] === "string") profile.value = config.payload["node_profile"];
+    }
   }
 
   disconnectedCallback(): void {
