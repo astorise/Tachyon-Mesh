@@ -1469,8 +1469,8 @@ pub async fn get_active_config(domain: &str) -> Result<Option<serde_json::Value>
                 if raw.is_empty() {
                     return Ok(None);
                 }
-                let manifest: IntegrityManifest = serde_json::from_str(&raw)
-                    .context("failed to parse integrity.lock")?;
+                let manifest: IntegrityManifest =
+                    serde_json::from_str(&raw).context("failed to parse integrity.lock")?;
                 serde_json::from_str(&manifest.config_payload)
                     .context("failed to parse config_payload")?
             }
@@ -1485,8 +1485,7 @@ pub async fn get_active_config(domain: &str) -> Result<Option<serde_json::Value>
         }
         let manifest: IntegrityManifest =
             serde_json::from_str(&raw).context("failed to parse integrity.lock")?;
-        serde_json::from_str(&manifest.config_payload)
-            .context("failed to parse config_payload")?
+        serde_json::from_str(&manifest.config_payload).context("failed to parse config_payload")?
     };
 
     Ok(payload_json
