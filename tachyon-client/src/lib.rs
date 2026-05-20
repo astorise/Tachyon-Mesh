@@ -1157,6 +1157,8 @@ struct ResourceOverlayFile {
     resources: Vec<MeshResource>,
     #[serde(default)]
     configurations: Vec<StagedConfiguration>,
+    #[serde(default)]
+    system_routes: Vec<StagedSystemRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1164,6 +1166,14 @@ struct ResourceOverlayFile {
 struct StagedConfiguration {
     domain: String,
     payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedSystemRoute {
+    slug: String,
+    version: String,
+    enabled: bool,
 }
 
 async fn read_overlay_file() -> Result<ResourceOverlayFile> {
@@ -1399,6 +1409,33 @@ pub async fn stage_configuration_overlay(domain: &str, payload: serde_json::Valu
         .sort_by(|left, right| left.domain.cmp(&right.domain));
     write_overlay_file(&overlay).await?;
     Ok(())
+}
+
+/// Returns the list of system-faas routes staged in the local overlay.
+pub async fn get_staged_system_routes() -> Result<Vec<(String, bool)>> {
+    let overlay = read_overlay_file().await?;
+    Ok(overlay
+        .system_routes
+        .into_iter()
+        .map(|r| (r.slug, r.enabled))
+        .collect())
+}
+
+/// Toggles a `system-faas-*` component in the overlay. `enabled = true` stages
+/// it for addition on the next seal; `enabled = false` stages it for removal.
+pub async fn toggle_system_route(slug: &str, version: &str, enabled: bool) -> Result<()> {
+    let mut overlay = read_overlay_file().await?;
+    if let Some(entry) = overlay.system_routes.iter_mut().find(|r| r.slug == slug) {
+        entry.enabled = enabled;
+        entry.version = version.to_owned();
+    } else {
+        overlay.system_routes.push(StagedSystemRoute {
+            slug: slug.to_owned(),
+            version: version.to_owned(),
+            enabled,
+        });
+    }
+    write_overlay_file(&overlay).await
 }
 
 /// Returns the staged (not-yet-sealed) payload for a given configuration domain,
@@ -1705,6 +1742,46 @@ fn apply_overlay_to_config(
             "ui_configurations".to_owned(),
             serde_json::to_value(configs).context("failed to serialize staged configurations")?,
         );
+    }
+
+    // Merge system routes: enabled ones are added/updated; disabled ones are removed.
+    let enabled: Vec<&StagedSystemRoute> =
+        overlay.system_routes.iter().filter(|r| r.enabled).collect();
+    if !overlay.system_routes.is_empty() {
+        let routes = object
+            .entry("routes".to_owned())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let arr = routes
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("routes must be an array"))?;
+
+        // Remove any previously staged system routes that are now disabled.
+        let disabled_slugs: std::collections::HashSet<&str> = overlay
+            .system_routes
+            .iter()
+            .filter(|r| !r.enabled)
+            .map(|r| r.slug.as_str())
+            .collect();
+        arr.retain(|route| {
+            let name = route.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            !disabled_slugs.contains(name)
+        });
+
+        // Add enabled routes that are not already present.
+        for sr in &enabled {
+            let already_present = arr
+                .iter()
+                .any(|r| r.get("name").and_then(|v| v.as_str()) == Some(&sr.slug));
+            if !already_present {
+                let path = format!("/system/{}", sr.slug.replace("system-faas-", ""));
+                arr.push(serde_json::json!({
+                    "path": path,
+                    "role": "system",
+                    "name": sr.slug,
+                    "version": sr.version,
+                }));
+            }
+        }
     }
 
     Ok(())
