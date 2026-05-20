@@ -18,27 +18,74 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Two scalar dimensions that GitHub Actions cross-joins (5 × 6 = 30 jobs).
+        # The `include` blocks below inject derived properties into each cell.
+        platform:
+          - ubuntu-x86_64
+          - ubuntu-aarch64
+          - macos-x86_64
+          - macos-aarch64
+          - windows-x86_64
+        features:
+          - default
+          - fips
+          - http3
+          - security
+          - ai
+          - no-default
         include:
-          - os: ubuntu-22.04
+          # ── platform properties ──────────────────────────────────────────────
+          - platform: ubuntu-x86_64
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             os_name: linux
             arch: x86_64
-          - os: ubuntu-22.04
+          - platform: ubuntu-aarch64
+            os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             os_name: linux
             arch: aarch64
-          - os: macos-latest
+          - platform: macos-x86_64
+            os: macos-latest
             target: x86_64-apple-darwin
             os_name: darwin
             arch: x86_64
-          - os: macos-latest
+          - platform: macos-aarch64
+            os: macos-latest
             target: aarch64-apple-darwin
             os_name: darwin
             arch: aarch64
-          - os: windows-latest
+          - platform: windows-x86_64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
             os_name: windows
             arch: x86_64
+          # ── feature properties ───────────────────────────────────────────────
+          - features: default
+            features_label: ""
+            cargo_args: ""
+          - features: fips
+            features_label: "-fips"
+            cargo_args: "--no-default-features --features fips"
+          - features: http3
+            features_label: "-http3"
+            cargo_args: "--features http3"
+          - features: security
+            features_label: "-security"
+            cargo_args: "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
+          - features: ai
+            features_label: "-ai"
+            cargo_args: "--features ai-inference"
+          - features: no-default
+            features_label: "-no-default"
+            cargo_args: "--no-default-features"
+        exclude:
+          # ai-inference links against ONNX Runtime which is not available for
+          # aarch64 cross-compilation or Windows in this CI setup.
+          - platform: ubuntu-aarch64
+            features: ai
+          - platform: windows-x86_64
+            features: ai
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
@@ -52,23 +99,26 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (aarch64 Linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install Linux system deps
-        if: matrix.os == 'ubuntu-22.04'
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev cmake nasm
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.features }}
 
       - name: Build core-host and tachyon-mcp
         run: |
-          cargo build --release --bin core-host --bin tachyon-mcp --target ${{ matrix.target }}
+          cargo build --release --bin core-host --bin tachyon-mcp \
+            --target ${{ matrix.target }} ${{ matrix.cargo_args }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
@@ -79,10 +129,10 @@ jobs:
           VERSION="${{ github.ref_name }}"
           OS="${{ matrix.os_name }}"
           ARCH="${{ matrix.arch }}"
+          SUFFIX="${{ matrix.features_label }}"
           BINDIR="target/${{ matrix.target }}/release"
           if [ "$OS" = "windows" ]; then
-            ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}.zip"
-            # PowerShell Compress-Archive is not available in bash; use 7z or zip
+            ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}${SUFFIX}.zip"
             if command -v 7z >/dev/null 2>&1; then
               7z a "${ARCHIVE}" \
                 "${BINDIR}/core-host.exe" \
@@ -93,7 +143,7 @@ jobs:
                 "${BINDIR}/tachyon-mcp.exe"
             fi
           else
-            ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}.tar.gz"
+            ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}${SUFFIX}.tar.gz"
             tar -czf "${ARCHIVE}" \
               -C "${BINDIR}" core-host tachyon-mcp \
               --transform "s|^|tachyon-mesh-${VERSION}/|" 2>/dev/null || \

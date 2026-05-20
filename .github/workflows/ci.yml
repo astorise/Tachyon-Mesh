@@ -194,6 +194,30 @@ jobs:
       - name: Test core-host feature set
         run: cargo test -p core-host ${{ matrix.features }}
 
+      - name: Build release binary for artifact
+        run: cargo build -p core-host --release ${{ matrix.features }}
+
+      - name: Derive artifact label from features
+        id: feat_label
+        shell: bash
+        run: |
+          case "${{ matrix.features }}" in
+            "")                                                        label="default" ;;
+            "--no-default-features")                                   label="no-default" ;;
+            "--all-features")                                          label="all" ;;
+            "--features http3")                                        label="http3" ;;
+            "--features rate-limit,resiliency,mtls,secrets-vault,websockets") label="security" ;;
+            *)                                                         label="custom" ;;
+          esac
+          echo "label=${label}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload core-host binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-host-linux-x86_64-${{ steps.feat_label.outputs.label }}-${{ github.sha }}
+          path: target/release/core-host
+          if-no-files-found: error
+
   fips-tests:
     runs-on: ubuntu-latest
     env:
@@ -220,6 +244,16 @@ jobs:
 
       - name: Test core-host FIPS feature
         run: cargo test -p core-host --features fips
+
+      - name: Build FIPS release binary for artifact
+        run: cargo build -p core-host --release --features fips
+
+      - name: Upload FIPS core-host binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-host-linux-x86_64-fips-${{ github.sha }}
+          path: target/release/core-host
+          if-no-files-found: error
 
   mutation-tests:
     if: github.event_name == 'schedule'
@@ -270,6 +304,23 @@ jobs:
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
+            cargo_features: ""
+            feature_tag: ""
+          - image_name: tachyon-mesh
+            dockerfile: ./Dockerfile
+            context: .
+            cargo_features: "fips"
+            feature_tag: "-fips"
+          - image_name: tachyon-mesh
+            dockerfile: ./Dockerfile
+            context: .
+            cargo_features: "http3"
+            feature_tag: "-http3"
+          - image_name: tachyon-mesh
+            dockerfile: ./Dockerfile
+            context: .
+            cargo_features: "rate-limit,resiliency,mtls,secrets-vault,websockets"
+            feature_tag: "-security"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -295,9 +346,9 @@ jobs:
         with:
           images: ghcr.io/${{ steps.owner.outputs.value }}/${{ matrix.image_name }}
           tags: |
-            type=ref,event=branch
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch,suffix=${{ matrix.feature_tag }}
+            type=sha,prefix=sha-,suffix=${{ matrix.feature_tag }}
+            type=raw,value=latest${{ matrix.feature_tag }},enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
@@ -309,5 +360,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: |
+            CARGO_FEATURES=${{ matrix.cargo_features }}
+          cache-from: type=gha,scope=${{ matrix.feature_tag || 'default' }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.feature_tag || 'default' }}
