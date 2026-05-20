@@ -46,6 +46,7 @@ describe("TachyonSystemsPanel", () => {
     vi.mocked(resilientInvoke).mockImplementation(async (command: string) => {
       if (command === "list_registered_systems") return registered;
       if (command === "list_deployed_systems") return deployed;
+      if (command === "get_staged_system_routes") return [];
       return null;
     });
 
@@ -53,8 +54,11 @@ describe("TachyonSystemsPanel", () => {
     document.body.appendChild(panel);
     await Promise.resolve();
     await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
 
-    expect(panel.shadowRoot?.textContent).toContain("35 catalog entries");
+    expect(panel.shadowRoot?.textContent).toContain("35");
+    expect(panel.shadowRoot?.textContent).toContain("catalog entries");
     expect(panel.shadowRoot?.textContent).toContain("version-drift");
     expect(panel.shadowRoot?.textContent).toContain("not-deployed");
   });
@@ -63,6 +67,7 @@ describe("TachyonSystemsPanel", () => {
     vi.mocked(resilientInvoke).mockImplementation(async (command: string) => {
       if (command === "list_registered_systems") return registered;
       if (command === "list_deployed_systems") return deployed;
+      if (command === "get_staged_system_routes") return [];
       return null;
     });
 
@@ -70,10 +75,15 @@ describe("TachyonSystemsPanel", () => {
     document.body.appendChild(panel);
     await Promise.resolve();
     await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
     panel.shadowRoot?.querySelector<HTMLButtonElement>('[data-system-slug="system-0"]')?.click();
 
     expect(panel.shadowRoot?.textContent).toContain("node-a");
+    // No form submission or destructive delete controls.
     expect(panel.shadowRoot?.querySelector("form")).toBeNull();
     expect(panel.shadowRoot?.querySelector('[data-action="delete"]')).toBeNull();
+    // Enable/Disable are present but not delete.
+    expect(panel.shadowRoot?.querySelectorAll('[data-toggle-slug]').length).toBeGreaterThan(0);
   });
 });

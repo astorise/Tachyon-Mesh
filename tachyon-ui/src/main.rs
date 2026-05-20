@@ -582,6 +582,20 @@ async fn get_active_config(domain: String) -> Result<Option<serde_json::Value>, 
 }
 
 #[tauri::command]
+async fn toggle_system_route(slug: String, version: String, enabled: bool) -> Result<(), String> {
+    tachyon_client::toggle_system_route(&slug, &version, enabled)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_staged_system_routes() -> Result<Vec<(String, bool)>, String> {
+    tachyon_client::get_staged_system_routes()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn validate_hardware_policy(
     policy: tachyon_client::HardwarePolicy,
 ) -> Result<tachyon_client::HardwareValidation, String> {
@@ -1199,6 +1213,8 @@ fn main() {
             get_cluster_hardware_summary,
             get_staged_config,
             get_active_config,
+            toggle_system_route,
+            get_staged_system_routes,
             validate_hardware_policy,
             save_resource,
             delete_resource,
