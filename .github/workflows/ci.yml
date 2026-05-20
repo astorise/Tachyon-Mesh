@@ -306,8 +306,14 @@ jobs:
             context: .
             cargo_features: ""
             feature_tag: ""
-          # fips (aws-lc-sys) is incompatible with the musl target used in the
-          # Dockerfile; FIPS binaries are published via release.yml (gnu targets).
+          # fips uses Dockerfile.fips (rust:alpine builder) — aws-lc-fips-sys
+          # compiles natively on Alpine musl (cmake/nasm/go/perl required).
+          # Validated on experiment/fips-musl-zigbuild: static-pie, 30.7 MB.
+          - image_name: tachyon-mesh
+            dockerfile: ./Dockerfile.fips
+            context: .
+            cargo_features: ""
+            feature_tag: "-fips"
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
