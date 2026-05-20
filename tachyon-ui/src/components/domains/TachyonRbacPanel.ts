@@ -1,6 +1,7 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import { loadPolicyConfig, configSourceBadge } from "../../utils/policy-config";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonRbacPanel extends TachyonConfigDashboard {
@@ -11,16 +12,15 @@ export class TachyonRbacPanel extends TachyonConfigDashboard {
     this.render();
     this.bindForm();
     this.animateEntrance();
-    try {
-      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "config-rbac" });
-      if (staged) {
-        const role = this.root.getElementById("role") as HTMLSelectElement | null;
-        if (role && typeof staged["role"] === "string") role.value = staged["role"];
-        const policy = this.root.getElementById("policy") as HTMLTextAreaElement | null;
-        if (policy && staged["policy"] !== undefined)
-          policy.value = JSON.stringify(staged["policy"], null, 2);
-      }
-    } catch { /* staged config unavailable */ }
+    const config = await loadPolicyConfig("config-rbac");
+    if (config) {
+      this.root.querySelector(".flex.items-baseline.gap-2")?.insertAdjacentHTML("beforeend", configSourceBadge(config.source));
+      const role = this.root.getElementById("role") as HTMLSelectElement | null;
+      if (role && typeof config.payload["role"] === "string") role.value = config.payload["role"];
+      const policy = this.root.getElementById("policy") as HTMLTextAreaElement | null;
+      if (policy && config.payload["policy"] !== undefined)
+        policy.value = JSON.stringify(config.payload["policy"], null, 2);
+    }
   }
 
   disconnectedCallback(): void {

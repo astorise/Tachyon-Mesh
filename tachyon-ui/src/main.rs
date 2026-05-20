@@ -575,6 +575,13 @@ async fn get_staged_config(domain: String) -> Result<Option<serde_json::Value>, 
 }
 
 #[tauri::command]
+async fn get_active_config(domain: String) -> Result<Option<serde_json::Value>, String> {
+    tachyon_client::get_active_config(&domain)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn validate_hardware_policy(
     policy: tachyon_client::HardwarePolicy,
 ) -> Result<tachyon_client::HardwareValidation, String> {
@@ -1191,6 +1198,7 @@ fn main() {
             list_deployed_systems,
             get_cluster_hardware_summary,
             get_staged_config,
+            get_active_config,
             validate_hardware_policy,
             save_resource,
             delete_resource,

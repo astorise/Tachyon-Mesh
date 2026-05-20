@@ -1,6 +1,7 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import { loadPolicyConfig, configSourceBadge } from "../../utils/policy-config";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonSupplyChainPanel extends TachyonConfigDashboard {
@@ -11,15 +12,14 @@ export class TachyonSupplyChainPanel extends TachyonConfigDashboard {
     this.render();
     this.bindForm();
     this.animateEntrance();
-    try {
-      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "supply_chain" });
-      if (staged) {
-        const key = this.root.getElementById("signature-key") as HTMLInputElement | null;
-        if (key && typeof staged["signature_key"] === "string") key.value = staged["signature_key"];
-        const ag = this.root.getElementById("air-gapped") as HTMLInputElement | null;
-        if (ag && typeof staged["air_gapped"] === "boolean") ag.checked = staged["air_gapped"];
-      }
-    } catch { /* staged config unavailable */ }
+    const config = await loadPolicyConfig("supply_chain");
+    if (config) {
+      this.root.querySelector(".flex.items-baseline.gap-2")?.insertAdjacentHTML("beforeend", configSourceBadge(config.source));
+      const key = this.root.getElementById("signature-key") as HTMLInputElement | null;
+      if (key && typeof config.payload["signature_key"] === "string") key.value = config.payload["signature_key"];
+      const ag = this.root.getElementById("air-gapped") as HTMLInputElement | null;
+      if (ag && typeof config.payload["air_gapped"] === "boolean") ag.checked = config.payload["air_gapped"];
+    }
   }
 
   disconnectedCallback(): void {

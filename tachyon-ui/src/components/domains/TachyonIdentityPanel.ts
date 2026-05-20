@@ -1,6 +1,7 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { applyAndSeal } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import { loadPolicyConfig, configSourceBadge } from "../../utils/policy-config";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonIdentityPanel extends TachyonConfigDashboard {
@@ -11,13 +12,12 @@ export class TachyonIdentityPanel extends TachyonConfigDashboard {
     this.render();
     this.bindForm();
     this.animateEntrance();
-    try {
-      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "config-security" });
-      if (staged) {
-        this.setField("jwt-issuer", staged["jwt_issuer"]);
-        this.setField("crdt-quota", staged["crdt_quota"]);
-      }
-    } catch { /* staged config unavailable */ }
+    const config = await loadPolicyConfig("config-security");
+    if (config) {
+      this.patchSourceBadge(configSourceBadge(config.source));
+      this.setField("jwt-issuer", config.payload["jwt_issuer"]);
+      this.setField("crdt-quota", config.payload["crdt_quota"]);
+    }
   }
 
   disconnectedCallback(): void {
@@ -86,6 +86,10 @@ export class TachyonIdentityPanel extends TachyonConfigDashboard {
   private setField(id: string, value: unknown): void {
     const el = this.root.getElementById(id) as HTMLInputElement | null;
     if (el && value !== undefined && value !== null) el.value = String(value);
+  }
+
+  private patchSourceBadge(badge: string): void {
+    this.root.querySelector(".flex.items-baseline.gap-2")?.insertAdjacentHTML("beforeend", badge);
   }
 }
 
