@@ -1,4 +1,4 @@
-name: Experiment — fips + musl via cargo-zigbuild
+name: Experiment — fips + musl natif (Alpine)
 
 on:
   push:
@@ -7,45 +7,45 @@ on:
   workflow_dispatch:
 
 jobs:
-  fips-musl-zigbuild:
+  # Alpine utilise musl nativement — pas de cross-compilation, pas de zigbuild.
+  # Les headers système (linux-headers) sont déjà musl-compatibles.
+  fips-musl-alpine:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    container:
+      image: alpine:3.21
     env:
       CARGO_TERM_COLOR: always
+      CARGO_HOME: /root/.cargo
     steps:
+      - name: Install Alpine build deps
+        run: |
+          apk add --no-cache \
+            bash curl git \
+            build-base cmake nasm \
+            linux-headers musl-dev \
+            openssl-dev pkgconf \
+            python3
+
+      - name: Install Rust (stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$CARGO_HOME/bin" >> $GITHUB_PATH
+
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Install Rust + musl target
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: fips-musl-zigbuild
+          key: fips-musl-alpine
 
-      - name: Install system deps (cmake, nasm, musl-tools, linux-headers)
+      - name: Build core-host — fips sur Alpine musl natif
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake nasm musl-tools linux-headers-generic
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.0
-
-      - name: Install cargo-zigbuild
-        run: |
-          pip install cargo-zigbuild
-          zig version
-          cargo zigbuild --help 2>&1 | head -2
-
-      - name: Build core-host — fips + musl via cargo-zigbuild
-        run: |
-          cargo zigbuild -p core-host \
-            --target x86_64-unknown-linux-musl \
+          # Sur Alpine, le target musl est le target par défaut (x86_64-unknown-linux-musl).
+          # On peut aussi cibler explicitement pour être cohérent avec le Dockerfile.
+          ~/.cargo/bin/cargo build -p core-host \
             --no-default-features \
             --features fips \
             --release \
@@ -54,21 +54,22 @@ jobs:
       - name: Inspect binary
         if: success()
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/core-host
+          BIN=target/release/core-host
           echo "=== File type ==="
           file "$BIN"
-          echo "=== Dynamic deps ==="
-          ldd "$BIN" || echo "(static — no dynamic deps)"
+          echo "=== Dynamic deps (doit être 'statically linked') ==="
+          ldd "$BIN" || echo "(static — aucune dépendance dynamique)"
           echo "=== Size ==="
           du -sh "$BIN"
-          echo "=== FIPS symbol check ==="
-          nm "$BIN" | grep -i "fips" | head -10 || echo "(no FIPS symbols visible — stripped)"
+          echo "=== FIPS symbols ==="
+          nm "$BIN" 2>/dev/null | grep -i "fips" | head -5 \
+            || echo "(stripped — FIPS symbols non visibles)"
 
       - name: Summary
         if: always()
         run: |
-          if [ -f target/x86_64-unknown-linux-musl/release/core-host ]; then
-            echo "✅ BUILD SUCCEEDED — fips + musl via cargo-zigbuild works"
+          if [ -f target/release/core-host ]; then
+            echo "SUCCESS — fips compile nativement sur Alpine musl"
           else
-            echo "❌ BUILD FAILED — see logs above for root cause"
+            echo "FAILED — voir les logs ci-dessus"
           fi
