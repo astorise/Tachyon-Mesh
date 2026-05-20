@@ -306,11 +306,8 @@ jobs:
             context: .
             cargo_features: ""
             feature_tag: ""
-          - image_name: tachyon-mesh
-            dockerfile: ./Dockerfile
-            context: .
-            cargo_features: "fips"
-            feature_tag: "-fips"
+          # fips (aws-lc-sys) is incompatible with the musl target used in the
+          # Dockerfile; FIPS binaries are published via release.yml (gnu targets).
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
