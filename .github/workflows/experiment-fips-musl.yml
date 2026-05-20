@@ -20,7 +20,7 @@ jobs:
       - name: Install build deps
         run: |
           apk add --no-cache \
-            git bash \
+            git bash go \
             build-base cmake nasm \
             linux-headers musl-dev \
             openssl-dev pkgconf
