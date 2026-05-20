@@ -1,16 +1,25 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonFleetPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
 
-  connectedCallback(): void {
+  async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindForm();
     this.animateEntrance();
+    try {
+      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "fleet" });
+      if (staged) {
+        const sel = this.root.getElementById("selector-tags") as HTMLInputElement | null;
+        if (sel && typeof staged["selector_tags"] === "string") sel.value = staged["selector_tags"];
+        const profile = this.root.getElementById("node-profile") as HTMLSelectElement | null;
+        if (profile && typeof staged["node_profile"] === "string") profile.value = staged["node_profile"];
+      }
+    } catch { /* staged config unavailable */ }
   }
 
   disconnectedCallback(): void {

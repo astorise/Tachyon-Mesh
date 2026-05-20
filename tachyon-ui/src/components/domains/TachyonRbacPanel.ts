@@ -1,16 +1,26 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonRbacPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
 
-  connectedCallback(): void {
+  async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindForm();
     this.animateEntrance();
+    try {
+      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "config-rbac" });
+      if (staged) {
+        const role = this.root.getElementById("role") as HTMLSelectElement | null;
+        if (role && typeof staged["role"] === "string") role.value = staged["role"];
+        const policy = this.root.getElementById("policy") as HTMLTextAreaElement | null;
+        if (policy && staged["policy"] !== undefined)
+          policy.value = JSON.stringify(staged["policy"], null, 2);
+      }
+    } catch { /* staged config unavailable */ }
   }
 
   disconnectedCallback(): void {

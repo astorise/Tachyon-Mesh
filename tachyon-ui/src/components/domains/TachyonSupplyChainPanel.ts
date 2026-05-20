@@ -1,16 +1,25 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonSupplyChainPanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
 
-  connectedCallback(): void {
+  async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindForm();
     this.animateEntrance();
+    try {
+      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "supply_chain" });
+      if (staged) {
+        const key = this.root.getElementById("signature-key") as HTMLInputElement | null;
+        if (key && typeof staged["signature_key"] === "string") key.value = staged["signature_key"];
+        const ag = this.root.getElementById("air-gapped") as HTMLInputElement | null;
+        if (ag && typeof staged["air_gapped"] === "boolean") ag.checked = staged["air_gapped"];
+      }
+    } catch { /* staged config unavailable */ }
   }
 
   disconnectedCallback(): void {

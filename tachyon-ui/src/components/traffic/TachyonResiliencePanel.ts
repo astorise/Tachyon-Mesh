@@ -1,16 +1,24 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal } from "../../utils/network";
+import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "../base/TachyonPolicyFormBadge";
 
 export class TachyonResiliencePanel extends TachyonConfigDashboard {
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
 
-  connectedCallback(): void {
+  async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
     this.bindForm();
     this.animateEntrance();
+    try {
+      const staged = await invoke<Record<string, unknown> | null>("get_staged_config", { domain: "config-resilience" });
+      if (staged) {
+        this.setNumber("timeout-ms", staged["timeout_ms"]);
+        this.setNumber("retry-count", staged["retry_count"]);
+        this.setNumber("circuit-breaker-threshold", staged["circuit_breaker_threshold"]);
+      }
+    } catch { /* staged config unavailable — leave defaults */ }
   }
 
   disconnectedCallback(): void {
@@ -73,11 +81,16 @@ export class TachyonResiliencePanel extends TachyonConfigDashboard {
 
   private numberValue(id: string, fallback: number): number {
     const input = this.root.getElementById(id) as HTMLInputElement | null;
-    if (!input) {
-      return fallback;
-    }
+    if (!input) return fallback;
     const raw = input.valueAsNumber;
     return Number.isFinite(raw) ? raw : fallback;
+  }
+
+  private setNumber(id: string, value: unknown): void {
+    const el = this.root.getElementById(id) as HTMLInputElement | null;
+    if (el && (typeof value === "number" || typeof value === "string")) {
+      el.value = String(value);
+    }
   }
 }
 
