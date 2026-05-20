@@ -31,10 +31,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake nasm musl-tools linux-headers-generic
 
-      - name: Install cargo-zigbuild + Zig
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Install cargo-zigbuild
         run: |
-          pip install cargo-zigbuild ziglang
+          pip install cargo-zigbuild
           zig version
+          cargo zigbuild --help 2>&1 | head -2
 
       - name: Build core-host — fips + musl via cargo-zigbuild
         run: |
