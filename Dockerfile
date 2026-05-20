@@ -150,7 +150,7 @@ RUN mkdir -p /workspace/guest-modules \
         exit 1; \
       fi
 
-FROM maven:3.9.15-eclipse-temurin-17 AS java-builder
+FROM maven:3.9.16-eclipse-temurin-17 AS java-builder
 
 WORKDIR /workspace/examples/guest-java
 
