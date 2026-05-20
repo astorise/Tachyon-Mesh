@@ -7,31 +7,23 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Alpine utilise musl nativement — pas de cross-compilation, pas de zigbuild.
-  # Les headers système (linux-headers) sont déjà musl-compatibles.
+  # rust:alpine = Rust stable sur Alpine musl (pas de cross-compilation, pas de zigbuild).
+  # Rust, cargo et la toolchain musl sont déjà en place dans cette image officielle.
   fips-musl-alpine:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
-      image: alpine:3.21
+      image: rust:alpine
     env:
       CARGO_TERM_COLOR: always
-      CARGO_HOME: /root/.cargo
     steps:
-      - name: Install Alpine build deps
+      - name: Install build deps
         run: |
           apk add --no-cache \
-            bash curl git \
+            git bash \
             build-base cmake nasm \
             linux-headers musl-dev \
-            openssl-dev pkgconf \
-            python3
-
-      - name: Install Rust (stable)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$CARGO_HOME/bin" >> $GITHUB_PATH
+            openssl-dev pkgconf
 
       - name: Checkout
         uses: actions/checkout@v6
@@ -43,13 +35,10 @@ jobs:
 
       - name: Build core-host — fips sur Alpine musl natif
         run: |
-          # Sur Alpine, le target musl est le target par défaut (x86_64-unknown-linux-musl).
-          # On peut aussi cibler explicitement pour être cohérent avec le Dockerfile.
-          ~/.cargo/bin/cargo build -p core-host \
+          cargo build -p core-host \
             --no-default-features \
             --features fips \
-            --release \
-            2>&1
+            --release 2>&1
 
       - name: Inspect binary
         if: success()
@@ -57,13 +46,13 @@ jobs:
           BIN=target/release/core-host
           echo "=== File type ==="
           file "$BIN"
-          echo "=== Dynamic deps (doit être 'statically linked') ==="
+          echo "=== Dynamic deps (doit être statically linked) ==="
           ldd "$BIN" || echo "(static — aucune dépendance dynamique)"
           echo "=== Size ==="
           du -sh "$BIN"
           echo "=== FIPS symbols ==="
           nm "$BIN" 2>/dev/null | grep -i "fips" | head -5 \
-            || echo "(stripped — FIPS symbols non visibles)"
+            || echo "(stripped)"
 
       - name: Summary
         if: always()
