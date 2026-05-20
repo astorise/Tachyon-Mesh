@@ -5,10 +5,10 @@ edition = "2021"
 
 [features]
 default = ["ring"]
-# Candle + TurboQuant inference — pure Rust, musl-compatible.
-# ORT/WASI-NN removed: ONNX is an interchange format with no unique models;
-# all relevant models are available as safetensors/GGUF via candle.
-ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:lru", "dep:turboquant-sys"]
+# Candle + TurboQuant + ONNX inference — pure Rust, musl-compatible.
+# candle-onnx executes .onnx model files without ORT (no C++, no glibc).
+# WASI-NN guest interface is not restored; guests use the accelerator WIT API.
+ai-inference = ["dep:candle-core", "dep:candle-nn", "dep:candle-onnx", "dep:lru", "dep:turboquant-sys"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
 # VRAM helpers, BaaS scratch tables) so they are excluded from the default build but
@@ -33,6 +33,7 @@ blake3 = "1.5"
 bytes = "1.5"
 candle-core = { version = "0.10.0", optional = true }
 candle-nn = { version = "0.10.0", optional = true }
+candle-onnx = { version = "0.10.2", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = "2"
 flate2 = "1"

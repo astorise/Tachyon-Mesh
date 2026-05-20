@@ -67,7 +67,8 @@ RUN apk add --no-cache \
     build-base cmake nasm \
     go perl \
     linux-headers musl-dev \
-    openssl-dev pkgconf
+    openssl-dev pkgconf \
+    protobuf
 
 WORKDIR /workspace
 
