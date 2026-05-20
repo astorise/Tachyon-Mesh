@@ -38,6 +38,7 @@ type RuntimeMetrics = {
 
 type ClusterHardwareSummary = {
   enrolledCount: number;
+  gpuCount: number;
 };
 
 export class TachyonOverviewPanel extends TachyonConfigDashboard {
@@ -143,30 +144,13 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
     const sealedFallback = snapshot.routes.reduce((total, route) => total + Math.max(route.targetCount, 1), 0);
     const liveQueue = runtime?.queueDepth;
     const wasmInstances = typeof liveQueue === "number" && liveQueue > 0 ? liveQueue : sealedFallback;
-    const gpuUtilization = this.gpuUtilizationFromMetrics(snapshot, runtime);
     const enrolledNodes = hardware?.enrolledCount ?? snapshot.batchTargets.length;
+    const gpuDevices = hardware?.gpuCount ?? 0;
     return [
       { ...this.metricTemplate("nodes"), value: Math.max(enrolledNodes, 0) },
       { ...this.metricTemplate("wasm"), value: Math.round(wasmInstances) },
-      { ...this.metricTemplate("gpu"), value: gpuUtilization },
+      { ...this.metricTemplate("gpu"), value: gpuDevices },
     ];
-  }
-
-  private gpuUtilizationFromMetrics(snapshot: MeshGraphSnapshot, runtime: RuntimeMetrics | null): number {
-    if (runtime) {
-      const errorComponent = Math.min(100, Math.round((runtime.errorRate ?? 0) * 100));
-      const latencyComponent = runtime.p99LatencyMs > 0
-        ? Math.min(100, Math.round((runtime.p99LatencyMs / 500) * 100))
-        : 0;
-      return Math.max(errorComponent, latencyComponent);
-    }
-    if (snapshot.routes.length === 0) {
-      return 0;
-    }
-    const acceleratedRoutes = snapshot.routes.filter((route) =>
-      [route.name, route.path, route.role].some((value) => value.toLowerCase().includes("gpu") || value.toLowerCase().includes("ai")),
-    ).length;
-    return Math.min(100, Math.round(((acceleratedRoutes + snapshot.batchTargets.length) / Math.max(snapshot.routes.length, 1)) * 50));
   }
 
   private initialMetrics(): OverviewMetric[] {
@@ -182,7 +166,7 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
   }
 
   private metricTemplate(key: OverviewMetric["key"]): Omit<OverviewMetric, "value"> {
-    const suffix = key === "gpu" ? "%" : "";
+    const suffix = "";
     return {
       key,
       label: t(`overview.${key}.label`),
