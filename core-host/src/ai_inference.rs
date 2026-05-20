@@ -15,7 +15,6 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BinaryHeap, HashMap},
     fs,
-    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc,
@@ -25,8 +24,7 @@ use std::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use wasmtime_wasi_nn::{
-    witx::WasiNnCtx, Backend as WasiNnProvider, Graph as WasiGraph, GraphRegistry,
-    Registry as WasiRegistry,
+    witx::WasiNnCtx, Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TensorType {
@@ -196,9 +194,7 @@ impl AiInferenceRuntime {
     }
 
     pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
-        let backends = [WasiNnProvider::from(
-            candle_onnx_backend::candle_onnx_backend(),
-        )];
+        let backends = [candle_onnx_backend::candle_onnx_backend()];
         WasiNnCtx::new(backends, WasiRegistry::from(EmptyGraphRegistry))
     }
 

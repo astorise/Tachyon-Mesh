@@ -187,7 +187,7 @@ jobs:
         if: matrix.features == '--all-features'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake nasm
+          sudo apt-get install -y cmake nasm protobuf-compiler
 
       - name: Build guest artifacts
         run: bash scripts/build-guest-artifacts.sh
@@ -235,7 +235,7 @@ jobs:
       - name: Install FIPS build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake nasm
+          sudo apt-get install -y cmake nasm protobuf-compiler
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
