@@ -264,12 +264,12 @@ impl AiInferenceRuntime {
     pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
         let backends = [candle_onnx_backend::candle_onnx_backend()];
         #[cfg(test)]
-        {
-            let registry = MockPreloadedGraphRegistry::from_aliases(self.models.keys().cloned());
-            return WasiNnCtx::new(backends, WasiRegistry::from(registry));
-        }
+        let registry = WasiRegistry::from(MockPreloadedGraphRegistry::from_aliases(
+            self.models.keys().cloned(),
+        ));
         #[cfg(not(test))]
-        WasiNnCtx::new(backends, WasiRegistry::from(EmptyGraphRegistry))
+        let registry = WasiRegistry::from(EmptyGraphRegistry);
+        WasiNnCtx::new(backends, registry)
     }
 
     #[cfg(test)]
