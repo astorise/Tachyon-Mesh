@@ -76,6 +76,8 @@ pub(crate) struct AppState {
     pub(crate) manifest_path: PathBuf,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     pub(crate) background_workers: Arc<BackgroundWorkerManager>,
+    #[cfg(feature = "s3-persistence")]
+    pub(crate) s3_backend: Option<Arc<crate::persistence::S3PersistenceBackend>>,
 }
 
 impl AppState {

@@ -23,6 +23,8 @@ pub mod identity;
 mod memory_governor;
 mod mesh;
 pub mod network;
+#[cfg(feature = "s3-persistence")]
+mod persistence;
 #[cfg(feature = "rate-limit")]
 mod rate_limit;
 #[cfg(feature = "resiliency")]

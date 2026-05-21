@@ -922,6 +922,7 @@ pub(crate) async fn generate_recovery_codes_handler(
     })?
     .map_err(string_error_to_response)?;
 
+    flush_auth_state(&state).await;
     Ok(Json(RecoveryCodeResponse { codes }))
 }
 
@@ -992,6 +993,7 @@ pub(crate) async fn finalize_enrollment_handler(
     })?
     .map_err(string_error_to_response)?;
 
+    flush_auth_state(&state).await;
     Ok(Json(session))
 }
 
@@ -1096,6 +1098,7 @@ pub(crate) async fn finalize_login_handler(
         "ok",
         String::new(),
     );
+    flush_auth_state(&state).await;
     Ok(Json(session))
 }
 
@@ -1149,6 +1152,7 @@ pub(crate) async fn regenerate_account_security_handler(
     })?
     .map_err(string_error_to_response)?;
 
+    flush_auth_state(&state).await;
     Ok(Json(RecoveryCodeResponse { codes }))
 }
 
@@ -1179,6 +1183,7 @@ pub(crate) async fn issue_pat_handler(
     })?
     .map_err(string_error_to_response)?;
 
+    flush_auth_state(&state).await;
     Ok(Json(IssuePatResponse { token }))
 }
 
@@ -1204,6 +1209,7 @@ pub(crate) async fn consume_recovery_code_handler(
     })?
     .map_err(string_error_to_response)?;
 
+    flush_auth_state(&state).await;
     Ok(Json(ConsumeRecoveryCodeResponse { token }))
 }
 
@@ -1295,6 +1301,7 @@ pub(crate) async fn update_user_handler(
     state
         .iam_audit_log
         .record(actor, action, Some(target), None, "ok", detail);
+    flush_auth_state(&state).await;
     Ok(Json(summary))
 }
 
@@ -1341,6 +1348,7 @@ pub(crate) async fn delete_user_handler(
         "ok",
         String::new(),
     );
+    flush_auth_state(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1424,6 +1432,7 @@ pub(crate) async fn upsert_group_handler(
     state
         .iam_audit_log
         .record(actor, "group.upsert", None, Some(group_name), "ok", detail);
+    flush_auth_state(&state).await;
     Ok(Json(summary))
 }
 
@@ -1461,6 +1470,7 @@ pub(crate) async fn delete_group_handler(
     state
         .iam_audit_log
         .record(actor, "group.delete", None, Some(name), "ok", String::new());
+    flush_auth_state(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1612,6 +1622,20 @@ fn map_auth_session(session: AuthnSession) -> FinalizeEnrollmentResponse {
         roles: session.roles,
         scopes: session.scopes,
     }
+}
+
+/// Flush the auth-state directory to S3 after any mutating auth operation.
+/// No-op when the `s3-persistence` feature is disabled or no backend is configured.
+async fn flush_auth_state(state: &crate::AppState) {
+    #[cfg(feature = "s3-persistence")]
+    if let Some(backend) = state.s3_backend.as_deref() {
+        let auth_dir = auth_state_dir(&state.manifest_path);
+        if let Err(error) = backend.flush_path(&auth_dir).await {
+            tracing::warn!(error = %error, "failed to flush auth state to S3");
+        }
+    }
+    #[cfg(not(feature = "s3-persistence"))]
+    let _ = state;
 }
 
 fn string_error_to_response(error: anyhow::Error) -> Response {

@@ -23,6 +23,9 @@ mtls = []
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
 ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]
+# Native S3 persistence: restores state on startup, flushes after auth mutations.
+# Uses object_store (pure Rust, musl-compatible) — no rclone sidecar needed.
+s3-persistence = ["dep:object_store", "dep:futures"]
 secrets-vault = []
 websockets = ["axum/ws", "dep:futures-util"]
 
@@ -40,6 +43,7 @@ candle-onnx = { version = "0.10.2", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = "2"
 flate2 = "1"
+futures = { version = "0.3", optional = true }
 futures-util = { version = "0.3", optional = true }
 forwarded-header-value = { version = "0.1", optional = true }
 governor = { version = "0.10", optional = true }
@@ -53,6 +57,7 @@ http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio", "http1", "http2"] }
 lru = { version = "0.18", optional = true }
+object_store = { version = "0.11", optional = true, features = ["aws"] }
 prometheus = "0.14"
 prost = { version = "0.14", optional = true }
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }

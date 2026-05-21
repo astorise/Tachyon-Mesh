@@ -36,6 +36,33 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     if maybe_run_bootstrap_mode(&runtime.config).await? {
         return Ok(());
     }
+    #[cfg(feature = "s3-persistence")]
+    let s3_backend = {
+        use crate::persistence::{S3PersistenceBackend, S3PersistenceConfig};
+        let data_root = manifest_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        if let Some(config) = S3PersistenceConfig::from_env() {
+            match S3PersistenceBackend::new(config, data_root) {
+                Ok(backend) => {
+                    let backend = std::sync::Arc::new(backend);
+                    if let Err(error) = backend.restore().await {
+                        tracing::warn!(error = %error, "S3 restore failed — starting with local state");
+                    }
+                    S3PersistenceBackend::spawn_background_flush(std::sync::Arc::clone(&backend));
+                    Some(backend)
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to initialise S3 persistence backend");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     let core_store = open_core_store_for_manifest(&manifest_path).await?;
     secure_cache_bootstrap(core_store.as_ref(), &runtime)?;
     let host_key_path = manifest_path
@@ -102,6 +129,8 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
         config_updates,
         manifest_path,
         background_workers: Arc::clone(&background_workers),
+        #[cfg(feature = "s3-persistence")]
+        s3_backend,
     };
     state.tls_manager.prime_from_store(&state).await?;
     prewarm_runtime_routes(

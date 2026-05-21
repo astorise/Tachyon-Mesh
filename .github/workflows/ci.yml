@@ -111,6 +111,9 @@ jobs:
       - name: Check ai-inference host build
         run: cargo check -p core-host --features ai-inference
 
+      - name: Check s3-persistence host build
+        run: cargo check -p core-host --features s3-persistence
+
       - name: Build core-host in release mode
         run: cargo build -p core-host --release
 
@@ -305,7 +308,7 @@ jobs:
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
-            cargo_features: ""
+            cargo_features: "s3-persistence"
             feature_tag: ""
           # fips uses Dockerfile.fips (rust:alpine builder) — aws-lc-fips-sys
           # compiles natively on Alpine musl (cmake/nasm/go/perl required).
