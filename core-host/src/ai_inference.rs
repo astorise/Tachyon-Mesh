@@ -105,6 +105,75 @@ impl GraphRegistry for EmptyGraphRegistry {
     }
 }
 
+// Test-only: pre-populate named graph aliases with a mock graph that always
+// returns MOCK_LLM_RESPONSE, allowing WASM guests that call build_from_cache()
+// to succeed in CI without actual model files on disk.
+#[cfg(test)]
+struct MockPreloadedGraphRegistry {
+    graphs: HashMap<String, WasiGraph>,
+}
+
+#[cfg(test)]
+impl MockPreloadedGraphRegistry {
+    fn from_aliases(aliases: impl IntoIterator<Item = String>) -> Self {
+        use wasmtime_wasi_nn::{
+            ExecutionContext, Graph,
+            backend::{BackendError, BackendExecutionContext, BackendGraph, Id, NamedTensor},
+            wit::{Tensor as WasiTensor, TensorType as WasiTensorType},
+        };
+
+        struct MockGraph;
+        struct MockCtx;
+
+        impl BackendGraph for MockGraph {
+            fn init_execution_context(&self) -> Result<ExecutionContext, BackendError> {
+                Ok(ExecutionContext::from(
+                    Box::new(MockCtx) as Box<dyn BackendExecutionContext>
+                ))
+            }
+        }
+
+        impl BackendExecutionContext for MockCtx {
+            fn set_input(&mut self, _id: Id, _tensor: &WasiTensor) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn compute(
+                &mut self,
+                _named: Option<Vec<NamedTensor>>,
+            ) -> Result<Option<Vec<NamedTensor>>, BackendError> {
+                Ok(None)
+            }
+            fn get_output(&mut self, _id: Id) -> Result<WasiTensor, BackendError> {
+                Ok(WasiTensor {
+                    dimensions: vec![MOCK_INFERENCE_RESPONSE.len() as u32],
+                    ty: WasiTensorType::U8,
+                    data: MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
+                })
+            }
+        }
+
+        let graphs = aliases
+            .into_iter()
+            .map(|alias| {
+                let graph =
+                    Graph::from(Box::new(MockGraph) as Box<dyn BackendGraph>);
+                (alias, graph)
+            })
+            .collect();
+        Self { graphs }
+    }
+}
+
+#[cfg(test)]
+impl GraphRegistry for MockPreloadedGraphRegistry {
+    fn get(&self, name: &str) -> Option<&WasiGraph> {
+        self.graphs.get(name)
+    }
+    fn get_mut(&mut self, name: &str) -> Option<&mut WasiGraph> {
+        self.graphs.get_mut(name)
+    }
+}
+
 #[derive(Clone)]
 struct SharedInputTensor {
     dimensions: Vec<u32>,
@@ -195,6 +264,14 @@ impl AiInferenceRuntime {
 
     pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
         let backends = [candle_onnx_backend::candle_onnx_backend()];
+        #[cfg(test)]
+        {
+            let registry = MockPreloadedGraphRegistry::from_aliases(
+                self.models.keys().cloned(),
+            );
+            return WasiNnCtx::new(backends, WasiRegistry::from(registry));
+        }
+        #[cfg(not(test))]
         WasiNnCtx::new(backends, WasiRegistry::from(EmptyGraphRegistry))
     }
 
@@ -273,6 +350,13 @@ impl AiInferenceRuntime {
         prompt: &str,
         adapter_id: Option<&str>,
     ) -> Result<String, String> {
+        if let Some(id) = adapter_id {
+            if id.contains("..") || id.starts_with('/') || id.starts_with('\\') {
+                return Err(format!(
+                    "adapter id `{id}` is not a valid identifier: must not contain path traversal sequences"
+                ));
+            }
+        }
         let model = self
             .models
             .get(alias)
