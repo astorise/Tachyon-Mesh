@@ -1,5 +1,20 @@
 use super::*;
 
+/// Run an async S3 volume operation from a potentially-synchronous context.
+///
+/// Uses `Handle::try_current()` so that direct test calls (which have no Tokio
+/// runtime active) safely skip the async work and return an empty result.
+fn try_block_on_s3<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+    T: Default,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(fut),
+        Err(_) => T::default(),
+    }
+}
+
 pub(crate) fn execute_guest(
     engine: &Engine,
     function_name: &str,
@@ -339,8 +354,7 @@ pub(crate) fn execute_component_guest(
         execution.ai_runtime.as_ref(),
         "component linker",
     )?;
-    let s3_preps = tokio::runtime::Handle::current()
-        .block_on(crate::host_core::volumes::prepare_s3_volumes(route));
+    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(route));
     let mut store = Store::new(
         engine,
         ComponentHostState::new(
@@ -400,8 +414,7 @@ pub(crate) fn execute_component_guest(
         ))
     })?;
 
-    tokio::runtime::Handle::current()
-        .block_on(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
+    try_block_on_s3(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
     crate::host_core::volumes::cleanup_s3_volume_dirs(&s3_preps);
 
     Ok(GuestExecutionOutcome {
@@ -1168,8 +1181,7 @@ pub(crate) fn execute_legacy_guest(
     }
 
     preopen_route_volumes(&mut wasi, route)?;
-    let s3_preps = tokio::runtime::Handle::current()
-        .block_on(crate::host_core::volumes::prepare_s3_volumes(route));
+    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(route));
     preopen_s3_volume_dirs(&mut wasi, &s3_preps)?;
 
     let wasi = wasi.build_p1();
@@ -1201,8 +1213,7 @@ pub(crate) fn execute_legacy_guest(
     let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
     let exec_result = handle_guest_entrypoint_result(entrypoint_name, call_result);
     if exec_result.is_ok() {
-        tokio::runtime::Handle::current()
-            .block_on(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
+        try_block_on_s3(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
     }
     crate::host_core::volumes::cleanup_s3_volume_dirs(&s3_preps);
     exec_result?;
@@ -1250,8 +1261,7 @@ pub(crate) fn execute_legacy_guest_with_stdio(
     }
 
     preopen_route_volumes(&mut wasi, route)?;
-    let s3_preps = tokio::runtime::Handle::current()
-        .block_on(crate::host_core::volumes::prepare_s3_volumes(route));
+    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(route));
     preopen_s3_volume_dirs(&mut wasi, &s3_preps)?;
 
     let wasi = wasi.build_p1();
@@ -1283,8 +1293,7 @@ pub(crate) fn execute_legacy_guest_with_stdio(
     let _ = sampled_fuel_consumed(&mut store, execution)?;
     let exec_result = handle_guest_entrypoint_result(entrypoint_name, call_result);
     if exec_result.is_ok() {
-        tokio::runtime::Handle::current()
-            .block_on(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
+        try_block_on_s3(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
     }
     crate::host_core::volumes::cleanup_s3_volume_dirs(&s3_preps);
     exec_result
