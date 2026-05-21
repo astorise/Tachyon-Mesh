@@ -1,6 +1,6 @@
 ## Tachyon Mesh — GPU Homelab Deployment
 ## Requires: NVIDIA GPU node with device plugin, NFS/local-path storage
-## Usage:   kubectl apply -f manifests/deploy-gpu-homelab.yaml
+## Usage:   kubectl apply -f manifests/deploy-gpu.yaml
 
 ---
 apiVersion: v1

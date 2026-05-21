@@ -2,7 +2,7 @@
 ## Implements Pod Security Standards (Restricted) + NetworkPolicy zero-trust perimeter.
 ## For Enterprise and highly-regulated environments.
 ## Requires: NVIDIA GPU node with device plugin, NFS/local-path storage, Kubernetes >= 1.25
-## Usage:   kubectl apply -f manifests/deploy-gpu-homelab-hardened.yaml
+## Usage:   kubectl apply -f manifests/deploy-gpu-hardened.yaml
 
 ---
 # Dedicated ServiceAccount — least-privilege identity for Tachyon pods.

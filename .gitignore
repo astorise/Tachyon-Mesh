@@ -17,3 +17,7 @@ tachyon.db-*
 buffered-requests/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Homelab-specific manifests (contain infrastructure credentials and local IPs)
+manifests/homelab*.yaml
+manifests/*-homelab*.yaml

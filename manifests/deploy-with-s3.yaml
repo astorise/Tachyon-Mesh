@@ -1,0 +1,184 @@
+## Tachyon Mesh — Deployment with S3-backed Persistence
+## Survives pod restarts and cluster reinstallations by restoring state from S3 at startup.
+##
+## Prerequisites:
+##   1. An S3-compatible bucket (AWS S3, MinIO, Cloudflare R2, etc.)
+##   2. Credentials with read/write access to the bucket
+##
+## Setup:
+##   1. Create a namespace:
+##        kubectl create namespace tachyon
+##
+##   2. Create the S3 credentials secret (replace placeholder values):
+##        kubectl create secret generic tachyon-s3-creds -n tachyon \
+##          --from-literal=access-key-id=<YOUR_ACCESS_KEY> \
+##          --from-literal=secret-access-key=<YOUR_SECRET_KEY>
+##
+##   3. Edit the RCLONE_CONFIG_S3_ENDPOINT environment variable below
+##      to match your S3 provider (leave empty for AWS S3 us-east-1).
+##
+##   4. Edit the RCLONE_CONFIG_S3_BUCKET value to your bucket name.
+##
+##   5. Apply:
+##        kubectl apply -f manifests/deploy-with-s3.yaml
+##
+## Persistent data stored in S3:
+##   /data/auth-state/      — user accounts, sessions, TOTP secrets
+##   /data/tachyon.db       — ReDB core store (KV partitions, node registry)
+##   /data/host-identity.key — stable Ed25519 node identity
+##   /data/config-store/    — GitOps configuration store
+##   /data/certs/           — TLS/ACME certificates
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tachyon-host
+  namespace: tachyon
+  labels:
+    app: tachyon-host
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tachyon-host
+  template:
+    metadata:
+      labels:
+        app: tachyon-host
+    spec:
+      initContainers:
+      - name: s3-restore
+        image: rclone/rclone:latest
+        command:
+          - sh
+          - -c
+          - |
+            echo "Restoring Tachyon state from S3..."
+            rclone sync s3:${RCLONE_CONFIG_S3_BUCKET} /data --create-empty-src-dirs \
+              || echo "No existing data in S3 — starting fresh."
+            echo "Restore complete."
+        env:
+        - name: RCLONE_CONFIG_S3_TYPE
+          value: "s3"
+        - name: RCLONE_CONFIG_S3_PROVIDER
+          value: "AWS"                  # Change to: Minio, Cloudflare, DigitalOcean, etc.
+        - name: RCLONE_CONFIG_S3_ENDPOINT
+          value: ""                     # Leave empty for AWS S3; set for other providers
+        - name: RCLONE_CONFIG_S3_REGION
+          value: "us-east-1"            # AWS region or equivalent
+        - name: RCLONE_CONFIG_S3_FORCE_PATH_STYLE
+          value: "false"                # Set to "true" for MinIO and other self-hosted providers
+        - name: RCLONE_CONFIG_S3_BUCKET
+          value: "tachyon-data"         # Your S3 bucket name
+        - name: RCLONE_CONFIG_S3_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: tachyon-s3-creds
+              key: access-key-id
+        - name: RCLONE_CONFIG_S3_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tachyon-s3-creds
+              key: secret-access-key
+        volumeMounts:
+        - name: tachyon-data
+          mountPath: /data
+
+      containers:
+      - name: core-host
+        image: ghcr.io/astorise/tachyon-mesh:latest
+        imagePullPolicy: Always
+        ports:
+          - containerPort: 8080
+        env:
+        - name: TACHYON_AUTH_STATE_DIR
+          value: "/data/auth-state"
+        - name: TACHYON_INTEGRITY_MANIFEST
+          value: "/data/integrity.lock"
+        - name: TACHYON_CONFIG_STORE_DIR
+          value: "/data/config-store"
+        volumeMounts:
+        - name: tachyon-data
+          mountPath: /data
+        - name: tachyon-data
+          mountPath: /app/certs
+          subPath: certs
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          periodSeconds: 2
+          failureThreshold: 30
+        livenessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 6
+
+      - name: s3-sync
+        image: rclone/rclone:latest
+        command:
+          - sh
+          - -c
+          - |
+            echo "S3 sync sidecar started (interval: 30s)"
+            while true; do
+              sleep 30
+              rclone sync /data s3:${RCLONE_CONFIG_S3_BUCKET} \
+                --create-empty-src-dirs 2>&1 | tail -1
+            done
+        env:
+        - name: RCLONE_CONFIG_S3_TYPE
+          value: "s3"
+        - name: RCLONE_CONFIG_S3_PROVIDER
+          value: "AWS"
+        - name: RCLONE_CONFIG_S3_ENDPOINT
+          value: ""
+        - name: RCLONE_CONFIG_S3_REGION
+          value: "us-east-1"
+        - name: RCLONE_CONFIG_S3_FORCE_PATH_STYLE
+          value: "false"
+        - name: RCLONE_CONFIG_S3_BUCKET
+          value: "tachyon-data"
+        - name: RCLONE_CONFIG_S3_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: tachyon-s3-creds
+              key: access-key-id
+        - name: RCLONE_CONFIG_S3_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tachyon-s3-creds
+              key: secret-access-key
+        volumeMounts:
+        - name: tachyon-data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+
+      volumes:
+      - name: tachyon-data
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tachyon-service
+  namespace: tachyon
+  labels:
+    app: tachyon-host
+spec:
+  selector:
+    app: tachyon-host
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
