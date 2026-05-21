@@ -280,6 +280,32 @@ async fn get_mesh_graph() -> Result<tachyon_client::MeshGraphSnapshot, String> {
 }
 
 #[tauri::command]
+async fn list_s3_volumes(route_path: String) -> Result<Vec<tachyon_client::S3VolumeEntry>, String> {
+    tachyon_client::list_s3_volumes(&route_path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn attach_s3_volume(
+    route_path: String,
+    s3_url: String,
+    guest_path: String,
+    readonly: bool,
+) -> Result<tachyon_client::S3VolumeEntry, String> {
+    tachyon_client::attach_s3_volume(&route_path, &s3_url, &guest_path, readonly)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn detach_s3_volume(route_path: String, guest_path: String) -> Result<(), String> {
+    tachyon_client::detach_s3_volume(&route_path, &guest_path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_topology_graph() -> Result<tachyon_client::TopologyGraphSpec, String> {
     tachyon_client::get_topology_graph()
         .await
@@ -1222,6 +1248,9 @@ fn main() {
             seal_and_apply_manifest,
             get_node_public_key,
             bundle_and_apply_manifest,
+            list_s3_volumes,
+            attach_s3_volume,
+            detach_s3_volume,
             save_credentials,
             load_credentials,
             delete_credentials,

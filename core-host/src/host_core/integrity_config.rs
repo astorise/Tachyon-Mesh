@@ -1741,6 +1741,20 @@ pub(crate) fn validate_route_volume(
         ));
     }
 
+    if volume.volume_type == VolumeType::S3 && route_role == RouteRole::System {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` is a system route and cannot use S3 volumes; system routes have direct host filesystem access"
+        ));
+    }
+
+    if volume.volume_type == VolumeType::S3 {
+        parse_s3_url(host_path).map_err(|_| {
+            anyhow!(
+                "Integrity Validation Failed: route `{route_path}` volume `host_path` value `{host_path}` is not a valid S3 URL; expected format: s3://bucket/prefix"
+            )
+        })?;
+    }
+
     let guest_path = normalize_guest_volume_path(&volume.guest_path)?;
     if volume.ttl_seconds.is_some_and(|ttl| ttl == 0) {
         return Err(anyhow!(
@@ -1824,6 +1838,25 @@ pub(crate) fn normalize_guest_volume_path(path: &str) -> Result<String> {
     }
 
     Ok(normalized)
+}
+
+/// Parse an S3 URL of the form `s3://bucket/prefix` into `(bucket, prefix)`.
+/// The prefix may be empty (bare bucket URL `s3://bucket` or `s3://bucket/`).
+pub(crate) fn parse_s3_url(url: &str) -> Result<(String, String)> {
+    let without_scheme = url
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow!("S3 URL must start with s3://"))?;
+    if without_scheme.is_empty() {
+        return Err(anyhow!("S3 URL missing bucket name"));
+    }
+    let (bucket, prefix) = match without_scheme.find('/') {
+        Some(idx) => (&without_scheme[..idx], without_scheme[idx + 1..].trim_end_matches('/')),
+        None => (without_scheme, ""),
+    };
+    if bucket.is_empty() {
+        return Err(anyhow!("S3 URL missing bucket name"));
+    }
+    Ok((bucket.to_owned(), prefix.to_owned()))
 }
 
 pub(crate) fn normalize_idle_timeout(

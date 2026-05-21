@@ -706,3 +706,238 @@ pub(crate) fn snapshot_path_for_volume(active_path: &Path) -> PathBuf {
     snapshot.set_extension("snapshot");
     snapshot
 }
+
+// ── S3 volume lifecycle ────────────────────────────────────────────────────────
+
+/// Carries the prepared temporary directory for one S3 volume invocation.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct S3VolumePrep {
+    /// Guest-side mount path (e.g. `/app/data`).
+    pub(crate) guest_path: String,
+    /// Host-side temporary directory created for this invocation.
+    pub(crate) temp_path: PathBuf,
+    pub(crate) readonly: bool,
+    /// S3 bucket extracted from `host_path`.
+    pub(crate) s3_bucket: String,
+    /// S3 prefix extracted from `host_path` (may be empty).
+    pub(crate) s3_prefix: String,
+}
+
+/// Download all S3 volumes for `route` into fresh per-invocation temp dirs.
+/// Returns one `S3VolumePrep` per S3 volume; empty if none are configured.
+/// Must be called from an async context (before entering `spawn_blocking`).
+pub(crate) async fn prepare_s3_volumes(route: &IntegrityRoute) -> Vec<S3VolumePrep> {
+    let mut preps = Vec::new();
+
+    for volume in route.volumes.iter().filter(|v| v.volume_type.is_s3()) {
+        let (bucket, prefix) = match parse_s3_url(&volume.host_path) {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(
+                    route = %route.path,
+                    host_path = %volume.host_path,
+                    "skipping S3 volume with invalid URL: {error:#}"
+                );
+                continue;
+            }
+        };
+
+        let temp_path = match build_s3_temp_dir() {
+            Ok(p) => p,
+            Err(error) => {
+                tracing::warn!(
+                    route = %route.path,
+                    guest_path = %volume.guest_path,
+                    "failed to create S3 temp dir: {error:#}"
+                );
+                continue;
+            }
+        };
+
+        #[cfg(feature = "s3-persistence")]
+        {
+            if let Err(error) =
+                download_s3_prefix_to_dir(&bucket, &prefix, &temp_path).await
+            {
+                tracing::warn!(
+                    route = %route.path,
+                    guest_path = %volume.guest_path,
+                    "S3 volume download failed, guest will see empty dir: {error:#}"
+                );
+            }
+        }
+        #[cfg(not(feature = "s3-persistence"))]
+        {
+            tracing::warn!(
+                route = %route.path,
+                guest_path = %volume.guest_path,
+                bucket = %bucket,
+                "S3 volume configured but binary was compiled without s3-persistence feature — guest will see empty dir"
+            );
+        }
+
+        preps.push(S3VolumePrep {
+            guest_path: volume.guest_path.clone(),
+            temp_path,
+            readonly: volume.readonly,
+            s3_bucket: bucket,
+            s3_prefix: prefix,
+        });
+    }
+
+    preps
+}
+
+/// Upload modified files back to S3 for all read-write volumes.
+/// Called after successful guest execution.
+pub(crate) async fn commit_s3_volumes(preps: &[S3VolumePrep]) {
+    #[cfg(feature = "s3-persistence")]
+    for prep in preps.iter().filter(|p| !p.readonly) {
+        if let Err(error) =
+            upload_dir_to_s3_prefix(&prep.temp_path, &prep.s3_bucket, &prep.s3_prefix).await
+        {
+            tracing::warn!(
+                guest_path = %prep.guest_path,
+                bucket = %prep.s3_bucket,
+                prefix = %prep.s3_prefix,
+                "S3 volume commit failed — changes may be lost: {error:#}"
+            );
+        }
+    }
+    #[cfg(not(feature = "s3-persistence"))]
+    let _ = preps;
+}
+
+/// Delete all temporary directories created by `prepare_s3_volumes`.
+/// Called unconditionally after execution (success or failure).
+pub(crate) fn cleanup_s3_volume_dirs(preps: &[S3VolumePrep]) {
+    for prep in preps {
+        if let Err(error) = std::fs::remove_dir_all(&prep.temp_path) {
+            tracing::debug!(
+                path = %prep.temp_path.display(),
+                "failed to remove S3 temp dir: {error}"
+            );
+        }
+    }
+}
+
+fn build_s3_temp_dir() -> std::io::Result<PathBuf> {
+    let uuid = uuid_v4_hex();
+    let dir = std::env::temp_dir().join(format!("tachyon-s3-vol-{uuid}"));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn uuid_v4_hex() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Simple unique ID without pulling in the uuid crate.
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    // Mix thread id and timestamp nanos for a reasonably unique suffix.
+    let tid = format!("{:?}", std::thread::current().id());
+    let h = format!("{:08x}{:08x}", t, tid.len().wrapping_mul(0x9e3779b9));
+    h
+}
+
+#[cfg(feature = "s3-persistence")]
+async fn download_s3_prefix_to_dir(
+    bucket: &str,
+    prefix: &str,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+    use object_store::{path::Path as OsPath, ObjectStore};
+
+    let store = build_s3_store(bucket)?;
+    let prefix_path = if prefix.is_empty() {
+        None
+    } else {
+        Some(OsPath::parse(prefix).map_err(|e| anyhow::anyhow!("{e}"))?)
+    };
+
+    let mut list = store.list(prefix_path.as_ref());
+    while let Some(entry) = list.next().await {
+        let meta = entry?;
+        let key_str = meta.location.to_string();
+        let rel = if prefix.is_empty() {
+            key_str.as_str()
+        } else {
+            key_str
+                .strip_prefix(&format!("{}/", prefix.trim_end_matches('/')))
+                .unwrap_or(key_str.as_str())
+        };
+
+        let local_path = dest.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let bytes = store.get(&meta.location).await?.bytes().await?;
+        tokio::fs::write(&local_path, &bytes).await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "s3-persistence")]
+async fn upload_dir_to_s3_prefix(
+    dir: &Path,
+    bucket: &str,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    use object_store::{path::Path as OsPath, ObjectStore};
+
+    let store = build_s3_store(bucket)?;
+    let mut stack = vec![dir.to_path_buf()];
+
+    while let Some(entry_path) = stack.pop() {
+        let metadata = match tokio::fs::metadata(&entry_path).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            let mut read = tokio::fs::read_dir(&entry_path).await?;
+            while let Some(child) = read.next_entry().await? {
+                stack.push(child.path());
+            }
+        } else {
+            let rel = entry_path
+                .strip_prefix(dir)
+                .unwrap_or(&entry_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let key_str = if prefix.is_empty() {
+                rel
+            } else {
+                format!("{}/{}", prefix.trim_end_matches('/'), rel)
+            };
+            let key = OsPath::parse(&key_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let bytes = tokio::fs::read(&entry_path).await?;
+            store.put(&key, bytes.into()).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "s3-persistence")]
+fn build_s3_store(bucket: &str) -> anyhow::Result<impl object_store::ObjectStore> {
+    use object_store::aws::AmazonS3Builder;
+    let mut builder = AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .with_access_key_id(
+            std::env::var("TACHYON_S3_ACCESS_KEY_ID").unwrap_or_default(),
+        )
+        .with_secret_access_key(
+            std::env::var("TACHYON_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+        )
+        .with_region(
+            std::env::var("TACHYON_S3_REGION")
+                .unwrap_or_else(|_| "us-east-1".to_owned()),
+        )
+        .with_allow_http(true);
+    if let Ok(endpoint) = std::env::var("TACHYON_S3_ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
+    builder.build().map_err(|e| anyhow::anyhow!("{e}"))
+}

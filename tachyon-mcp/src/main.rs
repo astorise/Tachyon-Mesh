@@ -293,6 +293,9 @@ fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<V
         "tachyon_register_resource" => &["name", "type", "target"],
         "tachyon_dryrun_manifest" => &["manifest"],
         "tachyon_run_chaos_scenario" => &["scenario"],
+        "list_s3_volumes" => &["route_path"],
+        "attach_s3_volume" => &["route_path", "s3_url", "guest_path"],
+        "detach_s3_volume" => &["route_path", "guest_path"],
         _ => return None,
     };
     let obj = match arguments.and_then(Value::as_object) {
@@ -326,6 +329,8 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         "tachyon_kv_put" | "tachyon_kv_delete" | "tachyon_function_logs" => 30,
         // Read-only telemetry tools.
         "tachyon_get_metrics" | "tachyon_tail_logs" => 30,
+        // S3 volume mutators — moderate budget.
+        "attach_s3_volume" | "detach_s3_volume" => 10,
         // All remaining read-only tools — high throughput allowed.
         "tachyon_mesh_status"
         | "tachyon_lockfile"
@@ -336,7 +341,8 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         | "tachyon_kv_get"
         | "tachyon_dryrun_manifest"
         | "validate_faas_capabilities"
-        | "run_chaos_scenario" => 100,
+        | "run_chaos_scenario"
+        | "list_s3_volumes" => 100,
         _ => return None,
     };
     Some(RateLimitSpec {
@@ -822,6 +828,43 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                             "weight_pct": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Percentage of traffic to route to the canary version. 0 = abort and roll back; 100 = full promotion." }
                         }
                     }
+                },
+                {
+                    "name": "list_s3_volumes",
+                    "description": "List all S3 volumes configured for a FaaS route. Returns bucket, prefix, guest mount path, and read-only flag for each volume.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path"],
+                        "properties": {
+                            "route_path": { "type": "string", "description": "HTTP route path of the function (e.g. '/api/my-function')." }
+                        }
+                    }
+                },
+                {
+                    "name": "attach_s3_volume",
+                    "description": "Attach an S3 volume to a FaaS route. The S3 bucket contents are downloaded before each invocation and (for read-write volumes) uploaded back after successful execution.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path", "s3_url", "guest_path"],
+                        "properties": {
+                            "route_path": { "type": "string", "description": "HTTP route path of the target function." },
+                            "s3_url": { "type": "string", "description": "S3 URL in the format s3://bucket/prefix (e.g. 's3://my-bucket/datasets/v1')." },
+                            "guest_path": { "type": "string", "description": "Absolute path inside the WASM guest where the volume will be mounted (e.g. '/app/data')." },
+                            "readonly": { "type": "boolean", "default": false, "description": "When true, guest writes are rejected and nothing is uploaded to S3 after execution." }
+                        }
+                    }
+                },
+                {
+                    "name": "detach_s3_volume",
+                    "description": "Remove an S3 volume from a FaaS route. Identified by its guest mount path. Subsequent invocations will no longer receive that volume.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path", "guest_path"],
+                        "properties": {
+                            "route_path": { "type": "string", "description": "HTTP route path of the target function." },
+                            "guest_path": { "type": "string", "description": "Guest mount path of the S3 volume to remove (e.g. '/app/data')." }
+                        }
+                    }
                 }
             ]
             });
@@ -1242,6 +1285,77 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 format!("canary weight for `{route_path}` set to {weight_pct}%")
             };
             Ok(json!({ "content": [{ "type": "text", "text": msg }] }))
+        }
+
+        // ── S3 FaaS volume management ─────────────────────────────────────────
+        "list_s3_volumes" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let volumes = tachyon_client::list_s3_volumes(route_path).await?;
+            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&volumes)? }] }))
+        }
+        "attach_s3_volume" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let s3_url = arguments
+                .get("s3_url")
+                .and_then(Value::as_str)
+                .context("missing s3_url")?;
+            let guest_path = arguments
+                .get("guest_path")
+                .and_then(Value::as_str)
+                .context("missing guest_path")?;
+            let readonly = arguments
+                .get("readonly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let entry =
+                tachyon_client::attach_s3_volume(route_path, s3_url, guest_path, readonly).await?;
+            let mode = if readonly { "read-only" } else { "read-write" };
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "S3 volume `{s3_url}` attached to route `{route_path}` at `{guest_path}` ({mode}).\n\n{}",
+                        serde_json::to_string_pretty(&entry)?
+                    )
+                }]
+            }))
+        }
+        "detach_s3_volume" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let guest_path = arguments
+                .get("guest_path")
+                .and_then(Value::as_str)
+                .context("missing guest_path")?;
+            tachyon_client::detach_s3_volume(route_path, guest_path).await?;
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "S3 volume at `{guest_path}` detached from route `{route_path}`. Manifest updated."
+                    )
+                }]
+            }))
         }
 
         other => Err(anyhow::anyhow!("unsupported tool `{other}`")),

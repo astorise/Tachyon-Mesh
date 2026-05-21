@@ -322,6 +322,13 @@ pub(crate) struct AsyncLogEntry {
 pub(crate) enum VolumeType {
     Host,
     Ram,
+    S3,
+}
+
+impl VolumeType {
+    pub(crate) fn is_s3(&self) -> bool {
+        matches!(self, Self::S3)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]

@@ -2205,6 +2205,184 @@ pub async fn run_chaos_scenario(request: ChaosScenarioRequest) -> Result<ChaosSc
     post_admin_json(ADMIN_CHAOS_SCENARIOS_PATH, &request).await
 }
 
+// ── S3 FaaS volume management ─────────────────────────────────────────────────
+
+/// One S3 volume entry as returned by `list_s3_volumes`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct S3VolumeEntry {
+    pub s3_url: String,
+    pub guest_path: String,
+    pub readonly: bool,
+}
+
+/// Read the live manifest and return S3 volumes configured for `route_path`.
+pub async fn list_s3_volumes(route_path: &str) -> Result<Vec<S3VolumeEntry>> {
+    let config = load_live_config_payload().await?;
+    let routes = config
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for route in &routes {
+        if route.get("path").and_then(|v| v.as_str()) == Some(route_path) {
+            let volumes = route
+                .get("volumes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let s3: Vec<S3VolumeEntry> = volumes
+                .into_iter()
+                .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("s3"))
+                .map(|v| S3VolumeEntry {
+                    s3_url: v
+                        .get("host_path")
+                        .and_then(|h| h.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    guest_path: v
+                        .get("guest_path")
+                        .and_then(|g| g.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    readonly: v
+                        .get("readonly")
+                        .and_then(|r| r.as_bool())
+                        .unwrap_or(false),
+                })
+                .collect();
+            return Ok(s3);
+        }
+    }
+    anyhow::bail!("route `{route_path}` not found in sealed manifest")
+}
+
+/// Add an S3 volume to a route in the live sealed manifest.
+/// The `s3_url` must be in the form `s3://bucket/prefix`.
+pub async fn attach_s3_volume(
+    route_path: &str,
+    s3_url: &str,
+    guest_path: &str,
+    readonly: bool,
+) -> Result<S3VolumeEntry> {
+    if !s3_url.starts_with("s3://") {
+        anyhow::bail!(
+            "invalid S3 URL `{s3_url}`: must start with s3://"
+        );
+    }
+
+    let mut config = load_live_config_payload().await?;
+    let routes = config
+        .get_mut("routes")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("manifest has no routes array"))?;
+
+    let route = routes
+        .iter_mut()
+        .find(|r| r.get("path").and_then(|v| v.as_str()) == Some(route_path))
+        .ok_or_else(|| anyhow::anyhow!("route `{route_path}` not found in sealed manifest"))?;
+
+    let volumes = route
+        .get_mut("volumes")
+        .and_then(|v| v.as_array_mut());
+
+    let new_volume = serde_json::json!({
+        "type": "s3",
+        "host_path": s3_url,
+        "guest_path": guest_path,
+        "readonly": readonly,
+    });
+
+    if let Some(arr) = volumes {
+        if arr.iter().any(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("s3")
+                && v.get("guest_path").and_then(|g| g.as_str()) == Some(guest_path)
+        }) {
+            anyhow::bail!(
+                "route `{route_path}` already has an S3 volume at guest path `{guest_path}`"
+            );
+        }
+        arr.push(new_volume);
+    } else {
+        route["volumes"] = serde_json::json!([new_volume]);
+    }
+
+    patch_and_apply_manifest(config).await?;
+
+    Ok(S3VolumeEntry {
+        s3_url: s3_url.to_owned(),
+        guest_path: guest_path.to_owned(),
+        readonly,
+    })
+}
+
+/// Remove an S3 volume (identified by `guest_path`) from a route in the live manifest.
+pub async fn detach_s3_volume(route_path: &str, guest_path: &str) -> Result<()> {
+    let mut config = load_live_config_payload().await?;
+    let routes = config
+        .get_mut("routes")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("manifest has no routes array"))?;
+
+    let route = routes
+        .iter_mut()
+        .find(|r| r.get("path").and_then(|v| v.as_str()) == Some(route_path))
+        .ok_or_else(|| anyhow::anyhow!("route `{route_path}` not found in sealed manifest"))?;
+
+    let volumes = route
+        .get_mut("volumes")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| {
+            anyhow::anyhow!("route `{route_path}` has no volumes configured")
+        })?;
+
+    let before = volumes.len();
+    volumes.retain(|v| {
+        !(v.get("type").and_then(|t| t.as_str()) == Some("s3")
+            && v.get("guest_path").and_then(|g| g.as_str()) == Some(guest_path))
+    });
+    if volumes.len() == before {
+        anyhow::bail!(
+            "route `{route_path}` has no S3 volume at guest path `{guest_path}`"
+        );
+    }
+
+    patch_and_apply_manifest(config).await
+}
+
+/// Fetch the live IntegrityConfig payload as a mutable JSON Value.
+/// Falls back to the local integrity.lock file when not connected.
+async fn load_live_config_payload() -> Result<serde_json::Value> {
+    #[derive(Deserialize)]
+    struct LiveManifest {
+        config_payload: String,
+    }
+
+    if current_connection().is_some() {
+        if let Ok(manifest) = get_admin_json::<LiveManifest>(ADMIN_MANIFEST_PATH).await {
+            return serde_json::from_str(&manifest.config_payload)
+                .context("failed to parse live manifest config_payload");
+        }
+    }
+
+    // Fall back to local integrity.lock
+    let raw = read_lockfile().await?;
+    let manifest: LiveManifest =
+        serde_json::from_str(&raw).context("failed to parse integrity.lock")?;
+    serde_json::from_str(&manifest.config_payload)
+        .context("failed to parse integrity.lock config_payload")
+}
+
+/// Serialize `config` back to a string, re-sign, write the lockfile, and POST to /admin/manifest.
+async fn patch_and_apply_manifest(config: serde_json::Value) -> Result<()> {
+    let payload =
+        serde_json::to_string(&config).context("failed to serialize patched config payload")?;
+    let manifest = sign_manifest_payload(payload).await?;
+    write_lockfile(&manifest).await?;
+    apply_manifest_to_active_node(&manifest).await?;
+    Ok(())
+}
+
 pub async fn remove_overlay_resource(name: &str) -> Result<()> {
     let trimmed = name.trim();
     if trimmed.is_empty() {

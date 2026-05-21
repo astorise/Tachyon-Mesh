@@ -339,6 +339,8 @@ pub(crate) fn execute_component_guest(
         execution.ai_runtime.as_ref(),
         "component linker",
     )?;
+    let s3_preps = tokio::runtime::Handle::current()
+        .block_on(crate::host_core::volumes::prepare_s3_volumes(route));
     let mut store = Store::new(
         engine,
         ComponentHostState::new(
@@ -352,6 +354,7 @@ pub(crate) fn execute_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
+            &s3_preps,
         )?,
     );
     #[cfg(feature = "ai-inference")]
@@ -386,14 +389,20 @@ pub(crate) fn execute_component_guest(
     record_wasm_end(execution.telemetry.as_ref());
     let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
     let response = response.map_err(|error| {
+        crate::host_core::volumes::cleanup_s3_volume_dirs(&s3_preps);
         guest_execution_error(error, "guest component `handle-request` trapped")
     })?;
     let status = StatusCode::from_u16(response.status).map_err(|error| {
+        crate::host_core::volumes::cleanup_s3_volume_dirs(&s3_preps);
         ExecutionError::Internal(format!(
             "guest component returned an invalid HTTP status code `{}`: {error}",
             response.status
         ))
     })?;
+
+    tokio::runtime::Handle::current()
+        .block_on(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
+    crate::host_core::volumes::cleanup_s3_volume_dirs(&s3_preps);
 
     Ok(GuestExecutionOutcome {
         output: GuestExecutionOutput::Http(GuestHttpResponse {
@@ -479,6 +488,7 @@ pub(crate) fn execute_udp_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
+            &[],
         )?,
     );
     store.limiter(|state| &mut state.limits);
@@ -618,6 +628,7 @@ pub(crate) fn execute_websocket_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
+            &[],
         )?,
     );
     store.limiter(|state| &mut state.limits);
@@ -842,6 +853,7 @@ pub(crate) fn execute_system_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
+            &[],
         )?,
     );
     store.data_mut().route_overrides = Arc::clone(&execution.route_overrides);
@@ -1044,6 +1056,7 @@ impl BackgroundTickRunner {
                 storage_broker,
                 concurrency_limits,
                 Vec::new(),
+                &[],
             )?,
         );
         store.data_mut().route_overrides = route_overrides;
@@ -1155,6 +1168,9 @@ pub(crate) fn execute_legacy_guest(
     }
 
     preopen_route_volumes(&mut wasi, route)?;
+    let s3_preps = tokio::runtime::Handle::current()
+        .block_on(crate::host_core::volumes::prepare_s3_volumes(route));
+    preopen_s3_volume_dirs(&mut wasi, &s3_preps)?;
 
     let wasi = wasi.build_p1();
     let mut store = Store::new(
@@ -1183,7 +1199,13 @@ pub(crate) fn execute_legacy_guest(
     let call_result = entrypoint.call(&mut store, ());
     record_wasm_end(execution.telemetry.as_ref());
     let fuel_consumed = sampled_fuel_consumed(&mut store, execution)?;
-    handle_guest_entrypoint_result(entrypoint_name, call_result)?;
+    let exec_result = handle_guest_entrypoint_result(entrypoint_name, call_result);
+    if exec_result.is_ok() {
+        tokio::runtime::Handle::current()
+            .block_on(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
+    }
+    crate::host_core::volumes::cleanup_s3_volume_dirs(&s3_preps);
+    exec_result?;
     let stdout_bytes = stdout_capture.finish()?;
 
     Ok(GuestExecutionOutcome {
@@ -1228,6 +1250,9 @@ pub(crate) fn execute_legacy_guest_with_stdio(
     }
 
     preopen_route_volumes(&mut wasi, route)?;
+    let s3_preps = tokio::runtime::Handle::current()
+        .block_on(crate::host_core::volumes::prepare_s3_volumes(route));
+    preopen_s3_volume_dirs(&mut wasi, &s3_preps)?;
 
     let wasi = wasi.build_p1();
     let mut store = Store::new(
@@ -1256,8 +1281,13 @@ pub(crate) fn execute_legacy_guest_with_stdio(
     let call_result = entrypoint.call(&mut store, ());
     record_wasm_end(execution.telemetry.as_ref());
     let _ = sampled_fuel_consumed(&mut store, execution)?;
-    handle_guest_entrypoint_result(entrypoint_name, call_result)?;
-    Ok(())
+    let exec_result = handle_guest_entrypoint_result(entrypoint_name, call_result);
+    if exec_result.is_ok() {
+        tokio::runtime::Handle::current()
+            .block_on(crate::host_core::volumes::commit_s3_volumes(&s3_preps));
+    }
+    crate::host_core::volumes::cleanup_s3_volume_dirs(&s3_preps);
+    exec_result
 }
 
 #[derive(Clone)]

@@ -83,9 +83,10 @@ impl ComponentHostState {
         storage_broker: Arc<StorageBrokerManager>,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
         propagated_headers: Vec<PropagatedHeader>,
+        s3_preps: &[crate::host_core::volumes::S3VolumePrep],
     ) -> std::result::Result<Self, ExecutionError> {
         Ok(Self {
-            ctx: build_component_wasi_ctx(route, host_identity.as_ref())?,
+            ctx: build_component_wasi_ctx(route, host_identity.as_ref(), s3_preps)?,
             table: ResourceTable::new(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
             secrets,
@@ -631,6 +632,7 @@ pub(crate) fn cached_capable_peer_destination(
 pub(crate) fn build_component_wasi_ctx(
     route: &IntegrityRoute,
     host_identity: &HostIdentity,
+    s3_preps: &[crate::host_core::volumes::S3VolumePrep],
 ) -> std::result::Result<WasiCtx, ExecutionError> {
     // Intentionally do not inherit the host environment. Secrets stay in host memory
     // and are only reachable through the typed vault import.
@@ -639,6 +641,7 @@ pub(crate) fn build_component_wasi_ctx(
         wasi.env(&name, &value);
     }
     preopen_route_volumes(&mut wasi, route)?;
+    preopen_s3_volume_dirs(&mut wasi, s3_preps)?;
     preopen_gitops_config_store(&mut wasi, route)?;
     Ok(wasi.build())
 }
@@ -723,11 +726,38 @@ pub(crate) fn is_valid_w3c_traceparent(value: &str) -> bool {
     true
 }
 
+pub(crate) fn preopen_s3_volume_dirs(
+    wasi: &mut WasiCtxBuilder,
+    preps: &[crate::host_core::volumes::S3VolumePrep],
+) -> std::result::Result<(), ExecutionError> {
+    for prep in preps {
+        wasi.preopened_dir(
+            &prep.temp_path,
+            &prep.guest_path,
+            volume_dir_perms(prep.readonly),
+            volume_file_perms(prep.readonly),
+        )
+        .map_err(|error| {
+            ExecutionError::Internal(format!(
+                "failed to preopen S3 volume temp dir `{}` at guest path `{}`: {error}",
+                prep.temp_path.display(),
+                prep.guest_path,
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn preopen_route_volumes(
     wasi: &mut WasiCtxBuilder,
     route: &IntegrityRoute,
 ) -> std::result::Result<(), ExecutionError> {
     for volume in &route.volumes {
+        // S3 volumes are preopened separately via preopen_s3_volume_dirs after
+        // async download into a per-invocation temp dir.
+        if volume.volume_type.is_s3() {
+            continue;
+        }
         if volume.volume_type == VolumeType::Ram {
             fs::create_dir_all(&volume.host_path).map_err(|error| {
                 ExecutionError::Internal(format!(

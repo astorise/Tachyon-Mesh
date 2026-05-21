@@ -373,6 +373,7 @@ pub(crate) fn prewarm_http_component_instance(
             storage_broker,
             concurrency_limits,
             Vec::new(),
+            &[],
         )?,
     );
     #[cfg(feature = "ai-inference")]
@@ -438,6 +439,7 @@ pub(crate) fn prewarm_udp_component_instance(
             storage_broker,
             concurrency_limits,
             Vec::new(),
+            &[],
         )?,
     );
     store.limiter(|state| &mut state.limits);
@@ -509,6 +511,7 @@ pub(crate) fn prewarm_websocket_component_instance(
             storage_broker,
             concurrency_limits,
             Vec::new(),
+            &[],
         )?,
     );
     store.limiter(|state| &mut state.limits);
@@ -641,6 +644,7 @@ pub(crate) fn prewarm_system_component_instance(
             storage_broker,
             concurrency_limits,
             Vec::new(),
+            &[],
         )?,
     );
     store.limiter(|state| &mut state.limits);

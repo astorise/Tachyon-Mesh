@@ -2,6 +2,7 @@ import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import "./TachyonVolumesPanel";
 
 type MeshRouteSummary = {
   name: string;
@@ -21,6 +22,7 @@ type MeshGraphSnapshot = {
 
 export class TachyonRoutingPanel extends TachyonConfigDashboard {
   private snapshot: MeshGraphSnapshot | null = null;
+  private expandedRoute: string | null = null;
 
   async connectedCallback(): Promise<void> {
     this.render();
@@ -143,16 +145,34 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
   private populateSnapshotRows(): void {
     const tbody = this.root.getElementById("routing-snapshot-rows");
     if (!tbody || !this.snapshot) return;
-    tbody.replaceChildren(
-      ...this.snapshot.routes.map((route) =>
-        el("tr", {},
-          el("td", { class: "py-1 pr-4 text-cyan-300" }, route.name),
-          el("td", { class: "py-1 pr-4 font-mono text-slate-300" }, route.path),
-          el("td", { class: "py-1 pr-4 text-slate-300" }, String(route.targetCount)),
-          el("td", { class: "py-1 text-slate-300" }, route.requiresTee ? "yes" : "no"),
-        ),
-      ),
-    );
+
+    const rows: Element[] = [];
+    for (const route of this.snapshot.routes) {
+      const isExpanded = this.expandedRoute === route.path;
+      const tr = el("tr", { class: "cursor-pointer hover:bg-slate-800/40", "data-route-path": route.path },
+        el("td", { class: "py-1 pr-4 text-cyan-300" }, route.name),
+        el("td", { class: "py-1 pr-4 font-mono text-slate-300" }, route.path),
+        el("td", { class: "py-1 pr-4 text-slate-300" }, String(route.targetCount)),
+        el("td", { class: "py-1 text-slate-300" }, route.requiresTee ? "yes" : "no"),
+        el("td", { class: "py-1 text-slate-400 text-xs" }, isExpanded ? "▲" : "▼"),
+      );
+      tr.addEventListener("click", () => {
+        this.expandedRoute = isExpanded ? null : route.path;
+        this.populateSnapshotRows();
+      });
+      rows.push(tr);
+
+      if (isExpanded) {
+        const volPanel = document.createElement("tachyon-volumes-panel") as HTMLElement;
+        volPanel.setAttribute("route-path", route.path);
+        const detailRow = el("tr", {},
+          el("td", { colspan: "5", class: "pb-2" }, volPanel),
+        );
+        rows.push(detailRow);
+      }
+    }
+
+    tbody.replaceChildren(...rows);
   }
 
   private value(id: string, fallback: string): string {
