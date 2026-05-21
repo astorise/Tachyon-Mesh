@@ -139,6 +139,7 @@ mod runtime_types;
 mod storage_broker;
 mod supervisors;
 mod uds_fast_path;
+mod volume_backup;
 mod volumes;
 
 pub(crate) use app_runtime::*;

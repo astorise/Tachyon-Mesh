@@ -106,6 +106,12 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/admin/kv-cache/{model}",
             delete(kv_cache::kv_cache_evict_handler),
         )
+        .route("/admin/volumes/backup", post(admin_volume_backup_handler))
+        .route("/admin/volumes/restore", post(admin_volume_restore_handler))
+        .route(
+            "/admin/volumes/backups",
+            get(admin_volume_list_backups_handler),
+        )
         .route("/admin/assets", post(system_storage::upload_asset_handler))
         .route(
             "/admin/models/init",
@@ -564,6 +570,70 @@ pub(crate) async fn admin_set_canary_weight_handler(
             ),
         )
             .into_response()
+    }
+}
+
+// ── Volume backup endpoints ───────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(crate) struct VolumeBackupRequest {
+    route_path: String,
+    guest_path: String,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct VolumeRestoreRequest {
+    route_path: String,
+    guest_path: String,
+    snapshot_id: String,
+}
+
+pub(crate) async fn admin_volume_backup_handler(
+    State(state): State<AppState>,
+    axum::Json(payload): axum::Json<VolumeBackupRequest>,
+) -> Response {
+    let config = state.runtime.load().config.clone();
+    match volume_backup::backup_volume(&config, &payload.route_path, &payload.guest_path).await {
+        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+pub(crate) async fn admin_volume_restore_handler(
+    State(state): State<AppState>,
+    axum::Json(payload): axum::Json<VolumeRestoreRequest>,
+) -> Response {
+    let config = state.runtime.load().config.clone();
+    match volume_backup::restore_volume(
+        &config,
+        &payload.route_path,
+        &payload.guest_path,
+        &payload.snapshot_id,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+pub(crate) async fn admin_volume_list_backups_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let config = state.runtime.load().config.clone();
+    let route_path = params.get("route_path").map(String::as_str).unwrap_or("");
+    let guest_path = params.get("guest_path").map(String::as_str).unwrap_or("");
+    if route_path.is_empty() || guest_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "route_path and guest_path query params required",
+        )
+            .into_response();
+    }
+    match volume_backup::list_volume_backups(&config, route_path, guest_path).await {
+        Ok(snapshots) => axum::Json(snapshots).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
 

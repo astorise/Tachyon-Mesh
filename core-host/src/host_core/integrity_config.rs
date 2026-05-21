@@ -1785,6 +1785,16 @@ pub(crate) fn validate_route_volume(
         ));
     }
 
+    if let Some(ref schedule) = volume.backup_schedule {
+        validate_cron_expression(schedule).map_err(|_| {
+            anyhow!(
+                "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` \
+                 has an invalid `backup_schedule` cron expression `{schedule}`; \
+                 expected 5-field format e.g. `0 3 * * *`"
+            )
+        })?;
+    }
+
     Ok(IntegrityVolume {
         volume_type: volume.volume_type,
         host_path: host_path.to_owned(),
@@ -1794,6 +1804,7 @@ pub(crate) fn validate_route_volume(
         idle_timeout,
         eviction_policy: volume.eviction_policy,
         encrypted: volume.encrypted,
+        backup_schedule: volume.backup_schedule,
     })
 }
 
@@ -1850,13 +1861,59 @@ pub(crate) fn parse_s3_url(url: &str) -> Result<(String, String)> {
         return Err(anyhow!("S3 URL missing bucket name"));
     }
     let (bucket, prefix) = match without_scheme.find('/') {
-        Some(idx) => (&without_scheme[..idx], without_scheme[idx + 1..].trim_end_matches('/')),
+        Some(idx) => (
+            &without_scheme[..idx],
+            without_scheme[idx + 1..].trim_end_matches('/'),
+        ),
         None => (without_scheme, ""),
     };
     if bucket.is_empty() {
         return Err(anyhow!("S3 URL missing bucket name"));
     }
     Ok((bucket.to_owned(), prefix.to_owned()))
+}
+
+/// Validate a 5-field cron expression (minute hour day-of-month month day-of-week).
+/// Each field may be `*`, a number, a range (`1-5`), a list (`1,3,5`), or a step (`*/15`).
+/// Returns `Ok(())` if valid, `Err(())` otherwise.
+pub(crate) fn validate_cron_expression(expr: &str) -> std::result::Result<(), ()> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(());
+    }
+    let ranges = [(0u32, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
+    for (field, (min, max)) in fields.iter().zip(ranges.iter()) {
+        if !is_valid_cron_field(field, *min, *max) {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_cron_field(field: &str, min: u32, max: u32) -> bool {
+    if field == "*" {
+        return true;
+    }
+    // Step: */n or x/n
+    if let Some((base, step)) = field.split_once('/') {
+        let step_ok = step.parse::<u32>().is_ok_and(|n| n >= 1);
+        let base_ok = base == "*" || base.parse::<u32>().is_ok_and(|n| n >= min && n <= max);
+        return base_ok && step_ok;
+    }
+    // List: a,b,c
+    if field.contains(',') {
+        return field
+            .split(',')
+            .all(|part| is_valid_cron_field(part.trim(), min, max));
+    }
+    // Range: a-b
+    if let Some((lo, hi)) = field.split_once('-') {
+        let lo_ok = lo.parse::<u32>().is_ok_and(|n| n >= min && n <= max);
+        let hi_ok = hi.parse::<u32>().is_ok_and(|n| n >= min && n <= max);
+        return lo_ok && hi_ok && lo.parse::<u32>().unwrap_or(0) <= hi.parse::<u32>().unwrap_or(0);
+    }
+    // Single number
+    field.parse::<u32>().is_ok_and(|n| n >= min && n <= max)
 }
 
 pub(crate) fn normalize_idle_timeout(

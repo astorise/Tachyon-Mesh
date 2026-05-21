@@ -280,6 +280,37 @@ async fn get_mesh_graph() -> Result<tachyon_client::MeshGraphSnapshot, String> {
 }
 
 #[tauri::command]
+async fn list_volume_backups(
+    route_path: String,
+    guest_path: String,
+) -> Result<Vec<tachyon_client::BackupSnapshot>, String> {
+    tachyon_client::list_volume_backups(&route_path, &guest_path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn backup_volume(
+    route_path: String,
+    guest_path: String,
+) -> Result<tachyon_client::BackupSnapshot, String> {
+    tachyon_client::backup_volume(&route_path, &guest_path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn restore_volume(
+    route_path: String,
+    guest_path: String,
+    snapshot_id: String,
+) -> Result<(), String> {
+    tachyon_client::restore_volume(&route_path, &guest_path, &snapshot_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn list_s3_volumes(route_path: String) -> Result<Vec<tachyon_client::S3VolumeEntry>, String> {
     tachyon_client::list_s3_volumes(&route_path)
         .await
@@ -1251,6 +1282,9 @@ fn main() {
             list_s3_volumes,
             attach_s3_volume,
             detach_s3_volume,
+            list_volume_backups,
+            backup_volume,
+            restore_volume,
             save_credentials,
             load_credentials,
             delete_credentials,

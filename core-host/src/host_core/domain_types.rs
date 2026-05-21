@@ -606,6 +606,10 @@ pub(crate) struct IntegrityVolume {
     /// that don't need TDE.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) encrypted: bool,
+    /// Optional cron expression (e.g. `"0 3 * * *"`) that triggers automatic S3 backups.
+    /// Requires the `s3-persistence` feature and `TACHYON_S3_BUCKET` to be configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) backup_schedule: Option<String>,
 }
 
 impl Default for IntegrityVolume {
@@ -619,6 +623,7 @@ impl Default for IntegrityVolume {
             idle_timeout: None,
             eviction_policy: None,
             encrypted: false,
+            backup_schedule: None,
         }
     }
 }

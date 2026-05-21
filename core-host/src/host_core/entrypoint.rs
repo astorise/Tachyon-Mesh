@@ -149,6 +149,7 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     spawn_buffered_request_replayer(state.clone());
     spawn_global_memory_governor(state.clone());
     spawn_pressure_monitor(state.clone());
+    spawn_volume_backup_scheduler(state.clone());
     let app = build_app(state.clone());
     let https_listener = start_https_listener(state.clone(), app.clone()).await?;
     let mtls_listener = start_mtls_gateway_listener(state.clone()).await?;

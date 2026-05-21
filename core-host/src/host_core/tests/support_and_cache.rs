@@ -662,6 +662,8 @@ pub(super) fn build_test_state_with_manifest(
         config_updates: broadcast::channel(CONFIG_UPDATE_CHANNEL_CAPACITY).0,
         manifest_path,
         background_workers: Arc::new(BackgroundWorkerManager::default()),
+        #[cfg(feature = "s3-persistence")]
+        s3_backend: None,
     };
     let runtime = state.runtime.load_full();
     prewarm_runtime_routes(

@@ -757,9 +757,7 @@ pub(crate) async fn prepare_s3_volumes(route: &IntegrityRoute) -> Vec<S3VolumePr
 
         #[cfg(feature = "s3-persistence")]
         {
-            if let Err(error) =
-                download_s3_prefix_to_dir(&bucket, &prefix, &temp_path).await
-            {
+            if let Err(error) = download_s3_prefix_to_dir(&bucket, &prefix, &temp_path).await {
                 tracing::warn!(
                     route = %route.path,
                     guest_path = %volume.guest_path,
@@ -843,11 +841,7 @@ fn uuid_v4_hex() -> String {
 }
 
 #[cfg(feature = "s3-persistence")]
-async fn download_s3_prefix_to_dir(
-    bucket: &str,
-    prefix: &str,
-    dest: &Path,
-) -> anyhow::Result<()> {
+async fn download_s3_prefix_to_dir(bucket: &str, prefix: &str, dest: &Path) -> anyhow::Result<()> {
     use futures::StreamExt as _;
     use object_store::{path::Path as OsPath, ObjectStore};
 
@@ -881,11 +875,7 @@ async fn download_s3_prefix_to_dir(
 }
 
 #[cfg(feature = "s3-persistence")]
-async fn upload_dir_to_s3_prefix(
-    dir: &Path,
-    bucket: &str,
-    prefix: &str,
-) -> anyhow::Result<()> {
+async fn upload_dir_to_s3_prefix(dir: &Path, bucket: &str, prefix: &str) -> anyhow::Result<()> {
     use object_store::{path::Path as OsPath, ObjectStore};
 
     let store = build_s3_store(bucket)?;
@@ -921,20 +911,13 @@ async fn upload_dir_to_s3_prefix(
 }
 
 #[cfg(feature = "s3-persistence")]
-fn build_s3_store(bucket: &str) -> anyhow::Result<impl object_store::ObjectStore> {
+pub(crate) fn build_s3_store(bucket: &str) -> anyhow::Result<impl object_store::ObjectStore> {
     use object_store::aws::AmazonS3Builder;
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
-        .with_access_key_id(
-            std::env::var("TACHYON_S3_ACCESS_KEY_ID").unwrap_or_default(),
-        )
-        .with_secret_access_key(
-            std::env::var("TACHYON_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
-        )
-        .with_region(
-            std::env::var("TACHYON_S3_REGION")
-                .unwrap_or_else(|_| "us-east-1".to_owned()),
-        )
+        .with_access_key_id(std::env::var("TACHYON_S3_ACCESS_KEY_ID").unwrap_or_default())
+        .with_secret_access_key(std::env::var("TACHYON_S3_SECRET_ACCESS_KEY").unwrap_or_default())
+        .with_region(std::env::var("TACHYON_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned()))
         .with_allow_http(true);
     if let Ok(endpoint) = std::env::var("TACHYON_S3_ENDPOINT") {
         builder = builder.with_endpoint(endpoint);

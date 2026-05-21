@@ -1,5 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import "./TachyonVolumeBackupsPanel";
 
 type S3VolumeEntry = {
   s3Url: string;

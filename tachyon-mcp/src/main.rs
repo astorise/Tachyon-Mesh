@@ -296,6 +296,9 @@ fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<V
         "list_s3_volumes" => &["route_path"],
         "attach_s3_volume" => &["route_path", "s3_url", "guest_path"],
         "detach_s3_volume" => &["route_path", "guest_path"],
+        "list_volume_backups" => &["route_path", "guest_path"],
+        "backup_volume" => &["route_path", "guest_path"],
+        "restore_volume" => &["route_path", "guest_path", "snapshot_id"],
         _ => return None,
     };
     let obj = match arguments.and_then(Value::as_object) {
@@ -330,7 +333,8 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         // Read-only telemetry tools.
         "tachyon_get_metrics" | "tachyon_tail_logs" => 30,
         // S3 volume mutators — moderate budget.
-        "attach_s3_volume" | "detach_s3_volume" => 10,
+        "attach_s3_volume" | "detach_s3_volume" | "backup_volume" | "restore_volume" => 10,
+        "list_volume_backups" => 60,
         // All remaining read-only tools — high throughput allowed.
         "tachyon_mesh_status"
         | "tachyon_lockfile"
@@ -865,6 +869,43 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                             "guest_path": { "type": "string", "description": "Guest mount path of the S3 volume to remove (e.g. '/app/data')." }
                         }
                     }
+                },
+                {
+                    "name": "list_volume_backups",
+                    "description": "List available S3 snapshots for a route volume, newest first.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path", "guest_path"],
+                        "properties": {
+                            "route_path": { "type": "string", "description": "HTTP route path of the function." },
+                            "guest_path": { "type": "string", "description": "Guest mount path of the volume (e.g. '/app/data')." }
+                        }
+                    }
+                },
+                {
+                    "name": "backup_volume",
+                    "description": "Create an S3 snapshot of a route volume. Returns snapshot metadata including snapshot_id, timestamp, and object count.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path", "guest_path"],
+                        "properties": {
+                            "route_path": { "type": "string", "description": "HTTP route path of the function." },
+                            "guest_path": { "type": "string", "description": "Guest mount path of the volume to back up." }
+                        }
+                    }
+                },
+                {
+                    "name": "restore_volume",
+                    "description": "Restore a route volume from a previously created snapshot. Overwrites the current volume contents with the snapshot data.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path", "guest_path", "snapshot_id"],
+                        "properties": {
+                            "route_path": { "type": "string", "description": "HTTP route path of the function." },
+                            "guest_path": { "type": "string", "description": "Guest mount path of the volume to restore." },
+                            "snapshot_id": { "type": "string", "description": "Snapshot identifier from list_volume_backups (e.g. 'api_my-fn/app_data/1748000000000')." }
+                        }
+                    }
                 }
             ]
             });
@@ -1298,7 +1339,9 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 .and_then(Value::as_str)
                 .context("missing route_path")?;
             let volumes = tachyon_client::list_s3_volumes(route_path).await?;
-            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&volumes)? }] }))
+            Ok(
+                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&volumes)? }] }),
+            )
         }
         "attach_s3_volume" => {
             let arguments = params
@@ -1355,6 +1398,71 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                         "S3 volume at `{guest_path}` detached from route `{route_path}`. Manifest updated."
                     )
                 }]
+            }))
+        }
+
+        // ── Volume backup management ──────────────────────────────────────────
+        "list_volume_backups" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let guest_path = arguments
+                .get("guest_path")
+                .and_then(Value::as_str)
+                .context("missing guest_path")?;
+            let snapshots = tachyon_client::list_volume_backups(route_path, guest_path).await?;
+            Ok(
+                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&snapshots)? }] }),
+            )
+        }
+        "backup_volume" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let guest_path = arguments
+                .get("guest_path")
+                .and_then(Value::as_str)
+                .context("missing guest_path")?;
+            let snapshot = tachyon_client::backup_volume(route_path, guest_path).await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!(
+                    "Backup created: snapshot_id={}, {} objects saved.",
+                    snapshot.snapshot_id, snapshot.object_count
+                ) }]
+            }))
+        }
+        "restore_volume" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let guest_path = arguments
+                .get("guest_path")
+                .and_then(Value::as_str)
+                .context("missing guest_path")?;
+            let snapshot_id = arguments
+                .get("snapshot_id")
+                .and_then(Value::as_str)
+                .context("missing snapshot_id")?;
+            tachyon_client::restore_volume(route_path, guest_path, snapshot_id).await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!(
+                    "Volume at `{guest_path}` on route `{route_path}` restored from snapshot `{snapshot_id}`."
+                ) }]
             }))
         }
 

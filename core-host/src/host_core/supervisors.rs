@@ -547,3 +547,94 @@ pub(crate) async fn shutdown_signal() {
 
     tracing::info!("shutdown signal received");
 }
+
+// ── Volume backup scheduler ───────────────────────────────────────────────────
+
+/// Spawn a background task that checks every 60 seconds whether any volume has
+/// a `backup_schedule` cron that is due and triggers a backup if so.
+pub(crate) fn spawn_volume_backup_scheduler(state: AppState) {
+    tokio::spawn(async move {
+        // Track last backup time per (route_path, guest_path) to avoid
+        // triggering more than once per cron window.
+        let mut last_backup: std::collections::HashMap<(String, String), u64> =
+            std::collections::HashMap::new();
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let config = state.runtime.load().config.clone();
+            let now_mins = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                / 60;
+
+            for route in &config.routes {
+                for volume in &route.volumes {
+                    let Some(ref schedule) = volume.backup_schedule else {
+                        continue;
+                    };
+                    let key = (route.path.clone(), volume.guest_path.clone());
+                    let last = *last_backup.get(&key).unwrap_or(&0);
+                    if !cron_is_due(schedule, now_mins, last) {
+                        continue;
+                    }
+                    last_backup.insert(key, now_mins);
+                    let config2 = config.clone();
+                    let route_path = route.path.clone();
+                    let guest_path = volume.guest_path.clone();
+                    tokio::spawn(async move {
+                        match volume_backup::backup_volume(&config2, &route_path, &guest_path).await
+                        {
+                            Ok(snap) => tracing::info!(
+                                route = %route_path,
+                                guest_path = %guest_path,
+                                snapshot_id = %snap.snapshot_id,
+                                "scheduled volume backup completed"
+                            ),
+                            Err(error) => tracing::warn!(
+                                route = %route_path,
+                                guest_path = %guest_path,
+                                "scheduled volume backup failed: {error:#}"
+                            ),
+                        }
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Returns true if `schedule` (5-field cron) is due at `now_mins` (minutes since Unix epoch)
+/// and has not already run this minute (`last_run_mins < now_mins`).
+fn cron_is_due(schedule: &str, now_mins: u64, last_run_mins: u64) -> bool {
+    if last_run_mins >= now_mins {
+        return false;
+    }
+    let fields: Vec<&str> = schedule.split_whitespace().collect();
+    if fields.len() != 5 {
+        return false;
+    }
+    // Derive current time components from now_mins.
+    let total_secs = now_mins * 60;
+    let minute = (total_secs / 60) % 60;
+    let hour = (total_secs / 3600) % 24;
+    // Use a simple check: does the minute/hour field match?
+    // Full calendar matching (dom/month/dow) is deferred to phase 2.
+    cron_field_matches(fields[0], minute as u32) && cron_field_matches(fields[1], hour as u32)
+}
+
+fn cron_field_matches(field: &str, value: u32) -> bool {
+    if field == "*" {
+        return true;
+    }
+    if let Some((_, step)) = field.split_once('/') {
+        return step
+            .parse::<u32>()
+            .is_ok_and(|step| step > 0 && value.is_multiple_of(step));
+    }
+    if let Ok(n) = field.parse::<u32>() {
+        return n == value;
+    }
+    false
+}

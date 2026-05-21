@@ -17,6 +17,9 @@ const ADMIN_RECOVERY_CODES_PATH: &str = "/admin/security/recovery-codes";
 const ADMIN_ACCOUNT_SECURITY_PATH: &str = "/admin/security/2fa/regenerate";
 const ADMIN_STEP_UP_PATH: &str = "/admin/security/step-up";
 const ADMIN_PAT_PATH: &str = "/admin/security/pats";
+const ADMIN_VOLUMES_BACKUP_PATH: &str = "/admin/volumes/backup";
+const ADMIN_VOLUMES_RESTORE_PATH: &str = "/admin/volumes/restore";
+const ADMIN_VOLUMES_BACKUPS_PATH: &str = "/admin/volumes/backups";
 const ADMIN_ENROLLMENT_START_PATH: &str = "/admin/enrollment/start";
 const ADMIN_IAM_USERS_PATH: &str = "/admin/iam/users";
 const ADMIN_IAM_GROUPS_PATH: &str = "/admin/iam/groups";
@@ -2245,10 +2248,7 @@ pub async fn list_s3_volumes(route_path: &str) -> Result<Vec<S3VolumeEntry>> {
                         .and_then(|g| g.as_str())
                         .unwrap_or("")
                         .to_owned(),
-                    readonly: v
-                        .get("readonly")
-                        .and_then(|r| r.as_bool())
-                        .unwrap_or(false),
+                    readonly: v.get("readonly").and_then(|r| r.as_bool()).unwrap_or(false),
                 })
                 .collect();
             return Ok(s3);
@@ -2266,9 +2266,7 @@ pub async fn attach_s3_volume(
     readonly: bool,
 ) -> Result<S3VolumeEntry> {
     if !s3_url.starts_with("s3://") {
-        anyhow::bail!(
-            "invalid S3 URL `{s3_url}`: must start with s3://"
-        );
+        anyhow::bail!("invalid S3 URL `{s3_url}`: must start with s3://");
     }
 
     let mut config = load_live_config_payload().await?;
@@ -2282,9 +2280,7 @@ pub async fn attach_s3_volume(
         .find(|r| r.get("path").and_then(|v| v.as_str()) == Some(route_path))
         .ok_or_else(|| anyhow::anyhow!("route `{route_path}` not found in sealed manifest"))?;
 
-    let volumes = route
-        .get_mut("volumes")
-        .and_then(|v| v.as_array_mut());
+    let volumes = route.get_mut("volumes").and_then(|v| v.as_array_mut());
 
     let new_volume = serde_json::json!({
         "type": "s3",
@@ -2332,9 +2328,7 @@ pub async fn detach_s3_volume(route_path: &str, guest_path: &str) -> Result<()> 
     let volumes = route
         .get_mut("volumes")
         .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| {
-            anyhow::anyhow!("route `{route_path}` has no volumes configured")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("route `{route_path}` has no volumes configured"))?;
 
     let before = volumes.len();
     volumes.retain(|v| {
@@ -2342,9 +2336,7 @@ pub async fn detach_s3_volume(route_path: &str, guest_path: &str) -> Result<()> 
             && v.get("guest_path").and_then(|g| g.as_str()) == Some(guest_path))
     });
     if volumes.len() == before {
-        anyhow::bail!(
-            "route `{route_path}` has no S3 volume at guest path `{guest_path}`"
-        );
+        anyhow::bail!("route `{route_path}` has no S3 volume at guest path `{guest_path}`");
     }
 
     patch_and_apply_manifest(config).await
@@ -2381,6 +2373,75 @@ async fn patch_and_apply_manifest(config: serde_json::Value) -> Result<()> {
     write_lockfile(&manifest).await?;
     apply_manifest_to_active_node(&manifest).await?;
     Ok(())
+}
+
+// ── Volume backup management ──────────────────────────────────────────────────
+
+/// Metadata for a single volume backup snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSnapshot {
+    pub snapshot_id: String,
+    pub route_path: String,
+    pub guest_path: String,
+    pub timestamp_ms: u64,
+    pub object_count: usize,
+}
+
+/// Trigger a backup of a route volume and return the snapshot metadata.
+pub async fn backup_volume(route_path: &str, guest_path: &str) -> Result<BackupSnapshot> {
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let body = serde_json::json!({ "route_path": route_path, "guest_path": guest_path });
+    let response = client
+        .post(build_endpoint_url(&config.url, ADMIN_VOLUMES_BACKUP_PATH)?)
+        .bearer_auth(&config.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&body)?)
+        .send()
+        .await
+        .context("failed to call /admin/volumes/backup")?;
+    decode_admin_response(response, ADMIN_VOLUMES_BACKUP_PATH).await
+}
+
+/// Restore a route volume from a previously created snapshot.
+pub async fn restore_volume(route_path: &str, guest_path: &str, snapshot_id: &str) -> Result<()> {
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let body = serde_json::json!({
+        "route_path": route_path,
+        "guest_path": guest_path,
+        "snapshot_id": snapshot_id,
+    });
+    let response = client
+        .post(build_endpoint_url(&config.url, ADMIN_VOLUMES_RESTORE_PATH)?)
+        .bearer_auth(&config.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&body)?)
+        .send()
+        .await
+        .context("failed to call /admin/volumes/restore")?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = response.text().await.unwrap_or_default();
+    anyhow::bail!("restore failed with {status}: {}", text.trim())
+}
+
+/// List available snapshots for a route volume, newest first.
+pub async fn list_volume_backups(
+    route_path: &str,
+    guest_path: &str,
+) -> Result<Vec<BackupSnapshot>> {
+    get_admin_json_with_query::<Vec<BackupSnapshot>>(
+        ADMIN_VOLUMES_BACKUPS_PATH,
+        &[
+            ("route_path", route_path.to_owned()),
+            ("guest_path", guest_path.to_owned()),
+        ],
+    )
+    .await
 }
 
 pub async fn remove_overlay_resource(name: &str) -> Result<()> {
