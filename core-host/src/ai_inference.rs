@@ -117,9 +117,9 @@ struct MockPreloadedGraphRegistry {
 impl MockPreloadedGraphRegistry {
     fn from_aliases(aliases: impl IntoIterator<Item = String>) -> Self {
         use wasmtime_wasi_nn::{
-            ExecutionContext, Graph,
             backend::{BackendError, BackendExecutionContext, BackendGraph, Id, NamedTensor},
             wit::{Tensor as WasiTensor, TensorType as WasiTensorType},
+            ExecutionContext, Graph,
         };
 
         struct MockGraph;
@@ -155,8 +155,7 @@ impl MockPreloadedGraphRegistry {
         let graphs = aliases
             .into_iter()
             .map(|alias| {
-                let graph =
-                    Graph::from(Box::new(MockGraph) as Box<dyn BackendGraph>);
+                let graph = Graph::from(Box::new(MockGraph) as Box<dyn BackendGraph>);
                 (alias, graph)
             })
             .collect();
@@ -266,9 +265,7 @@ impl AiInferenceRuntime {
         let backends = [candle_onnx_backend::candle_onnx_backend()];
         #[cfg(test)]
         {
-            let registry = MockPreloadedGraphRegistry::from_aliases(
-                self.models.keys().cloned(),
-            );
+            let registry = MockPreloadedGraphRegistry::from_aliases(self.models.keys().cloned());
             return WasiNnCtx::new(backends, WasiRegistry::from(registry));
         }
         #[cfg(not(test))]
