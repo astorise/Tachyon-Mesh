@@ -84,7 +84,7 @@ system-faas-enrollment = { path = "../systems/system-faas-enrollment" }
 system-faas-microvm-runner = { path = "../systems/system-faas-microvm-runner" }
 turboquant-sys = { path = "../turboquant-sys", optional = true }
 uuid = { version = "1", features = ["v4"] }
-wasmtime = { version = "44.0.1", features = ["component-model"] }
+wasmtime = { version = "45.0.0", features = ["component-model"] }
 wasmtime-wasi = { version = "44.0.1", features = ["p1"] }
 wasmtime-wasi-nn = { version = "44.0.1", optional = true, default-features = false }
 
