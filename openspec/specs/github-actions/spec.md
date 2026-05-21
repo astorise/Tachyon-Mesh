@@ -12,13 +12,14 @@ The repository SHALL define a GitHub Actions workflow at `.github/workflows/ci.y
 - **AND** the workflow runs on a GitHub-hosted Linux runner
 
 ### Requirement: CI runner installs the Node.js runtime, Rust toolchain, WASI target, and cache
-The CI workflow SHALL install a pinned Node.js runtime for Tauri tooling, install the stable Rust toolchain, add the `wasm32-wasip1` compilation target, and enable Rust dependency caching before building workspace artifacts.
+The CI workflow SHALL install a pinned Node.js runtime for Tauri tooling, install the stable Rust toolchain with `rustfmt` and `clippy` components, add the `wasm32-wasip1` and `wasm32-wasip2` compilation targets, install Linux system dependencies including `protobuf-compiler`, and enable Rust dependency caching before building workspace artifacts.
 
-#### Scenario: Runner is prepared for host and guest compilation
+#### Scenario: Runner is prepared for host, guest, and FIPS-adjacent compilation
 - **WHEN** the CI workflow starts on a fresh runner
 - **THEN** the pinned Node.js runtime is available to subsequent steps
-- **AND** the stable Rust toolchain is available to subsequent steps
-- **AND** the `wasm32-wasip1` target is installed before the guest build runs
+- **AND** the stable Rust toolchain with `rustfmt` and `clippy` is available
+- **AND** both `wasm32-wasip1` and `wasm32-wasip2` targets are installed
+- **AND** Linux system dependencies including `protobuf-compiler` are installed
 - **AND** Rust dependency caching is enabled to reduce repeated build time
 
 ### Requirement: CI enforces formatting, linting, tests, and production-oriented builds
@@ -108,6 +109,42 @@ The desktop release workflow SHALL build the Tauri bundles from the `tachyon-ui`
 - **THEN** `projectPath` points to `tachyon-ui`
 - **AND** frontend dependencies are installed from the `tachyon-ui` directory
 
-
 ### Requirement: Release workflow MUST publish Windows binaries as .zip
 The `publish-server-binaries` matrix SHALL include `windows-latest / x86_64-pc-windows-msvc`. The packaging step SHALL produce `tachyon-mesh-VERSION-windows-x86_64.zip` containing `core-host.exe` and `tachyon-mcp.exe`.
+
+#### Scenario: Windows release artifact is zipped and uploaded
+- **WHEN** the release workflow runs on `windows-latest`
+- **THEN** it compiles `core-host` and `tachyon-mcp` for `x86_64-pc-windows-msvc`
+- **AND** packages them as `tachyon-mesh-<version>-windows-x86_64.zip`
+- **AND** uploads the zip as a release artifact
+
+### Requirement: CI runs a dedicated feature-matrix test job across multiple feature flag combinations
+The CI workflow SHALL run a `feature-matrix-tests` job that tests `core-host` across at least five distinct feature flag combinations including default, `--no-default-features`, `--all-features`, `--features http3`, and a security bundle, uploading a release binary artifact for each combination.
+
+#### Scenario: All feature combinations build and test successfully
+- **WHEN** the feature-matrix-tests job runs
+- **THEN** each matrix entry runs `cargo test -p core-host <features>` and `cargo build -p core-host --release <features>`
+- **AND** each produces an uploaded artifact named `core-host-linux-x86_64-<label>-<sha>`
+
+#### Scenario: All-features combination installs FIPS build dependencies
+- **WHEN** the matrix entry with `--all-features` runs
+- **THEN** it installs `cmake nasm protobuf-compiler` via apt before building
+
+### Requirement: CI includes a dedicated FIPS test job
+The CI workflow SHALL include a `fips-tests` job that installs FIPS build dependencies and validates `core-host --features fips` independently of the main `rust-ci` job.
+
+#### Scenario: fips-tests job executes independently
+- **WHEN** CI is triggered by a push or pull request
+- **THEN** the `fips-tests` job runs in parallel with `rust-ci` and `feature-matrix-tests`
+- **AND** it installs cmake, nasm, and protobuf-compiler
+- **AND** it runs `cargo test -p core-host --features fips` and uploads the release binary
+
+### Requirement: Docker publish job includes a FIPS image variant
+The `publish-docker-images` job SHALL include a matrix entry that builds `Dockerfile.fips` and publishes it tagged with the `-fips` suffix to GHCR on every push to `main`.
+
+#### Scenario: FIPS Docker variant published alongside standard variants
+- **WHEN** a commit is merged to `main` and `rust-ci` passes
+- **THEN** the Docker publish matrix builds four variants: default, `-fips`, `-http3`, `-security`
+- **AND** the `-fips` variant uses `Dockerfile.fips` as its Dockerfile
+- **AND** all variants are pushed to `ghcr.io/<owner>/tachyon-mesh` with appropriate tags
+

@@ -4,6 +4,9 @@
 
 - Added the node registry and systems catalog surfaces: `control-plane-faas` can now import `kv-partition`, `system-faas-node-registry` persists enrolled nodes, and the UI exposes read-only Nodes and Systems views.
 - Honest policy views: five write-only policy panels (resilience, identity-config, rbac, supply-chain, fleet) now display a "Policy form" badge; topology panel gains a View/Edit mode toggle (defaults to View) with session persistence.
+- **FIPS + musl Alpine build** (`Dockerfile.fips`): new multi-stage Dockerfile using `rust:alpine` as the FIPS builder to compile `core-host --features fips` with musl libc, producing a static `FROM scratch` image (~32 MB). CI gains a dedicated `fips-tests` job and the Docker publish matrix gains a `-fips` variant. A `feature-matrix-tests` job now validates five distinct feature-flag combinations for `core-host`, each uploading a labelled release artifact.
+- **AI inference: ORT → candle-onnx** (`core-host/src/ai_inference/candle_onnx_backend.rs`): replaced Microsoft ORT (native FFI, musl-incompatible) with Hugging Face `candle-onnx` (pure Rust). WASI-NN guest API is preserved — guests use the same `graph_load → init_execution_context → set_input → compute → get_output` flow. Models load from raw ONNX bytes decoded via `prost`. GPU inference is deferred pending upstream candle issue #3491 (CPU-only for now). The `ai-inference` feature is now musl-compatible.
+- **Homelab K3S deployment**: provisioned two K3S instances (`tachyon-edge-1` and `tachyon-edge-2`) via WSL/MCP and deployed the latest `core-host` image from GHCR using hardened Kubernetes manifests with Pod Security Standards, NetworkPolicy, and GPU node-selector support.
 
 ## [v1.0.0] — General Availability (GA) · 2026-05-15
 
