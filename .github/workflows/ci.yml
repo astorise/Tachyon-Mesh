@@ -62,7 +62,7 @@ jobs:
 
       - name: Cache security tools
         id: cache-sec-tools
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/cargo-audit
@@ -196,7 +196,7 @@ jobs:
 
       - name: Cache cargo-llvm-cov
         id: cache-llvm-cov
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-llvm-cov
           key: cargo-llvm-cov-${{ runner.os }}-v1
