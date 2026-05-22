@@ -38,13 +38,17 @@ jobs:
       - name: Build guest artifacts
         run: bash scripts/build-guest-artifacts.sh
 
+      # Pack with tar so the full relative path (target/wasm32-wasip*/release/)
+      # is embedded in the archive. upload-artifact glob paths strip the common
+      # prefix, which breaks the tests that resolve WASM modules by relative path.
+      - name: Pack guest artifacts
+        run: tar -czf wasm-guests.tar.gz target/wasm32-wasip1/release/*.wasm target/wasm32-wasip2/release/*.wasm
+
       - name: Upload guest artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wasm-guests-${{ github.sha }}
-          path: |
-            target/wasm32-wasip1/release/*.wasm
-            target/wasm32-wasip2/release/*.wasm
+          path: wasm-guests.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -137,12 +141,13 @@ jobs:
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      # Restore WASM files built by build-guests into their original target paths.
+      # Restore WASM files into their original target/ paths.
       - name: Download guest artifacts
         uses: actions/download-artifact@v4
         with:
           name: wasm-guests-${{ github.sha }}
-          path: .
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
 
       - name: Check formatting
         run: cargo fmt --all -- --check
