@@ -14,45 +14,86 @@ permissions:
   contents: read
 
 jobs:
+  # ── Build every WASM guest once; all downstream jobs download the result. ────
+  # This replaces the per-job `bash scripts/build-guest-artifacts.sh` call that
+  # was costing ~10-15 min of compile time in rust-ci AND in each of the five
+  # feature-matrix-tests variants (plus fips-tests), totalling ~80-100 min of
+  # redundant CPU. The artifact is kept for one day — just long enough to cover
+  # the CI run lifetime.
+  build-guests:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm-guests
+
+      - name: Build guest artifacts
+        run: bash scripts/build-guest-artifacts.sh
+
+      - name: Upload guest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-guests-${{ github.sha }}
+          path: |
+            target/wasm32-wasip1/release/*.wasm
+            target/wasm32-wasip2/release/*.wasm
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Security audit — runs in parallel with build-guests. ─────────────────────
+  # cargo-audit and cargo-deny are compiled once and cached; subsequent runs
+  # restore the binaries in ~2 s instead of recompiling them (~4-5 min).
   security-audit:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache security tools
+        id: cache-sec-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+          key: sec-tools-${{ runner.os }}-v1
 
       - name: Install security tooling
+        if: steps.cache-sec-tools.outputs.cache-hit != 'true'
         run: cargo install cargo-audit cargo-deny --locked
 
       - name: Run cargo audit
         # RUSTSEC-2026-0149: wasmtime-wasi 44.0.1 path_open TRUNCATE bypass;
-        # fixed in 44.0.2 — ignored here until Cargo.lock is bumped (tracked
-        # via the Renovate wasmtime v45 PR). cargo deny reads deny.toml for
-        # this advisory; cargo audit needs the flag directly.
+        # fixed in 44.0.2 — ignored until Cargo.lock is bumped via the Renovate
+        # wasmtime v45 PR. cargo deny reads deny.toml; cargo audit needs the flag.
         run: cargo audit --ignore RUSTSEC-2026-0149
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
 
+  # ── Main CI: fmt, clippy, tests, coverage, release builds. ───────────────────
   rust-ci:
+    needs: build-guests
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      # Refuse to merge isolated stubs introduced under `#[allow(dead_code)]`.
-      # Existing `#[allow(dead_code)]` annotations are still honored per-item;
-      # this flag fails the build on *new* unannotated dead symbols.
       RUSTFLAGS: "-D dead_code"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6
         with:
           node-version-file: .node-version
 
@@ -73,14 +114,35 @@ jobs:
             librsvg2-dev \
             protobuf-compiler
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           targets: wasm32-wasip1,wasm32-wasip2
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
+
+      # cargo-llvm-cov is compiled once and cached; restores in ~2 s.
+      - name: Cache cargo-llvm-cov
+        id: cache-llvm-cov
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-v1
+
+      - name: Install cargo-llvm-cov
+        if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
+        run: cargo install cargo-llvm-cov --locked
+
+      # nextest is a pre-built binary (~5 s curl) — no need to cache separately.
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      # Restore WASM files built by build-guests into their original target paths.
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-guests-${{ github.sha }}
+          path: .
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -91,22 +153,21 @@ jobs:
       - name: Cross-Layer Validation
         run: bash scripts/validate_cross_layer.sh
 
-      - name: Build guest artifacts
-        run: bash scripts/build-guest-artifacts.sh
-
       - name: Run chaos test harness
-        run: cargo test -p core-host --test chaos_test
+        run: cargo nextest run -p core-host --test chaos_test
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
+
+      # nextest does not run doc tests; keep a separate cargo test --doc pass.
+      - name: Run doc tests
+        run: cargo test --doc --workspace
 
       - name: Generate core-host coverage
-        run: |
-          cargo install cargo-llvm-cov --locked
-          cargo llvm-cov -p core-host --lcov --output-path lcov.info
+        run: cargo llvm-cov -p core-host --lcov --output-path lcov.info
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: core-host-lcov-${{ github.sha }}
           if-no-files-found: error
@@ -125,7 +186,7 @@ jobs:
         run: cargo build -p tachyon-ui --release
 
       - name: Upload CI build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: tachyon-mesh-build-${{ github.sha }}
           if-no-files-found: error
@@ -151,6 +212,7 @@ jobs:
             target/wasm32-wasip2/release/system_faas_gc.wasm
             target/wasm32-wasip2/release/system_faas_gateway.wasm
             target/wasm32-wasip2/release/gossip.wasm
+            target/wasm32-wasip1/release/guest_loop.wasm
             target/wasm32-wasip2/release/k8s_scaler.wasm
             target/wasm32-wasip2/release/system_faas_logger.wasm
             target/wasm32-wasip2/release/system_faas_model_broker.wasm
@@ -162,9 +224,14 @@ jobs:
             target/wasm32-wasip2/release/system_faas_shadow_proxy.wasm
             target/wasm32-wasip2/release/system_faas_sqs.wasm
             target/wasm32-wasip2/release/system_faas_storage_broker.wasm
-            target/wasm32-wasip1/release/guest_loop.wasm
 
+  # ── Feature matrix (5 parallel variants, shared Rust dependency cache). ───────
+  # Sharing the cache across variants avoids recompiling the large common
+  # dependency set (tokio, serde, wasmtime, …) five times. Only the default
+  # variant writes to the shared cache; the others restore from it and do not
+  # write, preventing cross-feature cache collisions.
   feature-matrix-tests:
+    needs: build-guests
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -179,16 +246,16 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D dead_code"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: feature-matrix
+          save-if: ${{ matrix.features == '' }}
 
       - name: Install FIPS build dependencies
         if: matrix.features == '--all-features'
@@ -196,11 +263,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
 
-      - name: Build guest artifacts
-        run: bash scripts/build-guest-artifacts.sh
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-guests-${{ github.sha }}
+          path: .
 
       - name: Test core-host feature set
-        run: cargo test -p core-host ${{ matrix.features }}
+        run: cargo nextest run -p core-host ${{ matrix.features }}
 
       - name: Build release binary for artifact
         run: cargo build -p core-host --release ${{ matrix.features }}
@@ -220,22 +293,22 @@ jobs:
           echo "label=${label}" >> "$GITHUB_OUTPUT"
 
       - name: Upload core-host binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: core-host-linux-x86_64-${{ steps.feat_label.outputs.label }}-${{ github.sha }}
           path: target/release/core-host
           if-no-files-found: error
 
+  # ── FIPS tests ────────────────────────────────────────────────────────────────
   fips-tests:
+    needs: build-guests
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
@@ -244,34 +317,38 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Build guest artifacts
-        run: bash scripts/build-guest-artifacts.sh
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-guests-${{ github.sha }}
+          path: .
 
       - name: Test core-host FIPS feature
-        run: cargo test -p core-host --features fips
+        run: cargo nextest run -p core-host --features fips
 
       - name: Build FIPS release binary for artifact
         run: cargo build -p core-host --release --features fips
 
       - name: Upload FIPS core-host binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: core-host-linux-x86_64-fips-${{ github.sha }}
           path: target/release/core-host
           if-no-files-found: error
 
+  # ── Mutation tests (weekly schedule only) ────────────────────────────────────
   mutation-tests:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
@@ -279,14 +356,14 @@ jobs:
       - name: Run auth mutation tests
         run: cargo mutants --package core-host --file core-host/src/auth.rs --timeout 120
 
+  # ── Miri cwasm cache (weekly schedule only) ───────────────────────────────────
   miri-cwasm-cache:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     env:
       MIRIFLAGS: "-Zmiri-disable-isolation"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
       - name: Install nightly Miri
         run: |
@@ -296,6 +373,7 @@ jobs:
       - name: Run cwasm cache Miri smoke test
         run: cargo +nightly miri test -p core-host cwasm_cache_deserializes_same_engine_component --no-default-features
 
+  # ── Publish Docker images (push to main only, waits for rust-ci) ──────────────
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: rust-ci
@@ -314,9 +392,6 @@ jobs:
             context: .
             cargo_features: "s3-persistence"
             feature_tag: ""
-          # fips uses Dockerfile.fips (rust:alpine builder) — aws-lc-fips-sys
-          # compiles natively on Alpine musl (cmake/nasm/go/perl required).
-          # Validated on experiment/fips-musl-zigbuild: static-pie, 30.7 MB.
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile.fips
             context: .
@@ -333,8 +408,7 @@ jobs:
             cargo_features: "rate-limit,resiliency,mtls,secrets-vault,websockets"
             feature_tag: "-security"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
