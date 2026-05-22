@@ -151,9 +151,10 @@ pub(crate) async fn acquire_with_wait(
     let mut backoff = Duration::from_millis(50);
     let cap = (lease_ttl / 4).max(Duration::from_millis(100));
     loop {
-        match try_acquire(core_store, key, holder, lease_ttl)? {
-            (AcquireOutcome::Acquired, Some(guard)) => return Ok(Some(guard)),
-            _ => {}
+        if let (AcquireOutcome::Acquired, Some(guard)) =
+            try_acquire(core_store, key, holder, lease_ttl)?
+        {
+            return Ok(Some(guard));
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);

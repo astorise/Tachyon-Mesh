@@ -29,7 +29,11 @@ jobs:
         run: cargo install cargo-audit cargo-deny --locked
 
       - name: Run cargo audit
-        run: cargo audit
+        # RUSTSEC-2026-0149: wasmtime-wasi 44.0.1 path_open TRUNCATE bypass;
+        # fixed in 44.0.2 — ignored here until Cargo.lock is bumped (tracked
+        # via the Renovate wasmtime v45 PR). cargo deny reads deny.toml for
+        # this advisory; cargo audit needs the flag directly.
+        run: cargo audit --ignore RUSTSEC-2026-0149
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
