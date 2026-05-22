@@ -212,14 +212,18 @@ mod tests {
     #[test]
     fn s3_key_strips_local_root_and_uses_prefix() {
         let b = make_backend("tachyon", "/data");
-        let key = b.s3_key(Path::new("/data/auth-state/admin.json")).unwrap();
+        let key = b
+            .s3_key(Path::new("/data/auth-state/admin.json"))
+            .expect("valid path should produce a valid S3 key");
         assert_eq!(key.to_string(), "tachyon/auth-state/admin.json");
     }
 
     #[test]
     fn s3_key_without_prefix() {
         let b = make_backend("", "/data");
-        let key = b.s3_key(Path::new("/data/tachyon.db")).unwrap();
+        let key = b
+            .s3_key(Path::new("/data/tachyon.db"))
+            .expect("valid path should produce a valid S3 key");
         assert_eq!(key.to_string(), "tachyon.db");
     }
 
