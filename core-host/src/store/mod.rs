@@ -113,6 +113,10 @@ pub(crate) enum CoreStoreBucket {
     DataMutationOutbox,
     MeteringOutbox,
     ConfigUpdateOutbox,
+    // Accessed via lock_try_acquire/lock_heartbeat/lock_release directly;
+    // reserved here so the generic get/put/delete API compiles and the redb
+    // file remains forward-compatible.
+    #[allow(dead_code)]
     DistributedLocks,
 }
 

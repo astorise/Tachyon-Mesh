@@ -95,6 +95,10 @@ enum GuardKind {
         registry: Arc<NodeSingletonRegistry>,
         route_path: String,
     },
+    // Inner guard is held purely for its Drop side-effect (releases the
+    // distributed lock). Rust treats the field as "never read" because we
+    // never destructure it, hence the allow.
+    #[allow(dead_code)]
     MeshLock(distributed_lock::DistributedLockGuard),
 }
 
