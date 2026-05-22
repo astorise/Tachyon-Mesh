@@ -166,12 +166,14 @@ jobs:
       - name: Run chaos test harness
         run: cargo nextest run -p core-host --test chaos_test
 
+      # tachyon-ui is a Tauri desktop app with no unit tests (covered by
+      # Playwright E2E in e2e.yml). Excluding it avoids pulling in GTK/WebKit
+      # system libraries that are only needed in the quality job.
       - name: Run tests
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --exclude tachyon-ui
 
-      # nextest does not run doc tests; keep a separate cargo test --doc pass.
       - name: Run doc tests
-        run: cargo test --doc --workspace
+        run: cargo test --doc --workspace --exclude tachyon-ui
 
   # ── 5. Coverage (needs quality + guests, runs in parallel with test) ─────────
   # Separate job gives a fresh disk so the large llvm-cov instrumented tree
