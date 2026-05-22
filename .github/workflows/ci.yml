@@ -43,7 +43,7 @@ jobs:
         run: tar -czf wasm-guests.tar.gz target/wasm32-wasip1/release/*.wasm target/wasm32-wasip2/release/*.wasm
 
       - name: Upload guest artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wasm-guests-${{ github.sha }}
           path: wasm-guests.tar.gz
@@ -157,7 +157,7 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -206,7 +206,7 @@ jobs:
         run: cargo install cargo-llvm-cov --locked
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -216,7 +216,7 @@ jobs:
         run: cargo llvm-cov -p core-host --lcov --output-path lcov.info
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-host-lcov-${{ github.sha }}
           if-no-files-found: error
@@ -242,7 +242,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -252,7 +252,7 @@ jobs:
         run: cargo build -p core-host --release
 
       - name: Upload CI build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tachyon-mesh-build-${{ github.sha }}
           if-no-files-found: error
@@ -329,7 +329,7 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -356,7 +356,7 @@ jobs:
           echo "label=${label}" >> "$GITHUB_OUTPUT"
 
       - name: Upload core-host binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-host-linux-x86_64-${{ steps.feat_label.outputs.label }}-${{ github.sha }}
           path: target/release/core-host
@@ -386,7 +386,7 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -399,7 +399,7 @@ jobs:
         run: cargo build -p core-host --release --features fips
 
       - name: Upload FIPS core-host binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-host-linux-x86_64-fips-${{ github.sha }}
           path: target/release/core-host
