@@ -2,6 +2,7 @@ import { test, expect, Page } from "@playwright/test";
 
 async function installMocksEmpty(page: Page): Promise<void> {
   await page.addInitScript(() => {
+    localStorage.setItem("tachyon_tour_completed", "true");
     let id = 0;
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
       invoke: (cmd: string) => {

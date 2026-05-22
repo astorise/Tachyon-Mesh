@@ -2,6 +2,9 @@ import { test, expect, Page } from "@playwright/test";
 
 async function installMocks(page: Page): Promise<void> {
   await page.addInitScript(() => {
+    // Prevent the guided tour overlay from firing during tests; it starts after
+    // a 450ms timeout and its fixed inset-0 shadow-DOM layer intercepts clicks.
+    localStorage.setItem("tachyon_tour_completed", "true");
     let id = 0;
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
       invoke: (cmd: string) => {

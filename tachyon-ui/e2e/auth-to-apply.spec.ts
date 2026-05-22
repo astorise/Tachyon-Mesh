@@ -10,6 +10,7 @@ import { test, expect, Page } from "@playwright/test";
 
 async function installTauriMocks(page: Page): Promise<void> {
   await page.addInitScript(() => {
+    localStorage.setItem("tachyon_tour_completed", "true");
     // Stub the Tauri invoke bridge so calls resolve predictably in tests.
     const responses: Record<string, unknown> = {
       get_hardware_status: { totalRamMb: 8192, availableRamMb: 4096, accelerators: ["cpu"], gpus: [] },
