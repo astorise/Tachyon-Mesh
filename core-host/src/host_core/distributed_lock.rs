@@ -88,7 +88,9 @@ fn publish_lock_event(core_store: &store::CoreStore, event: &DistributedLockEven
             return;
         }
     };
-    if let Err(error) = core_store.append_outbox(store::CoreStoreBucket::ConfigUpdateOutbox, &payload) {
+    if let Err(error) =
+        core_store.append_outbox(store::CoreStoreBucket::ConfigUpdateOutbox, &payload)
+    {
         tracing::warn!("failed to publish distributed lock event to outbox: {error:#}");
     }
 }
@@ -130,7 +132,10 @@ pub(crate) fn try_acquire(
         stop: Notify::new(),
     });
     spawn_heartbeat_task(Arc::clone(&inner), lease_ttl);
-    Ok((AcquireOutcome::Acquired, Some(DistributedLockGuard { inner })))
+    Ok((
+        AcquireOutcome::Acquired,
+        Some(DistributedLockGuard { inner }),
+    ))
 }
 
 /// Block until the lock is acquired or `wait_timeout` elapses. Polls with
@@ -211,8 +216,8 @@ mod tests {
 
     fn make_store() -> (TempDir, Arc<store::CoreStore>) {
         let dir = TempDir::new().expect("temp dir for core store");
-        let store = store::CoreStore::open(&dir.path().join("test.db"))
-            .expect("core store should open");
+        let store =
+            store::CoreStore::open(&dir.path().join("test.db")).expect("core store should open");
         (dir, Arc::new(store))
     }
 
@@ -253,13 +258,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (out2, guard2) = try_acquire(
-            &store,
-            "test:2",
-            "node-b",
-            Duration::from_millis(100),
-        )
-        .expect("reclaim");
+        let (out2, guard2) =
+            try_acquire(&store, "test:2", "node-b", Duration::from_millis(100)).expect("reclaim");
         assert!(
             matches!(out2, AcquireOutcome::Acquired),
             "expected expired lease to be reclaimable"

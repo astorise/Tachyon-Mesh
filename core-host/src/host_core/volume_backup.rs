@@ -165,8 +165,8 @@ pub(crate) async fn backup_volume(
         // For CopyOnWrite: snapshot the live dir before uploading so concurrent
         // writes to the live dir don't race with the upload.
         let (source_dir, cow_snapshot) = if write_isolation == WriteIsolation::CopyOnWrite {
-            let snap = std::env::temp_dir()
-                .join(format!("tachyon-cow-{route}-{guest}-{timestamp_ms}"));
+            let snap =
+                std::env::temp_dir().join(format!("tachyon-cow-{route}-{guest}-{timestamp_ms}"));
             copy_on_write_snapshot(&host_dir, &snap)
                 .await
                 .with_context(|| {
@@ -244,10 +244,7 @@ async fn copy_on_write_snapshot(source: &std::path::Path, dest: &std::path::Path
 
 /// Portable recursive directory copy (no reflinks).
 #[cfg(feature = "s3-persistence")]
-async fn copy_dir_recursive(
-    source: &std::path::Path,
-    dest: &std::path::Path,
-) -> Result<()> {
+async fn copy_dir_recursive(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     let mut stack = vec![(source.to_path_buf(), dest.to_path_buf())];
     while let Some((src, dst)) = stack.pop() {
         let meta = tokio::fs::metadata(&src).await?;

@@ -283,8 +283,7 @@ pub(crate) async fn check(state: &AppState, route: &IntegrityRoute) -> Admission
             // window where two nodes may both consider themselves elected after a
             // registry change.
             let holder = leader_election::local_node_id();
-            let lease_ttl =
-                std::time::Duration::from_millis(policy.effective_lock_ttl_ms());
+            let lease_ttl = std::time::Duration::from_millis(policy.effective_lock_ttl_ms());
             match policy.on_conflict {
                 ConflictPolicy::Queue => {
                     let wait_timeout = lease_ttl.saturating_mul(6);
@@ -316,12 +315,8 @@ pub(crate) async fn check(state: &AppState, route: &IntegrityRoute) -> Admission
                     }
                 }
                 ConflictPolicy::Reject => {
-                    match distributed_lock::try_acquire(
-                        &state.core_store,
-                        &key,
-                        &holder,
-                        lease_ttl,
-                    ) {
+                    match distributed_lock::try_acquire(&state.core_store, &key, &holder, lease_ttl)
+                    {
                         Ok((distributed_lock::AcquireOutcome::Acquired, Some(guard))) => {
                             AdmissionOutcome::Pass(AdmissionGuard {
                                 inner: GuardKind::MeshLock(guard),
@@ -342,12 +337,8 @@ pub(crate) async fn check(state: &AppState, route: &IntegrityRoute) -> Admission
                     }
                 }
                 ConflictPolicy::Drop => {
-                    match distributed_lock::try_acquire(
-                        &state.core_store,
-                        &key,
-                        &holder,
-                        lease_ttl,
-                    ) {
+                    match distributed_lock::try_acquire(&state.core_store, &key, &holder, lease_ttl)
+                    {
                         Ok((distributed_lock::AcquireOutcome::Acquired, Some(guard))) => {
                             AdmissionOutcome::Pass(AdmissionGuard {
                                 inner: GuardKind::MeshLock(guard),
