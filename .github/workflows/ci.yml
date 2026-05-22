@@ -275,7 +275,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: wasm-guests-${{ github.sha }}
-          path: .
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
 
       - name: Test core-host feature set
         run: cargo nextest run -p core-host ${{ matrix.features }}
@@ -331,7 +332,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: wasm-guests-${{ github.sha }}
-          path: .
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
 
       - name: Test core-host FIPS feature
         run: cargo nextest run -p core-host --features fips
