@@ -136,11 +136,18 @@ async fn download_snapshot(
 }
 
 /// Create a snapshot of the volume and upload it to S3.
+///
+/// When `write_isolation` is `CopyOnWrite` the function first creates an
+/// instant copy-on-write clone of the live directory (via `cp --reflink=auto`
+/// on Linux, falling back to a regular recursive copy elsewhere), then uploads
+/// the clone. This allows new guest invocations to write to the live directory
+/// while the upload proceeds without locking them out.
 #[cfg_attr(not(feature = "s3-persistence"), allow(unused_variables))]
 pub(crate) async fn backup_volume(
     config: &IntegrityConfig,
     route_path: &str,
     guest_path: &str,
+    write_isolation: WriteIsolation,
 ) -> Result<BackupSnapshot> {
     #[cfg(not(feature = "s3-persistence"))]
     anyhow::bail!("s3-persistence feature is required for volume backups");
@@ -154,13 +161,42 @@ pub(crate) async fn backup_volume(
         let guest = normalize_path_segment(guest_path);
         let snapshot_id = format!("{route}/{guest}/{timestamp_ms}");
         let s3_prefix = snapshot_s3_prefix(route_path, guest_path, timestamp_ms);
-        let object_count = upload_dir(&host_dir, &bucket, &s3_prefix).await?;
+
+        // For CopyOnWrite: snapshot the live dir before uploading so concurrent
+        // writes to the live dir don't race with the upload.
+        let (source_dir, cow_snapshot) = if write_isolation == WriteIsolation::CopyOnWrite {
+            let snap = std::env::temp_dir()
+                .join(format!("tachyon-cow-{route}-{guest}-{timestamp_ms}"));
+            copy_on_write_snapshot(&host_dir, &snap)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to create copy-on-write snapshot of {}",
+                        host_dir.display()
+                    )
+                })?;
+            (snap.clone(), Some(snap))
+        } else {
+            (host_dir, None)
+        };
+
+        let object_count = upload_dir(&source_dir, &bucket, &s3_prefix).await?;
+
+        if let Some(snap) = cow_snapshot {
+            if let Err(error) = tokio::fs::remove_dir_all(&snap).await {
+                tracing::warn!(
+                    path = %snap.display(),
+                    "failed to clean up copy-on-write snapshot: {error}"
+                );
+            }
+        }
 
         tracing::info!(
             route = route_path,
             guest_path,
             snapshot_id = %snapshot_id,
             object_count,
+            ?write_isolation,
             "volume backup completed"
         );
 
@@ -172,6 +208,63 @@ pub(crate) async fn backup_volume(
             object_count,
         })
     }
+}
+
+/// Create a copy-on-write clone of `source` at `dest`.
+///
+/// On Linux, attempts `cp --reflink=auto -a` which is instant on btrfs/xfs/zfs
+/// (the kernel clones the extent tree rather than copying data). Falls back to a
+/// portable recursive copy when the filesystem does not support reflinking.
+#[cfg(feature = "s3-persistence")]
+async fn copy_on_write_snapshot(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    tokio::fs::create_dir_all(dest).await?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let src_glob = format!("{}/.", source.display());
+        let dest_str = dest.to_string_lossy().into_owned();
+        let status = tokio::process::Command::new("cp")
+            .args(["--reflink=auto", "-a", &src_glob, &dest_str])
+            .status()
+            .await;
+        if let Ok(s) = status {
+            if s.success() {
+                return Ok(());
+            }
+        }
+        // Filesystem does not support reflinks — fall through to recursive copy.
+        tracing::debug!(
+            source = %source.display(),
+            "cp --reflink=auto not supported; falling back to recursive copy for CopyOnWrite snapshot"
+        );
+    }
+
+    copy_dir_recursive(source, dest).await
+}
+
+/// Portable recursive directory copy (no reflinks).
+#[cfg(feature = "s3-persistence")]
+async fn copy_dir_recursive(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<()> {
+    let mut stack = vec![(source.to_path_buf(), dest.to_path_buf())];
+    while let Some((src, dst)) = stack.pop() {
+        let meta = tokio::fs::metadata(&src).await?;
+        if meta.is_dir() {
+            tokio::fs::create_dir_all(&dst).await?;
+            let mut read = tokio::fs::read_dir(&src).await?;
+            while let Some(child) = read.next_entry().await? {
+                let name = child.file_name();
+                stack.push((src.join(&name), dst.join(name)));
+            }
+        } else {
+            tokio::fs::copy(&src, &dst).await.with_context(|| {
+                format!("failed to copy {} → {}", src.display(), dst.display())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Restore a snapshot from S3 into the volume's local directory.

@@ -95,6 +95,7 @@ enum GuardKind {
         registry: Arc<NodeSingletonRegistry>,
         route_path: String,
     },
+    MeshLock(distributed_lock::DistributedLockGuard),
 }
 
 impl Drop for AdmissionGuard {
@@ -106,6 +107,8 @@ impl Drop for AdmissionGuard {
         {
             registry.release(route_path);
         }
+        // MeshLock variant drops the inner DistributedLockGuard automatically,
+        // which releases the lock + stops the heartbeat task.
     }
 }
 
@@ -123,12 +126,13 @@ pub(crate) enum AdmissionRejection {
 /// Evaluate the route's concurrency policy and return either a guard that
 /// MUST be held for the duration of the invocation, or a rejection.
 ///
-/// `NodeSingleton + Queue` blocks asynchronously until the slot is free.
-/// `NodeSingleton + Reject` returns Conflict immediately.
-/// `MeshSingleton`/`MeshLeader` not yet implemented in this phase — falls
-/// through to NodeSingleton semantics with a tracing warning. The
-/// DistributedLock primitive lands in a follow-up commit; this admission
-/// filter is wired now so the integration point exists and tests can drive it.
+/// - `Unrestricted` passes through.
+/// - `NodeSingleton + Queue` blocks asynchronously until the slot is free.
+/// - `NodeSingleton + Reject` returns Conflict immediately.
+/// - `MeshSingleton` acquires a redb-backed [`distributed_lock`] keyed on
+///   `route:<path>`. `Queue` polls with backoff; `Reject` returns Conflict
+///   immediately; `Drop` silently discards.
+/// - `MeshLeader` uses deterministic hash election against the node registry.
 pub(crate) async fn check(state: &AppState, route: &IntegrityRoute) -> AdmissionOutcome {
     let policy = &route.concurrency;
 
@@ -182,24 +186,76 @@ pub(crate) async fn check(state: &AppState, route: &IntegrityRoute) -> Admission
             }
         },
         ConcurrencyMode::MeshSingleton => {
-            // Phase 1: degrade to NodeSingleton semantics until the distributed
-            // lock primitive lands. The intent (one-at-a-time per node) is the
-            // safest non-trivial subset. Documented in design.md D1.
-            tracing::debug!(
-                route = %route.path,
-                "mesh-singleton mode falling back to node-singleton until distributed lock lands"
-            );
-            Box::pin(check(
-                state,
-                &IntegrityRoute {
-                    concurrency: ConcurrencyPolicy {
-                        mode: ConcurrencyMode::NodeSingleton,
-                        ..route.concurrency
-                    },
-                    ..route.clone()
-                },
-            ))
-            .await
+            let key = format!("route:{}", route.path);
+            let holder = leader_election::local_node_id();
+            let lease_ttl = std::time::Duration::from_millis(policy.effective_lock_ttl_ms());
+            match policy.on_conflict {
+                ConflictPolicy::Queue => {
+                    // Cap the queue wait at lease_ttl × 6 so a stuck holder
+                    // (whose lease should eventually expire) can't pin the
+                    // caller indefinitely.
+                    let wait_timeout = lease_ttl.saturating_mul(6);
+                    match distributed_lock::acquire_with_wait(
+                        &state.core_store,
+                        &key,
+                        &holder,
+                        lease_ttl,
+                        wait_timeout,
+                    )
+                    .await
+                    {
+                        Ok(Some(guard)) => AdmissionOutcome::Pass(AdmissionGuard {
+                            inner: GuardKind::MeshLock(guard),
+                        }),
+                        Ok(None) => AdmissionOutcome::Rejected(AdmissionRejection::Conflict {
+                            reason: format!(
+                                "route `{}` is mesh-singleton and the lock wait exceeded {}ms",
+                                route.path,
+                                wait_timeout.as_millis()
+                            ),
+                        }),
+                        Err(error) => AdmissionOutcome::Rejected(AdmissionRejection::Conflict {
+                            reason: format!(
+                                "route `{}` distributed lock acquire failed: {error:#}",
+                                route.path
+                            ),
+                        }),
+                    }
+                }
+                ConflictPolicy::Reject => {
+                    match distributed_lock::try_acquire(&state.core_store, &key, &holder, lease_ttl)
+                    {
+                        Ok((distributed_lock::AcquireOutcome::Acquired, Some(guard))) => {
+                            AdmissionOutcome::Pass(AdmissionGuard {
+                                inner: GuardKind::MeshLock(guard),
+                            })
+                        }
+                        Ok(_) => AdmissionOutcome::Rejected(AdmissionRejection::Conflict {
+                            reason: format!(
+                                "route `{}` mesh-singleton lock is held by another invocation",
+                                route.path
+                            ),
+                        }),
+                        Err(error) => AdmissionOutcome::Rejected(AdmissionRejection::Conflict {
+                            reason: format!(
+                                "route `{}` distributed lock acquire failed: {error:#}",
+                                route.path
+                            ),
+                        }),
+                    }
+                }
+                ConflictPolicy::Drop => {
+                    match distributed_lock::try_acquire(&state.core_store, &key, &holder, lease_ttl)
+                    {
+                        Ok((distributed_lock::AcquireOutcome::Acquired, Some(guard))) => {
+                            AdmissionOutcome::Pass(AdmissionGuard {
+                                inner: GuardKind::MeshLock(guard),
+                            })
+                        }
+                        _ => AdmissionOutcome::Rejected(AdmissionRejection::Dropped),
+                    }
+                }
+            }
         }
         ConcurrencyMode::MeshLeader => {
             let key = format!("route:{}", route.path);
@@ -212,6 +268,94 @@ pub(crate) async fn check(state: &AppState, route: &IntegrityRoute) -> Admission
                 AdmissionOutcome::Rejected(AdmissionRejection::NotLeader {
                     leader_node: leader_election::leader_for_in(&nodes, &key),
                 })
+            }
+        }
+        ConcurrencyMode::MeshLeaderStrict => {
+            let key = format!("route:{}", route.path);
+            let nodes = leader_election_nodes(state);
+            // Phase 1: hash election — reject immediately if not the elected node.
+            if !leader_election::am_i_leader_in(&nodes, &key) {
+                return AdmissionOutcome::Rejected(AdmissionRejection::NotLeader {
+                    leader_node: leader_election::leader_for_in(&nodes, &key),
+                });
+            }
+            // Phase 2: distributed lock — prevents double-execution during the brief
+            // window where two nodes may both consider themselves elected after a
+            // registry change.
+            let holder = leader_election::local_node_id();
+            let lease_ttl =
+                std::time::Duration::from_millis(policy.effective_lock_ttl_ms());
+            match policy.on_conflict {
+                ConflictPolicy::Queue => {
+                    let wait_timeout = lease_ttl.saturating_mul(6);
+                    match distributed_lock::acquire_with_wait(
+                        &state.core_store,
+                        &key,
+                        &holder,
+                        lease_ttl,
+                        wait_timeout,
+                    )
+                    .await
+                    {
+                        Ok(Some(guard)) => AdmissionOutcome::Pass(AdmissionGuard {
+                            inner: GuardKind::MeshLock(guard),
+                        }),
+                        Ok(None) => AdmissionOutcome::Rejected(AdmissionRejection::Conflict {
+                            reason: format!(
+                                "route `{}` mesh-leader-strict lock wait exceeded {}ms",
+                                route.path,
+                                wait_timeout.as_millis()
+                            ),
+                        }),
+                        Err(error) => AdmissionOutcome::Rejected(AdmissionRejection::Conflict {
+                            reason: format!(
+                                "route `{}` mesh-leader-strict lock acquire failed: {error:#}",
+                                route.path
+                            ),
+                        }),
+                    }
+                }
+                ConflictPolicy::Reject => {
+                    match distributed_lock::try_acquire(
+                        &state.core_store,
+                        &key,
+                        &holder,
+                        lease_ttl,
+                    ) {
+                        Ok((distributed_lock::AcquireOutcome::Acquired, Some(guard))) => {
+                            AdmissionOutcome::Pass(AdmissionGuard {
+                                inner: GuardKind::MeshLock(guard),
+                            })
+                        }
+                        Ok(_) => AdmissionOutcome::Rejected(AdmissionRejection::Conflict {
+                            reason: format!(
+                                "route `{}` mesh-leader-strict lock is held by another invocation",
+                                route.path
+                            ),
+                        }),
+                        Err(error) => AdmissionOutcome::Rejected(AdmissionRejection::Conflict {
+                            reason: format!(
+                                "route `{}` mesh-leader-strict lock acquire failed: {error:#}",
+                                route.path
+                            ),
+                        }),
+                    }
+                }
+                ConflictPolicy::Drop => {
+                    match distributed_lock::try_acquire(
+                        &state.core_store,
+                        &key,
+                        &holder,
+                        lease_ttl,
+                    ) {
+                        Ok((distributed_lock::AcquireOutcome::Acquired, Some(guard))) => {
+                            AdmissionOutcome::Pass(AdmissionGuard {
+                                inner: GuardKind::MeshLock(guard),
+                            })
+                        }
+                        _ => AdmissionOutcome::Rejected(AdmissionRejection::Dropped),
+                    }
+                }
             }
         }
     }

@@ -611,8 +611,13 @@ pub(crate) fn spawn_volume_backup_scheduler(state: AppState) {
                             )
                             .await;
                         }
-                        let result =
-                            volume_backup::backup_volume(&config2, &route_path, &guest_path).await;
+                        let result = volume_backup::backup_volume(
+                            &config2,
+                            &route_path,
+                            &guest_path,
+                            write_isolation,
+                        )
+                        .await;
                         if write_isolation == WriteIsolation::Drain {
                             crate::host_core::concurrency_admission::backup_drain::resume_admission(
                                 &state2,

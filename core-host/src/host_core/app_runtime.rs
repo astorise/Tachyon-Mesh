@@ -593,7 +593,14 @@ pub(crate) async fn admin_volume_backup_handler(
     axum::Json(payload): axum::Json<VolumeBackupRequest>,
 ) -> Response {
     let config = state.runtime.load().config.clone();
-    match volume_backup::backup_volume(&config, &payload.route_path, &payload.guest_path).await {
+    match volume_backup::backup_volume(
+        &config,
+        &payload.route_path,
+        &payload.guest_path,
+        WriteIsolation::None,
+    )
+    .await
+    {
         Ok(snapshot) => axum::Json(snapshot).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }

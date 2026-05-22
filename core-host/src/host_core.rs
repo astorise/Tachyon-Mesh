@@ -125,6 +125,7 @@ mod bridge;
 mod component_hosts;
 pub(crate) mod concurrency_admission;
 mod config_impls;
+pub(crate) mod distributed_lock;
 mod constants;
 mod domain_types;
 mod entrypoint;

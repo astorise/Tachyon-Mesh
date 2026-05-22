@@ -23,7 +23,11 @@ const CONCURRENCY_MODES = [
   { value: "unrestricted", label: "Unrestricted (N parallel)" },
   { value: "node-singleton", label: "Node singleton (1 per node)" },
   { value: "mesh-singleton", label: "Mesh singleton (1 mesh-wide)" },
-  { value: "mesh-leader", label: "Mesh leader (1 elected node only)" },
+  { value: "mesh-leader", label: "Mesh leader (elected node, eventual)" },
+  {
+    value: "mesh-leader-strict",
+    label: "Mesh leader strict (elected + lock, strong)",
+  },
 ];
 
 const CONFLICT_POLICIES = [
@@ -76,12 +80,22 @@ function deriveRisk(sel: Selection): { level: "low" | "medium" | "high"; tooltip
       sim: "etag-conflict",
     };
   }
-  if (sel.concurrency === "mesh-singleton" || sel.concurrency === "mesh-leader") {
+  if (
+    sel.concurrency === "mesh-singleton" ||
+    sel.concurrency === "mesh-leader" ||
+    sel.concurrency === "mesh-leader-strict"
+  ) {
+    const tooltip =
+      sel.concurrency === "mesh-leader-strict"
+        ? "Elected leader + distributed lock — strongest guarantee, one extra redb round-trip per invocation."
+        : "All invocations serialize through a single node — strong consistency with added latency under load.";
     return {
       level: "low",
-      tooltip:
-        "All invocations serialize through a single node — strong consistency with added latency under load.",
-      sim: "mesh-singleton-queue",
+      tooltip,
+      sim:
+        sel.concurrency === "mesh-leader-strict"
+          ? "mesh-leader-strict"
+          : "mesh-singleton-queue",
     };
   }
   return {

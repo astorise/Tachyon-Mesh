@@ -529,7 +529,6 @@ impl ConcurrencyPolicy {
             && self.lock_ttl_ms.is_none()
     }
 
-    #[allow(dead_code)] // wired in follow-up commits for distributed-lock TTL configuration
     pub(crate) fn effective_lock_ttl_ms(&self) -> u64 {
         self.lock_ttl_ms.unwrap_or(30_000)
     }
@@ -542,7 +541,14 @@ pub(crate) enum ConcurrencyMode {
     Unrestricted,
     NodeSingleton,
     MeshSingleton,
+    /// Deterministic hash election: same node always wins for a given key.
+    /// May briefly elect two leaders during node-registry propagation gaps —
+    /// acceptable for idempotent work (backups, scheduled triggers).
     MeshLeader,
+    /// Hash election + distributed lock: the elected node must also hold the
+    /// redb-backed lock before the invocation proceeds. Prevents double-execution
+    /// during registry churn at the cost of a lock round-trip.
+    MeshLeaderStrict,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]

@@ -45,6 +45,12 @@ const METERING_OUTBOX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 /// new manifest. Key: monotonic event id.
 const CONFIG_UPDATE_OUTBOX_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("config_update_outbox");
+/// Distributed lock state keyed by resource id. Value: serialized
+/// `DistributedLockEntry` (holder node id + lease metadata). The lock is
+/// considered held only while `now < acquired_ms + lease_ttl_ms`; expired
+/// entries are reclaimed lazily on the next acquire attempt.
+const DISTRIBUTED_LOCKS_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("distributed_locks");
 const NODE_REGISTRY_KV_PARTITION: &str = "node-registry";
 #[cfg(feature = "experimental")]
 const COMPRESSED_MAGIC_BYTES: &[&[u8]] = &[
@@ -107,6 +113,7 @@ pub(crate) enum CoreStoreBucket {
     DataMutationOutbox,
     MeteringOutbox,
     ConfigUpdateOutbox,
+    DistributedLocks,
 }
 
 #[cfg(feature = "experimental")]
@@ -295,6 +302,17 @@ struct DirectoryEntry {
     body: Vec<u8>,
 }
 
+/// On-disk representation of a held distributed lock. Persisted in the
+/// `DISTRIBUTED_LOCKS_TABLE` keyed by resource id (e.g. `route:/api/foo`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DistributedLockEntry {
+    pub(crate) holder: String,
+    pub(crate) acquired_ms: u64,
+    pub(crate) lease_ttl_ms: u64,
+    #[serde(default)]
+    pub(crate) refresh_count: u32,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VectorDocument {
@@ -388,6 +406,9 @@ impl CoreStore {
             write_txn
                 .open_table(KV_CACHE_TABLE)
                 .context("failed to open kv_cache table")?;
+            write_txn
+                .open_table(DISTRIBUTED_LOCKS_TABLE)
+                .context("failed to open distributed_locks table")?;
         }
         write_txn
             .commit()
@@ -458,6 +479,9 @@ impl CoreStore {
             CoreStoreBucket::MeteringOutbox => read_bytes(&read_txn, METERING_OUTBOX_TABLE, key),
             CoreStoreBucket::ConfigUpdateOutbox => {
                 read_bytes(&read_txn, CONFIG_UPDATE_OUTBOX_TABLE, key)
+            }
+            CoreStoreBucket::DistributedLocks => {
+                read_bytes(&read_txn, DISTRIBUTED_LOCKS_TABLE, key)
             }
         }
     }
@@ -541,6 +565,14 @@ impl CoreStore {
                         .insert(key, value)
                         .context("failed to insert config update outbox entry")?;
                 }
+                CoreStoreBucket::DistributedLocks => {
+                    let mut table = write_txn
+                        .open_table(DISTRIBUTED_LOCKS_TABLE)
+                        .context("failed to open distributed_locks table")?;
+                    table
+                        .insert(key, value)
+                        .context("failed to insert distributed lock entry")?;
+                }
             };
         }
         write_txn
@@ -618,11 +650,159 @@ impl CoreStore {
                         .remove(key)
                         .context("failed to delete config update outbox entry")?;
                 }
+                CoreStoreBucket::DistributedLocks => {
+                    write_txn
+                        .open_table(DISTRIBUTED_LOCKS_TABLE)
+                        .context("failed to open distributed_locks table")?
+                        .remove(key)
+                        .context("failed to delete distributed lock entry")?;
+                }
             }
         }
         write_txn
             .commit()
             .context("failed to commit core store delete transaction")
+    }
+
+    /// Try to acquire `key` for `holder` with a TTL of `lease_ttl_ms`. Returns
+    /// `Ok(true)` on success, `Ok(false)` if another holder owns a non-expired
+    /// lock. Expired locks are reclaimed atomically inside the same write txn.
+    pub(crate) fn lock_try_acquire(
+        &self,
+        key: &str,
+        holder: &str,
+        lease_ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("failed to begin distributed lock acquire transaction")?;
+        let acquired = {
+            let mut table = write_txn
+                .open_table(DISTRIBUTED_LOCKS_TABLE)
+                .context("failed to open distributed_locks table")?;
+            let existing = table
+                .get(key)
+                .context("failed to read distributed lock entry")?
+                .and_then(|v| serde_json::from_slice::<DistributedLockEntry>(v.value()).ok());
+            let can_take = match &existing {
+                None => true,
+                Some(entry) => now_ms >= entry.acquired_ms.saturating_add(entry.lease_ttl_ms),
+            };
+            if can_take {
+                let entry = DistributedLockEntry {
+                    holder: holder.to_owned(),
+                    acquired_ms: now_ms,
+                    lease_ttl_ms,
+                    refresh_count: 0,
+                };
+                let payload =
+                    serde_json::to_vec(&entry).context("failed to serialize lock entry")?;
+                table
+                    .insert(key, payload.as_slice())
+                    .context("failed to insert distributed lock entry")?;
+            }
+            can_take
+        };
+        write_txn
+            .commit()
+            .context("failed to commit distributed lock acquire transaction")?;
+        Ok(acquired)
+    }
+
+    /// Extend the lease for an already-held lock. Returns `Ok(true)` on success.
+    /// Returns `Ok(false)` if the lock was taken over by another holder (e.g.
+    /// after a lease expiration) — the caller MUST treat the lock as lost.
+    pub(crate) fn lock_heartbeat(
+        &self,
+        key: &str,
+        holder: &str,
+        lease_ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("failed to begin distributed lock heartbeat transaction")?;
+        let refreshed = {
+            let mut table = write_txn
+                .open_table(DISTRIBUTED_LOCKS_TABLE)
+                .context("failed to open distributed_locks table")?;
+            let existing = table
+                .get(key)
+                .context("failed to read distributed lock entry")?
+                .and_then(|v| serde_json::from_slice::<DistributedLockEntry>(v.value()).ok());
+            match existing {
+                Some(entry) if entry.holder == holder => {
+                    let entry = DistributedLockEntry {
+                        holder: holder.to_owned(),
+                        acquired_ms: now_ms,
+                        lease_ttl_ms,
+                        refresh_count: entry.refresh_count.saturating_add(1),
+                    };
+                    let payload =
+                        serde_json::to_vec(&entry).context("failed to serialize lock entry")?;
+                    table
+                        .insert(key, payload.as_slice())
+                        .context("failed to refresh distributed lock entry")?;
+                    true
+                }
+                _ => false,
+            }
+        };
+        write_txn
+            .commit()
+            .context("failed to commit distributed lock heartbeat transaction")?;
+        Ok(refreshed)
+    }
+
+    /// Release a lock if `holder` still owns it. Releasing a lock owned by
+    /// another node is a no-op (returns false) — this is the safe behavior
+    /// when a heartbeat failed silently and another node already took over.
+    pub(crate) fn lock_release(&self, key: &str, holder: &str) -> Result<bool> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("failed to begin distributed lock release transaction")?;
+        let released = {
+            let mut table = write_txn
+                .open_table(DISTRIBUTED_LOCKS_TABLE)
+                .context("failed to open distributed_locks table")?;
+            let existing = table
+                .get(key)
+                .context("failed to read distributed lock entry")?
+                .and_then(|v| serde_json::from_slice::<DistributedLockEntry>(v.value()).ok());
+            match existing {
+                Some(entry) if entry.holder == holder => {
+                    table
+                        .remove(key)
+                        .context("failed to remove distributed lock entry")?;
+                    true
+                }
+                _ => false,
+            }
+        };
+        write_txn
+            .commit()
+            .context("failed to commit distributed lock release transaction")?;
+        Ok(released)
+    }
+
+    /// Look up the current state of `key` without modifying it.
+    #[allow(dead_code)]
+    pub(crate) fn lock_inspect(&self, key: &str) -> Result<Option<DistributedLockEntry>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("failed to begin distributed lock read transaction")?;
+        let table = read_txn
+            .open_table(DISTRIBUTED_LOCKS_TABLE)
+            .context("failed to open distributed_locks table")?;
+        Ok(table
+            .get(key)
+            .context("failed to read distributed lock entry")?
+            .and_then(|v| serde_json::from_slice::<DistributedLockEntry>(v.value()).ok()))
     }
 
     /// Append a new event to one of the outbox-style tables. The key is generated

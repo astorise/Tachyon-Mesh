@@ -710,7 +710,6 @@ pub(crate) fn snapshot_path_for_volume(active_path: &Path) -> PathBuf {
 // ── S3 volume lifecycle ────────────────────────────────────────────────────────
 
 /// Carries the prepared temporary directory for one S3 volume invocation.
-#[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct S3VolumePrep {
     /// Guest-side mount path (e.g. `/app/data`).
@@ -727,12 +726,39 @@ pub(crate) struct S3VolumePrep {
     /// Map of relative_path -> ETag captured at download time. Used by
     /// `OptimisticEtag` commits to detect concurrent modification.
     pub(crate) initial_etags: std::collections::HashMap<String, String>,
+    /// Distributed lock held for the duration of the invocation when
+    /// `write_mode == PessimisticLock`. Drops automatically when the prep
+    /// is freed after commit + cleanup.
+    pub(crate) lock_guard: Option<distributed_lock::DistributedLockGuard>,
+}
+
+impl std::fmt::Debug for S3VolumePrep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3VolumePrep")
+            .field("guest_path", &self.guest_path)
+            .field("temp_path", &self.temp_path)
+            .field("readonly", &self.readonly)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_prefix", &self.s3_prefix)
+            .field("write_mode", &self.write_mode)
+            .field("initial_etags_count", &self.initial_etags.len())
+            .field("has_lock", &self.lock_guard.is_some())
+            .finish()
+    }
 }
 
 /// Download all S3 volumes for `route` into fresh per-invocation temp dirs.
 /// Returns one `S3VolumePrep` per S3 volume; empty if none are configured.
 /// Must be called from an async context (before entering `spawn_blocking`).
-pub(crate) async fn prepare_s3_volumes(route: &IntegrityRoute) -> Vec<S3VolumePrep> {
+///
+/// `core_store` is used only when a volume declares
+/// `consistency.write_mode = "pessimistic_lock"` — the lock is acquired
+/// BEFORE the download so the invocation sees a consistent snapshot for
+/// the entire prep + execute + commit lifecycle.
+pub(crate) async fn prepare_s3_volumes(
+    route: &IntegrityRoute,
+    core_store: &std::sync::Arc<store::CoreStore>,
+) -> Vec<S3VolumePrep> {
     let mut preps = Vec::new();
 
     for volume in route.volumes.iter().filter(|v| v.volume_type.is_s3()) {
@@ -746,6 +772,43 @@ pub(crate) async fn prepare_s3_volumes(route: &IntegrityRoute) -> Vec<S3VolumePr
                 );
                 continue;
             }
+        };
+
+        // Pessimistic lock is acquired BEFORE download so concurrent writers
+        // can't sneak modifications between our download and upload.
+        let lock_guard = if volume.consistency.write_mode == WriteMode::PessimisticLock
+            && !volume.readonly
+        {
+            let key = format!("s3-vol:{}:{}", route.path, volume.guest_path);
+            let holder = leader_election::local_node_id();
+            // Lease TTL of 5 minutes accommodates long-running invocations.
+            // Heartbeats refresh at TTL/2 so a stuck holder eventually loses
+            // the lock to another node.
+            let lease = std::time::Duration::from_secs(300);
+            let wait = std::time::Duration::from_secs(60);
+            match distributed_lock::acquire_with_wait(core_store, &key, &holder, lease, wait).await
+            {
+                Ok(Some(g)) => Some(g),
+                Ok(None) => {
+                    tracing::warn!(
+                        route = %route.path,
+                        guest_path = %volume.guest_path,
+                        "pessimistic_lock acquire timed out after {}s — proceeding without lock",
+                        wait.as_secs()
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        route = %route.path,
+                        guest_path = %volume.guest_path,
+                        "pessimistic_lock acquire failed: {error:#} — proceeding without lock"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         let temp_path = match build_s3_temp_dir() {
@@ -793,6 +856,7 @@ pub(crate) async fn prepare_s3_volumes(route: &IntegrityRoute) -> Vec<S3VolumePr
             s3_prefix: prefix,
             write_mode: volume.consistency.write_mode,
             initial_etags,
+            lock_guard,
         });
     }
 

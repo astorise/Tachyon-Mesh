@@ -354,7 +354,10 @@ pub(crate) fn execute_component_guest(
         execution.ai_runtime.as_ref(),
         "component linker",
     )?;
-    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(route));
+    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(
+        route,
+        &execution.storage_broker.core_store,
+    ));
     let mut store = Store::new(
         engine,
         ComponentHostState::new(
@@ -1181,7 +1184,10 @@ pub(crate) fn execute_legacy_guest(
     }
 
     preopen_route_volumes(&mut wasi, route)?;
-    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(route));
+    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(
+        route,
+        &execution.storage_broker.core_store,
+    ));
     preopen_s3_volume_dirs(&mut wasi, &s3_preps)?;
 
     let wasi = wasi.build_p1();
@@ -1261,7 +1267,10 @@ pub(crate) fn execute_legacy_guest_with_stdio(
     }
 
     preopen_route_volumes(&mut wasi, route)?;
-    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(route));
+    let s3_preps = try_block_on_s3(crate::host_core::volumes::prepare_s3_volumes(
+        route,
+        &execution.storage_broker.core_store,
+    ));
     preopen_s3_volume_dirs(&mut wasi, &s3_preps)?;
 
     let wasi = wasi.build_p1();
