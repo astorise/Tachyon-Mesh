@@ -256,9 +256,9 @@ async fn copy_dir_recursive(source: &std::path::Path, dest: &std::path::Path) ->
                 stack.push((src.join(&name), dst.join(name)));
             }
         } else {
-            tokio::fs::copy(&src, &dst).await.with_context(|| {
-                format!("failed to copy {} → {}", src.display(), dst.display())
-            })?;
+            tokio::fs::copy(&src, &dst)
+                .await
+                .with_context(|| format!("failed to copy {} → {}", src.display(), dst.display()))?;
         }
     }
     Ok(())
