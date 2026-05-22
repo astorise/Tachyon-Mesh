@@ -13,13 +13,14 @@ on:
 permissions:
   contents: read
 
+# ── Shared env snippets used across multiple jobs ─────────────────────────────
+# RUSTFLAGS and CARGO_TERM_COLOR are repeated per-job so each job's env block
+# is self-contained and readable without cross-referencing.
+
 jobs:
-  # ── Build every WASM guest once; all downstream jobs download the result. ────
-  # This replaces the per-job `bash scripts/build-guest-artifacts.sh` call that
-  # was costing ~10-15 min of compile time in rust-ci AND in each of the five
-  # feature-matrix-tests variants (plus fips-tests), totalling ~80-100 min of
-  # redundant CPU. The artifact is kept for one day — just long enough to cover
-  # the CI run lifetime.
+  # ── 1. Build WASM guest artifacts once ──────────────────────────────────────
+  # Packs with tar to preserve target/wasm32-wasip*/release/ paths exactly.
+  # All downstream jobs unpack instead of rebuilding (~12-15 min each).
   build-guests:
     runs-on: ubuntu-latest
     env:
@@ -38,9 +39,6 @@ jobs:
       - name: Build guest artifacts
         run: bash scripts/build-guest-artifacts.sh
 
-      # Pack with tar so the full relative path (target/wasm32-wasip*/release/)
-      # is embedded in the archive. upload-artifact glob paths strip the common
-      # prefix, which breaks the tests that resolve WASM modules by relative path.
       - name: Pack guest artifacts
         run: tar -czf wasm-guests.tar.gz target/wasm32-wasip1/release/*.wasm target/wasm32-wasip2/release/*.wasm
 
@@ -52,9 +50,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── Security audit — runs in parallel with build-guests. ─────────────────────
-  # cargo-audit and cargo-deny are compiled once and cached; subsequent runs
-  # restore the binaries in ~2 s instead of recompiling them (~4-5 min).
+  # ── 2. Security audit (runs in parallel with build-guests) ──────────────────
   security-audit:
     runs-on: ubuntu-latest
     env:
@@ -78,17 +74,18 @@ jobs:
         run: cargo install cargo-audit cargo-deny --locked
 
       - name: Run cargo audit
-        # RUSTSEC-2026-0149: wasmtime-wasi 44.0.1 path_open TRUNCATE bypass;
-        # fixed in 44.0.2 — ignored until Cargo.lock is bumped via the Renovate
-        # wasmtime v45 PR. cargo deny reads deny.toml; cargo audit needs the flag.
         run: cargo audit --ignore RUSTSEC-2026-0149
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
 
-  # ── Main CI: fmt, clippy, tests, coverage, release builds. ───────────────────
-  rust-ci:
-    needs: build-guests
+  # ── 3. Quality gate (runs in parallel with build-guests + security-audit) ───
+  # Fast checks that gate everything downstream: fmt, clippy, cross-layer
+  # validation and per-feature compilation checks.
+  # cargo build -p tachyon-ui --release is intentionally absent: clippy
+  # --workspace already verifies the crate compiles, and the Publish Tachyon
+  # Desktop workflow handles the full Tauri bundle on every branch in parallel.
+  quality:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -96,10 +93,6 @@ jobs:
       RUSTFLAGS: "-D dead_code"
     steps:
       - uses: actions/checkout@v6
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version-file: .node-version
 
       - name: Install Linux system dependencies for Tauri
         run: |
@@ -125,30 +118,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # cargo-llvm-cov is compiled once and cached; restores in ~2 s.
-      - name: Cache cargo-llvm-cov
-        id: cache-llvm-cov
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-llvm-cov-${{ runner.os }}-v1
-
-      - name: Install cargo-llvm-cov
-        if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
-        run: cargo install cargo-llvm-cov --locked
-
-      # nextest is a pre-built binary (~5 s curl) — no need to cache separately.
-      - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      # Restore WASM files into their original target/ paths.
-      - name: Download guest artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: wasm-guests-${{ github.sha }}
-      - name: Unpack guest artifacts
-        run: tar -xzf wasm-guests.tar.gz
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -157,6 +126,42 @@ jobs:
 
       - name: Cross-Layer Validation
         run: bash scripts/validate_cross_layer.sh
+
+      - name: Check ai-inference host build
+        run: cargo check -p core-host --features ai-inference
+
+      - name: Check s3-persistence host build
+        run: cargo check -p core-host --features s3-persistence
+
+  # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
+  # Runs chaos + full workspace nextest suite + doc tests.
+  # Separate job means it gets its own 14 GB disk, avoiding the exhaustion
+  # that plagued the previous monolithic rust-ci job.
+  test:
+    needs: [quality, build-guests]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFLAGS: "-D dead_code"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-guests-${{ github.sha }}
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
 
       - name: Run chaos test harness
         run: cargo nextest run -p core-host --test chaos_test
@@ -168,6 +173,43 @@ jobs:
       - name: Run doc tests
         run: cargo test --doc --workspace
 
+  # ── 5. Coverage (needs quality + guests, runs in parallel with test) ─────────
+  # Separate job gives a fresh disk so the large llvm-cov instrumented tree
+  # doesn't compete with the test or release build for SSD space.
+  cover:
+    needs: [quality, build-guests]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFLAGS: "-D dead_code"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-llvm-cov
+        id: cache-llvm-cov
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-v1
+
+      - name: Install cargo-llvm-cov
+        if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-guests-${{ github.sha }}
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
+
       - name: Generate core-host coverage
         run: cargo llvm-cov -p core-host --lcov --output-path lcov.info
 
@@ -178,27 +220,34 @@ jobs:
           if-no-files-found: error
           path: lcov.info
 
-      # llvm-cov produces instrumented binaries (~2× size) and leaves a large
-      # llvm-cov-target tree. Remove it before the check/release steps so the
-      # runner doesn't exhaust the ~14 GB SSD after clippy + nextest + cov.
-      - name: Free disk space after coverage
-        run: |
-          df -h
-          rm -rf target/llvm-cov-target
-          cargo clean -p core-host --profile dev 2>/dev/null || true
-          df -h
+  # ── 6. Release build (needs quality + guests, parallel with test + cover) ────
+  # Only builds core-host --release. tachyon-ui is excluded: clippy already
+  # validates it compiles, and Publish Tachyon Desktop handles the Tauri bundle.
+  release:
+    needs: [quality, build-guests]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFLAGS: "-D dead_code"
+    steps:
+      - uses: actions/checkout@v6
 
-      - name: Check ai-inference host build
-        run: cargo check -p core-host --features ai-inference
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-wasip2
 
-      - name: Check s3-persistence host build
-        run: cargo check -p core-host --features s3-persistence
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-guests-${{ github.sha }}
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
 
       - name: Build core-host in release mode
         run: cargo build -p core-host --release
-
-      - name: Build tachyon-ui in release mode
-        run: cargo build -p tachyon-ui --release
 
       - name: Upload CI build artifacts
         uses: actions/upload-artifact@v4
@@ -208,7 +257,6 @@ jobs:
           path: |
             integrity.lock
             target/release/core-host
-            target/release/tachyon-ui
             target/wasm32-wasip1/release/guest_ai.wasm
             target/wasm32-wasip2/release/guest_example.wasm
             target/wasm32-wasip2/release/guest_flaky.wasm
@@ -240,13 +288,10 @@ jobs:
             target/wasm32-wasip2/release/system_faas_sqs.wasm
             target/wasm32-wasip2/release/system_faas_storage_broker.wasm
 
-  # ── Feature matrix (5 parallel variants, shared Rust dependency cache). ───────
-  # Sharing the cache across variants avoids recompiling the large common
-  # dependency set (tokio, serde, wasmtime, …) five times. Only the default
-  # variant writes to the shared cache; the others restore from it and do not
-  # write, preventing cross-feature cache collisions.
+  # ── 7. Feature matrix (5 parallel variants, shared Rust cache) ──────────────
+  # Waits for quality so clippy failures don't spawn 5 redundant matrix runs.
   feature-matrix-tests:
-    needs: build-guests
+    needs: [quality, build-guests]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -315,9 +360,9 @@ jobs:
           path: target/release/core-host
           if-no-files-found: error
 
-  # ── FIPS tests ────────────────────────────────────────────────────────────────
+  # ── 8. FIPS tests ────────────────────────────────────────────────────────────
   fips-tests:
-    needs: build-guests
+    needs: [quality, build-guests]
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -358,7 +403,7 @@ jobs:
           path: target/release/core-host
           if-no-files-found: error
 
-  # ── Mutation tests (weekly schedule only) ────────────────────────────────────
+  # ── 9. Mutation tests (weekly schedule only) ─────────────────────────────────
   mutation-tests:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -373,7 +418,7 @@ jobs:
       - name: Run auth mutation tests
         run: cargo mutants --package core-host --file core-host/src/auth.rs --timeout 120
 
-  # ── Miri cwasm cache (weekly schedule only) ───────────────────────────────────
+  # ── 10. Miri cwasm cache (weekly schedule only) ───────────────────────────────
   miri-cwasm-cache:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -390,10 +435,14 @@ jobs:
       - name: Run cwasm cache Miri smoke test
         run: cargo +nightly miri test -p core-host cwasm_cache_deserializes_same_engine_component --no-default-features
 
-  # ── Publish Docker images (push to main only, waits for rust-ci) ──────────────
+  # ── 11. Publish Docker images (push to main, needs quality + test) ─────────
+  # Docker builds core-host from source inside the Dockerfile, so it doesn't
+  # consume the pre-built release artifact. It waits for quality + test so we
+  # don't publish an image that fails basic validation, but it runs in parallel
+  # with cover and release to reduce the push-to-publish wall time.
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: rust-ci
+    needs: [quality, test]
     runs-on: ubuntu-latest
     env:
       BUILDKIT_PROGRESS: plain
