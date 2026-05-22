@@ -442,7 +442,7 @@ jobs:
   # with cover and release to reduce the push-to-publish wall time.
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [quality, test]
+    needs: [quality, test, cover, release, feature-matrix-tests, fips-tests]
     runs-on: ubuntu-latest
     env:
       BUILDKIT_PROGRESS: plain
