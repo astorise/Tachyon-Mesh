@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     file \
+    musl-tools \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -49,9 +50,7 @@ RUN cargo build -p guest-ai --target wasm32-wasip1 --release
 RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p guest-loop --target wasm32-wasip1 --release
 
-# legacy-mock nécessite musl
-RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
-    && rm -rf /var/lib/apt/lists/*
+# legacy-mock nécessite musl (musl-tools installé dans le bloc apt initial)
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 
 # ── core-host FIPS — Alpine musl natif ───────────────────────────────────────
