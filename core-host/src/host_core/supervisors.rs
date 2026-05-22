@@ -574,18 +574,52 @@ pub(crate) fn spawn_volume_backup_scheduler(state: AppState) {
                     let Some(ref schedule) = volume.backup_schedule else {
                         continue;
                     };
+                    let coordination = schedule.coordination();
+                    // ManualOnly disables scheduled triggers entirely.
+                    if coordination == BackupCoordination::ManualOnly {
+                        continue;
+                    }
                     let key = (route.path.clone(), volume.guest_path.clone());
                     let last = *last_backup.get(&key).unwrap_or(&0);
-                    if !cron_is_due(schedule, now_mins, last) {
+                    if !cron_is_due(schedule.cron(), now_mins, last) {
                         continue;
+                    }
+                    // MeshLeader: only the deterministically elected leader runs the backup.
+                    if coordination == BackupCoordination::MeshLeader {
+                        let leader_key = format!("{}:{}", route.path, volume.guest_path);
+                        if !leader_election::am_i_leader(&state, &leader_key) {
+                            continue;
+                        }
                     }
                     last_backup.insert(key, now_mins);
                     let config2 = config.clone();
                     let route_path = route.path.clone();
                     let guest_path = volume.guest_path.clone();
+                    let write_isolation = schedule.write_isolation();
+                    let state2 = state.clone();
                     tokio::spawn(async move {
-                        match volume_backup::backup_volume(&config2, &route_path, &guest_path).await
-                        {
+                        // Drain mode pauses admission and waits for in-flight invocations.
+                        if write_isolation == WriteIsolation::Drain {
+                            crate::host_core::concurrency_admission::backup_drain::pause_admission(
+                                &state2,
+                                &route_path,
+                            )
+                            .await;
+                            crate::host_core::concurrency_admission::backup_drain::wait_for_drain(
+                                &state2,
+                                &route_path,
+                            )
+                            .await;
+                        }
+                        let result =
+                            volume_backup::backup_volume(&config2, &route_path, &guest_path).await;
+                        if write_isolation == WriteIsolation::Drain {
+                            crate::host_core::concurrency_admission::backup_drain::resume_admission(
+                                &state2,
+                                &route_path,
+                            );
+                        }
+                        match result {
                             Ok(snap) => tracing::info!(
                                 route = %route_path,
                                 guest_path = %guest_path,

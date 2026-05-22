@@ -280,6 +280,23 @@ async fn get_mesh_graph() -> Result<tachyon_client::MeshGraphSnapshot, String> {
 }
 
 #[tauri::command]
+fn recommend_concurrency_policy(
+    pattern: String,
+    writes_shared_state: Option<bool>,
+    requires_ordering: Option<bool>,
+    max_latency_ms: Option<u64>,
+) -> tachyon_client::ConcurrencyRecommendation {
+    tachyon_client::recommend_concurrency_policy(
+        &pattern,
+        &tachyon_client::ConcurrencyRequirements {
+            writes_shared_state: writes_shared_state.unwrap_or(false),
+            requires_ordering: requires_ordering.unwrap_or(false),
+            max_latency_ms,
+        },
+    )
+}
+
+#[tauri::command]
 async fn list_volume_backups(
     route_path: String,
     guest_path: String,
@@ -1285,6 +1302,7 @@ fn main() {
             list_volume_backups,
             backup_volume,
             restore_volume,
+            recommend_concurrency_policy,
             save_credentials,
             load_credentials,
             delete_credentials,

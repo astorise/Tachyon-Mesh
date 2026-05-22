@@ -662,6 +662,8 @@ pub(super) fn build_test_state_with_manifest(
         config_updates: broadcast::channel(CONFIG_UPDATE_CHANNEL_CAPACITY).0,
         manifest_path,
         background_workers: Arc::new(BackgroundWorkerManager::default()),
+        node_singletons: crate::host_core::concurrency_admission::NodeSingletonRegistry::new(),
+        admission_pause: crate::host_core::concurrency_admission::AdmissionPauseRegistry::new(),
         #[cfg(feature = "s3-persistence")]
         s3_backend: None,
     };

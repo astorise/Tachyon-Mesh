@@ -299,6 +299,7 @@ fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<V
         "list_volume_backups" => &["route_path", "guest_path"],
         "backup_volume" => &["route_path", "guest_path"],
         "restore_volume" => &["route_path", "guest_path", "snapshot_id"],
+        "recommend_concurrency_policy" => &["pattern"],
         _ => return None,
     };
     let obj = match arguments.and_then(Value::as_object) {
@@ -335,6 +336,8 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         // S3 volume mutators — moderate budget.
         "attach_s3_volume" | "detach_s3_volume" | "backup_volume" | "restore_volume" => 10,
         "list_volume_backups" => 60,
+        // Recommendation is pure local computation, no I/O.
+        "recommend_concurrency_policy" => 100,
         // All remaining read-only tools — high throughput allowed.
         "tachyon_mesh_status"
         | "tachyon_lockfile"
@@ -906,6 +909,24 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                             "snapshot_id": { "type": "string", "description": "Snapshot identifier from list_volume_backups (e.g. 'api_my-fn/app_data/1748000000000')." }
                         }
                     }
+                },
+                {
+                    "name": "recommend_concurrency_policy",
+                    "description": "Recommend a concurrency + consistency + coordination configuration for a FaaS route based on a declared usage pattern. Returns mode names, rationale, risk level, and trade-offs so the operator (human or AI) can apply the policy to integrity.lock.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["pattern"],
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "enum": ["batch", "interactive", "stateful", "etl", "scheduler"],
+                                "description": "Usage pattern. `batch` = scheduled jobs, `interactive` = low-latency request/response, `stateful` = shared mutable state, `etl` = pipelines with optimistic concurrency, `scheduler` = singleton coordinator."
+                            },
+                            "writes_shared_state": { "type": "boolean", "default": false, "description": "Set true if invocations may mutate shared volumes or external state." },
+                            "requires_ordering": { "type": "boolean", "default": false, "description": "Set true if invocations must be observed in a single linear order." },
+                            "max_latency_ms": { "type": "integer", "minimum": 1, "description": "Optional p99 latency budget in milliseconds; influences whether unrestricted mode is recommended." }
+                        }
+                    }
                 }
             ]
             });
@@ -1463,6 +1484,34 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 "content": [{ "type": "text", "text": format!(
                     "Volume at `{guest_path}` on route `{route_path}` restored from snapshot `{snapshot_id}`."
                 ) }]
+            }))
+        }
+
+        // ── Concurrency policy recommendation ────────────────────────────────
+        "recommend_concurrency_policy" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let pattern = arguments
+                .get("pattern")
+                .and_then(Value::as_str)
+                .context("missing pattern")?;
+            let requirements = tachyon_client::ConcurrencyRequirements {
+                writes_shared_state: arguments
+                    .get("writes_shared_state")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                requires_ordering: arguments
+                    .get("requires_ordering")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                max_latency_ms: arguments.get("max_latency_ms").and_then(Value::as_u64),
+            };
+            let recommendation =
+                tachyon_client::recommend_concurrency_policy(pattern, &requirements);
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&recommendation)? }]
             }))
         }
 

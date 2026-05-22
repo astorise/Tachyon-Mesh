@@ -722,6 +722,11 @@ pub(crate) struct S3VolumePrep {
     pub(crate) s3_bucket: String,
     /// S3 prefix extracted from `host_path` (may be empty).
     pub(crate) s3_prefix: String,
+    /// Concurrent-write resolution mode declared on the volume.
+    pub(crate) write_mode: WriteMode,
+    /// Map of relative_path -> ETag captured at download time. Used by
+    /// `OptimisticEtag` commits to detect concurrent modification.
+    pub(crate) initial_etags: std::collections::HashMap<String, String>,
 }
 
 /// Download all S3 volumes for `route` into fresh per-invocation temp dirs.
@@ -755,14 +760,19 @@ pub(crate) async fn prepare_s3_volumes(route: &IntegrityRoute) -> Vec<S3VolumePr
             }
         };
 
+        #[cfg_attr(not(feature = "s3-persistence"), allow(unused_mut))]
+        let mut initial_etags = std::collections::HashMap::new();
         #[cfg(feature = "s3-persistence")]
         {
-            if let Err(error) = download_s3_prefix_to_dir(&bucket, &prefix, &temp_path).await {
-                tracing::warn!(
-                    route = %route.path,
-                    guest_path = %volume.guest_path,
-                    "S3 volume download failed, guest will see empty dir: {error:#}"
-                );
+            match download_s3_prefix_to_dir(&bucket, &prefix, &temp_path).await {
+                Ok(etags) => initial_etags = etags,
+                Err(error) => {
+                    tracing::warn!(
+                        route = %route.path,
+                        guest_path = %volume.guest_path,
+                        "S3 volume download failed, guest will see empty dir: {error:#}"
+                    );
+                }
             }
         }
         #[cfg(not(feature = "s3-persistence"))]
@@ -781,6 +791,8 @@ pub(crate) async fn prepare_s3_volumes(route: &IntegrityRoute) -> Vec<S3VolumePr
             readonly: volume.readonly,
             s3_bucket: bucket,
             s3_prefix: prefix,
+            write_mode: volume.consistency.write_mode,
+            initial_etags,
         });
     }
 
@@ -788,18 +800,37 @@ pub(crate) async fn prepare_s3_volumes(route: &IntegrityRoute) -> Vec<S3VolumePr
 }
 
 /// Upload modified files back to S3 for all read-write volumes.
-/// Called after successful guest execution.
+/// Dispatches on the volume's `write_mode` to apply the appropriate
+/// concurrency-resolution strategy (LWW unconditional / optimistic ETag /
+/// pessimistic lock). Called after successful guest execution.
 pub(crate) async fn commit_s3_volumes(preps: &[S3VolumePrep]) {
     #[cfg(feature = "s3-persistence")]
     for prep in preps.iter().filter(|p| !p.readonly) {
-        if let Err(error) =
-            upload_dir_to_s3_prefix(&prep.temp_path, &prep.s3_bucket, &prep.s3_prefix).await
-        {
+        let result = match prep.write_mode {
+            WriteMode::LastWriteWins | WriteMode::PessimisticLock => {
+                // PessimisticLock holds the lock around the whole invocation
+                // upstream, so the commit itself is a simple unconditional upload.
+                upload_dir_to_s3_prefix(&prep.temp_path, &prep.s3_bucket, &prep.s3_prefix).await
+            }
+            WriteMode::OptimisticEtag => {
+                upload_dir_to_s3_prefix_with_etag(
+                    &prep.temp_path,
+                    &prep.s3_bucket,
+                    &prep.s3_prefix,
+                    &prep.initial_etags,
+                )
+                .await
+            }
+            // None is rejected at schema validation when !readonly; treat as no-op defensively.
+            WriteMode::None => Ok(()),
+        };
+        if let Err(error) = result {
             tracing::warn!(
                 guest_path = %prep.guest_path,
                 bucket = %prep.s3_bucket,
                 prefix = %prep.s3_prefix,
-                "S3 volume commit failed — changes may be lost: {error:#}"
+                write_mode = ?prep.write_mode,
+                "S3 volume commit failed: {error:#}"
             );
         }
     }
@@ -841,7 +872,14 @@ fn uuid_v4_hex() -> String {
 }
 
 #[cfg(feature = "s3-persistence")]
-async fn download_s3_prefix_to_dir(bucket: &str, prefix: &str, dest: &Path) -> anyhow::Result<()> {
+/// Download the S3 prefix into `dest` and return a map of
+/// `relative_path -> e_tag` captured at download time. The map lets the
+/// commit phase use `OptimisticEtag` conditional PUTs.
+async fn download_s3_prefix_to_dir(
+    bucket: &str,
+    prefix: &str,
+    dest: &Path,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
     use futures::StreamExt as _;
     use object_store::{path::Path as OsPath, ObjectStore};
 
@@ -852,6 +890,7 @@ async fn download_s3_prefix_to_dir(bucket: &str, prefix: &str, dest: &Path) -> a
         Some(OsPath::parse(prefix).map_err(|e| anyhow::anyhow!("{e}"))?)
     };
 
+    let mut etags = std::collections::HashMap::new();
     let mut list = store.list(prefix_path.as_ref());
     while let Some(entry) = list.next().await {
         let meta = entry?;
@@ -868,10 +907,14 @@ async fn download_s3_prefix_to_dir(bucket: &str, prefix: &str, dest: &Path) -> a
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let bytes = store.get(&meta.location).await?.bytes().await?;
+        let result = store.get(&meta.location).await?;
+        if let Some(etag) = &result.meta.e_tag {
+            etags.insert(rel.to_owned(), etag.clone());
+        }
+        let bytes = result.bytes().await?;
         tokio::fs::write(&local_path, &bytes).await?;
     }
-    Ok(())
+    Ok(etags)
 }
 
 #[cfg(feature = "s3-persistence")]
@@ -905,6 +948,69 @@ async fn upload_dir_to_s3_prefix(dir: &Path, bucket: &str, prefix: &str) -> anyh
             let key = OsPath::parse(&key_str).map_err(|e| anyhow::anyhow!("{e}"))?;
             let bytes = tokio::fs::read(&entry_path).await?;
             store.put(&key, bytes.into()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Like `upload_dir_to_s3_prefix` but uses a conditional PUT (`If-Match: <etag>`)
+/// for every file whose ETag was captured at download time. Aborts on the first
+/// 412 Precondition Failed so the caller surfaces the conflict to the operator.
+#[cfg(feature = "s3-persistence")]
+async fn upload_dir_to_s3_prefix_with_etag(
+    dir: &Path,
+    bucket: &str,
+    prefix: &str,
+    initial_etags: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    use object_store::{path::Path as OsPath, ObjectStore, PutMode, PutOptions};
+
+    let store = build_s3_store(bucket)?;
+    let mut stack = vec![dir.to_path_buf()];
+
+    while let Some(entry_path) = stack.pop() {
+        let metadata = match tokio::fs::metadata(&entry_path).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            let mut read = tokio::fs::read_dir(&entry_path).await?;
+            while let Some(child) = read.next_entry().await? {
+                stack.push(child.path());
+            }
+        } else {
+            let rel = entry_path
+                .strip_prefix(dir)
+                .unwrap_or(&entry_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let key_str = if prefix.is_empty() {
+                rel.clone()
+            } else {
+                format!("{}/{}", prefix.trim_end_matches('/'), rel)
+            };
+            let key = OsPath::parse(&key_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let bytes = tokio::fs::read(&entry_path).await?;
+            let mode = match initial_etags.get(&rel) {
+                Some(etag) => PutMode::Update(object_store::UpdateVersion {
+                    e_tag: Some(etag.clone()),
+                    version: None,
+                }),
+                None => PutMode::Create,
+            };
+            let opts = PutOptions {
+                mode,
+                ..Default::default()
+            };
+            store
+                .put_opts(&key, bytes.into(), opts)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "optimistic_etag commit failed for {key_str}: {e} \
+                         (another writer modified the object since download)"
+                    )
+                })?;
         }
     }
     Ok(())

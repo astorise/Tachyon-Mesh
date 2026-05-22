@@ -3,6 +3,7 @@ import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "./TachyonVolumesPanel";
+import "./TachyonConcurrencyPolicyPanel";
 
 type MeshRouteSummary = {
   name: string;
@@ -163,10 +164,16 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
       rows.push(tr);
 
       if (isExpanded) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "space-y-2";
+        const concPanel = document.createElement("tachyon-concurrency-policy-panel") as HTMLElement;
+        concPanel.setAttribute("route-path", route.path);
         const volPanel = document.createElement("tachyon-volumes-panel") as HTMLElement;
         volPanel.setAttribute("route-path", route.path);
+        wrapper.appendChild(concPanel);
+        wrapper.appendChild(volPanel);
         const detailRow = el("tr", {},
-          el("td", { colspan: "5", class: "pb-2" }, volPanel),
+          el("td", { colspan: "5", class: "pb-2" }, wrapper),
         );
         rows.push(detailRow);
       }

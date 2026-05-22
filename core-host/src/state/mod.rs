@@ -76,6 +76,11 @@ pub(crate) struct AppState {
     pub(crate) manifest_path: PathBuf,
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     pub(crate) background_workers: Arc<BackgroundWorkerManager>,
+    /// Per-route in-process locks honored by `ConcurrencyMode::NodeSingleton`.
+    pub(crate) node_singletons: Arc<crate::host_core::concurrency_admission::NodeSingletonRegistry>,
+    /// Per-route admission pauses raised by `WriteIsolation::Drain` backups.
+    pub(crate) admission_pause:
+        Arc<crate::host_core::concurrency_admission::AdmissionPauseRegistry>,
     #[cfg(feature = "s3-persistence")]
     pub(crate) s3_backend: Option<Arc<crate::persistence::S3PersistenceBackend>>,
 }

@@ -2661,7 +2661,18 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
         Arc::clone(&state.host_load),
         guest_memory_page_count(request_config.guest_memory_limit_bytes),
     );
+    // Concurrency admission: block / reject / pass through based on the route's
+    // declared policy. The guard MUST stay alive for the duration of the
+    // invocation; it is moved into the spawn_blocking closure below.
+    let admission = concurrency_admission::check(state, route).await;
+    let admission_guard = match admission {
+        concurrency_admission::AdmissionOutcome::Pass(guard) => Some(guard),
+        concurrency_admission::AdmissionOutcome::Rejected(rejection) => {
+            return Err(translate_admission_rejection(&route.path, rejection));
+        }
+    };
     let result = tokio::task::spawn_blocking(move || {
+        let _guard = admission_guard; // drop on closure exit releases the slot
         execute_guest(
             &engine,
             &task_function_name,
@@ -2740,6 +2751,36 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
         fuel_consumed,
         completion_guard: Some(active_request_guard.into_response_guard()),
     })
+}
+
+/// Map an `AdmissionRejection` to the `(StatusCode, String)` error shape
+/// expected by `BufferedRouteResult`. Includes an `X-Tachyon-Leader` hint
+/// when applicable so clients can retry against the elected leader.
+fn translate_admission_rejection(
+    route_path: &str,
+    rejection: concurrency_admission::AdmissionRejection,
+) -> (StatusCode, String) {
+    use concurrency_admission::AdmissionRejection::*;
+    match rejection {
+        NotLeader { leader_node } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "route `{route_path}` is mesh-leader scoped; this node is not the leader{}",
+                leader_node
+                    .map(|n| format!(" (try `{n}`)"))
+                    .unwrap_or_default()
+            ),
+        ),
+        Conflict { reason } => (StatusCode::CONFLICT, reason),
+        AdmissionPaused => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("route `{route_path}` admission is paused by an in-progress backup drain"),
+        ),
+        Dropped => (
+            StatusCode::NO_CONTENT,
+            format!("route `{route_path}` invocation dropped per `on_conflict = drop` policy"),
+        ),
+    }
 }
 
 pub(crate) async fn execute_buffered_route_request(

@@ -1206,6 +1206,10 @@ pub(crate) fn validate_integrity_route(route: IntegrityRoute) -> Result<Integrit
         ));
     }
 
+    let normalized_volumes = normalize_route_volumes(route.volumes, route.role, &normalized)?;
+    let normalized_concurrency =
+        validate_concurrency_policy(route.concurrency, &normalized, &normalized_volumes)?;
+
     Ok(IntegrityRoute {
         path: normalized.clone(),
         role: route.role,
@@ -1222,7 +1226,7 @@ pub(crate) fn validate_integrity_route(route: IntegrityRoute) -> Result<Integrit
         domains: normalize_route_domains(route.domains, &normalized)?,
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
-        volumes: normalize_route_volumes(route.volumes, route.role, &normalized)?,
+        volumes: normalized_volumes,
         resource_policy: route.resource_policy,
         runtime: normalize_route_runtime(route.runtime, &normalized)?,
         sync_to_cloud: route.sync_to_cloud,
@@ -1232,7 +1236,38 @@ pub(crate) fn validate_integrity_route(route: IntegrityRoute) -> Result<Integrit
         shadow_target: route.shadow_target,
         adapter_id: route.adapter_id,
         canary: route.canary,
+        concurrency: normalized_concurrency,
     })
+}
+
+/// Reject incompatible concurrency × volume combinations. Returns the policy
+/// unchanged on success. `volumes` is the already-normalized list of route volumes.
+fn validate_concurrency_policy(
+    policy: ConcurrencyPolicy,
+    route_path: &str,
+    volumes: &[IntegrityVolume],
+) -> Result<ConcurrencyPolicy> {
+    if policy.mode == ConcurrencyMode::Unrestricted {
+        for volume in volumes {
+            if volume.consistency.write_mode == WriteMode::PessimisticLock {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{route_path}` declares \
+                     `concurrency.mode = \"unrestricted\"` but volume `{}` requires \
+                     `pessimistic_lock`; pessimistic locking only applies under singleton modes",
+                    volume.guest_path
+                ));
+            }
+        }
+    }
+    if let Some(ttl) = policy.lock_ttl_ms {
+        if ttl == 0 {
+            return Err(anyhow!(
+                "Integrity Validation Failed: route `{route_path}` `concurrency.lock_ttl_ms` \
+                 must be greater than zero"
+            ));
+        }
+    }
+    Ok(policy)
 }
 
 pub(crate) fn normalize_route_runtime(
@@ -1786,13 +1821,22 @@ pub(crate) fn validate_route_volume(
     }
 
     if let Some(ref schedule) = volume.backup_schedule {
-        validate_cron_expression(schedule).map_err(|_| {
+        let cron = schedule.cron();
+        validate_cron_expression(cron).map_err(|_| {
             anyhow!(
                 "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` \
-                 has an invalid `backup_schedule` cron expression `{schedule}`; \
+                 has an invalid `backup_schedule` cron expression `{cron}`; \
                  expected 5-field format e.g. `0 3 * * *`"
             )
         })?;
+    }
+
+    if volume.consistency.write_mode == WriteMode::None && !volume.readonly {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` volume `{guest_path}` \
+             declares `consistency.write_mode = \"none\"` but is not marked `readonly`; \
+             set `readonly: true` or pick another write_mode"
+        ));
     }
 
     Ok(IntegrityVolume {
@@ -1805,6 +1849,7 @@ pub(crate) fn validate_route_volume(
         eviction_policy: volume.eviction_policy,
         encrypted: volume.encrypted,
         backup_schedule: volume.backup_schedule,
+        consistency: volume.consistency,
     })
 }
 

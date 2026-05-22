@@ -472,6 +472,11 @@ pub(crate) struct IntegrityRoute {
     /// `canary.next_version` according to the configured step schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) canary: Option<CanaryConfig>,
+    /// Declarative concurrency policy that governs how many invocations of this
+    /// route may run simultaneously and how conflicts are handled. Defaults to
+    /// `Unrestricted` (= pre-feature behavior, no admission control).
+    #[serde(default, skip_serializing_if = "ConcurrencyPolicy::is_default")]
+    pub(crate) concurrency: ConcurrencyPolicy,
 }
 
 impl Default for IntegrityRoute {
@@ -502,8 +507,51 @@ impl Default for IntegrityRoute {
             shadow_target: None,
             adapter_id: None,
             canary: None,
+            concurrency: ConcurrencyPolicy::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ConcurrencyPolicy {
+    #[serde(default)]
+    pub(crate) mode: ConcurrencyMode,
+    #[serde(default)]
+    pub(crate) on_conflict: ConflictPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lock_ttl_ms: Option<u64>,
+}
+
+impl ConcurrencyPolicy {
+    pub(crate) fn is_default(&self) -> bool {
+        self.mode == ConcurrencyMode::default()
+            && self.on_conflict == ConflictPolicy::default()
+            && self.lock_ttl_ms.is_none()
+    }
+
+    #[allow(dead_code)] // wired in follow-up commits for distributed-lock TTL configuration
+    pub(crate) fn effective_lock_ttl_ms(&self) -> u64 {
+        self.lock_ttl_ms.unwrap_or(30_000)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ConcurrencyMode {
+    #[default]
+    Unrestricted,
+    NodeSingleton,
+    MeshSingleton,
+    MeshLeader,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConflictPolicy {
+    #[default]
+    Queue,
+    Reject,
+    Drop,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -606,10 +654,15 @@ pub(crate) struct IntegrityVolume {
     /// that don't need TDE.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) encrypted: bool,
-    /// Optional cron expression (e.g. `"0 3 * * *"`) that triggers automatic S3 backups.
-    /// Requires the `s3-persistence` feature and `TACHYON_S3_BUCKET` to be configured.
+    /// Optional cron expression (e.g. `"0 3 * * *"`) or full `BackupSchedule` object
+    /// that triggers automatic S3 backups. Requires the `s3-persistence` feature
+    /// and `TACHYON_S3_BUCKET` to be configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) backup_schedule: Option<String>,
+    pub(crate) backup_schedule: Option<BackupSchedule>,
+    /// Consistency policy controlling how concurrent reads and writes are resolved.
+    /// Default = snapshot reads + last-write-wins commits, matching pre-feature behavior.
+    #[serde(default, skip_serializing_if = "VolumeConsistency::is_default")]
+    pub(crate) consistency: VolumeConsistency,
 }
 
 impl Default for IntegrityVolume {
@@ -624,8 +677,101 @@ impl Default for IntegrityVolume {
             eviction_policy: None,
             encrypted: false,
             backup_schedule: None,
+            consistency: VolumeConsistency::default(),
         }
     }
+}
+
+/// Accepts either the legacy bare cron string or the structured object form,
+/// preserving backward compatibility with sealed manifests written before
+/// the concurrency-policies change introduced coordination/write_isolation fields.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum BackupSchedule {
+    Cron(String),
+    Detailed(BackupScheduleDetailed),
+}
+
+impl BackupSchedule {
+    pub(crate) fn cron(&self) -> &str {
+        match self {
+            Self::Cron(s) => s,
+            Self::Detailed(d) => &d.cron,
+        }
+    }
+
+    pub(crate) fn coordination(&self) -> BackupCoordination {
+        match self {
+            Self::Cron(_) => BackupCoordination::PerNode,
+            Self::Detailed(d) => d.coordination,
+        }
+    }
+
+    pub(crate) fn write_isolation(&self) -> WriteIsolation {
+        match self {
+            Self::Cron(_) => WriteIsolation::None,
+            Self::Detailed(d) => d.write_isolation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct BackupScheduleDetailed {
+    pub(crate) cron: String,
+    #[serde(default)]
+    pub(crate) coordination: BackupCoordination,
+    #[serde(default)]
+    pub(crate) write_isolation: WriteIsolation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackupCoordination {
+    #[default]
+    PerNode,
+    MeshLeader,
+    ManualOnly,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WriteIsolation {
+    #[default]
+    None,
+    Drain,
+    CopyOnWrite,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct VolumeConsistency {
+    #[serde(default)]
+    pub(crate) read_mode: ReadMode,
+    #[serde(default)]
+    pub(crate) write_mode: WriteMode,
+}
+
+impl VolumeConsistency {
+    pub(crate) fn is_default(&self) -> bool {
+        self.read_mode == ReadMode::default() && self.write_mode == WriteMode::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReadMode {
+    #[default]
+    Snapshot,
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WriteMode {
+    #[default]
+    LastWriteWins,
+    OptimisticEtag,
+    PessimisticLock,
+    None,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

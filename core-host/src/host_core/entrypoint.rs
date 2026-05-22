@@ -129,6 +129,8 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
         config_updates,
         manifest_path,
         background_workers: Arc::clone(&background_workers),
+        node_singletons: crate::host_core::concurrency_admission::NodeSingletonRegistry::new(),
+        admission_pause: crate::host_core::concurrency_admission::AdmissionPauseRegistry::new(),
         #[cfg(feature = "s3-persistence")]
         s3_backend,
     };

@@ -420,6 +420,8 @@ async fn router_returns_service_unavailable_when_route_concurrency_is_exhausted(
         config_updates: broadcast::channel(CONFIG_UPDATE_CHANNEL_CAPACITY).0,
         manifest_path: core_store_manifest,
         background_workers: Arc::new(BackgroundWorkerManager::default()),
+        node_singletons: crate::host_core::concurrency_admission::NodeSingletonRegistry::new(),
+        admission_pause: crate::host_core::concurrency_admission::AdmissionPauseRegistry::new(),
         #[cfg(feature = "s3-persistence")]
         s3_backend: None,
     };

@@ -2444,6 +2444,178 @@ pub async fn list_volume_backups(
     .await
 }
 
+// ── Concurrency policy recommendation ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyRequirements {
+    #[serde(default)]
+    pub writes_shared_state: bool,
+    #[serde(default)]
+    pub requires_ordering: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyConfig {
+    pub mode: String,
+    pub on_conflict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsistencyConfig {
+    pub read_mode: String,
+    pub write_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinationConfig {
+    pub mode: String,
+    pub write_isolation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencyRecommendation {
+    pub concurrency: ConcurrencyConfig,
+    pub consistency: ConsistencyConfig,
+    pub coordination: CoordinationConfig,
+    pub rationale: String,
+    /// `low` | `medium` | `high`
+    pub risk_level: String,
+    pub trade_offs: Vec<String>,
+}
+
+/// Map a usage pattern + requirements to a recommended concurrency, consistency
+/// and coordination configuration. Implemented as a pure local decision table —
+/// no HTTP call, no LLM. The UI and MCP layers both use this so a draft policy
+/// is always available even when the core-host is unreachable.
+pub fn recommend_concurrency_policy(
+    pattern: &str,
+    requirements: &ConcurrencyRequirements,
+) -> ConcurrencyRecommendation {
+    let writes_shared = requirements.writes_shared_state;
+    let ordered = requirements.requires_ordering;
+    let latency_sensitive = requirements
+        .max_latency_ms
+        .map(|ms| ms <= 200)
+        .unwrap_or(false);
+
+    let (concurrency, consistency, coordination, rationale, risk, trade_offs) = match pattern {
+        "batch" => (
+            ("node-singleton", "queue", None),
+            ("snapshot", "last_write_wins"),
+            ("mesh_leader", "none"),
+            "Batch jobs typically run on a leader node with one invocation at a time per node.",
+            "low",
+            vec!["Higher latency when bursts queue", "Predictable resource usage"],
+        ),
+        "interactive" => (
+            ("unrestricted", "queue", None),
+            ("snapshot", "last_write_wins"),
+            ("per_node", "none"),
+            "Interactive workloads optimize for latency and accept best-effort consistency.",
+            "low",
+            vec!["No write-conflict protection — only safe for read-mostly or per-tenant state"],
+        ),
+        "stateful" => (
+            ("mesh-singleton", "queue", Some(30_000u64)),
+            ("live", "pessimistic_lock"),
+            ("mesh_leader", "drain"),
+            "Stateful services require strict serialization and consistent snapshots.",
+            "low",
+            vec![
+                "Added latency under load (serialized via distributed lock)",
+                "Backups pause new invocations during snapshot",
+            ],
+        ),
+        "etl" => (
+            ("mesh-leader", "reject", None),
+            ("snapshot", "optimistic_etag"),
+            ("mesh_leader", "none"),
+            "ETL pipelines run on a single elected node; concurrent writers fail fast on ETag conflict.",
+            "medium",
+            vec![
+                "Optimistic conflict failures require client-side retry",
+                "Non-leader nodes return 503 with a leader hint",
+            ],
+        ),
+        "scheduler" => (
+            ("mesh-leader", "reject", None),
+            ("snapshot", "last_write_wins"),
+            ("mesh_leader", "none"),
+            "Scheduler-style jobs MUST run on a single node to avoid duplicate work.",
+            "low",
+            vec!["Non-leader nodes reject invocations with a leader hint"],
+        ),
+        _ => {
+            // Unknown pattern: derive from requirements.
+            if writes_shared && ordered {
+                (
+                    ("mesh-singleton", "queue", Some(30_000u64)),
+                    ("live", "pessimistic_lock"),
+                    ("mesh_leader", "drain"),
+                    "Unknown pattern with shared writable state and ordering — defaulting to stateful mode.",
+                    "low",
+                    vec!["Higher latency", "Most conservative default"],
+                )
+            } else if writes_shared {
+                (
+                    ("mesh-leader", "reject", None),
+                    ("snapshot", "optimistic_etag"),
+                    ("mesh_leader", "none"),
+                    "Unknown pattern with shared writable state — defaulting to optimistic concurrency.",
+                    "medium",
+                    vec!["ETag conflicts will surface as 412 errors"],
+                )
+            } else if latency_sensitive {
+                (
+                    ("unrestricted", "queue", None),
+                    ("snapshot", "last_write_wins"),
+                    ("per_node", "none"),
+                    "Latency-sensitive without shared writes — using interactive defaults.",
+                    "low",
+                    vec!["No write-conflict protection (none needed)"],
+                )
+            } else {
+                (
+                    ("unrestricted", "queue", None),
+                    ("snapshot", "last_write_wins"),
+                    ("per_node", "none"),
+                    "No pattern hint provided — returning default permissive policy.",
+                    "low",
+                    vec!["Tighten when requirements are known"],
+                )
+            }
+        }
+    };
+
+    ConcurrencyRecommendation {
+        concurrency: ConcurrencyConfig {
+            mode: concurrency.0.to_owned(),
+            on_conflict: concurrency.1.to_owned(),
+            lock_ttl_ms: concurrency.2,
+        },
+        consistency: ConsistencyConfig {
+            read_mode: consistency.0.to_owned(),
+            write_mode: consistency.1.to_owned(),
+        },
+        coordination: CoordinationConfig {
+            mode: coordination.0.to_owned(),
+            write_isolation: coordination.1.to_owned(),
+        },
+        rationale: rationale.to_owned(),
+        risk_level: risk.to_owned(),
+        trade_offs: trade_offs.into_iter().map(str::to_owned).collect(),
+    }
+}
+
 pub async fn remove_overlay_resource(name: &str) -> Result<()> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
