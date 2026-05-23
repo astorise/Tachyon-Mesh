@@ -110,7 +110,7 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
             <p class="text-xs text-emerald-400">No scope denials recorded — scopes are working correctly.</p>
           </div>
           <div id="scope-denial-counter" class="${this.scopeDenialTotal !== 0 ? "" : "hidden"}">
-            <p class="text-xs text-slate-400 mb-1">Lifetime denials, all categories and deployments:</p>
+            <p class="text-xs text-slate-400 mb-1">lifetime denials, all categories and deployments:</p>
             <p class="font-mono text-2xl font-bold text-amber-400" id="scope-denial-count">${this.scopeDenialTotal}</p>
             <p class="text-[10px] text-slate-500 mt-1">Per-category breakdown: <span class="font-mono">faas_scope_denials_total{"{deployment,category}"}</span> in prometheus.</p>
             <a href="#" id="link-configure-scopes" class="text-[10px] text-cyan-400 hover:underline mt-1 inline-block">Configure scopes →</a>

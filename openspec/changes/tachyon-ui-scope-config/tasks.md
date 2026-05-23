@@ -35,11 +35,11 @@
 - [x] 5.2 Afficher `scopeDenialTotal` comme compteur principal avec un label "lifetime denials, all categories".
 - [x] 5.3 Afficher l'état vide quand `scopeDenialTotal === 0` : "No scope denials recorded — scopes are working correctly."
 - [x] 5.4 Ajouter un lien "Configure scopes" qui navigue vers le panneau Scopes de la route sélectionnée.
-- [ ] 5.5 Unit-test du widget : état vide, affichage du total, mise à jour au refresh.
+- [x] 5.5 Unit-test du widget : état vide, affichage du total, mise à jour au refresh.
 
 ## 6. Tests d'intégration et review
 
 - [x] 6.1 Test d'intégration Vitest : `TachyonScopesPanel` avec mock de `scopesController` — scénario save happy path, scénario erreur API.
 - [x] 6.2 Vérifier que `npm run build` passe sans warnings TypeScript.
 - [x] 6.3 Vérifier que `npm run test` passe (tous les tests existants restent verts).
-- [ ] 6.4 Vérifier manuellement dans le navigateur (dev server) : panel Scopes visible, badge allow-all présent, save → toast, widget observabilité refresh.
+- [x] 6.4 Vérifier manuellement dans le navigateur (dev server) : panel Scopes visible, badge allow-all présent, save → toast, widget observabilité refresh.
