@@ -482,6 +482,214 @@ fn test_deploy_function_missing_param_returns_32602() {
     let _ = child.wait();
 }
 
+/// `tools/list` must include the three new scope tools and `tachyon_get_metrics`
+/// description must mention `scope_denial_total`.
+#[test]
+fn test_tools_list_includes_scope_tools() {
+    let Some((mut child, mut stdin, mut reader)) = spawn_offline_mcp() else {
+        return;
+    };
+
+    let resp_raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":50,"method":"tools/list","params":{}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&resp_raw).expect("tools/list is valid JSON");
+
+    if let Some(tools) = resp["result"]["tools"].as_array() {
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        for expected in &[
+            "tachyon_get_scope_denials",
+            "tachyon_set_route_scopes",
+            "tachyon_suggest_scopes",
+        ] {
+            assert!(
+                names.contains(expected),
+                "tools/list must include `{expected}`"
+            );
+        }
+        let metrics_tool = tools.iter().find(|t| t["name"] == "tachyon_get_metrics");
+        if let Some(tool) = metrics_tool {
+            let desc = tool["description"].as_str().unwrap_or("");
+            assert!(
+                desc.contains("scope_denial_total"),
+                "tachyon_get_metrics description must mention scope_denial_total"
+            );
+        }
+    }
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// `tachyon_get_scope_denials` and `tachyon_suggest_scopes` return valid
+/// JSON-RPC responses offline (no required arguments needed for get_scope_denials;
+/// suggest_scopes missing route_path → -32602).
+#[test]
+fn test_scope_read_tools_offline_behavior() {
+    let Some((mut child, mut stdin, mut reader)) = spawn_offline_mcp() else {
+        return;
+    };
+
+    // get_scope_denials has no required args; offline → -32001 from the metrics call
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"tachyon_get_scope_denials","arguments":{}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("get_scope_denials response is valid JSON");
+    assert_offline_jsonrpc(&resp, 51);
+
+    // suggest_scopes missing route_path → -32602 (caught before cluster call)
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"tachyon_suggest_scopes","arguments":{}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("suggest_scopes missing-arg response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 52);
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "missing route_path must return -32602; got {resp}"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// Helper: spawn a fresh offline MCP with an isolated rate-limit state file.
+fn spawn_offline_mcp_isolated(name: &str) -> Option<(
+    std::process::Child,
+    std::process::ChildStdin,
+    std::io::BufReader<std::process::ChildStdout>,
+)> {
+    let bin = mcp_binary();
+    if !bin.exists() {
+        return None;
+    }
+    let mut child = Command::new(&bin)
+        .env("TACHYON_MCP_PAT", "e2e-test-token")
+        .env("TACHYON_MCP_URL", "http://127.0.0.1:19999")
+        .env("TACHYON_MCP_TIMEOUT_MS", "500")
+        .env("TACHYON_MCP_RATE_LIMIT_STATE", rate_limit_state_path(name))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tachyon-mcp");
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut s = stdin;
+    send_and_recv(
+        &mut s,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    );
+    Some((child, s, reader))
+}
+
+/// `tachyon_set_route_scopes` missing required args → -32602.
+/// Uses isolated rate-limit state per assertion so the 1/min limit doesn't
+/// interfere with the missing-params check.
+#[test]
+fn test_set_route_scopes_missing_args_returns_32602() {
+    // Missing both route_path and scopes
+    let Some((mut child, mut stdin, mut reader)) =
+        spawn_offline_mcp_isolated("set-scopes-miss-both") else { return; };
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"tachyon_set_route_scopes","arguments":{}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("set_route_scopes response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 60);
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "missing required args must return -32602; got {resp}"
+    );
+    drop(stdin);
+    let _ = child.wait();
+
+    // Missing scopes only — fresh process to avoid rate limit
+    let Some((mut child, mut stdin, mut reader)) =
+        spawn_offline_mcp_isolated("set-scopes-miss-scopes") else { return; };
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"tachyon_set_route_scopes","arguments":{"route_path":"/api/fn"}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("set_route_scopes missing scopes response is valid JSON");
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "missing scopes must return -32602; got {resp}"
+    );
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// `tachyon_set_route_scopes` is rate-limited to 1 req/min.
+/// The second call within the same window must return `-32002`.
+#[test]
+fn test_set_route_scopes_rate_limited() {
+    let bin = mcp_binary();
+    if !bin.exists() {
+        return;
+    }
+    let mut child = Command::new(&bin)
+        .env("TACHYON_MCP_PAT", "e2e-test-token")
+        .env("TACHYON_MCP_URL", "http://127.0.0.1:19999")
+        .env("TACHYON_MCP_TIMEOUT_MS", "500")
+        .env(
+            "TACHYON_MCP_RATE_LIMIT_STATE",
+            rate_limit_state_path("set-route-scopes"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tachyon-mcp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+
+    send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+    );
+
+    let req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tachyon_set_route_scopes","arguments":{"route_path":"/api/fn","scopes":{"secrets":["**"]}}}}"#;
+    send_and_recv(&mut stdin, &mut reader, req);
+
+    // Second call must be rate-limited
+    let raw = send_and_recv(&mut stdin, &mut reader, req);
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("second set_route_scopes response is valid JSON");
+    if let Some(code) = resp["error"]["code"].as_i64() {
+        assert_eq!(code, -32002, "second call must be rate-limited; got {resp}");
+        assert!(
+            resp["error"]["data"]["retry_after_ms"].is_number(),
+            "rate limit must include retry_after_ms"
+        );
+    }
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
 /// Full integration test against a running cluster.
 /// Skipped unless `E2E_CLUSTER_URL` and `E2E_CLUSTER_PAT` are set.
 #[test]

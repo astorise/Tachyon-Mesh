@@ -368,6 +368,20 @@ async fn get_metrics() -> Result<tachyon_client::RuntimeMetrics, String> {
 }
 
 #[tauri::command]
+async fn get_manifest_config() -> Result<serde_json::Value, String> {
+    tachyon_client::get_manifest_config()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn apply_manifest_config(config: serde_json::Value) -> Result<tachyon_client::SealApplyOutcome, String> {
+    tachyon_client::apply_manifest_config(config)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn tail_logs(lines: Option<usize>) -> Result<Vec<tachyon_client::LogLine>, String> {
     tachyon_client::tail_logs(lines.unwrap_or(50))
         .await
@@ -1303,6 +1317,8 @@ fn main() {
             backup_volume,
             restore_volume,
             recommend_concurrency_policy,
+            get_manifest_config,
+            apply_manifest_config,
             save_credentials,
             load_credentials,
             delete_credentials,

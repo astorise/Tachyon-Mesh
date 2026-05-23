@@ -4,6 +4,7 @@ import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "./TachyonVolumesPanel";
 import "./TachyonConcurrencyPolicyPanel";
+import "../routing/TachyonScopesPanel";
 
 type MeshRouteSummary = {
   name: string;
@@ -12,6 +13,7 @@ type MeshRouteSummary = {
   targetCount: number;
   requiresTee: boolean;
   encryptedVolumeCount: number;
+  allowAllScopes: boolean;
 };
 
 type MeshGraphSnapshot = {
@@ -136,7 +138,7 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
     return `
       <table class="w-full text-xs">
         <thead class="text-slate-500 uppercase tracking-widest">
-          <tr><th class="text-left pb-2 pr-4">${t("routing.preview.column.name")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.path")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.targets")}</th><th class="text-left pb-2">${t("routing.preview.column.tee")}</th></tr>
+          <tr><th class="text-left pb-2 pr-4">${t("routing.preview.column.name")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.path")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.targets")}</th><th class="text-left pb-2 pr-4">${t("routing.preview.column.tee")}</th><th class="text-left pb-2 pr-2">Scopes</th><th></th></tr>
         </thead>
         <tbody id="routing-snapshot-rows"></tbody>
       </table>
@@ -150,11 +152,20 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
     const rows: Element[] = [];
     for (const route of this.snapshot.routes) {
       const isExpanded = this.expandedRoute === route.path;
+      const scopeBadge = route.allowAllScopes
+        ? el("span", {
+            class: "rounded-full bg-amber-500/20 border border-amber-500/40 px-1.5 py-0.5 text-[9px] font-semibold text-amber-300 uppercase tracking-widest cursor-help",
+            title: "This deployment grants all WIT imports. Click to configure scopes.",
+          }, "allow-all")
+        : el("span", {
+            class: "rounded-full bg-emerald-500/20 border border-emerald-500/40 px-1.5 py-0.5 text-[9px] font-semibold text-emerald-300 uppercase tracking-widest",
+          }, "scoped");
       const tr = el("tr", { class: "cursor-pointer hover:bg-slate-800/40", "data-route-path": route.path },
         el("td", { class: "py-1 pr-4 text-cyan-300" }, route.name),
         el("td", { class: "py-1 pr-4 font-mono text-slate-300" }, route.path),
         el("td", { class: "py-1 pr-4 text-slate-300" }, String(route.targetCount)),
         el("td", { class: "py-1 text-slate-300" }, route.requiresTee ? "yes" : "no"),
+        el("td", { class: "py-1 pr-2" }, scopeBadge),
         el("td", { class: "py-1 text-slate-400 text-xs" }, isExpanded ? "▲" : "▼"),
       );
       tr.addEventListener("click", () => {
@@ -170,10 +181,13 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
         concPanel.setAttribute("route-path", route.path);
         const volPanel = document.createElement("tachyon-volumes-panel") as HTMLElement;
         volPanel.setAttribute("route-path", route.path);
+        const scopesPanel = document.createElement("tachyon-scopes-panel") as HTMLElement;
+        scopesPanel.setAttribute("route-path", route.path);
         wrapper.appendChild(concPanel);
         wrapper.appendChild(volPanel);
+        wrapper.appendChild(scopesPanel);
         const detailRow = el("tr", {},
-          el("td", { colspan: "5", class: "pb-2" }, wrapper),
+          el("td", { colspan: "6", class: "pb-2" }, wrapper),
         );
         rows.push(detailRow);
       }

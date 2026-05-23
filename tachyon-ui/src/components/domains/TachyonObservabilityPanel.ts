@@ -2,6 +2,7 @@ import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import { readScopeMetrics } from "../../controllers/scopesController";
 
 type RuntimeMetrics = {
   source: string;
@@ -9,6 +10,7 @@ type RuntimeMetrics = {
   p50LatencyMs: number;
   p99LatencyMs: number;
   queueDepth: number;
+  scopeDenialTotal?: number;
 };
 
 type LogLine = {
@@ -30,6 +32,8 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
   private metrics: RuntimeMetrics | null = null;
   private logs: LogLine[] = [];
   private shadow: ShadowDiff[] = [];
+  private scopeDenialTotal = 0;
+  private scopeRefreshInterval: ReturnType<typeof setInterval> | null = null;
   private readonly onLanguageChanged = () => this.render();
 
   async connectedCallback(): Promise<void> {
@@ -38,10 +42,40 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
     this.bindEvents();
     this.animateEntrance();
     await this.refreshTelemetry();
+    await this.refreshScopeDenials();
+    this.scopeRefreshInterval = setInterval(() => { void this.refreshScopeDenials(); }, 30_000);
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
+    if (this.scopeRefreshInterval !== null) {
+      clearInterval(this.scopeRefreshInterval);
+      this.scopeRefreshInterval = null;
+    }
+  }
+
+  private async refreshScopeDenials(): Promise<void> {
+    try {
+      const result = await readScopeMetrics();
+      this.scopeDenialTotal = result.scopeDenialTotal;
+      this.updateScopeDenialsWidget();
+    } catch {
+      // Non-fatal: widget stays at last known value.
+    }
+  }
+
+  private updateScopeDenialsWidget(): void {
+    const el = this.root.getElementById("scope-denial-count");
+    if (el) el.textContent = String(this.scopeDenialTotal);
+    const empty = this.root.getElementById("scope-denial-empty");
+    const counter = this.root.getElementById("scope-denial-counter");
+    if (this.scopeDenialTotal === 0) {
+      empty?.classList.remove("hidden");
+      counter?.classList.add("hidden");
+    } else {
+      empty?.classList.add("hidden");
+      counter?.classList.remove("hidden");
+    }
   }
 
   private render(): void {
@@ -68,6 +102,19 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
         <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-5">
           <h3 class="mb-3 text-sm font-semibold uppercase tracking-widest text-cyan-300">${t("observability.shadow.title")}</h3>
           ${this.renderShadow()}
+        </article>
+
+        <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-5">
+          <h3 class="mb-3 text-sm font-semibold uppercase tracking-widest text-cyan-300">Scope Denials</h3>
+          <div id="scope-denial-empty" class="${this.scopeDenialTotal === 0 ? "" : "hidden"}">
+            <p class="text-xs text-emerald-400">No scope denials recorded — scopes are working correctly.</p>
+          </div>
+          <div id="scope-denial-counter" class="${this.scopeDenialTotal !== 0 ? "" : "hidden"}">
+            <p class="text-xs text-slate-400 mb-1">Lifetime denials, all categories and deployments:</p>
+            <p class="font-mono text-2xl font-bold text-amber-400" id="scope-denial-count">${this.scopeDenialTotal}</p>
+            <p class="text-[10px] text-slate-500 mt-1">Per-category breakdown: <span class="font-mono">faas_scope_denials_total{"{deployment,category}"}</span> in prometheus.</p>
+            <a href="#" id="link-configure-scopes" class="text-[10px] text-cyan-400 hover:underline mt-1 inline-block">Configure scopes →</a>
+          </div>
         </article>
 
         <article data-stagger-panel class="rounded-lg border border-slate-700 bg-slate-800/40 p-6">
@@ -105,6 +152,10 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
     });
     this.root.getElementById("btn-refresh-observability")?.addEventListener("click", () => {
       void this.refreshTelemetry();
+    });
+    this.root.getElementById("link-configure-scopes")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.dispatchEvent(new CustomEvent("app:navigate", { detail: { panel: "routing" } }));
     });
   }
 

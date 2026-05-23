@@ -361,6 +361,8 @@ pub struct MeshRouteSummary {
     pub target_count: usize,
     pub requires_tee: bool,
     pub encrypted_volume_count: usize,
+    /// True when the route has no explicit scopes block (allow-all sentinel).
+    pub allow_all_scopes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +546,8 @@ pub struct RuntimeMetrics {
     pub vram_utilization_pct: u8,
     #[serde(default)]
     pub ram_offload_active: bool,
+    #[serde(default)]
+    pub scope_denial_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1988,6 +1992,7 @@ pub async fn get_metrics() -> Result<RuntimeMetrics> {
         queue_depth: graph.batch_targets.len() as u64,
         vram_utilization_pct: 0,
         ram_offload_active: false,
+        scope_denial_total: 0,
     })
 }
 
@@ -2018,6 +2023,41 @@ pub async fn get_manifest_schema() -> Result<serde_json::Value> {
         return Ok(serde_json::json!({ "type": "object" }));
     }
     get_admin_json(ADMIN_SCHEMA_MANIFEST_PATH).await
+}
+
+/// Fetch and parse the current live manifest's `config_payload` from the node.
+/// Returns the config as a `serde_json::Value` ready for modification.
+/// Errors if not connected or if the node returns an error.
+pub async fn get_manifest_config() -> Result<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    struct LiveManifest {
+        config_payload: String,
+    }
+    let m = get_admin_json::<LiveManifest>(ADMIN_MANIFEST_PATH)
+        .await
+        .context("failed to fetch live manifest from node")?;
+    serde_json::from_str(&m.config_payload).context("failed to parse live manifest config_payload")
+}
+
+/// Sign a modified manifest config and POST it to the active node.
+/// The `config` value is the parsed `config_payload` (same shape returned by
+/// `get_manifest_config`). Increments `config_version` before signing.
+pub async fn apply_manifest_config(mut config: serde_json::Value) -> Result<SealApplyOutcome> {
+    if let Some(obj) = config.as_object_mut() {
+        let next_version = obj
+            .get("config_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        obj.insert(
+            "config_version".to_owned(),
+            serde_json::Value::Number(next_version.into()),
+        );
+    }
+    let payload =
+        serde_json::to_string(&config).context("failed to serialize manifest config_payload")?;
+    let manifest = sign_manifest_payload(payload).await?;
+    apply_manifest_to_active_node(&manifest).await
 }
 
 pub async fn abort_canary_rollout(route_path: &str) -> Result<()> {
@@ -3307,6 +3347,15 @@ fn parse_route_summary(route: &serde_json::Value) -> Option<MeshRouteSummary> {
         })
         .unwrap_or(0);
 
+    let allow_all_scopes = {
+        let scopes = route.get("scopes");
+        scopes.is_none()
+            || scopes
+                .and_then(|v| v.as_str())
+                .map(|s| s == "allow-all")
+                .unwrap_or(false)
+    };
+
     Some(MeshRouteSummary {
         path,
         name,
@@ -3314,6 +3363,7 @@ fn parse_route_summary(route: &serde_json::Value) -> Option<MeshRouteSummary> {
         target_count,
         requires_tee,
         encrypted_volume_count,
+        allow_all_scopes,
     })
 }
 

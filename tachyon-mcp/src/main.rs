@@ -300,6 +300,8 @@ fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<V
         "backup_volume" => &["route_path", "guest_path"],
         "restore_volume" => &["route_path", "guest_path", "snapshot_id"],
         "recommend_concurrency_policy" => &["pattern"],
+        "tachyon_set_route_scopes" => &["route_path", "scopes"],
+        "tachyon_suggest_scopes" => &["route_path"],
         _ => return None,
     };
     let obj = match arguments.and_then(Value::as_object) {
@@ -326,13 +328,16 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         // Critical mutators — very tight budget to prevent accidental canary misconfiguration.
         "tachyon_canary_split" => 2,
         // Deployment / deletion mutators — moderate budget.
-        "tachyon_apply_manifest" | "tachyon_seal_overlay" => 1,
+        "tachyon_apply_manifest" | "tachyon_seal_overlay" | "tachyon_set_route_scopes" => 1,
         "tachyon_deploy_function" | "tachyon_delete_function" => 5,
         "tachyon_register_resource" => 10,
         // KV mutators and log fetches — generous but bounded.
         "tachyon_kv_put" | "tachyon_kv_delete" | "tachyon_function_logs" => 30,
-        // Read-only telemetry tools.
-        "tachyon_get_metrics" | "tachyon_tail_logs" => 30,
+        // Read-only telemetry and scope tools.
+        "tachyon_get_metrics"
+        | "tachyon_tail_logs"
+        | "tachyon_get_scope_denials"
+        | "tachyon_suggest_scopes" => 30,
         // S3 volume mutators — moderate budget.
         "attach_s3_volume" | "detach_s3_volume" | "backup_volume" | "restore_volume" => 10,
         "list_volume_backups" => 60,
@@ -679,10 +684,60 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_get_metrics",
-                    "description": "Return active node telemetry such as error rate, p50/p99 latency, and queue depth.",
+                    "description": "Return active node telemetry: error rate, p50/p99 latency, queue depth, and scope_denial_total (lifetime count of WIT import denials across all deployments and categories).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
+                    }
+                },
+                {
+                    "name": "tachyon_get_scope_denials",
+                    "description": "Return the lifetime count of WIT import scope denials from the active node. Optionally filter by route_path to inspect the allow_all flag for a specific route. Per-category and per-deployment breakdowns are available via prometheus (faas_scope_denials_total{deployment,category}).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "route_path": {
+                                "type": "string",
+                                "description": "Optional HTTP route path (e.g. '/api/my-fn'). When provided, response includes the allow_all flag derived from the manifest."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_set_route_scopes",
+                    "description": "Apply a scopes block to a route in the live manifest. Reads the current manifest, merges the provided scopes into the target route, and POSTs the modified manifest. Use dry_run=true to preview the manifest change without applying it. Caution: concurrent manifest edits will overwrite each other.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path", "scopes"],
+                        "properties": {
+                            "route_path": {
+                                "type": "string",
+                                "description": "HTTP route path of the target deployment (e.g. '/api/my-fn')."
+                            },
+                            "scopes": {
+                                "type": "object",
+                                "description": "Scopes block to merge. Keys are WIT categories (secrets, kv, graph, sql, http_client, blob, messaging, crypto, routing, compute); values are arrays of glob patterns or 'allow-all'."
+                            },
+                            "dry_run": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "When true, return manifest_preview without posting to the node."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_suggest_scopes",
+                    "description": "Suggest a starting scopes configuration for a route based on its current state and lifetime denial count. Returns a conservative YAML snippet and rationale. Apply the suggestion with tachyon_set_route_scopes.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path"],
+                        "properties": {
+                            "route_path": {
+                                "type": "string",
+                                "description": "HTTP route path of the deployment to analyse (e.g. '/api/my-fn')."
+                            }
+                        }
                     }
                 },
                 {
@@ -1137,6 +1192,228 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
             let metrics = tachyon_client::get_metrics().await?;
             Ok(text_tool_result(&metrics)?)
         }
+        "tachyon_get_scope_denials" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments.get("route_path").and_then(Value::as_str);
+
+            let metrics = tachyon_client::get_metrics()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            let scope_denial_total = metrics.scope_denial_total;
+
+            let result = if let Some(path) = route_path {
+                let config = tachyon_client::get_manifest_config()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                let routes = config
+                    .get("routes")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let route = routes.iter().find(|r| {
+                    r.get("path")
+                        .and_then(Value::as_str)
+                        .map(|p| p == path)
+                        .unwrap_or(false)
+                });
+                let allow_all = route.map(|r| {
+                    let scopes = r.get("scopes");
+                    scopes.is_none()
+                        || scopes
+                            .and_then(Value::as_str)
+                            .map(|s| s == "allow-all")
+                            .unwrap_or(false)
+                });
+                json!({
+                    "route_path": path,
+                    "scope_denial_total": scope_denial_total,
+                    "allow_all": allow_all.unwrap_or(true),
+                    "route_found": route.is_some(),
+                    "note": "Per-category breakdown available via prometheus: faas_scope_denials_total{deployment,category}"
+                })
+            } else {
+                json!({
+                    "scope_denial_total": scope_denial_total,
+                    "note": "Per-category breakdown available via prometheus: faas_scope_denials_total{deployment,category}"
+                })
+            };
+            Ok(text_tool_result(&result)?)
+        }
+        "tachyon_set_route_scopes" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let scopes = arguments
+                .get("scopes")
+                .cloned()
+                .context("missing scopes")?;
+            let dry_run = arguments
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            let mut config = tachyon_client::get_manifest_config()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+
+            let routes = config
+                .get_mut("routes")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("manifest has no routes array"))?;
+
+            let route = routes.iter_mut().find(|r| {
+                r.get("path")
+                    .and_then(Value::as_str)
+                    .map(|p| p == route_path)
+                    .unwrap_or(false)
+            });
+
+            let route = match route {
+                Some(r) => r,
+                None => {
+                    return Ok(json_rpc_error_response(
+                        None,
+                        &JsonRpcError::invalid_params(
+                            "route not found",
+                            json!({
+                                "route_path": route_path,
+                                "detail": "route not found in manifest — use tachyon_list_functions to list available routes"
+                            }),
+                        ),
+                    ));
+                }
+            };
+
+            if let Some(obj) = route.as_object_mut() {
+                obj.insert("scopes".to_owned(), scopes.clone());
+            }
+
+            if dry_run {
+                Ok(text_tool_result(&json!({
+                    "dry_run": true,
+                    "route_path": route_path,
+                    "scopes_applied": scopes,
+                    "manifest_preview": config,
+                }))?)
+            } else {
+                tachyon_client::apply_manifest_config(config)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                Ok(text_tool_result(&json!({
+                    "success": true,
+                    "route_path": route_path,
+                    "scopes_applied": scopes,
+                    "dry_run": false,
+                }))?)
+            }
+        }
+        "tachyon_suggest_scopes" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+
+            let (config, metrics) = tokio::try_join!(
+                tachyon_client::get_manifest_config(),
+                tachyon_client::get_metrics(),
+            )?;
+
+            let routes = config
+                .get("routes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let route = routes.iter().find(|r| {
+                r.get("path")
+                    .and_then(Value::as_str)
+                    .map(|p| p == route_path)
+                    .unwrap_or(false)
+            });
+            let route = match route {
+                Some(r) => r,
+                None => {
+                    return Ok(json_rpc_error_response(
+                        None,
+                        &JsonRpcError::invalid_params(
+                            "route not found",
+                            json!({
+                                "route_path": route_path,
+                                "detail": "route not found in manifest — use tachyon_list_functions to list available routes"
+                            }),
+                        ),
+                    ));
+                }
+            };
+
+            let current_scopes = route.get("scopes");
+            let allow_all = current_scopes.is_none()
+                || current_scopes
+                    .and_then(Value::as_str)
+                    .map(|s| s == "allow-all")
+                    .unwrap_or(false);
+
+            let current_state = if allow_all {
+                "allow-all"
+            } else {
+                "explicitly-scoped"
+            };
+
+            let scope_denial_total = metrics.scope_denial_total;
+
+            let (suggested_scopes_yaml, rationale, conservative_suggestion) = if allow_all
+                && scope_denial_total > 0
+            {
+                (
+                    Some(format!(
+                        "# Conservative starting point — tighten patterns after observing runtime behaviour\n\
+                         scopes:\n  secrets: [\"**\"]\n  kv: [\"**\"]\n  http_client: [\"**\"]\n\
+                         # Remove categories your function does not use"
+                    )),
+                    format!(
+                        "Route is allow-all with {scope_denial_total} lifetime denial(s). \
+                         Suggested scopes grant all patterns within each category as a safe starting point. \
+                         Restrict patterns progressively using tachyon_set_route_scopes."
+                    ),
+                    true,
+                )
+            } else if allow_all {
+                (
+                    None,
+                    "Route is allow-all with 0 recorded denials — no scope violations observed. \
+                     Scopes are optional but recommended for defence-in-depth."
+                        .to_owned(),
+                    false,
+                )
+            } else {
+                (
+                    None,
+                    "Route already has explicit scopes configured.".to_owned(),
+                    false,
+                )
+            };
+
+            Ok(text_tool_result(&json!({
+                "route_path": route_path,
+                "current_state": current_state,
+                "scope_denial_total": scope_denial_total,
+                "suggested_scopes_yaml": suggested_scopes_yaml,
+                "rationale": rationale,
+                "conservative_suggestion": conservative_suggestion,
+                "apply_with": "tachyon_set_route_scopes",
+            }))?)
+        }
         "tachyon_tail_logs" => {
             let arguments = params
                 .and_then(|value| value.get("arguments"))
@@ -1589,6 +1866,66 @@ mod tests {
                 .is_none(),
             "read tool should not be rate-limited"
         );
+    }
+
+    #[test]
+    fn scope_tools_missing_args_detected() {
+        // tachyon_set_route_scopes requires route_path and scopes
+        assert!(
+            missing_required_args("tachyon_set_route_scopes", Some(&json!({}))).is_some(),
+            "empty args must be missing"
+        );
+        assert!(
+            missing_required_args(
+                "tachyon_set_route_scopes",
+                Some(&json!({"route_path": "/api/fn"}))
+            )
+            .is_some(),
+            "missing scopes must be detected"
+        );
+        assert!(
+            missing_required_args(
+                "tachyon_set_route_scopes",
+                Some(&json!({"route_path": "/api/fn", "scopes": {}}))
+            )
+            .is_none(),
+            "all required args present should return None"
+        );
+
+        // tachyon_suggest_scopes requires route_path
+        assert!(
+            missing_required_args("tachyon_suggest_scopes", Some(&json!({}))).is_some(),
+            "missing route_path must be detected"
+        );
+        assert!(
+            missing_required_args(
+                "tachyon_suggest_scopes",
+                Some(&json!({"route_path": "/api/fn"}))
+            )
+            .is_none(),
+            "route_path present should return None"
+        );
+
+        // tachyon_get_scope_denials has no required args
+        assert!(
+            missing_required_args("tachyon_get_scope_denials", Some(&json!({}))).is_none(),
+            "get_scope_denials has no required args"
+        );
+    }
+
+    #[test]
+    fn scope_tools_rate_limits_match_spec() {
+        let spec_set = rate_limit_spec("tachyon_set_route_scopes");
+        assert!(spec_set.is_some(), "tachyon_set_route_scopes must have a rate limit");
+        assert_eq!(spec_set.unwrap().limit, 1, "set_route_scopes limit must be 1/min");
+
+        let spec_get = rate_limit_spec("tachyon_get_scope_denials");
+        assert!(spec_get.is_some(), "tachyon_get_scope_denials must have a rate limit");
+        assert_eq!(spec_get.unwrap().limit, 30, "get_scope_denials limit must be 30/min");
+
+        let spec_suggest = rate_limit_spec("tachyon_suggest_scopes");
+        assert!(spec_suggest.is_some(), "tachyon_suggest_scopes must have a rate limit");
+        assert_eq!(spec_suggest.unwrap().limit, 30, "suggest_scopes limit must be 30/min");
     }
 
     #[test]
