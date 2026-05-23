@@ -24,6 +24,11 @@ pub(crate) const INSTANCE_POOL_DEFAULT_CAPACITY: u64 = 256;
 /// the warm-start latency for actively-used modules.
 pub(crate) const INSTANCE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Default capacity for the scoped linker cache: 5 world tags × up to 50 distinct
+/// scope shapes per tag in a typical deployment. The 256-entry ceiling prevents
+/// a cardinality explosion on wildly varied manifests.
+pub(crate) const LINKER_CACHE_DEFAULT_CAPACITY: u64 = 256;
+
 pub(crate) fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeState> {
     let instance_pool = Arc::new(
         moka::sync::Cache::builder()
@@ -31,6 +36,10 @@ pub(crate) fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeStat
             .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
             .build(),
     );
+    let linker_cache = Arc::new(
+        crate::host_core::scoping::LinkerCache::new(LINKER_CACHE_DEFAULT_CAPACITY),
+    );
+    linker_cache.register_prometheus();
     Ok(RuntimeState {
         engine: build_engine(&config, false)?,
         metered_engine: build_engine(&config, true)?,
@@ -38,6 +47,7 @@ pub(crate) fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeStat
         batch_target_registry: Arc::new(BatchTargetRegistry::build(&config)?),
         concurrency_limits: build_concurrency_limits(&config),
         instance_pool,
+        linker_cache,
         #[cfg(feature = "ai-inference")]
         ai_runtime: Arc::new(ai_inference::AiInferenceRuntime::from_config(&config)?),
         config,

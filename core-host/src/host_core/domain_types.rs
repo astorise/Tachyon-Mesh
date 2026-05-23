@@ -477,6 +477,11 @@ pub(crate) struct IntegrityRoute {
     /// `Unrestricted` (= pre-feature behavior, no admission control).
     #[serde(default, skip_serializing_if = "ConcurrencyPolicy::is_default")]
     pub(crate) concurrency: ConcurrencyPolicy,
+    /// Per-deployment import scope declaration. Controls which WIT interfaces and
+    /// argument patterns this route may call into the host. Absent = `allow-all`
+    /// (migration default, emits a warning at instantiation time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scopes: Option<serde_json::Value>,
 }
 
 impl Default for IntegrityRoute {
@@ -508,6 +513,7 @@ impl Default for IntegrityRoute {
             adapter_id: None,
             canary: None,
             concurrency: ConcurrencyPolicy::default(),
+            scopes: None,
         }
     }
 }
@@ -896,6 +902,13 @@ pub(crate) struct IntegrityConfig {
     /// when that model is hot on the receiving node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) kv_caches: Vec<IntegrityKvCacheConfig>,
+    /// When `true`, manifests whose `scopes:` block is absent or resolves to
+    /// `allow-all` are rejected at submission time. Default `false` — the
+    /// transition from implicit allow-all to explicit scopes is operator-paced.
+    /// Flip via a separate openspec change once telemetry shows zero allow-all
+    /// deployments.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) require_scopes: bool,
 }
 
 impl Default for IntegrityConfig {
@@ -921,6 +934,7 @@ impl Default for IntegrityConfig {
             trusted_signers: Vec::new(),
             asset_versions: BTreeMap::new(),
             kv_caches: Vec::new(),
+            require_scopes: false,
         }
     }
 }

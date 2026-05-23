@@ -1,6 +1,9 @@
 mod support_and_cache;
 
 mod background_connectors;
+mod scoping_kv_handle;
+mod scoping_link_time;
+mod scoping_secrets;
 mod config_validation;
 mod http_router;
 mod iam_management;

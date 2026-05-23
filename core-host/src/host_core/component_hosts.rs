@@ -85,11 +85,42 @@ impl ComponentHostState {
         propagated_headers: Vec<PropagatedHeader>,
         s3_preps: &[crate::host_core::volumes::S3VolumePrep],
     ) -> std::result::Result<Self, ExecutionError> {
+        let scopes = {
+            use crate::host_core::scoping::DeploymentScopes;
+            match &route.scopes {
+                Some(value) => {
+                    // Already validated at manifest submission; errors here are
+                    // unexpected but we fall back to allow-all rather than crash.
+                    match DeploymentScopes::from_manifest(value) {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            tracing::warn!(
+                                route = %route.path,
+                                error = %e,
+                                "scope manifest re-parse failed at instantiation; falling back to allow-all"
+                            );
+                            crate::host_core::scoping::record_scope_allow_all_prometheus(&route.path);
+                            Arc::new(DeploymentScopes::allow_all())
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        route = %route.path,
+                        "route has no `scopes` block — defaulting to allow-all (consider adding explicit scopes)"
+                    );
+                    crate::host_core::scoping::record_scope_allow_all_prometheus(&route.path);
+                    Arc::new(DeploymentScopes::allow_all())
+                }
+            }
+        };
         Ok(Self {
             ctx: build_component_wasi_ctx(route, host_identity.as_ref(), s3_preps)?,
             table: ResourceTable::new(),
             limits: GuestResourceLimiter::new(max_memory_bytes),
             secrets,
+            scopes,
+            scope_denials: Arc::new(crate::host_core::scoping::ScopeDenialCounters::default()),
             runtime_config,
             request_headers,
             host_identity,
@@ -1079,6 +1110,11 @@ impl component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHostSta
         &mut self,
         name: String,
     ) -> std::result::Result<String, component_bindings::tachyon::mesh::secrets_vault::Error> {
+        if !self.scopes.check_secrets(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Secrets, &self.route_path);
+            return Err(component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied);
+        }
         self.secrets.get_secret(&name).map_err(|error| match error {
             SecretAccessErrorKind::NotFound => {
                 component_bindings::tachyon::mesh::secrets_vault::Error::NotFound
@@ -1100,6 +1136,13 @@ impl udp_component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHos
         name: String,
     ) -> std::result::Result<String, udp_component_bindings::tachyon::mesh::secrets_vault::Error>
     {
+        if !self.scopes.check_secrets(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Secrets, &self.route_path);
+            return Err(
+                udp_component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied,
+            );
+        }
         self.secrets.get_secret(&name).map_err(|error| match error {
             SecretAccessErrorKind::NotFound => {
                 udp_component_bindings::tachyon::mesh::secrets_vault::Error::NotFound
@@ -1124,6 +1167,13 @@ impl websocket_component_bindings::tachyon::mesh::secrets_vault::Host for Compon
         String,
         websocket_component_bindings::tachyon::mesh::secrets_vault::Error,
     > {
+        if !self.scopes.check_secrets(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Secrets, &self.route_path);
+            return Err(
+                websocket_component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied,
+            );
+        }
         self.secrets.get_secret(&name).map_err(|error| match error {
             SecretAccessErrorKind::NotFound => {
                 websocket_component_bindings::tachyon::mesh::secrets_vault::Error::NotFound
@@ -1147,6 +1197,16 @@ impl component_bindings::tachyon::mesh::bridge_controller::Host for ComponentHos
         component_bindings::tachyon::mesh::bridge_controller::BridgeEndpoints,
         String,
     > {
+        // Scope check at construction — handle-bound; no re-check on destroy_bridge.
+        if !self.scopes.check_bridge(&config.client_a_addr)
+            || !self.scopes.check_bridge(&config.client_b_addr)
+        {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Bridge, &self.route_path);
+            return Err(format!(
+                "permission denied: bridge address not granted by deployment scopes"
+            ));
+        }
         let allocation = self.handle_bridge_create(BridgeConfig {
             client_a_addr: config.client_a_addr,
             client_b_addr: config.client_b_addr,
@@ -1175,6 +1235,15 @@ impl system_component_bindings::tachyon::mesh::bridge_controller::Host for Compo
         system_component_bindings::tachyon::mesh::bridge_controller::BridgeEndpoints,
         String,
     > {
+        if !self.scopes.check_bridge(&config.client_a_addr)
+            || !self.scopes.check_bridge(&config.client_b_addr)
+        {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Bridge, &self.route_path);
+            return Err(
+                "permission denied: bridge address not granted by deployment scopes".to_owned(),
+            );
+        }
         let allocation = self.handle_bridge_create(BridgeConfig {
             client_a_addr: config.client_a_addr,
             client_b_addr: config.client_b_addr,
@@ -1200,6 +1269,14 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
         &mut self,
         spec: component_bindings::tachyon::mesh::vector::IndexSpec,
     ) -> std::result::Result<(), String> {
+        if !self.scopes.check_vector(&spec.name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Vector, &self.route_path);
+            return Err(format!(
+                "permission denied: vector index `{}` not granted by deployment scopes",
+                spec.name
+            ));
+        }
         self.storage_broker
             .core_store
             .create_vector_index(
@@ -1217,6 +1294,13 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
         name: String,
         docs: Vec<component_bindings::tachyon::mesh::vector::Document>,
     ) -> std::result::Result<(), String> {
+        if !self.scopes.check_vector(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Vector, &self.route_path);
+            return Err(format!(
+                "permission denied: vector index `{name}` not granted by deployment scopes"
+            ));
+        }
         let docs = docs
             .into_iter()
             .map(|doc| store::VectorDocument {
@@ -1238,6 +1322,13 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
         k: u32,
     ) -> std::result::Result<Vec<component_bindings::tachyon::mesh::vector::SearchMatch>, String>
     {
+        if !self.scopes.check_vector(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Vector, &self.route_path);
+            return Err(format!(
+                "permission denied: vector index `{name}` not granted by deployment scopes"
+            ));
+        }
         self.storage_broker
             .core_store
             .search_vectors(&self.vector_tenant_id(), &name, &query, k as usize)
@@ -1257,6 +1348,13 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
     }
 
     fn remove(&mut self, name: String, id: String) -> std::result::Result<bool, String> {
+        if !self.scopes.check_vector(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Vector, &self.route_path);
+            return Err(format!(
+                "permission denied: vector index `{name}` not granted by deployment scopes"
+            ));
+        }
         self.storage_broker
             .core_store
             .remove_vector(&self.vector_tenant_id(), &name, &id)
@@ -1269,6 +1367,14 @@ impl component_bindings::tachyon::mesh::training::Host for ComponentHostState {
         &mut self,
         job: component_bindings::tachyon::mesh::training::TrainingJob,
     ) -> std::result::Result<component_bindings::tachyon::mesh::training::JobId, String> {
+        if !self.scopes.check_training(&job.dataset.volume_alias) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Training, &self.route_path);
+            return Err(format!(
+                "permission denied: training volume alias `{}` not granted by deployment scopes",
+                job.dataset.volume_alias
+            ));
+        }
         if job.base_model.trim().is_empty() {
             return Err("training job base model must not be empty".to_owned());
         }
@@ -1338,9 +1444,20 @@ impl component_bindings::tachyon::mesh::graph::HostWorkspaceGraph for ComponentH
         name: String,
     ) -> wasmtime::component::Resource<component_bindings::tachyon::mesh::graph::WorkspaceGraph>
     {
+        // Scope check at construction only; subsequent methods on this handle do not re-check.
+        let scope_denial = if !self.scopes.check_graph(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Graph, &self.route_path);
+            Some(format!(
+                "permission denied: graph workspace `{name}` not granted by deployment scopes"
+            ))
+        } else {
+            None
+        };
         let resource = WorkspaceGraphResource {
             graph_name: name,
             core_store: Arc::clone(&self.storage_broker.core_store),
+            scope_denial,
         };
         let owned: wasmtime::component::Resource<WorkspaceGraphResource> = self
             .table
@@ -1359,6 +1476,9 @@ impl component_bindings::tachyon::mesh::graph::HostWorkspaceGraph for ComponentH
         let handle =
             wasmtime::component::Resource::<WorkspaceGraphResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         let graph_edges: Vec<GraphEdge> = edges
             .into_iter()
             .map(|e| GraphEdge {
@@ -1383,6 +1503,9 @@ impl component_bindings::tachyon::mesh::graph::HostWorkspaceGraph for ComponentH
         let handle =
             wasmtime::component::Resource::<WorkspaceGraphResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         let graph_edges: Vec<GraphEdge> = edges
             .into_iter()
             .map(|e| GraphEdge {
@@ -1409,6 +1532,9 @@ impl component_bindings::tachyon::mesh::graph::HostWorkspaceGraph for ComponentH
         let handle =
             wasmtime::component::Resource::<WorkspaceGraphResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .graph_traverse(&res.graph_name, &subject, &predicate, depth)
             .map_err(|e| format!("{e:#}"))
@@ -1431,9 +1557,21 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         &mut self,
         name: String,
     ) -> wasmtime::component::Resource<component_bindings::tachyon::mesh::kv_partition::Table> {
+        // Scope check at construction only; subsequent get/set/delete calls on this handle
+        // do not re-check (handle-bound invariant).
+        let scope_denial = if !self.scopes.check_kv(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Kv, &self.route_path);
+            Some(format!(
+                "permission denied: kv table `{name}` not granted by deployment scopes"
+            ))
+        } else {
+            None
+        };
         let resource = RedbTableResource {
             table_name: name,
             core_store: Arc::clone(&self.storage_broker.core_store),
+            scope_denial,
         };
         let owned: wasmtime::component::Resource<RedbTableResource> = self
             .table
@@ -1451,6 +1589,9 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
     ) -> std::result::Result<Vec<u8>, String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_get(&res.table_name, &key)
             .map_err(|e| format!("{e:#}"))
@@ -1467,6 +1608,9 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
     ) -> std::result::Result<(), String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_set(&res.table_name, &key, &value)
             .map_err(|e| format!("{e:#}"))
@@ -1481,6 +1625,9 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
     ) -> std::result::Result<(), String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_delete(&res.table_name, &key)
             .map_err(|e| format!("{e:#}"))
@@ -1495,6 +1642,9 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
     ) -> std::result::Result<(), String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_batch_set(&res.table_name, &entries)
             .map_err(|e| format!("{e:#}"))
@@ -1512,6 +1662,9 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
     ) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_get_range(&res.table_name, &start_key, &end_key, limit, offset)
             .map_err(|e| format!("{e:#}"))
@@ -1538,9 +1691,21 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     ) -> wasmtime::component::Resource<
         control_plane_component_bindings::tachyon::mesh::kv_partition::Table,
     > {
+        // Scope check at construction only; subsequent get/set/delete calls on this handle
+        // do not re-check (handle-bound invariant).
+        let scope_denial = if !self.scopes.check_kv(&name) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Kv, &self.route_path);
+            Some(format!(
+                "permission denied: kv table `{name}` not granted by deployment scopes"
+            ))
+        } else {
+            None
+        };
         let resource = RedbTableResource {
             table_name: name,
             core_store: Arc::clone(&self.storage_broker.core_store),
+            scope_denial,
         };
         let owned: wasmtime::component::Resource<RedbTableResource> = self
             .table
@@ -1558,6 +1723,9 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     ) -> std::result::Result<Vec<u8>, String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_get(&res.table_name, &key)
             .map_err(|e| format!("{e:#}"))
@@ -1574,6 +1742,9 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     ) -> std::result::Result<(), String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_set(&res.table_name, &key, &value)
             .map_err(|e| format!("{e:#}"))
@@ -1588,6 +1759,9 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     ) -> std::result::Result<(), String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_delete(&res.table_name, &key)
             .map_err(|e| format!("{e:#}"))
@@ -1602,6 +1776,9 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     ) -> std::result::Result<(), String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_batch_set(&res.table_name, &entries)
             .map_err(|e| format!("{e:#}"))
@@ -1619,6 +1796,9 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     ) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
         let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
         res.core_store
             .kv_partition_get_range(&res.table_name, &start_key, &end_key, limit, offset)
             .map_err(|e| format!("{e:#}"))
@@ -2007,6 +2187,13 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
         mode: system_component_bindings::tachyon::mesh::storage_broker::WriteMode,
         body: Vec<u8>,
     ) -> std::result::Result<(), String> {
+        if !self.scopes.check_storage(&path) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Storage, &self.route_path);
+            return Err(format!(
+                "permission denied: storage path `{path}` not granted by deployment scopes"
+            ));
+        }
         let mode = match mode {
             system_component_bindings::tachyon::mesh::storage_broker::WriteMode::Overwrite => {
                 StorageWriteMode::Overwrite
@@ -2037,6 +2224,13 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
         source_path: String,
         snapshot_path: String,
     ) -> std::result::Result<(), String> {
+        if !self.scopes.check_storage(&volume_id) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Storage, &self.route_path);
+            return Err(format!(
+                "permission denied: storage volume `{volume_id}` not granted by deployment scopes"
+            ));
+        }
         let source_path = parse_storage_broker_host_path(&source_path, "source_path")?;
         let snapshot_path = parse_storage_broker_host_path(&snapshot_path, "snapshot_path")?;
         drop(self.storage_broker.enqueue_snapshot(
@@ -2054,6 +2248,13 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
         snapshot_path: String,
         destination_path: String,
     ) -> std::result::Result<(), String> {
+        if !self.scopes.check_storage(&volume_id) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Storage, &self.route_path);
+            return Err(format!(
+                "permission denied: storage volume `{volume_id}` not granted by deployment scopes"
+            ));
+        }
         let snapshot_path = parse_storage_broker_host_path(&snapshot_path, "snapshot_path")?;
         let destination_path =
             parse_storage_broker_host_path(&destination_path, "destination_path")?;
@@ -2079,6 +2280,13 @@ impl control_plane_component_bindings::tachyon::mesh::routing_control::Host for 
         route_path: String,
         destination: String,
     ) -> std::result::Result<(), String> {
+        if !self.scopes.check_routing(&route_path, &destination) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Routing, &self.route_path);
+            return Err(format!(
+                "permission denied: routing `{route_path}` → `{destination}` not granted by deployment scopes"
+            ));
+        }
         update_control_plane_route_override(
             self.route_overrides.as_ref(),
             &self.peer_capabilities,
@@ -2094,6 +2302,13 @@ impl background_component_bindings::tachyon::mesh::routing_control::Host for Com
         route_path: String,
         destination: String,
     ) -> std::result::Result<(), String> {
+        if !self.scopes.check_routing(&route_path, &destination) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Routing, &self.route_path);
+            return Err(format!(
+                "permission denied: routing `{route_path}` → `{destination}` not granted by deployment scopes"
+            ));
+        }
         update_control_plane_route_override(
             self.route_overrides.as_ref(),
             &self.peer_capabilities,
@@ -2114,6 +2329,15 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
         background_component_bindings::tachyon::mesh::outbound_http::Response,
         String,
     > {
+        // Scope check on scheme://host/path (query string stripped per spec D5).
+        let url_without_query = crate::host_core::scoping::strip_url_query(&url);
+        if !self.scopes.check_http(url_without_query) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Http, &self.route_path);
+            return Err(format!(
+                "permission denied: outbound HTTP URL `{url_without_query}` not granted by deployment scopes"
+            ));
+        }
         let method = reqwest::Method::from_bytes(method.trim().as_bytes())
             .map_err(|error| format!("invalid outbound HTTP method `{method}`: {error}"))?;
         let route_registry = RouteRegistry::build(&self.runtime_config)
@@ -2198,6 +2422,13 @@ impl background_component_bindings::tachyon::mesh::outbox_store::Host for Compon
         Vec<background_component_bindings::tachyon::mesh::outbox_store::OutboxEvent>,
         String,
     > {
+        if !self.scopes.check_outbox(&db_url, &table) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Outbox, &self.route_path);
+            return Err(format!(
+                "permission denied: outbox `{db_url}/{table}` not granted by deployment scopes"
+            ));
+        }
         data_events::claim_events(
             self.storage_broker.core_store.as_ref(),
             &db_url,
@@ -2225,6 +2456,13 @@ impl background_component_bindings::tachyon::mesh::outbox_store::Host for Compon
         table: String,
         id: String,
     ) -> std::result::Result<(), String> {
+        if !self.scopes.check_outbox(&db_url, &table) {
+            self.scope_denials
+                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Outbox, &self.route_path);
+            return Err(format!(
+                "permission denied: outbox `{db_url}/{table}` not granted by deployment scopes"
+            ));
+        }
         data_events::ack_event(
             self.storage_broker.core_store.as_ref(),
             &db_url,

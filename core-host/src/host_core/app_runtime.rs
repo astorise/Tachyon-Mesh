@@ -183,6 +183,9 @@ pub(crate) struct AdminRuntimeMetrics {
     /// `true` when VRAM has exceeded the critical threshold and KV-cache
     /// tensors are being spilled to pinned host RAM via PCIe.
     pub(crate) ram_offload_active: bool,
+    /// Lifetime count of runtime WIT import denials across all deployments and categories.
+    /// Per-deployment, per-category breakdowns are available via the prometheus endpoint.
+    pub(crate) scope_denial_total: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,6 +242,7 @@ pub(crate) async fn admin_metrics_handler(
         queue_depth: u64::from(snapshot.active_requests),
         vram_utilization_pct: state.memory_governor.vram_utilization_pct(),
         ram_offload_active: state.memory_governor.ram_offload_active(),
+        scope_denial_total: crate::host_core::scoping::scope_denial_total_lifetime(),
     })
 }
 
@@ -283,6 +287,10 @@ pub(crate) async fn admin_manifest_schema_handler() -> axum::Json<serde_json::Va
                         "allowedSecrets":     { "type": "array", "items": { "type": "string" } },
                         "minInstances":       { "type": "integer", "minimum": 0 },
                         "maxConcurrency":     { "type": "integer", "minimum": 1 },
+                        "scopes": {
+                            "type": ["object", "string", "null"],
+                            "description": "Per-deployment WIT import scopes. Use `\"allow-all\"` to grant everything (default when omitted) or an object with category keys (`secrets`, `kv`, `bridge`, `vector`, `training`, `routing`, `http`, `outbox`, `storage`, `graph`) mapping to glob pattern arrays."
+                        },
                         "syncToCloud":        { "type": "boolean" },
                         "requiresTee":        { "type": "boolean" },
                         "allowOverflow":      { "type": "boolean" },
@@ -324,6 +332,10 @@ pub(crate) async fn admin_manifest_schema_handler() -> axum::Json<serde_json::Va
                         }
                     }
                 }
+            },
+            "requireScopes": {
+                "type": "boolean",
+                "description": "When true, manifests whose `scopes` block is absent or resolves to `allow-all` are rejected at submission. Default false — migrate routes to explicit scopes first."
             },
             "batchTargets": { "type": "array", "items": { "type": "object" } },
             "resources":    { "type": "object" },
@@ -2654,6 +2666,7 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
     let task_bridge_manager = Arc::clone(&state.bridge_manager);
     let task_async_log_sender = state.async_log_sender.clone();
     let task_instance_pool = Arc::clone(&runtime.instance_pool);
+    let task_linker_cache = Arc::clone(&runtime.linker_cache);
     let route_requires_tee = route.requires_tee;
     #[cfg(feature = "ai-inference")]
     let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
@@ -2707,6 +2720,7 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                 } else {
                     Some(task_instance_pool)
                 },
+                linker_cache: Some(task_linker_cache),
             },
         )
     })

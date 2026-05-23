@@ -110,6 +110,16 @@ pub(crate) struct RuntimeState {
     /// is dropped along with the rest of the runtime, so configuration
     /// changes propagate without a stale-module concern.
     pub(crate) instance_pool: Arc<moka::sync::Cache<PathBuf, Arc<Module>>>,
+    /// LRU cache of `Arc<ComponentLinker<ComponentHostState>>` keyed on
+    /// `(world_tag, ScopeShape)`. Two deployments with identical scope grants
+    /// for the same WIT world share one compiled linker; the per-request
+    /// `Store<ComponentHostState>` carries all tenant-specific state. Dropped
+    /// with the rest of `RuntimeState` on hot reload.
+    pub(crate) linker_cache: Arc<
+        crate::host_core::scoping::LinkerCache<
+            crate::host_core::ComponentLinker<crate::host_core::ComponentHostState>,
+        >,
+    >,
     #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }

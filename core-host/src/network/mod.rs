@@ -644,6 +644,7 @@ pub(crate) async fn handle_udp_layer4_datagram(
     let storage_broker = Arc::clone(&state.storage_broker);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let linker_cache = Arc::clone(&runtime.linker_cache);
     let request_headers = HeaderMap::new();
     let route_for_execution = route.clone();
     let route_overrides = Arc::clone(&state.route_overrides);
@@ -671,6 +672,7 @@ pub(crate) async fn handle_udp_layer4_datagram(
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
+            linker_cache: Some(linker_cache),
         };
         execute_udp_layer4_guest(
             &engine,
@@ -734,6 +736,7 @@ pub(crate) async fn handle_websocket_connection(
     let route_overrides = Arc::clone(&state.route_overrides);
     let host_load = Arc::clone(&state.host_load);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let linker_cache = Arc::clone(&runtime.linker_cache);
     let (incoming_tx, incoming_rx) = std::sync::mpsc::channel::<HostWebSocketFrame>();
     let (outgoing_tx, mut outgoing_rx) =
         tokio::sync::mpsc::unbounded_channel::<HostWebSocketFrame>();
@@ -797,6 +800,7 @@ pub(crate) async fn handle_websocket_connection(
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
+            linker_cache: Some(linker_cache),
         };
         let _ = result_tx.send(execute_websocket_guest(
             &engine,
@@ -1039,6 +1043,7 @@ pub(crate) fn execute_tcp_layer4_guest(
         #[cfg(feature = "ai-inference")]
         ai_runtime,
         instance_pool: None,
+        linker_cache: None,
     };
     let (module_path, module) = resolve_legacy_guest_module_with_pool(
         engine,

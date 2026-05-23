@@ -275,6 +275,7 @@ fn execute_guest_returns_component_response_payload() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            linker_cache: None,
         },
     )
     .expect("guest execution should succeed");
@@ -323,6 +324,7 @@ fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            linker_cache: None,
         },
     )
     .expect("legacy guest execution should succeed");
@@ -372,6 +374,7 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            linker_cache: None,
         },
     )
     .expect("legacy guest execution should succeed");
@@ -430,6 +433,7 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
                 host_load: test_host_load(),
                 ai_runtime,
                 instance_pool: None,
+                linker_cache: None,
             },
         )
         .expect("AI guest execution should succeed");
@@ -486,6 +490,7 @@ fn execute_guest_persists_volume_data_for_component_guest() {
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&ai_runtime),
             instance_pool: None,
+            linker_cache: None,
         },
     )
     .expect("volume guest should write successfully");
@@ -521,6 +526,7 @@ fn execute_guest_persists_volume_data_for_component_guest() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            linker_cache: None,
         },
     )
     .expect("volume guest should read successfully");

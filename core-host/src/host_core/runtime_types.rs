@@ -100,6 +100,12 @@ pub(crate) struct ComponentHostState {
     pub(crate) table: ResourceTable,
     pub(crate) limits: GuestResourceLimiter,
     pub(crate) secrets: SecretAccess,
+    /// Per-deployment import authorization layer. Never None at runtime —
+    /// defaults to `allow_all` when the manifest omits the `scopes` block.
+    pub(crate) scopes: Arc<crate::host_core::scoping::DeploymentScopes>,
+    /// Denial counters for scope checks (one per category). Shared with
+    /// telemetry via `Arc` so the snapshot path can read without locking.
+    pub(crate) scope_denials: Arc<crate::host_core::scoping::ScopeDenialCounters>,
     pub(crate) runtime_config: IntegrityConfig,
     pub(crate) request_headers: HeaderMap,
     pub(crate) host_identity: Arc<HostIdentity>,
@@ -165,6 +171,16 @@ pub(crate) struct GuestExecutionContext {
     /// avoid the `Module::deserialize` cost on every request. Tests fill in
     /// `None`; production code clones it from `RuntimeState::instance_pool`.
     pub(crate) instance_pool: Option<Arc<moka::sync::Cache<PathBuf, Arc<Module>>>>,
+    /// Shared linker cache from `RuntimeState`. Tests fill in `None` to disable
+    /// caching (fresh linker built per instantiation). Production code clones
+    /// from `RuntimeState::linker_cache`.
+    pub(crate) linker_cache: Option<
+        Arc<
+            crate::host_core::scoping::LinkerCache<
+                ComponentLinker<ComponentHostState>,
+            >,
+        >,
+    >,
     #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }
@@ -631,4 +647,8 @@ pub(crate) struct PropagatedHeader {
 pub(crate) struct RedbTableResource {
     pub(crate) table_name: String,
     pub(crate) core_store: Arc<store::CoreStore>,
+    /// Set when the table constructor was denied by deployment scopes. Every
+    /// subsequent method on this handle returns this error immediately.
+    /// The WIT constructor has no `result` return, so we use a poisoned handle.
+    pub(crate) scope_denial: Option<String>,
 }

@@ -1,3 +1,8 @@
+// This file is the single source of truth for all Tachyon Mesh WIT interfaces.
+// Do NOT fork worlds or create `-with-X` variants. Per-deployment import
+// authorization is layered on top by the host at link time and in runtime host
+// closures — the guest binary is unchanged. See `core-host/src/host_core/scoping/`
+// for the host-side implementation of the authorization layer.
 package tachyon:mesh@1.1.0;
 
 interface handler {
@@ -244,6 +249,8 @@ interface graph {
     }
 
     resource workspace-graph {
+        // Host validates `name` against deployment scopes at construction; subsequent
+        // methods do not re-check (handle-bound invariant).
         constructor(name: string);
         add-edges: func(edges: list<edge>) -> result<_, string>;
         delete-edges: func(edges: list<edge>) -> result<_, string>;
@@ -253,6 +260,8 @@ interface graph {
 
 interface kv-partition {
     resource table {
+        // Host validates `name` against deployment scopes at construction; subsequent
+        // methods do not re-check (handle-bound invariant).
         constructor(name: string);
         get: func(key: string) -> result<list<u8>, string>;
         set: func(key: string, value: list<u8>) -> result<_, string>;

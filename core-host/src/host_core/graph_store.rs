@@ -15,4 +15,7 @@ pub(crate) use store::GraphEdge;
 pub(crate) struct WorkspaceGraphResource {
     pub(crate) graph_name: String,
     pub(crate) core_store: Arc<store::CoreStore>,
+    /// Set when the graph constructor was denied by deployment scopes. Every
+    /// subsequent method on this handle returns this error immediately.
+    pub(crate) scope_denial: Option<String>,
 }

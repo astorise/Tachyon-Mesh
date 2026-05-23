@@ -1,5 +1,6 @@
 use super::support_and_cache::*;
 use crate::*;
+use serde_json::json;
 
 #[test]
 fn validate_integrity_config_normalizes_routes() {
@@ -51,6 +52,99 @@ fn validate_integrity_config_rejects_duplicate_routes() {
         .expect_err("duplicate normalized routes should fail validation");
 
     assert!(error.to_string().contains("defined more than once"));
+}
+
+#[test]
+fn validate_integrity_config_rejects_typo_in_scope_category() {
+    let mut route = IntegrityRoute::user("/api/guest-example");
+    route.scopes = Some(json!({ "secrest": ["db/prod/*"] }));
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![route];
+
+    let error = validate_integrity_config(config)
+        .expect_err("manifest with typo `secrest` must be rejected");
+
+    let msg = error.to_string();
+    assert!(
+        msg.contains("secrest") || msg.contains("invalid") || msg.contains("scopes"),
+        "error should reference the bad scope key; got: {msg}"
+    );
+}
+
+#[test]
+fn validate_integrity_config_rejects_routing_entry_without_destination() {
+    let mut route = IntegrityRoute::user("/api/guest-example");
+    route.scopes = Some(json!({ "routing": ["/api/*"] }));
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![route];
+
+    let error = validate_integrity_config(config)
+        .expect_err("routing scope entry without destination must be rejected");
+
+    let msg = error.to_string();
+    assert!(
+        msg.contains("routing") || msg.contains("destination") || msg.contains("scopes"),
+        "error should reference the routing scope problem; got: {msg}"
+    );
+}
+
+#[test]
+fn require_scopes_flag_rejects_missing_scopes_block() {
+    let mut config = IntegrityConfig::default_sealed();
+    config.require_scopes = true;
+    // default_sealed() routes have no `scopes` block → should be rejected
+
+    let error = validate_integrity_config(config)
+        .expect_err("require_scopes=true must reject routes without an explicit scopes block");
+
+    let msg = error.to_string();
+    assert!(
+        msg.contains("scopes") || msg.contains("require_scopes"),
+        "error should reference the missing scopes block; got: {msg}"
+    );
+}
+
+#[test]
+fn require_scopes_flag_rejects_allow_all_scopes() {
+    let mut route = IntegrityRoute::user("/api/guest-example");
+    route.scopes = Some(json!("allow-all"));
+    let mut config = IntegrityConfig::default_sealed();
+    config.require_scopes = true;
+    config.routes = vec![route];
+
+    let error = validate_integrity_config(config)
+        .expect_err("require_scopes=true must reject allow-all scopes");
+
+    let msg = error.to_string();
+    assert!(
+        msg.contains("allow-all") || msg.contains("scopes"),
+        "error should reference allow-all; got: {msg}"
+    );
+}
+
+#[test]
+fn require_scopes_flag_accepts_explicit_scopes() {
+    let mut route = IntegrityRoute::user("/api/guest-example");
+    route.scopes = Some(json!({ "secrets": ["db/prod/*"] }));
+    let mut config = IntegrityConfig::default_sealed();
+    config.require_scopes = true;
+    config.routes = vec![route];
+
+    validate_integrity_config(config)
+        .expect("require_scopes=true must accept routes with explicit scope patterns");
+}
+
+#[test]
+fn routes_without_scopes_pass_validation_under_default_require_scopes_false() {
+    // Regression guard: existing manifests that omit `scopes:` must continue to
+    // validate and run under the default `require_scopes: false` flag.
+    let config = IntegrityConfig::default_sealed();
+    assert!(
+        !config.require_scopes,
+        "require_scopes must default to false — do not flip without a separate openspec change"
+    );
+    validate_integrity_config(config)
+        .expect("manifest without `scopes` blocks must validate when require_scopes is false");
 }
 
 #[test]

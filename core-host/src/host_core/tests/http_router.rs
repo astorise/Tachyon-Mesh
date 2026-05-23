@@ -229,6 +229,7 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         instance_pool: None,
+        linker_cache: None,
     };
 
     let request = GuestRequest::new("POST", "/api/guest-log-storm", Bytes::new());
@@ -262,6 +263,7 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         instance_pool: None,
+        linker_cache: None,
     };
     let sync_start = Instant::now();
     let sync_result = execute_legacy_guest_with_sync_file_capture(
@@ -380,6 +382,7 @@ async fn router_returns_service_unavailable_when_route_concurrency_is_exhausted(
         ),
         #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
+        linker_cache: Arc::new(crate::host_core::scoping::LinkerCache::new(256)),
         config,
     };
     let core_store_manifest = unique_test_dir("app-state-manifest").join("integrity.lock");
@@ -508,6 +511,7 @@ fn system_guest_requires_system_route_role() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            linker_cache: None,
         },
     )
     .expect_err("privileged metrics guest should fail as a user route");

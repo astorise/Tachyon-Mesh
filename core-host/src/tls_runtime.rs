@@ -328,6 +328,7 @@ impl TlsManager {
                     #[cfg(feature = "ai-inference")]
                     ai_runtime,
                     instance_pool: None,
+                    linker_cache: None,
                 },
             )
         })

@@ -233,6 +233,7 @@ async fn forward_node_registry_faas(
     let route_overrides = Arc::clone(&state.route_overrides);
     let host_load = Arc::clone(&state.host_load);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let linker_cache = Arc::clone(&runtime.linker_cache);
     #[cfg(feature = "ai-inference")]
     let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
@@ -260,6 +261,7 @@ async fn forward_node_registry_faas(
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
                 instance_pool: Some(instance_pool),
+                linker_cache: Some(linker_cache),
             },
         )
     })
@@ -782,6 +784,9 @@ pub(crate) fn validate_integrity_config(mut config: IntegrityConfig) -> Result<I
     config.tls_address = normalize_tls_address(config.tls_address)?;
     config.batch_targets = normalize_batch_targets(config.batch_targets)?;
     config.routes = normalize_config_routes(config.routes, !config.batch_targets.is_empty())?;
+    if config.require_scopes {
+        validate_require_scopes(&config.routes)?;
+    }
     validate_tee_requirements(&config)?;
     validate_kv_caches(&config)?;
     let route_registry = RouteRegistry::build(&config)?;
@@ -814,6 +819,37 @@ pub(crate) fn validate_kv_caches(config: &IntegrityConfig) -> Result<()> {
                 "Integrity Validation Failed: duplicate kv_caches name `{}`",
                 cache.name
             );
+        }
+    }
+    Ok(())
+}
+
+/// Enforces `require_scopes: true` — every route must have an explicit,
+/// non-allow-all `scopes:` block. Called only when the flag is set; the default
+/// is `false` so existing manifests without scopes continue to work.
+fn validate_require_scopes(routes: &[IntegrityRoute]) -> Result<()> {
+    use crate::host_core::scoping::DeploymentScopes;
+    for route in routes {
+        match &route.scopes {
+            None => {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{}` is missing a `scopes` block \
+                     and `require_scopes` is enabled on this node",
+                    route.path
+                ));
+            }
+            Some(value) => {
+                // Already validated by validate_route_scopes; re-parse to check allow-all.
+                if let Ok(scopes) = DeploymentScopes::from_manifest(value) {
+                    if scopes.allow_all {
+                        return Err(anyhow!(
+                            "Integrity Validation Failed: route `{}` resolves to allow-all scopes \
+                             and `require_scopes` is enabled on this node; add explicit scope patterns",
+                            route.path
+                        ));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1237,6 +1273,7 @@ pub(crate) fn validate_integrity_route(route: IntegrityRoute) -> Result<Integrit
         adapter_id: route.adapter_id,
         canary: route.canary,
         concurrency: normalized_concurrency,
+        scopes: validate_route_scopes(route.scopes, &normalized)?,
     })
 }
 
@@ -2007,6 +2044,29 @@ pub(crate) fn parse_hibernation_duration(value: &str) -> Result<Duration> {
     multiplier
         .checked_mul(u32::try_from(amount).context("idle_timeout is too large")?)
         .ok_or_else(|| anyhow!("idle_timeout is too large"))
+}
+
+/// Validate and pass-through the `scopes` JSON block from a route manifest.
+/// An absent block (`None`) is preserved as `None` — the caller (instantiation
+/// path) will treat `None` as `allow-all` with a warning.
+/// A present block is validated eagerly so that manifest errors surface at
+/// submission time rather than at guest instantiation.
+fn validate_route_scopes(
+    scopes: Option<serde_json::Value>,
+    route_path: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(ref value) = scopes else {
+        return Ok(None);
+    };
+    // Validate by attempting to parse — we discard the result here and
+    // re-parse at instantiation so `GlobSet` (not Send/Sync-safe for storage)
+    // is not persisted on `IntegrityRoute`.
+    crate::host_core::scoping::DeploymentScopes::from_manifest(value).map_err(|e| {
+        anyhow!(
+            "Integrity Validation Failed: route `{route_path}` has invalid `scopes` block: {e}"
+        )
+    })?;
+    Ok(scopes)
 }
 
 pub(crate) fn normalize_allowed_secrets(allowed_secrets: Vec<String>) -> Result<Vec<String>> {

@@ -123,6 +123,7 @@ mod app_runtime;
 mod background_workers;
 mod bridge;
 mod component_hosts;
+pub(crate) mod scoping;
 pub(crate) mod concurrency_admission;
 mod config_impls;
 mod constants;
