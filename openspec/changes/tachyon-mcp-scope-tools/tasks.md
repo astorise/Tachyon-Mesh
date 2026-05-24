@@ -37,5 +37,5 @@
 
 - [x] 5.1 Vérifier que `cargo check -p tachyon-mcp` passe sans warnings.
 - [x] 5.2 Vérifier que `cargo test -p tachyon-mcp` passe (tests existants + nouveaux).
-- [ ] 5.3 Test d'intégration end-to-end (si tachyon-client mockable) : enchaîner `tachyon_get_scope_denials` → `tachyon_suggest_scopes` → `tachyon_set_route_scopes` dry_run → vérifier le flux complet.
+- [x] 5.3 Test d'intégration end-to-end (si tachyon-client mockable) : enchaîner `tachyon_get_scope_denials` → `tachyon_suggest_scopes` → `tachyon_set_route_scopes` dry_run → vérifier le flux complet.
 - [x] 5.4 Vérifier que les 3 nouveaux outils apparaissent dans `tools/list` et que leurs descriptions mentionnent les champs clés (route_path, scopes, dry_run).

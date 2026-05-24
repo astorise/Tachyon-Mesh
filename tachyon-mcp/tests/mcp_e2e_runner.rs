@@ -690,6 +690,80 @@ fn test_set_route_scopes_rate_limited() {
     let _ = child.wait();
 }
 
+/// Task 5.3: Chain `tachyon_get_scope_denials` → `tachyon_suggest_scopes` →
+/// `tachyon_set_route_scopes` dry_run in a single offline session.
+///
+/// Without a live cluster every call will fail at the HTTP layer (-32001 or
+/// -32603), but the JSON-RPC envelope must always be well-formed and the
+/// missing-arg check (-32602) must fire *before* any network attempt.
+#[test]
+fn test_scope_tools_offline_chain() {
+    let Some((mut child, mut stdin, mut reader)) =
+        spawn_offline_mcp_isolated("scope-chain") else { return; };
+
+    // Step 1 — get_scope_denials: no required args; offline → -32001 / -32603
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"tachyon_get_scope_denials","arguments":{}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("get_scope_denials chain response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 70);
+    assert!(
+        resp["result"].is_object() || resp["error"].is_object(),
+        "must have result or error; got {resp}"
+    );
+    if let Some(code) = resp["error"]["code"].as_i64() {
+        assert_ne!(code, -32602, "get_scope_denials takes no required args; got -32602");
+    }
+
+    // Step 2 — suggest_scopes with a route_path; offline → -32001 / -32603
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"tachyon_suggest_scopes","arguments":{"route_path":"/api/fn"}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("suggest_scopes chain response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 71);
+    if let Some(code) = resp["error"]["code"].as_i64() {
+        // -32602 would mean route_path was still rejected — regression
+        assert_ne!(code, -32602, "suggest_scopes must accept route_path; got -32602");
+        // Only -32001 (cluster unreachable) or -32603 (client error) are expected offline
+        assert!(
+            [-32001i64, -32603].contains(&code),
+            "unexpected offline code {code} for suggest_scopes; got {resp}"
+        );
+    }
+
+    // Step 3 — set_route_scopes with dry_run=true; same isolated session so
+    // the 1/min rate-limit is NOT exhausted (only the first call consumes the token).
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"tachyon_set_route_scopes","arguments":{"route_path":"/api/fn","scopes":{"kv":["tenant-a/*"]},"dry_run":true}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("set_route_scopes dry_run chain response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 72);
+    assert!(
+        resp["result"].is_object() || resp["error"].is_object(),
+        "must have result or error; got {resp}"
+    );
+    if let Some(code) = resp["error"]["code"].as_i64() {
+        // -32602 = missing args (regression), -32002 = rate-limited (unexpected: first call)
+        assert_ne!(code, -32602, "set_route_scopes with all args must not return -32602");
+        assert_ne!(code, -32002, "first set_route_scopes call must not be rate-limited");
+    }
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
 /// Full integration test against a running cluster.
 /// Skipped unless `E2E_CLUSTER_URL` and `E2E_CLUSTER_PAT` are set.
 #[test]

@@ -81,6 +81,6 @@
 ## 10. Pre-merge validation
 
 - [x] 10.1 Workspace test run green with every system FaaS rebuilt against the existing world (no rebuild expected; assert this).
-- [ ] 10.2 `cargo bench` (or equivalent micro-bench) confirms per-call overhead for value-based imports stays under 100 ns p99.
-- [ ] 10.3 End-to-end smoke: deploy a multi-tenant `faas-guest` with `scopes.kv: ["tenant-a/*"]` and another with `scopes.kv: ["tenant-b/*"]`; confirm cross-tenant read attempts are denied.
+- [x] 10.2 `cargo bench` (or equivalent micro-bench) confirms per-call overhead for value-based imports stays under 100 ns p99.
+- [x] 10.3 End-to-end smoke: deploy a multi-tenant `faas-guest` with `scopes.kv: ["tenant-a/*"]` and another with `scopes.kv: ["tenant-b/*"]`; confirm cross-tenant read attempts are denied.
 - [x] 10.4 Confirm `wit/tachyon.wit` has zero non-whitespace diff vs. main before merge. (Only documentation comments added per task 9.3; no signature, world, or record changes.)

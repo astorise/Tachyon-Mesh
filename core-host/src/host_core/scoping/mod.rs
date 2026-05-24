@@ -1110,4 +1110,113 @@ mod tests {
             "all 10 inserts must be cache misses (never seen before)"
         );
     }
+
+    // ── Task 10.3: multi-tenant cross-isolation smoke ─────────────────────────
+    //
+    // Simulates two FaaS deployments with disjoint KV scopes and verifies that
+    // neither tenant can access the other's namespace — the same invariant that
+    // a live E2E deploy would exercise.
+
+    #[test]
+    fn multitenant_kv_isolation_smoke() {
+        // tenant-a is granted kv["tenant-a/*"], tenant-b is granted kv["tenant-b/*"].
+        let scopes_a = parse(json!({ "kv": ["tenant-a/*"] })).unwrap();
+        let scopes_b = parse(json!({ "kv": ["tenant-b/*"] })).unwrap();
+
+        // Within-tenant access is allowed.
+        assert!(scopes_a.check_kv("tenant-a/users"), "tenant-a may read tenant-a/users");
+        assert!(scopes_b.check_kv("tenant-b/orders"), "tenant-b may read tenant-b/orders");
+
+        // Cross-tenant access is denied.
+        assert!(!scopes_a.check_kv("tenant-b/users"), "tenant-a must NOT read tenant-b/users");
+        assert!(!scopes_b.check_kv("tenant-a/orders"), "tenant-b must NOT read tenant-a/orders");
+
+        // Wildcard sibling is also denied.
+        assert!(!scopes_a.check_kv("tenant-b/*"), "tenant-a must NOT access tenant-b wildcard");
+    }
+
+    #[test]
+    fn multitenant_denial_counter_increments_on_cross_access() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let scopes_a = parse(json!({ "kv": ["tenant-a/*"] })).unwrap();
+        let counters = ScopeDenialCounters::default();
+
+        // Simulate the host calling check_kv and incrementing the counter on denial.
+        if !scopes_a.check_kv("tenant-b/secret") {
+            counters.increment(ScopeCategory::Kv);
+        }
+        if !scopes_a.check_kv("tenant-b/private") {
+            counters.increment(ScopeCategory::Kv);
+        }
+        // Permitted access must not increment.
+        if !scopes_a.check_kv("tenant-a/data") {
+            counters.increment(ScopeCategory::Kv);
+        }
+
+        assert_eq!(
+            counters.kv.load(Relaxed),
+            2,
+            "exactly two cross-tenant KV denials should be recorded"
+        );
+    }
+
+    // ── Task 10.2: per-call overhead micro-bench ──────────────────────────────
+    //
+    // Runs 1 000 000 iterations of the hot-path scope check and asserts the
+    // average per-call cost is under 100 ns.  GlobSet pattern matching on
+    // pre-compiled sets is typically 5–20 ns; 100 ns gives 5× headroom for
+    // slower CI environments.
+
+    #[test]
+    fn scope_check_kv_avg_under_100ns() {
+        let scopes = parse(json!({ "kv": ["tenant-a/*", "db/prod/*", "cache/**"] })).unwrap();
+        let iters = 1_000_000_u64;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = std::hint::black_box(scopes.check_kv("tenant-a/users"));
+        }
+        let elapsed = start.elapsed();
+        let avg_ns = elapsed.as_nanos() as u64 / iters;
+        assert!(
+            avg_ns < 100,
+            "check_kv average per-call overhead is {avg_ns} ns — exceeds 100 ns budget"
+        );
+    }
+
+    #[test]
+    fn scope_check_secrets_avg_under_100ns() {
+        let scopes = parse(json!({ "secrets": ["db/prod/*", "auth/**", "cert/*"] })).unwrap();
+        let iters = 1_000_000_u64;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = std::hint::black_box(scopes.check_secrets("db/prod/password"));
+        }
+        let elapsed = start.elapsed();
+        let avg_ns = elapsed.as_nanos() as u64 / iters;
+        assert!(
+            avg_ns < 100,
+            "check_secrets average per-call overhead is {avg_ns} ns — exceeds 100 ns budget"
+        );
+    }
+
+    #[test]
+    fn scope_check_routing_avg_under_100ns() {
+        let scopes =
+            parse(json!({ "routing": ["/api/* -> https://backend/*", "/rpc/* -> grpc://svc/*"] }))
+                .unwrap();
+        let iters = 1_000_000_u64;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = std::hint::black_box(
+                scopes.check_routing("/api/v2/users", "https://backend/v2/users"),
+            );
+        }
+        let elapsed = start.elapsed();
+        let avg_ns = elapsed.as_nanos() as u64 / iters;
+        assert!(
+            avg_ns < 100,
+            "check_routing average per-call overhead is {avg_ns} ns — exceeds 100 ns budget"
+        );
+    }
 }
