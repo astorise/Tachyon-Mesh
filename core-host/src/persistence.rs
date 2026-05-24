@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures::StreamExt as _;
-use object_store::{aws::AmazonS3Builder, path::Path as OsPath, ObjectStore};
+use object_store::{aws::AmazonS3Builder, path::Path as OsPath, ObjectStore, ObjectStoreExt};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,

@@ -945,7 +945,7 @@ async fn download_s3_prefix_to_dir(
     dest: &Path,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
     use futures::StreamExt as _;
-    use object_store::{path::Path as OsPath, ObjectStore};
+    use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt};
 
     let store = build_s3_store(bucket)?;
     let prefix_path = if prefix.is_empty() {
@@ -983,7 +983,7 @@ async fn download_s3_prefix_to_dir(
 
 #[cfg(feature = "s3-persistence")]
 async fn upload_dir_to_s3_prefix(dir: &Path, bucket: &str, prefix: &str) -> anyhow::Result<()> {
-    use object_store::{path::Path as OsPath, ObjectStore};
+    use object_store::{path::Path as OsPath, ObjectStoreExt};
 
     let store = build_s3_store(bucket)?;
     let mut stack = vec![dir.to_path_buf()];

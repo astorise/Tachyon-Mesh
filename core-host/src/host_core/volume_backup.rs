@@ -73,7 +73,7 @@ fn resolve_host_dir(
 /// Upload all files from `host_dir` to `s3://bucket/<s3_prefix>/`.
 #[cfg(feature = "s3-persistence")]
 async fn upload_dir(host_dir: &std::path::Path, bucket: &str, s3_prefix: &str) -> Result<usize> {
-    use object_store::{path::Path as OsPath, ObjectStore};
+    use object_store::{path::Path as OsPath, ObjectStoreExt};
 
     let store = build_s3_store(bucket)?;
     let mut stack = vec![host_dir.to_path_buf()];
@@ -112,7 +112,7 @@ async fn download_snapshot(
     host_dir: &std::path::Path,
 ) -> Result<()> {
     use futures::StreamExt as _;
-    use object_store::{path::Path as OsPath, ObjectStore};
+    use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt};
 
     let store = build_s3_store(bucket)?;
     let prefix_path = OsPath::parse(s3_prefix).map_err(|e| anyhow!("{e}"))?;
