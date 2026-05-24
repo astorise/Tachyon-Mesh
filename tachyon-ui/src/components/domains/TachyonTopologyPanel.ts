@@ -832,11 +832,11 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         if (!isDemoTopologyEnabled()) {
           this.nodes = [];
           this.edges = [];
-          this.liveSource = graph.source;
-          this.render();
-          this.bindEvents();
-          this.pushGraphToCanvas();
         }
+        this.liveSource = graph.source;
+        this.render();
+        this.bindEvents();
+        this.pushGraphToCanvas();
         return;
       }
 

@@ -825,6 +825,7 @@ pub(crate) fn record_scope_allow_all_prometheus(deployment: &str) {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1184,8 +1185,13 @@ mod tests {
     // average per-call cost is under 100 ns.  GlobSet pattern matching on
     // pre-compiled sets is typically 5–20 ns; 100 ns gives 5× headroom for
     // slower CI environments.
+    //
+    // Guarded by `not(debug_assertions)`: unoptimised debug builds routinely
+    // exceed 100 ns even for trivial GlobSet lookups, so the assertion is
+    // only meaningful in release mode.
 
     #[test]
+    #[cfg(not(debug_assertions))]
     fn scope_check_kv_avg_under_100ns() {
         let scopes = parse(json!({ "kv": ["tenant-a/*", "db/prod/*", "cache/**"] })).unwrap();
         let iters = 1_000_000_u64;
@@ -1202,6 +1208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(debug_assertions))]
     fn scope_check_secrets_avg_under_100ns() {
         let scopes = parse(json!({ "secrets": ["db/prod/*", "auth/**", "cert/*"] })).unwrap();
         let iters = 1_000_000_u64;
@@ -1218,6 +1225,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(debug_assertions))]
     fn scope_check_routing_avg_under_100ns() {
         let scopes =
             parse(json!({ "routing": ["/api/* -> https://backend/*", "/rpc/* -> grpc://svc/*"] }))
