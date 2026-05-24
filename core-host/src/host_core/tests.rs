@@ -1,9 +1,6 @@
 mod support_and_cache;
 
 mod background_connectors;
-mod scoping_kv_handle;
-mod scoping_link_time;
-mod scoping_secrets;
 mod config_validation;
 mod http_router;
 mod iam_management;
@@ -15,6 +12,9 @@ mod node_registry;
 mod rate_limit_models;
 mod reload_and_guest;
 mod routing_aliases;
+mod scoping_kv_handle;
+mod scoping_link_time;
+mod scoping_secrets;
 mod secret_injection;
 mod telemetry_and_l4;
 mod uds_loop_resilience;

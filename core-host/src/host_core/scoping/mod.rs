@@ -5,11 +5,7 @@
 
 use globset::{GlobSet, GlobSetBuilder};
 use serde_json::Value;
-use std::{
-    collections::BTreeMap,
-    hash::Hash,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, hash::Hash, sync::Arc};
 use thiserror::Error;
 
 // ── Scope categories ─────────────────────────────────────────────────────────
@@ -109,7 +105,9 @@ impl ScopeShape {
         if self.allow_all {
             return true;
         }
-        self.entries.get(category.key()).map_or(false, |v| v.is_some())
+        self.entries
+            .get(category.key())
+            .map_or(false, |v| v.is_some())
     }
 }
 
@@ -371,8 +369,7 @@ pub(crate) struct LinkerCacheCounters {
 
 impl LinkerCacheCounters {
     pub(crate) fn hit(&self) {
-        self.hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     pub(crate) fn miss(&self) {
         self.misses
@@ -505,14 +502,8 @@ impl prometheus::core::Collector for LinkerCacheCollector {
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
         use std::sync::atomic::Ordering::Relaxed;
         vec![
-            Self::atomic_counter_mf(
-                &self.descs[0],
-                self.counters.hits.load(Relaxed),
-            ),
-            Self::atomic_counter_mf(
-                &self.descs[1],
-                self.counters.misses.load(Relaxed),
-            ),
+            Self::atomic_counter_mf(&self.descs[0], self.counters.hits.load(Relaxed)),
+            Self::atomic_counter_mf(&self.descs[1], self.counters.misses.load(Relaxed)),
         ]
     }
 }
@@ -674,8 +665,7 @@ impl ScopeDenialCounters {
     }
 
     pub(crate) fn total_secrets(&self) -> u64 {
-        self.secrets
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.secrets.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -729,8 +719,7 @@ fn scope_allow_all_vec() -> Option<&'static prometheus::CounterVec> {
 
 /// Lifetime total scope denials across all deployments and categories.
 /// Exposed via `scope_denial_total_lifetime()` for operator-facing admin snapshots.
-static SCOPE_DENIAL_LIFETIME: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SCOPE_DENIAL_LIFETIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Total scope denials recorded since process start, across all deployments and categories.
 /// Suitable for surfacing in the admin `/admin/metrics` JSON response.
@@ -793,9 +782,7 @@ fn maybe_warn_denial_rate(deployment: &str, category: ScopeCategory) {
     }
 
     let count = state.window_count.fetch_add(1, Relaxed) + 1;
-    if count >= DENIAL_WARN_THRESHOLD_PER_MIN
-        && !state.warned_this_window.swap(true, AcqRel)
-    {
+    if count >= DENIAL_WARN_THRESHOLD_PER_MIN && !state.warned_this_window.swap(true, AcqRel) {
         tracing::warn!(
             deployment = %deployment,
             category = ?category,
@@ -1002,11 +989,17 @@ mod tests {
             Ok::<u32, ()>(99u32)
         });
         assert_eq!(
-            cache.counters.hits.load(std::sync::atomic::Ordering::Relaxed),
+            cache
+                .counters
+                .hits
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(
-            cache.counters.misses.load(std::sync::atomic::Ordering::Relaxed),
+            cache
+                .counters
+                .misses
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
     }
@@ -1019,7 +1012,10 @@ mod tests {
         let _ = cache.get_or_build("faas", &a, || Ok::<u32, ()>(1u32));
         let _ = cache.get_or_build("faas", &b, || Ok::<u32, ()>(2u32));
         assert_eq!(
-            cache.counters.misses.load(std::sync::atomic::Ordering::Relaxed),
+            cache
+                .counters
+                .misses
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
     }
@@ -1031,7 +1027,10 @@ mod tests {
         let _ = cache.get_or_build("faas", &shape, || Ok::<u32, ()>(1u32));
         let _ = cache.get_or_build("system", &shape, || Ok::<u32, ()>(2u32));
         assert_eq!(
-            cache.counters.misses.load(std::sync::atomic::Ordering::Relaxed),
+            cache
+                .counters
+                .misses
+                .load(std::sync::atomic::Ordering::Relaxed),
             2,
             "same shape for different worlds must not share a linker"
         );
@@ -1105,7 +1104,10 @@ mod tests {
             cache.entry_count()
         );
         assert_eq!(
-            cache.counters.misses.load(std::sync::atomic::Ordering::Relaxed),
+            cache
+                .counters
+                .misses
+                .load(std::sync::atomic::Ordering::Relaxed),
             10,
             "all 10 inserts must be cache misses (never seen before)"
         );
@@ -1124,15 +1126,30 @@ mod tests {
         let scopes_b = parse(json!({ "kv": ["tenant-b/*"] })).unwrap();
 
         // Within-tenant access is allowed.
-        assert!(scopes_a.check_kv("tenant-a/users"), "tenant-a may read tenant-a/users");
-        assert!(scopes_b.check_kv("tenant-b/orders"), "tenant-b may read tenant-b/orders");
+        assert!(
+            scopes_a.check_kv("tenant-a/users"),
+            "tenant-a may read tenant-a/users"
+        );
+        assert!(
+            scopes_b.check_kv("tenant-b/orders"),
+            "tenant-b may read tenant-b/orders"
+        );
 
         // Cross-tenant access is denied.
-        assert!(!scopes_a.check_kv("tenant-b/users"), "tenant-a must NOT read tenant-b/users");
-        assert!(!scopes_b.check_kv("tenant-a/orders"), "tenant-b must NOT read tenant-a/orders");
+        assert!(
+            !scopes_a.check_kv("tenant-b/users"),
+            "tenant-a must NOT read tenant-b/users"
+        );
+        assert!(
+            !scopes_b.check_kv("tenant-a/orders"),
+            "tenant-b must NOT read tenant-a/orders"
+        );
 
         // Wildcard sibling is also denied.
-        assert!(!scopes_a.check_kv("tenant-b/*"), "tenant-a must NOT access tenant-b wildcard");
+        assert!(
+            !scopes_a.check_kv("tenant-b/*"),
+            "tenant-a must NOT access tenant-b wildcard"
+        );
     }
 
     #[test]

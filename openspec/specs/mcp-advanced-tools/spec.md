@@ -2,9 +2,7 @@
 
 ## Purpose
 Advanced MCP operations for Tachyon runtime observability, safe manifest validation, shadow traffic analysis, and resilience testing.
-
 ## Requirements
-
 ### Requirement: MCP Manifest Dry Run
 The MCP server SHALL expose a `tachyon_dryrun_manifest` tool that validates a manifest payload without writing the workspace overlay, replacing `integrity.lock`, or applying state to a Tachyon node.
 
@@ -16,13 +14,14 @@ The MCP server SHALL expose a `tachyon_dryrun_manifest` tool that validates a ma
 - **AND** no local or remote Tachyon configuration state is persisted
 
 ### Requirement: MCP Runtime Metrics
-The MCP server SHALL expose a `tachyon_get_metrics` tool that returns active node telemetry through tachyon-client bindings.
+The MCP server SHALL expose a `tachyon_get_metrics` tool that returns active node telemetry through tachyon-client bindings, including scope denial totals introduced by faas-wit-import-scoping.
 
 #### Scenario: Agent queries telemetry
 - **GIVEN** an MCP client calls `tools/call` with `name` set to `tachyon_get_metrics`
 - **WHEN** an active Tachyon node connection is configured
 - **THEN** tachyon-client queries the admin metrics endpoint
-- **AND** the MCP response includes error rate, p50 latency, p99 latency, and queue depth data
+- **AND** the MCP response includes error rate, p50 latency, p99 latency, queue depth, and `scope_denial_total`
+- **AND** `scope_denial_total` is the lifetime count of runtime WIT import denials across all deployments and categories
 
 ### Requirement: MCP Log Notifications
 The MCP server SHALL expose a `tachyon_tail_logs` tool that returns recent logs and notification-compatible `notifications/message` JSON-RPC payloads.
@@ -59,3 +58,4 @@ tachyon-client SHALL provide the HTTP request bindings required by the advanced 
 - **WHEN** the MCP server invokes tachyon-client
 - **THEN** tachyon-client performs the required admin request with the active connection token
 - **AND** non-success admin responses are surfaced as explicit errors
+

@@ -1251,10 +1251,7 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 .get("route_path")
                 .and_then(Value::as_str)
                 .context("missing route_path")?;
-            let scopes = arguments
-                .get("scopes")
-                .cloned()
-                .context("missing scopes")?;
+            let scopes = arguments.get("scopes").cloned().context("missing scopes")?;
             let dry_run = arguments
                 .get("dry_run")
                 .and_then(Value::as_bool)
@@ -1916,16 +1913,37 @@ mod tests {
     #[test]
     fn scope_tools_rate_limits_match_spec() {
         let spec_set = rate_limit_spec("tachyon_set_route_scopes");
-        assert!(spec_set.is_some(), "tachyon_set_route_scopes must have a rate limit");
-        assert_eq!(spec_set.unwrap().limit, 1, "set_route_scopes limit must be 1/min");
+        assert!(
+            spec_set.is_some(),
+            "tachyon_set_route_scopes must have a rate limit"
+        );
+        assert_eq!(
+            spec_set.unwrap().limit,
+            1,
+            "set_route_scopes limit must be 1/min"
+        );
 
         let spec_get = rate_limit_spec("tachyon_get_scope_denials");
-        assert!(spec_get.is_some(), "tachyon_get_scope_denials must have a rate limit");
-        assert_eq!(spec_get.unwrap().limit, 30, "get_scope_denials limit must be 30/min");
+        assert!(
+            spec_get.is_some(),
+            "tachyon_get_scope_denials must have a rate limit"
+        );
+        assert_eq!(
+            spec_get.unwrap().limit,
+            30,
+            "get_scope_denials limit must be 30/min"
+        );
 
         let spec_suggest = rate_limit_spec("tachyon_suggest_scopes");
-        assert!(spec_suggest.is_some(), "tachyon_suggest_scopes must have a rate limit");
-        assert_eq!(spec_suggest.unwrap().limit, 30, "suggest_scopes limit must be 30/min");
+        assert!(
+            spec_suggest.is_some(),
+            "tachyon_suggest_scopes must have a rate limit"
+        );
+        assert_eq!(
+            spec_suggest.unwrap().limit,
+            30,
+            "suggest_scopes limit must be 30/min"
+        );
     }
 
     #[test]

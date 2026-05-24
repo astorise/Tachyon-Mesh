@@ -2062,9 +2062,7 @@ fn validate_route_scopes(
     // re-parse at instantiation so `GlobSet` (not Send/Sync-safe for storage)
     // is not persisted on `IntegrityRoute`.
     crate::host_core::scoping::DeploymentScopes::from_manifest(value).map_err(|e| {
-        anyhow!(
-            "Integrity Validation Failed: route `{route_path}` has invalid `scopes` block: {e}"
-        )
+        anyhow!("Integrity Validation Failed: route `{route_path}` has invalid `scopes` block: {e}")
     })?;
     Ok(scopes)
 }

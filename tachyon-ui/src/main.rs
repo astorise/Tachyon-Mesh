@@ -375,7 +375,9 @@ async fn get_manifest_config() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn apply_manifest_config(config: serde_json::Value) -> Result<tachyon_client::SealApplyOutcome, String> {
+async fn apply_manifest_config(
+    config: serde_json::Value,
+) -> Result<tachyon_client::SealApplyOutcome, String> {
     tachyon_client::apply_manifest_config(config)
         .await
         .map_err(|error| error.to_string())

@@ -564,7 +564,9 @@ fn test_scope_read_tools_offline_behavior() {
 }
 
 /// Helper: spawn a fresh offline MCP with an isolated rate-limit state file.
-fn spawn_offline_mcp_isolated(name: &str) -> Option<(
+fn spawn_offline_mcp_isolated(
+    name: &str,
+) -> Option<(
     std::process::Child,
     std::process::ChildStdin,
     std::io::BufReader<std::process::ChildStdout>,
@@ -602,7 +604,10 @@ fn spawn_offline_mcp_isolated(name: &str) -> Option<(
 fn test_set_route_scopes_missing_args_returns_32602() {
     // Missing both route_path and scopes
     let Some((mut child, mut stdin, mut reader)) =
-        spawn_offline_mcp_isolated("set-scopes-miss-both") else { return; };
+        spawn_offline_mcp_isolated("set-scopes-miss-both")
+    else {
+        return;
+    };
     let raw = send_and_recv(
         &mut stdin,
         &mut reader,
@@ -622,7 +627,10 @@ fn test_set_route_scopes_missing_args_returns_32602() {
 
     // Missing scopes only — fresh process to avoid rate limit
     let Some((mut child, mut stdin, mut reader)) =
-        spawn_offline_mcp_isolated("set-scopes-miss-scopes") else { return; };
+        spawn_offline_mcp_isolated("set-scopes-miss-scopes")
+    else {
+        return;
+    };
     let raw = send_and_recv(
         &mut stdin,
         &mut reader,
@@ -698,8 +706,9 @@ fn test_set_route_scopes_rate_limited() {
 /// missing-arg check (-32602) must fire *before* any network attempt.
 #[test]
 fn test_scope_tools_offline_chain() {
-    let Some((mut child, mut stdin, mut reader)) =
-        spawn_offline_mcp_isolated("scope-chain") else { return; };
+    let Some((mut child, mut stdin, mut reader)) = spawn_offline_mcp_isolated("scope-chain") else {
+        return;
+    };
 
     // Step 1 — get_scope_denials: no required args; offline → -32001 / -32603
     let raw = send_and_recv(
@@ -716,7 +725,10 @@ fn test_scope_tools_offline_chain() {
         "must have result or error; got {resp}"
     );
     if let Some(code) = resp["error"]["code"].as_i64() {
-        assert_ne!(code, -32602, "get_scope_denials takes no required args; got -32602");
+        assert_ne!(
+            code, -32602,
+            "get_scope_denials takes no required args; got -32602"
+        );
     }
 
     // Step 2 — suggest_scopes with a route_path; offline → -32001 / -32603
@@ -731,7 +743,10 @@ fn test_scope_tools_offline_chain() {
     assert_eq!(resp["id"], 71);
     if let Some(code) = resp["error"]["code"].as_i64() {
         // -32602 would mean route_path was still rejected — regression
-        assert_ne!(code, -32602, "suggest_scopes must accept route_path; got -32602");
+        assert_ne!(
+            code, -32602,
+            "suggest_scopes must accept route_path; got -32602"
+        );
         // Only -32001 (cluster unreachable) or -32603 (client error) are expected offline
         assert!(
             [-32001i64, -32603].contains(&code),
@@ -756,8 +771,14 @@ fn test_scope_tools_offline_chain() {
     );
     if let Some(code) = resp["error"]["code"].as_i64() {
         // -32602 = missing args (regression), -32002 = rate-limited (unexpected: first call)
-        assert_ne!(code, -32602, "set_route_scopes with all args must not return -32602");
-        assert_ne!(code, -32002, "first set_route_scopes call must not be rate-limited");
+        assert_ne!(
+            code, -32602,
+            "set_route_scopes with all args must not return -32602"
+        );
+        assert_ne!(
+            code, -32002,
+            "first set_route_scopes call must not be rate-limited"
+        );
     }
 
     drop(stdin);

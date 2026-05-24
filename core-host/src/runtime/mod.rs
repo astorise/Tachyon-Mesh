@@ -36,9 +36,9 @@ pub(crate) fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeStat
             .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
             .build(),
     );
-    let linker_cache = Arc::new(
-        crate::host_core::scoping::LinkerCache::new(LINKER_CACHE_DEFAULT_CAPACITY),
-    );
+    let linker_cache = Arc::new(crate::host_core::scoping::LinkerCache::new(
+        LINKER_CACHE_DEFAULT_CAPACITY,
+    ));
     linker_cache.register_prometheus();
     Ok(RuntimeState {
         engine: build_engine(&config, false)?,

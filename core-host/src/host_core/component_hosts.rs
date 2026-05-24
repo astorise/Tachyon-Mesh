@@ -99,7 +99,9 @@ impl ComponentHostState {
                                 error = %e,
                                 "scope manifest re-parse failed at instantiation; falling back to allow-all"
                             );
-                            crate::host_core::scoping::record_scope_allow_all_prometheus(&route.path);
+                            crate::host_core::scoping::record_scope_allow_all_prometheus(
+                                &route.path,
+                            );
                             Arc::new(DeploymentScopes::allow_all())
                         }
                     }
@@ -1111,8 +1113,10 @@ impl component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHostSta
         name: String,
     ) -> std::result::Result<String, component_bindings::tachyon::mesh::secrets_vault::Error> {
         if !self.scopes.check_secrets(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Secrets, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Secrets,
+                &self.route_path,
+            );
             return Err(component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied);
         }
         self.secrets.get_secret(&name).map_err(|error| match error {
@@ -1137,8 +1141,10 @@ impl udp_component_bindings::tachyon::mesh::secrets_vault::Host for ComponentHos
     ) -> std::result::Result<String, udp_component_bindings::tachyon::mesh::secrets_vault::Error>
     {
         if !self.scopes.check_secrets(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Secrets, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Secrets,
+                &self.route_path,
+            );
             return Err(
                 udp_component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied,
             );
@@ -1168,8 +1174,10 @@ impl websocket_component_bindings::tachyon::mesh::secrets_vault::Host for Compon
         websocket_component_bindings::tachyon::mesh::secrets_vault::Error,
     > {
         if !self.scopes.check_secrets(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Secrets, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Secrets,
+                &self.route_path,
+            );
             return Err(
                 websocket_component_bindings::tachyon::mesh::secrets_vault::Error::PermissionDenied,
             );
@@ -1201,8 +1209,10 @@ impl component_bindings::tachyon::mesh::bridge_controller::Host for ComponentHos
         if !self.scopes.check_bridge(&config.client_a_addr)
             || !self.scopes.check_bridge(&config.client_b_addr)
         {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Bridge, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Bridge,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: bridge address not granted by deployment scopes"
             ));
@@ -1238,8 +1248,10 @@ impl system_component_bindings::tachyon::mesh::bridge_controller::Host for Compo
         if !self.scopes.check_bridge(&config.client_a_addr)
             || !self.scopes.check_bridge(&config.client_b_addr)
         {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Bridge, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Bridge,
+                &self.route_path,
+            );
             return Err(
                 "permission denied: bridge address not granted by deployment scopes".to_owned(),
             );
@@ -1270,8 +1282,10 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
         spec: component_bindings::tachyon::mesh::vector::IndexSpec,
     ) -> std::result::Result<(), String> {
         if !self.scopes.check_vector(&spec.name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Vector, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Vector,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: vector index `{}` not granted by deployment scopes",
                 spec.name
@@ -1295,8 +1309,10 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
         docs: Vec<component_bindings::tachyon::mesh::vector::Document>,
     ) -> std::result::Result<(), String> {
         if !self.scopes.check_vector(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Vector, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Vector,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: vector index `{name}` not granted by deployment scopes"
             ));
@@ -1323,8 +1339,10 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
     ) -> std::result::Result<Vec<component_bindings::tachyon::mesh::vector::SearchMatch>, String>
     {
         if !self.scopes.check_vector(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Vector, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Vector,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: vector index `{name}` not granted by deployment scopes"
             ));
@@ -1349,8 +1367,10 @@ impl component_bindings::tachyon::mesh::vector::Host for ComponentHostState {
 
     fn remove(&mut self, name: String, id: String) -> std::result::Result<bool, String> {
         if !self.scopes.check_vector(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Vector, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Vector,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: vector index `{name}` not granted by deployment scopes"
             ));
@@ -1368,8 +1388,10 @@ impl component_bindings::tachyon::mesh::training::Host for ComponentHostState {
         job: component_bindings::tachyon::mesh::training::TrainingJob,
     ) -> std::result::Result<component_bindings::tachyon::mesh::training::JobId, String> {
         if !self.scopes.check_training(&job.dataset.volume_alias) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Training, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Training,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: training volume alias `{}` not granted by deployment scopes",
                 job.dataset.volume_alias
@@ -1446,8 +1468,10 @@ impl component_bindings::tachyon::mesh::graph::HostWorkspaceGraph for ComponentH
     {
         // Scope check at construction only; subsequent methods on this handle do not re-check.
         let scope_denial = if !self.scopes.check_graph(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Graph, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Graph,
+                &self.route_path,
+            );
             Some(format!(
                 "permission denied: graph workspace `{name}` not granted by deployment scopes"
             ))
@@ -1560,8 +1584,10 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         // Scope check at construction only; subsequent get/set/delete calls on this handle
         // do not re-check (handle-bound invariant).
         let scope_denial = if !self.scopes.check_kv(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Kv, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Kv,
+                &self.route_path,
+            );
             Some(format!(
                 "permission denied: kv table `{name}` not granted by deployment scopes"
             ))
@@ -1694,8 +1720,10 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         // Scope check at construction only; subsequent get/set/delete calls on this handle
         // do not re-check (handle-bound invariant).
         let scope_denial = if !self.scopes.check_kv(&name) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Kv, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Kv,
+                &self.route_path,
+            );
             Some(format!(
                 "permission denied: kv table `{name}` not granted by deployment scopes"
             ))
@@ -2188,8 +2216,10 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
         body: Vec<u8>,
     ) -> std::result::Result<(), String> {
         if !self.scopes.check_storage(&path) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Storage, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Storage,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: storage path `{path}` not granted by deployment scopes"
             ));
@@ -2225,8 +2255,10 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
         snapshot_path: String,
     ) -> std::result::Result<(), String> {
         if !self.scopes.check_storage(&volume_id) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Storage, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Storage,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: storage volume `{volume_id}` not granted by deployment scopes"
             ));
@@ -2249,8 +2281,10 @@ impl system_component_bindings::tachyon::mesh::storage_broker::Host for Componen
         destination_path: String,
     ) -> std::result::Result<(), String> {
         if !self.scopes.check_storage(&volume_id) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Storage, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Storage,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: storage volume `{volume_id}` not granted by deployment scopes"
             ));
@@ -2281,8 +2315,10 @@ impl control_plane_component_bindings::tachyon::mesh::routing_control::Host for 
         destination: String,
     ) -> std::result::Result<(), String> {
         if !self.scopes.check_routing(&route_path, &destination) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Routing, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Routing,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: routing `{route_path}` → `{destination}` not granted by deployment scopes"
             ));
@@ -2303,8 +2339,10 @@ impl background_component_bindings::tachyon::mesh::routing_control::Host for Com
         destination: String,
     ) -> std::result::Result<(), String> {
         if !self.scopes.check_routing(&route_path, &destination) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Routing, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Routing,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: routing `{route_path}` → `{destination}` not granted by deployment scopes"
             ));
@@ -2332,8 +2370,10 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
         // Scope check on scheme://host/path (query string stripped per spec D5).
         let url_without_query = crate::host_core::scoping::strip_url_query(&url);
         if !self.scopes.check_http(url_without_query) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Http, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Http,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: outbound HTTP URL `{url_without_query}` not granted by deployment scopes"
             ));
@@ -2423,8 +2463,10 @@ impl background_component_bindings::tachyon::mesh::outbox_store::Host for Compon
         String,
     > {
         if !self.scopes.check_outbox(&db_url, &table) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Outbox, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Outbox,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: outbox `{db_url}/{table}` not granted by deployment scopes"
             ));
@@ -2457,8 +2499,10 @@ impl background_component_bindings::tachyon::mesh::outbox_store::Host for Compon
         id: String,
     ) -> std::result::Result<(), String> {
         if !self.scopes.check_outbox(&db_url, &table) {
-            self.scope_denials
-                .increment_with_deployment(crate::host_core::scoping::ScopeCategory::Outbox, &self.route_path);
+            self.scope_denials.increment_with_deployment(
+                crate::host_core::scoping::ScopeCategory::Outbox,
+                &self.route_path,
+            );
             return Err(format!(
                 "permission denied: outbox `{db_url}/{table}` not granted by deployment scopes"
             ));

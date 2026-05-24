@@ -174,13 +174,8 @@ pub(crate) struct GuestExecutionContext {
     /// Shared linker cache from `RuntimeState`. Tests fill in `None` to disable
     /// caching (fresh linker built per instantiation). Production code clones
     /// from `RuntimeState::linker_cache`.
-    pub(crate) linker_cache: Option<
-        Arc<
-            crate::host_core::scoping::LinkerCache<
-                ComponentLinker<ComponentHostState>,
-            >,
-        >,
-    >,
+    pub(crate) linker_cache:
+        Option<Arc<crate::host_core::scoping::LinkerCache<ComponentLinker<ComponentHostState>>>>,
     #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 }

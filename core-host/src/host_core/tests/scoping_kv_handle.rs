@@ -10,18 +10,22 @@ use crate::host_core::scoping::{DeploymentScopes, ScopeCategory, ScopeDenialCoun
 
 #[test]
 fn kv_scope_allows_matching_table_name() {
-    let scopes =
-        DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/**"] }))
-            .expect("manifest should parse");
-    assert!(scopes.check_kv("tenant-a/users"), "direct sub-path must match");
-    assert!(scopes.check_kv("tenant-a/orders/2024"), "nested sub-path must match");
+    let scopes = DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/**"] }))
+        .expect("manifest should parse");
+    assert!(
+        scopes.check_kv("tenant-a/users"),
+        "direct sub-path must match"
+    );
+    assert!(
+        scopes.check_kv("tenant-a/orders/2024"),
+        "nested sub-path must match"
+    );
 }
 
 #[test]
 fn kv_scope_denies_non_matching_table_name() {
-    let scopes =
-        DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/**"] }))
-            .expect("manifest should parse");
+    let scopes = DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/**"] }))
+        .expect("manifest should parse");
     assert!(
         !scopes.check_kv("tenant-b/users"),
         "different tenant prefix must be denied"
@@ -31,9 +35,8 @@ fn kv_scope_denies_non_matching_table_name() {
 
 #[test]
 fn kv_scope_denial_increments_counter_once_at_construction() {
-    let scopes =
-        DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/*"] }))
-            .expect("manifest should parse");
+    let scopes = DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/*"] }))
+        .expect("manifest should parse");
     let denials = ScopeDenialCounters::default();
 
     // Simulate the host closure: check → deny → store denial in handle.
@@ -43,7 +46,10 @@ fn kv_scope_denial_increments_counter_once_at_construction() {
     } else {
         None
     };
-    assert!(scope_denial.is_some(), "scope denial must be captured in handle");
+    assert!(
+        scope_denial.is_some(),
+        "scope denial must be captured in handle"
+    );
     assert_eq!(
         denials.kv.load(Relaxed),
         1,
@@ -66,9 +72,8 @@ fn kv_scope_denial_increments_counter_once_at_construction() {
 
 #[test]
 fn kv_scope_allowed_handle_has_no_denial() {
-    let scopes =
-        DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/*"] }))
-            .expect("manifest should parse");
+    let scopes = DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/*"] }))
+        .expect("manifest should parse");
     let denials = ScopeDenialCounters::default();
 
     let scope_denial: Option<String> = if !scopes.check_kv("tenant-a/users") {
@@ -90,9 +95,8 @@ fn kv_scope_allowed_handle_has_no_denial() {
 
 #[test]
 fn kv_scope_handle_bound_invariant_verified_via_counter() {
-    let scopes =
-        DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/*"] }))
-            .expect("manifest should parse");
+    let scopes = DeploymentScopes::from_manifest(&serde_json::json!({ "kv": ["tenant-a/*"] }))
+        .expect("manifest should parse");
     let denials = ScopeDenialCounters::default();
 
     // Open tenant-a/users → ok.
@@ -113,7 +117,11 @@ fn kv_scope_handle_bound_invariant_verified_via_counter() {
         None
     };
     assert!(denied_b.is_some());
-    assert_eq!(denials.kv.load(Relaxed), 1, "one denial for disallowed name");
+    assert_eq!(
+        denials.kv.load(Relaxed),
+        1,
+        "one denial for disallowed name"
+    );
 
     // 1000 get/set calls on the poisoned handle must not touch the counter.
     let before = denials.kv.load(Relaxed);

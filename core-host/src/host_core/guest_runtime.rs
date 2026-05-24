@@ -316,44 +316,78 @@ pub(crate) fn execute_component_guest(
         let mut l = ComponentLinker::new(engine);
         // Infrastructure — always linked regardless of deployment scopes.
         wasmtime_wasi::p2::add_to_linker_sync(&mut l).map_err(|error| {
-            guest_execution_error(error, "failed to add WASI preview2 functions to component linker")
+            guest_execution_error(
+                error,
+                "failed to add WASI preview2 functions to component linker",
+            )
         })?;
         // Authorization-gated: omitting this interface denies it at link time for
         // components that declare the import; components without the import are unaffected.
         if shape.grants(ScopeCategory::Secrets) {
             component_bindings::tachyon::mesh::secrets_vault::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add secrets vault functions to component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add secrets vault functions to component linker",
+                )
+            })?;
         }
         // Authorization-gated: bridge addresses validated against scopes.bridge at construction.
         if shape.grants(ScopeCategory::Bridge) {
             component_bindings::tachyon::mesh::bridge_controller::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add bridge controller functions to component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add bridge controller functions to component linker",
+                )
+            })?;
         }
         // Authorization-gated: index names validated against scopes.vector per call.
         if shape.grants(ScopeCategory::Vector) {
             component_bindings::tachyon::mesh::vector::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add vector store functions to component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add vector store functions to component linker",
+                )
+            })?;
         }
         // Authorization-gated: dataset volume-alias validated against scopes.training.
         if shape.grants(ScopeCategory::Training) {
             component_bindings::tachyon::mesh::training::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add training functions to component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(e, "failed to add training functions to component linker")
+            })?;
         }
         // Infrastructure — custom-metrics is always available; no resource access.
         component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
-            ComponentHostState, ComponentHostState,
+            ComponentHostState,
+            ComponentHostState,
         >(&mut l, |s: &mut ComponentHostState| s)
-        .map_err(|e| guest_execution_error(e, "failed to add custom-metrics functions to component linker"))?;
+        .map_err(|e| {
+            guest_execution_error(
+                e,
+                "failed to add custom-metrics functions to component linker",
+            )
+        })?;
         #[cfg(feature = "ai-inference")]
-        add_accelerator_interfaces_to_component_linker(&mut l, &ai_runtime_ref, "component linker")?;
+        add_accelerator_interfaces_to_component_linker(
+            &mut l,
+            &ai_runtime_ref,
+            "component linker",
+        )?;
         Ok(l)
     };
     let linker: Arc<ComponentLinker<ComponentHostState>> = match &execution.linker_cache {
@@ -485,14 +519,23 @@ pub(crate) fn execute_udp_component_guest(
         let mut l = ComponentLinker::new(engine);
         // Infrastructure — always linked.
         wasmtime_wasi::p2::add_to_linker_sync(&mut l).map_err(|error| {
-            guest_execution_error(error, "failed to add WASI preview2 functions to UDP component linker")
+            guest_execution_error(
+                error,
+                "failed to add WASI preview2 functions to UDP component linker",
+            )
         })?;
         // Authorization-gated: secret names validated against scopes.secrets per call.
         if shape.grants(ScopeCategory::Secrets) {
             udp_component_bindings::tachyon::mesh::secrets_vault::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add secrets vault functions to UDP component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add secrets vault functions to UDP component linker",
+                )
+            })?;
         }
         Ok(l)
     };
@@ -519,24 +562,23 @@ pub(crate) fn execute_udp_component_guest(
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
 
-    let bindings = udp_component_bindings::UdpFaasGuest::instantiate(
-        &mut store, component, &*linker,
-    )
-    .map_err(|error| {
-        let message = format!(
-            "failed to instantiate UDP guest component from {}",
-            component_path.display()
-        );
-        let error_message = error.to_string();
-        if error_message.contains("no exported instance named `tachyon:mesh/udp-handler`") {
-            ExecutionError::Internal(format!(
-                "guest component `{}` does not export the UDP packet handler",
-                component_path.display()
-            ))
-        } else {
-            guest_execution_error(error, message)
-        }
-    })?;
+    let bindings =
+        udp_component_bindings::UdpFaasGuest::instantiate(&mut store, component, &*linker)
+            .map_err(|error| {
+                let message = format!(
+                    "failed to instantiate UDP guest component from {}",
+                    component_path.display()
+                );
+                let error_message = error.to_string();
+                if error_message.contains("no exported instance named `tachyon:mesh/udp-handler`") {
+                    ExecutionError::Internal(format!(
+                        "guest component `{}` does not export the UDP packet handler",
+                        component_path.display()
+                    ))
+                } else {
+                    guest_execution_error(error, message)
+                }
+            })?;
     record_wasm_start(execution.telemetry.as_ref());
     let source_ip = source.ip().to_string();
     let response = bindings.tachyon_mesh_udp_handler().call_handle_packet(
@@ -618,20 +660,35 @@ pub(crate) fn execute_websocket_component_guest(
         let mut l = ComponentLinker::new(engine);
         // Infrastructure — always linked.
         wasmtime_wasi::p2::add_to_linker_sync(&mut l).map_err(|error| {
-            guest_execution_error(error, "failed to add WASI preview2 functions to WebSocket component linker")
+            guest_execution_error(
+                error,
+                "failed to add WASI preview2 functions to WebSocket component linker",
+            )
         })?;
         // Authorization-gated: secret names validated against scopes.secrets per call.
         if shape.grants(ScopeCategory::Secrets) {
             websocket_component_bindings::tachyon::mesh::secrets_vault::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add secrets vault functions to WebSocket component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add secrets vault functions to WebSocket component linker",
+                )
+            })?;
         }
         // Infrastructure — WebSocket I/O channel, always linked.
         websocket_component_bindings::tachyon::mesh::websocket::add_to_linker::<
-            ComponentHostState, ComponentHostState,
+            ComponentHostState,
+            ComponentHostState,
         >(&mut l, |s: &mut ComponentHostState| s)
-        .map_err(|e| guest_execution_error(e, "failed to add WebSocket host functions to component linker"))?;
+        .map_err(|e| {
+            guest_execution_error(
+                e,
+                "failed to add WebSocket host functions to component linker",
+            )
+        })?;
         Ok(l)
     };
     let linker: Arc<ComponentLinker<ComponentHostState>> = match &execution.linker_cache {
@@ -780,55 +837,106 @@ pub(crate) fn execute_system_component_guest(
         let mut l = ComponentLinker::new(engine);
         // Infrastructure — always linked regardless of deployment scopes.
         wasmtime_wasi::p2::add_to_linker_sync(&mut l).map_err(|error| {
-            guest_execution_error(error, "failed to add WASI preview2 functions to system component linker")
+            guest_execution_error(
+                error,
+                "failed to add WASI preview2 functions to system component linker",
+            )
         })?;
         // Infrastructure — telemetry, metrics, scaling always linked.
         control_plane_component_bindings::tachyon::mesh::telemetry_reader::add_to_linker::<
-            ComponentHostState, ComponentHostState,
+            ComponentHostState,
+            ComponentHostState,
         >(&mut l, |s: &mut ComponentHostState| s)
-        .map_err(|e| guest_execution_error(e, "failed to add telemetry reader functions to system component linker"))?;
+        .map_err(|e| {
+            guest_execution_error(
+                e,
+                "failed to add telemetry reader functions to system component linker",
+            )
+        })?;
         control_plane_component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
-            ComponentHostState, ComponentHostState,
+            ComponentHostState,
+            ComponentHostState,
         >(&mut l, |s: &mut ComponentHostState| s)
-        .map_err(|e| guest_execution_error(e, "failed to add custom-metrics functions to system component linker"))?;
+        .map_err(|e| {
+            guest_execution_error(
+                e,
+                "failed to add custom-metrics functions to system component linker",
+            )
+        })?;
         control_plane_component_bindings::tachyon::mesh::scaling_metrics::add_to_linker::<
-            ComponentHostState, ComponentHostState,
+            ComponentHostState,
+            ComponentHostState,
         >(&mut l, |s: &mut ComponentHostState| s)
-        .map_err(|e| guest_execution_error(e, "failed to add scaling metrics functions to system component linker"))?;
+        .map_err(|e| {
+            guest_execution_error(
+                e,
+                "failed to add scaling metrics functions to system component linker",
+            )
+        })?;
         // Authorization-gated: URL validated against scopes.http per call.
         if shape.grants(ScopeCategory::Http) {
             control_plane_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add outbound HTTP functions to system component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add outbound HTTP functions to system component linker",
+                )
+            })?;
         }
         // Authorization-gated: routing tuple (route-path, destination) validated against scopes.routing.
         if shape.grants(ScopeCategory::Routing) {
             control_plane_component_bindings::tachyon::mesh::routing_control::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add routing control functions to system component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add routing control functions to system component linker",
+                )
+            })?;
         }
         // Authorization-gated: kv table name validated against scopes.kv at construction.
         if shape.grants(ScopeCategory::Kv) {
             control_plane_component_bindings::tachyon::mesh::kv_partition::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add kv-partition functions to system component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add kv-partition functions to system component linker",
+                )
+            })?;
         }
         // Authorization-gated: bridge addresses validated against scopes.bridge at construction.
         if shape.grants(ScopeCategory::Bridge) {
             system_component_bindings::tachyon::mesh::bridge_controller::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add bridge controller functions to system component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add bridge controller functions to system component linker",
+                )
+            })?;
         }
         // Authorization-gated: path/volume-id validated against scopes.storage per call.
         if shape.grants(ScopeCategory::Storage) {
             system_component_bindings::tachyon::mesh::storage_broker::add_to_linker::<
-                ComponentHostState, ComponentHostState,
+                ComponentHostState,
+                ComponentHostState,
             >(&mut l, |s: &mut ComponentHostState| s)
-            .map_err(|e| guest_execution_error(e, "failed to add storage broker functions to system component linker"))?;
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add storage broker functions to system component linker",
+                )
+            })?;
         }
         Ok(l)
     };

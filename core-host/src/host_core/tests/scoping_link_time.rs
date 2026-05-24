@@ -3,9 +3,9 @@ use wasmtime::{
     Engine, Store,
 };
 
-use crate::host_core::scoping::{DeploymentScopes, ScopeCategory, ScopeShape};
-use crate::host_core::integrity_config::validate_integrity_config;
 use crate::host_core::domain_types::{IntegrityConfig, IntegrityRoute};
+use crate::host_core::integrity_config::validate_integrity_config;
+use crate::host_core::scoping::{DeploymentScopes, ScopeCategory, ScopeShape};
 
 fn test_engine() -> Engine {
     Engine::default()
