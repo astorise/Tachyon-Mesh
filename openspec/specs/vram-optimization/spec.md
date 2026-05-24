@@ -5,20 +5,29 @@ VRAM-aware routing, PCIe host-RAM offloading, and semantic context flattening fo
 
 ## Requirements
 
-### Specification: VRAM-Aware Routing & Local Offloading
+### Requirement: Local KV-cache tiering
+The memory governor SHALL handle VRAM exhaustion by mapping new KV-cache tensor shards to pinned host memory when local VRAM allocation would exceed 90%, and MUST NOT fall back to disk or NVMe swapping.
 
-## 1. Local Tiering (CPU-Offloading)
-The memory governor must gracefully handle VRAM exhaustion using local system RAM, avoiding disk swap entirely.
-* **Allocator Modification:** In `memory_governor.rs`, implement a tiered allocation strategy for the KV-cache tensors. 
-* **Threshold:** When requesting memory for KV-cache, check current local VRAM limits. If VRAM allocation exceeds 90%, map new tensor shards to pinned host memory (system RAM) via PCIe. 
-* **Constraint:** Do NOT implement disk/NVMe swapping due to the sequential read latency constraints of inference generation.
+#### Scenario: KV-cache spills to pinned host memory
+- **GIVEN** a KV-cache allocation would push local VRAM usage above 90%
+- **WHEN** the memory governor allocates new tensor shards
+- **THEN** it maps those shards to pinned host memory over PCIe
+- **AND** it does not allocate disk-backed swap for inference state
 
-## 2. VRAM-Aware Load Balancing
-The L7 router must be memory-intelligent to prevent node crashes.
-* **Metric Ingestion:** The router must query the `telemetry::TelemetrySnapshot` for the `vram_utilization` metric of all candidate nodes in the execution mesh.
-* **Routing Decision:** Assign a negative weight penalty to nodes with VRAM utilization > 80%. 
-* **Queuing:** If all available nodes are > 90% utilized, place the incoming inference request into a bounded local `await` queue rather than failing immediately with an HTTP 429 or triggering an OOM kill.
+### Requirement: VRAM-aware load balancing
+The L7 router SHALL query `telemetry::TelemetrySnapshot` for candidate node `vram_utilization`, penalize nodes above 80%, and queue inference requests locally when all candidates exceed 90%.
 
-## 3. Semantic Inlining Correction
-* **Implementation:** The `Feature Flattener` must stop traversing generic JSON structures. It must explicitly identify semantic markers (e.g., conversational turn IDs, system prompt boundaries) and inline these directly into the tokenized chunk metadata. 
-* **Goal:** This ensures that contiguous logical sequences have adjacent keys in the KV-cache, drastically improving cache hit rates across dynamic conversations and reducing overall memory waste.
+#### Scenario: Saturated candidates are queued
+- **GIVEN** every candidate node reports VRAM utilization above 90%
+- **WHEN** an inference request is routed
+- **THEN** the router places the request into a bounded local await queue
+- **AND** it avoids immediate HTTP 429 responses caused only by temporary VRAM saturation
+
+### Requirement: Semantic marker inlining
+The feature flattener SHALL identify semantic markers such as conversational turn IDs and system prompt boundaries and inline them into tokenized chunk metadata instead of traversing generic JSON structures.
+
+#### Scenario: Conversational sequence preserves cache locality
+- **GIVEN** an OpenAI-style conversational payload contains ordered message boundaries
+- **WHEN** the feature flattener prepares tokenized chunk metadata
+- **THEN** semantic markers are represented directly in the metadata
+- **AND** contiguous logical sequences receive adjacent KV-cache keys

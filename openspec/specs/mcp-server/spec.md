@@ -206,14 +206,35 @@ The MCP server SHALL apply per-tool rate limits: `tachyon_canary_split` ≤ 2/mi
 ### Requirement: Mutator tool descriptions MUST include explicit LLM guidance
 `tachyon_deploy_function` description SHALL state that `artifact_path` must be an absolute local path on the MCP host. `tachyon_kv_put` description SHALL mandate JSON-stringified values. `tachyon_canary_split` description SHALL explain that `weight_pct=0` performs an immediate rollback.
 
+#### Scenario: Agent reads mutator tool guidance
+- **WHEN** an agent calls `tools/list`
+- **THEN** mutator tool descriptions include the required input guidance
+- **AND** rollback behavior for `tachyon_canary_split` is explicit
+
 ### Requirement: The legacy error_response() function MUST be removed
 The `error_response(id, code, message)` function SHALL be deleted in favour of `json_rpc_error_response(id, &JsonRpcError)`, which produces a fully structured error object consistent with all other error paths.
+
+#### Scenario: Error responses use structured helper
+- **WHEN** the MCP server builds a JSON-RPC error
+- **THEN** it uses `json_rpc_error_response(id, &JsonRpcError)`
+- **AND** no legacy flat `error_response()` helper remains
 
 ### Requirement: Schema fetch failure MUST emit a tracing warning and populate tools/list warnings
 When `get_manifest_schema()` fails, `tachyon-mcp` SHALL emit a `tracing::warn!` describing the degradation. The `tools/list` response SHALL include `data.warnings` when `MANIFEST_SCHEMA` is unpopulated.
 
+#### Scenario: Manifest schema fetch degrades visibly
+- **GIVEN** `get_manifest_schema()` fails
+- **WHEN** `tools/list` is called
+- **THEN** the MCP server emits a tracing warning
+- **AND** the response includes a warning describing the schema degradation
+
 ### Requirement: Hardware status retrieval MUST be a named async helper
 The `tachyon_hardware_status` tool dispatch SHALL delegate to a `get_hardware_status() -> Result<Value>` async function rather than embedding the spawn_blocking call inline.
+
+#### Scenario: Hardware status dispatch delegates to helper
+- **WHEN** `tachyon_hardware_status` is invoked
+- **THEN** dispatch calls `get_hardware_status()`
+- **AND** blocking hardware collection remains outside the inline JSON-RPC dispatch branch
 
 ### Requirement: MCP exposes tools to list, attach, and detach S3 volumes on routes
 The Tachyon MCP server SHALL provide three tools for managing S3 volumes on FaaS routes, operating on the live sealed manifest via the admin API.
