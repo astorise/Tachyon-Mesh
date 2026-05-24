@@ -1213,9 +1213,9 @@ impl component_bindings::tachyon::mesh::bridge_controller::Host for ComponentHos
                 crate::host_core::scoping::ScopeCategory::Bridge,
                 &self.route_path,
             );
-            return Err(format!(
-                "permission denied: bridge address not granted by deployment scopes"
-            ));
+            return Err(
+                "permission denied: bridge address not granted by deployment scopes".to_owned(),
+            );
         }
         let allocation = self.handle_bridge_create(BridgeConfig {
             client_a_addr: config.client_a_addr,

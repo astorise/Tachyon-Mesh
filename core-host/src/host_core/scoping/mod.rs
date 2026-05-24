@@ -107,7 +107,7 @@ impl ScopeShape {
         }
         self.entries
             .get(category.key())
-            .map_or(false, |v| v.is_some())
+            .is_some_and(|v| v.is_some())
     }
 }
 
@@ -481,13 +481,17 @@ impl LinkerCacheCollector {
         desc: &prometheus::core::Desc,
         value: u64,
     ) -> prometheus::proto::MetricFamily {
-        let mut counter = prometheus::proto::Counter::default();
-        counter.value = Some(value as f64);
+        let counter = prometheus::proto::Counter {
+            value: Some(value as f64),
+            ..Default::default()
+        };
         let mut metric = prometheus::proto::Metric::default();
         metric.set_counter(counter);
-        let mut mf = prometheus::proto::MetricFamily::default();
-        mf.name = Some(desc.fq_name.clone());
-        mf.help = Some(desc.help.clone());
+        let mut mf = prometheus::proto::MetricFamily {
+            name: Some(desc.fq_name.clone()),
+            help: Some(desc.help.clone()),
+            ..Default::default()
+        };
         mf.set_field_type(prometheus::proto::MetricType::COUNTER);
         mf.set_metric(vec![metric]);
         mf

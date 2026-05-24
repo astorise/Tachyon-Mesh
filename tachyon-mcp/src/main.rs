@@ -1373,11 +1373,12 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 && scope_denial_total > 0
             {
                 (
-                    Some(format!(
+                    Some(
                         "# Conservative starting point — tighten patterns after observing runtime behaviour\n\
                          scopes:\n  secrets: [\"**\"]\n  kv: [\"**\"]\n  http_client: [\"**\"]\n\
                          # Remove categories your function does not use"
-                    )),
+                            .to_string(),
+                    ),
                     format!(
                         "Route is allow-all with {scope_denial_total} lifetime denial(s). \
                          Suggested scopes grant all patterns within each category as a safe starting point. \
@@ -1918,7 +1919,9 @@ mod tests {
             "tachyon_set_route_scopes must have a rate limit"
         );
         assert_eq!(
-            spec_set.unwrap().limit,
+            spec_set
+                .expect("set_route_scopes must have a rate limit spec")
+                .limit,
             1,
             "set_route_scopes limit must be 1/min"
         );
@@ -1929,7 +1932,9 @@ mod tests {
             "tachyon_get_scope_denials must have a rate limit"
         );
         assert_eq!(
-            spec_get.unwrap().limit,
+            spec_get
+                .expect("get_scope_denials must have a rate limit spec")
+                .limit,
             30,
             "get_scope_denials limit must be 30/min"
         );
@@ -1940,7 +1945,9 @@ mod tests {
             "tachyon_suggest_scopes must have a rate limit"
         );
         assert_eq!(
-            spec_suggest.unwrap().limit,
+            spec_suggest
+                .expect("suggest_scopes must have a rate limit spec")
+                .limit,
             30,
             "suggest_scopes limit must be 30/min"
         );
