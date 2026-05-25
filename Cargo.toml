@@ -42,6 +42,8 @@ members = [
     "systems/system-faas-prom",
     "systems/system-faas-registry",
     "systems/system-faas-model-broker",
+    "systems/system-faas-ai-list-model",
+    "systems/system-faas-openai-adapter",
     "systems/system-faas-media-server",
     "systems/system-faas-mesh-overlay",
     "systems/system-faas-microvm-runner",

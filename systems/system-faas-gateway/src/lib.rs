@@ -14,6 +14,8 @@ const GATEWAY_ROUTE: &str = "/system/gateway";
 const MEDIA_SERVER_ROUTE: &str = "/system/media-server";
 const OLAP_ENGINE_ROUTE: &str = "/system/olap-engine";
 const MATERIALIZED_VIEW_PREFIX: &str = "/api/views/";
+const OPENAI_ADAPTER_ROUTE: &str = "/system/ai-openai-adapter";
+const OPENAI_V1_PREFIX: &str = "/v1/";
 
 struct Component;
 
@@ -63,6 +65,7 @@ enum GatewayTargetKind {
     Media,
     Olap,
     MaterializedView,
+    OpenAiAdapter,
 }
 
 struct GatewayTarget {
@@ -92,6 +95,12 @@ fn route_baas_request(
         return GatewayTarget {
             route: original_route.to_owned(),
             kind: GatewayTargetKind::MaterializedView,
+        };
+    }
+    if original_route.starts_with(OPENAI_V1_PREFIX) || original_route == "/v1" {
+        return GatewayTarget {
+            route: OPENAI_ADAPTER_ROUTE.to_owned(),
+            kind: GatewayTargetKind::OpenAiAdapter,
         };
     }
     GatewayTarget {
@@ -249,5 +258,19 @@ mod tests {
             materialized_view_key(&target.route),
             Some("V:dashboard/user123".to_owned())
         );
+    }
+
+    #[test]
+    fn v1_models_routes_to_openai_adapter() {
+        let target = route_baas_request("/v1/models", &[], b"");
+        assert_eq!(target.kind, GatewayTargetKind::OpenAiAdapter);
+        assert_eq!(target.route, OPENAI_ADAPTER_ROUTE);
+    }
+
+    #[test]
+    fn v1_chat_completions_routes_to_openai_adapter() {
+        let target = route_baas_request("/v1/chat/completions", &[], b"{}");
+        assert_eq!(target.kind, GatewayTargetKind::OpenAiAdapter);
+        assert_eq!(target.route, OPENAI_ADAPTER_ROUTE);
     }
 }

@@ -1,0 +1,19 @@
+package tachyon:ai@1.1.0;
+
+/// Persistent index of AI models available on this Tachyon node.
+/// system-faas-ai-list-model is the authoritative implementation;
+/// system-faas-openai-adapter consumes it over the internal HTTP mesh.
+interface model-registry {
+    record model-info {
+        /// Human-readable identifier (alias supplied at upload time, falls back to sha256 hash).
+        alias: string,
+        /// Inference engine format, e.g. "gguf".
+        engine: string,
+        /// Estimated VRAM footprint in MiB; 0 when unknown.
+        vram-required-mb: u64,
+        /// Lifecycle state: "available" | "deleted".
+        status: string,
+    }
+
+    list-models: func() -> list<model-info>;
+}

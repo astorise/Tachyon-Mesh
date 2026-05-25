@@ -25,6 +25,7 @@ const COMMIT_PREFIX: &str = "/admin/models/commit/";
 const ABORT_PREFIX: &str = "/admin/models/abort/";
 const AUTH_SESSION_CDC_PATH: &str = "/internal/model-broker/cdc/auth-session";
 const PROMPT_FINISHED_PATH: &str = "/internal/model-broker/prompt-finished";
+const AI_LIST_MODEL_REGISTER_URL: &str = "http://mesh/internal/ai-list-model/register";
 const STANDARD_VRAM_TTL_SECONDS: u64 = 300;
 const EXTENDED_VRAM_TTL_SECONDS: u64 = 1_800;
 const HIGH_FOLLOWUP_PROBABILITY: f32 = 0.8;
@@ -35,6 +36,8 @@ struct Component;
 struct InitUploadRequest {
     expected_hash: String,
     size_bytes: u64,
+    #[serde(default)]
+    alias: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +97,17 @@ struct PendingUpload {
     size_bytes: u64,
     bytes_received: u64,
     last_part: u64,
+    #[serde(default)]
+    alias: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelRegistryEntry {
+    alias: String,
+    engine: String,
+    #[serde(rename = "vramRequiredMb")]
+    vram_required_mb: u64,
+    status: String,
 }
 
 impl bindings::exports::tachyon::mesh::handler::Guest for Component {
@@ -245,6 +259,7 @@ fn init_upload(body: &[u8]) -> Result<String, String> {
             size_bytes: payload.size_bytes,
             bytes_received: 0,
             last_part: 0,
+            alias: payload.alias,
         },
     )?;
 
@@ -348,7 +363,33 @@ fn commit_upload(uri: &str) -> Result<String, String> {
         })?;
     }
 
+    let alias = pending
+        .alias
+        .unwrap_or_else(|| pending.expected_hash.trim_start_matches("sha256:").to_owned());
+    notify_ai_list_model(&alias);
+
     Ok(model_path.to_string_lossy().to_string())
+}
+
+/// Best-effort notification to system-faas-ai-list-model that a model is now available.
+/// Failures are swallowed — the commit has already succeeded and the registry can be
+/// refreshed on the next model upload or operator intervention.
+fn notify_ai_list_model(alias: &str) {
+    let entry = ModelRegistryEntry {
+        alias: alias.to_owned(),
+        engine: "gguf".to_owned(),
+        vram_required_mb: 0,
+        status: "available".to_owned(),
+    };
+    let Ok(body) = serde_json::to_vec(&entry) else {
+        return;
+    };
+    let _ = bindings::tachyon::mesh::outbound_http::send_request(
+        "POST",
+        AI_LIST_MODEL_REGISTER_URL,
+        &[("content-type".to_owned(), "application/json".to_owned())],
+        &body,
+    );
 }
 
 /// Explicit client-driven cleanup for an in-progress upload. The broker is request-driven

@@ -131,6 +131,18 @@ version = "1.1.0-alpha"
 description = "Model upload and prewarm broker"
 
 [[system]]
+slug = "ai-list-model"
+crate_name = "system-faas-ai-list-model"
+version = "1.1.0-alpha"
+description = "Persistent AI model registry (kv-partition index)"
+
+[[system]]
+slug = "ai-openai-adapter"
+crate_name = "system-faas-openai-adapter"
+version = "1.1.0-alpha"
+description = "OpenAI-compatible REST adapter for the AI model registry"
+
+[[system]]
 slug = "node-registry"
 crate_name = "system-faas-node-registry"
 version = "1.1.0-alpha"
