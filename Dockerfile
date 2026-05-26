@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     file \
+    golang-go \
     libayatana-appindicator3-dev \
     librsvg2-dev \
     libssl-dev \
@@ -15,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxdo-dev \
     musl-tools \
     nasm \
+    perl \
     pkg-config \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
