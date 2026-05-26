@@ -408,17 +408,25 @@ jobs:
   # ── 9. Mutation tests (weekly schedule only) ─────────────────────────────────
   mutation-tests:
     if: github.event_name == 'schedule'
+    needs: build-guests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: wasm-guests-${{ github.sha }}
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
+
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
 
       - name: Run auth mutation tests
-        run: cargo mutants --package core-host --file core-host/src/auth.rs --timeout 120
+        run: cargo mutants --package core-host --file core-host/src/auth.rs --timeout 120 --copy-target true
 
   # ── 10. Miri cwasm cache (weekly schedule only) ───────────────────────────────
   miri-cwasm-cache:

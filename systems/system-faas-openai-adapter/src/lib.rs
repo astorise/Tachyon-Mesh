@@ -100,19 +100,12 @@ fn route_request(method: &str, path: &str) -> Result<(u16, Vec<u8>), String> {
 }
 
 fn handle_list_models() -> Result<(u16, Vec<u8>), String> {
-    let upstream = bindings::tachyon::mesh::outbound_http::send_request(
-        "GET",
-        LIST_MODELS_URL,
-        &[],
-        &[],
-    )
-    .map_err(|e| format!("failed to reach ai-list-model: {e}"))?;
+    let upstream =
+        bindings::tachyon::mesh::outbound_http::send_request("GET", LIST_MODELS_URL, &[], &[])
+            .map_err(|e| format!("failed to reach ai-list-model: {e}"))?;
 
     if upstream.status != 200 {
-        return Err(format!(
-            "ai-list-model returned status {}",
-            upstream.status
-        ));
+        return Err(format!("ai-list-model returned status {}", upstream.status));
     }
 
     let models: Vec<ModelInfo> = serde_json::from_slice(&upstream.body)
@@ -167,15 +160,16 @@ mod tests {
                 kind: "invalid_request_error",
             },
         })
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        .expect("error response should serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("serialized error should parse");
         assert!(parsed["error"]["message"].is_string());
     }
 
     #[test]
     fn chat_completions_returns_501() {
         let result = route_request("POST", ROUTE_CHAT_COMPLETIONS);
-        let (status, _) = result.unwrap();
+        let (status, _) = result.expect("chat completions route should return a response");
         assert_eq!(status, 501);
     }
 }

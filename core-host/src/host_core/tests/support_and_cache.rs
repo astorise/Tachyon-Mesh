@@ -356,15 +356,15 @@ pub(super) fn instance_pool_evicts_idle_entries_for_hibernation() {
 
 #[test]
 pub(super) fn cwasm_cache_deserializes_same_engine_component() {
-    let runtime = build_test_runtime(IntegrityConfig::default_sealed());
-    let component =
-        Component::new(&runtime.engine, "(component)").expect("test component should compile");
+    let engine = build_command_engine(&IntegrityConfig::default_sealed())
+        .expect("component engine should be created");
+    let component = Component::new(&engine, "(component)").expect("test component should compile");
     let compiled = component
         .serialize()
         .expect("test component should serialize to cwasm bytes");
     // SAFETY: this test deserializes bytes produced by the same Wasmtime
     // engine instance immediately above, matching the cwasm cache invariant.
-    let restored = unsafe { Component::deserialize(&runtime.engine, &compiled) }
+    let restored = unsafe { Component::deserialize(&engine, &compiled) }
         .expect("same-engine cwasm component should deserialize");
     drop(restored);
 }
