@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     file \
+    golang-go \
     libayatana-appindicator3-dev \
     librsvg2-dev \
     libssl-dev \
@@ -15,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxdo-dev \
     musl-tools \
     nasm \
+    perl \
     pkg-config \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
@@ -45,7 +47,7 @@ RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p guest-loop --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-ui --release
-# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=fips
+# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=http3
 # to produce a feature-specific image variant.
 ARG CARGO_FEATURES=""
 RUN set -eux; \
