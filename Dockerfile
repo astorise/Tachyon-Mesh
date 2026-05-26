@@ -48,13 +48,10 @@ RUN cargo build -p guest-loop --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-ui --release
 # CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=http3
-# to produce a feature-specific image variant, or CARGO_ALL_FEATURES=true to enable all features.
-ARG CARGO_ALL_FEATURES=""
+# to produce a feature-specific image variant.
 ARG CARGO_FEATURES=""
 RUN set -eux; \
-    if [ "${CARGO_ALL_FEATURES}" = "true" ]; then \
-      cargo build -p core-host --target x86_64-unknown-linux-musl --release --all-features; \
-    elif [ -n "${CARGO_FEATURES}" ]; then \
+    if [ -n "${CARGO_FEATURES}" ]; then \
       cargo build -p core-host --target x86_64-unknown-linux-musl --release --features "${CARGO_FEATURES}"; \
     else \
       cargo build -p core-host --target x86_64-unknown-linux-musl --release; \
