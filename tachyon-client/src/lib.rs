@@ -488,6 +488,21 @@ pub struct ClusterHardwareSummary {
     pub gpu_count: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterFeatureSet {
+    pub has_enrolled_nodes: bool,
+    pub has_fleet: bool,
+    pub has_ai: bool,
+    pub has_routing: bool,
+    pub has_resilience: bool,
+    pub has_identity: bool,
+    pub has_rbac: bool,
+    pub has_storage: bool,
+    pub has_observability: bool,
+    pub has_supply_chain: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HardwareStatus {
@@ -843,6 +858,31 @@ pub async fn list_enrolled_nodes() -> Result<Vec<EnrolledNode>> {
         }
         Err(error) => Err(error),
     }
+}
+
+pub async fn get_cluster_features() -> Result<ClusterFeatureSet> {
+    use std::collections::HashSet;
+    let nodes = list_enrolled_nodes().await?;
+    let slugs: HashSet<&str> = nodes
+        .iter()
+        .flat_map(|n| n.capabilities.active_systems.iter().map(|s| s.slug.as_str()))
+        .collect();
+    Ok(ClusterFeatureSet {
+        has_enrolled_nodes: !nodes.is_empty(),
+        has_fleet: nodes.len() > 1,
+        has_ai: slugs.contains("ai-list-model")
+            || slugs.contains("model-broker")
+            || slugs.contains("buffer"),
+        has_routing: slugs.contains("gateway") || slugs.contains("mesh-overlay"),
+        has_resilience: slugs.contains("shadow-proxy") || slugs.contains("dist-limiter"),
+        has_identity: slugs.contains("authn"),
+        has_rbac: slugs.contains("authz"),
+        has_storage: slugs.contains("s3-proxy") || slugs.contains("storage-broker"),
+        has_observability: slugs.contains("otel")
+            || slugs.contains("prom")
+            || slugs.contains("logger"),
+        has_supply_chain: slugs.contains("registry") || slugs.contains("gitops-broker"),
+    })
 }
 
 pub async fn get_node_capabilities(node_id: &str) -> Result<NodeCapabilities> {

@@ -394,6 +394,17 @@ fn self_registry_node(node_id: &str, state: &AppState) -> RegistryEnrolledNode {
     let available_ram_mb = sys.available_memory() / 1024 / 1024;
     let accelerators = state.host_capabilities.names();
     let gpus = detect_self_gpus(&state.host_capabilities);
+    let runtime = state.runtime.load();
+    let active_systems = runtime
+        .config
+        .routes
+        .iter()
+        .filter(|r| r.role == RouteRole::System)
+        .map(|r| RegistryActiveSystem {
+            slug: r.path.trim_start_matches("/system/").to_owned(),
+            version: r.version.clone(),
+        })
+        .collect();
     RegistryEnrolledNode {
         node_id: node_id.to_owned(),
         public_key: node_id.to_owned(),
@@ -407,7 +418,7 @@ fn self_registry_node(node_id: &str, state: &AppState) -> RegistryEnrolledNode {
             available_ram_mb,
             accelerators,
             gpus,
-            active_systems: Vec::new(),
+            active_systems,
         },
     }
 }
