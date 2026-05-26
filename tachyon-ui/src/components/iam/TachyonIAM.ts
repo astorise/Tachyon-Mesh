@@ -386,6 +386,7 @@ export class TachyonIAM extends HTMLElement {
 
   private async completeAuthentication(detail: AuthenticatedDetail): Promise<void> {
     this.hideError();
+    window.dispatchEvent(new CustomEvent("connection:connected"));
     this.dispatchEvent(new CustomEvent("iam:authenticated", { bubbles: true, composed: true, detail }));
     await gsap.to(this.panel(), { y: -12, opacity: 0, duration: 0.2 });
     this.classList.add("hidden");
@@ -413,7 +414,12 @@ export class TachyonIAM extends HTMLElement {
     }
     const first = this.value("signup-first-name").toLowerCase();
     const last = this.value("signup-last-name").toLowerCase();
-    username.value = [first, last].filter(Boolean).join(".").replace(/[^a-z0-9._-]/g, "");
+    username.value = [first, last]
+      .filter(Boolean)
+      .join(".")
+      .normalize("NFD")
+      .replace(/\p{M}/gu, "")
+      .replace(/[^a-z0-9._-]/g, "");
   }
 
   private async renderTotpEnrollment(session: StagedSignupSession): Promise<void> {
