@@ -19,6 +19,7 @@ async function installMocks(page: Page): Promise<void> {
           list_registered_systems: [],
           list_deployed_systems: [],
           get_cluster_hardware_summary: { source: "mock", enrolledCount: 0, onlineCount: 0, staleCount: 0, totalRamMb: 0, gpuCount: 0 },
+          get_cluster_features: { hasEnrolledNodes: true, hasFleet: true, hasAi: true, hasRouting: true, hasResilience: true, hasIdentity: true, hasRbac: true, hasStorage: true, hasObservability: true, hasSupplyChain: true },
           get_resources: [],
           load_credentials: null,
           load_custom_ca: null,
