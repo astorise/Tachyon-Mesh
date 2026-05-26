@@ -53,8 +53,8 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         let info: ModelInfo = serde_json::from_slice(body)
             .map_err(|e| format!("invalid model registration payload: {e}"))?;
         let table = bindings::tachyon::mesh::kv_partition::Table::new(MODELS_TABLE);
-        let value = serde_json::to_vec(&info)
-            .map_err(|e| format!("failed to encode model info: {e}"))?;
+        let value =
+            serde_json::to_vec(&info).map_err(|e| format!("failed to encode model info: {e}"))?;
         table
             .set(&info.alias, &value)
             .map_err(|e| format!("model registry write failed: {e}"))?;
@@ -74,8 +74,8 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
 
     if method.eq_ignore_ascii_case("GET") && path == ROUTE_LIST {
         let models = list_models()?;
-        let body = serde_json::to_vec(&models)
-            .map_err(|e| format!("failed to encode model list: {e}"))?;
+        let body =
+            serde_json::to_vec(&models).map_err(|e| format!("failed to encode model list: {e}"))?;
         return Ok((200, body));
     }
 
