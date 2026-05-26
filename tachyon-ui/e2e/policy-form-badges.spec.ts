@@ -41,6 +41,7 @@ async function installMocks(page: Page): Promise<void> {
 
 async function authenticate(page: Page): Promise<void> {
   await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent("connection:connected"));
     document.dispatchEvent(
       new CustomEvent("iam:authenticated", {
         bubbles: true,
@@ -48,6 +49,8 @@ async function authenticate(page: Page): Promise<void> {
       }),
     );
   });
+  // Give clusterFeaturesStore time to resolve get_cluster_features before navigation.
+  await page.waitForTimeout(200);
 }
 
 async function navigateTo(page: Page, route: string): Promise<void> {

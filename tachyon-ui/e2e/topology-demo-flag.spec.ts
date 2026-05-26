@@ -36,6 +36,7 @@ async function installMocksEmpty(page: Page): Promise<void> {
 
 async function authenticate(page: Page): Promise<void> {
   await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent("connection:connected"));
     document.dispatchEvent(
       new CustomEvent("iam:authenticated", {
         bubbles: true,
@@ -43,6 +44,7 @@ async function authenticate(page: Page): Promise<void> {
       }),
     );
   });
+  await page.waitForTimeout(200);
 }
 
 test.describe("Topology demo flag (?demo=1)", () => {
