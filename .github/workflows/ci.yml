@@ -483,6 +483,12 @@ jobs:
             context: .
             cargo_features: "rate-limit,resiliency,mtls,secrets-vault,websockets"
             feature_tag: "-security"
+          - image_name: tachyon-mesh
+            dockerfile: ./Dockerfile
+            context: .
+            cargo_features: ""
+            cargo_all_features: "true"
+            feature_tag: "-all-features"
     steps:
       - uses: actions/checkout@v6
 
@@ -523,5 +529,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             CARGO_FEATURES=${{ matrix.cargo_features }}
+            CARGO_ALL_FEATURES=${{ matrix.cargo_all_features }}
           cache-from: type=gha,scope=${{ matrix.feature_tag || 'default' }}
           cache-to: type=gha,mode=max,scope=${{ matrix.feature_tag || 'default' }}
