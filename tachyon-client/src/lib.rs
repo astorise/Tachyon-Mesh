@@ -865,7 +865,12 @@ pub async fn get_cluster_features() -> Result<ClusterFeatureSet> {
     let nodes = list_enrolled_nodes().await?;
     let slugs: HashSet<&str> = nodes
         .iter()
-        .flat_map(|n| n.capabilities.active_systems.iter().map(|s| s.slug.as_str()))
+        .flat_map(|n| {
+            n.capabilities
+                .active_systems
+                .iter()
+                .map(|s| s.slug.as_str())
+        })
         .collect();
     Ok(ClusterFeatureSet {
         has_enrolled_nodes: !nodes.is_empty(),
