@@ -651,6 +651,13 @@ async fn list_deployed_systems() -> Result<Vec<tachyon_client::DeployedSystem>, 
 }
 
 #[tauri::command]
+async fn get_cluster_features() -> Result<tachyon_client::ClusterFeatureSet, String> {
+    tachyon_client::get_cluster_features()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_cluster_hardware_summary() -> Result<tachyon_client::ClusterHardwareSummary, String> {
     tachyon_client::get_cluster_hardware_summary()
         .await
@@ -1300,6 +1307,7 @@ fn main() {
             get_node_capabilities,
             list_registered_systems,
             list_deployed_systems,
+            get_cluster_features,
             get_cluster_hardware_summary,
             get_staged_config,
             get_active_config,
