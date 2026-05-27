@@ -600,6 +600,15 @@ async fn push_asset(path: String, bytes: Option<Vec<u8>>) -> Result<String, Stri
 }
 
 #[tauri::command]
+async fn import_faas_package(
+    bytes: Vec<u8>,
+) -> Result<tachyon_client::ImportPackageResult, String> {
+    tachyon_client::import_faas_package_bytes(&bytes)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn push_large_model(app: tauri::AppHandle, path: String) -> Result<String, String> {
     tachyon_client::push_large_model_with_progress(&path, |percentage| {
         let _ = app.emit("upload_progress", percentage);
@@ -1300,6 +1309,7 @@ fn main() {
             generate_pat,
             generate_operator_invite,
             push_asset,
+            import_faas_package,
             push_large_model,
             get_resources,
             get_hardware_status,

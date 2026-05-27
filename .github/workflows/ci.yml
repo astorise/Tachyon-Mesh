@@ -54,7 +54,8 @@ jobs:
         run: |
           tar --transform 's|.*/||' -czf guest-examples.tar.gz \
             target/wasm32-wasip1/release/guest_*.wasm \
-            target/wasm32-wasip2/release/guest_*.wasm
+            target/wasm32-wasip2/release/guest_*.wasm \
+            examples/guest-examples/manifest.json
 
       - name: Upload example guest modules archive
         uses: actions/upload-artifact@v7

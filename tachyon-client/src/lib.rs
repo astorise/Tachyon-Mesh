@@ -3209,6 +3209,171 @@ pub async fn push_asset_bytes(path: &str, bytes: &[u8]) -> Result<String> {
     Ok(payload.asset_uri)
 }
 
+/// A single WASM module uploaded during a package import.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedModule {
+    pub name: String,
+    pub asset_uri: String,
+}
+
+/// Result returned by [`import_faas_package`] / [`import_faas_package_bytes`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPackageResult {
+    pub imported_modules: Vec<ImportedModule>,
+    pub skipped_modules: Vec<String>,
+    pub routes_added: usize,
+}
+
+/// Read a `.tar.gz` FaaS package from `package_path`, upload every `.wasm`
+/// inside it as an asset, then register the routes from `manifest.json`.
+pub async fn import_faas_package(package_path: &str) -> Result<ImportPackageResult> {
+    let bytes = tokio::fs::read(package_path)
+        .await
+        .with_context(|| format!("failed to read package `{package_path}`"))?;
+    import_faas_package_bytes(&bytes).await
+}
+
+/// Same as [`import_faas_package`] but accepts the archive bytes directly.
+pub async fn import_faas_package_bytes(data: &[u8]) -> Result<ImportPackageResult> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use tar::Archive;
+
+    let gz = GzDecoder::new(data);
+    let mut archive = Archive::new(gz);
+
+    let mut wasm_files: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut manifest_bytes: Option<Vec<u8>> = None;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if filename == "manifest.json" {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            manifest_bytes = Some(buf);
+        } else if let Some(stem) = filename.strip_suffix(".wasm") {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            wasm_files.insert(stem.to_owned(), buf);
+        }
+    }
+
+    let manifest_bytes = manifest_bytes
+        .ok_or_else(|| anyhow::anyhow!("package does not contain manifest.json"))?;
+
+    #[derive(Deserialize)]
+    struct PackageManifest {
+        routes: Vec<serde_json::Value>,
+    }
+    let manifest: PackageManifest =
+        serde_json::from_slice(&manifest_bytes).context("failed to parse manifest.json")?;
+
+    // Upload each WASM module and build a lookup: module-name → asset URI.
+    // Store under both the raw stem (guest_example) and the dash form (guest-example).
+    let mut module_uris: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut imported_modules: Vec<ImportedModule> = Vec::new();
+
+    for (stem, bytes) in &wasm_files {
+        let uri = push_asset_bytes(stem, bytes)
+            .await
+            .with_context(|| format!("failed to upload module `{stem}`"))?;
+        let dash_name = stem.replace('_', "-");
+        module_uris.insert(stem.clone(), uri.clone());
+        module_uris.insert(dash_name.clone(), uri.clone());
+        imported_modules.push(ImportedModule {
+            name: dash_name,
+            asset_uri: uri,
+        });
+    }
+
+    // Process manifest routes: replace each module reference with its asset URI.
+    let mut routes_to_add: Vec<serde_json::Value> = Vec::new();
+    let mut skipped_modules: Vec<String> = Vec::new();
+
+    for mut route in manifest.routes {
+        let has_targets = route
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
+
+        if has_targets {
+            let targets = route["targets"].as_array().cloned().unwrap_or_default();
+            let mut new_targets: Vec<serde_json::Value> = Vec::new();
+            let mut any_resolved = false;
+            for mut target in targets {
+                let module_name = target
+                    .get("module")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if let Some(uri) = module_uris.get(&module_name) {
+                    target["module"] = serde_json::Value::String(uri.clone());
+                    any_resolved = true;
+                }
+                new_targets.push(target);
+            }
+            if !any_resolved {
+                let route_path = route
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_owned();
+                skipped_modules.push(route_path);
+                continue;
+            }
+            route["targets"] = serde_json::Value::Array(new_targets);
+        } else {
+            let name = route
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if let Some(uri) = module_uris.get(&name) {
+                route["targets"] =
+                    serde_json::json!([{ "module": uri, "weight": 100 }]);
+            } else {
+                skipped_modules.push(name);
+                continue;
+            }
+        }
+        routes_to_add.push(route);
+    }
+
+    let routes_added = routes_to_add.len();
+
+    if !routes_to_add.is_empty() {
+        let mut config = load_live_config_payload().await?;
+        let routes = config
+            .get_mut("routes")
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| anyhow::anyhow!("manifest has no routes array"))?;
+
+        for new_route in &routes_to_add {
+            let path = new_route
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            routes.retain(|r| r.get("path").and_then(|v| v.as_str()) != Some(path));
+        }
+        routes.extend(routes_to_add);
+        patch_and_apply_manifest(config).await?;
+    }
+
+    Ok(ImportPackageResult {
+        imported_modules,
+        skipped_modules,
+        routes_added,
+    })
+}
+
 pub async fn push_large_model(file_path: &str) -> Result<String> {
     push_large_model_with_progress(file_path, |_| {}).await
 }
