@@ -3265,8 +3265,8 @@ pub async fn import_faas_package_bytes(data: &[u8]) -> Result<ImportPackageResul
         }
     }
 
-    let manifest_bytes = manifest_bytes
-        .ok_or_else(|| anyhow::anyhow!("package does not contain manifest.json"))?;
+    let manifest_bytes =
+        manifest_bytes.ok_or_else(|| anyhow::anyhow!("package does not contain manifest.json"))?;
 
     #[derive(Deserialize)]
     struct PackageManifest {
@@ -3337,8 +3337,7 @@ pub async fn import_faas_package_bytes(data: &[u8]) -> Result<ImportPackageResul
                 .unwrap_or("")
                 .to_owned();
             if let Some(uri) = module_uris.get(&name) {
-                route["targets"] =
-                    serde_json::json!([{ "module": uri, "weight": 100 }]);
+                route["targets"] = serde_json::json!([{ "module": uri, "weight": 100 }]);
             } else {
                 skipped_modules.push(name);
                 continue;
@@ -3357,10 +3356,7 @@ pub async fn import_faas_package_bytes(data: &[u8]) -> Result<ImportPackageResul
             .ok_or_else(|| anyhow::anyhow!("manifest has no routes array"))?;
 
         for new_route in &routes_to_add {
-            let path = new_route
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let path = new_route.get("path").and_then(|v| v.as_str()).unwrap_or("");
             routes.retain(|r| r.get("path").and_then(|v| v.as_str()) != Some(path));
         }
         routes.extend(routes_to_add);
