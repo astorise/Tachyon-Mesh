@@ -103,10 +103,11 @@ jobs:
 
           # /metrics is a system route always present in the default manifest.
           retry_curl /tmp/metrics.txt http://127.0.0.1:8080/metrics
-          assert_contains "process_" /tmp/metrics.txt
+          assert_contains "tachyon_" /tmp/metrics.txt
 
+          # legacy-mock calls tachyon /metrics via FAAS_URL; verify the call succeeds.
           retry_curl /tmp/legacy-to-faas.txt --request POST http://127.0.0.1:8081/call-faas
-          assert_contains "FaaS received an empty payload" /tmp/legacy-to-faas.txt
+          assert_contains "tachyon_" /tmp/legacy-to-faas.txt
 
       - name: Show diagnostics on failure
         if: failure()
