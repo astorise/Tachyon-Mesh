@@ -522,23 +522,6 @@ pub(crate) async fn admin_registered_systems_handler() -> Response {
     (StatusCode::OK, axum::Json(read_system_manifest())).into_response()
 }
 
-pub(crate) async fn admin_modules_handler() -> Response {
-    let modules_dir = PathBuf::from("guest-modules");
-    let mut names: Vec<String> = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(&modules_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    names.push(stem.to_owned());
-                }
-            }
-        }
-    }
-    names.sort();
-    (StatusCode::OK, axum::Json(names)).into_response()
-}
-
 pub(crate) async fn admin_deployed_systems_handler(State(state): State<AppState>) -> Response {
     let nodes = match list_registry_nodes(&state.core_store) {
         Ok(nodes) => nodes,

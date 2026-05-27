@@ -63,7 +63,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/admin/nodes/{node_id}/capabilities",
             post(admin_node_capabilities_handler),
         )
-        .route("/admin/modules", get(admin_modules_handler))
         .route(
             "/admin/systems/registered",
             get(admin_registered_systems_handler),
