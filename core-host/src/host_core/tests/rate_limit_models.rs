@@ -727,42 +727,40 @@ fn embedded_integrity_payload_is_a_valid_runtime_config() {
             .role,
         RouteRole::System
     );
-    assert_eq!(
-        config
-            .sealed_route("/api/guest-example")
-            .expect("embedded config should seal the example route")
-            .allowed_secrets,
-        vec!["DB_PASS".to_owned()]
+    assert!(
+        config.sealed_route("/system/logger").is_some(),
+        "embedded config should seal the system logger route"
     );
-    assert_eq!(
-        config
-            .sealed_route("/api/guest-example")
-            .expect("embedded config should seal the example route")
-            .min_instances,
-        0
-    );
-    assert_eq!(
-        config
-            .sealed_route("/api/guest-example")
-            .expect("embedded config should seal the example route")
-            .max_concurrency,
-        DEFAULT_ROUTE_MAX_CONCURRENCY
-    );
-    assert!(config.sealed_route("/api/guest-example").is_some());
-    assert!(config.sealed_route("/api/guest-loop").is_some());
-    assert!(config.sealed_route("/api/guest-csharp").is_some());
-    assert!(config.sealed_route("/api/guest-java").is_some());
+    // Example routes are no longer part of the default manifest; they are
+    // shipped as a separate guest-examples package and imported on demand.
+    assert!(config.sealed_route("/api/guest-example").is_none());
 }
 
 #[test]
 fn embedded_integrity_payload_allows_legacy_service_resource_alias() {
-    let config = serde_json::from_str::<IntegrityConfig>(EMBEDDED_CONFIG_PAYLOAD)
-        .expect("embedded payload should deserialize into an integrity config");
-    let config = validate_integrity_config(config).expect("embedded config should validate");
+    // Build a minimal config that includes the legacy-service resource and
+    // a caller route. Example routes were removed from the default manifest
+    // so we construct the config locally rather than relying on the embedded
+    // payload containing guest-call-legacy.
+    let caller = IntegrityRoute::user("/api/caller");
+    let mut resources = std::collections::BTreeMap::new();
+    resources.insert(
+        "legacy-service".to_owned(),
+        IntegrityResource::External {
+            target: "http://legacy-service:8081".to_owned(),
+            allowed_methods: vec!["GET".to_owned()],
+        },
+    );
+    let config = validate_integrity_config(IntegrityConfig {
+        routes: vec![caller],
+        resources,
+        ..IntegrityConfig::default_sealed()
+    })
+    .expect("config should validate");
     let route_registry = RouteRegistry::build(&config).expect("route registry should build");
     let caller_route = config
-        .sealed_route("/api/guest-call-legacy")
-        .expect("legacy route should remain sealed");
+        .sealed_route("/api/caller")
+        .expect("caller route should be sealed");
 
     assert_eq!(
         resolve_outbound_http_target(

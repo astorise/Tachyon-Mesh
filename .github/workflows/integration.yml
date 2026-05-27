@@ -101,26 +101,12 @@ jobs:
           retry_curl /tmp/legacy-direct.txt http://127.0.0.1:8081/ping
           assert_contains "legacy_ok" /tmp/legacy-direct.txt
 
-          retry_curl /tmp/faas-direct.txt --request POST --data 'Hello Lean FaaS!' http://127.0.0.1:8080/api/guest-example
-          assert_contains "FaaS received: Hello Lean FaaS!" /tmp/faas-direct.txt
-
-          retry_curl /tmp/faas-go.txt http://127.0.0.1:8080/api/guest-go
-          assert_contains "Hello from TinyGo FaaS!" /tmp/faas-go.txt
-
-          retry_curl /tmp/faas-js.txt http://127.0.0.1:8080/api/guest-js
-          assert_contains "Hello from JavaScript FaaS!" /tmp/faas-js.txt
-
-          retry_curl /tmp/faas-csharp.txt http://127.0.0.1:8080/api/guest-csharp
-          assert_contains "Hello from C# FaaS!" /tmp/faas-csharp.txt
-
-          retry_curl /tmp/faas-java.txt http://127.0.0.1:8080/api/guest-java
-          assert_contains "Hello from Java FaaS!" /tmp/faas-java.txt
+          # /metrics is a system route always present in the default manifest.
+          retry_curl /tmp/metrics.txt http://127.0.0.1:8080/metrics
+          assert_contains "process_" /tmp/metrics.txt
 
           retry_curl /tmp/legacy-to-faas.txt --request POST http://127.0.0.1:8081/call-faas
           assert_contains "FaaS received an empty payload" /tmp/legacy-to-faas.txt
-
-          retry_curl /tmp/faas-to-legacy.txt http://127.0.0.1:8080/api/guest-call-legacy
-          assert_contains "legacy_ok" /tmp/faas-to-legacy.txt
 
       - name: Show diagnostics on failure
         if: failure()
