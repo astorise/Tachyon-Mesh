@@ -50,6 +50,20 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Pack example guest modules
+        run: |
+          tar --transform 's|.*/||' -czf guest-examples.tar.gz \
+            target/wasm32-wasip1/release/guest_*.wasm \
+            target/wasm32-wasip2/release/guest_*.wasm
+
+      - name: Upload example guest modules archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: guest-examples-${{ github.sha }}
+          path: guest-examples.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
   # ── 2. Security audit (runs in parallel with build-guests) ──────────────────
   security-audit:
     runs-on: ubuntu-latest

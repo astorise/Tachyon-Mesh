@@ -49,7 +49,11 @@ RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-ui --release
 # CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=http3
 # to produce a feature-specific image variant.
+# Layers above this ARG are cached independently of the feature set.
 ARG CARGO_FEATURES=""
+# Build and stage system FaaS modules that are gated behind feature flags.
+# The staging directory is copied into the runtime image in one COPY step.
+RUN CARGO_FEATURES="${CARGO_FEATURES}" bash scripts/build-feature-system-faas.sh /workspace/staging-modules
 RUN set -eux; \
     if [ -n "${CARGO_FEATURES}" ]; then \
       cargo build -p core-host --target x86_64-unknown-linux-musl --release --features "${CARGO_FEATURES}"; \
@@ -200,6 +204,7 @@ COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-mod
 COPY --from=javy-builder /workspace/guest-modules/guest_js.wasm /app/guest-modules/guest_js.wasm
 COPY --from=dotnet-builder /workspace/guest-modules/. /app/guest-modules/
 COPY --from=java-builder /workspace/guest-modules/guest_java.wasm /app/guest-modules/guest_java.wasm
+COPY --from=rust-builder /workspace/staging-modules/ /app/guest-modules/
 
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
