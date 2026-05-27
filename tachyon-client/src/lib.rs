@@ -863,26 +863,51 @@ pub async fn list_enrolled_nodes() -> Result<Vec<EnrolledNode>> {
 pub async fn get_cluster_features() -> Result<ClusterFeatureSet> {
     use std::collections::HashSet;
     let nodes = list_enrolled_nodes().await?;
-    let slugs: HashSet<&str> = nodes
+    let slugs: HashSet<String> = nodes
         .iter()
         .flat_map(|n| {
             n.capabilities
                 .active_systems
                 .iter()
-                .map(|s| s.slug.as_str())
+                .map(|s| s.slug.clone())
         })
         .collect();
+
+    // Also check available WASM modules on the connected node so that
+    // feature-gated panels appear even on nodes running an older binary that
+    // does not yet auto-inject the corresponding system routes.
+    let available_wasm_stems: HashSet<String> = if current_connection().is_some() {
+        get_admin_json::<Vec<String>>("/admin/modules")
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let has_wasm = |slug: &str| -> bool {
+        let stem = format!("system_faas_{}", slug.replace('-', "_"));
+        available_wasm_stems.contains(&stem)
+    };
+
     Ok(ClusterFeatureSet {
         has_enrolled_nodes: !nodes.is_empty(),
         has_fleet: nodes.len() > 1,
         has_ai: slugs.contains("ai-list-model")
             || slugs.contains("model-broker")
-            || slugs.contains("buffer"),
+            || slugs.contains("buffer")
+            || has_wasm("ai-list-model")
+            || has_wasm("model-broker")
+            || has_wasm("buffer"),
         has_routing: slugs.contains("gateway") || slugs.contains("mesh-overlay"),
         has_resilience: slugs.contains("shadow-proxy") || slugs.contains("dist-limiter"),
         has_identity: slugs.contains("authn"),
         has_rbac: slugs.contains("authz"),
-        has_storage: slugs.contains("s3-proxy") || slugs.contains("storage-broker"),
+        has_storage: slugs.contains("s3-proxy")
+            || slugs.contains("storage-broker")
+            || has_wasm("s3-proxy")
+            || has_wasm("storage-broker"),
         has_observability: slugs.contains("otel")
             || slugs.contains("prom")
             || slugs.contains("logger"),

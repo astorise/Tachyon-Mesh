@@ -17,6 +17,40 @@ pub(crate) fn ensure_rustls_crypto_provider() {
     tls_runtime::ensure_crypto_provider();
 }
 
+/// Inject system routes that are always active when their feature flag is
+/// compiled in, without requiring the operator to manually add them via the
+/// manifest.  Routes already present in the config are left untouched.
+pub(crate) fn inject_feature_routes(mut config: IntegrityConfig) -> IntegrityConfig {
+    #[allow(unused_mut)]
+    let mut to_inject: Vec<(&str, &str)> = Vec::new();
+
+    #[cfg(feature = "ai-inference")]
+    {
+        to_inject.push(("/system/model-broker", "model-broker"));
+        to_inject.push(("/system/ai-list-model", "ai-list-model"));
+    }
+
+    #[cfg(feature = "s3-persistence")]
+    {
+        to_inject.push(("/system/s3-proxy", "s3-proxy"));
+        to_inject.push(("/system/storage-broker", "storage-broker"));
+    }
+
+    for (path, name) in to_inject {
+        if config.routes.iter().any(|r| r.path == path) {
+            continue;
+        }
+        config.routes.push(IntegrityRoute {
+            path: path.to_owned(),
+            role: RouteRole::System,
+            name: name.to_owned(),
+            version: "1.1.0-alpha".to_owned(),
+            ..IntegrityRoute::default()
+        });
+    }
+    config
+}
+
 pub(crate) fn verify_integrity() -> Result<IntegrityConfig> {
     match verify_integrity_payload(
         EMBEDDED_CONFIG_PAYLOAD,
@@ -486,6 +520,23 @@ pub(crate) async fn admin_node_capabilities_handler(
 
 pub(crate) async fn admin_registered_systems_handler() -> Response {
     (StatusCode::OK, axum::Json(read_system_manifest())).into_response()
+}
+
+pub(crate) async fn admin_modules_handler() -> Response {
+    let modules_dir = PathBuf::from("guest-modules");
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&modules_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_owned());
+                }
+            }
+        }
+    }
+    names.sort();
+    (StatusCode::OK, axum::Json(names)).into_response()
 }
 
 pub(crate) async fn admin_deployed_systems_handler(State(state): State<AppState>) -> Response {

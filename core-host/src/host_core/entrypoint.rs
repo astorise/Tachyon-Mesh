@@ -31,7 +31,7 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     let telemetry =
         telemetry::init_telemetry_with_emitter(move |line| export_sender.try_send(line).is_ok());
     let memory_governor = Arc::new(memory_governor::MemoryGovernor::from_system_memory());
-    let runtime = build_runtime_state(verify_integrity()?)?;
+    let runtime = build_runtime_state(inject_feature_routes(verify_integrity()?))?;
     maybe_init_l4_acceleration(accel, &runtime.config.layer4);
     if maybe_run_bootstrap_mode(&runtime.config).await? {
         return Ok(());
