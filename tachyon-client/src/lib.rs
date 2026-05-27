@@ -3241,6 +3241,10 @@ pub async fn import_faas_package_bytes(data: &[u8]) -> Result<ImportPackageResul
     use std::io::Read;
     use tar::Archive;
 
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+
     let gz = GzDecoder::new(data);
     let mut archive = Archive::new(gz);
 
@@ -3349,7 +3353,7 @@ pub async fn import_faas_package_bytes(data: &[u8]) -> Result<ImportPackageResul
     let routes_added = routes_to_add.len();
 
     if !routes_to_add.is_empty() {
-        let mut config = load_live_config_payload().await?;
+        let mut config = get_manifest_config().await?;
         let routes = config
             .get_mut("routes")
             .and_then(|v| v.as_array_mut())
