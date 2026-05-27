@@ -38,18 +38,13 @@ if has_feature "s3-persistence"; then
     build_and_stage system-faas-storage-broker system_faas_storage_broker.wasm
 fi
 
-# rate-limit ───────────────────────────────────────────────────────────────────
-if has_feature "rate-limit"; then
-    build_and_stage system-faas-dist-limiter dist_limiter.wasm
-fi
-
 # websockets ───────────────────────────────────────────────────────────────────
 if has_feature "websockets"; then
     build_and_stage system-faas-media-server system_faas_media_server.wasm
 fi
 
 # experimental ─────────────────────────────────────────────────────────────────
+# system-faas-tde is crate-type rlib (not a deployable WASM module).
 if has_feature "experimental"; then
-    build_and_stage system-faas-tde         tde.wasm
     build_and_stage system-faas-tee-runtime tee_runtime.wasm
 fi
