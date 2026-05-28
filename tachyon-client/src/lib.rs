@@ -1523,16 +1523,9 @@ pub async fn get_staged_config(domain: &str) -> Result<Option<serde_json::Value>
 /// active configuration.
 pub async fn get_active_config(domain: &str) -> Result<Option<serde_json::Value>> {
     let payload_json: serde_json::Value = if current_connection().is_some() {
-        // Connected — fetch the live manifest and parse its config_payload.
-        #[derive(serde::Deserialize)]
-        struct LiveManifest {
-            config_payload: String,
-        }
-        match get_admin_json::<LiveManifest>(ADMIN_MANIFEST_PATH).await {
-            Ok(m) => serde_json::from_str(&m.config_payload)
-                .context("failed to parse live manifest config_payload")?,
+        match get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH).await {
+            Ok(config) => config,
             Err(_) => {
-                // Unreachable or older node — fall through to local file.
                 let raw = read_lockfile().await.unwrap_or_default();
                 if raw.is_empty() {
                     return Ok(None);
@@ -2075,14 +2068,9 @@ pub async fn get_manifest_schema() -> Result<serde_json::Value> {
 /// Returns the config as a `serde_json::Value` ready for modification.
 /// Errors if not connected or if the node returns an error.
 pub async fn get_manifest_config() -> Result<serde_json::Value> {
-    #[derive(serde::Deserialize)]
-    struct LiveManifest {
-        config_payload: String,
-    }
-    let m = get_admin_json::<LiveManifest>(ADMIN_MANIFEST_PATH)
+    get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH)
         .await
-        .context("failed to fetch live manifest from node")?;
-    serde_json::from_str(&m.config_payload).context("failed to parse live manifest config_payload")
+        .context("failed to fetch live manifest from node")
 }
 
 /// Sign a modified manifest config and POST it to the active node.
@@ -2431,21 +2419,19 @@ pub async fn detach_s3_volume(route_path: &str, guest_path: &str) -> Result<()> 
 /// Fetch the live IntegrityConfig payload as a mutable JSON Value.
 /// Falls back to the local integrity.lock file when not connected.
 async fn load_live_config_payload() -> Result<serde_json::Value> {
-    #[derive(Deserialize)]
-    struct LiveManifest {
-        config_payload: String,
-    }
-
     if current_connection().is_some() {
-        if let Ok(manifest) = get_admin_json::<LiveManifest>(ADMIN_MANIFEST_PATH).await {
-            return serde_json::from_str(&manifest.config_payload)
-                .context("failed to parse live manifest config_payload");
+        if let Ok(config) = get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH).await {
+            return Ok(config);
         }
     }
 
-    // Fall back to local integrity.lock
+    // Fall back to local integrity.lock (wrapper format: { config_payload, public_key, signature })
+    #[derive(Deserialize)]
+    struct IntegrityManifestFile {
+        config_payload: String,
+    }
     let raw = read_lockfile().await?;
-    let manifest: LiveManifest =
+    let manifest: IntegrityManifestFile =
         serde_json::from_str(&raw).context("failed to parse integrity.lock")?;
     serde_json::from_str(&manifest.config_payload)
         .context("failed to parse integrity.lock config_payload")
