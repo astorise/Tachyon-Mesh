@@ -1756,7 +1756,7 @@ pub(crate) fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget>
             "Integrity Validation Failed: route targets must include a non-empty `module`"
         ));
     }
-    if module.contains('/') || module.contains('\\') {
+    if !system_storage::is_asset_uri(&module) && (module.contains('/') || module.contains('\\')) {
         return Err(anyhow!(
             "Integrity Validation Failed: route targets must use module names, not filesystem paths"
         ));
