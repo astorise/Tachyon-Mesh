@@ -2438,7 +2438,18 @@ async fn load_live_config_payload() -> Result<serde_json::Value> {
 }
 
 /// Serialize `config` back to a string, re-sign, write the lockfile, and POST to /admin/manifest.
-async fn patch_and_apply_manifest(config: serde_json::Value) -> Result<()> {
+async fn patch_and_apply_manifest(mut config: serde_json::Value) -> Result<()> {
+    if let Some(obj) = config.as_object_mut() {
+        let next = obj
+            .get("config_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        obj.insert(
+            "config_version".to_owned(),
+            serde_json::Value::Number(next.into()),
+        );
+    }
     let payload =
         serde_json::to_string(&config).context("failed to serialize patched config payload")?;
     let manifest = sign_manifest_payload(payload).await?;
