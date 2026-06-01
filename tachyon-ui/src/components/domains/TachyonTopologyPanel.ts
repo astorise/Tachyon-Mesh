@@ -355,7 +355,6 @@ export class TachyonTopologyCanvas extends HTMLElement {
 
     this.root.querySelectorAll<HTMLButtonElement>("[data-node-id]").forEach((button) => {
       button.addEventListener("pointerdown", (event) => {
-        if (!this.editable) return;
         this.didDrag = false;
         this.dragState = {
           nodeId: button.dataset.nodeId ?? "",

@@ -1,6 +1,6 @@
 [package]
 name = "system-faas-gc"
-version = "1.1.0-alpha"
+version = "1.0.0"
 edition = "2021"
 
 [[bin]]
