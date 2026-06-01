@@ -28,8 +28,8 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
         bindings::exports::tachyon::mesh::handler::Response {
             status: 200,
             headers: vec![
-                ("content-type".to_owned(), b"application/json".to_vec()),
-                ("x-faas-version".to_owned(), VERSION.as_bytes().to_vec()),
+                ("content-type".to_owned(), "application/json".to_owned()),
+                ("x-faas-version".to_owned(), VERSION.to_owned()),
             ],
             body,
             trailers: vec![],
@@ -41,7 +41,7 @@ fn extract_name(req: &bindings::exports::tachyon::mesh::handler::Request) -> Str
     req.headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("x-guest-name"))
-        .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
+        .map(|(_, v)| v.clone())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "World".to_owned())
 }
