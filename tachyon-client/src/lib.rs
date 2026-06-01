@@ -1057,7 +1057,13 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         let is_wasm_module =
             module_name.ends_with(".wasm") || module_name.starts_with("tachyon://");
 
-        let node_type = if has_models {
+        // For user routes backed by a WASM module, emit both an endpoint node
+        // (the HTTP entry point) and a custom-wasm node (the backing module),
+        // connected by an edge.  This gives the canonical two-tier view where
+        // the gateway/endpoint is clearly distinct from the WASM implementation.
+        let emit_endpoint_pair = role == "user" && is_wasm_module && !has_models;
+
+        let primary_node_type = if has_models {
             "llm"
         } else if role == "system" {
             "system-faas"
@@ -1067,63 +1073,99 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             "endpoint"
         };
 
-        let id = format!("route:{path}");
-        path_to_id.insert(path.to_owned(), id.clone());
+        // Endpoint node (always emitted for user routes).
+        let endpoint_id = format!("route:{path}");
+        path_to_id.insert(path.to_owned(), endpoint_id.clone());
 
-        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        match node_type {
-            "llm" => {
-                if let Some(alias) = route
-                    .get("models")
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|m| m.get("alias").and_then(|v| v.as_str()))
-                {
-                    data.insert("modelName".to_owned(), alias.to_owned());
+        if emit_endpoint_pair || primary_node_type == "endpoint" {
+            let protocol = if path.starts_with("/wss") || path.starts_with("/ws") {
+                "WS"
+            } else if path.starts_with("/grpc") {
+                "gRPC"
+            } else {
+                "HTTP"
+            };
+            let mut ep_data: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            ep_data.insert("protocol".to_owned(), protocol.to_owned());
+            let (x, y) = topology_layout_position("endpoint", &type_order, &mut type_counters);
+            nodes.push(TopologyNodeSpec {
+                id: endpoint_id.clone(),
+                node_type: "endpoint".to_owned(),
+                label: path.to_owned(),
+                x,
+                y,
+                data: ep_data,
+            });
+        }
+
+        // Backing node (system-faas / custom-wasm / llm).
+        if primary_node_type != "endpoint" {
+            let wasm_id = if emit_endpoint_pair {
+                format!("wasm:{name}")
+            } else {
+                endpoint_id.clone()
+            };
+
+            let mut data: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            match primary_node_type {
+                "llm" => {
+                    if let Some(alias) = route
+                        .get("models")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|m| m.get("alias").and_then(|v| v.as_str()))
+                    {
+                        data.insert("modelName".to_owned(), alias.to_owned());
+                    }
                 }
-            }
-            "system-faas" => {
-                data.insert("component".to_owned(), name.to_owned());
-            }
-            "custom-wasm" => {
-                data.insert("capabilityName".to_owned(), name.to_owned());
-                let version = route
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("^1.0.0");
-                data.insert("semver".to_owned(), version.to_owned());
-                if !module_name.is_empty() {
-                    data.insert("assetSource".to_owned(), module_name.to_owned());
+                "system-faas" => {
+                    data.insert("component".to_owned(), name.to_owned());
                 }
+                "custom-wasm" => {
+                    data.insert("capabilityName".to_owned(), name.to_owned());
+                    let version = route
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("^1.0.0");
+                    data.insert("semver".to_owned(), version.to_owned());
+                    if !module_name.is_empty() {
+                        data.insert("assetSource".to_owned(), module_name.to_owned());
+                    }
+                }
+                _ => {}
             }
-            _ => {
-                // endpoint: infer protocol from path or defaults
-                let protocol = if path.starts_with("/wss") || path.starts_with("/ws") {
-                    "WS"
-                } else {
-                    "HTTP"
-                };
-                data.insert("protocol".to_owned(), protocol.to_owned());
+
+            let (x, y) =
+                topology_layout_position(primary_node_type, &type_order, &mut type_counters);
+            nodes.push(TopologyNodeSpec {
+                id: wasm_id.clone(),
+                node_type: primary_node_type.to_owned(),
+                label: name.to_owned(),
+                x,
+                y,
+                data,
+            });
+
+            // Edge: endpoint → backing module.
+            if emit_endpoint_pair {
+                edge_counter += 1;
+                edges.push(TopologyEdgeSpec {
+                    id: format!("e{edge_counter}"),
+                    from: endpoint_id.clone(),
+                    to: wasm_id,
+                });
             }
         }
 
-        let (x, y) = topology_layout_position(node_type, &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
-            id: id.clone(),
-            node_type: node_type.to_owned(),
-            label: name.to_owned(),
-            x,
-            y,
-            data,
-        });
-
-        // Collect dependency edges (route path → other route path).
+        // Dependency edges (route path → other route path).
         if let Some(deps) = route.get("dependencies").and_then(|v| v.as_object()) {
             for dep_path in deps.keys() {
                 edge_counter += 1;
                 edges.push(TopologyEdgeSpec {
                     id: format!("e{edge_counter}"),
-                    from: id.clone(),
+                    from: endpoint_id.clone(),
                     to: format!("route:{dep_path}"),
                 });
             }
