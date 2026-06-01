@@ -1054,8 +1054,8 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
                     .and_then(|v| v.as_str())
             })
             .unwrap_or("");
-        let is_wasm_module = module_name.ends_with(".wasm")
-            || module_name.starts_with("tachyon://");
+        let is_wasm_module =
+            module_name.ends_with(".wasm") || module_name.starts_with("tachyon://");
 
         let node_type = if has_models {
             "llm"
