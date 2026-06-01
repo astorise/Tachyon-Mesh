@@ -972,11 +972,10 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
               <button id="btn-compact"    type="button" class="${btnClass}" title="${t("topology.compact-mode")}">⊞</button>
             </div>
           </div>
-          ${(this.filterText || this.filterTypes.size > 0) ? `
-          <div class="mb-1 flex items-center gap-2 text-[10px] text-slate-500">
+          <div id="filter-badge" class="mb-1 flex items-center gap-2 text-[10px] text-slate-500" style="${(this.filterText || this.filterTypes.size > 0) ? "" : "display:none;"}">
             <span>${t("topology.filter.active")} ${this.computeFilteredGraph().nodes.length} / ${this.nodes.length}</span>
             <button id="btn-clear-filters" type="button" class="text-cyan-400 hover:text-cyan-300">${t("topology.filter.clear")}</button>
-          </div>` : ""}
+          </div>
           <tachyon-topology-canvas></tachyon-topology-canvas>
           <tachyon-node-editor></tachyon-node-editor>
           ${this.nodes.length === 0 && !isDemoTopologyEnabled() ? `
@@ -1246,11 +1245,8 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
 
   private updateFilterBadge(): void {
     const active = this.filterText || this.filterTypes.size > 0;
-    const badge = this.root.querySelector<HTMLElement>("[id='btn-clear-filters']")?.parentElement;
-    if (!badge) {
-      if (active) this.render();
-      return;
-    }
+    const badge = this.root.getElementById("filter-badge") as HTMLElement | null;
+    if (!badge) return;
     if (!active) {
       badge.style.display = "none";
     } else {
