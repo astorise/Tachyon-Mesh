@@ -1005,8 +1005,9 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         }
     };
 
-    // ── Node construction ─────────────────────────────────────────────────────
-    // Track type-row indices for auto-layout.
+    // ── Node construction — two-pass layout ──────────────────────────────────
+    // Pass 1: collect (id, node_type, label, data) without positions.
+    // Pass 2: compute base rows from actual counts, then assign (x, y).
     let type_order = [
         "endpoint",
         "system-faas",
@@ -1017,11 +1018,19 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         "storage",
         "external-resource",
     ];
-    let mut type_counters: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut nodes: Vec<TopologyNodeSpec> = Vec::new();
+
+    struct PendingNode {
+        id: String,
+        node_type: String,
+        label: String,
+        data: std::collections::HashMap<String, String>,
+    }
+
+    let mut pending: Vec<PendingNode> = Vec::new();
     let mut edges: Vec<TopologyEdgeSpec> = Vec::new();
     let mut edge_counter: usize = 0;
+    let mut pending_type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // Map route path → node id for edge construction.
     let mut path_to_id: std::collections::HashMap<String, String> =
@@ -1088,13 +1097,11 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             let mut ep_data: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             ep_data.insert("protocol".to_owned(), protocol.to_owned());
-            let (x, y) = topology_layout_position("endpoint", &type_order, &mut type_counters);
-            nodes.push(TopologyNodeSpec {
+            *pending_type_counts.entry("endpoint".to_owned()).or_insert(0) += 1;
+            pending.push(PendingNode {
                 id: endpoint_id.clone(),
                 node_type: "endpoint".to_owned(),
                 label: path.to_owned(),
-                x,
-                y,
                 data: ep_data,
             });
         }
@@ -1137,14 +1144,13 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
                 _ => {}
             }
 
-            let (x, y) =
-                topology_layout_position(primary_node_type, &type_order, &mut type_counters);
-            nodes.push(TopologyNodeSpec {
+            *pending_type_counts
+                .entry(primary_node_type.to_owned())
+                .or_insert(0) += 1;
+            pending.push(PendingNode {
                 id: wasm_id.clone(),
                 node_type: primary_node_type.to_owned(),
                 label: name.to_owned(),
-                x,
-                y,
                 data,
             });
 
@@ -1196,13 +1202,11 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             data.insert("modelRef".to_owned(), model_ref.to_owned());
         }
 
-        let (x, y) = topology_layout_position("kv-cache", &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
+        *pending_type_counts.entry("kv-cache".to_owned()).or_insert(0) += 1;
+        pending.push(PendingNode {
             id: id.clone(),
             node_type: "kv-cache".to_owned(),
             label: name.to_owned(),
-            x,
-            y,
             data,
         });
 
@@ -1229,14 +1233,31 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         data.insert("targetUrl".to_owned(), target.to_owned());
 
-        let (x, y) = topology_layout_position("external-resource", &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
+        *pending_type_counts
+            .entry("external-resource".to_owned())
+            .or_insert(0) += 1;
+        pending.push(PendingNode {
             id,
             node_type: "external-resource".to_owned(),
             label: name.clone(),
+            data,
+        });
+    }
+
+    // Pass 2: build layout from actual counts, then assign positions.
+    let layout = TopologyLayout::build(&type_order, &pending_type_counts);
+    let mut type_counters: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut nodes: Vec<TopologyNodeSpec> = Vec::new();
+    for p in pending {
+        let (x, y) = layout.position(&p.node_type, &mut type_counters);
+        nodes.push(TopologyNodeSpec {
+            id: p.id,
+            node_type: p.node_type,
+            label: p.label,
             x,
             y,
-            data,
+            data: p.data,
         });
     }
 
@@ -1248,24 +1269,48 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
     })
 }
 
-/// Assign a canvas position based on node type, grouping same-type nodes in rows.
-/// Each type occupies its own horizontal band; wraps to a new sub-row after 5 nodes.
-fn topology_layout_position(
-    node_type: &str,
-    type_order: &[&str],
-    counters: &mut std::collections::HashMap<String, usize>,
-) -> (i32, i32) {
-    let index = *counters.entry(node_type.to_owned()).or_insert(0);
-    *counters.get_mut(node_type).expect("just inserted") += 1;
+/// Two-pass topology layout: precompute base rows from actual node counts so
+/// that an overflowing type never overlaps the band of the next type.
+struct TopologyLayout {
+    base_rows: std::collections::HashMap<String, i32>,
+    max_per_row: i32,
+}
 
-    let type_row = type_order.iter().position(|&t| t == node_type).unwrap_or(7) as i32;
-    let max_per_row: i32 = 5;
-    let col = (index as i32) % max_per_row;
-    let sub_row = (index as i32) / max_per_row;
+impl TopologyLayout {
+    fn build(
+        type_order: &[&str],
+        counts: &std::collections::HashMap<String, usize>,
+    ) -> Self {
+        const MAX_PER_ROW: i32 = 5;
+        let mut base_rows = std::collections::HashMap::new();
+        let mut current_row: i32 = 0;
+        for &t in type_order {
+            let count = *counts.get(t).unwrap_or(&0) as i32;
+            if count > 0 {
+                base_rows.insert(t.to_owned(), current_row);
+                current_row += (count + MAX_PER_ROW - 1) / MAX_PER_ROW;
+            }
+        }
+        Self {
+            base_rows,
+            max_per_row: MAX_PER_ROW,
+        }
+    }
 
-    let x = 40 + col * 300;
-    let y = 40 + (type_row + sub_row) * 140;
-    (x, y)
+    fn position(
+        &self,
+        node_type: &str,
+        counters: &mut std::collections::HashMap<String, usize>,
+    ) -> (i32, i32) {
+        let index = *counters.entry(node_type.to_owned()).or_insert(0);
+        *counters.get_mut(node_type).expect("just inserted") += 1;
+        let base_row = *self.base_rows.get(node_type).unwrap_or(&0);
+        let col = (index as i32) % self.max_per_row;
+        let sub_row = (index as i32) / self.max_per_row;
+        let x = 40 + col * 300;
+        let y = 40 + (base_row + sub_row) * 140;
+        (x, y)
+    }
 }
 
 const OVERLAY_FILE_NAME: &str = "tachyon.resources.json";
