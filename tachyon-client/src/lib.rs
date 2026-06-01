@@ -1097,7 +1097,9 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             let mut ep_data: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             ep_data.insert("protocol".to_owned(), protocol.to_owned());
-            *pending_type_counts.entry("endpoint".to_owned()).or_insert(0) += 1;
+            *pending_type_counts
+                .entry("endpoint".to_owned())
+                .or_insert(0) += 1;
             pending.push(PendingNode {
                 id: endpoint_id.clone(),
                 node_type: "endpoint".to_owned(),
@@ -1202,7 +1204,9 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             data.insert("modelRef".to_owned(), model_ref.to_owned());
         }
 
-        *pending_type_counts.entry("kv-cache".to_owned()).or_insert(0) += 1;
+        *pending_type_counts
+            .entry("kv-cache".to_owned())
+            .or_insert(0) += 1;
         pending.push(PendingNode {
             id: id.clone(),
             node_type: "kv-cache".to_owned(),
@@ -1277,10 +1281,7 @@ struct TopologyLayout {
 }
 
 impl TopologyLayout {
-    fn build(
-        type_order: &[&str],
-        counts: &std::collections::HashMap<String, usize>,
-    ) -> Self {
+    fn build(type_order: &[&str], counts: &std::collections::HashMap<String, usize>) -> Self {
         const MAX_PER_ROW: i32 = 5;
         let mut base_rows = std::collections::HashMap::new();
         let mut current_row: i32 = 0;
