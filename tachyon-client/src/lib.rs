@@ -1042,13 +1042,26 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             .and_then(|v| v.as_array())
             .map(|a| !a.is_empty())
             .unwrap_or(false);
-        let module_name = route.get("module").and_then(|v| v.as_str()).unwrap_or("");
+        let module_name = route
+            .get("module")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                route
+                    .get("targets")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|t| t.get("module"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+        let is_wasm_module = module_name.ends_with(".wasm")
+            || module_name.starts_with("tachyon://");
 
         let node_type = if has_models {
             "llm"
         } else if role == "system" {
             "system-faas"
-        } else if module_name.ends_with(".wasm") {
+        } else if is_wasm_module {
             "custom-wasm"
         } else {
             "endpoint"
