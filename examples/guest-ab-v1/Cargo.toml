@@ -1,0 +1,11 @@
+[package]
+name = "guest-ab-v1"
+version = "1.0.0"
+edition = "2021"
+description = "Greeting service v1 — stable variant for A/B testing and canary examples"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"

@@ -1,0 +1,22 @@
+{
+  "routes": [
+    {
+      "path": "/api/greeting",
+      "role": "user",
+      "name": "greeting",
+      "version": "1.0.0",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "targets": [
+        { "module": "guest-ab-v1", "weight": 100 }
+      ],
+      "canary": {
+        "next_version": "guest-ab-v2",
+        "step_weight": 10,
+        "interval_secs": 60,
+        "max_error_rate": 0.05
+      },
+      "dependencies": {}
+    }
+  ]
+}

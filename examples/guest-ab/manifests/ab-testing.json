@@ -1,0 +1,17 @@
+{
+  "routes": [
+    {
+      "path": "/api/greeting",
+      "role": "user",
+      "name": "greeting",
+      "version": "1.0.0",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "targets": [
+        { "module": "guest-ab-v1", "weight": 50 },
+        { "module": "guest-ab-v2", "weight": 50 }
+      ],
+      "dependencies": {}
+    }
+  ]
+}

@@ -4,6 +4,8 @@ members = [
     "crates/smolvm",
     "ebpf-probes",
     "faas-sdk",
+    "examples/guest-ab-v1",
+    "examples/guest-ab-v2",
     "examples/guest-ai",
     "examples/guest-call-legacy",
     "examples/guest-example",

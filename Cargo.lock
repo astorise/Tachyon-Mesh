@@ -3571,6 +3571,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-ab-v1"
+version = "1.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "guest-ab-v2"
+version = "2.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "guest-ai"
 version = "1.0.0"
 dependencies = [
