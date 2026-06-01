@@ -488,6 +488,21 @@ pub struct ClusterHardwareSummary {
     pub gpu_count: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterFeatureSet {
+    pub has_enrolled_nodes: bool,
+    pub has_fleet: bool,
+    pub has_ai: bool,
+    pub has_routing: bool,
+    pub has_resilience: bool,
+    pub has_identity: bool,
+    pub has_rbac: bool,
+    pub has_storage: bool,
+    pub has_observability: bool,
+    pub has_supply_chain: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HardwareStatus {
@@ -845,6 +860,37 @@ pub async fn list_enrolled_nodes() -> Result<Vec<EnrolledNode>> {
     }
 }
 
+pub async fn get_cluster_features() -> Result<ClusterFeatureSet> {
+    use std::collections::HashSet;
+    let nodes = list_enrolled_nodes().await?;
+    let slugs: HashSet<&str> = nodes
+        .iter()
+        .flat_map(|n| {
+            n.capabilities
+                .active_systems
+                .iter()
+                .map(|s| s.slug.as_str())
+        })
+        .collect();
+
+    Ok(ClusterFeatureSet {
+        has_enrolled_nodes: !nodes.is_empty(),
+        has_fleet: nodes.len() > 1,
+        has_ai: slugs.contains("ai-list-model")
+            || slugs.contains("model-broker")
+            || slugs.contains("buffer"),
+        has_routing: slugs.contains("gateway") || slugs.contains("mesh-overlay"),
+        has_resilience: slugs.contains("shadow-proxy") || slugs.contains("dist-limiter"),
+        has_identity: slugs.contains("authn"),
+        has_rbac: slugs.contains("authz"),
+        has_storage: slugs.contains("s3-proxy") || slugs.contains("storage-broker"),
+        has_observability: slugs.contains("otel")
+            || slugs.contains("prom")
+            || slugs.contains("logger"),
+        has_supply_chain: slugs.contains("registry") || slugs.contains("gitops-broker"),
+    })
+}
+
 pub async fn get_node_capabilities(node_id: &str) -> Result<NodeCapabilities> {
     let nodes = list_enrolled_nodes().await?;
     Ok(nodes
@@ -959,23 +1005,32 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         }
     };
 
-    // ── Node construction ─────────────────────────────────────────────────────
-    // Track type-row indices for auto-layout.
+    // ── Node construction — two-pass layout ──────────────────────────────────
+    // Pass 1: collect (id, node_type, label, data) without positions.
+    // Pass 2: compute base rows from actual counts, then assign (x, y).
     let type_order = [
         "endpoint",
         "system-faas",
+        "custom-wasm",
         "llm",
         "kv-cache",
-        "custom-wasm",
         "message-broker",
         "storage",
         "external-resource",
     ];
-    let mut type_counters: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut nodes: Vec<TopologyNodeSpec> = Vec::new();
+
+    struct PendingNode {
+        id: String,
+        node_type: String,
+        label: String,
+        data: std::collections::HashMap<String, String>,
+    }
+
+    let mut pending: Vec<PendingNode> = Vec::new();
     let mut edges: Vec<TopologyEdgeSpec> = Vec::new();
     let mut edge_counter: usize = 0;
+    let mut pending_type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // Map route path → node id for edge construction.
     let mut path_to_id: std::collections::HashMap<String, String> =
@@ -996,75 +1051,129 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             .and_then(|v| v.as_array())
             .map(|a| !a.is_empty())
             .unwrap_or(false);
-        let module_name = route.get("module").and_then(|v| v.as_str()).unwrap_or("");
+        let module_name = route
+            .get("module")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                route
+                    .get("targets")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|t| t.get("module"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+        let is_wasm_module =
+            module_name.ends_with(".wasm") || module_name.starts_with("tachyon://");
 
-        let node_type = if has_models {
+        // For user routes backed by a WASM module, emit both an endpoint node
+        // (the HTTP entry point) and a custom-wasm node (the backing module),
+        // connected by an edge.  This gives the canonical two-tier view where
+        // the gateway/endpoint is clearly distinct from the WASM implementation.
+        let emit_endpoint_pair = role == "user" && is_wasm_module && !has_models;
+
+        let primary_node_type = if has_models {
             "llm"
         } else if role == "system" {
             "system-faas"
-        } else if module_name.ends_with(".wasm") {
+        } else if is_wasm_module {
             "custom-wasm"
         } else {
             "endpoint"
         };
 
-        let id = format!("route:{path}");
-        path_to_id.insert(path.to_owned(), id.clone());
+        // Endpoint node (always emitted for user routes).
+        let endpoint_id = format!("route:{path}");
+        path_to_id.insert(path.to_owned(), endpoint_id.clone());
 
-        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        match node_type {
-            "llm" => {
-                if let Some(alias) = route
-                    .get("models")
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|m| m.get("alias").and_then(|v| v.as_str()))
-                {
-                    data.insert("modelName".to_owned(), alias.to_owned());
+        if emit_endpoint_pair || primary_node_type == "endpoint" {
+            let protocol = if path.starts_with("/wss") || path.starts_with("/ws") {
+                "WS"
+            } else if path.starts_with("/grpc") {
+                "gRPC"
+            } else {
+                "HTTP"
+            };
+            let mut ep_data: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            ep_data.insert("protocol".to_owned(), protocol.to_owned());
+            *pending_type_counts
+                .entry("endpoint".to_owned())
+                .or_insert(0) += 1;
+            pending.push(PendingNode {
+                id: endpoint_id.clone(),
+                node_type: "endpoint".to_owned(),
+                label: path.to_owned(),
+                data: ep_data,
+            });
+        }
+
+        // Backing node (system-faas / custom-wasm / llm).
+        if primary_node_type != "endpoint" {
+            let wasm_id = if emit_endpoint_pair {
+                format!("wasm:{name}")
+            } else {
+                endpoint_id.clone()
+            };
+
+            let mut data: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            match primary_node_type {
+                "llm" => {
+                    if let Some(alias) = route
+                        .get("models")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|m| m.get("alias").and_then(|v| v.as_str()))
+                    {
+                        data.insert("modelName".to_owned(), alias.to_owned());
+                    }
                 }
-            }
-            "system-faas" => {
-                data.insert("component".to_owned(), name.to_owned());
-            }
-            "custom-wasm" => {
-                data.insert("capabilityName".to_owned(), name.to_owned());
-                let version = route
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("^1.0.0");
-                data.insert("semver".to_owned(), version.to_owned());
-                if !module_name.is_empty() {
-                    data.insert("assetSource".to_owned(), module_name.to_owned());
+                "system-faas" => {
+                    data.insert("component".to_owned(), name.to_owned());
                 }
+                "custom-wasm" => {
+                    data.insert("capabilityName".to_owned(), name.to_owned());
+                    let version = route
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("^1.0.0");
+                    data.insert("semver".to_owned(), version.to_owned());
+                    if !module_name.is_empty() {
+                        data.insert("assetSource".to_owned(), module_name.to_owned());
+                    }
+                }
+                _ => {}
             }
-            _ => {
-                // endpoint: infer protocol from path or defaults
-                let protocol = if path.starts_with("/wss") || path.starts_with("/ws") {
-                    "WS"
-                } else {
-                    "HTTP"
-                };
-                data.insert("protocol".to_owned(), protocol.to_owned());
+
+            *pending_type_counts
+                .entry(primary_node_type.to_owned())
+                .or_insert(0) += 1;
+            pending.push(PendingNode {
+                id: wasm_id.clone(),
+                node_type: primary_node_type.to_owned(),
+                label: name.to_owned(),
+                data,
+            });
+
+            // Edge: endpoint → backing module.
+            if emit_endpoint_pair {
+                edge_counter += 1;
+                edges.push(TopologyEdgeSpec {
+                    id: format!("e{edge_counter}"),
+                    from: endpoint_id.clone(),
+                    to: wasm_id,
+                });
             }
         }
 
-        let (x, y) = topology_layout_position(node_type, &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
-            id: id.clone(),
-            node_type: node_type.to_owned(),
-            label: name.to_owned(),
-            x,
-            y,
-            data,
-        });
-
-        // Collect dependency edges (route path → other route path).
+        // Dependency edges (route path → other route path).
         if let Some(deps) = route.get("dependencies").and_then(|v| v.as_object()) {
             for dep_path in deps.keys() {
                 edge_counter += 1;
                 edges.push(TopologyEdgeSpec {
                     id: format!("e{edge_counter}"),
-                    from: id.clone(),
+                    from: endpoint_id.clone(),
                     to: format!("route:{dep_path}"),
                 });
             }
@@ -1095,13 +1204,13 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             data.insert("modelRef".to_owned(), model_ref.to_owned());
         }
 
-        let (x, y) = topology_layout_position("kv-cache", &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
+        *pending_type_counts
+            .entry("kv-cache".to_owned())
+            .or_insert(0) += 1;
+        pending.push(PendingNode {
             id: id.clone(),
             node_type: "kv-cache".to_owned(),
             label: name.to_owned(),
-            x,
-            y,
             data,
         });
 
@@ -1128,14 +1237,31 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         data.insert("targetUrl".to_owned(), target.to_owned());
 
-        let (x, y) = topology_layout_position("external-resource", &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
+        *pending_type_counts
+            .entry("external-resource".to_owned())
+            .or_insert(0) += 1;
+        pending.push(PendingNode {
             id,
             node_type: "external-resource".to_owned(),
             label: name.clone(),
+            data,
+        });
+    }
+
+    // Pass 2: build layout from actual counts, then assign positions.
+    let layout = TopologyLayout::build(&type_order, &pending_type_counts);
+    let mut type_counters: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut nodes: Vec<TopologyNodeSpec> = Vec::new();
+    for p in pending {
+        let (x, y) = layout.position(&p.node_type, &mut type_counters);
+        nodes.push(TopologyNodeSpec {
+            id: p.id,
+            node_type: p.node_type,
+            label: p.label,
             x,
             y,
-            data,
+            data: p.data,
         });
     }
 
@@ -1147,24 +1273,45 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
     })
 }
 
-/// Assign a canvas position based on node type, grouping same-type nodes in rows.
-/// Each type occupies its own horizontal band; wraps to a new sub-row after 5 nodes.
-fn topology_layout_position(
-    node_type: &str,
-    type_order: &[&str],
-    counters: &mut std::collections::HashMap<String, usize>,
-) -> (i32, i32) {
-    let index = *counters.entry(node_type.to_owned()).or_insert(0);
-    *counters.get_mut(node_type).expect("just inserted") += 1;
+/// Two-pass topology layout: precompute base rows from actual node counts so
+/// that an overflowing type never overlaps the band of the next type.
+struct TopologyLayout {
+    base_rows: std::collections::HashMap<String, i32>,
+    max_per_row: i32,
+}
 
-    let type_row = type_order.iter().position(|&t| t == node_type).unwrap_or(7) as i32;
-    let max_per_row: i32 = 5;
-    let col = (index as i32) % max_per_row;
-    let sub_row = (index as i32) / max_per_row;
+impl TopologyLayout {
+    fn build(type_order: &[&str], counts: &std::collections::HashMap<String, usize>) -> Self {
+        const MAX_PER_ROW: i32 = 5;
+        let mut base_rows = std::collections::HashMap::new();
+        let mut current_row: i32 = 0;
+        for &t in type_order {
+            let count = *counts.get(t).unwrap_or(&0) as i32;
+            if count > 0 {
+                base_rows.insert(t.to_owned(), current_row);
+                current_row += (count + MAX_PER_ROW - 1) / MAX_PER_ROW;
+            }
+        }
+        Self {
+            base_rows,
+            max_per_row: MAX_PER_ROW,
+        }
+    }
 
-    let x = 40 + col * 300;
-    let y = 40 + (type_row + sub_row) * 140;
-    (x, y)
+    fn position(
+        &self,
+        node_type: &str,
+        counters: &mut std::collections::HashMap<String, usize>,
+    ) -> (i32, i32) {
+        let index = *counters.entry(node_type.to_owned()).or_insert(0);
+        *counters.get_mut(node_type).expect("just inserted") += 1;
+        let base_row = *self.base_rows.get(node_type).unwrap_or(&0);
+        let col = (index as i32) % self.max_per_row;
+        let sub_row = (index as i32) / self.max_per_row;
+        let x = 40 + col * 300;
+        let y = 40 + (base_row + sub_row) * 140;
+        (x, y)
+    }
 }
 
 const OVERLAY_FILE_NAME: &str = "tachyon.resources.json";
@@ -1477,16 +1624,9 @@ pub async fn get_staged_config(domain: &str) -> Result<Option<serde_json::Value>
 /// active configuration.
 pub async fn get_active_config(domain: &str) -> Result<Option<serde_json::Value>> {
     let payload_json: serde_json::Value = if current_connection().is_some() {
-        // Connected — fetch the live manifest and parse its config_payload.
-        #[derive(serde::Deserialize)]
-        struct LiveManifest {
-            config_payload: String,
-        }
-        match get_admin_json::<LiveManifest>(ADMIN_MANIFEST_PATH).await {
-            Ok(m) => serde_json::from_str(&m.config_payload)
-                .context("failed to parse live manifest config_payload")?,
+        match get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH).await {
+            Ok(config) => config,
             Err(_) => {
-                // Unreachable or older node — fall through to local file.
                 let raw = read_lockfile().await.unwrap_or_default();
                 if raw.is_empty() {
                     return Ok(None);
@@ -2029,14 +2169,9 @@ pub async fn get_manifest_schema() -> Result<serde_json::Value> {
 /// Returns the config as a `serde_json::Value` ready for modification.
 /// Errors if not connected or if the node returns an error.
 pub async fn get_manifest_config() -> Result<serde_json::Value> {
-    #[derive(serde::Deserialize)]
-    struct LiveManifest {
-        config_payload: String,
-    }
-    let m = get_admin_json::<LiveManifest>(ADMIN_MANIFEST_PATH)
+    get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH)
         .await
-        .context("failed to fetch live manifest from node")?;
-    serde_json::from_str(&m.config_payload).context("failed to parse live manifest config_payload")
+        .context("failed to fetch live manifest from node")
 }
 
 /// Sign a modified manifest config and POST it to the active node.
@@ -2385,28 +2520,37 @@ pub async fn detach_s3_volume(route_path: &str, guest_path: &str) -> Result<()> 
 /// Fetch the live IntegrityConfig payload as a mutable JSON Value.
 /// Falls back to the local integrity.lock file when not connected.
 async fn load_live_config_payload() -> Result<serde_json::Value> {
-    #[derive(Deserialize)]
-    struct LiveManifest {
-        config_payload: String,
-    }
-
     if current_connection().is_some() {
-        if let Ok(manifest) = get_admin_json::<LiveManifest>(ADMIN_MANIFEST_PATH).await {
-            return serde_json::from_str(&manifest.config_payload)
-                .context("failed to parse live manifest config_payload");
+        if let Ok(config) = get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH).await {
+            return Ok(config);
         }
     }
 
-    // Fall back to local integrity.lock
+    // Fall back to local integrity.lock (wrapper format: { config_payload, public_key, signature })
+    #[derive(Deserialize)]
+    struct IntegrityManifestFile {
+        config_payload: String,
+    }
     let raw = read_lockfile().await?;
-    let manifest: LiveManifest =
+    let manifest: IntegrityManifestFile =
         serde_json::from_str(&raw).context("failed to parse integrity.lock")?;
     serde_json::from_str(&manifest.config_payload)
         .context("failed to parse integrity.lock config_payload")
 }
 
 /// Serialize `config` back to a string, re-sign, write the lockfile, and POST to /admin/manifest.
-async fn patch_and_apply_manifest(config: serde_json::Value) -> Result<()> {
+async fn patch_and_apply_manifest(mut config: serde_json::Value) -> Result<()> {
+    if let Some(obj) = config.as_object_mut() {
+        let next = obj
+            .get("config_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        obj.insert(
+            "config_version".to_owned(),
+            serde_json::Value::Number(next.into()),
+        );
+    }
     let payload =
         serde_json::to_string(&config).context("failed to serialize patched config payload")?;
     let manifest = sign_manifest_payload(payload).await?;
@@ -3162,6 +3306,171 @@ pub async fn push_asset_bytes(path: &str, bytes: &[u8]) -> Result<String> {
     let payload: AssetUploadResponse =
         serde_json::from_slice(&body).context("failed to decode asset-upload response payload")?;
     Ok(payload.asset_uri)
+}
+
+/// A single WASM module uploaded during a package import.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedModule {
+    pub name: String,
+    pub asset_uri: String,
+}
+
+/// Result returned by [`import_faas_package`] / [`import_faas_package_bytes`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPackageResult {
+    pub imported_modules: Vec<ImportedModule>,
+    pub skipped_modules: Vec<String>,
+    pub routes_added: usize,
+}
+
+/// Read a `.tar.gz` FaaS package from `package_path`, upload every `.wasm`
+/// inside it as an asset, then register the routes from `manifest.json`.
+pub async fn import_faas_package(package_path: &str) -> Result<ImportPackageResult> {
+    let bytes = tokio::fs::read(package_path)
+        .await
+        .with_context(|| format!("failed to read package `{package_path}`"))?;
+    import_faas_package_bytes(&bytes).await
+}
+
+/// Same as [`import_faas_package`] but accepts the archive bytes directly.
+pub async fn import_faas_package_bytes(data: &[u8]) -> Result<ImportPackageResult> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use tar::Archive;
+
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+
+    let gz = GzDecoder::new(data);
+    let mut archive = Archive::new(gz);
+
+    let mut wasm_files: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut manifest_bytes: Option<Vec<u8>> = None;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if filename == "manifest.json" {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            manifest_bytes = Some(buf);
+        } else if let Some(stem) = filename.strip_suffix(".wasm") {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            wasm_files.insert(stem.to_owned(), buf);
+        }
+    }
+
+    let manifest_bytes =
+        manifest_bytes.ok_or_else(|| anyhow::anyhow!("package does not contain manifest.json"))?;
+
+    #[derive(Deserialize)]
+    struct PackageManifest {
+        routes: Vec<serde_json::Value>,
+    }
+    let manifest: PackageManifest =
+        serde_json::from_slice(&manifest_bytes).context("failed to parse manifest.json")?;
+
+    // Upload each WASM module and build a lookup: module-name → asset URI.
+    // Store under both the raw stem (guest_example) and the dash form (guest-example).
+    let mut module_uris: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut imported_modules: Vec<ImportedModule> = Vec::new();
+
+    for (stem, bytes) in &wasm_files {
+        let uri = push_asset_bytes(stem, bytes)
+            .await
+            .with_context(|| format!("failed to upload module `{stem}`"))?;
+        let dash_name = stem.replace('_', "-");
+        module_uris.insert(stem.clone(), uri.clone());
+        module_uris.insert(dash_name.clone(), uri.clone());
+        imported_modules.push(ImportedModule {
+            name: dash_name,
+            asset_uri: uri,
+        });
+    }
+
+    // Process manifest routes: replace each module reference with its asset URI.
+    let mut routes_to_add: Vec<serde_json::Value> = Vec::new();
+    let mut skipped_modules: Vec<String> = Vec::new();
+
+    for mut route in manifest.routes {
+        let has_targets = route
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
+
+        if has_targets {
+            let targets = route["targets"].as_array().cloned().unwrap_or_default();
+            let mut new_targets: Vec<serde_json::Value> = Vec::new();
+            let mut any_resolved = false;
+            for mut target in targets {
+                let module_name = target
+                    .get("module")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if let Some(uri) = module_uris.get(&module_name) {
+                    target["module"] = serde_json::Value::String(uri.clone());
+                    any_resolved = true;
+                }
+                new_targets.push(target);
+            }
+            if !any_resolved {
+                let route_path = route
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_owned();
+                skipped_modules.push(route_path);
+                continue;
+            }
+            route["targets"] = serde_json::Value::Array(new_targets);
+        } else {
+            let name = route
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if let Some(uri) = module_uris.get(&name) {
+                route["targets"] = serde_json::json!([{ "module": uri, "weight": 100 }]);
+            } else {
+                skipped_modules.push(name);
+                continue;
+            }
+        }
+        routes_to_add.push(route);
+    }
+
+    let routes_added = routes_to_add.len();
+
+    if !routes_to_add.is_empty() {
+        let mut config = get_manifest_config().await?;
+        let routes = config
+            .get_mut("routes")
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| anyhow::anyhow!("manifest has no routes array"))?;
+
+        for new_route in &routes_to_add {
+            let path = new_route.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            routes.retain(|r| r.get("path").and_then(|v| v.as_str()) != Some(path));
+        }
+        routes.extend(routes_to_add);
+        patch_and_apply_manifest(config).await?;
+    }
+
+    Ok(ImportPackageResult {
+        imported_modules,
+        skipped_modules,
+        routes_added,
+    })
 }
 
 pub async fn push_large_model(file_path: &str) -> Result<String> {

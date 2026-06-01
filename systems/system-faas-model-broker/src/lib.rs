@@ -363,9 +363,12 @@ fn commit_upload(uri: &str) -> Result<String, String> {
         })?;
     }
 
-    let alias = pending
-        .alias
-        .unwrap_or_else(|| pending.expected_hash.trim_start_matches("sha256:").to_owned());
+    let alias = pending.alias.unwrap_or_else(|| {
+        pending
+            .expected_hash
+            .trim_start_matches("sha256:")
+            .to_owned()
+    });
     notify_ai_list_model(&alias);
 
     Ok(model_path.to_string_lossy().to_string())

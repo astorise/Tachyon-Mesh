@@ -1,5 +1,6 @@
 import { tachyonSharedStylesheet } from "../../styles/shared-sheets";
 import { listComponentRoutes } from "../../registry/ComponentRegistry";
+import { clusterFeaturesStore, isFeatureAvailable } from "../../stores/clusterFeaturesStore";
 import { el } from "../../utils/dom-safe";
 import { t } from "../../utils/i18n";
 
@@ -9,10 +10,16 @@ import { t } from "../../utils/i18n";
  * Observes the `active-route` attribute. On each nav-button click,
  * dispatches `shell:navigate` with `{ route }` so the parent shell can
  * update the main-content area without knowing the sidebar implementation.
+ *
+ * Routes are filtered by cluster feature availability: a route with a
+ * `requires` field is only rendered when the corresponding feature is
+ * present in the cluster (derived from active_systems in enrolled nodes).
  */
 export class TachyonAppShellNav extends HTMLElement {
   private readonly root: ShadowRoot;
   private readonly onLanguageChanged = () => this.render();
+  private readonly onFeaturesChanged = () => this.render();
+  private unsubscribeFeatures?: () => void;
 
   static get observedAttributes() {
     return ["active-route"];
@@ -26,11 +33,13 @@ export class TachyonAppShellNav extends HTMLElement {
 
   connectedCallback(): void {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
+    this.unsubscribeFeatures = clusterFeaturesStore.subscribe(this.onFeaturesChanged);
     this.render();
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
+    this.unsubscribeFeatures?.();
   }
 
   attributeChangedCallback(): void {
@@ -74,7 +83,10 @@ export class TachyonAppShellNav extends HTMLElement {
           t("nav.dashboard"),
         ),
       );
-      for (const entry of listComponentRoutes()) {
+      const availableRoutes = listComponentRoutes().filter(
+        (entry) => entry.requires === undefined || isFeatureAvailable(entry.requires),
+      );
+      for (const entry of availableRoutes) {
         const label = t(`nav.${entry.route}`) || entry.label;
         nav.appendChild(
           el(

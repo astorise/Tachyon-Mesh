@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     file \
+    golang-go \
     libayatana-appindicator3-dev \
     librsvg2-dev \
     libssl-dev \
@@ -15,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxdo-dev \
     musl-tools \
     nasm \
+    perl \
     pkg-config \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
@@ -38,6 +40,7 @@ RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-node-registry --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-logger --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-registry --target wasm32-wasip2 --release
 RUN cargo build -p guest-ai --target wasm32-wasip1 --release
@@ -45,9 +48,13 @@ RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
 RUN cargo build -p guest-loop --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 RUN cargo build -p tachyon-ui --release
-# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=fips
+# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=http3
 # to produce a feature-specific image variant.
+# Layers above this ARG are cached independently of the feature set.
 ARG CARGO_FEATURES=""
+# Build and stage system FaaS modules that are gated behind feature flags.
+# The staging directory is copied into the runtime image in one COPY step.
+RUN CARGO_FEATURES="${CARGO_FEATURES}" bash scripts/build-feature-system-faas.sh /workspace/staging-modules
 RUN set -eux; \
     if [ -n "${CARGO_FEATURES}" ]; then \
       cargo build -p core-host --target x86_64-unknown-linux-musl --release --features "${CARGO_FEATURES}"; \
@@ -190,6 +197,7 @@ COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /a
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_model_broker.wasm /app/guest-modules/system_faas_model_broker.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_node_registry.wasm /app/guest-modules/system_faas_node_registry.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_logger.wasm /app/guest-modules/system_faas_logger.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_registry.wasm /app/guest-modules/system_faas_registry.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_ai.wasm /app/guest-modules/guest_ai.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
@@ -198,6 +206,7 @@ COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-mod
 COPY --from=javy-builder /workspace/guest-modules/guest_js.wasm /app/guest-modules/guest_js.wasm
 COPY --from=dotnet-builder /workspace/guest-modules/. /app/guest-modules/
 COPY --from=java-builder /workspace/guest-modules/guest_java.wasm /app/guest-modules/guest_java.wasm
+COPY --from=rust-builder /workspace/staging-modules/ /app/guest-modules/
 
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 

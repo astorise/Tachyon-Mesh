@@ -2,6 +2,13 @@ import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
 import { applyAndSeal, resilientInvoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import { invoke } from "@tauri-apps/api/core";
+
+type ImportPackageResult = {
+  importedModules: Array<{ name: string; assetUri: string }>;
+  skippedModules: string[];
+  routesAdded: number;
+};
 
 type CanaryStatusEntry = {
   routePath: string;
@@ -15,6 +22,7 @@ type CanaryStatusEntry = {
 
 export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
   private rollouts: CanaryStatusEntry[] = [];
+  private importFile: File | null = null;
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
 
   async connectedCallback(): Promise<void> {
@@ -96,6 +104,24 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
         </form>
 
         ${this.renderRolloutStatus()}
+
+        <section data-stagger-panel class="rounded-lg border border-slate-700 bg-slate-800/40 p-6 space-y-4">
+          <div>
+            <h3 class="text-sm font-semibold uppercase tracking-widest text-cyan-400">${t("workloads.import.title")}</h3>
+            <p class="mt-1 text-xs text-slate-400">${t("workloads.import.description")}</p>
+          </div>
+          <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
+            <label class="flex cursor-pointer items-center gap-2 rounded border border-slate-600 bg-slate-900 px-4 py-2 text-sm text-slate-200 hover:border-cyan-500 transition-colors">
+              ${t("workloads.import.button")}
+              <input id="import-pkg-file" type="file" accept=".tar.gz,.tgz" class="sr-only">
+            </label>
+            <span id="import-pkg-name" class="font-mono text-xs text-slate-500">${t("workloads.import.noFile")}</span>
+            <button id="import-pkg-btn" type="button" disabled
+              class="rounded border border-cyan-500/40 bg-cyan-900/30 px-5 py-2 text-sm font-bold text-cyan-400 transition-colors hover:bg-cyan-500 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-40">
+              ${t("workloads.import.deploy")}
+            </button>
+          </div>
+        </section>
 
         <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">${t("workloads.feedback.empty")}</div>
       </section>
@@ -215,6 +241,24 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
         void this.abortRollout(routePath);
       });
     });
+
+    const fileInput = this.root.getElementById("import-pkg-file") as HTMLInputElement | null;
+    const fileLabel = this.root.getElementById("import-pkg-name");
+    const importBtn = this.root.getElementById("import-pkg-btn") as HTMLButtonElement | null;
+
+    fileInput?.addEventListener("change", () => {
+      this.importFile = fileInput.files?.[0] ?? null;
+      if (fileLabel) {
+        fileLabel.textContent = this.importFile?.name ?? t("workloads.import.noFile");
+      }
+      if (importBtn) {
+        importBtn.disabled = !this.importFile;
+      }
+    });
+
+    importBtn?.addEventListener("click", () => {
+      void this.importPackage();
+    });
   }
 
   private async abortRollout(routePath: string): Promise<void> {
@@ -224,6 +268,34 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
       await this.refreshRollouts();
     } catch (error) {
       this.showFeedback("error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async importPackage(): Promise<void> {
+    if (!this.importFile) return;
+    const importBtn = this.root.getElementById("import-pkg-btn") as HTMLButtonElement | null;
+    if (importBtn) importBtn.disabled = true;
+    try {
+      const buffer = await this.importFile.arrayBuffer();
+      const bytes = Array.from(new Uint8Array(buffer));
+      const result = await invoke<ImportPackageResult>("import_faas_package", { bytes });
+      if (result.routesAdded === 0) {
+        this.showFeedback("error", t("workloads.import.empty"));
+      } else {
+        const skippedText = result.skippedModules.length > 0
+          ? result.skippedModules.join(", ")
+          : "none";
+        this.showFeedback(
+          "success",
+          t("workloads.import.success")
+            .replace("{count}", String(result.routesAdded))
+            .replace("{skipped}", skippedText),
+        );
+      }
+    } catch (error) {
+      this.showFeedback("error", error instanceof Error ? error.message : String(error));
+    } finally {
+      if (importBtn) importBtn.disabled = false;
     }
   }
 

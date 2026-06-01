@@ -153,7 +153,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -164,7 +164,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -753,7 +753,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -782,7 +782,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
  "winx",
 ]
 
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "core-host"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1218,7 +1218,7 @@ dependencies = [
  "rand 0.10.1",
  "rcgen",
  "redb",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls-pemfile",
  "semver",
  "serde",
@@ -1866,7 +1866,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2016,7 +2016,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
 name = "ebpf-probes"
-version = "1.1.0-alpha"
+version = "1.0.0"
 
 [[package]]
 name = "ecdsa"
@@ -2173,7 +2173,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2184,7 +2184,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
 name = "faas-sdk"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2375,7 +2375,7 @@ checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "guest-ai"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3581,25 +3581,25 @@ dependencies = [
 
 [[package]]
 name = "guest-call-legacy"
-version = "1.1.0-alpha"
+version = "1.0.0"
 
 [[package]]
 name = "guest-example"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-flaky"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-grpc"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "prost 0.13.5",
  "wit-bindgen 0.46.0",
@@ -3607,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "guest-grpc-interop"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "prost 0.13.5",
  "wit-bindgen 0.57.1",
@@ -3615,37 +3615,37 @@ dependencies = [
 
 [[package]]
 name = "guest-log-storm"
-version = "1.1.0-alpha"
+version = "1.0.0"
 
 [[package]]
 name = "guest-loop"
-version = "1.1.0-alpha"
+version = "1.0.0"
 
 [[package]]
 name = "guest-malicious"
-version = "1.1.0-alpha"
+version = "1.0.0"
 
 [[package]]
 name = "guest-rag-vector"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-tcp-echo"
-version = "1.1.0-alpha"
+version = "1.0.0"
 
 [[package]]
 name = "guest-udp-echo"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-voip-gate"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3654,23 +3654,23 @@ dependencies = [
 
 [[package]]
 name = "guest-volume"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "guest-websocket-echo"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.46.0",
 ]
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3919,9 +3919,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.9.0"
+version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca"
+checksum = "55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3990,7 +3990,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -4196,7 +4196,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2285ddfe3054097ef4b2fe909ef8c3bcd1ea52a8f0d274416caebeef39f04a65"
 dependencies = [
  "io-lifetimes",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4364,7 +4364,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4554,11 +4554,11 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "legacy-mock"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls",
  "tokio",
 ]
@@ -4969,7 +4969,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5098,7 +5098,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5985,7 +5985,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -6193,7 +6193,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6534,9 +6534,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6666,7 +6666,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6743,7 +6743,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7270,7 +7270,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -7284,7 +7284,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7541,9 +7541,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.39.2"
+version = "0.39.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14311e7e9a03114cd4b65eedd54e8fed2945e17f08586ae97ef53bc0669f9581"
+checksum = "21d0d938c10fcda3e897e28aaddf4ab462375d411f4378cd63b1c945f69aba96"
 dependencies = [
  "libc",
  "memchr",
@@ -7569,7 +7569,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-ai-list-model"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7578,7 +7578,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-authn"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -7593,14 +7593,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-authz"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-bridge"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7609,7 +7609,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-buffer"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7618,14 +7618,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-cdc"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-cdc-broadcaster"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7634,7 +7634,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-cert-manager"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "rcgen",
  "serde",
@@ -7644,7 +7644,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-config-api"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7653,7 +7653,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-dist-limiter"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7662,31 +7662,31 @@ dependencies = [
 
 [[package]]
 name = "system-faas-enrollment"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
  "hex",
  "rand 0.10.1",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "tokio",
 ]
 
 [[package]]
 name = "system-faas-gateway"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-gc"
-version = "1.1.0-alpha"
+version = "1.0.0"
 
 [[package]]
 name = "system-faas-gitops-broker"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "gix",
  "serde",
@@ -7696,7 +7696,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-gossip"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7705,21 +7705,21 @@ dependencies = [
 
 [[package]]
 name = "system-faas-k8s-scaler"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-keda"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-logger"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7728,14 +7728,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-media-server"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-mesh-overlay"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "hex",
  "serde",
@@ -7746,7 +7746,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-metering"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde_json",
  "wit-bindgen 0.57.1",
@@ -7754,7 +7754,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-microvm-runner"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -7765,7 +7765,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-model-broker"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "hex",
  "serde",
@@ -7777,7 +7777,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-node-registry"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "hex",
  "serde",
@@ -7787,7 +7787,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-olap-engine"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7796,7 +7796,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-openai-adapter"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7805,14 +7805,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-openapi"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-otel"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7821,14 +7821,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-prom"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-registry"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "hex",
  "serde",
@@ -7839,7 +7839,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-s3-proxy"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7848,7 +7848,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-shadow-proxy"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "hex",
  "serde",
@@ -7859,7 +7859,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-sql-engine"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7868,7 +7868,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-sqs"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7877,14 +7877,14 @@ dependencies = [
 
 [[package]]
 name = "system-faas-storage-broker"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "system-faas-tde"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "serde",
@@ -7894,7 +7894,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-tee-runtime"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7903,7 +7903,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-vector-search"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7912,7 +7912,7 @@ dependencies = [
 
 [[package]]
 name = "system-faas-view-builder"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7921,14 +7921,14 @@ dependencies = [
 
 [[package]]
 name = "tachyon-client"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
  "flate2",
  "hex",
  "rand_core 0.6.4",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -7939,14 +7939,14 @@ dependencies = [
 
 [[package]]
 name = "tachyon-faas-sdk"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "tachyon-mcp"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -7958,7 +7958,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-ui"
-version = "1.1.0-alpha"
+version = "1.0.0"
 dependencies = [
  "iota_stronghold",
  "rand_core 0.6.4",
@@ -8082,7 +8082,7 @@ dependencies = [
  "percent-encoding",
  "plist",
  "raw-window-handle",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "serde_repr",
@@ -8309,10 +8309,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8800,7 +8800,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8827,7 +8827,7 @@ dependencies = [
 
 [[package]]
 name = "turboquant-sys"
-version = "1.1.0-alpha"
+version = "1.0.0"
 
 [[package]]
 name = "typed-path"
@@ -9064,9 +9064,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.23.1"
+version = "1.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
+checksum = "d258b83ceec21034727ecee8c382cfa6c3e133699b0742c64571814fb420c9f7"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -9961,7 +9961,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10527,7 +10527,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags 2.11.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

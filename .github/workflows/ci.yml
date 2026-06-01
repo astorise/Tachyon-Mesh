@@ -50,6 +50,21 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Pack example guest modules
+        run: |
+          tar --transform 's|.*/||' -czf guest-examples.tar.gz \
+            target/wasm32-wasip1/release/guest_*.wasm \
+            target/wasm32-wasip2/release/guest_*.wasm \
+            examples/guest-examples/manifest.json
+
+      - name: Upload example guest modules archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: guest-examples-${{ github.sha }}
+          path: guest-examples.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
   # ── 2. Security audit (runs in parallel with build-guests) ──────────────────
   security-audit:
     runs-on: ubuntu-latest
@@ -408,17 +423,25 @@ jobs:
   # ── 9. Mutation tests (weekly schedule only) ─────────────────────────────────
   mutation-tests:
     if: github.event_name == 'schedule'
+    needs: build-guests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: wasm-guests-${{ github.sha }}
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
+
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
 
       - name: Run auth mutation tests
-        run: cargo mutants --package core-host --file core-host/src/auth.rs --timeout 120
+        run: cargo mutants --package core-host --file core-host/src/auth.rs --timeout 120 --copy-target true
 
   # ── 10. Miri cwasm cache (weekly schedule only) ───────────────────────────────
   miri-cwasm-cache:
@@ -475,11 +498,16 @@ jobs:
             context: .
             cargo_features: "rate-limit,resiliency,mtls,secrets-vault,websockets"
             feature_tag: "-security"
+          - image_name: tachyon-mesh
+            dockerfile: ./Dockerfile
+            context: .
+            cargo_features: "ai-inference,ebpf-loader,experimental,http3,mtls,rate-limit,resiliency,s3-persistence,secrets-vault,websockets"
+            feature_tag: "-all-features"
     steps:
       - uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v4.1.0
 
       - name: Normalize image owner
         id: owner
@@ -487,7 +515,7 @@ jobs:
         run: echo "value=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -495,7 +523,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@v6.1.0
         with:
           images: ghcr.io/${{ steps.owner.outputs.value }}/${{ matrix.image_name }}
           tags: |
@@ -506,7 +534,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Build and publish Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v7.2.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}

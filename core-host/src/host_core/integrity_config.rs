@@ -17,6 +17,41 @@ pub(crate) fn ensure_rustls_crypto_provider() {
     tls_runtime::ensure_crypto_provider();
 }
 
+/// Inject system routes that are always active when their feature flag is
+/// compiled in, without requiring the operator to manually add them via the
+/// manifest.  Routes already present in the config are left untouched.
+pub(crate) fn inject_feature_routes(mut config: IntegrityConfig) -> IntegrityConfig {
+    #[allow(unused_mut)]
+    let mut to_inject: Vec<(&str, &str)> = Vec::new();
+
+    #[cfg(feature = "ai-inference")]
+    {
+        to_inject.push(("/system/model-broker", "model-broker"));
+        to_inject.push(("/system/ai-list-model", "ai-list-model"));
+        to_inject.push(("/system/ai-openai-adapter", "ai-openai-adapter"));
+    }
+
+    #[cfg(feature = "s3-persistence")]
+    {
+        to_inject.push(("/system/s3-proxy", "s3-proxy"));
+        to_inject.push(("/system/storage-broker", "storage-broker"));
+    }
+
+    for (path, name) in to_inject {
+        if config.routes.iter().any(|r| r.path == path) {
+            continue;
+        }
+        config.routes.push(IntegrityRoute {
+            path: path.to_owned(),
+            role: RouteRole::System,
+            name: name.to_owned(),
+            version: "1.0.0".to_owned(),
+            ..IntegrityRoute::default()
+        });
+    }
+    config
+}
+
 pub(crate) fn verify_integrity() -> Result<IntegrityConfig> {
     match verify_integrity_payload(
         EMBEDDED_CONFIG_PAYLOAD,
@@ -394,6 +429,17 @@ fn self_registry_node(node_id: &str, state: &AppState) -> RegistryEnrolledNode {
     let available_ram_mb = sys.available_memory() / 1024 / 1024;
     let accelerators = state.host_capabilities.names();
     let gpus = detect_self_gpus(&state.host_capabilities);
+    let runtime = state.runtime.load();
+    let active_systems = runtime
+        .config
+        .routes
+        .iter()
+        .filter(|r| r.role == RouteRole::System)
+        .map(|r| RegistryActiveSystem {
+            slug: r.path.trim_start_matches("/system/").to_owned(),
+            version: r.version.clone(),
+        })
+        .collect();
     RegistryEnrolledNode {
         node_id: node_id.to_owned(),
         public_key: node_id.to_owned(),
@@ -407,7 +453,7 @@ fn self_registry_node(node_id: &str, state: &AppState) -> RegistryEnrolledNode {
             available_ram_mb,
             accelerators,
             gpus,
-            active_systems: Vec::new(),
+            active_systems,
         },
     }
 }
@@ -1711,7 +1757,7 @@ pub(crate) fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget>
             "Integrity Validation Failed: route targets must include a non-empty `module`"
         ));
     }
-    if module.contains('/') || module.contains('\\') {
+    if !system_storage::is_asset_uri(&module) && (module.contains('/') || module.contains('\\')) {
         return Err(anyhow!(
             "Integrity Validation Failed: route targets must use module names, not filesystem paths"
         ));

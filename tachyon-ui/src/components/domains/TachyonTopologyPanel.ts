@@ -355,7 +355,6 @@ export class TachyonTopologyCanvas extends HTMLElement {
 
     this.root.querySelectorAll<HTMLButtonElement>("[data-node-id]").forEach((button) => {
       button.addEventListener("pointerdown", (event) => {
-        if (!this.editable) return;
         this.didDrag = false;
         this.dragState = {
           nodeId: button.dataset.nodeId ?? "",
@@ -802,7 +801,37 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
   private applying = false;
   private liveSource: string | null = null;
   private mode: "view" | "edit" = "view";
+  private filterText: string = "";
+  private filterTypes: Set<TopologyNodeType> = new Set();
+  private showEdges: boolean = true;
   private readonly onLanguageChanged = () => this.refresh();
+
+  private computeFilteredGraph(): { nodes: TopologyNode[]; edges: TopologyEdge[] } {
+    const text = this.filterText.trim().toLowerCase();
+    const filteredNodes = this.nodes.filter((n) => {
+      if (text && !n.label.toLowerCase().includes(text) && !n.id.toLowerCase().includes(text)) {
+        // also check custom tags stored in node.data.tags
+        const tags = (n.data.tags ?? "").toLowerCase();
+        if (!tags.includes(text)) return false;
+      }
+      if (this.filterTypes.size > 0 && !this.filterTypes.has(n.type)) return false;
+      return true;
+    });
+    if (!this.showEdges) return { nodes: filteredNodes, edges: [] };
+    const visibleIds = new Set(filteredNodes.map((n) => n.id));
+    const filteredEdges = this.edges.filter(
+      (e) => visibleIds.has(e.from) && visibleIds.has(e.to),
+    );
+    return { nodes: filteredNodes, edges: filteredEdges };
+  }
+
+  private collectTags(): string[] {
+    const tags = new Set<string>();
+    for (const node of this.nodes) {
+      (node.data.tags ?? "").split(",").map((t) => t.trim()).filter(Boolean).forEach((tag) => tags.add(tag));
+    }
+    return [...tags].sort();
+  }
 
   connectedCallback(): void {
     const stored = sessionStorage.getItem(TOPOLOGY_MODE_KEY);
@@ -840,7 +869,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         return;
       }
 
-      this.nodes = graph.nodes.map((n) => ({
+      const liveNodes: TopologyNode[] = graph.nodes.map((n) => ({
         id: n.id,
         type: (n.nodeType as TopologyNodeType) ?? "endpoint",
         label: n.label,
@@ -848,7 +877,17 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         y: n.y,
         data: { ...n.data },
       }));
-      this.edges = graph.edges.map((e) => ({ ...e }));
+      const liveIds = new Set(liveNodes.map((n) => n.id));
+      // Keep manually-added nodes that have no live counterpart (user-defined
+      // endpoints, gateways, etc.) so the editor canvas is not reset on reload.
+      const manualNodes = this.nodes.filter((n) => !liveIds.has(n.id));
+      this.nodes = [...liveNodes, ...manualNodes];
+      // Live edges take precedence; keep manual edges that reference surviving nodes.
+      const allIds = new Set(this.nodes.map((n) => n.id));
+      const manualEdges = this.edges.filter(
+        (e) => !liveIds.has(e.from) && !liveIds.has(e.to) && allIds.has(e.from) && allIds.has(e.to),
+      );
+      this.edges = [...graph.edges.map((e) => ({ ...e })), ...manualEdges];
       this.liveSource = graph.source;
       this.render();
       this.bindEvents();
@@ -900,12 +939,44 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         </header>
 
         <article data-stagger-panel>
-          <div class="mb-2 flex items-center gap-2 justify-end">
-            <button id="btn-zoom-in"    type="button" class="${btnClass}" title="${t("topology.zoom-in")}">＋</button>
-            <button id="btn-zoom-out"   type="button" class="${btnClass}" title="${t("topology.zoom-out")}">－</button>
-            <button id="btn-zoom-reset" type="button" class="${btnClass}" title="${t("topology.zoom-reset")}">⊙</button>
-            <button id="btn-compact"    type="button" class="${btnClass}" title="${t("topology.compact-mode")}">⊞</button>
+          <div class="mb-2 flex flex-wrap items-center gap-2">
+            <input id="filter-text" type="search" value="${this.filterText}"
+              placeholder="${t("topology.filter.placeholder")}"
+              class="rounded border border-slate-700 bg-slate-900/80 px-3 py-1 text-xs text-slate-200 outline-none focus:border-cyan-400 w-48" />
+            <div class="flex flex-wrap gap-1" id="filter-type-chips">
+              ${(Object.keys(NODE_THEMES) as TopologyNodeType[]).map((type) => {
+                const active = this.filterTypes.has(type);
+                const theme = NODE_THEMES[type];
+                return `<button data-type-filter="${type}" type="button"
+                  class="flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${active ? `${theme.card} ${theme.badge} border-current` : "border-slate-700 bg-slate-900 text-slate-500 hover:border-slate-500"}">
+                  <span>${theme.glyph}</span>${t(`topology.type.${type}`)}
+                </button>`;
+              }).join("")}
+            </div>
+            ${this.collectTags().map((tag) => {
+              const active = this.filterText === tag;
+              return `<button data-tag-filter="${tag}" type="button"
+                class="rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${active ? "border-violet-400/60 bg-violet-500/15 text-violet-300" : "border-slate-700 bg-slate-900 text-slate-500 hover:border-violet-400/40 hover:text-violet-400"}">
+                #${tag}
+              </button>`;
+            }).join("")}
+            <label class="ml-auto flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
+              <input id="filter-show-edges" type="checkbox" ${this.showEdges ? "checked" : ""}
+                class="accent-cyan-400" />
+              ${t("topology.filter.show-edges")}
+            </label>
+            <div class="flex items-center gap-1">
+              <button id="btn-zoom-in"    type="button" class="${btnClass}" title="${t("topology.zoom-in")}">＋</button>
+              <button id="btn-zoom-out"   type="button" class="${btnClass}" title="${t("topology.zoom-out")}">－</button>
+              <button id="btn-zoom-reset" type="button" class="${btnClass}" title="${t("topology.zoom-reset")}">⊙</button>
+              <button id="btn-compact"    type="button" class="${btnClass}" title="${t("topology.compact-mode")}">⊞</button>
+            </div>
           </div>
+          ${(this.filterText || this.filterTypes.size > 0) ? `
+          <div class="mb-1 flex items-center gap-2 text-[10px] text-slate-500">
+            <span>${t("topology.filter.active")} ${this.computeFilteredGraph().nodes.length} / ${this.nodes.length}</span>
+            <button id="btn-clear-filters" type="button" class="text-cyan-400 hover:text-cyan-300">${t("topology.filter.clear")}</button>
+          </div>` : ""}
           <tachyon-topology-canvas></tachyon-topology-canvas>
           <tachyon-node-editor></tachyon-node-editor>
           ${this.nodes.length === 0 && !isDemoTopologyEnabled() ? `
@@ -964,6 +1035,47 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
   private bindEvents(): void {
     this.root.getElementById("btn-mode-view")?.addEventListener("click", () => this.setMode("view"));
     this.root.getElementById("btn-mode-edit")?.addEventListener("click", () => this.setMode("edit"));
+
+    // ── Filter bar ──────────────────────────────────────────────────────────
+    const filterInput = this.root.getElementById("filter-text") as HTMLInputElement | null;
+    filterInput?.addEventListener("input", () => {
+      this.filterText = filterInput.value;
+      this.pushGraphToCanvas();
+      this.updateFilterBadge();
+    });
+
+    this.root.getElementById("filter-type-chips")?.querySelectorAll<HTMLButtonElement>("[data-type-filter]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const type = btn.dataset.typeFilter as TopologyNodeType;
+        if (this.filterTypes.has(type)) this.filterTypes.delete(type);
+        else this.filterTypes.add(type);
+        this.refresh();
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-tag-filter]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tag = btn.dataset.tagFilter ?? "";
+        this.filterText = this.filterText === tag ? "" : tag;
+        const inp = this.root.getElementById("filter-text") as HTMLInputElement | null;
+        if (inp) inp.value = this.filterText;
+        this.pushGraphToCanvas();
+        this.updateFilterBadge();
+      });
+    });
+
+    const edgesCheckbox = this.root.getElementById("filter-show-edges") as HTMLInputElement | null;
+    edgesCheckbox?.addEventListener("change", () => {
+      this.showEdges = edgesCheckbox.checked;
+      this.pushGraphToCanvas();
+    });
+
+    this.root.getElementById("btn-clear-filters")?.addEventListener("click", () => {
+      this.filterText = "";
+      this.filterTypes.clear();
+      this.showEdges = true;
+      this.refresh();
+    });
 
     this.root.getElementById("btn-apply-topology")?.addEventListener("click", () => {
       void this.applyTopology();
@@ -1121,14 +1233,31 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
     const editable = this.mode === "edit";
     const canvas = this.canvas();
     if (canvas) {
+      const { nodes, edges } = this.computeFilteredGraph();
       canvas.setGraph(
-        this.nodes.map((node) => ({ ...node, data: { ...node.data } })),
-        this.edges.map((edge) => ({ ...edge })),
+        nodes.map((node) => ({ ...node, data: { ...node.data } })),
+        edges.map((edge) => ({ ...edge })),
       );
       canvas.setSelected(this.selectedId);
       canvas.setEditable(editable);
     }
     this.editor()?.setEditable(editable);
+  }
+
+  private updateFilterBadge(): void {
+    const active = this.filterText || this.filterTypes.size > 0;
+    const badge = this.root.querySelector<HTMLElement>("[id='btn-clear-filters']")?.parentElement;
+    if (!badge) {
+      if (active) this.render();
+      return;
+    }
+    if (!active) {
+      badge.style.display = "none";
+    } else {
+      badge.style.display = "";
+      const count = badge.querySelector("span");
+      if (count) count.textContent = `${t("topology.filter.active")} ${this.computeFilteredGraph().nodes.length} / ${this.nodes.length}`;
+    }
   }
 
   private canvas(): TachyonTopologyCanvas | null {

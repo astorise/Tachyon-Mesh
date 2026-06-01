@@ -600,6 +600,15 @@ async fn push_asset(path: String, bytes: Option<Vec<u8>>) -> Result<String, Stri
 }
 
 #[tauri::command]
+async fn import_faas_package(
+    bytes: Vec<u8>,
+) -> Result<tachyon_client::ImportPackageResult, String> {
+    tachyon_client::import_faas_package_bytes(&bytes)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn push_large_model(app: tauri::AppHandle, path: String) -> Result<String, String> {
     tachyon_client::push_large_model_with_progress(&path, |percentage| {
         let _ = app.emit("upload_progress", percentage);
@@ -646,6 +655,13 @@ async fn list_registered_systems() -> Result<Vec<tachyon_client::RegisteredSyste
 #[tauri::command]
 async fn list_deployed_systems() -> Result<Vec<tachyon_client::DeployedSystem>, String> {
     tachyon_client::list_deployed_systems()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_cluster_features() -> Result<tachyon_client::ClusterFeatureSet, String> {
+    tachyon_client::get_cluster_features()
         .await
         .map_err(|error| error.to_string())
 }
@@ -1293,6 +1309,7 @@ fn main() {
             generate_pat,
             generate_operator_invite,
             push_asset,
+            import_faas_package,
             push_large_model,
             get_resources,
             get_hardware_status,
@@ -1300,6 +1317,7 @@ fn main() {
             get_node_capabilities,
             list_registered_systems,
             list_deployed_systems,
+            get_cluster_features,
             get_cluster_hardware_summary,
             get_staged_config,
             get_active_config,

@@ -15,6 +15,7 @@ async function installTauriMocks(page: Page): Promise<void> {
     const responses: Record<string, unknown> = {
       get_hardware_status: { totalRamMb: 8192, availableRamMb: 4096, accelerators: ["cpu"], gpus: [] },
       get_cluster_hardware_summary: { source: "mock", enrolledCount: 0, onlineCount: 0, staleCount: 0, totalRamMb: 0, gpuCount: 0 },
+      get_cluster_features: { hasEnrolledNodes: true, hasFleet: true, hasAi: true, hasRouting: true, hasResilience: true, hasIdentity: true, hasRbac: true, hasStorage: true, hasObservability: true, hasSupplyChain: true },
       get_mesh_graph: { source: "mock", status: "ready", routes: [], batchTargets: [] },
       get_topology_graph: { source: "mock", status: "ready", nodes: [], edges: [] },
       list_enrolled_nodes: [],

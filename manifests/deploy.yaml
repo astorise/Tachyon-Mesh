@@ -62,7 +62,7 @@ spec:
           imagePullPolicy: Never
           env:
             - name: FAAS_URL
-              value: http://tachyon-service:8080/api/guest-example
+              value: http://tachyon-service:8080/metrics
           ports:
             - containerPort: 8081
           readinessProbe:

@@ -283,6 +283,7 @@ impl McpContext {
 /// `-32602 invalid_params` rather than `-32001 cluster_unreachable`.
 fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<Vec<String>> {
     let required: &[&str] = match tool_name {
+        "tachyon_import_package" => &["package_path"],
         "tachyon_deploy_function" => &["function_name", "artifact_path"],
         "tachyon_delete_function" => &["function_name"],
         "tachyon_function_logs" => &["function_name"],
@@ -329,6 +330,7 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         "tachyon_canary_split" => 2,
         // Deployment / deletion mutators — moderate budget.
         "tachyon_apply_manifest" | "tachyon_seal_overlay" | "tachyon_set_route_scopes" => 1,
+        "tachyon_import_package" => 3,
         "tachyon_deploy_function" | "tachyon_delete_function" => 5,
         "tachyon_register_resource" => 10,
         // KV mutators and log fetches — generous but bounded.
@@ -797,6 +799,17 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                             "minVramMb": { "type": "integer", "minimum": 0 },
                             "qosClass": { "type": "string", "enum": ["realtime", "batch", "background"] },
                             "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"] }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_import_package",
+                    "description": "Imports a FaaS package archive (.tar.gz) produced by the Tachyon build pipeline. Uploads every .wasm inside as an asset, then registers the routes declared in the archive's manifest.json — replacing module names with their uploaded asset URIs. The manifest is applied immediately; no separate seal/apply step is needed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["package_path"],
+                        "properties": {
+                            "package_path": { "type": "string", "description": "Absolute local file path to the guest-examples.tar.gz (or any compatible FaaS package) on the MCP host machine." }
                         }
                     }
                 },
@@ -1467,6 +1480,20 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
             }))
         }
         // ── WASM function lifecycle ───────────────────────────────────────────
+        "tachyon_import_package" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let package_path = arguments
+                .get("package_path")
+                .and_then(Value::as_str)
+                .context("missing package_path")?;
+            let result = tachyon_client::import_faas_package(package_path).await?;
+            Ok(
+                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result)? }] }),
+            )
+        }
         "tachyon_deploy_function" => {
             let arguments = params
                 .and_then(|v| v.get("arguments"))

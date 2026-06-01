@@ -22,7 +22,8 @@ import "../routing/TachyonRoutingDashboard";
 import "../traffic/TachyonResiliencePanel";
 import "../traffic/TachyonRoutingPanel";
 import stylesheetText from "../../style.css?inline";
-import { listComponentRoutes, resolveComponentTag } from "../../registry/ComponentRegistry";
+import { listComponentRoutes, resolveComponentTag, resolveComponentRoute } from "../../registry/ComponentRegistry";
+import { isFeatureAvailable } from "../../stores/clusterFeaturesStore";
 import { getLanguage, setLanguage, t } from "../../utils/i18n";
 import { resilientInvoke as invoke } from "../../utils/network";
 
@@ -234,7 +235,15 @@ export class TachyonAppShell extends HTMLElement {
   }
 
   private showRoute(route: string): void {
-    this.activeRoute = this.normalizeRoute(route);
+    const normalized = this.normalizeRoute(route);
+    const componentRoute = resolveComponentRoute(normalized);
+    if (componentRoute?.requires !== undefined && !isFeatureAvailable(componentRoute.requires)) {
+      window.location.hash = "overview";
+      this.activeRoute = "overview";
+      this.updateNavigation("overview");
+    } else {
+      this.activeRoute = normalized;
+    }
     const staticPanel = this.root.querySelector<HTMLElement>(`[data-route-panel="${this.activeRoute}"]`);
     this.root.querySelectorAll<HTMLElement>("[data-route-panel]").forEach((panel) => {
       panel.classList.toggle("hidden", panel !== staticPanel);
