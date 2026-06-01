@@ -26,9 +26,10 @@ pub(crate) fn inject_feature_routes(mut config: IntegrityConfig) -> IntegrityCon
 
     #[cfg(feature = "ai-inference")]
     {
+        // The OpenAI surface and model registry are now the `guest-openai` user
+        // FaaS example (see change `faas-openai-user-example`); only the broker
+        // remains a system route auto-injected under `ai-inference`.
         to_inject.push(("/system/model-broker", "model-broker"));
-        to_inject.push(("/system/ai-list-model", "ai-list-model"));
-        to_inject.push(("/system/ai-openai-adapter", "ai-openai-adapter"));
     }
 
     #[cfg(feature = "s3-persistence")]

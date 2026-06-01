@@ -876,9 +876,7 @@ pub async fn get_cluster_features() -> Result<ClusterFeatureSet> {
     Ok(ClusterFeatureSet {
         has_enrolled_nodes: !nodes.is_empty(),
         has_fleet: nodes.len() > 1,
-        has_ai: slugs.contains("ai-list-model")
-            || slugs.contains("model-broker")
-            || slugs.contains("buffer"),
+        has_ai: slugs.contains("model-broker") || slugs.contains("buffer"),
         has_routing: slugs.contains("gateway") || slugs.contains("mesh-overlay"),
         has_resilience: slugs.contains("shadow-proxy") || slugs.contains("dist-limiter"),
         has_identity: slugs.contains("authn"),

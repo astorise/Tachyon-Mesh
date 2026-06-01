@@ -1,5 +1,8 @@
-## ADDED Requirements
+# topology-live-and-filters Specification
 
+## Purpose
+TBD - created by archiving change topology-live-and-filters. Update Purpose after archive.
+## Requirements
 ### Requirement: Topology reads live manifest
 The topology graph SHALL be sourced from the live node's manifest
 (`GET /admin/manifest`) when connected, not from the local `integrity.lock` file.
@@ -15,8 +18,7 @@ correctly populate `routes`, `batch_targets`, `resources`, and `kv_caches`.
 - **THEN** nodes are sourced from the local `integrity.lock` as before
 
 ### Requirement: Two-tier node model for user WASM routes
-For each user route whose `targets[0].module` is a WASM reference (`.wasm`
-suffix or `tachyon://` prefix), the system SHALL emit two nodes and one edge:
+The system SHALL emit two nodes and one edge for each user route whose `targets[0].module` is a WASM reference (`.wasm` suffix or `tachyon://` prefix):
 - An `endpoint` node with the route's HTTP path as label and `protocol` in data.
 - A `custom-wasm` node with the module name as label.
 - An edge from endpoint → custom-wasm.
@@ -72,3 +74,18 @@ The topology panel SHALL provide a filter bar with:
 #### Scenario: Clear button resets all filters
 - **WHEN** active filters exist and the operator clicks *Clear filters*
 - **THEN** all nodes and edges are visible again and the filter inputs are reset
+
+### Requirement: Topology canvas allows drag in view mode
+Topology canvas nodes SHALL be draggable in both view and edit modes. The
+`editable` flag SHALL continue to gate node creation, deletion, the node-editor
+sidebar, and the "Apply Topology" button, but SHALL NOT gate the node `pointerdown`
+drag handler.
+
+#### Scenario: Drag in view mode moves the node
+- **WHEN** the topology is in view mode and the operator presses and drags a node
+- **THEN** the node's position updates on the canvas in real time
+
+#### Scenario: Node editor does not open in view mode
+- **WHEN** the topology is in view mode and the operator clicks a node without dragging
+- **THEN** the `topology:node-selected` event fires but the node-editor sidebar remains hidden (editable = false)
+

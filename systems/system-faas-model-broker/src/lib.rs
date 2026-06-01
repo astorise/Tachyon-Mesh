@@ -25,7 +25,7 @@ const COMMIT_PREFIX: &str = "/admin/models/commit/";
 const ABORT_PREFIX: &str = "/admin/models/abort/";
 const AUTH_SESSION_CDC_PATH: &str = "/internal/model-broker/cdc/auth-session";
 const PROMPT_FINISHED_PATH: &str = "/internal/model-broker/prompt-finished";
-const AI_LIST_MODEL_REGISTER_URL: &str = "http://mesh/internal/ai-list-model/register";
+const MODEL_REGISTRY_REGISTER_URL: &str = "http://mesh/internal/guest-openai/register";
 const STANDARD_VRAM_TTL_SECONDS: u64 = 300;
 const EXTENDED_VRAM_TTL_SECONDS: u64 = 1_800;
 const HIGH_FOLLOWUP_PROBABILITY: f32 = 0.8;
@@ -369,15 +369,15 @@ fn commit_upload(uri: &str) -> Result<String, String> {
             .trim_start_matches("sha256:")
             .to_owned()
     });
-    notify_ai_list_model(&alias);
+    notify_model_registry(&alias);
 
     Ok(model_path.to_string_lossy().to_string())
 }
 
-/// Best-effort notification to system-faas-ai-list-model that a model is now available.
-/// Failures are swallowed — the commit has already succeeded and the registry can be
-/// refreshed on the next model upload or operator intervention.
-fn notify_ai_list_model(alias: &str) {
+/// Best-effort notification to the `guest-openai` model registry that a model is now
+/// available. Failures are swallowed — the commit has already succeeded and the registry
+/// can be refreshed on the next model upload or operator intervention.
+fn notify_model_registry(alias: &str) {
     let entry = ModelRegistryEntry {
         alias: alias.to_owned(),
         engine: "gguf".to_owned(),
@@ -389,7 +389,7 @@ fn notify_ai_list_model(alias: &str) {
     };
     let _ = bindings::tachyon::mesh::outbound_http::send_request(
         "POST",
-        AI_LIST_MODEL_REGISTER_URL,
+        MODEL_REGISTRY_REGISTER_URL,
         &[("content-type".to_owned(), "application/json".to_owned())],
         &body,
     );

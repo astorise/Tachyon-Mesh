@@ -84,12 +84,14 @@ Tachyon Mesh SHALL define a `wit/ai/model-registry.wit` contract that exposes a 
 - **THEN** it receives a list of model records with alias, engine, VRAM requirement, and status fields
 
 ### Requirement: OpenAI adapter model listing
-The `system-faas-openai-adapter` FaaS SHALL serve `/v1/models` by calling the AI model registry and transforming each Tachyon model record into an OpenAI-compatible model object.
+
+The `guest-openai` user FaaS SHALL serve `/v1/models` by reading the `ai-models-registry` `kv-partition` table directly and transforming each Tachyon model record into an OpenAI-compatible model object. It SHALL NOT call a separate registry FaaS to obtain the model list.
 
 #### Scenario: Client lists OpenAI-compatible models
-- **GIVEN** the registry contains at least one available model
+
+- **GIVEN** the `ai-models-registry` table contains at least one available model
 - **WHEN** an authenticated client requests `/v1/models`
-- **THEN** the adapter returns an OpenAI-compatible JSON response with `object: "list"` and a `data` array
+- **THEN** `guest-openai` returns an OpenAI-compatible JSON response with `object: "list"` and a `data` array
 - **AND** each item includes an `id`, `object: "model"`, and `owned_by: "tachyon-mesh"`
 
 ### Requirement: OpenAI adapter scope enforcement
@@ -100,10 +102,3 @@ The OpenAI-compatible adapter SHALL require the requesting identity to have the 
 - **WHEN** it requests `/v1/models`
 - **THEN** the adapter rejects the request without exposing model metadata
 
-### Requirement: Gateway routes OpenAI-compatible endpoints to the adapter
-The system FaaS gateway SHALL route `/v1/models` and `/v1/chat/completions` requests to `system-faas-openai-adapter` while preserving HTTP headers.
-
-#### Scenario: Gateway forwards OpenAI-compatible request
-- **WHEN** a request reaches the gateway for `/v1/chat/completions`
-- **THEN** the gateway dispatches it to `system-faas-openai-adapter`
-- **AND** authorization and tracing headers remain available to the adapter

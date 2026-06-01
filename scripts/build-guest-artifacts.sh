@@ -8,6 +8,7 @@ cargo build -p guest-example --target wasm32-wasip2 --release
 cargo build -p guest-flaky --target wasm32-wasip2 --release
 cargo build -p guest-grpc --target wasm32-wasip2 --release
 cargo build -p guest-log-storm --target wasm32-wasip1 --release
+cargo build -p guest-openai --target wasm32-wasip2 --release
 cargo build -p guest-tcp-echo --target wasm32-wasip1 --release
 cargo build -p guest-udp-echo --target wasm32-wasip2 --release
 cargo build -p guest-voip-gate --target wasm32-wasip2 --release

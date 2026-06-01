@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Topology canvas allows drag in view mode
 Topology canvas nodes SHALL be draggable in both view and edit modes. The

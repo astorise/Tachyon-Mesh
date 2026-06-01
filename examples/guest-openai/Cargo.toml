@@ -1,5 +1,5 @@
 [package]
-name = "system-faas-openai-adapter"
+name = "guest-openai"
 version = "1.0.0"
 edition = "2021"
 
@@ -7,6 +7,6 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+wit-bindgen = "0.46"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-wit-bindgen = "0.57"

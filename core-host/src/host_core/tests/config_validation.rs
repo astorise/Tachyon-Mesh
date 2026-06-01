@@ -148,6 +148,43 @@ fn routes_without_scopes_pass_validation_under_default_require_scopes_false() {
 }
 
 #[test]
+fn guest_openai_example_routes_validate_with_kv_scope() {
+    // Regression guard for the `guest-openai` user FaaS example
+    // (change `faas-openai-user-example`): the OpenAI surface and registry
+    // endpoints are sealed user routes carrying a `scopes.kv` grant for the
+    // shared `ai-models-registry` table, and they must resolve to a guest
+    // function without runtime feature injection.
+    let scopes = json!({ "kv": ["ai-models-registry"] });
+    let make = |path: &str, name: &str| {
+        let mut route = IntegrityRoute::user(path);
+        route.name = name.to_owned();
+        route.scopes = Some(scopes.clone());
+        route
+    };
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![
+        make("/v1/models", "openai-models"),
+        make("/v1/chat/completions", "openai-chat"),
+        make("/internal/guest-openai/register", "openai-registry"),
+    ];
+
+    let config = validate_integrity_config(config)
+        .expect("guest-openai example routes with a kv scope must validate");
+
+    let models = config
+        .sealed_route("/v1/models")
+        .expect("/v1/models should remain sealed");
+    assert_eq!(models.role, RouteRole::User);
+    assert_eq!(models.name, "openai-models");
+    assert!(
+        config
+            .sealed_route("/internal/guest-openai/register")
+            .is_some(),
+        "the model-broker register target must be a sealed route"
+    );
+}
+
+#[test]
 fn validate_integrity_config_defaults_route_scaling_when_scaling_fields_are_omitted() {
     let config = serde_json::from_str::<IntegrityConfig>(
             r#"{

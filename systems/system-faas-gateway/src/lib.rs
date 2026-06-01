@@ -14,8 +14,6 @@ const GATEWAY_ROUTE: &str = "/system/gateway";
 const MEDIA_SERVER_ROUTE: &str = "/system/media-server";
 const OLAP_ENGINE_ROUTE: &str = "/system/olap-engine";
 const MATERIALIZED_VIEW_PREFIX: &str = "/api/views/";
-const OPENAI_ADAPTER_ROUTE: &str = "/system/ai-openai-adapter";
-const OPENAI_V1_PREFIX: &str = "/v1/";
 
 struct Component;
 
@@ -65,7 +63,6 @@ enum GatewayTargetKind {
     Media,
     Olap,
     MaterializedView,
-    OpenAiAdapter,
 }
 
 struct GatewayTarget {
@@ -97,12 +94,9 @@ fn route_baas_request(
             kind: GatewayTargetKind::MaterializedView,
         };
     }
-    if original_route.starts_with(OPENAI_V1_PREFIX) || original_route == "/v1" {
-        return GatewayTarget {
-            route: OPENAI_ADAPTER_ROUTE.to_owned(),
-            kind: GatewayTargetKind::OpenAiAdapter,
-        };
-    }
+    // `/v1/*` (the OpenAI-compatible surface) are sealed user routes served by
+    // the `guest-openai` example FaaS; the gateway forwards them as ordinary
+    // OLTP traffic rather than rewriting to a system adapter route.
     GatewayTarget {
         route: original_route.to_owned(),
         kind: GatewayTargetKind::Oltp,
@@ -261,16 +255,18 @@ mod tests {
     }
 
     #[test]
-    fn v1_models_routes_to_openai_adapter() {
+    fn v1_models_passes_through_as_oltp() {
+        // `/v1/*` are sealed user routes (guest-openai); the gateway forwards
+        // them unchanged rather than rewriting to a system adapter.
         let target = route_baas_request("/v1/models", &[], b"");
-        assert_eq!(target.kind, GatewayTargetKind::OpenAiAdapter);
-        assert_eq!(target.route, OPENAI_ADAPTER_ROUTE);
+        assert_eq!(target.kind, GatewayTargetKind::Oltp);
+        assert_eq!(target.route, "/v1/models");
     }
 
     #[test]
-    fn v1_chat_completions_routes_to_openai_adapter() {
+    fn v1_chat_completions_passes_through_as_oltp() {
         let target = route_baas_request("/v1/chat/completions", &[], b"{}");
-        assert_eq!(target.kind, GatewayTargetKind::OpenAiAdapter);
-        assert_eq!(target.route, OPENAI_ADAPTER_ROUTE);
+        assert_eq!(target.kind, GatewayTargetKind::Oltp);
+        assert_eq!(target.route, "/v1/chat/completions");
     }
 }

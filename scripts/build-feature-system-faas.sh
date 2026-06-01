@@ -26,9 +26,10 @@ build_and_stage() {
 }
 
 # ai-inference ─────────────────────────────────────────────────────────────────
+# The OpenAI adapter and model registry are now the `guest-openai` user FaaS
+# example (built via build-guest-artifacts.sh); only the broker and vector-search
+# remain feature-gated system components here.
 if has_feature "ai-inference"; then
-    build_and_stage system-faas-ai-list-model  system_faas_ai_list_model.wasm
-    build_and_stage system-faas-openai-adapter system_faas_openai_adapter.wasm
     build_and_stage system-faas-vector-search  system_faas_vector_search.wasm
 fi
 
