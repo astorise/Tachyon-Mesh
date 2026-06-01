@@ -1005,23 +1005,32 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         }
     };
 
-    // ── Node construction ─────────────────────────────────────────────────────
-    // Track type-row indices for auto-layout.
+    // ── Node construction — two-pass layout ──────────────────────────────────
+    // Pass 1: collect (id, node_type, label, data) without positions.
+    // Pass 2: compute base rows from actual counts, then assign (x, y).
     let type_order = [
         "endpoint",
         "system-faas",
+        "custom-wasm",
         "llm",
         "kv-cache",
-        "custom-wasm",
         "message-broker",
         "storage",
         "external-resource",
     ];
-    let mut type_counters: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut nodes: Vec<TopologyNodeSpec> = Vec::new();
+
+    struct PendingNode {
+        id: String,
+        node_type: String,
+        label: String,
+        data: std::collections::HashMap<String, String>,
+    }
+
+    let mut pending: Vec<PendingNode> = Vec::new();
     let mut edges: Vec<TopologyEdgeSpec> = Vec::new();
     let mut edge_counter: usize = 0;
+    let mut pending_type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // Map route path → node id for edge construction.
     let mut path_to_id: std::collections::HashMap<String, String> =
@@ -1042,75 +1051,129 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             .and_then(|v| v.as_array())
             .map(|a| !a.is_empty())
             .unwrap_or(false);
-        let module_name = route.get("module").and_then(|v| v.as_str()).unwrap_or("");
+        let module_name = route
+            .get("module")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                route
+                    .get("targets")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|t| t.get("module"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+        let is_wasm_module =
+            module_name.ends_with(".wasm") || module_name.starts_with("tachyon://");
 
-        let node_type = if has_models {
+        // For user routes backed by a WASM module, emit both an endpoint node
+        // (the HTTP entry point) and a custom-wasm node (the backing module),
+        // connected by an edge.  This gives the canonical two-tier view where
+        // the gateway/endpoint is clearly distinct from the WASM implementation.
+        let emit_endpoint_pair = role == "user" && is_wasm_module && !has_models;
+
+        let primary_node_type = if has_models {
             "llm"
         } else if role == "system" {
             "system-faas"
-        } else if module_name.ends_with(".wasm") {
+        } else if is_wasm_module {
             "custom-wasm"
         } else {
             "endpoint"
         };
 
-        let id = format!("route:{path}");
-        path_to_id.insert(path.to_owned(), id.clone());
+        // Endpoint node (always emitted for user routes).
+        let endpoint_id = format!("route:{path}");
+        path_to_id.insert(path.to_owned(), endpoint_id.clone());
 
-        let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        match node_type {
-            "llm" => {
-                if let Some(alias) = route
-                    .get("models")
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.first())
-                    .and_then(|m| m.get("alias").and_then(|v| v.as_str()))
-                {
-                    data.insert("modelName".to_owned(), alias.to_owned());
+        if emit_endpoint_pair || primary_node_type == "endpoint" {
+            let protocol = if path.starts_with("/wss") || path.starts_with("/ws") {
+                "WS"
+            } else if path.starts_with("/grpc") {
+                "gRPC"
+            } else {
+                "HTTP"
+            };
+            let mut ep_data: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            ep_data.insert("protocol".to_owned(), protocol.to_owned());
+            *pending_type_counts
+                .entry("endpoint".to_owned())
+                .or_insert(0) += 1;
+            pending.push(PendingNode {
+                id: endpoint_id.clone(),
+                node_type: "endpoint".to_owned(),
+                label: path.to_owned(),
+                data: ep_data,
+            });
+        }
+
+        // Backing node (system-faas / custom-wasm / llm).
+        if primary_node_type != "endpoint" {
+            let wasm_id = if emit_endpoint_pair {
+                format!("wasm:{name}")
+            } else {
+                endpoint_id.clone()
+            };
+
+            let mut data: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            match primary_node_type {
+                "llm" => {
+                    if let Some(alias) = route
+                        .get("models")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|m| m.get("alias").and_then(|v| v.as_str()))
+                    {
+                        data.insert("modelName".to_owned(), alias.to_owned());
+                    }
                 }
-            }
-            "system-faas" => {
-                data.insert("component".to_owned(), name.to_owned());
-            }
-            "custom-wasm" => {
-                data.insert("capabilityName".to_owned(), name.to_owned());
-                let version = route
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("^1.0.0");
-                data.insert("semver".to_owned(), version.to_owned());
-                if !module_name.is_empty() {
-                    data.insert("assetSource".to_owned(), module_name.to_owned());
+                "system-faas" => {
+                    data.insert("component".to_owned(), name.to_owned());
                 }
+                "custom-wasm" => {
+                    data.insert("capabilityName".to_owned(), name.to_owned());
+                    let version = route
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("^1.0.0");
+                    data.insert("semver".to_owned(), version.to_owned());
+                    if !module_name.is_empty() {
+                        data.insert("assetSource".to_owned(), module_name.to_owned());
+                    }
+                }
+                _ => {}
             }
-            _ => {
-                // endpoint: infer protocol from path or defaults
-                let protocol = if path.starts_with("/wss") || path.starts_with("/ws") {
-                    "WS"
-                } else {
-                    "HTTP"
-                };
-                data.insert("protocol".to_owned(), protocol.to_owned());
+
+            *pending_type_counts
+                .entry(primary_node_type.to_owned())
+                .or_insert(0) += 1;
+            pending.push(PendingNode {
+                id: wasm_id.clone(),
+                node_type: primary_node_type.to_owned(),
+                label: name.to_owned(),
+                data,
+            });
+
+            // Edge: endpoint → backing module.
+            if emit_endpoint_pair {
+                edge_counter += 1;
+                edges.push(TopologyEdgeSpec {
+                    id: format!("e{edge_counter}"),
+                    from: endpoint_id.clone(),
+                    to: wasm_id,
+                });
             }
         }
 
-        let (x, y) = topology_layout_position(node_type, &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
-            id: id.clone(),
-            node_type: node_type.to_owned(),
-            label: name.to_owned(),
-            x,
-            y,
-            data,
-        });
-
-        // Collect dependency edges (route path → other route path).
+        // Dependency edges (route path → other route path).
         if let Some(deps) = route.get("dependencies").and_then(|v| v.as_object()) {
             for dep_path in deps.keys() {
                 edge_counter += 1;
                 edges.push(TopologyEdgeSpec {
                     id: format!("e{edge_counter}"),
-                    from: id.clone(),
+                    from: endpoint_id.clone(),
                     to: format!("route:{dep_path}"),
                 });
             }
@@ -1141,13 +1204,13 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
             data.insert("modelRef".to_owned(), model_ref.to_owned());
         }
 
-        let (x, y) = topology_layout_position("kv-cache", &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
+        *pending_type_counts
+            .entry("kv-cache".to_owned())
+            .or_insert(0) += 1;
+        pending.push(PendingNode {
             id: id.clone(),
             node_type: "kv-cache".to_owned(),
             label: name.to_owned(),
-            x,
-            y,
             data,
         });
 
@@ -1174,14 +1237,31 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         let mut data: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         data.insert("targetUrl".to_owned(), target.to_owned());
 
-        let (x, y) = topology_layout_position("external-resource", &type_order, &mut type_counters);
-        nodes.push(TopologyNodeSpec {
+        *pending_type_counts
+            .entry("external-resource".to_owned())
+            .or_insert(0) += 1;
+        pending.push(PendingNode {
             id,
             node_type: "external-resource".to_owned(),
             label: name.clone(),
+            data,
+        });
+    }
+
+    // Pass 2: build layout from actual counts, then assign positions.
+    let layout = TopologyLayout::build(&type_order, &pending_type_counts);
+    let mut type_counters: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut nodes: Vec<TopologyNodeSpec> = Vec::new();
+    for p in pending {
+        let (x, y) = layout.position(&p.node_type, &mut type_counters);
+        nodes.push(TopologyNodeSpec {
+            id: p.id,
+            node_type: p.node_type,
+            label: p.label,
             x,
             y,
-            data,
+            data: p.data,
         });
     }
 
@@ -1193,24 +1273,45 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
     })
 }
 
-/// Assign a canvas position based on node type, grouping same-type nodes in rows.
-/// Each type occupies its own horizontal band; wraps to a new sub-row after 5 nodes.
-fn topology_layout_position(
-    node_type: &str,
-    type_order: &[&str],
-    counters: &mut std::collections::HashMap<String, usize>,
-) -> (i32, i32) {
-    let index = *counters.entry(node_type.to_owned()).or_insert(0);
-    *counters.get_mut(node_type).expect("just inserted") += 1;
+/// Two-pass topology layout: precompute base rows from actual node counts so
+/// that an overflowing type never overlaps the band of the next type.
+struct TopologyLayout {
+    base_rows: std::collections::HashMap<String, i32>,
+    max_per_row: i32,
+}
 
-    let type_row = type_order.iter().position(|&t| t == node_type).unwrap_or(7) as i32;
-    let max_per_row: i32 = 5;
-    let col = (index as i32) % max_per_row;
-    let sub_row = (index as i32) / max_per_row;
+impl TopologyLayout {
+    fn build(type_order: &[&str], counts: &std::collections::HashMap<String, usize>) -> Self {
+        const MAX_PER_ROW: i32 = 5;
+        let mut base_rows = std::collections::HashMap::new();
+        let mut current_row: i32 = 0;
+        for &t in type_order {
+            let count = *counts.get(t).unwrap_or(&0) as i32;
+            if count > 0 {
+                base_rows.insert(t.to_owned(), current_row);
+                current_row += (count + MAX_PER_ROW - 1) / MAX_PER_ROW;
+            }
+        }
+        Self {
+            base_rows,
+            max_per_row: MAX_PER_ROW,
+        }
+    }
 
-    let x = 40 + col * 300;
-    let y = 40 + (type_row + sub_row) * 140;
-    (x, y)
+    fn position(
+        &self,
+        node_type: &str,
+        counters: &mut std::collections::HashMap<String, usize>,
+    ) -> (i32, i32) {
+        let index = *counters.entry(node_type.to_owned()).or_insert(0);
+        *counters.get_mut(node_type).expect("just inserted") += 1;
+        let base_row = *self.base_rows.get(node_type).unwrap_or(&0);
+        let col = (index as i32) % self.max_per_row;
+        let sub_row = (index as i32) / self.max_per_row;
+        let x = 40 + col * 300;
+        let y = 40 + (base_row + sub_row) * 140;
+        (x, y)
+    }
 }
 
 const OVERLAY_FILE_NAME: &str = "tachyon.resources.json";
@@ -2438,7 +2539,18 @@ async fn load_live_config_payload() -> Result<serde_json::Value> {
 }
 
 /// Serialize `config` back to a string, re-sign, write the lockfile, and POST to /admin/manifest.
-async fn patch_and_apply_manifest(config: serde_json::Value) -> Result<()> {
+async fn patch_and_apply_manifest(mut config: serde_json::Value) -> Result<()> {
+    if let Some(obj) = config.as_object_mut() {
+        let next = obj
+            .get("config_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        obj.insert(
+            "config_version".to_owned(),
+            serde_json::Value::Number(next.into()),
+        );
+    }
     let payload =
         serde_json::to_string(&config).context("failed to serialize patched config payload")?;
     let manifest = sign_manifest_payload(payload).await?;

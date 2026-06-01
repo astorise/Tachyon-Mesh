@@ -29,6 +29,51 @@
       "dependencies": {}
     },
     {
+      "path": "/api/guest-ai",
+      "role": "user",
+      "name": "guest-ai",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "0.0.0",
+      "dependencies": {}
+    },
+    {
+      "path": "/api/guest-log-storm",
+      "role": "user",
+      "name": "guest-log-storm",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "0.0.0",
+      "dependencies": {}
+    },
+    {
+      "path": "/api/guest-voip-gate",
+      "role": "user",
+      "name": "guest-voip-gate",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "0.0.0",
+      "dependencies": {}
+    },
+    {
+      "path": "/api/guest-volume",
+      "role": "user",
+      "name": "guest-volume",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "0.0.0",
+      "dependencies": {}
+    },
+    {
+      "path": "/ws/guest-websocket-echo",
+      "role": "user",
+      "name": "guest-websocket-echo",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "0.0.0",
+      "dependencies": {}
+    },
+    {
       "path": "/grpc/hello",
       "role": "user",
       "name": "hello",

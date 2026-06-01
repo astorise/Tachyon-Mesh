@@ -28,6 +28,7 @@ pub(crate) fn inject_feature_routes(mut config: IntegrityConfig) -> IntegrityCon
     {
         to_inject.push(("/system/model-broker", "model-broker"));
         to_inject.push(("/system/ai-list-model", "ai-list-model"));
+        to_inject.push(("/system/ai-openai-adapter", "ai-openai-adapter"));
     }
 
     #[cfg(feature = "s3-persistence")]
@@ -44,7 +45,7 @@ pub(crate) fn inject_feature_routes(mut config: IntegrityConfig) -> IntegrityCon
             path: path.to_owned(),
             role: RouteRole::System,
             name: name.to_owned(),
-            version: "1.1.0-alpha".to_owned(),
+            version: "1.0.0".to_owned(),
             ..IntegrityRoute::default()
         });
     }
@@ -1756,7 +1757,7 @@ pub(crate) fn normalize_route_target(target: RouteTarget) -> Result<RouteTarget>
             "Integrity Validation Failed: route targets must include a non-empty `module`"
         ));
     }
-    if module.contains('/') || module.contains('\\') {
+    if !system_storage::is_asset_uri(&module) && (module.contains('/') || module.contains('\\')) {
         return Err(anyhow!(
             "Integrity Validation Failed: route targets must use module names, not filesystem paths"
         ));

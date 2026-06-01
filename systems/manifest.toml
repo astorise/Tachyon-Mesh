@@ -1,233 +1,233 @@
 [[system]]
 slug = "authn"
 crate_name = "system-faas-authn"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Authentication control-plane component"
 
 [[system]]
 slug = "authz"
 crate_name = "system-faas-authz"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Authorization policy component"
 
 [[system]]
 slug = "bridge"
 crate_name = "system-faas-bridge"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Bridge controller component"
 
 [[system]]
 slug = "buffer"
 crate_name = "system-faas-buffer"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Inference queue buffer component"
 
 [[system]]
 slug = "cdc"
 crate_name = "system-faas-cdc"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Change-data-capture component"
 
 [[system]]
 slug = "cdc-broadcaster"
 crate_name = "system-faas-cdc-broadcaster"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "CDC subscriber broadcaster component"
 
 [[system]]
 slug = "cert-manager"
 crate_name = "system-faas-cert-manager"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Certificate lifecycle component"
 
 [[system]]
 slug = "config-api"
 crate_name = "system-faas-config-api"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Configuration API component"
 
 [[system]]
 slug = "dist-limiter"
 crate_name = "system-faas-dist-limiter"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Distributed rate limiter component"
 
 [[system]]
 slug = "enrollment"
 crate_name = "system-faas-enrollment"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Enrollment helper component"
 
 [[system]]
 slug = "gateway"
 crate_name = "system-faas-gateway"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Internal gateway component"
 
 [[system]]
 slug = "gc"
 crate_name = "system-faas-gc"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Garbage collection component"
 
 [[system]]
 slug = "gitops-broker"
 crate_name = "system-faas-gitops-broker"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "GitOps broker component"
 
 [[system]]
 slug = "gossip"
 crate_name = "system-faas-gossip"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Gossip control component"
 
 [[system]]
 slug = "k8s-scaler"
 crate_name = "system-faas-k8s-scaler"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Kubernetes scaling component"
 
 [[system]]
 slug = "keda"
 crate_name = "system-faas-keda"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "KEDA autoscaling component"
 
 [[system]]
 slug = "logger"
 crate_name = "system-faas-logger"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Structured logging component"
 
 [[system]]
 slug = "media-server"
 crate_name = "system-faas-media-server"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Range media streaming component"
 
 [[system]]
 slug = "mesh-overlay"
 crate_name = "system-faas-mesh-overlay"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Mesh overlay control component"
 
 [[system]]
 slug = "metering"
 crate_name = "system-faas-metering"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Usage metering component"
 
 [[system]]
 slug = "microvm-runner"
 crate_name = "system-faas-microvm-runner"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "MicroVM runner component"
 
 [[system]]
 slug = "model-broker"
 crate_name = "system-faas-model-broker"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Model upload and prewarm broker"
 
 [[system]]
 slug = "ai-list-model"
 crate_name = "system-faas-ai-list-model"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Persistent AI model registry (kv-partition index)"
 
 [[system]]
 slug = "ai-openai-adapter"
 crate_name = "system-faas-openai-adapter"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "OpenAI-compatible REST adapter for the AI model registry"
 
 [[system]]
 slug = "node-registry"
 crate_name = "system-faas-node-registry"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Enrolled node registry and system catalog component"
 
 [[system]]
 slug = "olap-engine"
 crate_name = "system-faas-olap-engine"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Isolated OLAP aggregation component"
 
 [[system]]
 slug = "openapi"
 crate_name = "system-faas-openapi"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "OpenAPI publication component"
 
 [[system]]
 slug = "otel"
 crate_name = "system-faas-otel"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "OpenTelemetry component"
 
 [[system]]
 slug = "prom"
 crate_name = "system-faas-prom"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Prometheus integration component"
 
 [[system]]
 slug = "registry"
 crate_name = "system-faas-registry"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Artifact registry component"
 
 [[system]]
 slug = "s3-proxy"
 crate_name = "system-faas-s3-proxy"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "S3 proxy component"
 
 [[system]]
 slug = "shadow-proxy"
 crate_name = "system-faas-shadow-proxy"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Shadow traffic proxy component"
 
 [[system]]
 slug = "sql-engine"
 crate_name = "system-faas-sql-engine"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "SQL planning component"
 
 [[system]]
 slug = "sqs"
 crate_name = "system-faas-sqs"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Queue service component"
 
 [[system]]
 slug = "storage-broker"
 crate_name = "system-faas-storage-broker"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Storage broker component"
 
 [[system]]
 slug = "tde"
 crate_name = "system-faas-tde"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Transparent data encryption component"
 
 [[system]]
 slug = "tee-runtime"
 crate_name = "system-faas-tee-runtime"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "TEE runtime component"
 
 [[system]]
 slug = "vector-search"
 crate_name = "system-faas-vector-search"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Ephemeral vector search component"
 
 [[system]]
 slug = "view-builder"
 crate_name = "system-faas-view-builder"
-version = "1.1.0-alpha"
+version = "1.0.0"
 description = "Materialized view builder component"
