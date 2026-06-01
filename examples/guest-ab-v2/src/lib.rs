@@ -18,8 +18,8 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
         req: bindings::exports::tachyon::mesh::handler::Request,
     ) -> bindings::exports::tachyon::mesh::handler::Response {
         let name = extract_name(&req);
-        let request_id = extract_header(&req, "x-request-id")
-            .unwrap_or_else(|| "unknown".to_owned());
+        let request_id =
+            extract_header(&req, "x-request-id").unwrap_or_else(|| "unknown".to_owned());
         let body = format!(
             r#"{{"version":"{VERSION}","variant":"canary","greeting":"Hello, {name}!","algorithm":"personalized","request_id":"{request_id}","features":["enhanced-routing","request-tracing"]}}"#
         )
