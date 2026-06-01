@@ -1010,9 +1010,9 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
     let type_order = [
         "endpoint",
         "system-faas",
+        "custom-wasm",
         "llm",
         "kv-cache",
-        "custom-wasm",
         "message-broker",
         "storage",
         "external-resource",

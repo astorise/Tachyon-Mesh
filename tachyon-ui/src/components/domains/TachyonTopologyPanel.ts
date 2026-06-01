@@ -840,7 +840,7 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         return;
       }
 
-      this.nodes = graph.nodes.map((n) => ({
+      const liveNodes: TopologyNode[] = graph.nodes.map((n) => ({
         id: n.id,
         type: (n.nodeType as TopologyNodeType) ?? "endpoint",
         label: n.label,
@@ -848,7 +848,17 @@ export class TachyonTopologyPanel extends TachyonConfigDashboard {
         y: n.y,
         data: { ...n.data },
       }));
-      this.edges = graph.edges.map((e) => ({ ...e }));
+      const liveIds = new Set(liveNodes.map((n) => n.id));
+      // Keep manually-added nodes that have no live counterpart (user-defined
+      // endpoints, gateways, etc.) so the editor canvas is not reset on reload.
+      const manualNodes = this.nodes.filter((n) => !liveIds.has(n.id));
+      this.nodes = [...liveNodes, ...manualNodes];
+      // Live edges take precedence; keep manual edges that reference surviving nodes.
+      const allIds = new Set(this.nodes.map((n) => n.id));
+      const manualEdges = this.edges.filter(
+        (e) => !liveIds.has(e.from) && !liveIds.has(e.to) && allIds.has(e.from) && allIds.has(e.to),
+      );
+      this.edges = [...graph.edges.map((e) => ({ ...e })), ...manualEdges];
       this.liveSource = graph.source;
       this.render();
       this.bindEvents();
