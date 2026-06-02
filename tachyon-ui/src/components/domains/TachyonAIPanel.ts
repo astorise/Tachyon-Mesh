@@ -3,6 +3,7 @@ import gsap from "gsap";
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
+import "./TachyonModelUploadPanel";
 
 type RuntimeMetrics = {
   source: string;
@@ -55,6 +56,8 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
         </header>
 
         ${this.renderVramMetrics()}
+
+        <tachyon-model-upload-panel data-stagger-panel></tachyon-model-upload-panel>
 
         <form class="space-y-6">
           <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">

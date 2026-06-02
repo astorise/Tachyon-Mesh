@@ -608,6 +608,23 @@ async fn import_faas_package(
         .map_err(|error| error.to_string())
 }
 
+/// Open a native file-open dialog and return the chosen model file path, or
+/// `None` if the operator cancelled. Implemented as an app command (no plugin
+/// capability needed) wrapping the dialog plugin's Rust API.
+#[tauri::command]
+async fn pick_model_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Select a model file")
+        .pick_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let picked = rx.await.map_err(|error| error.to_string())?;
+    Ok(picked.map(|path| path.to_string()))
+}
+
 #[tauri::command]
 async fn push_large_model(app: tauri::AppHandle, path: String) -> Result<String, String> {
     tachyon_client::push_large_model_with_progress(&path, |percentage| {
@@ -1259,6 +1276,7 @@ fn stronghold_profile_key(data_dir: &std::path::Path) -> Result<Vec<u8>, String>
 
 fn main() {
     let result = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -1310,6 +1328,7 @@ fn main() {
             generate_operator_invite,
             push_asset,
             import_faas_package,
+            pick_model_file,
             push_large_model,
             get_resources,
             get_hardware_status,

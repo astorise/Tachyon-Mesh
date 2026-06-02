@@ -11,8 +11,9 @@ tauri-build = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tachyon-client = { path = "../tachyon-client" }
+tauri-plugin-dialog = "2"
 tauri-plugin-stronghold = "2"
-tokio = { version = "1", features = ["fs"] }
+tokio = { version = "1", features = ["fs", "sync"] }
 wit-bindgen = "0.57"
 rand_core = { version = "0.6", features = ["getrandom"] }
 iota_stronghold = "2.1"

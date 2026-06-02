@@ -4,7 +4,7 @@
 Define the Tachyon UI controls and backend validation contract for AI orchestration, accelerator selection, and KV cache configuration.
 ## Requirements
 ### Requirement: AI Orchestration Panel
-The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for configuring LoRA multiplexing, edge KV cache size, and encrypted TDE key material through the shared dashboard base.
+The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for configuring LoRA multiplexing, edge KV cache size, and encrypted TDE key material through the shared dashboard base. The AI Orchestration view SHALL also host the `<tachyon-model-upload-panel>` control for uploading model files (see `ai-model-upload-ui`).
 
 #### Scenario: Operator adjusts KV cache
 - **WHEN** the operator moves the KV cache slider
@@ -14,6 +14,10 @@ The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for confi
 - **WHEN** the operator submits the AI panel
 - **THEN** the panel sends a `config-ai` payload with `lora_mode`, `kv_cache_size`, and `tde_key` to `apply_configuration`
 - **AND** the panel shows the backend validation result in its feedback zone
+
+#### Scenario: AI view exposes the model-upload panel
+- **WHEN** the AI Orchestration view is rendered (with `has_ai` true)
+- **THEN** the `<tachyon-model-upload-panel>` control is present for uploading a model file
 
 ### Requirement: Hardware Accelerator Panel
 The Tachyon UI shell SHALL expose a `<tachyon-hardware-panel>` web component for selecting NPU, TPU, or GPU acceleration and enabling eBPF XDP offloading.

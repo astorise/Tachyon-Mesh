@@ -58,6 +58,20 @@ describe("t()", () => {
       expect(t(key)).not.toBe(key);
     }
   });
+
+  it("resolves model-upload panel keys in both languages", () => {
+    const keys = [
+      "ai.upload.title", "ai.upload.subtitle", "ai.upload.select",
+      "ai.upload.selected", "ai.upload.uploading", "ai.upload.cancelled",
+      "ai.upload.success", "ai.upload.registryHint", "ai.upload.error",
+    ];
+    for (const lang of ["en", "fr"] as const) {
+      setLanguage(lang);
+      for (const key of keys) {
+        expect(t(key), `${key} (${lang})`).not.toBe(key);
+      }
+    }
+  });
 });
 
 describe("getLanguage / setLanguage", () => {
