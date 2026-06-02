@@ -19,4 +19,4 @@ base64 = "0.22"
 
 [dev-dependencies]
 # Host-only: RNG for generating a test RSA key in the RS256 round-trip test.
-rand = "0.8"
+rand = "0.10"
