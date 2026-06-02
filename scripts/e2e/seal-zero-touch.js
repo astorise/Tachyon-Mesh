@@ -53,6 +53,9 @@ config.enrollment = {
 // 2. Sealed route so node-registry's `http://mesh/internal/cert-manager/sign-node`
 //    call resolves to the cert-manager FaaS.
 if (!config.routes.some((r) => r.path === SIGNER_ROUTE)) {
+    // Cluster-CA seed handed to cert-manager via route env (a WASM guest cannot
+    // read an arbitrary host mount; env is passed into the sandbox).
+    const caSeed = crypto.randomBytes(32).toString('hex');
     config.routes.push({
         path: SIGNER_ROUTE,
         role: 'system',
@@ -63,6 +66,7 @@ if (!config.routes.some((r) => r.path === SIGNER_ROUTE)) {
         // Explicit target: module resolution uses targets[0].module, NOT the
         // route name — the path's last segment ("sign-node") would mis-resolve.
         targets: [{ module: 'system-faas-cert-manager', weight: 100 }],
+        env: { TACHYON_CLUSTER_CA_SEED: caSeed },
         dependencies: {},
     });
 }

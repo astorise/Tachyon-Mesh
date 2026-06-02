@@ -21,6 +21,8 @@ const SIGN_NODE_ROUTE: &str = "/internal/cert-manager/sign-node";
 /// Mounted path of the 32-byte cluster-CA ed25519 seed (raw or hex). Only
 /// signer-eligible pods mount this secret.
 const CA_SEED_PATH: &str = "/ca/cluster-ca.seed";
+/// Route-env carrying the cluster-CA seed (hex), passed into the guest sandbox.
+const CA_SEED_ENV: &str = "TACHYON_CLUSTER_CA_SEED";
 #[cfg(target_arch = "wasm32")]
 const MOCK_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
 MIIC1zCCAb+gAwIBAgIIL4ARv71JyR0wDQYJKoZIhvcNAQELBQAwGzEZMBcGA1UEAxMQYXBpLmV4\n\
@@ -183,10 +185,25 @@ fn sign_node_credential_with_key(
 }
 
 fn load_ca_signing_key() -> Result<SigningKey, (u16, String)> {
+    // Prefer the env-provided seed (set via the sealed route `env`, which the
+    // host passes into the guest sandbox). A WASM guest cannot read an
+    // arbitrary host mount like `/ca` unless it is a configured volume, so env
+    // is the portable source; fall back to the mounted file when present.
+    if let Ok(env_seed) = std::env::var(CA_SEED_ENV) {
+        let seed = parse_ca_seed(env_seed.as_bytes()).ok_or_else(|| {
+            (
+                500,
+                format!("{CA_SEED_ENV} must be 32 raw bytes or 64 hex chars"),
+            )
+        })?;
+        return Ok(SigningKey::from_bytes(&seed));
+    }
     let raw = std::fs::read(CA_SEED_PATH).map_err(|error| {
         (
             503,
-            format!("cluster CA seed unavailable at {CA_SEED_PATH}: {error}"),
+            format!(
+                "cluster CA seed unavailable: set {CA_SEED_ENV} or mount {CA_SEED_PATH} ({error})"
+            ),
         )
     })?;
     let seed = parse_ca_seed(&raw).ok_or_else(|| {
