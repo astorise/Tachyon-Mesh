@@ -14,7 +14,7 @@ hex = "0.4"
 wit-bindgen = "0.57"
 # Pure-Rust (wasm-safe) RS256 JWT verification for machine-identity enrollment.
 rsa = "0.9"
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
 base64 = "0.22"
 
 [dev-dependencies]
