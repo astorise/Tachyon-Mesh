@@ -77,12 +77,15 @@ jobs:
       - name: Install k3d
         run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
 
-      - name: Create cluster and import image
+      - name: Create k3d cluster
         run: |
-          k3d cluster create tachyon-zt --wait --no-lb \
-            --k3s-arg "--no-deploy=traefik@server:*"
-          k3d image import "$IMAGE" -c tachyon-zt
+          # Plain create (mirrors the passing k3d-integration workflow); the
+          # deprecated `--no-deploy` k3s-arg can hang `--wait` on newer k3s.
+          k3d cluster create tachyon-zt --wait
           kubectl create namespace tachyon
+
+      - name: Import image into k3d
+        run: k3d image import "$IMAGE" -c tachyon-zt
 
       - name: Deploy mock OIDC issuer
         run: |
