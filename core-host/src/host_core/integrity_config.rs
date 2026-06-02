@@ -204,10 +204,17 @@ pub(crate) async fn admin_enrollment_start_handler(
     // can evaluate machine-identity auto-approval without holding global state.
     // The FaaS reads camelCase keys (matching its `EnrollmentStartRequest`).
     let enrollment = state.runtime.load().config.enrollment.clone();
+    let has_token = payload.identity_token.is_some();
     let mut forward = serde_json::json!({ "nodePublicKey": payload.node_public_key });
     if let Some(token) = payload.identity_token {
         forward["identityToken"] = serde_json::Value::String(token);
     }
+    tracing::info!(
+        zero_touch = enrollment.allows_zero_touch(),
+        has_token,
+        issuer = enrollment.oidc_issuer.as_deref().unwrap_or(""),
+        "enrollment start: injecting policy"
+    );
     if enrollment.allows_zero_touch() {
         if let Some(issuer) = &enrollment.oidc_issuer {
             forward["oidcIssuer"] = serde_json::Value::String(issuer.clone());
