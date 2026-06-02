@@ -38,10 +38,34 @@ pub struct EnrolledNode {
     pub region: Option<String>,
     pub zone: Option<String>,
     pub capabilities: NodeCapabilities,
+    /// Approval provenance: `pin:<operator>` or `oidc:<subject>`. Defaults empty
+    /// for records written before zero-touch enrollment existed.
+    #[serde(default)]
+    pub approved_by: String,
+    /// The `auto_approve_tags` matchers that authorized an automatic approval.
+    /// Empty for PIN approvals.
+    #[serde(default)]
+    pub approval_tags: Vec<String>,
 }
 
 impl EnrolledNode {
     pub fn awaiting_capabilities(node_id: String, public_key: String, now: u64) -> Self {
+        Self::awaiting_capabilities_with_provenance(
+            node_id,
+            public_key,
+            now,
+            String::new(),
+            Vec::new(),
+        )
+    }
+
+    pub fn awaiting_capabilities_with_provenance(
+        node_id: String,
+        public_key: String,
+        now: u64,
+        approved_by: String,
+        approval_tags: Vec<String>,
+    ) -> Self {
         Self {
             node_id,
             public_key,
@@ -51,6 +75,8 @@ impl EnrolledNode {
             region: None,
             zone: None,
             capabilities: NodeCapabilities::default(),
+            approved_by,
+            approval_tags,
         }
     }
 }

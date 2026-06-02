@@ -234,6 +234,46 @@ fn select_route_module_falls_back_to_path_module_when_targets_are_header_only() 
 }
 
 #[test]
+fn injected_signer_route_resolves_to_cert_manager_module() {
+    // Zero-touch validation (unknown #1): the sealed signer route
+    // `/internal/cert-manager/sign-node` must dispatch to the cert-manager wasm.
+    // Module resolution uses targets[0].module, so seal-zero-touch.js sets an
+    // explicit target; the route name and path tail are NOT used for the module.
+    let route = targeted_route(
+        "/internal/cert-manager/sign-node",
+        vec![weighted_target("system-faas-cert-manager", 100)],
+    );
+    let module = select_route_module(&route, &HeaderMap::new())
+        .expect("signer route should resolve to a module");
+    assert_eq!(module, "system-faas-cert-manager");
+
+    // …and that module name maps to the wasm file the image stages.
+    let candidates = guest_module_candidate_paths(&module);
+    assert!(
+        candidates
+            .iter()
+            .any(|path| path.ends_with("system_faas_cert_manager.wasm")),
+        "expected a system_faas_cert_manager.wasm candidate, got: {candidates:?}"
+    );
+}
+
+#[test]
+fn signer_route_without_target_misresolves() {
+    // Guard documenting WHY the explicit target is required: a path-only route
+    // resolves to the last segment ("sign-node"), which is NOT cert-manager.
+    let route = IntegrityRoute::system("/internal/cert-manager/sign-node");
+    let module = select_route_module(&route, &HeaderMap::new()).expect("resolves to a module");
+    assert_eq!(module, "sign-node");
+    let candidates = guest_module_candidate_paths(&module);
+    assert!(
+        !candidates
+            .iter()
+            .any(|path| path.ends_with("system_faas_cert_manager.wasm")),
+        "path-only route must NOT resolve to the cert-manager module"
+    );
+}
+
+#[test]
 fn extract_propagated_headers_copies_legacy_and_canonical_cohort_names() {
     let mut headers = HeaderMap::new();
     headers.insert(COHORT_HEADER, HeaderValue::from_static("beta"));

@@ -1,0 +1,139 @@
+# Zero-touch node enrollment for a multi-node Kubernetes deployment.
+#
+# This extends the headless-Service + StatefulSet topology of deploy-mesh.yaml
+# with the pieces needed for automated, identity-gated enrollment:
+#   * a ServiceAccount whose projected token is the machine identity,
+#   * the cluster-CA seed mounted from a Secret on signer-eligible pods,
+#   * env wiring so system-faas-enrollment presents the token.
+#
+# The enrollment POLICY (mode / oidc_issuer / oidc_audience / auto_approve_tags)
+# lives in the signed integrity.lock, NOT here — k8s only supplies identity and
+# discovery. Example `enrollment` block to seal into integrity.lock:
+#
+#   "enrollment": {
+#     "mode": "both",
+#     "oidc_issuer": "https://kubernetes.default.svc.cluster.local",
+#     "oidc_audience": "tachyon",
+#     "auto_approve_tags": ["namespace=tachyon", "serviceaccount=tachyon-node"]
+#   }
+#
+# and set `enrollment_endpoint` to the headless Service DNS below so a fresh pod
+# opens its outbound enrollment tunnel to any ready peer (no designated master):
+#   "enrollment_endpoint": "http://tachyon-mesh.tachyon.svc.cluster.local:8080"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tachyon-node
+  namespace: tachyon
+---
+# Cluster-CA ed25519 seed (32 raw bytes or 64 hex chars), consumed by
+# system-faas-cert-manager at /ca/cluster-ca.seed to mint node credentials.
+# Provision once (e.g. from the homelab PKI); mount ONLY on signer-eligible
+# pods. Placeholder value — replace with a real sealed secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tachyon-cluster-ca
+  namespace: tachyon
+type: Opaque
+stringData:
+  cluster-ca.seed: "REPLACE_WITH_64_HEX_CHAR_ED25519_SEED"
+---
+# Headless Service → stable per-pod DNS (tachyon-mesh-0.tachyon-mesh...).
+apiVersion: v1
+kind: Service
+metadata:
+  name: tachyon-mesh
+  namespace: tachyon
+spec:
+  clusterIP: None
+  selector:
+    app: tachyon-mesh
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tachyon-mesh
+  namespace: tachyon
+spec:
+  serviceName: tachyon-mesh
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: tachyon-mesh
+  template:
+    metadata:
+      labels:
+        app: tachyon-mesh
+    spec:
+      serviceAccountName: tachyon-node
+      containers:
+        - name: core-host
+          image: ghcr.io/astorise/tachyon-mesh:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Path of the projected ServiceAccount token presented for
+            # zero-touch enrollment (read by system-faas-enrollment).
+            - name: TACHYON_ENROLLMENT_IDENTITY_TOKEN_PATH
+              value: /var/run/secrets/tokens/tachyon-token
+          volumeMounts:
+            - name: tachyon-store
+              mountPath: /app/data
+            - name: sa-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
+            # Genesis/signer pods mount the cluster-CA seed. For a stricter
+            # blast radius, gate this mount to ordinal 0 (a separate seed
+            # StatefulSet) rather than every replica.
+            - name: cluster-ca
+              mountPath: /ca
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        - name: sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  # Audience must equal the sealed `oidc_audience`.
+                  audience: tachyon
+                  expirationSeconds: 3600
+                  path: tachyon-token
+        - name: cluster-ca
+          secret:
+            secretName: tachyon-cluster-ca
+            optional: true
+  volumeClaimTemplates:
+    - metadata:
+        name: tachyon-store
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 256Mi

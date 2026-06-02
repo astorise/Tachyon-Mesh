@@ -148,6 +148,60 @@ fn routes_without_scopes_pass_validation_under_default_require_scopes_false() {
 }
 
 #[test]
+fn enrollment_block_absent_defaults_to_pin() {
+    // Back-compat: no `enrollment` block → PIN mode, validates unchanged.
+    let config = IntegrityConfig::default_sealed();
+    assert_eq!(config.enrollment.mode, EnrollmentMode::Pin);
+    assert!(config.enrollment.is_default());
+    validate_integrity_config(config)
+        .expect("manifest without an `enrollment` block must validate (PIN-only)");
+}
+
+#[test]
+fn enrollment_zero_touch_without_issuer_is_rejected() {
+    let mut config = IntegrityConfig::default_sealed();
+    config.enrollment = EnrollmentConfig {
+        mode: EnrollmentMode::ZeroTouch,
+        oidc_issuer: None,
+        oidc_audience: None,
+        auto_approve_tags: vec!["namespace=tachyon".to_owned()],
+    };
+    let error = validate_integrity_config(config)
+        .expect_err("zero-touch mode without an oidc_issuer must be rejected");
+    assert!(error.to_string().contains("oidc_issuer"));
+}
+
+#[test]
+fn enrollment_malformed_auto_approve_tag_is_rejected() {
+    let mut config = IntegrityConfig::default_sealed();
+    config.enrollment = EnrollmentConfig {
+        mode: EnrollmentMode::Both,
+        oidc_issuer: Some("https://kubernetes.default.svc".to_owned()),
+        oidc_audience: Some("tachyon".to_owned()),
+        auto_approve_tags: vec!["not-a-pair".to_owned()],
+    };
+    let error = validate_integrity_config(config)
+        .expect_err("a non key=value auto_approve_tags entry must be rejected");
+    assert!(error.to_string().contains("auto_approve_tags"));
+}
+
+#[test]
+fn enrollment_zero_touch_with_issuer_and_valid_tags_validates() {
+    let mut config = IntegrityConfig::default_sealed();
+    config.enrollment = EnrollmentConfig {
+        mode: EnrollmentMode::Both,
+        oidc_issuer: Some("https://kubernetes.default.svc".to_owned()),
+        oidc_audience: Some("tachyon".to_owned()),
+        auto_approve_tags: vec![
+            "namespace=tachyon".to_owned(),
+            "serviceaccount=tachyon-node".to_owned(),
+        ],
+    };
+    validate_integrity_config(config)
+        .expect("zero-touch with issuer and valid key=value tags must validate");
+}
+
+#[test]
 fn guest_openai_example_routes_validate_with_kv_scope() {
     // Regression guard for the `guest-openai` user FaaS example
     // (change `faas-openai-user-example`): the OpenAI surface and registry

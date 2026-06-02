@@ -9,12 +9,18 @@ pub struct EnrollmentConfig {
     pub cert_output_path: PathBuf,
     pub poll_interval: Duration,
     pub max_polls: u32,
+    /// Optional path to a machine-identity token (e.g. a projected Kubernetes
+    /// ServiceAccount token) to present for zero-touch enrollment. When unset
+    /// or unreadable, enrollment proceeds with the human PIN flow.
+    pub identity_token_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StartRequest {
     node_public_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,11 +56,24 @@ pub fn start_request_for_key(signing_key: &SigningKey) -> (String, EnrollmentSes
 pub async fn run_enrollment(config: EnrollmentConfig) -> Result<PathBuf> {
     let signing_key = generate_node_keypair();
     let (node_public_key, _) = start_request_for_key(&signing_key);
+    // Present a machine identity for zero-touch enrollment when a token path is
+    // configured and readable; otherwise fall back to the PIN flow.
+    let identity_token =
+        config
+            .identity_token_path
+            .as_ref()
+            .and_then(|path| match std::fs::read_to_string(path) {
+                Ok(token) if !token.trim().is_empty() => Some(token.trim().to_owned()),
+                _ => None,
+            });
     let client = reqwest::Client::new();
     let start_url = join_endpoint(&config.bootstrap_url, "/admin/enrollment/start");
     let start = client
         .post(&start_url)
-        .json(&StartRequest { node_public_key })
+        .json(&StartRequest {
+            node_public_key,
+            identity_token,
+        })
         .send()
         .await
         .with_context(|| format!("failed to start enrollment via `{start_url}`"))?;

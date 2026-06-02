@@ -40,6 +40,7 @@ RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-node-registry --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-cert-manager --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-logger --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
 RUN cargo build -p system-faas-registry --target wasm32-wasip2 --release
@@ -197,6 +198,7 @@ COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /a
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_model_broker.wasm /app/guest-modules/system_faas_model_broker.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_node_registry.wasm /app/guest-modules/system_faas_node_registry.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_cert_manager.wasm /app/guest-modules/system_faas_cert_manager.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_logger.wasm /app/guest-modules/system_faas_logger.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_registry.wasm /app/guest-modules/system_faas_registry.wasm
 COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_ai.wasm /app/guest-modules/guest_ai.wasm

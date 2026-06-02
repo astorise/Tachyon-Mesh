@@ -162,10 +162,18 @@ pub(crate) fn is_integrity_schema_violation(error: &anyhow::Error) -> bool {
     error.to_string().contains(ERR_INTEGRITY_SCHEMA_VIOLATION)
 }
 
+/// Internal mesh route of the cluster-CA signer the node-registry FaaS calls
+/// to mint a credential during zero-touch auto-approval.
+pub(crate) const CLUSTER_CA_SIGNER_ROUTE: &str = "/internal/cert-manager/sign-node";
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminEnrollmentStartRequest {
     pub(crate) node_public_key: String,
+    /// Optional machine-identity proof (a signed JWT) attached by the enrolling
+    /// node for zero-touch enrollment. Passed through to the FaaS.
+    #[serde(default)]
+    pub(crate) identity_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,7 +200,25 @@ pub(crate) async fn admin_enrollment_start_handler(
     if payload.node_public_key.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "nodePublicKey is required").into_response();
     }
-    match serde_json::to_vec(&payload) {
+    // Inject the active enrollment policy from the running config so the FaaS
+    // can evaluate machine-identity auto-approval without holding global state.
+    // The FaaS reads camelCase keys (matching its `EnrollmentStartRequest`).
+    let enrollment = state.runtime.load().config.enrollment.clone();
+    let mut forward = serde_json::json!({ "nodePublicKey": payload.node_public_key });
+    if let Some(token) = payload.identity_token {
+        forward["identityToken"] = serde_json::Value::String(token);
+    }
+    if enrollment.allows_zero_touch() {
+        if let Some(issuer) = &enrollment.oidc_issuer {
+            forward["oidcIssuer"] = serde_json::Value::String(issuer.clone());
+        }
+        if let Some(audience) = &enrollment.oidc_audience {
+            forward["oidcAudience"] = serde_json::Value::String(audience.clone());
+        }
+        forward["autoApproveTags"] = serde_json::json!(enrollment.auto_approve_tags);
+        forward["signerRoute"] = serde_json::Value::String(CLUSTER_CA_SIGNER_ROUTE.to_owned());
+    }
+    match serde_json::to_vec(&forward) {
         Ok(body) => {
             forward_node_registry_faas(
                 state,
@@ -835,11 +861,37 @@ pub(crate) fn validate_integrity_config(mut config: IntegrityConfig) -> Result<I
         validate_require_scopes(&config.routes)?;
     }
     validate_tee_requirements(&config)?;
+    validate_enrollment_config(&config.enrollment)?;
     validate_kv_caches(&config)?;
     let route_registry = RouteRegistry::build(&config)?;
     config.resources = normalize_resources(config.resources, &config.routes, &route_registry)?;
     config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
     Ok(config)
+}
+
+pub(crate) fn validate_enrollment_config(enrollment: &EnrollmentConfig) -> Result<()> {
+    if enrollment.allows_zero_touch()
+        && enrollment
+            .oidc_issuer
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
+        anyhow::bail!(
+            "Integrity Validation Failed: enrollment.mode `{:?}` requires a non-empty `oidc_issuer`",
+            enrollment.mode
+        );
+    }
+    for tag in &enrollment.auto_approve_tags {
+        match tag.split_once('=') {
+            Some((key, value)) if !key.trim().is_empty() && !value.trim().is_empty() => {}
+            _ => anyhow::bail!(
+                "Integrity Validation Failed: enrollment.auto_approve_tags entry `{tag}` must be of the form `key=value`"
+            ),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_kv_caches(config: &IntegrityConfig) -> Result<()> {

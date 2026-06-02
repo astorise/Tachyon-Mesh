@@ -840,6 +840,50 @@ fn default_true() -> bool {
     true
 }
 
+/// Enrollment strategy for new nodes. `Pin` (default) is the existing
+/// operator-PIN device flow; `ZeroTouch` enables machine-identity (OIDC/JWT)
+/// auto-approval; `Both` tries machine identity first and falls back to PIN.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum EnrollmentMode {
+    #[default]
+    Pin,
+    ZeroTouch,
+    Both,
+}
+
+/// Optional enrollment configuration. Absent / all-default means PIN-only,
+/// identical to the pre-existing behavior.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct EnrollmentConfig {
+    #[serde(default)]
+    pub(crate) mode: EnrollmentMode,
+    /// OIDC issuer URL whose JWKS validates machine-identity tokens. Required
+    /// when `mode` allows zero-touch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) oidc_issuer: Option<String>,
+    /// Expected `aud` claim for machine-identity tokens (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) oidc_audience: Option<String>,
+    /// `key=value` claim matchers; a node is auto-approved only when its
+    /// validated token claims satisfy every matcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) auto_approve_tags: Vec<String>,
+}
+
+impl EnrollmentConfig {
+    pub(crate) fn is_default(&self) -> bool {
+        self.mode == EnrollmentMode::Pin
+            && self.oidc_issuer.is_none()
+            && self.oidc_audience.is_none()
+            && self.auto_approve_tags.is_empty()
+    }
+
+    pub(crate) fn allows_zero_touch(&self) -> bool {
+        matches!(self.mode, EnrollmentMode::ZeroTouch | EnrollmentMode::Both)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct IntegrityConfig {
     pub(crate) host_address: String,
@@ -873,6 +917,10 @@ pub(crate) struct IntegrityConfig {
     /// credentials don't need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) enrollment_endpoint: Option<String>,
+    /// Enrollment strategy (PIN device flow vs. machine-identity zero-touch).
+    /// Absent / all-default preserves the PIN-only behavior.
+    #[serde(default, skip_serializing_if = "EnrollmentConfig::is_default")]
+    pub(crate) enrollment: EnrollmentConfig,
     /// Cloud endpoint that `system-faas-cdc` POSTs to when draining the
     /// data-mutation outbox. Optional — air-gapped deployments leave it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -928,6 +976,7 @@ impl Default for IntegrityConfig {
             routes: Vec::new(),
             config_version: 0,
             enrollment_endpoint: None,
+            enrollment: EnrollmentConfig::default(),
             cloud_sync_endpoint: None,
             tee_backend: None,
             instance_pool_max_memory_bytes: None,

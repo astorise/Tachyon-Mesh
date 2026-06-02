@@ -495,11 +495,15 @@ pub(crate) async fn maybe_run_bootstrap_mode(config: &IntegrityConfig) -> Result
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("auth-state/enrolled-node.cert"));
     tracing::warn!("Entering Bootstrap Mode: isolating host startup to system-faas-enrollment");
+    let identity_token_path = std::env::var("TACHYON_ENROLLMENT_IDENTITY_TOKEN_PATH")
+        .ok()
+        .map(PathBuf::from);
     system_faas_enrollment::run_enrollment(system_faas_enrollment::EnrollmentConfig {
         bootstrap_url: endpoint.to_owned(),
         cert_output_path,
         poll_interval: Duration::from_secs(30),
         max_polls: 120,
+        identity_token_path,
     })
     .await?;
     Ok(true)

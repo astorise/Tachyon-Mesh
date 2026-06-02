@@ -10,11 +10,17 @@ mod bindings {
 }
 
 use bindings::tachyon::mesh::storage_broker::WriteMode;
+use ed25519_dalek::{Signer, SigningKey};
 #[cfg(not(target_arch = "wasm32"))]
 use rcgen::generate_simple_self_signed;
 use serde::{Deserialize, Serialize};
 
 const ACME_STAGING_MOCK: &str = "ACME_STAGING_MOCK";
+/// Internal route the node-registry FaaS calls to mint a node credential.
+const SIGN_NODE_ROUTE: &str = "/internal/cert-manager/sign-node";
+/// Mounted path of the 32-byte cluster-CA ed25519 seed (raw or hex). Only
+/// signer-eligible pods mount this secret.
+const CA_SEED_PATH: &str = "/ca/cluster-ca.seed";
 #[cfg(target_arch = "wasm32")]
 const MOCK_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
 MIIC1zCCAb+gAwIBAgIIL4ARv71JyR0wDQYJKoZIhvcNAQELBQAwGzEZMBcGA1UEAxMQYXBpLmV4\n\
@@ -81,6 +87,17 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             return response(405, "Method Not Allowed");
         }
 
+        // Cluster-CA node-credential signing for zero-touch enrollment. The
+        // node-registry FaaS calls this route after validating a machine
+        // identity; we mint an ed25519-signed credential over the node key.
+        let path = req.uri.split_once('?').map(|(p, _)| p).unwrap_or(&req.uri);
+        if path == SIGN_NODE_ROUTE {
+            return match sign_node_credential(&req.body) {
+                Ok(credential_hex) => response(200, credential_hex),
+                Err((status, message)) => response(status, message),
+            };
+        }
+
         let request = match parse_certificate_request(&req.uri) {
             Ok(request) => request,
             Err(message) => return response(400, message),
@@ -116,6 +133,95 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
 
         response(200, body)
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignNodeRequest {
+    node_public_key: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeCredential {
+    node_public_key: String,
+    ca_public_key: String,
+    issued_at: u64,
+    signature: String,
+}
+
+/// Mint a cluster-CA-signed credential for a node's ed25519 public key.
+/// Returns the hex-encoded credential bytes (the node-registry FaaS stages
+/// this hex for the enrolling node's poll, which stores the decoded bytes).
+fn sign_node_credential(body: &[u8]) -> Result<Vec<u8>, (u16, String)> {
+    let request: SignNodeRequest = serde_json::from_slice(body)
+        .map_err(|error| (400, format!("invalid sign-node request: {error}")))?;
+    let signing_key = load_ca_signing_key()?;
+    sign_node_credential_with_key(&signing_key, request.node_public_key.trim())
+}
+
+/// Pure credential minting (no I/O), separated so the signing scheme is
+/// unit-testable: ed25519 signature over the node's public-key bytes, wrapped in
+/// a JSON `NodeCredential` and hex-encoded.
+fn sign_node_credential_with_key(
+    signing_key: &SigningKey,
+    node_public_key: &str,
+) -> Result<Vec<u8>, (u16, String)> {
+    let node_public_key = node_public_key.trim().to_owned();
+    let node_key_bytes = hex::decode(&node_public_key)
+        .map_err(|error| (400, format!("nodePublicKey must be hex: {error}")))?;
+    let signature = signing_key.sign(&node_key_bytes);
+    let credential = NodeCredential {
+        node_public_key,
+        ca_public_key: hex::encode(signing_key.verifying_key().to_bytes()),
+        issued_at: now_seconds(),
+        signature: hex::encode(signature.to_bytes()),
+    };
+    let json = serde_json::to_vec(&credential)
+        .map_err(|error| (500, format!("failed to encode node credential: {error}")))?;
+    Ok(hex::encode(json).into_bytes())
+}
+
+fn load_ca_signing_key() -> Result<SigningKey, (u16, String)> {
+    let raw = std::fs::read(CA_SEED_PATH).map_err(|error| {
+        (
+            503,
+            format!("cluster CA seed unavailable at {CA_SEED_PATH}: {error}"),
+        )
+    })?;
+    let seed = parse_ca_seed(&raw).ok_or_else(|| {
+        (
+            500,
+            format!("cluster CA seed at {CA_SEED_PATH} must be 32 raw bytes or 64 hex chars"),
+        )
+    })?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// Accept the CA seed as 32 raw bytes or a 64-char hex string (with optional
+/// surrounding whitespace).
+fn parse_ca_seed(raw: &[u8]) -> Option<[u8; 32]> {
+    if raw.len() == 32 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(raw);
+        return Some(seed);
+    }
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    let decoded = hex::decode(text).ok()?;
+    if decoded.len() == 32 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&decoded);
+        Some(seed)
+    } else {
+        None
+    }
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 fn parse_certificate_request(uri: &str) -> Result<CertificateRequest, &'static str> {
@@ -256,5 +362,46 @@ mod tests {
         assert_eq!(bundle.domain, "api.example.test");
         assert!(bundle.certificate_pem.contains("BEGIN CERTIFICATE"));
         assert!(bundle.private_key_pem.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn node_credential_is_signed_and_verifiable_by_the_cluster_ca() {
+        // Zero-touch validation (unknown #2, soundness): the minted credential
+        // is an ed25519 signature over the node public-key bytes, verifiable by
+        // the cluster-CA public key and rejected by any other key.
+        use ed25519_dalek::{Signature, Verifier};
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let ca_verifying = signing_key.verifying_key();
+        let node_pub = "11223344556677889900aabbccddeeff";
+
+        let hex_credential = sign_node_credential_with_key(&signing_key, node_pub)
+            .expect("credential should be minted");
+        let json = hex::decode(&hex_credential).expect("credential body is hex");
+        let credential: serde_json::Value =
+            serde_json::from_slice(&json).expect("credential is json");
+
+        assert_eq!(credential["nodePublicKey"], node_pub);
+        assert_eq!(
+            credential["caPublicKey"].as_str().unwrap(),
+            hex::encode(ca_verifying.to_bytes())
+        );
+
+        let message = hex::decode(node_pub).unwrap();
+        let sig_bytes: [u8; 64] = hex::decode(credential["signature"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .expect("64-byte signature");
+        ca_verifying
+            .verify(&message, &Signature::from_bytes(&sig_bytes))
+            .expect("cluster CA must verify its own credential");
+
+        let other_ca = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        assert!(
+            other_ca
+                .verify(&message, &Signature::from_bytes(&sig_bytes))
+                .is_err(),
+            "a credential must not verify under a different CA key"
+        );
     }
 }

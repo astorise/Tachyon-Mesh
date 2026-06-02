@@ -10,7 +10,9 @@ mod bindings {
 }
 
 pub mod enrollment;
+pub mod jwt;
 pub mod types;
+pub mod zero_touch;
 
 include!(concat!(env!("OUT_DIR"), "/static_catalog.rs"));
 
@@ -38,6 +40,22 @@ thread_local! {
 #[serde(rename_all = "camelCase")]
 struct EnrollmentStartRequest {
     node_public_key: String,
+    /// Optional machine-identity proof (a signed JWT, e.g. a projected k8s
+    /// ServiceAccount token) attached by the enrolling node.
+    #[serde(default)]
+    identity_token: Option<String>,
+    /// Enrollment policy injected by `core-host` from the active `IntegrityConfig`
+    /// (the FaaS does not hold the global config). Absent → PIN-only.
+    #[serde(default)]
+    oidc_issuer: Option<String>,
+    #[serde(default)]
+    oidc_audience: Option<String>,
+    #[serde(default)]
+    auto_approve_tags: Vec<String>,
+    /// Internal mesh route of the cluster-CA signer (e.g.
+    /// `/internal/cert-manager/sign-node`). Required for auto-approval.
+    #[serde(default)]
+    signer_route: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +63,10 @@ struct EnrollmentStartRequest {
 struct EnrollmentStartResponse {
     session_id: String,
     pin: String,
+    /// `true` when the node was auto-approved from a machine identity and the
+    /// signed credential is already staged for the first poll.
+    #[serde(default)]
+    auto_approved: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,19 +146,58 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
             pin: deterministic_pin(&session_id),
             created_at: now_seconds(),
         };
+        // Zero-touch path: when a machine-identity token is presented and the
+        // injected policy allows it, validate the token and (on a tag match)
+        // fetch a cluster-CA credential from the signer and stage it on the
+        // session so the node's first poll completes enrollment with no human.
+        let auto = try_zero_touch(&input, &session.node_public_key);
+        let (signed_certificate_hex, auto_approved, provenance) = match auto {
+            Ok(Some(approved)) => (
+                Some(approved.credential_hex),
+                true,
+                Some((format!("oidc:{}", approved.subject), approved.matched_tags)),
+            ),
+            Ok(None) => (None, false, None),
+            Err(error) => {
+                // Fail closed to PIN: never auto-approve on a validation error.
+                emit_audit(&format!(
+                    "enrollment auto-approve denied for session {}: {error}",
+                    session.session_id
+                ));
+                (None, false, None)
+            }
+        };
+
         registry.write_enrollment_session(&StoredEnrollmentSession {
             session_id: session.session_id.clone(),
-            node_public_key: session.node_public_key,
+            node_public_key: session.node_public_key.clone(),
             pin: session.pin.clone(),
             created_at: session.created_at,
-            signed_certificate_hex: None,
+            signed_certificate_hex,
             consumed: false,
         })?;
+        if let Some((approved_by, tags)) = provenance {
+            registry.record_approval_with_provenance(
+                &EnrollmentSession {
+                    session_id: session.session_id.clone(),
+                    node_public_key: session.node_public_key.clone(),
+                    pin: session.pin.clone(),
+                    created_at: session.created_at,
+                },
+                approved_by.clone(),
+                tags.clone(),
+            )?;
+            emit_audit(&format!(
+                "enrollment auto-approved node from {approved_by} (tags: {})",
+                tags.join(",")
+            ));
+        }
         return json(
             201,
             &EnrollmentStartResponse {
                 session_id,
                 pin: session.pin,
+                auto_approved,
             },
         );
     }
@@ -224,11 +285,24 @@ impl Registry {
     }
 
     pub fn record_approval(&self, session: &EnrollmentSession) -> Result<(), String> {
+        // PIN approvals: provenance is the PIN ceremony (operator identity is
+        // not carried on the approve request today).
+        self.record_approval_with_provenance(session, "pin".to_owned(), Vec::new())
+    }
+
+    pub fn record_approval_with_provenance(
+        &self,
+        session: &EnrollmentSession,
+        approved_by: String,
+        approval_tags: Vec<String>,
+    ) -> Result<(), String> {
         let node_id = node_id_from_public_key(&session.node_public_key);
-        let node = EnrolledNode::awaiting_capabilities(
+        let node = EnrolledNode::awaiting_capabilities_with_provenance(
             node_id.clone(),
             session.node_public_key.clone(),
             now_seconds(),
+            approved_by,
+            approval_tags,
         );
         self.write_node(&node_id, &node)
     }
@@ -364,6 +438,120 @@ fn list_deployed_systems(nodes: &[EnrolledNode]) -> Vec<DeployedSystem> {
             }
         })
         .collect()
+}
+
+/// Outcome of a successful machine-identity evaluation: the cluster-CA
+/// credential to stage plus the provenance to record.
+struct ApprovedCredential {
+    credential_hex: String,
+    subject: String,
+    matched_tags: Vec<String>,
+}
+
+/// Attempt zero-touch approval. Returns `Ok(None)` when no machine identity is
+/// presented or policy does not enable zero-touch (→ PIN path). Returns `Err`
+/// on any validation failure; the caller fails closed to PIN.
+fn try_zero_touch(
+    input: &EnrollmentStartRequest,
+    node_public_key: &str,
+) -> Result<Option<ApprovedCredential>, String> {
+    let Some(token) = input
+        .identity_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(issuer) = input
+        .oidc_issuer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let signer_route = input
+        .signer_route
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "zero-touch enrollment requires a signer_route".to_owned())?;
+
+    // 1. Verify the token signature against the issuer's JWKS.
+    let (signing_input, signature_b64, payload) = jwt::split_jwt(token)?;
+    let kid = zero_touch::header_kid(token)?;
+    let jwks = oidc_fetch_jwks(issuer)?;
+    let (n, e) = zero_touch::select_jwk(&jwks, kid.as_deref())?;
+    jwt::verify_rs256(&signing_input, &signature_b64, n, e)?;
+
+    // 2. Enforce audience/expiry and match the auto-approve policy.
+    let claims = zero_touch::claims_from_payload(&payload)?;
+    zero_touch::check_aud_exp(&claims, input.oidc_audience.as_deref(), now_seconds())?;
+    let matched_tags = zero_touch::match_tags(&claims, &input.auto_approve_tags)?;
+    let subject = zero_touch::subject(&claims);
+
+    // 3. Obtain a cluster-CA credential from the mesh signer.
+    let credential_hex = request_credential(signer_route, node_public_key)?;
+    Ok(Some(ApprovedCredential {
+        credential_hex,
+        subject,
+        matched_tags,
+    }))
+}
+
+fn oidc_fetch_jwks(issuer: &str) -> Result<serde_json::Value, String> {
+    let base = issuer.trim_end_matches('/');
+    let discovery = http_get(&format!("{base}/.well-known/openid-configuration"))?;
+    let doc: serde_json::Value = serde_json::from_slice(&discovery)
+        .map_err(|error| format!("invalid OIDC discovery document: {error}"))?;
+    let jwks_uri = doc
+        .get("jwks_uri")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "OIDC discovery document has no `jwks_uri`".to_owned())?;
+    let jwks = http_get(jwks_uri)?;
+    serde_json::from_slice(&jwks).map_err(|error| format!("invalid JWKS: {error}"))
+}
+
+fn request_credential(signer_route: &str, node_public_key: &str) -> Result<String, String> {
+    let path = if signer_route.starts_with('/') {
+        signer_route.to_owned()
+    } else {
+        format!("/{signer_route}")
+    };
+    let url = format!("http://mesh{path}");
+    let body = serde_json::to_vec(&serde_json::json!({ "nodePublicKey": node_public_key }))
+        .map_err(|error| format!("failed to encode signer request: {error}"))?;
+    let response = bindings::tachyon::mesh::outbound_http::send_request(
+        "POST",
+        &url,
+        &[("content-type".to_owned(), "application/json".to_owned())],
+        &body,
+    )
+    .map_err(|error| format!("signer call failed: {error}"))?;
+    if response.status != 200 && response.status != 201 {
+        return Err(format!("signer returned status {}", response.status));
+    }
+    let credential = String::from_utf8(response.body)
+        .map_err(|error| format!("signer returned non-utf8 credential: {error}"))?
+        .trim()
+        .to_owned();
+    hex::decode(&credential).map_err(|error| format!("signer credential is not hex: {error}"))?;
+    Ok(credential)
+}
+
+fn http_get(url: &str) -> Result<Vec<u8>, String> {
+    let response = bindings::tachyon::mesh::outbound_http::send_request("GET", url, &[], &[])
+        .map_err(|error| format!("GET {url} failed: {error}"))?;
+    if response.status != 200 {
+        return Err(format!("GET {url} returned status {}", response.status));
+    }
+    Ok(response.body)
+}
+
+/// Emit a security/audit line. Guest stdout is captured by the host log sink.
+fn emit_audit(message: &str) {
+    println!("[AUDIT] {message}");
 }
 
 fn route_path(uri: &str) -> &str {

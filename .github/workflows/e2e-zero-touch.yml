@@ -1,0 +1,193 @@
+name: E2E Zero-Touch Enrollment
+
+# Exercises machine-identity (OIDC) node enrollment end to end on a real k3d
+# cluster running the mesh with a zero-touch-sealed integrity.lock.
+#
+# HARD GATES:
+#  1. security invariant — a request with no token, or an unverifiable token,
+#     must NEVER be auto-approved (it falls back to PIN);
+#  2. a valid fixture token signed by an in-cluster mock OIDC issuer IS
+#     auto-approved and lands in the registry with `oidc:` provenance, which
+#     exercises route→cert-manager resolution + ed25519 signing end to end.
+# Route resolution and credential soundness also have deterministic unit tests
+# (routing_aliases.rs, system-faas-cert-manager) that run in the standard CI.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "systems/system-faas-node-registry/**"
+      - "systems/system-faas-cert-manager/**"
+      - "systems/system-faas-enrollment/**"
+      - "core-host/src/host_core/integrity_config.rs"
+      - "core-host/src/host_core/domain_types.rs"
+      - "manifests/deploy-zero-touch.yaml"
+      - "scripts/e2e/**"
+      - ".github/workflows/e2e-zero-touch.yml"
+  pull_request:
+    paths:
+      - "systems/system-faas-node-registry/**"
+      - "systems/system-faas-cert-manager/**"
+      - "manifests/deploy-zero-touch.yaml"
+      - "scripts/e2e/**"
+      - ".github/workflows/e2e-zero-touch.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-zero-touch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      ISSUER: http://oidc-mock.tachyon.svc.cluster.local:8080
+      IMAGE: tachyon-mesh:zerotouch
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential libssl-dev cmake nasm
+
+      - name: Generate OIDC fixture (JWKS + discovery + signed JWT)
+        run: node scripts/e2e/make-oidc-fixture.js "$ISSUER" fixture
+
+      - name: Seal zero-touch integrity.lock (enrollment policy + signer route)
+        run: node scripts/e2e/seal-zero-touch.js "$ISSUER"
+
+      - name: Build image (embeds the sealed zero-touch config + cert-manager)
+        run: docker build -t "$IMAGE" .
+
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+      - name: Create cluster and import image
+        run: |
+          k3d cluster create tachyon-zt --wait --no-lb \
+            --k3s-arg "--no-deploy=traefik@server:*"
+          k3d image import "$IMAGE" -c tachyon-zt
+          kubectl create namespace tachyon
+
+      - name: Deploy mock OIDC issuer
+        run: |
+          kubectl -n tachyon create configmap oidc-content \
+            --from-file=jwks.json=fixture/jwks.json \
+            --from-file=openid-configuration.json=fixture/openid-configuration.json
+          cat > /tmp/oidc-nginx.conf <<'EOF'
+          server {
+            listen 8080;
+            location = /.well-known/openid-configuration { default_type application/json; alias /data/openid-configuration.json; }
+            location = /jwks { default_type application/json; alias /data/jwks.json; }
+          }
+          EOF
+          kubectl -n tachyon create configmap oidc-nginx --from-file=default.conf=/tmp/oidc-nginx.conf
+          kubectl -n tachyon apply -f - <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: oidc-mock }
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: oidc-mock } }
+            template:
+              metadata: { labels: { app: oidc-mock } }
+              spec:
+                containers:
+                  - name: nginx
+                    image: nginx:1.27-alpine
+                    ports: [{ containerPort: 8080 }]
+                    volumeMounts:
+                      - { name: content, mountPath: /data }
+                      - { name: conf, mountPath: /etc/nginx/conf.d }
+                volumes:
+                  - { name: content, configMap: { name: oidc-content } }
+                  - { name: conf, configMap: { name: oidc-nginx } }
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: { name: oidc-mock }
+          spec:
+            selector: { app: oidc-mock }
+            ports: [{ port: 8080, targetPort: 8080 }]
+          EOF
+          kubectl -n tachyon rollout status deployment/oidc-mock --timeout=120s
+
+      - name: Deploy zero-touch mesh
+        run: |
+          SEED=$(openssl rand -hex 32)
+          sed \
+            -e "s|ghcr.io/astorise/tachyon-mesh:latest|${IMAGE}|g" \
+            -e "s|imagePullPolicy: Always|imagePullPolicy: Never|g" \
+            -e "s|REPLACE_WITH_64_HEX_CHAR_ED25519_SEED|${SEED}|g" \
+            manifests/deploy-zero-touch.yaml | kubectl apply -f -
+          kubectl -n tachyon rollout status statefulset/tachyon-mesh --timeout=240s
+          kubectl -n tachyon get pods -o wide
+
+      - name: Port-forward node-0 admin API
+        run: |
+          kubectl -n tachyon port-forward tachyon-mesh-0 18080:8080 >/tmp/pf.log 2>&1 &
+          echo $! > /tmp/pf.pid
+          for i in $(seq 1 20); do
+            sleep 1
+            curl -sS -o /dev/null "http://127.0.0.1:18080/admin/status" && break || true
+          done
+
+      - name: 'HARD: no token must not auto-approve (PIN fallback)'
+        run: |
+          BODY=$(curl -sS -X POST http://127.0.0.1:18080/admin/enrollment/start \
+            -H 'content-type: application/json' \
+            -d '{"nodePublicKey":"aa11bb22cc33dd44"}' || true)
+          echo "response: $BODY"
+          if echo "$BODY" | grep -q '"autoApproved":true'; then
+            echo "FAIL: a no-token enrollment was auto-approved"; exit 1
+          fi
+          echo "ok: no-token request was not auto-approved"
+
+      - name: 'HARD: unverifiable token must fail closed to PIN'
+        run: |
+          BODY=$(curl -sS -X POST http://127.0.0.1:18080/admin/enrollment/start \
+            -H 'content-type: application/json' \
+            -d '{"nodePublicKey":"deadbeefdeadbeef","identityToken":"not.a.validjwt"}' || true)
+          echo "response: $BODY"
+          if echo "$BODY" | grep -q '"autoApproved":true'; then
+            echo "FAIL: an unverifiable token was auto-approved"; exit 1
+          fi
+          echo "ok: unverifiable token failed closed (no auto-approval)"
+
+      - name: 'HARD: valid fixture token auto-approves with oidc provenance'
+        run: |
+          TOKEN=$(cat fixture/token.jwt)
+          BODY=$(curl -sS -X POST http://127.0.0.1:18080/admin/enrollment/start \
+            -H 'content-type: application/json' \
+            -d "{\"nodePublicKey\":\"a1b2c3d4e5f60718\",\"identityToken\":\"${TOKEN}\"}" || true)
+          echo "start response: $BODY"
+          echo "$BODY" | grep -q '"autoApproved":true' || { echo "auto-approval not observed"; exit 1; }
+          NODES=$(curl -sS http://127.0.0.1:18080/admin/nodes || true)
+          echo "nodes: $NODES"
+          echo "$NODES" | grep -q 'oidc:' || { echo "oidc provenance not found in registry"; exit 1; }
+          echo "ok: valid identity auto-approved with oidc provenance"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n tachyon get pods -o wide || true
+          kubectl -n tachyon logs tachyon-mesh-0 --tail=200 || true
+          kubectl -n tachyon logs deployment/oidc-mock --tail=50 || true
+          cat /tmp/pf.log || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -f /tmp/pf.pid ] && kill "$(cat /tmp/pf.pid)" 2>/dev/null || true
+          k3d cluster delete tachyon-zt || true
