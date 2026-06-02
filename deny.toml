@@ -8,6 +8,7 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is a direct TLS parser dependency; warnings remain surfaced by cargo audit while we track replacement." },
     { id = "RUSTSEC-2026-0149", reason = "wasmtime-wasi 44.0.1 WASI path_open TRUNCATE bypass; fixed in 44.0.2. Tracked for upgrade — Renovate PR for wasmtime v45 will resolve this." },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side-channel applies to RSA private-key decryption; system-faas-node-registry uses rsa only for RS256 JWT signature VERIFICATION with public keys (no private-key ops), so it is not exploitable here. No fixed rsa release is available yet." },
 ]
 
 [licenses]

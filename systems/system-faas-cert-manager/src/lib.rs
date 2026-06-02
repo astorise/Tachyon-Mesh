@@ -383,13 +383,16 @@ mod tests {
 
         assert_eq!(credential["nodePublicKey"], node_pub);
         assert_eq!(
-            credential["caPublicKey"].as_str().unwrap(),
+            credential["caPublicKey"].as_str().expect("caPublicKey is a string"),
             hex::encode(ca_verifying.to_bytes())
         );
 
-        let message = hex::decode(node_pub).unwrap();
-        let sig_bytes: [u8; 64] = hex::decode(credential["signature"].as_str().unwrap())
-            .unwrap()
+        let message = hex::decode(node_pub).expect("node pubkey is hex");
+        let sig_hex = credential["signature"]
+            .as_str()
+            .expect("signature is a string");
+        let sig_bytes: [u8; 64] = hex::decode(sig_hex)
+            .expect("signature is hex")
             .try_into()
             .expect("64-byte signature");
         ca_verifying
