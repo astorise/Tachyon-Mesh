@@ -383,7 +383,9 @@ mod tests {
 
         assert_eq!(credential["nodePublicKey"], node_pub);
         assert_eq!(
-            credential["caPublicKey"].as_str().expect("caPublicKey is a string"),
+            credential["caPublicKey"]
+                .as_str()
+                .expect("caPublicKey is a string"),
             hex::encode(ca_verifying.to_bytes())
         );
 
