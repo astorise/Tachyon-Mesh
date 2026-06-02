@@ -67,6 +67,11 @@ struct EnrollmentStartResponse {
     /// signed credential is already staged for the first poll.
     #[serde(default)]
     auto_approved: bool,
+    /// When zero-touch was attempted but failed (and enrollment fell back to
+    /// PIN), the reason — for observability/diagnostics. Absent on success or
+    /// when no machine identity was presented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zero_touch_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,20 +156,21 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         // fetch a cluster-CA credential from the signer and stage it on the
         // session so the node's first poll completes enrollment with no human.
         let auto = try_zero_touch(&input, &session.node_public_key);
-        let (signed_certificate_hex, auto_approved, provenance) = match auto {
+        let (signed_certificate_hex, auto_approved, provenance, zero_touch_error) = match auto {
             Ok(Some(approved)) => (
                 Some(approved.credential_hex),
                 true,
                 Some((format!("oidc:{}", approved.subject), approved.matched_tags)),
+                None,
             ),
-            Ok(None) => (None, false, None),
+            Ok(None) => (None, false, None, None),
             Err(error) => {
                 // Fail closed to PIN: never auto-approve on a validation error.
                 emit_audit(&format!(
                     "enrollment auto-approve denied for session {}: {error}",
                     session.session_id
                 ));
-                (None, false, None)
+                (None, false, None, Some(error))
             }
         };
 
@@ -198,6 +204,7 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
                 session_id,
                 pin: session.pin,
                 auto_approved,
+                zero_touch_error,
             },
         );
     }
