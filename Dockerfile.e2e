@@ -1,0 +1,81 @@
+# Slim image for cluster E2E tests (e.g. e2e-zero-touch).
+#
+# Identical core-host runtime to the production Dockerfile, but builds ONLY the
+# Rust pieces: it drops `tachyon-ui`, `legacy-mock`, and the four polyglot guest
+# builders (tinygo / javy / dotnet / java). Those dominate build time and image
+# size and are irrelevant to the mesh/enrollment E2E, which only exercises
+# core-host + system FaaS (node-registry, cert-manager, …). Keeping this
+# separate avoids any risk to the release image build.
+FROM ubuntu:24.04 AS rust-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    file \
+    libssl-dev \
+    musl-tools \
+    nasm \
+    perl \
+    pkg-config \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+ENV RUSTUP_HOME=/usr/local/rustup
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+RUN rustup target add wasm32-wasip1 wasm32-wasip2 x86_64-unknown-linux-musl
+
+WORKDIR /workspace
+
+COPY . .
+
+RUN cargo build -p guest-example --target wasm32-wasip2 --release
+RUN cargo build -p guest-volume --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-authn --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-authz --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-node-registry --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-cert-manager --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-logger --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
+RUN cargo build -p system-faas-registry --target wasm32-wasip2 --release
+RUN cargo build -p guest-ai --target wasm32-wasip1 --release
+RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
+RUN cargo build -p guest-loop --target wasm32-wasip1 --release
+RUN cargo build -p core-host --target x86_64-unknown-linux-musl --release
+
+FROM scratch AS runtime
+
+WORKDIR /app
+
+COPY --from=rust-builder /etc/ssl/certs /etc/ssl/certs
+COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_volume.wasm /app/guest-modules/guest_volume.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_authn.wasm /app/guest-modules/system_faas_authn.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_authz.wasm /app/guest-modules/system_faas_authz.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/k8s_scaler.wasm /app/guest-modules/k8s_scaler.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /app/guest-modules/metrics.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_model_broker.wasm /app/guest-modules/system_faas_model_broker.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_node_registry.wasm /app/guest-modules/system_faas_node_registry.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_cert_manager.wasm /app/guest-modules/system_faas_cert_manager.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_logger.wasm /app/guest-modules/system_faas_logger.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_registry.wasm /app/guest-modules/system_faas_registry.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_ai.wasm /app/guest-modules/guest_ai.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
+COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_loop.wasm /app/guest-modules/guest_loop.wasm
+
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/core-host"]

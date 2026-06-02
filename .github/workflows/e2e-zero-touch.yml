@@ -24,6 +24,7 @@ on:
       - "core-host/src/host_core/domain_types.rs"
       - "manifests/deploy-zero-touch.yaml"
       - "scripts/e2e/**"
+      - "Dockerfile.e2e"
       - ".github/workflows/e2e-zero-touch.yml"
   pull_request:
     paths:
@@ -31,6 +32,7 @@ on:
       - "systems/system-faas-cert-manager/**"
       - "manifests/deploy-zero-touch.yaml"
       - "scripts/e2e/**"
+      - "Dockerfile.e2e"
       - ".github/workflows/e2e-zero-touch.yml"
 
 permissions:
@@ -39,7 +41,7 @@ permissions:
 jobs:
   e2e-zero-touch:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       ISSUER: http://oidc-mock.tachyon.svc.cluster.local:8080
@@ -67,8 +69,10 @@ jobs:
       - name: Seal zero-touch integrity.lock (enrollment policy + signer route)
         run: node scripts/e2e/seal-zero-touch.js "$ISSUER"
 
-      - name: Build image (embeds the sealed zero-touch config + cert-manager)
-        run: docker build -t "$IMAGE" .
+      - name: Build slim image (embeds the sealed zero-touch config + cert-manager)
+        # Dockerfile.e2e builds only core-host + Rust wasm (no tauri-ui / polyglot
+        # guests) — far smaller and faster to build and to import into k3d.
+        run: docker build -f Dockerfile.e2e -t "$IMAGE" .
 
       - name: Install k3d
         run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
@@ -126,9 +130,11 @@ jobs:
       - name: Deploy zero-touch mesh
         run: |
           SEED=$(openssl rand -hex 32)
+          # One replica is enough to drive the enrollment API and keeps rollout fast.
           sed \
             -e "s|ghcr.io/astorise/tachyon-mesh:latest|${IMAGE}|g" \
             -e "s|imagePullPolicy: Always|imagePullPolicy: Never|g" \
+            -e "s|replicas: 3|replicas: 1|g" \
             -e "s|REPLACE_WITH_64_HEX_CHAR_ED25519_SEED|${SEED}|g" \
             manifests/deploy-zero-touch.yaml | kubectl apply -f -
           kubectl -n tachyon rollout status statefulset/tachyon-mesh --timeout=240s
