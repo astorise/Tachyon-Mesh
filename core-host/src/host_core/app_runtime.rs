@@ -47,16 +47,8 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(auth::node_public_key_handler),
         )
         .route(
-            "/admin/enrollment/start",
-            post(admin_enrollment_start_handler),
-        )
-        .route(
             "/admin/enrollment/approve",
             post(admin_enrollment_approve_handler),
-        )
-        .route(
-            "/admin/enrollment/poll/{session_id}",
-            get(admin_enrollment_poll_handler),
         )
         .route("/admin/nodes", get(admin_nodes_handler))
         .route(
@@ -132,6 +124,18 @@ pub(crate) fn build_app(state: AppState) -> Router {
 
     let app = Router::new()
         .merge(admin_routes)
+        // Enrollment bootstrap endpoints are reachable WITHOUT admin auth: an
+        // unenrolled node has no credentials yet. Security is enforced at
+        // approval — a PIN session needs operator approval, and zero-touch
+        // needs a verified machine identity. `approve` stays authenticated.
+        .route(
+            "/admin/enrollment/start",
+            post(admin_enrollment_start_handler),
+        )
+        .route(
+            "/admin/enrollment/poll/{session_id}",
+            get(admin_enrollment_poll_handler),
+        )
         .route(
             "/auth/signup/validate-token",
             post(auth::validate_registration_token_handler),

@@ -32,6 +32,50 @@ async fn router_returns_guest_stdout_for_post_request() {
 }
 
 #[tokio::test]
+async fn enrollment_start_is_reachable_without_admin_auth() {
+    // An unenrolled node has no credentials; the bootstrap endpoints must not
+    // sit behind admin auth. (Regression for the device-flow/zero-touch path.)
+    let app = build_app(build_test_state(
+        IntegrityConfig::default_sealed(),
+        telemetry::init_test_telemetry(),
+    ));
+    let response = app
+        .oneshot(
+            Request::post("/admin/enrollment/start")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nodePublicKey":"deadbeef"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_ne!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "enrollment start must be reachable by a credential-less node"
+    );
+}
+
+#[tokio::test]
+async fn other_admin_routes_still_require_auth() {
+    // Guard: only enrollment start/poll are exempt — the rest of /admin stays gated.
+    let app = build_app(build_test_state(
+        IntegrityConfig::default_sealed(),
+        telemetry::init_test_telemetry(),
+    ));
+    let response = app
+        .oneshot(
+            Request::get("/admin/nodes")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn router_accepts_get_requests() {
     let app = build_app(build_test_state(
         IntegrityConfig::default_sealed(),
