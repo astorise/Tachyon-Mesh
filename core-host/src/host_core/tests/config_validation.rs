@@ -766,6 +766,13 @@ fn validate_integrity_config_preserves_encrypted_volume_flag() {
 
 #[test]
 fn encrypted_volume_seal_hides_plaintext_and_prepare_restores_it() {
+    // Encrypted volumes require an explicit data-encryption key; configure one
+    // for the round-trip assertions below.
+    std::env::set_var(
+        "TDE_KEY_HEX",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    );
+
     let volume_dir = unique_test_dir("tachyon-tde-volume");
     let mut route = storage_broker_test_route(&volume_dir);
     route.volumes[0].encrypted = true;
@@ -783,6 +790,15 @@ fn encrypted_volume_seal_hides_plaintext_and_prepare_restores_it() {
     assert_eq!(
         fs::read(&file_path).expect("prepared file should be readable"),
         b"patient-record: secret"
+    );
+
+    // Fail-closed: without a configured key, sealing an encrypted volume must
+    // error rather than silently fall back to a constant default key.
+    std::env::remove_var("TDE_KEY_HEX");
+    fs::write(&file_path, b"patient-record: secret").expect("plaintext should be re-written");
+    assert!(
+        seal_encrypted_route_volumes(&route).is_err(),
+        "sealing must fail when TDE_KEY_HEX is unset"
     );
 
     let _ = fs::remove_dir_all(volume_dir);

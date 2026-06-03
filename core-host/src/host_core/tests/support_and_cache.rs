@@ -973,7 +973,13 @@ pub(super) fn cert_manager_test_route(host_path: &std::path::Path) -> IntegrityR
         dependencies: BTreeMap::new(),
         requires_credentials: Vec::new(),
         middleware: None,
-        env: BTreeMap::new(),
+        // The cert-manager now mints a real cluster-CA-signed leaf, so it needs
+        // the CA seed the host injects into the route env (same source
+        // `load_ca_signing_key` reads in production).
+        env: route_env(&[(
+            "TACHYON_CLUSTER_CA_SEED",
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )]),
         allowed_secrets: Vec::new(),
         targets: vec![RouteTarget {
             module: "system-faas-cert-manager".to_owned(),

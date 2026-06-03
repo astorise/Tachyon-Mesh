@@ -21,14 +21,12 @@ pub(crate) fn ensure_rustls_crypto_provider() {
 /// compiled in, without requiring the operator to manually add them via the
 /// manifest.  Routes already present in the config are left untouched.
 pub(crate) fn inject_feature_routes(mut config: IntegrityConfig) -> IntegrityConfig {
-    #[allow(unused_mut)]
-    let mut to_inject: Vec<(&str, &str)> = Vec::new();
-
     // The node-registry FaaS is invoked by the host via the synthetic
     // `/admin/node-registry` route. Seal it so the FaaS is recognised as a
     // System caller and is allowed to make the outbound calls zero-touch
     // enrollment needs (OIDC JWKS fetch, cluster-CA signer). Always present.
-    to_inject.push(("/admin/node-registry", "node-registry"));
+    #[allow(unused_mut)]
+    let mut to_inject: Vec<(&str, &str)> = vec![("/admin/node-registry", "node-registry")];
 
     #[cfg(feature = "ai-inference")]
     {
@@ -668,9 +666,9 @@ fn current_unix_seconds() -> u64 {
 
 /// Cluster-wide configuration update event written to `config_update_outbox`
 /// whenever a node accepts a signed manifest via `POST /admin/manifest`. The
-/// gossip bridge (still TODO — Session C wiring) reads from this table and
-/// broadcasts to peers, who then pull the new manifest from `origin_node_id`
-/// over the secure overlay.
+/// host-side gossip bridge (`spawn_config_gossip_subscriber`) drains this table
+/// and announces each event to peers, who then pull the new manifest from
+/// `origin_node_id` over the secure overlay.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ConfigUpdateEvent {
     pub version: u64,

@@ -190,6 +190,229 @@ pub(crate) fn spawn_authz_purge_subscriber(state: AppState) {
     });
 }
 
+/// How often the config-gossip bridge drains the `config_update_outbox` and
+/// announces accepted manifests to peers. Config changes are rare, so a relaxed
+/// cadence keeps the (normally empty) read essentially free.
+pub(crate) const CONFIG_GOSSIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Maximum config-update events broadcast in a single poll tick.
+pub(crate) const CONFIG_GOSSIP_BATCH_LIMIT: usize = 32;
+
+const MESH_OVERLAY_ROUTE_NAME: &str = "system-faas-mesh-overlay";
+const MESH_OVERLAY_DEFAULT_MOUNT: &str = "/system/mesh-overlay";
+const MESH_OVERLAY_CONFIG_UPDATE_SUBPATH: &str = "/config/update";
+const OVERLAY_PEER_URLS_ENV: &str = "PEER_URLS";
+const OVERLAY_SHARED_SECRET_ENV: &str = "OVERLAY_SHARED_SECRET";
+const OVERLAY_NODE_ID_ENV: &str = "NODE_ID";
+const DEFAULT_OVERLAY_NODE_ID: &str = "local-node";
+const OVERLAY_AUTH_HEADER: &str = "x-tachyon-overlay-auth";
+
+/// Per-peer announcement timeout. The gossip subscriber is single-threaded, so a
+/// peer that accepts the connection but never sends response headers would
+/// otherwise block every later peer and every later outbox row indefinitely.
+const CONFIG_GOSSIP_PEER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Where to fan out `ConfigUpdateEvent`s. The host keeps no standalone peer
+/// registry — peer URLs and the overlay shared secret live in the `mesh-overlay`
+/// route's `env`, the very same values the `system-faas-mesh-overlay` guest
+/// consumes for discovery — so we read them straight from the live config.
+struct ConfigGossipTargets {
+    /// Peer base URLs (scheme + authority), e.g. `https://node-b:8443`.
+    peers: Vec<String>,
+    /// Mount path of the mesh-overlay route on every peer host.
+    mount_path: String,
+    /// Shared secret the peer's `authorize_peer` expects, when configured.
+    auth_secret: Option<String>,
+    /// This node's overlay `NODE_ID` — the key peers index it under in their
+    /// routing table (from its heartbeats), and therefore the value
+    /// `origin_node_id` must carry so a peer can resolve the origin and pull.
+    node_id: String,
+}
+
+/// Drain the `config_update_outbox` on a steady cadence and announce each
+/// accepted manifest to peers by POSTing the `ConfigUpdateEvent` to their
+/// `system-faas-mesh-overlay` `/config/update` endpoint. Peers compare the
+/// advertised version with their own and pull the full manifest from the origin
+/// node over the secure overlay only when they are behind.
+///
+/// This is the host-side half of multi-master config sync: `core-host` already
+/// writes the durable outbox row and fires the in-process `config_updates`
+/// broadcast when it accepts a manifest (see `integrity_config.rs`); this
+/// subscriber turns those rows into the cross-node gossip the
+/// distributed-control-plane spec requires. Delivery is best-effort — the
+/// receiver is version-guarded and idempotent, and peers also self-heal through
+/// their own overlay discovery — so a row is removed after its broadcast round to
+/// keep the outbox bounded.
+pub(crate) fn spawn_config_gossip_subscriber(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CONFIG_GOSSIP_POLL_INTERVAL);
+        loop {
+            interval.tick().await;
+            if let Err(error) = drain_config_update_outbox(&state).await {
+                tracing::warn!("config gossip subscriber drain failed: {error:#}");
+            }
+        }
+    });
+}
+
+async fn drain_config_update_outbox(state: &AppState) -> Result<()> {
+    let core_store = Arc::clone(&state.core_store);
+    let rows = tokio::task::spawn_blocking(move || {
+        core_store
+            .peek_outbox(
+                store::CoreStoreBucket::ConfigUpdateOutbox,
+                CONFIG_GOSSIP_BATCH_LIMIT,
+            )
+            .context("failed to peek config update outbox")
+    })
+    .await
+    .context("config gossip peek task join failed")??;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let targets = config_gossip_targets(&state.runtime.load().config.routes);
+    let mut acked = 0usize;
+    let mut keys = Vec::with_capacity(rows.len());
+    for (key, payload) in rows {
+        if let Some(targets) = &targets {
+            let outgoing = stamp_origin_node_id(&payload, &targets.node_id);
+            acked += broadcast_config_event(state, targets, &outgoing).await;
+        }
+        keys.push(key);
+    }
+
+    // Remove the drained rows regardless of per-peer delivery outcome: the
+    // broadcast is best-effort gossip, and retaining rows because of a single
+    // unreachable peer would grow the outbox without bound.
+    let drained = keys.len();
+    let core_store = Arc::clone(&state.core_store);
+    tokio::task::spawn_blocking(move || {
+        for key in keys {
+            if let Err(error) = core_store.delete(store::CoreStoreBucket::ConfigUpdateOutbox, &key)
+            {
+                tracing::warn!("config_update_outbox cleanup for `{key}` failed: {error:#}");
+            }
+        }
+    })
+    .await
+    .context("config gossip cleanup task join failed")?;
+
+    if targets.is_none() {
+        tracing::debug!(
+            "config gossip: drained {drained} event(s) with no mesh-overlay peers configured"
+        );
+    } else {
+        tracing::debug!("config gossip: announced {drained} event(s), {acked} peer ack(s)");
+    }
+    Ok(())
+}
+
+/// POST one serialized `ConfigUpdateEvent` to every peer's mesh-overlay
+/// `/config/update` endpoint. Returns the number of peers that accepted it.
+async fn broadcast_config_event(
+    state: &AppState,
+    targets: &ConfigGossipTargets,
+    payload: &[u8],
+) -> usize {
+    let mut acked = 0usize;
+    for peer in &targets.peers {
+        let url = format!(
+            "{}{}{}",
+            peer.trim_end_matches('/'),
+            targets.mount_path,
+            MESH_OVERLAY_CONFIG_UPDATE_SUBPATH
+        );
+        let mut request = state
+            .http_client
+            .post(&url)
+            .timeout(CONFIG_GOSSIP_PEER_TIMEOUT)
+            .header("content-type", "application/json")
+            .body(payload.to_vec());
+        if let Some(secret) = &targets.auth_secret {
+            request = request.header(OVERLAY_AUTH_HEADER, secret);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                acked += 1;
+                tracing::debug!(peer = %peer, status = %response.status(), "config update announced");
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    peer = %peer,
+                    status = %response.status(),
+                    "peer rejected config update announcement"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(peer = %peer, "failed to announce config update: {error}");
+            }
+        }
+    }
+    acked
+}
+
+/// Resolve peer fan-out targets from the live `mesh-overlay` route. Returns
+/// `None` when the route is absent or declares no peers (e.g. a single-node
+/// deployment), in which case there is nothing to propagate.
+fn config_gossip_targets(routes: &[IntegrityRoute]) -> Option<ConfigGossipTargets> {
+    let route = routes.iter().find(|route| {
+        route.name == MESH_OVERLAY_ROUTE_NAME || route.path == MESH_OVERLAY_DEFAULT_MOUNT
+    })?;
+    let peers = route
+        .env
+        .get(OVERLAY_PEER_URLS_ENV)
+        .map(|raw| {
+            raw.split(',')
+                .map(|entry| entry.trim().trim_end_matches('/').to_owned())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if peers.is_empty() {
+        return None;
+    }
+    let mount_path = if route.path.trim().is_empty() {
+        MESH_OVERLAY_DEFAULT_MOUNT.to_owned()
+    } else {
+        route.path.trim_end_matches('/').to_owned()
+    };
+    let auth_secret = route
+        .env
+        .get(OVERLAY_SHARED_SECRET_ENV)
+        .map(|secret| secret.trim().to_owned())
+        .filter(|secret| !secret.is_empty());
+    let node_id = route
+        .env
+        .get(OVERLAY_NODE_ID_ENV)
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| DEFAULT_OVERLAY_NODE_ID.to_owned());
+    Some(ConfigGossipTargets {
+        peers,
+        mount_path,
+        auth_secret,
+        node_id,
+    })
+}
+
+/// Rewrite a stored event's `origin_node_id` to the value peers index this node
+/// under (its overlay heartbeat `NODE_ID`). The admin handler stamps the event
+/// with the host public key, but `system-faas-mesh-overlay` resolves the origin
+/// peer by heartbeat `NODE_ID`; without this rewrite `pull_config_update` returns
+/// `404 origin peer unknown` and the manifest never propagates. Non-event rows
+/// are forwarded unchanged.
+fn stamp_origin_node_id(payload: &[u8], node_id: &str) -> Vec<u8> {
+    match serde_json::from_slice::<ConfigUpdateEvent>(payload) {
+        Ok(mut event) => {
+            event.origin_node_id = node_id.to_owned();
+            serde_json::to_vec(&event).unwrap_or_else(|_| payload.to_vec())
+        }
+        Err(_) => payload.to_vec(),
+    }
+}
+
 pub(crate) fn spawn_volume_gc_sweeper(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(VOLUME_GC_TICK_INTERVAL);
@@ -680,4 +903,92 @@ fn cron_field_matches(field: &str, value: u32) -> bool {
         return n == value;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn overlay_route(env: &[(&str, &str)]) -> IntegrityRoute {
+        IntegrityRoute {
+            name: MESH_OVERLAY_ROUTE_NAME.to_owned(),
+            path: MESH_OVERLAY_DEFAULT_MOUNT.to_owned(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn config_gossip_targets_is_none_without_overlay_route() {
+        let routes = vec![IntegrityRoute {
+            name: "api".to_owned(),
+            path: "/api/generate".to_owned(),
+            ..Default::default()
+        }];
+        assert!(config_gossip_targets(&routes).is_none());
+    }
+
+    #[test]
+    fn config_gossip_targets_is_none_when_no_peers_declared() {
+        let routes = vec![overlay_route(&[("OVERLAY_SHARED_SECRET", "s3cr3t")])];
+        assert!(config_gossip_targets(&routes).is_none());
+    }
+
+    #[test]
+    fn config_gossip_targets_parses_peers_secret_and_node_id() {
+        let routes = vec![overlay_route(&[
+            ("PEER_URLS", "https://node-b:8443/ , https://node-c:8443"),
+            ("OVERLAY_SHARED_SECRET", "s3cr3t"),
+            ("NODE_ID", "node-a-pub"),
+        ])];
+        let targets = config_gossip_targets(&routes).expect("targets should resolve");
+        assert_eq!(
+            targets.peers,
+            vec![
+                "https://node-b:8443".to_owned(),
+                "https://node-c:8443".to_owned(),
+            ]
+        );
+        assert_eq!(targets.mount_path, MESH_OVERLAY_DEFAULT_MOUNT);
+        assert_eq!(targets.auth_secret.as_deref(), Some("s3cr3t"));
+        assert_eq!(targets.node_id, "node-a-pub");
+    }
+
+    #[test]
+    fn config_gossip_targets_matches_by_path_and_defaults_node_id() {
+        let mut route = overlay_route(&[("PEER_URLS", "https://node-b:8443")]);
+        route.name = String::new(); // force the match to rely on the path alone
+        let targets = config_gossip_targets(&[route]).expect("targets should resolve");
+        assert_eq!(targets.peers, vec!["https://node-b:8443".to_owned()]);
+        assert!(
+            targets.auth_secret.is_none(),
+            "absent secret must stay None so unauthenticated overlays still work"
+        );
+        assert_eq!(
+            targets.node_id, DEFAULT_OVERLAY_NODE_ID,
+            "node_id must mirror the overlay heartbeat default so peers can resolve the origin"
+        );
+    }
+
+    #[test]
+    fn stamp_origin_node_id_overrides_event_origin_and_passes_through_garbage() {
+        let original =
+            br#"{"version":7,"checksum":"sha256:abc","origin_node_id":"hostpubkey","ts_ms":123}"#;
+        let stamped = stamp_origin_node_id(original, "node-a");
+        let event: ConfigUpdateEvent = serde_json::from_slice(&stamped)
+            .expect("stamped payload should still be a valid event");
+        assert_eq!(event.origin_node_id, "node-a");
+        assert_eq!(event.version, 7);
+        assert_eq!(event.checksum, "sha256:abc");
+
+        // Non-event rows are forwarded unchanged rather than dropped.
+        assert_eq!(
+            stamp_origin_node_id(b"not an event", "node-a"),
+            b"not an event"
+        );
+    }
 }
