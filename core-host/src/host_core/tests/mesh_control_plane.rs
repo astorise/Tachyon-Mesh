@@ -280,7 +280,7 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
         targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
     user_route.models = vec![IntegrityModelBinding {
         alias: "llama3".to_owned(),
-        path: "/models/llama3.gguf".to_owned(),
+        path: "mock:llama3".to_owned(),
         device: ModelDevice::Cuda,
         qos: RouteQos::RealTime,
     }];
@@ -458,7 +458,7 @@ async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
         targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
     user_route.models = vec![IntegrityModelBinding {
         alias: "llama3".to_owned(),
-        path: "/models/llama3.gguf".to_owned(),
+        path: "mock:llama3".to_owned(),
         device: ModelDevice::Cuda,
         qos: RouteQos::RealTime,
     }];
@@ -777,13 +777,13 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
     route.models = vec![
         IntegrityModelBinding {
             alias: "gpu-live-chat".to_owned(),
-            path: "/models/gpu-live-chat.gguf".to_owned(),
+            path: "mock:gpu-live-chat".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
         },
         IntegrityModelBinding {
             alias: "gpu-batch".to_owned(),
-            path: "/models/gpu-batch.gguf".to_owned(),
+            path: "mock:gpu-batch".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::Batch,
         },
@@ -887,13 +887,13 @@ async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold()
     route.models = vec![
         IntegrityModelBinding {
             alias: "gpu-live-chat".to_owned(),
-            path: "/models/gpu-live-chat.gguf".to_owned(),
+            path: "mock:gpu-live-chat".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
         },
         IntegrityModelBinding {
             alias: "gpu-batch".to_owned(),
-            path: "/models/gpu-batch.gguf".to_owned(),
+            path: "mock:gpu-batch".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::Batch,
         },
