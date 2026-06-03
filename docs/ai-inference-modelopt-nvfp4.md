@@ -34,7 +34,7 @@ Without all three, Tachyon selects the BF16/F32 fallback when allowed by memory 
 
 ## CUDA/CUTLASS Build
 
-The concrete native backend is behind the `nvfp4-cuda` feature. Standard builds do not require CUDA, NVCC, or CUTLASS.
+The concrete native backend is behind the `nvfp4-cuda` feature. Standard builds do not require CUDA, NVCC, or CUTLASS. CI and `--all-features` builds may enable `nvfp4-cuda` without native inputs; in that case Tachyon compiles the Rust capability layer and reports native NVFP4 CUDA kernels unavailable.
 
 To compile the native backend, set:
 
@@ -52,7 +52,7 @@ $env:TACHYON_NVFP4_CUDA_ARCH='sm_120'
 cargo test -p core-host --features "ai-inference nvfp4-cuda" modelopt_nvfp4
 ```
 
-The native source provides CUDA entrypoints for NVFP4 dequantization and an initial linear matmul kernel that consumes ModelOpt packed FP4 weights and FP8 E4M3 scales. CUTLASS headers are required by the feature so future block-scaled Tensor Core kernels can use the same ABI boundary.
+The native source provides CUDA entrypoints for NVFP4 dequantization and an initial linear matmul kernel that consumes ModelOpt packed FP4 weights and FP8 E4M3 scales. CUTLASS headers are required to compile the native kernels so future block-scaled Tensor Core kernels can use the same ABI boundary.
 
 ## Current Runtime Boundary
 

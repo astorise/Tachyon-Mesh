@@ -1290,8 +1290,11 @@ pub(crate) mod tests_support {
             "num_hidden_layers": 2,
             "quantization_config": quantization_config
         });
-        std::fs::write(root.join(CONFIG_JSON), serde_json::to_vec(&config).unwrap())
-            .expect("config should be written");
+        std::fs::write(
+            root.join(CONFIG_JSON),
+            serde_json::to_vec(&config).expect("test config JSON should serialize"),
+        )
+        .expect("config should be written");
     }
 
     pub(crate) fn write_index(root: &Path, shard: &str, tensors: &[&str]) {
@@ -1308,7 +1311,7 @@ pub(crate) mod tests_support {
         });
         std::fs::write(
             root.join(SAFETENSORS_INDEX_JSON),
-            serde_json::to_vec(&index).unwrap(),
+            serde_json::to_vec(&index).expect("test index JSON should serialize"),
         )
         .expect("index should be written");
     }
@@ -1334,7 +1337,8 @@ pub(crate) mod tests_support {
             );
             payload.extend(bytes);
         }
-        let header_bytes = serde_json::to_vec(&Value::Object(header)).unwrap();
+        let header_bytes = serde_json::to_vec(&Value::Object(header))
+            .expect("test safetensors header should serialize");
         let mut file = File::create(path).expect("shard should be created");
         file.write_all(&(header_bytes.len() as u64).to_le_bytes())
             .expect("header prefix should be written");
@@ -1859,7 +1863,7 @@ mod tests {
         });
         std::fs::write(
             root.join(SAFETENSORS_INDEX_JSON),
-            serde_json::to_vec(&index).unwrap(),
+            serde_json::to_vec(&index).expect("test index JSON should serialize"),
         )
         .expect("index should be written");
         let model = ModelOptNvfp4Directory::try_load("nvfp4", &root)

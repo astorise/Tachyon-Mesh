@@ -71,6 +71,11 @@ The runtime SHALL expose a concrete CUDA/CUTLASS native backend only when the `n
 - **THEN** Tachyon builds and tests without CUDA, NVCC, or CUTLASS headers
 - **AND** native NVFP4 capability is reported unavailable
 
+#### Scenario: Feature-only build does not require CUDA inputs
+- **WHEN** `nvfp4-cuda` is enabled without CUDA toolkit or CUTLASS include paths
+- **THEN** Tachyon builds the Rust NVFP4 capability layer without compiling native CUDA kernels
+- **AND** native NVFP4 capability is reported unavailable
+
 #### Scenario: CUDA/CUTLASS build exposes native kernels
 - **WHEN** `nvfp4-cuda` is enabled with CUDA toolkit and CUTLASS include paths
 - **THEN** the build compiles the native NVFP4 CUDA source

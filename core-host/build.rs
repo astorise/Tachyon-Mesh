@@ -75,6 +75,7 @@ fn prepare_ebpf_artifact() {
 }
 
 fn prepare_nvfp4_cuda_artifact() {
+    println!("cargo:rustc-check-cfg=cfg(tachyon_nvfp4_cuda_compiled)");
     println!("cargo:rerun-if-env-changed=TACHYON_NVFP4_CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
@@ -94,6 +95,19 @@ fn prepare_nvfp4_cuda_artifact() {
     let cuda_home = env_path("TACHYON_NVFP4_CUDA_HOME")
         .or_else(|| env_path("CUDA_HOME"))
         .or_else(|| env_path("CUDA_PATH"));
+    let Some(cutlass_include) = env_path("TACHYON_CUTLASS_INCLUDE_DIR") else {
+        println!(
+            "cargo:warning=`nvfp4-cuda` enabled without TACHYON_CUTLASS_INCLUDE_DIR; native NVFP4 CUDA kernels will be reported unavailable"
+        );
+        return;
+    };
+    if !cutlass_include.exists() {
+        panic!(
+            "TACHYON_CUTLASS_INCLUDE_DIR does not exist: {}",
+            cutlass_include.display()
+        );
+    }
+
     let nvcc = env_path("TACHYON_NVCC")
         .or_else(|| {
             cuda_home
@@ -101,15 +115,6 @@ fn prepare_nvfp4_cuda_artifact() {
                 .map(|home| home.join("bin").join(exe("nvcc")))
         })
         .unwrap_or_else(|| PathBuf::from(exe("nvcc")));
-    let cutlass_include = env_path("TACHYON_CUTLASS_INCLUDE_DIR").unwrap_or_else(|| {
-        panic!("`nvfp4-cuda` requires TACHYON_CUTLASS_INCLUDE_DIR to point at CUTLASS headers")
-    });
-    if !cutlass_include.exists() {
-        panic!(
-            "TACHYON_CUTLASS_INCLUDE_DIR does not exist: {}",
-            cutlass_include.display()
-        );
-    }
 
     let arch = env::var("TACHYON_NVFP4_CUDA_ARCH").unwrap_or_else(|_| "sm_100a".to_owned());
     let object = out_dir.join(obj("tachyon_nvfp4_cutlass"));
