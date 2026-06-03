@@ -146,6 +146,7 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     spawn_reload_watcher(state.clone());
     spawn_manifest_file_watcher(state.clone());
     spawn_authz_purge_subscriber(state.clone());
+    spawn_config_gossip_subscriber(state.clone());
     spawn_draining_runtime_reaper(state.clone());
     spawn_volume_gc_sweeper(state.clone());
     spawn_buffered_request_replayer(state.clone());

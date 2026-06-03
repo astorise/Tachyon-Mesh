@@ -668,9 +668,9 @@ fn current_unix_seconds() -> u64 {
 
 /// Cluster-wide configuration update event written to `config_update_outbox`
 /// whenever a node accepts a signed manifest via `POST /admin/manifest`. The
-/// gossip bridge (still TODO — Session C wiring) reads from this table and
-/// broadcasts to peers, who then pull the new manifest from `origin_node_id`
-/// over the secure overlay.
+/// host-side gossip bridge (`spawn_config_gossip_subscriber`) drains this table
+/// and announces each event to peers, who then pull the new manifest from
+/// `origin_node_id` over the secure overlay.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ConfigUpdateEvent {
     pub version: u64,
