@@ -36,7 +36,7 @@ pkcs8 = { version = "0.10", default-features = false, features = [
 const-oid = { version = "0.9", default-features = false, features = ["db"] }
 # Fresh leaf-key entropy. getrandom 0.2 uses the WASI backend on
 # wasm32-wasip2, so no `js` feature is needed.
-getrandom = "0.2"
+getrandom = "0.4"
 # ECDSA P-256 (NIST secp256r1) leaf keypair. P-256 is universally accepted for
 # TLS server CertificateVerify, unlike ed25519 (which narrow clients omit). This
 # 0.13.x line is pure-Rust and rides the existing der 0.7 / spki 0.7 / pkcs8 0.10
