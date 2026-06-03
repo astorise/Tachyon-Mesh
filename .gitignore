@@ -10,6 +10,7 @@ tachyon-ui/dist/
 .vscode/*
 .artifacts/*
 artifacts/*
+models/*
 
 # Local runtime artifacts; never committed.
 tachyon.db

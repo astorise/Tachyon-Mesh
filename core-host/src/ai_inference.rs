@@ -1,5 +1,7 @@
 #[path = "ai_inference/candle_onnx_backend.rs"]
 mod candle_onnx_backend;
+#[path = "ai_inference/modelopt_nvfp4.rs"]
+mod modelopt_nvfp4;
 #[path = "ai_inference/vram_manager.rs"]
 pub(crate) mod vram_manager;
 
@@ -728,6 +730,12 @@ fn process_batch(
 // Unified candle-native backend model â€” replaces the WasiNnBackend abstraction.
 struct CandleBackendModel {
     source: BackendModelSource,
+    kind: CandleBackendModelKind,
+}
+
+enum CandleBackendModelKind {
+    Mock,
+    ModelOptNvfp4(modelopt_nvfp4::ModelOptNvfp4Directory),
 }
 
 impl CandleBackendModel {
@@ -738,6 +746,13 @@ impl CandleBackendModel {
                 binding.alias
             ));
         }
+        let kind = match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(
+            &binding.alias,
+            &binding.path,
+        )? {
+            Some(model) => CandleBackendModelKind::ModelOptNvfp4(model),
+            None => CandleBackendModelKind::Mock,
+        };
         Ok(Self {
             source: BackendModelSource {
                 alias: binding.alias.clone(),
@@ -747,6 +762,7 @@ impl CandleBackendModel {
                 qos: binding.qos,
                 model_bytes: load_model_bytes(&binding.path),
             },
+            kind,
         })
     }
 }
@@ -766,6 +782,13 @@ impl BackendModel for CandleBackendModel {
     }
 
     fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>> {
+        if let CandleBackendModelKind::ModelOptNvfp4(model) = &self.kind {
+            return Err(anyhow!(
+                "ModelOpt/NVFP4 model `{}` was loaded from `{}` but this backend only has NVFP4 detection/dequant support; native kernels or architecture execution are not configured yet",
+                model.alias(),
+                model.root().display()
+            ));
+        }
         if inputs.is_empty() {
             return Err(anyhow!(
                 "{} backend requires at least one input tensor",

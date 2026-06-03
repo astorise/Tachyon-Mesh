@@ -1,0 +1,59 @@
+# ModelOpt/NVFP4 Inference Primitives
+
+Tachyon supports ModelOpt/NVFP4 as quantized tensor primitives, not as a complete causal-LLM runtime.
+
+## Supported Layout
+
+The loader recognizes Hugging Face-style directories with `model.safetensors.index.json` and sharded `.safetensors` files. NVFP4 detection comes from `W4A16_NVFP4` metadata in `config.json` or `hf_quant_config.json`, or from ModelOpt tensor names such as `.weight_scale_2`.
+
+Supported linear groups are:
+
+- `weight`: packed FP4 bytes stored as `U8`
+- `weight_scale`: FP8 E4M3 block scales
+- `weight_scale_2`: scalar tensor-level scale
+- `input_scale`: optional activation scale
+- BF16/F16 tensors: preserved as passthrough tensors
+
+Packed FP4 bytes must not be interpreted as `f32`.
+
+## Fallback Dequantization
+
+The pure Rust fallback converts packed FP4 plus FP8 E4M3 scales into BF16 or F32 dense tensors. It validates NVFP4 block size, packed shape, scale shape, nibble order, tensor scale, and fallback memory limits.
+
+Fallback can be estimated for eager full-model dequantization or for a layer window. If estimated host RAM or accelerator memory exceeds configured limits, the runtime rejects fallback instead of silently loading an unsafe dense tensor set.
+
+## Native Kernel Requirements
+
+Native NVFP4 execution is capability-gated. A backend must report:
+
+- FP4-capable accelerator hardware
+- Runtime availability for the accelerator stack
+- Compiled NVFP4 dequant and matmul kernels
+
+Without all three, Tachyon selects the BF16/F32 fallback when allowed by memory limits, or returns an unsupported native-execution error when native execution is required.
+
+## CUDA/CUTLASS Build
+
+The concrete native backend is behind the `nvfp4-cuda` feature. Standard builds do not require CUDA, NVCC, or CUTLASS.
+
+To compile the native backend, set:
+
+- `TACHYON_NVFP4_CUDA_HOME`, `CUDA_HOME`, or `CUDA_PATH`: CUDA toolkit root
+- `TACHYON_CUTLASS_INCLUDE_DIR`: CUTLASS include directory
+- `TACHYON_NVFP4_CUDA_ARCH`: optional NVCC architecture, default `sm_100a`
+- `TACHYON_NVCC`: optional explicit `nvcc` path
+
+Example:
+
+```powershell
+$env:CUDA_PATH='C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0'
+$env:TACHYON_CUTLASS_INCLUDE_DIR='C:\src\cutlass\include'
+$env:TACHYON_NVFP4_CUDA_ARCH='sm_120'
+cargo test -p core-host --features "ai-inference nvfp4-cuda" modelopt_nvfp4
+```
+
+The native source provides CUDA entrypoints for NVFP4 dequantization and an initial linear matmul kernel that consumes ModelOpt packed FP4 weights and FP8 E4M3 scales. CUTLASS headers are required by the feature so future block-scaled Tensor Core kernels can use the same ABI boundary.
+
+## Current Runtime Boundary
+
+Detected ModelOpt/NVFP4 directories are registered as typed component sets and do not fall through to `MOCK_LLM_RESPONSE`. Inference for such aliases returns an explicit unsupported-execution error until a concrete architecture runtime or native kernel backend is configured.
