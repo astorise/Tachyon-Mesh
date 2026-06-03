@@ -72,11 +72,9 @@ jobs:
       - name: Apply deploy manifest
         run: kubectl apply -f /tmp/deploy-local.yaml
 
-      - name: Wait for tachyon-host pod readiness
+      - name: Wait for tachyon-host deployment readiness
         run: |
-          kubectl wait --for=condition=ready pod \
-            -l app=tachyon-host \
-            --timeout=120s
+          kubectl rollout status deployment/tachyon-host --timeout=300s
 
       - name: Basic API healthcheck
         run: |
@@ -85,6 +83,15 @@ jobs:
           sleep 4
           curl -f --retry 5 --retry-delay 2 http://localhost:8080/admin/status && echo "healthcheck passed"
           kill $PF_PID 2>/dev/null || true
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get deployments,pods,svc -o wide || true
+          kubectl get events --sort-by=.lastTimestamp || true
+          kubectl describe deployment/tachyon-host || true
+          kubectl describe pod -l app=tachyon-host || true
+          kubectl logs deployment/tachyon-host --tail=200 || true
 
       - name: Delete k3d cluster
         if: always()
