@@ -1059,7 +1059,9 @@ pub(crate) fn tde_cipher() -> Result<Aes256Gcm> {
 /// reach this path, so unencrypted deployments are unaffected.
 pub(crate) fn tde_key_bytes() -> Result<[u8; 32]> {
     let value = std::env::var(TDE_KEY_HEX_ENV).map_err(|_| {
-        anyhow!("{TDE_KEY_HEX_ENV} is not configured; refusing to use a default encrypted-volume key")
+        anyhow!(
+            "{TDE_KEY_HEX_ENV} is not configured; refusing to use a default encrypted-volume key"
+        )
     })?;
     decode_tde_key_hex(value.trim())
 }

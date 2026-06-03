@@ -203,7 +203,14 @@ const MESH_OVERLAY_DEFAULT_MOUNT: &str = "/system/mesh-overlay";
 const MESH_OVERLAY_CONFIG_UPDATE_SUBPATH: &str = "/config/update";
 const OVERLAY_PEER_URLS_ENV: &str = "PEER_URLS";
 const OVERLAY_SHARED_SECRET_ENV: &str = "OVERLAY_SHARED_SECRET";
+const OVERLAY_NODE_ID_ENV: &str = "NODE_ID";
+const DEFAULT_OVERLAY_NODE_ID: &str = "local-node";
 const OVERLAY_AUTH_HEADER: &str = "x-tachyon-overlay-auth";
+
+/// Per-peer announcement timeout. The gossip subscriber is single-threaded, so a
+/// peer that accepts the connection but never sends response headers would
+/// otherwise block every later peer and every later outbox row indefinitely.
+const CONFIG_GOSSIP_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where to fan out `ConfigUpdateEvent`s. The host keeps no standalone peer
 /// registry — peer URLs and the overlay shared secret live in the `mesh-overlay`
@@ -216,6 +223,10 @@ struct ConfigGossipTargets {
     mount_path: String,
     /// Shared secret the peer's `authorize_peer` expects, when configured.
     auth_secret: Option<String>,
+    /// This node's overlay `NODE_ID` — the key peers index it under in their
+    /// routing table (from its heartbeats), and therefore the value
+    /// `origin_node_id` must carry so a peer can resolve the origin and pull.
+    node_id: String,
 }
 
 /// Drain the `config_update_outbox` on a steady cadence and announce each
@@ -266,7 +277,8 @@ async fn drain_config_update_outbox(state: &AppState) -> Result<()> {
     let mut keys = Vec::with_capacity(rows.len());
     for (key, payload) in rows {
         if let Some(targets) = &targets {
-            acked += broadcast_config_event(state, targets, &payload).await;
+            let outgoing = stamp_origin_node_id(&payload, &targets.node_id);
+            acked += broadcast_config_event(state, targets, &outgoing).await;
         }
         keys.push(key);
     }
@@ -278,7 +290,8 @@ async fn drain_config_update_outbox(state: &AppState) -> Result<()> {
     let core_store = Arc::clone(&state.core_store);
     tokio::task::spawn_blocking(move || {
         for key in keys {
-            if let Err(error) = core_store.delete(store::CoreStoreBucket::ConfigUpdateOutbox, &key) {
+            if let Err(error) = core_store.delete(store::CoreStoreBucket::ConfigUpdateOutbox, &key)
+            {
                 tracing::warn!("config_update_outbox cleanup for `{key}` failed: {error:#}");
             }
         }
@@ -314,6 +327,7 @@ async fn broadcast_config_event(
         let mut request = state
             .http_client
             .post(&url)
+            .timeout(CONFIG_GOSSIP_PEER_TIMEOUT)
             .header("content-type", "application/json")
             .body(payload.to_vec());
         if let Some(secret) = &targets.auth_secret {
@@ -369,11 +383,34 @@ fn config_gossip_targets(routes: &[IntegrityRoute]) -> Option<ConfigGossipTarget
         .get(OVERLAY_SHARED_SECRET_ENV)
         .map(|secret| secret.trim().to_owned())
         .filter(|secret| !secret.is_empty());
+    let node_id = route
+        .env
+        .get(OVERLAY_NODE_ID_ENV)
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| DEFAULT_OVERLAY_NODE_ID.to_owned());
     Some(ConfigGossipTargets {
         peers,
         mount_path,
         auth_secret,
+        node_id,
     })
+}
+
+/// Rewrite a stored event's `origin_node_id` to the value peers index this node
+/// under (its overlay heartbeat `NODE_ID`). The admin handler stamps the event
+/// with the host public key, but `system-faas-mesh-overlay` resolves the origin
+/// peer by heartbeat `NODE_ID`; without this rewrite `pull_config_update` returns
+/// `404 origin peer unknown` and the manifest never propagates. Non-event rows
+/// are forwarded unchanged.
+fn stamp_origin_node_id(payload: &[u8], node_id: &str) -> Vec<u8> {
+    match serde_json::from_slice::<ConfigUpdateEvent>(payload) {
+        Ok(mut event) => {
+            event.origin_node_id = node_id.to_owned();
+            serde_json::to_vec(&event).unwrap_or_else(|_| payload.to_vec())
+        }
+        Err(_) => payload.to_vec(),
+    }
 }
 
 pub(crate) fn spawn_volume_gc_sweeper(state: AppState) {
@@ -902,10 +939,11 @@ mod tests {
     }
 
     #[test]
-    fn config_gossip_targets_parses_peers_and_secret() {
+    fn config_gossip_targets_parses_peers_secret_and_node_id() {
         let routes = vec![overlay_route(&[
             ("PEER_URLS", "https://node-b:8443/ , https://node-c:8443"),
             ("OVERLAY_SHARED_SECRET", "s3cr3t"),
+            ("NODE_ID", "node-a-pub"),
         ])];
         let targets = config_gossip_targets(&routes).expect("targets should resolve");
         assert_eq!(
@@ -917,10 +955,11 @@ mod tests {
         );
         assert_eq!(targets.mount_path, MESH_OVERLAY_DEFAULT_MOUNT);
         assert_eq!(targets.auth_secret.as_deref(), Some("s3cr3t"));
+        assert_eq!(targets.node_id, "node-a-pub");
     }
 
     #[test]
-    fn config_gossip_targets_matches_by_path_when_name_differs() {
+    fn config_gossip_targets_matches_by_path_and_defaults_node_id() {
         let mut route = overlay_route(&[("PEER_URLS", "https://node-b:8443")]);
         route.name = String::new(); // force the match to rely on the path alone
         let targets = config_gossip_targets(&[route]).expect("targets should resolve");
@@ -928,6 +967,28 @@ mod tests {
         assert!(
             targets.auth_secret.is_none(),
             "absent secret must stay None so unauthenticated overlays still work"
+        );
+        assert_eq!(
+            targets.node_id, DEFAULT_OVERLAY_NODE_ID,
+            "node_id must mirror the overlay heartbeat default so peers can resolve the origin"
+        );
+    }
+
+    #[test]
+    fn stamp_origin_node_id_overrides_event_origin_and_passes_through_garbage() {
+        let original =
+            br#"{"version":7,"checksum":"sha256:abc","origin_node_id":"hostpubkey","ts_ms":123}"#;
+        let stamped = stamp_origin_node_id(original, "node-a");
+        let event: ConfigUpdateEvent = serde_json::from_slice(&stamped)
+            .expect("stamped payload should still be a valid event");
+        assert_eq!(event.origin_node_id, "node-a");
+        assert_eq!(event.version, 7);
+        assert_eq!(event.checksum, "sha256:abc");
+
+        // Non-event rows are forwarded unchanged rather than dropped.
+        assert_eq!(
+            stamp_origin_node_id(b"not an event", "node-a"),
+            b"not an event"
         );
     }
 }

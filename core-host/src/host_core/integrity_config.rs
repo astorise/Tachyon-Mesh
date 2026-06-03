@@ -21,14 +21,12 @@ pub(crate) fn ensure_rustls_crypto_provider() {
 /// compiled in, without requiring the operator to manually add them via the
 /// manifest.  Routes already present in the config are left untouched.
 pub(crate) fn inject_feature_routes(mut config: IntegrityConfig) -> IntegrityConfig {
-    #[allow(unused_mut)]
-    let mut to_inject: Vec<(&str, &str)> = Vec::new();
-
     // The node-registry FaaS is invoked by the host via the synthetic
     // `/admin/node-registry` route. Seal it so the FaaS is recognised as a
     // System caller and is allowed to make the outbound calls zero-touch
     // enrollment needs (OIDC JWKS fetch, cluster-CA signer). Always present.
-    to_inject.push(("/admin/node-registry", "node-registry"));
+    #[allow(unused_mut)]
+    let mut to_inject: Vec<(&str, &str)> = vec![("/admin/node-registry", "node-registry")];
 
     #[cfg(feature = "ai-inference")]
     {
