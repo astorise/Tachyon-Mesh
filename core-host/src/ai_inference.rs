@@ -1,3 +1,5 @@
+#[path = "ai_inference/candle_llm_runtime.rs"]
+mod candle_llm_runtime;
 #[path = "ai_inference/candle_onnx_backend.rs"]
 mod candle_onnx_backend;
 #[path = "ai_inference/modelopt_nvfp4.rs"]
@@ -735,10 +737,31 @@ struct CandleBackendModel {
 
 enum CandleBackendModelKind {
     Mock,
+    TextGeneration(Box<candle_llm_runtime::CandleLlmRuntime>),
     ModelOptNvfp4(modelopt_nvfp4::ModelOptNvfp4Directory),
 }
 
 impl CandleBackendModel {
+    fn mock(binding: &IntegrityModelBinding) -> Result<Self> {
+        if binding.path.trim().is_empty() {
+            return Err(anyhow!(
+                "Integrity Validation Failed: model alias `{}` must declare a non-empty `path`",
+                binding.alias
+            ));
+        }
+        Ok(Self {
+            source: BackendModelSource {
+                alias: binding.alias.clone(),
+                path: binding.path.clone(),
+                requested_target: binding.device.as_str().to_owned(),
+                accelerator: AcceleratorKind::from_model_device(&binding.device),
+                qos: binding.qos,
+                model_bytes: load_model_bytes(&binding.path),
+            },
+            kind: CandleBackendModelKind::Mock,
+        })
+    }
+
     fn load(binding: &IntegrityModelBinding) -> Result<Self> {
         if binding.path.trim().is_empty() {
             return Err(anyhow!(
@@ -746,12 +769,29 @@ impl CandleBackendModel {
                 binding.alias
             ));
         }
-        let kind = match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(
-            &binding.alias,
-            &binding.path,
-        )? {
-            Some(model) => CandleBackendModelKind::ModelOptNvfp4(model),
-            None => CandleBackendModelKind::Mock,
+        let kind = if is_explicit_mock_binding(binding) {
+            CandleBackendModelKind::Mock
+        } else {
+            match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(
+                &binding.alias,
+                &binding.path,
+            )? {
+                Some(model) => CandleBackendModelKind::ModelOptNvfp4(model),
+                None => match candle_llm_runtime::CandleLlmRuntime::try_load(
+                    &binding.alias,
+                    &binding.path,
+                    binding.device.as_str(),
+                )? {
+                    Some(model) => CandleBackendModelKind::TextGeneration(Box::new(model)),
+                    None => {
+                        return Err(anyhow!(
+                            "unsupported AI model binding `{}` at `{}`: expected explicit mock path `mock:<name>`, supported Candle LLM directory, ONNX guest-loaded graph, or ModelOpt/NVFP4 directory",
+                            binding.alias,
+                            binding.path
+                        ))
+                    }
+                },
+            }
         };
         Ok(Self {
             source: BackendModelSource {
@@ -782,12 +822,37 @@ impl BackendModel for CandleBackendModel {
     }
 
     fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>> {
-        if let CandleBackendModelKind::ModelOptNvfp4(model) = &self.kind {
-            return Err(anyhow!(
-                "ModelOpt/NVFP4 model `{}` was loaded from `{}` but this backend only has NVFP4 detection/dequant support; native kernels or architecture execution are not configured yet",
-                model.alias(),
-                model.root().display()
-            ));
+        match &self.kind {
+            CandleBackendModelKind::ModelOptNvfp4(model) => {
+                return Err(anyhow!(
+                    "ModelOpt/NVFP4 model `{}` was loaded from `{}` but this backend only has NVFP4 detection/dequant support; native kernels or architecture execution are not configured yet",
+                    model.alias(),
+                    model.root().display()
+                ));
+            }
+            CandleBackendModelKind::TextGeneration(runtime) => {
+                if inputs
+                    .iter()
+                    .any(|input| !matches!(input.ty, TensorType::U8))
+                {
+                    return Err(anyhow!(
+                        "Candle LLM model `{}` only accepts U8 prompt tensors",
+                        self.source.alias
+                    ));
+                }
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                return runtime.generate(&prompts).map_err(|error| {
+                    anyhow!(
+                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                        self.source.alias,
+                        runtime.root().display()
+                    )
+                });
+            }
+            CandleBackendModelKind::Mock => {}
         }
         if inputs.is_empty() {
             return Err(anyhow!(
@@ -848,7 +913,7 @@ impl CandleModel {
 
     #[cfg(test)]
     fn load_mock(binding: &IntegrityModelBinding) -> Result<Self> {
-        Self::load_mock_with_backend(binding, Arc::new(CandleBackendModel::load(binding)?))
+        Self::load_mock_with_backend(binding, Arc::new(CandleBackendModel::mock(binding)?))
     }
 
     #[cfg(test)]
@@ -865,6 +930,10 @@ impl CandleModel {
         let _ = adapter_id; // LoRA adapters are a future enhancement
         self.backend_model.execute(inputs)
     }
+}
+
+fn is_explicit_mock_binding(binding: &IntegrityModelBinding) -> bool {
+    binding.path == "mock" || binding.path.starts_with("mock:")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1595,13 +1664,13 @@ mod tests {
         route.models = vec![
             IntegrityModelBinding {
                 alias: "llama3".to_owned(),
-                path: "/models/llama3.gguf".to_owned(),
+                path: "mock:llama3".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::Standard,
             },
             IntegrityModelBinding {
                 alias: "tiny".to_owned(),
-                path: "/models/tiny.gguf".to_owned(),
+                path: "mock:tiny".to_owned(),
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Standard,
             },
@@ -1618,6 +1687,169 @@ mod tests {
             runtime.loaded_model_aliases(),
             vec!["llama3".to_owned(), "tiny".to_owned()]
         );
+    }
+
+    #[test]
+    fn real_candle_llm_runtime_generates_non_mock_text() {
+        let model_dir = unique_candle_llm_dir("real-generation");
+        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
+            .expect("fixture should be written");
+        let runtime =
+            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
+                .expect("runtime should load real Candle LLM fixture");
+
+        let output = runtime
+            .compute_component_prompt("tiny", "hello")
+            .expect("real Candle LLM should generate");
+
+        assert_eq!(output, "tachyon");
+        assert_ne!(output, MOCK_INFERENCE_RESPONSE);
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn real_candle_llm_runtime_accepts_json_generation_request() {
+        let model_dir = unique_candle_llm_dir("json-generation");
+        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
+            .expect("fixture should be written");
+        let runtime =
+            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
+                .expect("runtime should load real Candle LLM fixture");
+
+        let output = runtime
+            .compute_component_prompt(
+                "tiny",
+                r#"{"prompt":"hello","max_new_tokens":1,"temperature":0.0,"seed":7}"#,
+            )
+            .expect("real Candle LLM should generate from JSON request");
+
+        assert_eq!(output, "tachyon");
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn unsupported_non_mock_binding_does_not_register_mock_backend() {
+        let model_dir = unique_candle_llm_dir("unsupported");
+        fs::create_dir_all(&model_dir).expect("fixture dir should be created");
+        fs::write(
+            model_dir.join("model.safetensors"),
+            b"not-a-supported-layout",
+        )
+        .expect("unsupported safetensors marker should be written");
+
+        let error = match AiInferenceRuntime::from_config(&config_with_real_candle_model(
+            "unsupported",
+            &model_dir,
+        )) {
+            Ok(_) => panic!("unsupported non-mock binding should fail before registration"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("unsupported AI model binding `unsupported`"));
+        assert!(error.contains(model_dir.to_string_lossy().as_ref()));
+        assert!(!error.contains(MOCK_INFERENCE_RESPONSE));
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn invalid_candle_llm_tokenizer_reports_alias_and_path() {
+        let model_dir = unique_candle_llm_dir("invalid-tokenizer");
+        fs::create_dir_all(&model_dir).expect("fixture dir should be created");
+        fs::write(
+            model_dir.join("config.json"),
+            serde_json::json!({
+                "model_type": candle_llm_runtime::TACHYON_TINY_MODEL_TYPE,
+                "architectures": [candle_llm_runtime::TACHYON_TINY_ARCHITECTURE],
+                "vocab_size": 4
+            })
+            .to_string(),
+        )
+        .expect("config should be written");
+        fs::write(model_dir.join("tokenizer.json"), b"{not-json")
+            .expect("invalid tokenizer should be written");
+        fs::write(model_dir.join("model.safetensors"), b"not-used")
+            .expect("weights marker should be written");
+
+        let error = match AiInferenceRuntime::from_config(&config_with_real_candle_model(
+            "bad-tokenizer",
+            &model_dir,
+        )) {
+            Ok(_) => panic!("invalid tokenizer should fail before registration"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("bad-tokenizer"));
+        assert!(error.contains(model_dir.to_string_lossy().as_ref()));
+        assert!(error.contains("tokenizer.json"));
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn real_candle_llm_runtime_reports_invalid_config_and_weights() {
+        let unsupported_dir = unique_candle_llm_dir("unsupported-architecture");
+        candle_llm_runtime::write_tachyon_tiny_fixture(&unsupported_dir)
+            .expect("fixture should be written");
+        fs::write(
+            unsupported_dir.join("config.json"),
+            serde_json::json!({
+                "model_type": "unsupported_fixture",
+                "architectures": ["UnsupportedFixture"],
+                "vocab_size": 4
+            })
+            .to_string(),
+        )
+        .expect("unsupported config should be written");
+        let config_error = match AiInferenceRuntime::from_config(&config_with_real_candle_model(
+            "bad-config",
+            &unsupported_dir,
+        )) {
+            Ok(_) => panic!("unsupported architecture should fail before registration"),
+            Err(error) => error.to_string(),
+        };
+        assert!(config_error.contains("bad-config"));
+        assert!(config_error.contains(unsupported_dir.to_string_lossy().as_ref()));
+        assert!(config_error.contains(candle_llm_runtime::TACHYON_TINY_MODEL_TYPE));
+
+        let weights_dir = unique_candle_llm_dir("invalid-weights");
+        candle_llm_runtime::write_tachyon_tiny_fixture(&weights_dir)
+            .expect("fixture should be written");
+        fs::write(weights_dir.join("model.safetensors"), b"not-a-safetensor")
+            .expect("invalid weights should be written");
+        let weights_error = match AiInferenceRuntime::from_config(&config_with_real_candle_model(
+            "bad-weights",
+            &weights_dir,
+        )) {
+            Ok(_) => panic!("invalid weights should fail before registration"),
+            Err(error) => error.to_string(),
+        };
+        assert!(weights_error.contains("bad-weights"));
+        assert!(weights_error.contains(weights_dir.to_string_lossy().as_ref()));
+        assert!(weights_error.contains("model.safetensors"));
+
+        let _ = fs::remove_dir_all(unsupported_dir);
+        let _ = fs::remove_dir_all(weights_dir);
+    }
+
+    #[test]
+    fn real_candle_llm_runtime_enforces_generation_limits() {
+        let model_dir = unique_candle_llm_dir("limits");
+        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
+            .expect("fixture should be written");
+        let runtime =
+            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
+                .expect("runtime should load real Candle LLM fixture");
+
+        let too_many_tokens = runtime
+            .compute_component_prompt("tiny", r#"{"prompt":"hello","max_new_tokens":65}"#)
+            .expect_err("generation cap should reject oversized request");
+        assert!(too_many_tokens.contains("max_new_tokens 65"));
+
+        let long_prompt = "x".repeat(129);
+        let prompt_error = runtime
+            .compute_component_prompt("tiny", &long_prompt)
+            .expect_err("prompt byte limit should reject oversized prompt");
+        assert!(prompt_error.contains("prompt bytes 129 exceed limit 128"));
+        let _ = fs::remove_dir_all(model_dir);
     }
 
     #[test]
@@ -1673,7 +1905,7 @@ mod tests {
         let batch_model = Arc::new(
             CandleModel::load_mock(&IntegrityModelBinding {
                 alias: "gpu-batch".to_owned(),
-                path: "/models/gpu-batch.gguf".to_owned(),
+                path: "mock:gpu-batch".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::Batch,
             })
@@ -1683,7 +1915,7 @@ mod tests {
         let realtime_model = Arc::new(
             CandleModel::load_mock(&IntegrityModelBinding {
                 alias: "gpu-bot".to_owned(),
-                path: "/models/gpu-bot.gguf".to_owned(),
+                path: "mock:gpu-bot".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
             })
@@ -1746,13 +1978,13 @@ mod tests {
         route.models = vec![
             IntegrityModelBinding {
                 alias: "llama3".to_owned(),
-                path: "/models/llama3.gguf".to_owned(),
+                path: "mock:llama3".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
             },
             IntegrityModelBinding {
                 alias: "tiny".to_owned(),
-                path: "/models/tiny.gguf".to_owned(),
+                path: "mock:tiny".to_owned(),
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Batch,
             },
@@ -1802,7 +2034,7 @@ mod tests {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "llama3".to_owned(),
-            path: "/models/llama3.gguf".to_owned(),
+            path: "mock:llama3".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
         }];
@@ -1832,25 +2064,25 @@ mod tests {
         route.models = vec![
             IntegrityModelBinding {
                 alias: "cpu-bert".to_owned(),
-                path: "/models/cpu-bert.onnx".to_owned(),
+                path: "mock:cpu-bert".to_owned(),
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Standard,
             },
             IntegrityModelBinding {
                 alias: "gpu-llama".to_owned(),
-                path: "/models/gpu-llama.gguf".to_owned(),
+                path: "mock:gpu-llama".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
             },
             IntegrityModelBinding {
                 alias: "npu-whisper".to_owned(),
-                path: "/models/npu-whisper.xml".to_owned(),
+                path: "mock:npu-whisper".to_owned(),
                 device: ModelDevice::Npu,
                 qos: RouteQos::RealTime,
             },
             IntegrityModelBinding {
                 alias: "tpu-embed".to_owned(),
-                path: "/models/tpu-embed.tflite".to_owned(),
+                path: "mock:tpu-embed".to_owned(),
                 device: ModelDevice::Tpu,
                 qos: RouteQos::Batch,
             },
@@ -2020,7 +2252,7 @@ mod tests {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: alias.to_owned(),
-            path: format!("/models/{alias}.gguf"),
+            path: format!("mock:{alias}"),
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
         }];
@@ -2028,6 +2260,30 @@ mod tests {
             routes: vec![route],
             ..IntegrityConfig::default_sealed()
         }
+    }
+
+    fn config_with_real_candle_model(alias: &str, path: &std::path::Path) -> IntegrityConfig {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: alias.to_owned(),
+            path: path.to_string_lossy().into_owned(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+        }];
+        IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        }
+    }
+
+    fn unique_candle_llm_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tachyon-candle-llm-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be valid")
+                .as_nanos()
+        ))
     }
 
     #[test]

@@ -394,7 +394,7 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
     let mut route = IntegrityRoute::user("/api/guest-ai");
     route.models = vec![IntegrityModelBinding {
         alias: "llama3".to_owned(),
-        path: "/models/llama3.gguf".to_owned(),
+        path: "mock:llama3".to_owned(),
         device: ModelDevice::Cuda,
         qos: RouteQos::Standard,
     }];

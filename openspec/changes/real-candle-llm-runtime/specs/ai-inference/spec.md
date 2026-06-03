@@ -1,0 +1,81 @@
+## ADDED Requirements
+
+### Requirement: Candle LLM bindings MUST generate real model output
+The AI inference runtime SHALL execute supported local Candle text-generation model bindings by loading their tokenizer, config, and safetensors weights, and SHALL return generated UTF-8 text bytes instead of mock inference output.
+
+#### Scenario: Supported Candle LLM binding returns generated text
+- **WHEN** a model binding points at a supported local Candle LLM directory
+- **AND** a guest or host caller submits a UTF-8 prompt as the first `U8` input tensor
+- **THEN** the runtime loads the model tokenizer, config, and safetensors weights
+- **AND** executes bounded text generation through Candle
+- **AND** returns UTF-8 generated text bytes that are not `MOCK_LLM_RESPONSE`
+
+#### Scenario: Supported Candle LLM binding accepts a bounded JSON request
+- **WHEN** a model binding points at a supported local Candle LLM directory
+- **AND** the first `U8` input tensor is a JSON generation request with `prompt` and optional generation parameters
+- **THEN** the runtime validates the request against configured prompt and generation limits
+- **AND** returns UTF-8 generated text bytes through the existing inference response path
+
+### Requirement: Non-mock model bindings MUST NOT fall back to mock output
+The AI inference runtime SHALL classify model bindings as explicit mock, ModelOpt/NVFP4, supported Candle LLM, ONNX/WASI-NN, or unsupported, and SHALL NOT return `MOCK_LLM_RESPONSE` for any non-mock binding.
+
+#### Scenario: Unsupported safetensors directory fails before registration
+- **WHEN** a model binding points at a safetensors directory that is neither ModelOpt/NVFP4 nor a supported Candle LLM
+- **THEN** model initialization fails with a typed unsupported-model error containing the alias, path, and unsupported reason
+- **AND** inference for that alias is not registered
+
+#### Scenario: Runtime load failure does not use mock output
+- **WHEN** a supported Candle LLM binding has invalid tokenizer, config, or weight files
+- **THEN** model initialization fails with a typed load error containing the alias, path, and invalid component
+- **AND** the runtime does not register a mock model for the alias
+
+#### Scenario: Explicit mock binding preserves test behavior
+- **WHEN** a test or fixture configures an explicit mock model binding
+- **THEN** the runtime may return `MOCK_LLM_RESPONSE`
+- **AND** the mock path remains distinguishable from supported Candle LLM bindings
+
+### Requirement: Candle LLM generation MUST be bounded and deterministic by default
+The Candle LLM runtime SHALL enforce prompt length, max-new-token, batch size, and sampling limits, and SHALL use deterministic generation defaults suitable for repeatable tests.
+
+#### Scenario: Prompt exceeds configured limit
+- **WHEN** a caller submits a prompt that exceeds the configured prompt token or byte limit
+- **THEN** the runtime rejects the request with a typed validation error
+- **AND** no generation work is executed
+
+#### Scenario: Generation request omits sampling parameters
+- **WHEN** a caller submits a plain UTF-8 prompt or a JSON request without sampling parameters
+- **THEN** the runtime uses deterministic defaults for token selection
+- **AND** repeated runs against the deterministic fixture produce the expected non-mock output
+
+#### Scenario: Requested generation limit exceeds host cap
+- **WHEN** a JSON generation request asks for more new tokens than the configured host cap
+- **THEN** the runtime rejects or clamps the request according to the configured policy
+- **AND** the behavior is reported in the response or error path
+
+### Requirement: Existing ONNX and NVFP4 boundaries MUST remain unchanged
+Adding a real Candle LLM runtime SHALL NOT change legacy Candle ONNX/WASI-NN graph loading or the ModelOpt/NVFP4 unsupported-execution boundary.
+
+#### Scenario: Legacy ONNX guest still uses candle-onnx
+- **WHEN** a legacy guest loads an ONNX model through WASI-NN
+- **THEN** the host continues to use the candle-onnx backend
+- **AND** Candle LLM binding classification does not change the ONNX graph encoding contract
+
+#### Scenario: ModelOpt/NVFP4 alias remains non-mock and unsupported for text generation
+- **WHEN** a preloaded model alias is classified as ModelOpt/NVFP4
+- **AND** no complete architecture execution runtime is configured for that alias
+- **THEN** inference returns the existing actionable unsupported-execution error
+- **AND** the response is not `MOCK_LLM_RESPONSE`
+
+### Requirement: Real Candle LLM validation MUST run without network downloads
+The repository SHALL include deterministic tests for real Candle LLM loading and generation that do not download external model artifacts during CI.
+
+#### Scenario: CI validates real Candle generation
+- **WHEN** the CI workflow runs the optional `core-host --features ai-inference` checks
+- **THEN** it executes a deterministic real Candle LLM fixture test
+- **AND** the fixture output is generated by Candle rather than by a mock backend
+- **AND** the test does not require network access or Hugging Face downloads
+
+#### Scenario: Optional real checkpoint probe is gated
+- **WHEN** a developer sets an environment variable pointing at a local supported checkpoint directory
+- **THEN** the test suite may run an additional real-checkpoint load and generation probe
+- **AND** CI remains independent of that local checkpoint

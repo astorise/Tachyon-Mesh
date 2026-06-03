@@ -10,7 +10,8 @@ default = ["ring"]
 # WASI-NN guest interface backed by our CandleOnnxBackend.
 ai-inference = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-onnx",
-    "dep:lru", "dep:prost", "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
+    "dep:lru", "dep:prost", "dep:tokenizers", "dep:turboquant-sys",
+    "dep:wasmtime-wasi-nn",
 ]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
@@ -77,6 +78,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 tokio-stream = { version = "0.1", optional = true }
+tokenizers = { version = "0.22.2", optional = true, default-features = false }
 tower = { version = "0.5", optional = true, features = ["retry", "timeout", "util"] }
 tracing = "0.1"
 utoipa = { version = "5", features = ["axum_extras"] }
