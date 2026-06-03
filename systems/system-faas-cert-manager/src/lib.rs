@@ -10,12 +10,14 @@ mod bindings {
 }
 
 use bindings::tachyon::mesh::storage_broker::WriteMode;
+use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{Signer, SigningKey};
-#[cfg(not(target_arch = "wasm32"))]
-use rcgen::generate_simple_self_signed;
 use serde::{Deserialize, Serialize};
 
-const ACME_STAGING_MOCK: &str = "ACME_STAGING_MOCK";
+/// Wire value for the issuance mode the host sends (`mode=ACME_STAGING_MOCK`).
+/// The label is historical: issuance now mints a real cluster-CA-signed leaf,
+/// but the host/guest contract for this string is fixed and must not change.
+const CA_ISSUED_MODE: &str = "ACME_STAGING_MOCK";
 /// Internal route the node-registry FaaS calls to mint a node credential.
 const SIGN_NODE_ROUTE: &str = "/internal/cert-manager/sign-node";
 /// Mounted path of the 32-byte cluster-CA ed25519 seed (raw or hex). Only
@@ -23,47 +25,6 @@ const SIGN_NODE_ROUTE: &str = "/internal/cert-manager/sign-node";
 const CA_SEED_PATH: &str = "/ca/cluster-ca.seed";
 /// Route-env carrying the cluster-CA seed (hex), passed into the guest sandbox.
 const CA_SEED_ENV: &str = "TACHYON_CLUSTER_CA_SEED";
-#[cfg(target_arch = "wasm32")]
-const MOCK_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
-MIIC1zCCAb+gAwIBAgIIL4ARv71JyR0wDQYJKoZIhvcNAQELBQAwGzEZMBcGA1UEAxMQYXBpLmV4\n\
-YW1wbGUudGVzdDAeFw0yNjA0MDgyMDAwMTdaFw0yNzA0MDgyMDAxMTdaMBsxGTAXBgNVBAMTEGFw\n\
-aS5leGFtcGxlLnRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDrmjAl5zo9zWP5\n\
-m3PFTXkU3l57tLA5qhABbWSCAYZHod00ItVfzljcn0mA/oeUC4tMQ/zuv1z3qaxKAZ35q06hSEkw\n\
-ERYHJrnAKSOU6c9R2bgwwsP5nIGKM0hgIwFOMbIMckX5XwTg9iXxNAnzRoyI4II46hDOqHGxwpcV\n\
-sGqfSQiay450dwmmk4mIX/MtKeA9Zaav4Igl1bgjUV1D8rtwyQyhxSeYknE97dPls6YzxbkW+Bay\n\
-I6a4MaoH6fXvhvKNESguEiyr62eggfcJD6NWOFcAES1u+uNy8xU+vK7atN+HseRtdFqf/Ik/0eQS\n\
-9QMG/wDnWnv3r+4RnCudpTDJAgMBAAGjHzAdMBsGA1UdEQQUMBKCEGFwaS5leGFtcGxlLnRlc3Qw\n\
-DQYJKoZIhvcNAQELBQADggEBAI/jP+bMfScWfZUCVIH/4zPOn2yvdVJWIlsJ5AhJ6Fzcdon0pttN\n\
-AJQlMBGuz+Pserc9Q8o7VFhx9CXxUbhHLeUHY/E0H7J8cpzw58L8MHyYwzH2Qwlly52SeQgTKKN7\n\
-I257n9ynLo0lTAxDj2U9S3cH2BCLZE1Caac9DC8C3ZKdoKLxJx3Oqa4WCly7gmDFZuVA3ZOlEUOp\n\
-D5wk8mb3G2eUsIgoph6Lr39JJnS68JW0ldjpUzVcwODIkK5YlOYmEKKdk98KQ7ekbG51rCzW/cRH\n\
-zyB8leXXFu4ICWsDUW0AlIyxSmHl7avn69xrjqNMD4zyI5s+8NjbOPItKn2DQk0=\n\
------END CERTIFICATE-----\n";
-#[cfg(target_arch = "wasm32")]
-const MOCK_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDrmjAl5zo9zWP5m3PFTXkU3l57\n\
-tLA5qhABbWSCAYZHod00ItVfzljcn0mA/oeUC4tMQ/zuv1z3qaxKAZ35q06hSEkwERYHJrnAKSOU\n\
-6c9R2bgwwsP5nIGKM0hgIwFOMbIMckX5XwTg9iXxNAnzRoyI4II46hDOqHGxwpcVsGqfSQiay450\n\
-dwmmk4mIX/MtKeA9Zaav4Igl1bgjUV1D8rtwyQyhxSeYknE97dPls6YzxbkW+BayI6a4MaoH6fXv\n\
-hvKNESguEiyr62eggfcJD6NWOFcAES1u+uNy8xU+vK7atN+HseRtdFqf/Ik/0eQS9QMG/wDnWnv3\n\
-r+4RnCudpTDJAgMBAAECggEAKCbp57vFeDzlueddTpXKedz/2zNLCTjLa4LaKzHZUaHrUfRRyvce\n\
-u9LFsx8tufRRtBiuJX4leOvIugAWjTM9vkzUdEWlLGjUJUSdlMZYF8n0ExNOVN7wUL42qnOsyEe9\n\
-4VMkS8B+01v/0WCeBYDTeIxShSKW5LFeVv4jw4WCVkzHUNJIrS4p2asFntqygpxtq0ee7EBnty4N\n\
-oyAFlV9fGcXIz3WmmE792+3X5CBE4JhnZwsfLWZ4PvqIIGrJqNheF32owRiqnfciF7uUORCXAtzN\n\
-jqv8HLTUeKvE3PRujiu9qivmUM9ef9kPfIJXWipaUw1QcLk3mbfnZFsh6UY2FQKBgQDtHZeguCX/\n\
-/4XygBoWw24oHPwS+1zLBQlNBFPEJo+7oIspxBHtp+KbarvXsQSzFdkCzbHtJcEHK6ufqKZPSU47\n\
-t1g0E+FhokizL6mkfEQZXKcBZ0boS20UAEVY7gEzqSN0zH0HB0zK68qF948uchhonk7SB6wjlF0n\n\
-Tuku/+YftwKBgQD+Xb33yX/i/UiDHf6L9Gd6zD3LRH6Dfgt0SQMJdmNshcCif9pIIQNO5LDDVyza\n\
-NJBRuS7qb6DE4FOLR1ZOe3N76MZyuKGF6uegLpyvImbqdc0xfGzILtULHyaJqs2w/1G/T2vFegLQ\n\
-A5ozvwn79cQud3UVIhEgJHDMwoD3yyYzfwKBgQDhKkrEqlobgXCXWaJsn2TJ3sxY0i3J9JxicIuD\n\
-JwMyrz+3h6NmxRhhcbezGTxXO5X6HY6qnkFxJ70wPhzACeKqvm6Z9Y7/AfZ7gfVcZ0zbsKo+oO4q\n\
-xQVuCtvPmSO3BRTQYycPN5Vq1QJauT1UY7BeGIbM19BVcRwMqdixcvv6fQKBgEHbc3vcJ8hVW5jX\n\
-AzipJsGcb8NZEIhq8fxBiw/AHy3R03Y/M/zIz1p1y25H+8zjHxqJn6QDEtTmX7sH1UisndHPCtJZ\n\
-CzjpAN9wMhEGDy9VILNXS7LorTAb+JZcKrVQ5ZFqtrSCSogg5qPPKn6ZuxlsxFucXmK8DJh3I30E\n\
-k/dxAoGAUIybvptmZTvJUwPvl6i9cNuA80oH4GRMrfboYW6YYja++CpX71k/Vx5UgzKlYeq3BIMd\n\
-JRLnIUlWtlxC66AtuNcqbJNbC5OWYCPGdLHbVd2aHCG/tSqINerY527QPW758Dl//Qa72wTQx3vV\n\
-pt79cED8u9mUVLgqKjlduogu588=\n\
------END PRIVATE KEY-----\n";
 
 struct Component;
 
@@ -105,11 +66,11 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             Err(message) => return response(400, message),
         };
 
-        if request.mode != ACME_STAGING_MOCK {
+        if request.mode != CA_ISSUED_MODE {
             return response(400, "cert-manager `mode` must be `ACME_STAGING_MOCK`");
         }
 
-        let bundle = match issue_self_signed_certificate(&request.domain) {
+        let bundle = match issue_leaf_certificate(&request.domain) {
             Ok(bundle) => bundle,
             Err(message) => return response(500, message),
         };
@@ -292,31 +253,274 @@ fn require_query_value(value: Option<String>, key: &'static str) -> Result<Strin
     }
 }
 
-fn issue_self_signed_certificate(domain: &str) -> Result<CertificateBundle, String> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        return Ok(mock_certificate_bundle(domain));
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let certified = generate_simple_self_signed(vec![domain.to_owned()])
-            .map_err(|error| format!("failed to issue self-signed certificate: {error}"))?;
-
-        Ok(CertificateBundle {
-            domain: domain.to_owned(),
-            certificate_pem: certified.cert.pem(),
-            private_key_pem: certified.signing_key.serialize_pem(),
-        })
-    }
+/// Issue a real X.509 leaf certificate for `domain`, signed by the cluster CA.
+///
+/// This is the single (wasm-safe) issuance path: it loads the cluster-CA
+/// signing key, derives the deterministic CA certificate, generates a fresh
+/// random ed25519 leaf keypair, and mints a v3 leaf certificate
+/// (`CN=<domain>`, SAN dNSName=<domain>, serverAuth) signed over the
+/// TBSCertificate DER with the CA key. The returned bundle is a leaf-first
+/// full chain plus the leaf's PKCS#8 private key.
+fn issue_leaf_certificate(domain: &str) -> Result<CertificateBundle, String> {
+    let ca_signing_key = load_ca_signing_key().map_err(|(_, message)| message)?;
+    cert::issue_leaf_certificate(&ca_signing_key, domain)
 }
 
-#[cfg(target_arch = "wasm32")]
-fn mock_certificate_bundle(domain: &str) -> CertificateBundle {
-    CertificateBundle {
-        domain: domain.to_owned(),
-        certificate_pem: MOCK_CERTIFICATE_PEM.to_owned(),
-        private_key_pem: MOCK_PRIVATE_KEY_PEM.to_owned(),
+/// Pure X.509 issuance (no host I/O), separated so the certificate scheme is
+/// unit-testable on the host target. Mints a cluster-CA-signed leaf for
+/// `domain` using `ca_signing_key` as the issuing CA.
+mod cert {
+    use super::{now_seconds, CertificateBundle, EncodePrivateKey, EncodePublicKey, SigningKey};
+    use const_oid::db::rfc5280::ID_KP_SERVER_AUTH;
+    use const_oid::db::rfc8410::ID_ED_25519;
+    use const_oid::AssociatedOid;
+    use der::asn1::{BitString, GeneralizedTime, Ia5String, OctetString, UtcTime};
+    use der::flagset::FlagSet;
+    use der::{Decode, Encode, EncodePem};
+    use ed25519_dalek::Signer;
+    use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+    use std::str::FromStr;
+    use std::time::Duration;
+    use x509_cert::certificate::{Certificate, TbsCertificate, Version};
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::{
+        BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, SubjectAltName,
+    };
+    use x509_cert::ext::{Extension, Extensions};
+    use x509_cert::name::Name;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::time::{Time, Validity};
+
+    /// Subject/issuer common name of the self-signed cluster CA.
+    const CA_COMMON_NAME: &str = "CN=tachyon-cluster-ca";
+    /// Fixed CA `notBefore` (2020-01-01T00:00:00Z) so the CA certificate is
+    /// deterministic for a given CA key.
+    const CA_NOT_BEFORE_SECS: u64 = 1_577_836_800;
+    /// CA certificate lifetime past `now` (~10 years).
+    const CA_VALIDITY_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+    /// Leaf certificate lifetime past `now` (~90 days).
+    const LEAF_VALIDITY_SECS: u64 = 90 * 24 * 60 * 60;
+
+    pub(super) fn issue_leaf_certificate(
+        ca_signing_key: &SigningKey,
+        domain: &str,
+    ) -> Result<CertificateBundle, String> {
+        let now = now_seconds();
+
+        // Deterministic self-signed CA certificate for the issuing key.
+        let ca_cert = build_ca_certificate(ca_signing_key, now)?;
+        let ca_pem = ca_cert
+            .to_pem(der::pem::LineEnding::LF)
+            .map_err(|error| format!("failed to PEM-encode CA certificate: {error}"))?;
+
+        // Fresh random ed25519 leaf keypair.
+        let leaf_signing_key = generate_leaf_key()?;
+        let leaf_cert = build_leaf_certificate(ca_signing_key, &leaf_signing_key, domain, now)?;
+        let leaf_pem = leaf_cert
+            .to_pem(der::pem::LineEnding::LF)
+            .map_err(|error| format!("failed to PEM-encode leaf certificate: {error}"))?;
+        let leaf_key_pem = leaf_signing_key
+            .to_pkcs8_pem(der::pem::LineEnding::LF)
+            .map_err(|error| format!("failed to PEM-encode leaf private key: {error}"))?
+            .to_string();
+
+        // Full chain, leaf-first: the host loads every cert in the PEM as the
+        // served chain.
+        Ok(CertificateBundle {
+            domain: domain.to_owned(),
+            certificate_pem: format!("{leaf_pem}{ca_pem}"),
+            private_key_pem: leaf_key_pem,
+        })
+    }
+
+    /// Generate a fresh random ed25519 leaf keypair from 32 bytes of OS entropy.
+    fn generate_leaf_key() -> Result<SigningKey, String> {
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed)
+            .map_err(|error| format!("failed to sample leaf key entropy: {error}"))?;
+        Ok(SigningKey::from_bytes(&seed))
+    }
+
+    /// Build the deterministic self-signed cluster-CA certificate.
+    fn build_ca_certificate(ca_signing_key: &SigningKey, now: u64) -> Result<Certificate, String> {
+        let name = distinguished_name(CA_COMMON_NAME)?;
+        let validity = validity(CA_NOT_BEFORE_SECS, now.saturating_add(CA_VALIDITY_SECS))?;
+        let extensions = vec![
+            basic_constraints_extension(true)?,
+            key_usage_extension(KeyUsages::KeyCertSign | KeyUsages::DigitalSignature)?,
+        ];
+        sign_certificate(
+            ca_signing_key,
+            &ca_signing_key.verifying_key(),
+            serial_number(now, 0)?,
+            name.clone(),
+            name,
+            validity,
+            extensions,
+        )
+    }
+
+    /// Build the cluster-CA-signed v3 leaf certificate for `domain`.
+    fn build_leaf_certificate(
+        ca_signing_key: &SigningKey,
+        leaf_signing_key: &SigningKey,
+        domain: &str,
+        now: u64,
+    ) -> Result<Certificate, String> {
+        let subject = distinguished_name(&format!("CN={domain}"))?;
+        let issuer = distinguished_name(CA_COMMON_NAME)?;
+        let validity = validity(now, now.saturating_add(LEAF_VALIDITY_SECS))?;
+        let extensions = vec![
+            basic_constraints_extension(false)?,
+            key_usage_extension(KeyUsages::DigitalSignature.into())?,
+            extended_key_usage_extension()?,
+            subject_alt_name_extension(domain)?,
+        ];
+        sign_certificate(
+            ca_signing_key,
+            &leaf_signing_key.verifying_key(),
+            serial_number(now, 1)?,
+            issuer,
+            subject,
+            validity,
+            extensions,
+        )
+    }
+
+    /// Assemble a `TbsCertificate`, sign its DER with the CA key (Ed25519), and
+    /// wrap it into a `Certificate`.
+    fn sign_certificate(
+        ca_signing_key: &SigningKey,
+        subject_key: &ed25519_dalek::VerifyingKey,
+        serial_number: SerialNumber,
+        issuer: Name,
+        subject: Name,
+        validity: Validity,
+        extensions: Extensions,
+    ) -> Result<Certificate, String> {
+        let signature_algorithm = ed25519_algorithm_identifier();
+        let tbs_certificate = TbsCertificate {
+            version: Version::V3,
+            serial_number,
+            signature: signature_algorithm.clone(),
+            issuer,
+            validity,
+            subject,
+            subject_public_key_info: subject_public_key_info(subject_key)?,
+            issuer_unique_id: None,
+            subject_unique_id: None,
+            extensions: Some(extensions),
+        };
+
+        let tbs_der = tbs_certificate
+            .to_der()
+            .map_err(|error| format!("failed to encode TBSCertificate: {error}"))?;
+        let signature = ca_signing_key.sign(&tbs_der);
+        let signature_bits = BitString::from_bytes(&signature.to_bytes())
+            .map_err(|error| format!("failed to encode certificate signature: {error}"))?;
+
+        Ok(Certificate {
+            tbs_certificate,
+            signature_algorithm,
+            signature: signature_bits,
+        })
+    }
+
+    /// `AlgorithmIdentifier` for Ed25519 (OID 1.3.101.112, absent parameters).
+    fn ed25519_algorithm_identifier() -> AlgorithmIdentifierOwned {
+        AlgorithmIdentifierOwned {
+            oid: ID_ED_25519,
+            parameters: None,
+        }
+    }
+
+    /// Build the SPKI for an ed25519 verifying key (reuses dalek's SPKI encoder).
+    fn subject_public_key_info(
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<SubjectPublicKeyInfoOwned, String> {
+        let der = verifying_key
+            .to_public_key_der()
+            .map_err(|error| format!("failed to encode subject public key: {error}"))?;
+        SubjectPublicKeyInfoOwned::from_der(der.as_bytes())
+            .map_err(|error| format!("failed to parse subject public key info: {error}"))
+    }
+
+    fn distinguished_name(rfc4514: &str) -> Result<Name, String> {
+        Name::from_str(rfc4514)
+            .map_err(|error| format!("failed to build distinguished name: {error}"))
+    }
+
+    /// Positive serial number derived from the issuance time plus a per-cert
+    /// discriminant so CA and leaf never collide.
+    fn serial_number(now: u64, discriminant: u8) -> Result<SerialNumber, String> {
+        let mut bytes = [0u8; 9];
+        bytes[..8].copy_from_slice(&now.to_be_bytes());
+        bytes[8] = discriminant;
+        SerialNumber::new(&bytes).map_err(|error| format!("failed to build serial number: {error}"))
+    }
+
+    fn validity(not_before_secs: u64, not_after_secs: u64) -> Result<Validity, String> {
+        Ok(Validity {
+            not_before: x509_time(not_before_secs)?,
+            not_after: x509_time(not_after_secs)?,
+        })
+    }
+
+    /// Encode a unix timestamp as an X.509 `Time`, using `UTCTime` through 2049
+    /// (per RFC 5280 4.1.2.5) and `GeneralizedTime` thereafter.
+    fn x509_time(secs: u64) -> Result<Time, String> {
+        let duration = Duration::from_secs(secs);
+        // 2050-01-01T00:00:00Z: RFC 5280 requires GeneralizedTime from 2050 on.
+        const UTC_TIME_MAX_SECS: u64 = 2_524_608_000;
+        if secs < UTC_TIME_MAX_SECS {
+            let utc = UtcTime::from_unix_duration(duration)
+                .map_err(|error| format!("failed to build UTCTime: {error}"))?;
+            Ok(Time::UtcTime(utc))
+        } else {
+            let general = GeneralizedTime::from_unix_duration(duration)
+                .map_err(|error| format!("failed to build GeneralizedTime: {error}"))?;
+            Ok(Time::GeneralTime(general))
+        }
+    }
+
+    fn basic_constraints_extension(is_ca: bool) -> Result<Extension, String> {
+        let basic_constraints = BasicConstraints {
+            ca: is_ca,
+            path_len_constraint: None,
+        };
+        build_extension(true, &basic_constraints)
+    }
+
+    fn key_usage_extension(usages: FlagSet<KeyUsages>) -> Result<Extension, String> {
+        build_extension(true, &KeyUsage(usages))
+    }
+
+    fn extended_key_usage_extension() -> Result<Extension, String> {
+        build_extension(false, &ExtendedKeyUsage(vec![ID_KP_SERVER_AUTH]))
+    }
+
+    fn subject_alt_name_extension(domain: &str) -> Result<Extension, String> {
+        let dns = Ia5String::new(domain)
+            .map_err(|error| format!("domain is not a valid dNSName: {error}"))?;
+        build_extension(false, &SubjectAltName(vec![GeneralName::DnsName(dns)]))
+    }
+
+    /// Wrap an encodable extension value into an `Extension`, taking its OID from
+    /// the value's `AssociatedOid`.
+    fn build_extension<T: Encode + AssociatedOid>(
+        critical: bool,
+        value: &T,
+    ) -> Result<Extension, String> {
+        let der = value
+            .to_der()
+            .map_err(|error| format!("failed to encode extension value: {error}"))?;
+        let extn_value = OctetString::new(der)
+            .map_err(|error| format!("failed to wrap extension value: {error}"))?;
+        Ok(Extension {
+            extn_id: T::OID,
+            critical,
+            extn_value,
+        })
     }
 }
 
@@ -356,9 +560,10 @@ mod tests {
             CertificateRequest {
                 domain: "api.example.test".to_owned(),
                 storage_path: "/app/certs/api.example.test.json".to_owned(),
-                mode: ACME_STAGING_MOCK.to_owned(),
+                mode: CA_ISSUED_MODE.to_owned(),
             }
         );
+        assert_eq!(CA_ISSUED_MODE, "ACME_STAGING_MOCK");
     }
 
     #[test]
@@ -371,14 +576,202 @@ mod tests {
         assert_eq!(error, "cert-manager `domain` must be a single hostname");
     }
 
-    #[test]
-    fn self_signed_certificate_contains_domain_and_pem_material() {
-        let bundle =
-            issue_self_signed_certificate("api.example.test").expect("bundle should be issued");
+    // ---- X.509 leaf issuance validation -----------------------------------
+    //
+    // `TACHYON_CLUSTER_CA_SEED` is process-global, so tests that mutate it are
+    // serialized behind this lock to avoid cross-test interference.
+    static CA_SEED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The fixed CA seed used by the issuance tests (64 hex chars / 32 bytes).
+    const TEST_CA_SEED_HEX: &str =
+        "0101010101010101010101010101010101010101010101010101010101010101";
+
+    fn test_ca_signing_key() -> SigningKey {
+        let seed: [u8; 32] = hex::decode(TEST_CA_SEED_HEX)
+            .expect("seed is hex")
+            .try_into()
+            .expect("32-byte seed");
+        SigningKey::from_bytes(&seed)
+    }
+
+    fn issue_via_env(domain: &str) -> CertificateBundle {
+        let _guard = CA_SEED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        std::env::set_var(CA_SEED_ENV, TEST_CA_SEED_HEX);
+        let bundle = issue_leaf_certificate(domain).expect("leaf certificate should be issued");
+        std::env::remove_var(CA_SEED_ENV);
+        bundle
+    }
+
+    /// Test 1: issuance succeeds when the CA seed is provided via env, exactly
+    /// how `load_ca_signing_key` reads it in production.
+    #[test]
+    fn issues_leaf_for_domain_from_env_seed() {
+        let bundle = issue_via_env("api.example.test");
         assert_eq!(bundle.domain, "api.example.test");
-        assert!(bundle.certificate_pem.contains("BEGIN CERTIFICATE"));
+        // Full chain, leaf-first: exactly two certificates in the PEM.
+        assert_eq!(
+            bundle.certificate_pem.matches("BEGIN CERTIFICATE").count(),
+            2,
+            "certificate_pem must contain the leaf followed by the CA cert"
+        );
         assert!(bundle.private_key_pem.contains("BEGIN PRIVATE KEY"));
+    }
+
+    /// Test 2: the leaf parses and carries the expected subject, SAN and issuer.
+    #[test]
+    fn leaf_certificate_has_expected_names_and_san() {
+        use x509_parser::prelude::*;
+
+        let domain = "node-7.api.example.test";
+        let bundle = cert::issue_leaf_certificate(&test_ca_signing_key(), domain).expect("issued");
+        let leaf_der = first_certificate_der(&bundle.certificate_pem);
+        let (_, leaf) = X509Certificate::from_der(&leaf_der).expect("leaf parses");
+
+        let subject_cn = leaf
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .expect("subject CN present");
+        assert_eq!(subject_cn, domain);
+
+        let issuer_cn = leaf
+            .issuer()
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .expect("issuer CN present");
+        assert_eq!(issuer_cn, "tachyon-cluster-ca");
+
+        let san = leaf
+            .subject_alternative_name()
+            .expect("SAN extension parses")
+            .expect("SAN extension present");
+        let has_dns = san
+            .value
+            .general_names
+            .iter()
+            .any(|name| matches!(name, GeneralName::DNSName(dns) if *dns == domain));
+        assert!(has_dns, "SAN must contain dNSName={domain}");
+    }
+
+    /// Test 3: the leaf certificate's Ed25519 signature validates under the CA
+    /// verifying key (TBSCertificate bytes verified against the CA public key),
+    /// proving it is genuinely CA-signed.
+    #[test]
+    fn leaf_certificate_is_signed_by_the_cluster_ca() {
+        use ed25519_dalek::{Signature, Verifier};
+        use x509_parser::prelude::*;
+
+        let ca_signing_key = test_ca_signing_key();
+        let bundle =
+            cert::issue_leaf_certificate(&ca_signing_key, "api.example.test").expect("issued");
+        let leaf_der = first_certificate_der(&bundle.certificate_pem);
+        let (_, leaf) = X509Certificate::from_der(&leaf_der).expect("leaf parses");
+
+        // Ed25519 signature OID (1.3.101.112).
+        assert_eq!(
+            leaf.signature_algorithm.algorithm.to_id_string(),
+            "1.3.101.112"
+        );
+
+        let tbs = leaf.tbs_certificate.as_ref();
+        let sig_bytes: [u8; 64] = leaf
+            .signature_value
+            .as_ref()
+            .try_into()
+            .expect("ed25519 signature is 64 bytes");
+        let signature = Signature::from_bytes(&sig_bytes);
+
+        ca_signing_key
+            .verifying_key()
+            .verify(tbs, &signature)
+            .expect("leaf TBS must verify under the cluster CA key");
+
+        // A different CA key must reject the same leaf.
+        let other_ca = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        assert!(
+            other_ca.verify(tbs, &signature).is_err(),
+            "leaf must not verify under an unrelated CA key"
+        );
+    }
+
+    /// Test 4: rustls accepts the full chain + leaf key via `with_single_cert`,
+    /// proving the ed25519 leaf and PKCS#8 key are mutually consistent and
+    /// loadable by the host TLS runtime.
+    #[test]
+    fn bundle_loads_into_a_rustls_server_config() {
+        use std::io::BufReader;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let bundle = cert::issue_leaf_certificate(&test_ca_signing_key(), "api.example.test")
+            .expect("issued");
+
+        let mut cert_reader = BufReader::new(bundle.certificate_pem.as_bytes());
+        let cert_chain = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("certificate chain parses");
+        assert_eq!(cert_chain.len(), 2, "chain must be leaf + CA");
+
+        let mut key_reader = BufReader::new(bundle.private_key_pem.as_bytes());
+        let private_key = rustls_pemfile::private_key(&mut key_reader)
+            .expect("private key parses")
+            .expect("private key present");
+
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, private_key)
+            .expect("rustls must accept the ed25519 leaf and key");
+    }
+
+    /// Test 5: each issuance mints a fresh random leaf key (never the old mock).
+    #[test]
+    fn each_issuance_uses_a_fresh_leaf_key() {
+        let ca_signing_key = test_ca_signing_key();
+        let first =
+            cert::issue_leaf_certificate(&ca_signing_key, "api.example.test").expect("issued");
+        let second =
+            cert::issue_leaf_certificate(&ca_signing_key, "api.example.test").expect("issued");
+
+        assert_ne!(
+            first.private_key_pem, second.private_key_pem,
+            "leaf private key must be randomly generated per issuance"
+        );
+        assert_ne!(
+            first.certificate_pem, second.certificate_pem,
+            "fresh leaf key must yield a different certificate"
+        );
+
+        // It must not be the retired hardcoded mock material.
+        let old_mock_cn = "api.example.test";
+        assert!(
+            !first
+                .private_key_pem
+                .contains("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw"),
+            "issuance must not return the old hardcoded RSA mock key"
+        );
+        // The new leaf key is PKCS#8 ed25519 (short), not the long RSA mock.
+        assert!(
+            first.private_key_pem.len() < 400,
+            "ed25519 PKCS#8 keys are short"
+        );
+        // Subject is still the requested domain (sanity, unrelated to mock).
+        let _ = old_mock_cn;
+    }
+
+    /// Helper: decode the first PEM certificate (the leaf) into DER.
+    fn first_certificate_der(pem: &str) -> Vec<u8> {
+        use std::io::BufReader;
+        let mut reader = BufReader::new(pem.as_bytes());
+        let mut certs = rustls_pemfile::certs(&mut reader);
+        let first = certs
+            .next()
+            .expect("at least one certificate")
+            .expect("certificate parses");
+        first.as_ref().to_vec()
     }
 
     #[test]

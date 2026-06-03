@@ -10,9 +10,35 @@ crate-type = ["cdylib"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wit-bindgen = "0.57"
-# Pure-Rust (wasm-safe) ed25519 signing for cluster-CA node credentials.
-ed25519-dalek = { version = "2", default-features = false }
+# Pure-Rust (wasm-safe) ed25519 signing for the cluster CA. `pkcs8`/`pem`
+# export the leaf private key as PKCS#8 PEM; `alloc` is required by both.
+ed25519-dalek = { version = "2", default-features = false, features = [
+    "alloc",
+    "pkcs8",
+    "pem",
+] }
 hex = "0.4"
+# Pure-Rust X.509 certificate building/encoding on der 0.7 / spki 0.7.
+x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
+der = { version = "0.7", default-features = false, features = [
+    "alloc",
+    "pem",
+    "flagset",
+] }
+spki = { version = "0.7", default-features = false, features = ["alloc"] }
+const-oid = { version = "0.9", default-features = false, features = ["db"] }
+# Fresh leaf-key entropy. getrandom 0.2 uses the WASI backend on
+# wasm32-wasip2, so no `js` feature is needed.
+getrandom = "0.2"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rcgen = "0.14"
+[dev-dependencies]
+# Host-only validation that the issued leaf is genuinely CA-signed and
+# loadable by rustls. rustls is pinned to the workspace version; the `ring`
+# provider keeps the test build off a C-toolchain-heavy crypto backend.
+x509-parser = "0.18"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+rustls-pemfile = "2"
