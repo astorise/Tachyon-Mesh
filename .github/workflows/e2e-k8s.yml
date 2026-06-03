@@ -7,10 +7,12 @@ on:
       - "manifests/**"
       - "core-host/**"
       - "Dockerfile"
+      - ".github/workflows/e2e-k8s.yml"
   pull_request:
     paths:
       - "manifests/**"
       - "Dockerfile"
+      - ".github/workflows/e2e-k8s.yml"
 
 permissions:
   contents: read
@@ -43,14 +45,21 @@ jobs:
       - name: Build local Docker image
         run: docker build -t tachyon-mesh:local .
 
+      - name: Install k3d
+        run: |
+          curl --fail --show-error --silent --location \
+            -o k3d \
+            https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-linux-amd64
+          chmod +x k3d
+          sudo mv k3d /usr/local/bin/k3d
+          k3d version
+
       - name: Set up k3d cluster
-        uses: AbsaOSS/k3d-action@v2
-        with:
-          cluster-name: tachyon-test
-          args: >-
-            --agents 1
-            --no-lb
-            --k3s-arg "--no-deploy=traefik@server:*"
+        run: |
+          k3d cluster create tachyon-test \
+            --agents 1 \
+            --no-lb \
+            --wait
 
       - name: Import local image into k3d
         run: k3d image import tachyon-mesh:local -c tachyon-test
@@ -76,3 +85,7 @@ jobs:
           sleep 4
           curl -f --retry 5 --retry-delay 2 http://localhost:8080/admin/status && echo "healthcheck passed"
           kill $PF_PID 2>/dev/null || true
+
+      - name: Delete k3d cluster
+        if: always()
+        run: k3d cluster delete tachyon-test || true
