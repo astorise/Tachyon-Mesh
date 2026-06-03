@@ -59,27 +59,33 @@ fn transform(
 
 pub fn encrypt_chunk(data: &[u8], nonce: u64) -> Result<Vec<u8>, String> {
     let nonce = nonce_bytes(nonce);
-    cipher()
+    cipher()?
         .encrypt(Nonce::from_slice(&nonce), data)
         .map_err(|_| "failed to encrypt TDE chunk with AES-256-GCM".to_owned())
 }
 
 pub fn decrypt_chunk(data: &[u8], nonce: u64) -> Result<Vec<u8>, String> {
     let nonce = nonce_bytes(nonce);
-    cipher()
+    cipher()?
         .decrypt(Nonce::from_slice(&nonce), data)
         .map_err(|_| "failed to decrypt TDE chunk or authenticate ciphertext".to_owned())
 }
 
-fn cipher() -> Aes256Gcm {
-    Aes256Gcm::new((&key_bytes()).into())
+fn cipher() -> Result<Aes256Gcm, String> {
+    Ok(Aes256Gcm::new((&key_bytes()?).into()))
 }
 
-fn key_bytes() -> [u8; 32] {
-    std::env::var(TDE_KEY_HEX_ENV)
-        .ok()
-        .and_then(|value| decode_hex_32(value.trim()).ok())
-        .unwrap_or([0x42; 32])
+/// Resolve the TDE data-encryption key strictly from `TDE_KEY_HEX`.
+///
+/// Fail-closed: if the variable is unset or malformed we refuse the operation
+/// rather than silently falling back to a constant key. A default key would
+/// encrypt every tenant's data under a value baked into the binary, which
+/// defeats Transparent Data Encryption entirely.
+fn key_bytes() -> Result<[u8; 32], String> {
+    let value = std::env::var(TDE_KEY_HEX_ENV).map_err(|_| {
+        format!("{TDE_KEY_HEX_ENV} is not configured; refusing to run TDE with a default key")
+    })?;
+    decode_hex_32(value.trim())
 }
 
 fn nonce_bytes(value: u64) -> [u8; 12] {
@@ -157,10 +163,25 @@ struct ChunkResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_chunk, encrypt_chunk};
+    use super::{decrypt_chunk, encrypt_chunk, TDE_KEY_HEX_ENV};
 
     #[test]
     fn aes_gcm_chunk_round_trips_and_authenticates() {
+        // Fail-closed: with no key configured, TDE refuses to operate rather
+        // than silently using a constant default key.
+        std::env::remove_var(TDE_KEY_HEX_ENV);
+        assert!(
+            encrypt_chunk(b"unconfigured", 1).is_err(),
+            "TDE must refuse to encrypt when {TDE_KEY_HEX_ENV} is unset"
+        );
+
+        // With a configured 256-bit key, encrypt/decrypt round-trips and the
+        // AEAD tag rejects tampered ciphertext.
+        std::env::set_var(
+            TDE_KEY_HEX_ENV,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+
         let plaintext = b"patient-record: secret";
         let ciphertext = encrypt_chunk(plaintext, 7).expect("encryption should succeed");
 
@@ -173,5 +194,7 @@ mod tests {
         let mut tampered = ciphertext;
         tampered[0] ^= 0x01;
         assert!(decrypt_chunk(&tampered, 7).is_err());
+
+        std::env::remove_var(TDE_KEY_HEX_ENV);
     }
 }

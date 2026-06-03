@@ -1023,7 +1023,7 @@ pub(crate) fn encrypt_tde_file_body(plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let mut nonce = [0_u8; 12];
     nonce[4..].copy_from_slice(&rand::rng().random::<u64>().to_be_bytes());
-    let ciphertext = tde_cipher()
+    let ciphertext = tde_cipher()?
         .encrypt(Nonce::from_slice(&nonce), plaintext)
         .map_err(|_| anyhow!("failed to encrypt TDE file body"))?;
     let mut out = Vec::with_capacity(TDE_FILE_MAGIC.len() + nonce.len() + ciphertext.len());
@@ -1041,20 +1041,27 @@ pub(crate) fn decrypt_tde_file_body(body: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("TDE file body is missing nonce"));
     }
     let (nonce, ciphertext) = rest.split_at(12);
-    tde_cipher()
+    tde_cipher()?
         .decrypt(Nonce::from_slice(nonce), ciphertext)
         .map_err(|_| anyhow!("failed to decrypt TDE file body"))
 }
 
-pub(crate) fn tde_cipher() -> Aes256Gcm {
-    Aes256Gcm::new((&tde_key_bytes()).into())
+pub(crate) fn tde_cipher() -> Result<Aes256Gcm> {
+    Ok(Aes256Gcm::new((&tde_key_bytes()?).into()))
 }
 
-pub(crate) fn tde_key_bytes() -> [u8; 32] {
-    std::env::var(TDE_KEY_HEX_ENV)
-        .ok()
-        .and_then(|value| decode_tde_key_hex(value.trim()).ok())
-        .unwrap_or([0x42; 32])
+/// Resolve the host-side TDE volume-encryption key strictly from `TDE_KEY_HEX`.
+///
+/// Fail-closed: refuse to seal or open an encrypted volume when no key is
+/// configured instead of falling back to a constant. A default key would
+/// "encrypt" sensitive volumes under a value compiled into every binary, which
+/// defeats the encryption entirely. Only routes that opt into encrypted volumes
+/// reach this path, so unencrypted deployments are unaffected.
+pub(crate) fn tde_key_bytes() -> Result<[u8; 32]> {
+    let value = std::env::var(TDE_KEY_HEX_ENV).map_err(|_| {
+        anyhow!("{TDE_KEY_HEX_ENV} is not configured; refusing to use a default encrypted-volume key")
+    })?;
+    decode_tde_key_hex(value.trim())
 }
 
 pub(crate) fn decode_tde_key_hex(value: &str) -> Result<[u8; 32]> {
