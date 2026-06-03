@@ -26,10 +26,34 @@ der = { version = "0.7", default-features = false, features = [
     "flagset",
 ] }
 spki = { version = "0.7", default-features = false, features = ["alloc"] }
+# PKCS#8 PEM export of the P-256 leaf private key (`EncodePrivateKey`). Already
+# in the tree via ed25519-dalek / p256; named directly so both key types share
+# one trait import. `alloc` + `pem` enable `to_pkcs8_pem`.
+pkcs8 = { version = "0.10", default-features = false, features = [
+    "alloc",
+    "pem",
+] }
 const-oid = { version = "0.9", default-features = false, features = ["db"] }
 # Fresh leaf-key entropy. getrandom 0.2 uses the WASI backend on
 # wasm32-wasip2, so no `js` feature is needed.
 getrandom = "0.2"
+# ECDSA P-256 (NIST secp256r1) leaf keypair. P-256 is universally accepted for
+# TLS server CertificateVerify, unlike ed25519 (which narrow clients omit). This
+# 0.13.x line is pure-Rust and rides the existing der 0.7 / spki 0.7 / pkcs8 0.10
+# / sec1 0.7 stack, so it stays wasm32-wasip2-safe (no protoc / C deps). Features:
+# `ecdsa` (signing key type), `pkcs8` + `pem` (PKCS#8 PEM export of the leaf key),
+# `arithmetic` (curve arithmetic needed to derive the verifying key / SPKI).
+p256 = { version = "0.13", default-features = false, features = [
+    "ecdsa",
+    "pkcs8",
+    "pem",
+    "arithmetic",
+] }
+# `OsRng` for sampling the P-256 leaf key. The `getrandom` feature backs it with
+# getrandom 0.2 (WASI on wasm32-wasip2), matching the leaf-entropy source above.
+rand_core = { version = "0.6", default-features = false, features = [
+    "getrandom",
+] }
 
 [dev-dependencies]
 # Host-only validation that the issued leaf is genuinely CA-signed and

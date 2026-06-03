@@ -10,7 +10,6 @@ mod bindings {
 }
 
 use bindings::tachyon::mesh::storage_broker::WriteMode;
-use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 
@@ -257,10 +256,16 @@ fn require_query_value(value: Option<String>, key: &'static str) -> Result<Strin
 ///
 /// This is the single (wasm-safe) issuance path: it loads the cluster-CA
 /// signing key, derives the deterministic CA certificate, generates a fresh
-/// random ed25519 leaf keypair, and mints a v3 leaf certificate
+/// random ECDSA P-256 leaf keypair, and mints a v3 leaf certificate
 /// (`CN=<domain>`, SAN dNSName=<domain>, serverAuth) signed over the
 /// TBSCertificate DER with the CA key. The returned bundle is a leaf-first
 /// full chain plus the leaf's PKCS#8 private key.
+///
+/// The cluster CA remains ed25519, so the certificate's `signatureAlgorithm`
+/// stays Ed25519 (1.3.101.112); only the leaf's subjectPublicKeyInfo and the
+/// returned leaf private key are P-256. A P-256 leaf is universally accepted
+/// for TLS server CertificateVerify, whereas an ed25519 leaf breaks clients
+/// that do not advertise the ed25519 signature scheme.
 fn issue_leaf_certificate(domain: &str) -> Result<CertificateBundle, String> {
     let ca_signing_key = load_ca_signing_key().map_err(|(_, message)| message)?;
     cert::issue_leaf_certificate(&ca_signing_key, domain)
@@ -270,7 +275,7 @@ fn issue_leaf_certificate(domain: &str) -> Result<CertificateBundle, String> {
 /// unit-testable on the host target. Mints a cluster-CA-signed leaf for
 /// `domain` using `ca_signing_key` as the issuing CA.
 mod cert {
-    use super::{now_seconds, CertificateBundle, EncodePrivateKey, EncodePublicKey, SigningKey};
+    use super::{now_seconds, CertificateBundle, SigningKey};
     use const_oid::db::rfc5280::ID_KP_SERVER_AUTH;
     use const_oid::db::rfc8410::ID_ED_25519;
     use const_oid::AssociatedOid;
@@ -278,7 +283,8 @@ mod cert {
     use der::flagset::FlagSet;
     use der::{Decode, Encode, EncodePem};
     use ed25519_dalek::Signer;
-    use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+    use pkcs8::EncodePrivateKey;
+    use spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
     use std::str::FromStr;
     use std::time::Duration;
     use x509_cert::certificate::{Certificate, TbsCertificate, Version};
@@ -313,8 +319,8 @@ mod cert {
             .to_pem(der::pem::LineEnding::LF)
             .map_err(|error| format!("failed to PEM-encode CA certificate: {error}"))?;
 
-        // Fresh random ed25519 leaf keypair.
-        let leaf_signing_key = generate_leaf_key()?;
+        // Fresh random ECDSA P-256 leaf keypair.
+        let leaf_signing_key = generate_leaf_key();
         let leaf_cert = build_leaf_certificate(ca_signing_key, &leaf_signing_key, domain, now)?;
         let leaf_pem = leaf_cert
             .to_pem(der::pem::LineEnding::LF)
@@ -333,12 +339,12 @@ mod cert {
         })
     }
 
-    /// Generate a fresh random ed25519 leaf keypair from 32 bytes of OS entropy.
-    fn generate_leaf_key() -> Result<SigningKey, String> {
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed)
-            .map_err(|error| format!("failed to sample leaf key entropy: {error}"))?;
-        Ok(SigningKey::from_bytes(&seed))
+    /// Generate a fresh random ECDSA P-256 (NIST secp256r1) leaf keypair.
+    ///
+    /// `OsRng` is getrandom-backed (WASI on wasm32-wasip2), the same entropy
+    /// source the cluster CA seed loading relies on.
+    fn generate_leaf_key() -> p256::ecdsa::SigningKey {
+        p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)
     }
 
     /// Build the deterministic self-signed cluster-CA certificate.
@@ -349,9 +355,11 @@ mod cert {
             basic_constraints_extension(true)?,
             key_usage_extension(KeyUsages::KeyCertSign | KeyUsages::DigitalSignature)?,
         ];
+        // The CA is self-signed: its SPKI is the ed25519 CA verifying key.
+        let spki = subject_public_key_info(&ca_signing_key.verifying_key())?;
         sign_certificate(
             ca_signing_key,
-            &ca_signing_key.verifying_key(),
+            spki,
             serial_number(now, 0)?,
             name.clone(),
             name,
@@ -361,9 +369,13 @@ mod cert {
     }
 
     /// Build the cluster-CA-signed v3 leaf certificate for `domain`.
+    ///
+    /// The leaf key is ECDSA P-256, so the leaf's subjectPublicKeyInfo carries
+    /// `id-ecPublicKey` with the P-256 named curve. The certificate is still
+    /// signed by the ed25519 cluster CA (see `sign_certificate`).
     fn build_leaf_certificate(
         ca_signing_key: &SigningKey,
-        leaf_signing_key: &SigningKey,
+        leaf_signing_key: &p256::ecdsa::SigningKey,
         domain: &str,
         now: u64,
     ) -> Result<Certificate, String> {
@@ -376,9 +388,11 @@ mod cert {
             extended_key_usage_extension()?,
             subject_alt_name_extension(domain)?,
         ];
+        // The leaf's SPKI is the P-256 verifying key.
+        let spki = subject_public_key_info(leaf_signing_key.verifying_key())?;
         sign_certificate(
             ca_signing_key,
-            &leaf_signing_key.verifying_key(),
+            spki,
             serial_number(now, 1)?,
             issuer,
             subject,
@@ -389,9 +403,15 @@ mod cert {
 
     /// Assemble a `TbsCertificate`, sign its DER with the CA key (Ed25519), and
     /// wrap it into a `Certificate`.
+    ///
+    /// `subject_public_key_info` is supplied by the caller so the same signing
+    /// path serves both the ed25519 self-signed CA (CA SPKI) and the P-256 leaf
+    /// (leaf SPKI). The signature itself is always the ed25519 CA signature over
+    /// the TBSCertificate DER, so the certificate's `signatureAlgorithm` stays
+    /// Ed25519 (1.3.101.112) regardless of the subject key type.
     fn sign_certificate(
         ca_signing_key: &SigningKey,
-        subject_key: &ed25519_dalek::VerifyingKey,
+        subject_public_key_info: SubjectPublicKeyInfoOwned,
         serial_number: SerialNumber,
         issuer: Name,
         subject: Name,
@@ -406,7 +426,7 @@ mod cert {
             issuer,
             validity,
             subject,
-            subject_public_key_info: subject_public_key_info(subject_key)?,
+            subject_public_key_info,
             issuer_unique_id: None,
             subject_unique_id: None,
             extensions: Some(extensions),
@@ -434,9 +454,12 @@ mod cert {
         }
     }
 
-    /// Build the SPKI for an ed25519 verifying key (reuses dalek's SPKI encoder).
-    fn subject_public_key_info(
-        verifying_key: &ed25519_dalek::VerifyingKey,
+    /// Build the SPKI for any verifying key that can encode itself as a
+    /// SubjectPublicKeyInfo DER. Used for both the ed25519 CA key (yielding an
+    /// Ed25519 SPKI) and the P-256 leaf key (yielding an `id-ecPublicKey` SPKI
+    /// with the P-256 named curve).
+    fn subject_public_key_info<T: EncodePublicKey>(
+        verifying_key: &T,
     ) -> Result<SubjectPublicKeyInfoOwned, String> {
         let der = verifying_key
             .to_public_key_der()
