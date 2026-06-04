@@ -19,6 +19,15 @@ use std::{
 use uuid::Uuid;
 
 const MODEL_CHUNK_BYTES: usize = 5 * 1024 * 1024;
+/// Host dispatch sidecar written into each unpacked model directory. Mirrors
+/// `core-host`'s `candle_llm_runtime::MODEL_META_JSON` — the broker performs the
+/// format *detection* and records the result; the host honours the declared
+/// value (and still validates the bytes through the matching loader).
+const MODEL_META_JSON: &str = ".tachyon-model.json";
+/// GGUF files begin with this ASCII magic.
+const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+const FORMAT_GGUF: &str = "gguf";
+const FORMAT_SAFETENSORS: &str = "safetensors";
 const INIT_PATH: &str = "/admin/models/init";
 const UPLOAD_PREFIX: &str = "/admin/models/upload/";
 const COMMIT_PREFIX: &str = "/admin/models/commit/";
@@ -248,6 +257,9 @@ fn init_upload(body: &[u8]) -> Result<String, String> {
     if payload.size_bytes == 0 {
         return Err("model upload size must be greater than zero".to_owned());
     }
+    if let Some(alias) = &payload.alias {
+        validate_alias(alias)?;
+    }
 
     let upload_id = Uuid::new_v4().to_string();
     fs::write(staging_path(&upload_id), [])
@@ -326,7 +338,7 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     if computed_hash != pending.expected_hash {
         // Hash mismatch means the staged content is unusable. Delete the .part and the
         // metadata so the upload slot is freed and the broker never accidentally
-        // promotes a corrupted file to the final model name.
+        // promotes a corrupted archive to the final model directory.
         cleanup_staging(&upload_id);
         return Err(format!(
             "model upload `{upload_id}` hash mismatch: expected `{}`, computed `{computed_hash}`",
@@ -334,53 +346,185 @@ fn commit_upload(uri: &str) -> Result<String, String> {
         ));
     }
 
-    let model_path = models_dir().join(format!(
-        "{}.gguf",
-        pending.expected_hash.trim_start_matches("sha256:")
-    ));
-    if model_path.exists() {
-        fs::remove_file(&model_path).map_err(|error| {
+    // The uploaded blob is a gzip+tar archive (single `.gguf` or a safetensors
+    // directory). Unpack it into a per-alias model directory that core-host can
+    // mmap, detect the on-disk format, and drop the host dispatch sidecar.
+    let alias = model_alias(&pending);
+    let model_dir = models_dir().join(&alias);
+    if model_dir.exists() {
+        fs::remove_dir_all(&model_dir).map_err(|error| {
             format!(
                 "failed to replace existing model `{}`: {error}",
-                model_path.display()
+                model_dir.display()
             )
         })?;
     }
-    fs::rename(&staging_path, &model_path).map_err(|error| {
-        format!(
-            "failed to finalize model upload from `{}` to `{}`: {error}",
-            staging_path.display(),
-            model_path.display()
-        )
-    })?;
-    let metadata_path = metadata_path(&upload_id);
-    if metadata_path.exists() {
-        fs::remove_file(&metadata_path).map_err(|error| {
-            format!(
-                "failed to remove upload metadata `{}`: {error}",
-                metadata_path.display()
-            )
-        })?;
-    }
+    fs::create_dir_all(&model_dir)
+        .map_err(|error| format!("failed to create model directory: {error}"))?;
 
-    let alias = pending.alias.unwrap_or_else(|| {
+    let format = unpack_targz(&staging_path, &model_dir)
+        .and_then(|()| detect_format(&model_dir))
+        .inspect_err(|_error| {
+            // The archive is unusable: drop the half-written directory and the
+            // staging slot so a retry starts clean.
+            let _ = fs::remove_dir_all(&model_dir);
+            cleanup_staging(&upload_id);
+        })?;
+    write_meta_sidecar(&model_dir, format, &alias)?;
+
+    cleanup_staging(&upload_id);
+    notify_model_registry(&alias, format);
+
+    Ok(model_dir.to_string_lossy().to_string())
+}
+
+/// The model directory / registry name: the caller-supplied alias, or the bare
+/// hash digest when none was given. Aliases are validated at `init` time, so
+/// this is always a safe single path component.
+fn model_alias(pending: &PendingUpload) -> String {
+    pending.alias.clone().unwrap_or_else(|| {
         pending
             .expected_hash
             .trim_start_matches("sha256:")
             .to_owned()
-    });
-    notify_model_registry(&alias);
+    })
+}
 
-    Ok(model_path.to_string_lossy().to_string())
+/// Stream a gzip+tar archive into `dest`, writing only regular files and
+/// directories. Extraction is manual (no permission/mtime/xattr restoration) so
+/// it stays within the WASI filesystem surface, and every entry path is
+/// sanitised to keep writes inside `dest` (defence against `../` tar slips).
+fn unpack_targz(archive_path: &Path, dest: &Path) -> Result<(), String> {
+    let file = fs::File::open(archive_path)
+        .map_err(|error| format!("failed to open uploaded archive: {error}"))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("uploaded archive is not a valid tar stream: {error}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| format!("failed to read archive entry: {error}"))?;
+        let raw_path = entry
+            .path()
+            .map_err(|error| format!("archive entry has an invalid path: {error}"))?
+            .into_owned();
+        let relative = sanitize_relative(&raw_path)?;
+        let out_path = dest.join(&relative);
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&out_path)
+                .map_err(|error| format!("failed to create archive directory: {error}"))?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create archive parent: {error}"))?;
+        }
+        let mut out = fs::File::create(&out_path)
+            .map_err(|error| format!("failed to create extracted file: {error}"))?;
+        std::io::copy(&mut entry, &mut out)
+            .map_err(|error| format!("failed to write extracted file: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Reduce an archive entry path to a safe relative path, rejecting absolute
+/// paths and any `..` component so extraction can never escape the target dir.
+fn sanitize_relative(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "model archive contains an unsafe path `{}`",
+                    path.display()
+                ))
+            }
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err("model archive contains an empty path entry".to_owned());
+    }
+    Ok(clean)
+}
+
+/// Detect the on-disk format of an unpacked model directory by content: a file
+/// starting with the GGUF magic wins; otherwise a `config.json` next to a
+/// `.safetensors` file marks a Hugging Face safetensors checkpoint.
+fn detect_format(dir: &Path) -> Result<&'static str, String> {
+    let mut has_config = false;
+    let mut has_safetensors = false;
+    let read = fs::read_dir(dir)
+        .map_err(|error| format!("failed to scan unpacked model directory: {error}"))?;
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if file_starts_with_gguf_magic(&path) {
+            return Ok(FORMAT_GGUF);
+        }
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("config.json") => has_config = true,
+            Some(name) if name.ends_with(".safetensors") => has_safetensors = true,
+            _ => {}
+        }
+    }
+    if has_config && has_safetensors {
+        Ok(FORMAT_SAFETENSORS)
+    } else {
+        Err(
+            "uploaded model archive contains neither a GGUF file nor a safetensors checkpoint \
+             (config.json + .safetensors)"
+                .to_owned(),
+        )
+    }
+}
+
+/// Cheap content probe: does the file begin with the 4-byte GGUF magic?
+fn file_starts_with_gguf_magic(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic).is_ok() && &magic == GGUF_MAGIC
+}
+
+/// Write the host dispatch sidecar declaring the detected format.
+fn write_meta_sidecar(dir: &Path, format: &str, alias: &str) -> Result<(), String> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "format": format,
+        "alias": alias,
+    }))
+    .map_err(|error| format!("failed to encode model metadata sidecar: {error}"))?;
+    fs::write(dir.join(MODEL_META_JSON), body)
+        .map_err(|error| format!("failed to write model metadata sidecar: {error}"))
+}
+
+/// Reject aliases that are not a single safe path component.
+fn validate_alias(alias: &str) -> Result<(), String> {
+    if alias.is_empty()
+        || alias.contains('/')
+        || alias.contains('\\')
+        || alias.contains("..")
+        || alias.starts_with('.')
+    {
+        return Err(format!(
+            "model alias `{alias}` must be a non-empty name without path separators, `..`, or a leading dot"
+        ));
+    }
+    Ok(())
 }
 
 /// Best-effort notification to the `guest-openai` model registry that a model is now
 /// available. Failures are swallowed — the commit has already succeeded and the registry
 /// can be refreshed on the next model upload or operator intervention.
-fn notify_model_registry(alias: &str) {
+fn notify_model_registry(alias: &str, engine: &str) {
     let entry = ModelRegistryEntry {
         alias: alias.to_owned(),
-        engine: "gguf".to_owned(),
+        engine: engine.to_owned(),
         vram_required_mb: 0,
         status: "available".to_owned(),
     };
@@ -659,5 +803,87 @@ mod tests {
         };
 
         assert_eq!(followup_probability(&request), 0.8);
+    }
+
+    fn unique_tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tachyon-broker-{tag}-{}", Uuid::new_v4()))
+    }
+
+    fn build_targz(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            for (name, data) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, &data[..])
+                    .expect("append archive entry");
+            }
+            builder.finish().expect("finish tar");
+        }
+        encoder.finish().expect("finish gzip")
+    }
+
+    #[test]
+    fn validate_alias_rejects_unsafe_names() {
+        assert!(validate_alias("tinyllama-1.1b").is_ok());
+        assert!(validate_alias("").is_err());
+        assert!(validate_alias("../evil").is_err());
+        assert!(validate_alias("a/b").is_err());
+        assert!(validate_alias(".hidden").is_err());
+    }
+
+    #[test]
+    fn sanitize_relative_blocks_traversal_and_absolute_paths() {
+        assert!(sanitize_relative(Path::new("../escape")).is_err());
+        assert!(sanitize_relative(Path::new("/abs/path")).is_err());
+        assert_eq!(
+            sanitize_relative(Path::new("./nested/model.gguf")).expect("safe path"),
+            PathBuf::from("nested/model.gguf")
+        );
+    }
+
+    #[test]
+    fn unpack_then_detect_gguf_archive() {
+        let tmp = unique_tmp("gguf");
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        let archive = build_targz(&[
+            ("model.gguf", b"GGUF\x00\x00\x00\x00body".to_vec()),
+            ("tokenizer.json", b"{}".to_vec()),
+        ]);
+        let staging = tmp.join("upload.part");
+        fs::write(&staging, &archive).expect("write archive");
+        let dest = tmp.join("model");
+        fs::create_dir_all(&dest).expect("dest dir");
+
+        unpack_targz(&staging, &dest).expect("archive should unpack");
+        assert!(dest.join("model.gguf").exists());
+        assert!(dest.join("tokenizer.json").exists());
+        assert_eq!(detect_format(&dest).expect("format"), FORMAT_GGUF);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_format_identifies_safetensors_directory() {
+        let tmp = unique_tmp("safetensors");
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        fs::write(tmp.join("config.json"), br#"{"model_type":"llama"}"#).expect("config");
+        fs::write(tmp.join("model.safetensors"), b"\x00\x00").expect("weights");
+        fs::write(tmp.join("tokenizer.json"), b"{}").expect("tokenizer");
+
+        assert_eq!(detect_format(&tmp).expect("format"), FORMAT_SAFETENSORS);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_format_rejects_an_unrecognized_archive() {
+        let tmp = unique_tmp("junk");
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        fs::write(tmp.join("README.txt"), b"not a model").expect("file");
+        assert!(detect_format(&tmp).is_err());
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
