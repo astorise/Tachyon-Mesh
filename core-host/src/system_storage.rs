@@ -66,6 +66,7 @@ fn model_broker_dir(manifest_path: &Path) -> PathBuf {
 /// (`{tachyon_data}/models/{alias}/`). The broker's preopened `.` maps to
 /// `model_broker_dir`, so this is exactly where it writes; the AI runtime reads
 /// the same path to lazily load uploaded checkpoints.
+#[cfg(feature = "ai-inference")]
 pub(crate) fn model_broker_models_dir(manifest_path: &Path) -> PathBuf {
     model_broker_dir(manifest_path).join("models")
 }
