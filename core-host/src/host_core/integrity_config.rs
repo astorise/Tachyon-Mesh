@@ -1601,6 +1601,7 @@ pub(crate) fn normalize_route_models(
                 path: path.to_owned(),
                 device: model.device,
                 qos: model.qos,
+                dynamic: false,
             });
     }
 

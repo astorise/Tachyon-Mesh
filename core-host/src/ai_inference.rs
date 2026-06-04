@@ -247,12 +247,27 @@ impl AiInferenceRuntime {
             })
             .collect::<HashMap<_, _>>();
         let mut models = HashMap::new();
+        let mut sealed_aliases = std::collections::HashSet::new();
 
         for route in &config.routes {
             for binding in &route.models {
-                if models.contains_key(&binding.alias) {
+                if !sealed_aliases.insert(binding.alias.clone()) {
                     return Err(anyhow!(
                         "Integrity Validation Failed: model alias `{}` must be globally unique",
+                        binding.alias
+                    ));
+                }
+                if binding.dynamic {
+                    // Sealed but not present at boot. The alias is authorised for
+                    // the route (scope is enforced from `route.models`), and the
+                    // model is lazily materialised from `{dynamic_models_root}/{alias}`
+                    // by `ensure_model_loaded` on first use. Skipping eager load
+                    // here lets the host boot before the model has been uploaded.
+                    continue;
+                }
+                if binding.path.is_empty() {
+                    return Err(anyhow!(
+                        "Integrity Validation Failed: static model alias `{}` requires a non-empty `path` (set `dynamic: true` for broker-uploaded models)",
                         binding.alias
                     ));
                 }
@@ -306,6 +321,7 @@ impl AiInferenceRuntime {
             path: model_dir.to_string_lossy().into_owned(),
             device: crate::ModelDevice::Cpu,
             qos: RouteQos::Standard,
+            dynamic: false,
         };
         let backend_model: Arc<dyn BackendModel> =
             Arc::new(CandleBackendModel::load(&binding).map_err(|error| error.to_string())?);
@@ -1753,12 +1769,14 @@ mod tests {
                 path: "mock:llama3".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::Standard,
+                dynamic: false,
             },
             IntegrityModelBinding {
                 alias: "tiny".to_owned(),
                 path: "mock:tiny".to_owned(),
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Standard,
+                dynamic: false,
             },
         ];
         let config = IntegrityConfig {
@@ -2006,6 +2024,69 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_binding_is_sealed_but_not_eager_loaded() {
+        let root = unique_candle_llm_dir("dynamic-binding-root");
+        let alias = "tenant-llama";
+        candle_llm_runtime::write_tachyon_tiny_fixture(&root.join(alias))
+            .expect("fixture should be written");
+
+        // A `dynamic` binding seals the alias for the route but carries no path
+        // and is not present at boot. from_config must build without eager-loading
+        // it, so the host can start before the model has been uploaded.
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: alias.to_owned(),
+            path: String::new(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: true,
+        }];
+        let config = IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        };
+
+        let runtime = AiInferenceRuntime::from_config(&config)
+            .expect("a dynamic binding must not fail boot")
+            .with_dynamic_models_root(Some(root.clone()));
+
+        // Not eager-loaded at boot.
+        assert!(!runtime.loaded_model_aliases().contains(&alias.to_owned()));
+
+        // Lazily materialised from the broker models root on first use.
+        let output = runtime
+            .compute_component_prompt(alias, "hello")
+            .expect("a sealed dynamic alias should load lazily once uploaded");
+        assert!(!output.is_empty());
+        assert!(runtime.loaded_model_aliases().contains(&alias.to_owned()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn static_binding_with_empty_path_is_rejected() {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "needs-path".to_owned(),
+            path: String::new(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+        }];
+        let config = IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        };
+        let error = match AiInferenceRuntime::from_config(&config) {
+            Ok(_) => panic!("a static binding without a path must fail validation"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("needs-path"), "message was: {message}");
+        assert!(message.contains("dynamic"), "message was: {message}");
+    }
+
+    #[test]
     fn scheduler_batches_concurrent_requests_for_same_alias() {
         let runtime = AiInferenceRuntime::from_config(&config_with_model("llama3"))
             .expect("runtime should build");
@@ -2063,6 +2144,7 @@ mod tests {
                 path: "mock:gpu-batch".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::Batch,
+                dynamic: false,
             })
             .expect("batch model should load")
             .with_mock_latency(Duration::from_millis(20)),
@@ -2073,6 +2155,7 @@ mod tests {
                 path: "mock:gpu-bot".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
+                dynamic: false,
             })
             .expect("realtime model should load")
             .with_mock_latency(Duration::from_millis(20)),
@@ -2136,12 +2219,14 @@ mod tests {
                 path: "mock:llama3".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
+                dynamic: false,
             },
             IntegrityModelBinding {
                 alias: "tiny".to_owned(),
                 path: "mock:tiny".to_owned(),
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Batch,
+                dynamic: false,
             },
         ];
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
@@ -2192,6 +2277,7 @@ mod tests {
             path: "mock:llama3".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
+            dynamic: false,
         }];
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![route],
@@ -2222,24 +2308,28 @@ mod tests {
                 path: "mock:cpu-bert".to_owned(),
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Standard,
+                dynamic: false,
             },
             IntegrityModelBinding {
                 alias: "gpu-llama".to_owned(),
                 path: "mock:gpu-llama".to_owned(),
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
+                dynamic: false,
             },
             IntegrityModelBinding {
                 alias: "npu-whisper".to_owned(),
                 path: "mock:npu-whisper".to_owned(),
                 device: ModelDevice::Npu,
                 qos: RouteQos::RealTime,
+                dynamic: false,
             },
             IntegrityModelBinding {
                 alias: "tpu-embed".to_owned(),
                 path: "mock:tpu-embed".to_owned(),
                 device: ModelDevice::Tpu,
                 qos: RouteQos::Batch,
+                dynamic: false,
             },
         ];
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
@@ -2410,6 +2500,7 @@ mod tests {
             path: format!("mock:{alias}"),
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
+            dynamic: false,
         }];
         IntegrityConfig {
             routes: vec![route],
@@ -2424,6 +2515,7 @@ mod tests {
             path: path.to_string_lossy().into_owned(),
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
+            dynamic: false,
         }];
         IntegrityConfig {
             routes: vec![route],

@@ -636,11 +636,21 @@ pub(crate) struct IntegrityBatchTarget {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) struct IntegrityModelBinding {
     pub(crate) alias: String,
+    /// Filesystem path to the model. Required for static bindings; ignored for
+    /// `dynamic` bindings, which load from `{tachyon_data}/models/{alias}`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) path: String,
     #[serde(default, skip_serializing_if = "is_default_model_device")]
     pub(crate) device: ModelDevice,
     #[serde(default, skip_serializing_if = "is_default_route_qos")]
     pub(crate) qos: RouteQos,
+    /// When true, the alias is sealed (authorised for the route) but the model
+    /// files are NOT eager-loaded at boot. They arrive later via a broker upload
+    /// and are lazily materialised from `{tachyon_data}/models/{alias}` on first
+    /// use. Static bindings (the default) are eager-loaded and fail fast at boot
+    /// if their `path` is missing or invalid.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) dynamic: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
