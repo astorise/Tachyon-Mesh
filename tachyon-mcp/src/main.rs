@@ -284,6 +284,7 @@ impl McpContext {
 fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<Vec<String>> {
     let required: &[&str] = match tool_name {
         "tachyon_import_package" => &["package_path"],
+        "tachyon_upload_model" => &["path"],
         "tachyon_deploy_function" => &["function_name", "artifact_path"],
         "tachyon_delete_function" => &["function_name"],
         "tachyon_function_logs" => &["function_name"],
@@ -331,6 +332,8 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         // Deployment / deletion mutators — moderate budget.
         "tachyon_apply_manifest" | "tachyon_seal_overlay" | "tachyon_set_route_scopes" => 1,
         "tachyon_import_package" => 3,
+        // Model uploads are large and hash-verified — keep the budget tight.
+        "tachyon_upload_model" => 3,
         "tachyon_deploy_function" | "tachyon_delete_function" => 5,
         "tachyon_register_resource" => 10,
         // KV mutators and log fetches — generous but bounded.
@@ -995,6 +998,17 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                             "max_latency_ms": { "type": "integer", "minimum": 1, "description": "Optional p99 latency budget in milliseconds; influences whether unrestricted mode is recommended." }
                         }
                     }
+                },
+                {
+                    "name": "tachyon_upload_model",
+                    "description": "Upload a local AI model to the cluster via the model broker. Point `path` at a complete model directory (weights plus tokenizer.json, and config.json for safetensors) or a single self-contained file on the MCP host machine. The directory is tar+gzip compressed on the fly during upload — no pre-built archive needed — and verified by hash on commit. On success the model is registered automatically and appears in the model list (/v1/models); the alias is derived from the directory/file name.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": { "type": "string", "description": "Absolute local path to the model directory (or single file) on the MCP host machine (e.g. '/home/user/models/tinyllama-1.1b')." }
+                        }
+                    }
                 }
             ]
             });
@@ -1162,6 +1176,25 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                         "text": format!(
                             "Registered `{name}` in workspace overlay. Pending CLI re-seal of integrity.lock to take effect.\n\n{body}",
                             name = resource.name,
+                        )
+                    }
+                ]
+            }))
+        }
+        "tachyon_upload_model" => {
+            let path = params
+                .and_then(|value| value.get("arguments"))
+                .and_then(|args| args.get("path"))
+                .and_then(|value| value.as_str())
+                .context("`tachyon_upload_model` requires a string `path` argument")?
+                .to_owned();
+            let model_path = tachyon_client::push_large_model(&path).await?;
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": format!(
+                            "Uploaded model from `{path}`. The broker is unpacking and registering it; it will appear in the model list (/v1/models).\n\nServer model path: {model_path}"
                         )
                     }
                 ]
