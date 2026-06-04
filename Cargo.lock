@@ -7797,7 +7797,7 @@ dependencies = [
  "const-oid 0.9.6",
  "der",
  "ed25519-dalek",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "hex",
  "p256",
  "pkcs8",
