@@ -5,24 +5,30 @@ use std::{
     sync::Arc,
 };
 
-use candle_core::{safetensors, DType, Device, Tensor};
-use candle_nn::{Embedding, LayerNorm, Linear, Module, VarBuilder};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig, LlamaEosToks};
 use serde::Deserialize;
 use thiserror::Error;
 use tokenizers::Tokenizer;
 
-pub(crate) const TACHYON_TINY_MODEL_TYPE: &str = "tachyon_tiny_causal_lm";
-pub(crate) const TACHYON_TINY_ARCHITECTURE: &str = "TachyonTinyCausalLM";
+/// HF `model_type` of the only architecture family currently executed. Real,
+/// uploaded Llama-family checkpoints (Llama 2/3, TinyLlama, Vicuna, …) carry
+/// this value in their `config.json`.
+pub(crate) const LLAMA_MODEL_TYPE: &str = "llama";
 
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
 const MODEL_SAFETENSORS: &str = "model.safetensors";
-const DEFAULT_MAX_NEW_TOKENS: usize = 1;
-const HOST_MAX_NEW_TOKENS: usize = 64;
-const DEFAULT_MAX_PROMPT_BYTES: usize = 4096;
-const DEFAULT_MAX_PROMPT_TOKENS: usize = 1024;
+const SAFETENSORS_INDEX_JSON: &str = "model.safetensors.index.json";
+const DEFAULT_MAX_NEW_TOKENS: usize = 64;
+/// Hard upper bound on `max_new_tokens` for any single request, regardless of
+/// what the caller asks for. Protects the host from unbounded decode loops.
+pub(crate) const HOST_MAX_NEW_TOKENS: usize = 256;
+/// Hard upper bound on the raw prompt size (bytes) accepted before tokenization.
+pub(crate) const DEFAULT_MAX_PROMPT_BYTES: usize = 16_384;
+const DEFAULT_MAX_PROMPT_TOKENS: usize = 4_096;
 const DEFAULT_MAX_BATCH_SIZE: usize = 32;
-const LAYER_NORM_EPS: f64 = 1e-5;
 
 #[derive(Debug, Error)]
 pub(crate) enum CandleLlmError {
@@ -51,39 +57,65 @@ pub(crate) enum CandleLlmError {
     Execution { alias: String, detail: String },
 }
 
+/// A loaded, ready-to-run Llama-family model. The weights are mmapped from the
+/// model directory (never copied into the Tachyon artifact); this struct is
+/// shared behind an `Arc` so the runtime stays cheap to clone.
+struct LoadedModel {
+    model: Llama,
+    config: Config,
+    eos_tokens: Vec<u32>,
+}
+
+/// Runtime guardrails applied to every generation request. Independent of the
+/// model weights (the HF config only contributes the context window).
+#[derive(Clone, Copy)]
+struct GenerationLimits {
+    default_max_new_tokens: usize,
+    max_prompt_bytes: usize,
+    max_prompt_tokens: usize,
+    max_batch_size: usize,
+    max_position_embeddings: usize,
+}
+
+impl GenerationLimits {
+    fn for_config(config: &Config) -> Self {
+        Self {
+            default_max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+            max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
+            max_prompt_tokens: DEFAULT_MAX_PROMPT_TOKENS,
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            max_position_embeddings: config.max_position_embeddings,
+        }
+    }
+}
+
+impl std::fmt::Debug for CandleLlmRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandleLlmRuntime")
+            .field("alias", &self.alias)
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CandleLlmRuntime {
     alias: String,
     root: PathBuf,
     tokenizer: Tokenizer,
-    config: CandleLlmConfig,
-    model: Arc<TachyonTinyModel>,
+    inner: Arc<LoadedModel>,
+    limits: GenerationLimits,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct CandleLlmConfig {
-    model_type: String,
+#[derive(Debug, Deserialize)]
+struct ModelTypeProbe {
     #[serde(default)]
-    architectures: Vec<String>,
-    vocab_size: usize,
-    #[serde(default = "default_hidden_size")]
-    hidden_size: usize,
-    #[serde(default = "default_num_hidden_layers")]
-    num_hidden_layers: usize,
-    #[serde(default = "default_num_attention_heads")]
-    num_attention_heads: usize,
-    #[serde(default = "default_intermediate_size")]
-    intermediate_size: usize,
-    #[serde(default = "default_max_position_embeddings")]
-    max_position_embeddings: usize,
-    #[serde(default = "default_max_new_tokens")]
-    default_max_new_tokens: usize,
-    #[serde(default = "default_max_prompt_bytes")]
-    max_prompt_bytes: usize,
-    #[serde(default = "default_max_prompt_tokens")]
-    max_prompt_tokens: usize,
-    #[serde(default = "default_max_batch_size")]
-    max_batch_size: usize,
+    model_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SafetensorsIndex {
+    weight_map: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +146,8 @@ impl CandleLlmRuntime {
 
         let has_config = root.join(CONFIG_JSON).exists();
         let has_tokenizer = root.join(TOKENIZER_JSON).exists();
-        let has_weights = root.join(MODEL_SAFETENSORS).exists();
+        let has_weights =
+            root.join(MODEL_SAFETENSORS).exists() || root.join(SAFETENSORS_INDEX_JSON).exists();
         if !(has_config || has_tokenizer || has_weights) {
             return Ok(None);
         }
@@ -130,19 +163,28 @@ impl CandleLlmRuntime {
             return Ok(None);
         }
 
-        let config = load_config(alias, root)?;
-        if config.model_type != TACHYON_TINY_MODEL_TYPE
-            || !config
-                .architectures
-                .iter()
-                .any(|name| name == TACHYON_TINY_ARCHITECTURE)
-        {
+        let raw_config =
+            fs::read(root.join(CONFIG_JSON)).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            })?;
+        let probe: ModelTypeProbe = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        if probe.model_type != LLAMA_MODEL_TYPE {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
                 detail: format!(
-                    "expected model_type `{}` with architecture `{}`",
-                    TACHYON_TINY_MODEL_TYPE, TACHYON_TINY_ARCHITECTURE
+                    "expected a Llama-family checkpoint (`model_type` = `{LLAMA_MODEL_TYPE}`), got `{}`",
+                    probe.model_type
                 ),
             });
         }
@@ -152,7 +194,7 @@ impl CandleLlmRuntime {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
                 detail: format!(
-                    "the first Candle LLM runtime supports `cpu` execution only, got `{requested_device}`"
+                    "the Candle LLM runtime supports `cpu` execution only, got `{requested_device}`"
                 ),
             });
         }
@@ -181,23 +223,49 @@ impl CandleLlmRuntime {
             }
         })?;
 
-        let tensors =
-            safetensors::load(root.join(MODEL_SAFETENSORS), &Device::Cpu).map_err(|error| {
-                CandleLlmError::InvalidComponent {
+        let llama_config: LlamaConfig = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        let config = llama_config.into_config(false);
+        let limits = GenerationLimits::for_config(&config);
+        let eos_tokens = eos_token_ids(&config);
+
+        let weight_paths = safetensors_paths(alias, root)?;
+        let device = Device::Cpu;
+        // SAFETY: the model files live in the (uploaded) model directory and are
+        // not mutated for the lifetime of the mmap held by the VarBuilder/model.
+        let var_builder =
+            unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &device) }
+                .map_err(|error| CandleLlmError::InvalidComponent {
                     alias: alias.to_owned(),
                     path: root.to_path_buf(),
                     component: MODEL_SAFETENSORS,
                     detail: error.to_string(),
-                }
-            })?;
-        let model = build_model(alias, root, &config, tensors)?;
+                })?;
+        let model = Llama::load(var_builder, &config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            }
+        })?;
 
         Ok(Some(Self {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
             tokenizer,
-            config,
-            model: Arc::new(model),
+            inner: Arc::new(LoadedModel {
+                model,
+                config,
+                eos_tokens,
+            }),
+            limits,
         }))
     }
 
@@ -208,13 +276,13 @@ impl CandleLlmRuntime {
                 detail: "at least one U8 prompt tensor is required".to_owned(),
             });
         }
-        if prompts.len() > self.config.max_batch_size {
+        if prompts.len() > self.limits.max_batch_size {
             return Err(CandleLlmError::InvalidRequest {
                 alias: self.alias.clone(),
                 detail: format!(
                     "batch size {} exceeds max batch size {}",
                     prompts.len(),
-                    self.config.max_batch_size
+                    self.limits.max_batch_size
                 ),
             });
         }
@@ -230,10 +298,6 @@ impl CandleLlmRuntime {
                 detail: "at least one U8 prompt tensor is required".to_owned(),
             })?;
 
-        // Real autoregressive decode: the prompt tokens flow through the
-        // transformer, and each step appends the greedily-argmaxed next token to
-        // the running context before recomputing — so the output is a genuine
-        // function of the prompt, not a static lookup.
         let prompt_ids = self.encode_ids(&request.prompt)?;
         if prompt_ids.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
@@ -241,30 +305,8 @@ impl CandleLlmRuntime {
                 detail: "prompt produced no tokens to condition on".to_owned(),
             });
         }
-        let mut context = prompt_ids;
-        let mut generated = Vec::with_capacity(request.max_new_tokens);
-        for _ in 0..request.max_new_tokens {
-            if context.len() >= self.config.max_position_embeddings {
-                break;
-            }
-            let logits =
-                self.model
-                    .forward(&context)
-                    .map_err(|error| CandleLlmError::Execution {
-                        alias: self.alias.clone(),
-                        detail: format!("transformer forward pass failed: {error}"),
-                    })?;
-            let next = logits
-                .argmax(0)
-                .and_then(|id| id.to_vec0::<u32>())
-                .map_err(|error| CandleLlmError::Execution {
-                    alias: self.alias.clone(),
-                    detail: format!("failed to sample greedy token with Candle: {error}"),
-                })?;
-            generated.push(next);
-            context.push(next);
-        }
 
+        let generated = self.decode_greedy(&prompt_ids, request.max_new_tokens)?;
         let text =
             self.tokenizer
                 .decode(&generated, true)
@@ -279,16 +321,73 @@ impl CandleLlmRuntime {
         &self.root
     }
 
-    /// Test-only: the vocabulary logits the transformer produces for the final
-    /// position of `prompt`. Used to prove that generation is a genuine function
-    /// of the prompt (different prompts -> different logits), not a static lookup.
-    #[cfg(test)]
-    pub(crate) fn debug_last_logits(&self, prompt: &str) -> Vec<f32> {
-        let ids = self.encode_ids(prompt).expect("prompt should tokenize");
-        let logits = self.model.forward(&ids).expect("forward pass should run");
+    /// Greedy autoregressive decode through the real Llama forward, reusing a
+    /// fresh KV cache per request: the prompt is processed once, then each new
+    /// token is fed back in with the running `index_pos`.
+    fn decode_greedy(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+    ) -> Result<Vec<u32>, CandleLlmError> {
+        let device = Device::Cpu;
+        let mut cache = Cache::new(true, DType::F32, &self.inner.config, &device)
+            .map_err(|error| self.execution_error(format!("failed to build KV cache: {error}")))?;
+        let mut tokens = prompt_ids.to_vec();
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut index_pos = 0usize;
+        for step in 0..max_new_tokens {
+            let context: &[u32] = if step == 0 {
+                &tokens
+            } else {
+                &tokens[tokens.len() - 1..]
+            };
+            if index_pos + context.len() > self.limits.max_position_embeddings {
+                break;
+            }
+            let next = self.forward_argmax(context, index_pos, &mut cache)?;
+            index_pos += context.len();
+            tokens.push(next);
+            generated.push(next);
+            if self.inner.eos_tokens.contains(&next) {
+                break;
+            }
+        }
+        Ok(generated)
+    }
+
+    /// Run one forward step over `context` and greedily pick the next token id.
+    fn forward_argmax(
+        &self,
+        context: &[u32],
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<u32, CandleLlmError> {
+        let input = Tensor::new(context, &Device::Cpu)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .map_err(|error| {
+                self.execution_error(format!("failed to build input tensor: {error}"))
+            })?;
+        let logits = self
+            .inner
+            .model
+            .forward(&input, index_pos, cache)
+            .map_err(|error| {
+                self.execution_error(format!("transformer forward pass failed: {error}"))
+            })?;
         logits
-            .to_vec1::<f32>()
-            .expect("last-position logits should be an f32 vector")
+            .squeeze(0)
+            .and_then(|row| row.argmax(0))
+            .and_then(|id| id.to_vec0::<u32>())
+            .map_err(|error| {
+                self.execution_error(format!("failed to sample greedy token: {error}"))
+            })
+    }
+
+    fn execution_error(&self, detail: String) -> CandleLlmError {
+        CandleLlmError::Execution {
+            alias: self.alias.clone(),
+            detail,
+        }
     }
 
     fn encode_ids(&self, prompt: &str) -> Result<Vec<u32>, CandleLlmError> {
@@ -301,14 +400,36 @@ impl CandleLlmRuntime {
             })
     }
 
+    /// Test-only: the vocabulary logits the model produces for the final
+    /// position of `prompt`. Used to prove generation is prompt-dependent.
+    #[cfg(test)]
+    pub(crate) fn debug_last_logits(&self, prompt: &str) -> Vec<f32> {
+        let ids = self.encode_ids(prompt).expect("prompt should tokenize");
+        let device = Device::Cpu;
+        let mut cache =
+            Cache::new(true, DType::F32, &self.inner.config, &device).expect("cache should build");
+        let input = Tensor::new(ids.as_slice(), &device)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .expect("input tensor should build");
+        let logits = self
+            .inner
+            .model
+            .forward(&input, 0, &mut cache)
+            .expect("forward pass should run");
+        logits
+            .squeeze(0)
+            .and_then(|row| row.to_vec1::<f32>())
+            .expect("logits should be an f32 vector")
+    }
+
     fn parse_request(&self, data: &[u8]) -> Result<ParsedGenerationRequest, CandleLlmError> {
-        if data.len() > self.config.max_prompt_bytes {
+        if data.len() > self.limits.max_prompt_bytes {
             return Err(CandleLlmError::InvalidRequest {
                 alias: self.alias.clone(),
                 detail: format!(
                     "prompt bytes {} exceed limit {}",
                     data.len(),
-                    self.config.max_prompt_bytes
+                    self.limits.max_prompt_bytes
                 ),
             });
         }
@@ -328,14 +449,14 @@ impl CandleLlmRuntime {
                 prompt: request.prompt,
                 max_new_tokens: request
                     .max_new_tokens
-                    .unwrap_or(self.config.default_max_new_tokens),
+                    .unwrap_or(self.limits.default_max_new_tokens),
                 _temperature: request.temperature,
                 _seed: request.seed,
             }
         } else {
             ParsedGenerationRequest {
                 prompt: raw.to_owned(),
-                max_new_tokens: self.config.default_max_new_tokens,
+                max_new_tokens: self.limits.default_max_new_tokens,
                 _temperature: None,
                 _seed: None,
             }
@@ -357,16 +478,16 @@ impl CandleLlmRuntime {
                 alias: self.alias.clone(),
                 detail: format!("failed to tokenize prompt: {error}"),
             })?;
-        if encoded.len() > self.config.max_prompt_tokens
-            || encoded.len() > self.config.max_position_embeddings
+        if encoded.len() > self.limits.max_prompt_tokens
+            || encoded.len() > self.limits.max_position_embeddings
         {
             return Err(CandleLlmError::InvalidRequest {
                 alias: self.alias.clone(),
                 detail: format!(
                     "prompt tokens {} exceed token limit {} and context limit {}",
                     encoded.len(),
-                    self.config.max_prompt_tokens,
-                    self.config.max_position_embeddings
+                    self.limits.max_prompt_tokens,
+                    self.limits.max_position_embeddings
                 ),
             });
         }
@@ -375,242 +496,40 @@ impl CandleLlmRuntime {
     }
 }
 
-/// A minimal but genuine decoder-only transformer (`TachyonTinyCausalLM`):
-/// token + learned positional embeddings, `num_hidden_layers` pre-norm blocks of
-/// causal multi-head self-attention and a GELU MLP, a final layer norm, and an
-/// untied `lm_head`. Built from `model.safetensors` via `VarBuilder` and run on
-/// CPU in F32.
-struct TachyonTinyModel {
-    wte: Embedding,
-    wpe: Embedding,
-    blocks: Vec<TransformerBlock>,
-    ln_f: LayerNorm,
-    lm_head: Linear,
-    num_heads: usize,
-    head_dim: usize,
-}
-
-impl TachyonTinyModel {
-    fn load(vb: &VarBuilder, config: &CandleLlmConfig) -> candle_core::Result<Self> {
-        let hidden = config.hidden_size;
-        let wte = candle_nn::embedding(config.vocab_size, hidden, vb.pp("wte"))?;
-        let wpe = candle_nn::embedding(config.max_position_embeddings, hidden, vb.pp("wpe"))?;
-        let layers = vb.pp("layers");
-        let mut blocks = Vec::with_capacity(config.num_hidden_layers);
-        for index in 0..config.num_hidden_layers {
-            blocks.push(TransformerBlock::load(&layers.pp(index), config)?);
-        }
-        let ln_f = candle_nn::layer_norm(hidden, LAYER_NORM_EPS, vb.pp("ln_f"))?;
-        let lm_head = candle_nn::linear_no_bias(hidden, config.vocab_size, vb.pp("lm_head"))?;
-        Ok(Self {
-            wte,
-            wpe,
-            blocks,
-            ln_f,
-            lm_head,
-            num_heads: config.num_attention_heads,
-            head_dim: hidden / config.num_attention_heads,
-        })
-    }
-
-    /// Forward the full token context and return the logits over the vocabulary
-    /// for the final position only (`[vocab_size]`), which greedy decode argmaxes.
-    fn forward(&self, ids: &[u32]) -> candle_core::Result<Tensor> {
-        let device = Device::Cpu;
-        let seq = ids.len();
-        let token_ids = Tensor::from_vec(ids.to_vec(), (seq,), &device)?;
-        let position_ids =
-            Tensor::from_vec((0..seq as u32).collect::<Vec<u32>>(), (seq,), &device)?;
-        // hidden states: token embedding + learned positional embedding.
-        let mut hidden = self
-            .wte
-            .forward(&token_ids)?
-            .broadcast_add(&self.wpe.forward(&position_ids)?)?;
-        let mask = causal_mask(seq, &device)?;
-        for block in &self.blocks {
-            hidden = block.forward(&hidden, &mask, self.num_heads, self.head_dim)?;
-        }
-        let hidden = self.ln_f.forward(&hidden)?;
-        let logits = self.lm_head.forward(&hidden)?; // [seq, vocab]
-        logits.narrow(0, seq - 1, 1)?.squeeze(0)
+/// Collect the model's end-of-sequence token id(s), if any, into a flat list.
+fn eos_token_ids(config: &Config) -> Vec<u32> {
+    match &config.eos_token_id {
+        Some(LlamaEosToks::Single(id)) => vec![*id],
+        Some(LlamaEosToks::Multiple(ids)) => ids.clone(),
+        None => Vec::new(),
     }
 }
 
-/// One pre-norm transformer decoder block.
-struct TransformerBlock {
-    ln1: LayerNorm,
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
-    ln2: LayerNorm,
-    fc: Linear,
-    proj: Linear,
-}
-
-impl TransformerBlock {
-    fn load(vb: &VarBuilder, config: &CandleLlmConfig) -> candle_core::Result<Self> {
-        let hidden = config.hidden_size;
-        let attn = vb.pp("attn");
-        let mlp = vb.pp("mlp");
-        Ok(Self {
-            ln1: candle_nn::layer_norm(hidden, LAYER_NORM_EPS, vb.pp("ln1"))?,
-            q: candle_nn::linear(hidden, hidden, attn.pp("q"))?,
-            k: candle_nn::linear(hidden, hidden, attn.pp("k"))?,
-            v: candle_nn::linear(hidden, hidden, attn.pp("v"))?,
-            o: candle_nn::linear(hidden, hidden, attn.pp("o"))?,
-            ln2: candle_nn::layer_norm(hidden, LAYER_NORM_EPS, vb.pp("ln2"))?,
-            fc: candle_nn::linear(hidden, config.intermediate_size, mlp.pp("fc"))?,
-            proj: candle_nn::linear(config.intermediate_size, hidden, mlp.pp("proj"))?,
-        })
-    }
-
-    fn forward(
-        &self,
-        hidden: &Tensor,
-        mask: &Tensor,
-        num_heads: usize,
-        head_dim: usize,
-    ) -> candle_core::Result<Tensor> {
-        let attention = self.attention(&self.ln1.forward(hidden)?, mask, num_heads, head_dim)?;
-        let hidden = hidden.broadcast_add(&attention)?;
-        let mlp = self.mlp(&self.ln2.forward(&hidden)?)?;
-        hidden.broadcast_add(&mlp)
-    }
-
-    fn attention(
-        &self,
-        x: &Tensor,
-        mask: &Tensor,
-        num_heads: usize,
-        head_dim: usize,
-    ) -> candle_core::Result<Tensor> {
-        let seq = x.dim(0)?;
-        // Project and split into heads: [seq, hidden] -> [num_heads, seq, head_dim].
-        let q = split_heads(&self.q.forward(x)?, seq, num_heads, head_dim)?;
-        let k = split_heads(&self.k.forward(x)?, seq, num_heads, head_dim)?;
-        let v = split_heads(&self.v.forward(x)?, seq, num_heads, head_dim)?;
-        // Scaled dot-product attention with a causal mask, per head.
-        let scores = q
-            .matmul(&k.transpose(1, 2)?)?
-            .affine(1.0 / (head_dim as f64).sqrt(), 0.0)?
-            .broadcast_add(mask)?;
-        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
-        let context = weights.matmul(&v)?; // [num_heads, seq, head_dim]
-                                           // Merge heads back: [num_heads, seq, head_dim] -> [seq, hidden].
-        let merged = context
-            .transpose(0, 1)?
-            .contiguous()?
-            .reshape((seq, num_heads * head_dim))?;
-        self.o.forward(&merged)
-    }
-
-    fn mlp(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let hidden = self.fc.forward(x)?.gelu()?;
-        self.proj.forward(&hidden)
-    }
-}
-
-fn split_heads(
-    x: &Tensor,
-    seq: usize,
-    num_heads: usize,
-    head_dim: usize,
-) -> candle_core::Result<Tensor> {
-    x.reshape((seq, num_heads, head_dim))?
-        .transpose(0, 1)?
-        .contiguous()
-}
-
-/// Additive causal mask `[seq, seq]`: `0` where a query may attend (`j <= i`) and
-/// `-inf` for future positions (`j > i`), applied before the softmax.
-fn causal_mask(seq: usize, device: &Device) -> candle_core::Result<Tensor> {
-    let mut data = vec![0f32; seq * seq];
-    for i in 0..seq {
-        for value in data.iter_mut().skip(i * seq + i + 1).take(seq - i - 1) {
-            *value = f32::NEG_INFINITY;
-        }
-    }
-    Tensor::from_vec(data, (seq, seq), device)
-}
-
-fn build_model(
-    alias: &str,
-    root: &Path,
-    config: &CandleLlmConfig,
-    tensors: HashMap<String, Tensor>,
-) -> Result<TachyonTinyModel, CandleLlmError> {
-    let invalid = |detail: String| CandleLlmError::InvalidComponent {
-        alias: alias.to_owned(),
-        path: root.to_path_buf(),
-        component: MODEL_SAFETENSORS,
-        detail,
-    };
-    if config.hidden_size == 0
-        || config.num_attention_heads == 0
-        || !config.hidden_size.is_multiple_of(config.num_attention_heads)
-    {
-        return Err(invalid(format!(
-            "hidden_size {} must be a non-zero multiple of num_attention_heads {}",
-            config.hidden_size, config.num_attention_heads
-        )));
-    }
-    let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
-    TachyonTinyModel::load(&vb, config).map_err(|error| invalid(error.to_string()))
-}
-
-fn load_config(alias: &str, root: &Path) -> Result<CandleLlmConfig, CandleLlmError> {
-    let path = root.join(CONFIG_JSON);
-    let data = fs::read(&path).map_err(|error| CandleLlmError::InvalidComponent {
-        alias: alias.to_owned(),
-        path: root.to_path_buf(),
-        component: CONFIG_JSON,
-        detail: error.to_string(),
-    })?;
-    serde_json::from_slice::<CandleLlmConfig>(&data).map_err(|error| {
-        CandleLlmError::InvalidComponent {
+/// Resolve the safetensors shard paths for a model directory: the HF index when
+/// the checkpoint is sharded, otherwise the single `model.safetensors`.
+fn safetensors_paths(alias: &str, root: &Path) -> Result<Vec<PathBuf>, CandleLlmError> {
+    let index = root.join(SAFETENSORS_INDEX_JSON);
+    if index.exists() {
+        let raw = fs::read(&index).map_err(|error| CandleLlmError::InvalidComponent {
             alias: alias.to_owned(),
             path: root.to_path_buf(),
-            component: CONFIG_JSON,
+            component: "model.safetensors.index.json",
             detail: error.to_string(),
-        }
-    })
-}
-
-fn default_hidden_size() -> usize {
-    64
-}
-
-fn default_num_hidden_layers() -> usize {
-    2
-}
-
-fn default_num_attention_heads() -> usize {
-    4
-}
-
-fn default_intermediate_size() -> usize {
-    128
-}
-
-fn default_max_position_embeddings() -> usize {
-    DEFAULT_MAX_PROMPT_TOKENS
-}
-
-fn default_max_new_tokens() -> usize {
-    DEFAULT_MAX_NEW_TOKENS
-}
-
-fn default_max_prompt_bytes() -> usize {
-    DEFAULT_MAX_PROMPT_BYTES
-}
-
-fn default_max_prompt_tokens() -> usize {
-    DEFAULT_MAX_PROMPT_TOKENS
-}
-
-fn default_max_batch_size() -> usize {
-    DEFAULT_MAX_BATCH_SIZE
+        })?;
+        let parsed: SafetensorsIndex =
+            serde_json::from_slice(&raw).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: "model.safetensors.index.json",
+                detail: error.to_string(),
+            })?;
+        let mut shards: Vec<String> = parsed.weight_map.into_values().collect();
+        shards.sort();
+        shards.dedup();
+        Ok(shards.into_iter().map(|shard| root.join(shard)).collect())
+    } else {
+        Ok(vec![root.join(MODEL_SAFETENSORS)])
+    }
 }
 
 #[cfg(test)]
@@ -624,26 +543,31 @@ pub(crate) const FIXTURE_INTERMEDIATE_SIZE: usize = 16;
 #[cfg(test)]
 pub(crate) const FIXTURE_VOCAB_SIZE: usize = 4;
 #[cfg(test)]
-pub(crate) const FIXTURE_MAX_POSITION_EMBEDDINGS: usize = 16;
+pub(crate) const FIXTURE_MAX_POSITION_EMBEDDINGS: usize = 32;
 
+/// Write a complete, deterministic tiny **Llama** checkpoint (HF layout:
+/// `config.json` + `tokenizer.json` + `model.safetensors`) so tests exercise the
+/// real candle-transformers Llama forward without downloading a multi-GB model.
 #[cfg(test)]
 pub(crate) fn write_tachyon_tiny_fixture(root: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(root)?;
     fs::write(
         root.join(CONFIG_JSON),
         serde_json::json!({
-            "model_type": TACHYON_TINY_MODEL_TYPE,
-            "architectures": [TACHYON_TINY_ARCHITECTURE],
-            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "model_type": LLAMA_MODEL_TYPE,
+            "architectures": ["LlamaForCausalLM"],
             "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
             "num_hidden_layers": FIXTURE_NUM_LAYERS,
             "num_attention_heads": FIXTURE_NUM_HEADS,
-            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
             "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
-            "default_max_new_tokens": 1,
-            "max_prompt_bytes": 128,
-            "max_prompt_tokens": 16,
-            "max_batch_size": 32
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null
         })
         .to_string(),
     )?;
@@ -665,19 +589,23 @@ pub(crate) fn write_tachyon_tiny_fixture(root: &Path) -> anyhow::Result<()> {
   }
 }"#,
     )?;
-    safetensors::save(&fixture_weights()?, root.join(MODEL_SAFETENSORS))?;
+    candle_core::safetensors::save(&fixture_weights()?, root.join(MODEL_SAFETENSORS))?;
     Ok(())
 }
 
-/// Build a complete, deterministic, non-degenerate weight set for the fixture
-/// model so tests exercise a real forward pass (not random per-run).
+/// Deterministic, non-degenerate weights for the fixture, in the Llama tensor
+/// layout candle-transformers expects (all `*.weight`, no biases; RMSNorm scales
+/// are 1.0 so normalization is well-conditioned).
 #[cfg(test)]
 fn fixture_weights() -> anyhow::Result<HashMap<String, Tensor>> {
     let hidden = FIXTURE_HIDDEN_SIZE;
     let inter = FIXTURE_INTERMEDIATE_SIZE;
+    let head_dim = hidden / FIXTURE_NUM_HEADS;
+    let q = FIXTURE_NUM_HEADS * head_dim;
+    let kv = FIXTURE_NUM_HEADS * head_dim;
     let mut tensors = HashMap::new();
     let mut seed = 1u64;
-    let mut weight =
+    let mut dense =
         |tensors: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]| -> anyhow::Result<()> {
             let len: usize = dims.iter().product();
             let values = deterministic_fill(seed, len);
@@ -688,66 +616,64 @@ fn fixture_weights() -> anyhow::Result<HashMap<String, Tensor>> {
             );
             Ok(())
         };
-    let ones = |tensors: &mut HashMap<String, Tensor>, name: &str| -> anyhow::Result<()> {
+    let norm = |tensors: &mut HashMap<String, Tensor>, name: &str| -> anyhow::Result<()> {
         tensors.insert(
             name.to_owned(),
             Tensor::from_vec(vec![1f32; hidden], (hidden,), &Device::Cpu)?,
         );
         Ok(())
     };
-    let zeros =
-        |tensors: &mut HashMap<String, Tensor>, name: &str, len: usize| -> anyhow::Result<()> {
-            tensors.insert(
-                name.to_owned(),
-                Tensor::from_vec(vec![0f32; len], (len,), &Device::Cpu)?,
-            );
-            Ok(())
-        };
 
-    weight(&mut tensors, "wte.weight", &[FIXTURE_VOCAB_SIZE, hidden])?;
-    weight(
+    dense(
         &mut tensors,
-        "wpe.weight",
-        &[FIXTURE_MAX_POSITION_EMBEDDINGS, hidden],
+        "model.embed_tokens.weight",
+        &[FIXTURE_VOCAB_SIZE, hidden],
     )?;
     for layer in 0..FIXTURE_NUM_LAYERS {
-        // LayerNorm: unit scale, zero shift (degenerate-safe).
-        ones(&mut tensors, &format!("layers.{layer}.ln1.weight"))?;
-        zeros(&mut tensors, &format!("layers.{layer}.ln1.bias"), hidden)?;
-        ones(&mut tensors, &format!("layers.{layer}.ln2.weight"))?;
-        zeros(&mut tensors, &format!("layers.{layer}.ln2.bias"), hidden)?;
-        for proj in ["q", "k", "v", "o"] {
-            weight(
-                &mut tensors,
-                &format!("layers.{layer}.attn.{proj}.weight"),
-                &[hidden, hidden],
-            )?;
-            zeros(
-                &mut tensors,
-                &format!("layers.{layer}.attn.{proj}.bias"),
-                hidden,
-            )?;
-        }
-        weight(
+        let prefix = format!("model.layers.{layer}");
+        dense(
             &mut tensors,
-            &format!("layers.{layer}.mlp.fc.weight"),
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            &[q, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            &[kv, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            &[kv, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            &[hidden, q],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.mlp.gate_proj.weight"),
             &[inter, hidden],
         )?;
-        zeros(&mut tensors, &format!("layers.{layer}.mlp.fc.bias"), inter)?;
-        weight(
+        dense(
             &mut tensors,
-            &format!("layers.{layer}.mlp.proj.weight"),
+            &format!("{prefix}.mlp.up_proj.weight"),
+            &[inter, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.mlp.down_proj.weight"),
             &[hidden, inter],
         )?;
-        zeros(
+        norm(&mut tensors, &format!("{prefix}.input_layernorm.weight"))?;
+        norm(
             &mut tensors,
-            &format!("layers.{layer}.mlp.proj.bias"),
-            hidden,
+            &format!("{prefix}.post_attention_layernorm.weight"),
         )?;
     }
-    ones(&mut tensors, "ln_f.weight")?;
-    zeros(&mut tensors, "ln_f.bias", hidden)?;
-    weight(
+    norm(&mut tensors, "model.norm.weight")?;
+    dense(
         &mut tensors,
         "lm_head.weight",
         &[FIXTURE_VOCAB_SIZE, hidden],
@@ -756,8 +682,8 @@ fn fixture_weights() -> anyhow::Result<HashMap<String, Tensor>> {
 }
 
 /// Deterministic small weights in roughly `[-0.4, 0.4)`, distinct per element and
-/// per tensor (via `seed`), so the forward pass is well-conditioned and varies
-/// with the input rather than collapsing.
+/// per tensor (via `seed`), so the forward pass varies with the input rather than
+/// collapsing.
 #[cfg(test)]
 fn deterministic_fill(seed: u64, len: usize) -> Vec<f32> {
     (0..len)
@@ -783,22 +709,22 @@ mod tests {
             .expect("clock should be after the epoch")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "tachyon-candle-{tag}-{}-{nanos}",
+            "tachyon-llama-{tag}-{}-{nanos}",
             std::process::id()
         ));
         write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
         let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cpu")
             .expect("fixture should load without error")
-            .expect("fixture is a supported Candle LLM model");
+            .expect("fixture is a supported Llama model");
         (runtime, dir)
     }
 
     #[test]
-    fn generate_runs_a_real_forward_and_is_not_a_mock() {
+    fn generate_runs_a_real_llama_forward_and_is_not_a_mock() {
         let (runtime, dir) = load_fixture("real-forward");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
-            .expect("generation should run the transformer");
+            .expect("generation should run the Llama forward");
         let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
         assert!(
             !text.is_empty(),
@@ -836,27 +762,43 @@ mod tests {
     }
 
     #[test]
-    fn missing_weight_tensor_is_a_clear_error_not_a_panic() {
+    fn non_llama_model_type_is_rejected() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock should be after the epoch")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "tachyon-candle-missing-weight-{}-{nanos}",
+            "tachyon-llama-reject-{}-{nanos}",
             std::process::id()
         ));
-        write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
-        // Drop one required tensor, then re-save, so the model build fails cleanly.
-        let mut tensors = safetensors::load(dir.join(MODEL_SAFETENSORS), &Device::Cpu)
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            dir.join(CONFIG_JSON),
+            serde_json::json!({"model_type": "gpt2", "vocab_size": 4}).to_string(),
+        )
+        .expect("config");
+        fs::write(dir.join(TOKENIZER_JSON), b"{}").expect("tokenizer marker");
+        fs::write(dir.join(MODEL_SAFETENSORS), b"marker").expect("weights marker");
+
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu")
+            .expect_err("a non-Llama model_type must be rejected");
+        assert!(matches!(error, CandleLlmError::UnsupportedModel { .. }));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_weight_tensor_is_a_clear_error_not_a_panic() {
+        let (_runtime, dir) = load_fixture("missing-weight-base");
+        // Re-save the weights without lm_head.weight so Llama::load fails cleanly
+        // (its lm_head load propagates the error rather than panicking).
+        let mut tensors = candle_core::safetensors::load(dir.join(MODEL_SAFETENSORS), &Device::Cpu)
             .expect("fixture weights should load");
         tensors.remove("lm_head.weight");
-        safetensors::save(&tensors, dir.join(MODEL_SAFETENSORS))
+        candle_core::safetensors::save(&tensors, dir.join(MODEL_SAFETENSORS))
             .expect("trimmed weights should save");
 
-        let error = match CandleLlmRuntime::try_load("tiny", &dir, "cpu") {
-            Ok(_) => panic!("a model missing lm_head.weight must fail to load"),
-            Err(error) => error,
-        };
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu")
+            .expect_err("a model missing lm_head.weight must fail to load");
         assert!(matches!(error, CandleLlmError::InvalidComponent { .. }));
         let _ = fs::remove_dir_all(dir);
     }

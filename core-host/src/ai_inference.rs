@@ -1769,8 +1769,8 @@ mod tests {
         fs::write(
             model_dir.join("config.json"),
             serde_json::json!({
-                "model_type": candle_llm_runtime::TACHYON_TINY_MODEL_TYPE,
-                "architectures": [candle_llm_runtime::TACHYON_TINY_ARCHITECTURE],
+                "model_type": candle_llm_runtime::LLAMA_MODEL_TYPE,
+                "architectures": ["LlamaForCausalLM"],
                 "vocab_size": 4
             })
             .to_string(),
@@ -1819,7 +1819,7 @@ mod tests {
         };
         assert!(config_error.contains("bad-config"));
         assert!(config_error.contains(unsupported_dir.to_string_lossy().as_ref()));
-        assert!(config_error.contains(candle_llm_runtime::TACHYON_TINY_MODEL_TYPE));
+        assert!(config_error.contains(candle_llm_runtime::LLAMA_MODEL_TYPE));
 
         let weights_dir = unique_candle_llm_dir("invalid-weights");
         candle_llm_runtime::write_tachyon_tiny_fixture(&weights_dir)
@@ -1850,16 +1850,24 @@ mod tests {
             AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
                 .expect("runtime should load real Candle LLM fixture");
 
+        let over_cap = candle_llm_runtime::HOST_MAX_NEW_TOKENS + 1;
         let too_many_tokens = runtime
-            .compute_component_prompt("tiny", r#"{"prompt":"hello","max_new_tokens":65}"#)
+            .compute_component_prompt(
+                "tiny",
+                &format!(r#"{{"prompt":"hello","max_new_tokens":{over_cap}}}"#),
+            )
             .expect_err("generation cap should reject oversized request");
-        assert!(too_many_tokens.contains("max_new_tokens 65"));
+        assert!(too_many_tokens.contains(&format!("max_new_tokens {over_cap}")));
 
-        let long_prompt = "x".repeat(129);
+        let over_bytes = candle_llm_runtime::DEFAULT_MAX_PROMPT_BYTES + 1;
+        let long_prompt = "x".repeat(over_bytes);
         let prompt_error = runtime
             .compute_component_prompt("tiny", &long_prompt)
             .expect_err("prompt byte limit should reject oversized prompt");
-        assert!(prompt_error.contains("prompt bytes 129 exceed limit 128"));
+        assert!(prompt_error.contains(&format!(
+            "prompt bytes {over_bytes} exceed limit {}",
+            candle_llm_runtime::DEFAULT_MAX_PROMPT_BYTES
+        )));
         let _ = fs::remove_dir_all(model_dir);
     }
 
