@@ -52,6 +52,7 @@ pub fn split_jwt(token: &str) -> Result<(String, String, Vec<u8>), String> {
 mod tests {
     use super::*;
     use rsa::pkcs1v15::SigningKey as RsaSigningKey;
+    use rsa::rand_core::OsRng;
     use rsa::signature::{SignatureEncoding, Signer};
     use rsa::traits::PublicKeyParts;
     use rsa::RsaPrivateKey;
@@ -71,7 +72,7 @@ mod tests {
     fn rs256_round_trip_verifies_and_rejects_tampering() {
         // Generate a real RSA key, sign a JWT signing-input, then verify with the
         // public (n, e) exactly as a JWKS would publish them.
-        let mut rng = rand::thread_rng();
+        let mut rng = OsRng;
         let private = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
         let signing_key = RsaSigningKey::<Sha256>::new(private.clone());
 

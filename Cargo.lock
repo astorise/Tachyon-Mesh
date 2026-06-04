@@ -7968,7 +7968,7 @@ version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
- "rand 0.8.6",
+ "rand 0.10.1",
  "rsa",
  "serde",
  "serde_json",
