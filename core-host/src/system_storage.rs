@@ -62,6 +62,14 @@ fn model_broker_dir(manifest_path: &Path) -> PathBuf {
         .join("tachyon_data")
 }
 
+/// Host-side directory where `system-faas-model-broker` unpacks uploaded models
+/// (`{tachyon_data}/models/{alias}/`). The broker's preopened `.` maps to
+/// `model_broker_dir`, so this is exactly where it writes; the AI runtime reads
+/// the same path to lazily load uploaded checkpoints.
+pub(crate) fn model_broker_models_dir(manifest_path: &Path) -> PathBuf {
+    model_broker_dir(manifest_path).join("models")
+}
+
 pub(crate) fn is_asset_uri(value: &str) -> bool {
     value.starts_with(ASSET_URI_PREFIX)
 }

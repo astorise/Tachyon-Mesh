@@ -19,9 +19,10 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BinaryHeap, HashMap},
     fs,
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -199,7 +200,15 @@ trait BackendModel: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct AiInferenceRuntime {
     schedulers: HashMap<AcceleratorKind, AcceleratorScheduler>,
-    models: HashMap<String, Arc<CandleModel>>,
+    /// Loaded models, keyed by alias. Behind an `Arc<RwLock<_>>` so broker-uploaded
+    /// models can be lazily registered at runtime (see `ensure_model_loaded`)
+    /// while clones of the runtime share one registry.
+    models: Arc<RwLock<HashMap<String, Arc<CandleModel>>>>,
+    /// Root directory of broker-uploaded models (`{tachyon_data}/models`). When
+    /// set, an inference request for an alias absent from the sealed config is
+    /// lazily loaded from `{root}/{alias}` — gated upstream by the route's sealed
+    /// `allowed_model_aliases`. `None` disables lazy loading (tests, no broker).
+    dynamic_models_root: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -256,11 +265,72 @@ impl AiInferenceRuntime {
             }
         }
 
-        Ok(Self { schedulers, models })
+        Ok(Self {
+            schedulers,
+            models: Arc::new(RwLock::new(models)),
+            dynamic_models_root: None,
+        })
+    }
+
+    /// Set the root directory from which broker-uploaded models are lazily loaded
+    /// on first use. Production wires this to `{tachyon_data}/models`; tests and
+    /// hosts without a broker leave it unset.
+    pub(crate) fn with_dynamic_models_root(mut self, root: Option<PathBuf>) -> Self {
+        self.dynamic_models_root = root;
+        self
+    }
+
+    /// Ensure `alias` is loaded, lazily materializing a broker-uploaded model from
+    /// `{dynamic_models_root}/{alias}` on a registry miss. The format (GGUF or
+    /// safetensors) is resolved from the directory's `.tachyon-model.json` sidecar
+    /// by the backend loader. This runs only after the caller's sealed-alias scope
+    /// check, so it cannot widen what a route may execute.
+    fn ensure_model_loaded(&self, alias: &str) -> Result<(), String> {
+        if self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .contains_key(alias)
+        {
+            return Ok(());
+        }
+        let Some(root) = self.dynamic_models_root.as_ref() else {
+            return Err(format!("model alias `{alias}` is not loaded"));
+        };
+        let model_dir = root.join(alias);
+        if !model_dir.is_dir() {
+            return Err(format!("model alias `{alias}` is not loaded"));
+        }
+        let binding = IntegrityModelBinding {
+            alias: alias.to_owned(),
+            path: model_dir.to_string_lossy().into_owned(),
+            device: crate::ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+        };
+        let backend_model: Arc<dyn BackendModel> =
+            Arc::new(CandleBackendModel::load(&binding).map_err(|error| error.to_string())?);
+        let model = Arc::new(
+            CandleModel::load_mock_with_backend(&binding, backend_model)
+                .map_err(|error| error.to_string())?,
+        );
+        // Insert under the write lock; `or_insert` tolerates a concurrent first-use
+        // race (the loser's freshly loaded model is simply dropped).
+        self.models
+            .write()
+            .expect("model registry lock poisoned")
+            .entry(alias.to_owned())
+            .or_insert(model);
+        Ok(())
     }
 
     pub(crate) fn loaded_model_aliases(&self) -> Vec<String> {
-        let mut aliases = self.models.keys().cloned().collect::<Vec<_>>();
+        let mut aliases = self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         aliases.sort();
         aliases
     }
@@ -269,7 +339,12 @@ impl AiInferenceRuntime {
         let backends = [candle_onnx_backend::candle_onnx_backend()];
         #[cfg(test)]
         let registry = WasiRegistry::from(MockPreloadedGraphRegistry::from_aliases(
-            self.models.keys().cloned(),
+            self.models
+                .read()
+                .expect("model registry lock poisoned")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
         ));
         #[cfg(not(test))]
         let registry = WasiRegistry::from(EmptyGraphRegistry);
@@ -297,7 +372,11 @@ impl AiInferenceRuntime {
 
     #[cfg(test)]
     pub(crate) fn model_memory_residency(&self, alias: &str) -> Option<AcceleratorMemoryResidency> {
-        self.models.get(alias).map(|model| model.memory_residency)
+        self.models
+            .read()
+            .expect("model registry lock poisoned")
+            .get(alias)
+            .map(|model| model.memory_residency)
     }
 
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
@@ -322,8 +401,9 @@ impl AiInferenceRuntime {
             ));
         }
 
-        let model = self
-            .models
+        self.ensure_model_loaded(alias)?;
+        let models = self.models.read().expect("model registry lock poisoned");
+        let model = models
             .get(alias)
             .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
         if model.accelerator != accelerator {
@@ -358,10 +438,16 @@ impl AiInferenceRuntime {
                 ));
             }
         }
-        let model = self
-            .models
-            .get(alias)
-            .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
+        self.ensure_model_loaded(alias)?;
+        // Clone the `Arc` out and drop the read lock before inference so a slow
+        // forward pass never blocks lazy registration of other models.
+        let model = {
+            let models = self.models.read().expect("model registry lock poisoned");
+            models
+                .get(alias)
+                .cloned()
+                .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
+        };
         let output = self
             .scheduler_for(model.accelerator)
             .ok_or_else(|| {
@@ -371,7 +457,7 @@ impl AiInferenceRuntime {
                 )
             })?
             .infer(
-                Arc::clone(model),
+                Arc::clone(&model),
                 adapter_id.map(str::to_owned),
                 SharedInputTensor {
                     dimensions: vec![prompt.len() as u32],
@@ -1872,6 +1958,54 @@ mod tests {
     }
 
     #[test]
+    fn uploaded_model_is_lazily_loaded_from_the_broker_models_root() {
+        let root = unique_candle_llm_dir("dynamic-root");
+        let alias = "tenant-llama";
+        candle_llm_runtime::write_tachyon_tiny_fixture(&root.join(alias))
+            .expect("fixture should be written");
+
+        // The alias is absent from the sealed config; only the on-disk upload
+        // directory and the dynamic models root make it resolvable.
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
+            .expect("runtime should build")
+            .with_dynamic_models_root(Some(root.clone()));
+
+        let output = runtime
+            .compute_component_prompt(alias, "hello")
+            .expect("an uploaded model should load lazily and generate");
+        assert!(!output.is_empty());
+        assert_ne!(output, MOCK_INFERENCE_RESPONSE);
+        // It is now registered for reuse.
+        assert!(runtime.loaded_model_aliases().contains(&alias.to_owned()));
+
+        // An alias with no upload directory stays unloaded.
+        let missing = runtime
+            .compute_component_prompt("no-such-model", "hello")
+            .expect_err("an absent alias must not load");
+        assert!(missing.contains("is not loaded"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lazy_load_is_disabled_without_a_dynamic_models_root() {
+        let root = unique_candle_llm_dir("no-dynamic-root");
+        let alias = "tenant-llama";
+        candle_llm_runtime::write_tachyon_tiny_fixture(&root.join(alias))
+            .expect("fixture should be written");
+
+        // Same on-disk model, but no dynamic root configured → not loadable.
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
+            .expect("runtime should build");
+        let error = runtime
+            .compute_component_prompt(alias, "hello")
+            .expect_err("without a dynamic root, uploads must not load");
+        assert!(error.contains("is not loaded"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn scheduler_batches_concurrent_requests_for_same_alias() {
         let runtime = AiInferenceRuntime::from_config(&config_with_model("llama3"))
             .expect("runtime should build");
@@ -1886,6 +2020,8 @@ mod tests {
             let scheduler = scheduler.clone();
             let model = runtime
                 .models
+                .read()
+                .expect("model registry lock poisoned")
                 .get("llama3")
                 .expect("model should exist")
                 .clone();
