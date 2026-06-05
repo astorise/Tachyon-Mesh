@@ -64,6 +64,8 @@ struct ChatCompletionRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Option<StopField>,
+    #[serde(default)]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +106,31 @@ struct ChatChoice {
     index: u32,
     message: ChatMessage,
     finish_reason: &'static str,
+}
+
+/// Sent for each SSE chunk when `stream: true`.
+#[derive(Debug, Serialize)]
+struct ChatCompletionChunk {
+    id: &'static str,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkChoice {
+    index: u32,
+    delta: ChunkDelta,
+    finish_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,12 +216,8 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
     ))
 }
 
-/// Run `/v1/chat/completions` against the host CPU accelerator: load the named
-/// model (lazily materialised by the host from the broker upload directory on
-/// first use), hand the structured conversation and sampling parameters to the
-/// host (which renders the model's chat template and samples), and reshape the
-/// output into an OpenAI-compatible response. A model the host cannot load
-/// surfaces as 404.
+/// Run `/v1/chat/completions` against the host CPU accelerator.
+/// Routes to the streaming SSE path when `stream: true`, buffered otherwise.
 fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let request: ChatCompletionRequest = serde_json::from_slice(body)
         .map_err(|e| format!("invalid chat completion request: {e}"))?;
@@ -216,6 +239,17 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
         }
     };
 
+    if request.stream == Some(true) {
+        handle_chat_completions_streaming(request, model_id)
+    } else {
+        handle_chat_completions_buffered(request, model_id)
+    }
+}
+
+fn handle_chat_completions_buffered(
+    request: ChatCompletionRequest,
+    model_id: u32,
+) -> Result<(u16, Vec<u8>), String> {
     let generation = build_generation_request(&request)?;
     let output = bindings::tachyon::accelerator::cpu::compute(model_id, &generation)
         .map_err(|e| format!("inference failed for model `{}`: {e}", request.model))?;
@@ -237,6 +271,110 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     serde_json::to_vec(&response)
         .map(|body| (200, body))
         .map_err(|e| format!("failed to encode chat completion response: {e}"))
+}
+
+/// Stream `/v1/chat/completions` as Server-Sent Events. Each decoded token
+/// fragment becomes a `chat.completion.chunk` frame; the stream is terminated
+/// by `data: [DONE]`. The host `streaming-response` resource is used to flush
+/// status + headers first, then each SSE frame as it is produced.
+fn handle_chat_completions_streaming(
+    request: ChatCompletionRequest,
+    model_id: u32,
+) -> Result<(u16, Vec<u8>), String> {
+    let writer = bindings::tachyon::mesh::response_body::get_streaming_response()
+        .map_err(|e| format!("streaming not available for this request: {e}"))?;
+
+    writer
+        .begin(
+            200,
+            &[
+                ("content-type".to_string(), "text/event-stream".to_string()),
+                ("cache-control".to_string(), "no-cache".to_string()),
+                ("x-accel-buffering".to_string(), "no".to_string()),
+            ],
+        )
+        .map_err(|e| format!("failed to begin streaming response: {e}"))?;
+
+    // First chunk carries the role.
+    let first_chunk = ChatCompletionChunk {
+        id: "chatcmpl-tachyon",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: request.model.clone(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta {
+                role: Some("assistant"),
+                content: None,
+            },
+            finish_reason: None,
+        }],
+    };
+    write_sse_chunk(&writer, &first_chunk)?;
+
+    let generation = build_generation_request(&request)?;
+    let token_stream = bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation)
+        .map_err(|e| format!("failed to start streaming inference for `{}`: {e}", request.model))?;
+
+    loop {
+        match token_stream.next() {
+            Ok(Some(fragment)) => {
+                let chunk = ChatCompletionChunk {
+                    id: "chatcmpl-tachyon",
+                    object: "chat.completion.chunk",
+                    created: 0,
+                    model: request.model.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: None,
+                            content: Some(fragment),
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                write_sse_chunk(&writer, &chunk)?;
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("streaming inference error: {e}")),
+        }
+    }
+
+    // Final chunk signals stop.
+    let stop_chunk = ChatCompletionChunk {
+        id: "chatcmpl-tachyon",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: request.model,
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta {
+                role: None,
+                content: None,
+            },
+            finish_reason: Some("stop"),
+        }],
+    };
+    write_sse_chunk(&writer, &stop_chunk)?;
+    writer
+        .write(b"data: [DONE]\n\n")
+        .map_err(|e| format!("failed to write [DONE] frame: {e}"))?;
+
+    // Return a dummy buffered response; the real response was sent via the
+    // streaming writer. The host ignores this body when streaming was used.
+    Ok((200, Vec::new()))
+}
+
+fn write_sse_chunk<T: serde::Serialize>(
+    writer: &bindings::tachyon::mesh::response_body::StreamingResponse,
+    chunk: &T,
+) -> Result<(), String> {
+    let json =
+        serde_json::to_string(chunk).map_err(|e| format!("failed to encode SSE chunk: {e}"))?;
+    let frame = format!("data: {json}\n\n");
+    writer
+        .write(frame.as_bytes())
+        .map_err(|e| format!("failed to write SSE frame: {e}"))
 }
 
 /// Encode the host generation request: the structured chat turns (the host

@@ -152,6 +152,7 @@ impl ComponentHostState {
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
+            streaming_body: None,
         })
     }
 
@@ -2809,5 +2810,87 @@ pub(crate) fn loopback_ip_for(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    }
+}
+
+// ── tachyon:mesh/response-body ────────────────────────────────────────────────
+
+impl component_bindings::tachyon::mesh::response_body::Host for ComponentHostState {
+    fn get_streaming_response(
+        &mut self,
+    ) -> std::result::Result<
+        wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::response_body::StreamingResponse,
+        >,
+        String,
+    > {
+        let slot = self
+            .streaming_body
+            .take()
+            .ok_or_else(|| "no streaming response available for this request".to_owned())?;
+        let resource = HostStreamingResponseResource {
+            headers_tx: Some(slot.headers_tx),
+            chunk_tx: slot.chunk_tx,
+        };
+        let owned = self
+            .table
+            .push(resource)
+            .expect("resource table push failed");
+        Ok(wasmtime::component::Resource::new_own(owned.rep()))
+    }
+}
+
+impl component_bindings::tachyon::mesh::response_body::HostStreamingResponse
+    for ComponentHostState
+{
+    fn begin(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::response_body::StreamingResponse,
+        >,
+        status: u16,
+        headers: Vec<(String, String)>,
+    ) -> std::result::Result<(), String> {
+        let handle =
+            wasmtime::component::Resource::<HostStreamingResponseResource>::new_borrow(self_.rep());
+        let res = self
+            .table
+            .get_mut(&handle)
+            .map_err(|e| format!("{e:#}"))?;
+        let tx = res
+            .headers_tx
+            .take()
+            .ok_or_else(|| "begin() called more than once on streaming-response".to_owned())?;
+        let sc = StatusCode::from_u16(status)
+            .map_err(|e| format!("invalid status code {status}: {e}"))?;
+        let _ = tx.send((sc, headers));
+        Ok(())
+    }
+
+    fn write(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::response_body::StreamingResponse,
+        >,
+        chunk: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        let handle =
+            wasmtime::component::Resource::<HostStreamingResponseResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        res.chunk_tx
+            .blocking_send(Bytes::from(chunk))
+            .map_err(|_| "streaming body channel closed".to_owned())
+    }
+
+    fn drop(
+        &mut self,
+        rep: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::response_body::StreamingResponse,
+        >,
+    ) -> wasmtime::Result<()> {
+        self.table.delete(
+            wasmtime::component::Resource::<HostStreamingResponseResource>::new_own(rep.rep()),
+        )?;
+        Ok(())
     }
 }

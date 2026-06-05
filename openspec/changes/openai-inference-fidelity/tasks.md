@@ -45,19 +45,19 @@
 
 ## 6. HTTP streaming transport (validated where the wasm guest runs)
 
-- [ ] 6.1 Add a generic streaming guest-execution path that flushes response
+- [x] 6.1 Add a generic streaming guest-execution path that flushes response
       body chunks as the guest produces them (mirroring the websocket path).
-- [ ] 6.2 Add the host import the guest writes body chunks to, and a streaming
+- [x] 6.2 Add the host import the guest writes body chunks to, and a streaming
       axum body fed by it.
-- [ ] 6.3 `guest-openai`: on `stream: true`, pull from `compute-stream` and emit
+- [x] 6.3 `guest-openai`: on `stream: true`, pull from `compute-stream` and emit
       `chat.completion.chunk` SSE frames terminated by `data: [DONE]` with
       `content-type: text/event-stream`.
-- [ ] 6.4 Integration test: an OpenAI streaming client receives incremental
+- [x] 6.4 Integration test: an OpenAI streaming client receives incremental
       frames whose deltas concatenate to the non-streamed response.
 
 ## 7. Documentation
 
 - [x] 7.1 Document the generation request fields (`messages`, `top_p`, `seed`,
       `stop`) and sampling/template/stop semantics in the runtime.
-- [ ] 7.2 Document the streaming transport and its time-to-first-token behaviour
+- [x] 7.2 Document the streaming transport and its time-to-first-token behaviour
       once the wire path lands.
