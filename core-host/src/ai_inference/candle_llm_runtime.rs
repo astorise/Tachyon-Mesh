@@ -7,6 +7,7 @@ use std::{
 
 use candle_core::{quantized::gguf_file, DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig, LlamaEosToks};
 use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlama;
 use serde::Deserialize;
@@ -20,6 +21,9 @@ pub(crate) const LLAMA_MODEL_TYPE: &str = "llama";
 
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
+/// Hugging Face tokenizer settings; carries the `chat_template` (Jinja2) and the
+/// special tokens (`bos_token`/`eos_token`) that instruct templates reference.
+const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
 const MODEL_SAFETENSORS: &str = "model.safetensors";
 const SAFETENSORS_INDEX_JSON: &str = "model.safetensors.index.json";
 /// Sidecar dropped next to the weights by `system-faas-model-broker` at upload
@@ -41,6 +45,14 @@ const DEFAULT_MAX_NEW_TOKENS: usize = 64;
 /// Hard upper bound on `max_new_tokens` for any single request, regardless of
 /// what the caller asks for. Protects the host from unbounded decode loops.
 pub(crate) const HOST_MAX_NEW_TOKENS: usize = 256;
+/// Seed used when a generation request samples (temperature > 0) but does not
+/// pin a `seed`. Fixed so that an un-seeded sampled request is still reproducible
+/// for a given prompt — callers that want variation pass their own `seed`.
+const DEFAULT_SAMPLING_SEED: u64 = 299_792_458;
+/// Hard cap on the number of stop sequences honoured for a single request, and on
+/// the length of each, so a caller cannot force unbounded substring scans.
+const MAX_STOP_SEQUENCES: usize = 8;
+const MAX_STOP_SEQUENCE_BYTES: usize = 256;
 /// Hard upper bound on the raw prompt size (bytes) accepted before tokenization.
 pub(crate) const DEFAULT_MAX_PROMPT_BYTES: usize = 16_384;
 const DEFAULT_MAX_PROMPT_TOKENS: usize = 4_096;
@@ -142,6 +154,10 @@ pub(crate) struct CandleLlmRuntime {
     tokenizer: Tokenizer,
     inner: Arc<LoadedModel>,
     limits: GenerationLimits,
+    /// The model's own chat template, loaded once from `tokenizer_config.json`.
+    /// `None` when the checkpoint ships no template (the runtime then falls back
+    /// to a generic chat rendering). Shared behind `Arc` so clones stay cheap.
+    chat_template: Option<Arc<ChatTemplate>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,19 +179,63 @@ struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
 }
 
+/// A single chat turn carried by a structured (`messages`) generation request.
+/// Rendered into a prompt by the model's own chat template at parse time.
+/// `Serialize` so it can be handed to the Jinja chat-template context.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+struct ChatTurn {
+    role: String,
+    content: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GenerationRequest {
-    prompt: String,
+    /// Raw prompt. Optional when `messages` is supplied (chat-templated path).
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Structured chat turns. When present, the model's chat template renders
+    /// them into the final prompt; `prompt` is ignored.
+    #[serde(default)]
+    messages: Option<Vec<ChatTurn>>,
     max_new_tokens: Option<usize>,
     temperature: Option<f32>,
+    top_p: Option<f32>,
     seed: Option<u64>,
+    /// Stop sequences: generation halts once any of these appears in the decoded
+    /// text, and the matched sequence (and anything after it) is trimmed.
+    #[serde(default)]
+    stop: Option<Vec<String>>,
+}
+
+/// Token-selection policy resolved from a request's `temperature`/`top_p`/`seed`.
+/// `temperature <= 0` (or absent) collapses to deterministic greedy decoding,
+/// which preserves the runtime's reproducible-by-default contract.
+struct SamplingPolicy {
+    seed: u64,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+}
+
+impl SamplingPolicy {
+    fn processor(&self) -> LogitsProcessor {
+        match self.temperature {
+            // Greedy: deterministic argmax, independent of the seed.
+            None => LogitsProcessor::from_sampling(self.seed, Sampling::ArgMax),
+            Some(temperature) => match self.top_p {
+                Some(p) if p > 0.0 && p < 1.0 => {
+                    LogitsProcessor::from_sampling(self.seed, Sampling::TopP { p, temperature })
+                }
+                _ => LogitsProcessor::from_sampling(self.seed, Sampling::All { temperature }),
+            },
+        }
+    }
 }
 
 struct ParsedGenerationRequest {
     prompt: String,
     max_new_tokens: usize,
-    _temperature: Option<f32>,
-    _seed: Option<u64>,
+    sampling: SamplingPolicy,
+    stop: Vec<String>,
 }
 
 impl CandleLlmRuntime {
@@ -224,6 +284,10 @@ impl CandleLlmRuntime {
             }
         })?;
 
+        // Load the model's own chat template (if any) once, so structured
+        // `messages` requests render exactly as the checkpoint expects.
+        let chat_template = ChatTemplate::load(alias, root)?.map(Arc::new);
+
         let (inner, limits) = match format {
             ModelFormat::Safetensors => Self::load_safetensors(alias, root)?,
             ModelFormat::Gguf => Self::load_gguf(alias, root)?,
@@ -235,6 +299,7 @@ impl CandleLlmRuntime {
             tokenizer,
             inner: Arc::new(inner),
             limits,
+            chat_template,
         }))
     }
 
@@ -427,7 +492,7 @@ impl CandleLlmRuntime {
             });
         }
 
-        let generated = self.decode_greedy(&prompt_ids, request.max_new_tokens)?;
+        let generated = self.decode(&prompt_ids, request)?;
         let text =
             self.tokenizer
                 .decode(&generated, true)
@@ -435,22 +500,23 @@ impl CandleLlmRuntime {
                     alias: self.alias.clone(),
                     detail: format!("failed to decode generated tokens: {error}"),
                 })?;
-        Ok(text.into_bytes())
+        Ok(trim_at_stop(&text, &request.stop).into_bytes())
     }
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Greedy autoregressive decode through the real Llama forward, with a fresh
-    /// KV cache per request: the prompt is processed once, then each new token is
-    /// fed back in with the running `index_pos`. Safetensors uses an external
-    /// `Cache`; GGUF uses the in-weights cache, which resets when the sequence
-    /// restarts at `index_pos == 0`.
-    fn decode_greedy(
+    /// Autoregressive decode through the real Llama forward, with a fresh KV
+    /// cache per request: the prompt is processed once, then each new token is
+    /// fed back in with the running `index_pos`. Token selection follows the
+    /// request's sampling policy (greedy when `temperature <= 0`). Safetensors
+    /// uses an external `Cache`; GGUF uses the in-weights cache, which resets
+    /// when the sequence restarts at `index_pos == 0`.
+    fn decode(
         &self,
         prompt_ids: &[u32],
-        max_new_tokens: usize,
+        request: &ParsedGenerationRequest,
     ) -> Result<Vec<u32>, CandleLlmError> {
         let device = Device::Cpu;
         match &*self.inner {
@@ -462,42 +528,39 @@ impl CandleLlmRuntime {
                 let mut cache = Cache::new(true, DType::F32, config, &device).map_err(|error| {
                     self.execution_error(format!("failed to build KV cache: {error}"))
                 })?;
-                self.greedy_loop(
-                    prompt_ids,
-                    max_new_tokens,
-                    eos_tokens,
-                    |input, index_pos| model.forward(input, index_pos, &mut cache),
-                )
+                self.decode_loop(prompt_ids, request, eos_tokens, |input, index_pos| {
+                    model.forward(input, index_pos, &mut cache)
+                })
             }
             LoadedModel::Gguf { model, eos_tokens } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
                 })?;
-                self.greedy_loop(
-                    prompt_ids,
-                    max_new_tokens,
-                    eos_tokens,
-                    |input, index_pos| guard.forward(input, index_pos),
-                )
+                self.decode_loop(prompt_ids, request, eos_tokens, |input, index_pos| {
+                    guard.forward(input, index_pos)
+                })
             }
         }
     }
 
-    /// Drive a greedy decode, delegating the single-step forward to `forward`,
-    /// which maps an input tensor `[1, seq]` + position to the final-position
-    /// logits `[1, vocab]`. Shared by both backends.
-    fn greedy_loop(
+    /// Drive an autoregressive decode, delegating the single-step forward to
+    /// `forward`, which maps an input tensor `[1, seq]` + position to the
+    /// final-position logits `[1, vocab]`. Shared by both backends. The next
+    /// token is drawn by the request's `LogitsProcessor`; decoding halts on EOS,
+    /// the token budget, the context window, or a matched stop sequence.
+    fn decode_loop(
         &self,
         prompt_ids: &[u32],
-        max_new_tokens: usize,
+        request: &ParsedGenerationRequest,
         eos_tokens: &[u32],
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<Vec<u32>, CandleLlmError> {
         let device = Device::Cpu;
+        let mut processor = request.sampling.processor();
         let mut tokens = prompt_ids.to_vec();
-        let mut generated = Vec::with_capacity(max_new_tokens);
+        let mut generated = Vec::with_capacity(request.max_new_tokens);
         let mut index_pos = 0usize;
-        for step in 0..max_new_tokens {
+        for step in 0..request.max_new_tokens {
             let context: &[u32] = if step == 0 {
                 &tokens
             } else {
@@ -514,21 +577,33 @@ impl CandleLlmRuntime {
             let logits = forward(&input, index_pos).map_err(|error| {
                 self.execution_error(format!("transformer forward pass failed: {error}"))
             })?;
-            let next = logits
-                .squeeze(0)
-                .and_then(|row| row.argmax(0))
-                .and_then(|id| id.to_vec0::<u32>())
-                .map_err(|error| {
-                    self.execution_error(format!("failed to sample greedy token: {error}"))
-                })?;
+            let row = logits.squeeze(0).map_err(|error| {
+                self.execution_error(format!("failed to reshape logits: {error}"))
+            })?;
+            let next = processor.sample(&row).map_err(|error| {
+                self.execution_error(format!("failed to sample next token: {error}"))
+            })?;
             index_pos += context.len();
             tokens.push(next);
             generated.push(next);
             if eos_tokens.contains(&next) {
                 break;
             }
+            // Stop sequences are matched against decoded text: cheap because the
+            // generated suffix is short and the loop is already token-bounded.
+            if !request.stop.is_empty() && self.generated_hits_stop(&generated, &request.stop) {
+                break;
+            }
         }
         Ok(generated)
+    }
+
+    /// Whether the decoded text of `generated` contains any stop sequence.
+    fn generated_hits_stop(&self, generated: &[u32], stop: &[String]) -> bool {
+        let Ok(text) = self.tokenizer.decode(generated, true) else {
+            return false;
+        };
+        stop.iter().any(|needle| text.contains(needle.as_str()))
     }
 
     fn execution_error(&self, detail: String) -> CandleLlmError {
@@ -546,6 +621,30 @@ impl CandleLlmRuntime {
                 alias: self.alias.clone(),
                 detail: format!("failed to tokenize prompt: {error}"),
             })
+    }
+
+    /// Render structured chat turns into a single prompt. Uses the model's own
+    /// `chat_template` (from `tokenizer_config.json`) when present so the result
+    /// matches the checkpoint's expected control tokens; otherwise falls back to
+    /// a generic, deterministic rendering that ends on an open assistant turn.
+    fn render_chat(&self, messages: &[ChatTurn]) -> Result<String, CandleLlmError> {
+        if messages.is_empty() {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: "chat request must include at least one message".to_owned(),
+            });
+        }
+        match &self.chat_template {
+            Some(template) => {
+                template
+                    .render(messages)
+                    .map_err(|detail| CandleLlmError::InvalidRequest {
+                        alias: self.alias.clone(),
+                        detail: format!("failed to render chat template: {detail}"),
+                    })
+            }
+            None => Ok(render_generic_chat(messages)),
+        }
     }
 
     /// Test-only: the vocabulary logits the model produces for the final
@@ -599,20 +698,32 @@ impl CandleLlmRuntime {
                     detail: format!("invalid JSON generation request: {error}"),
                 }
             })?;
+            // Prefer structured `messages` (chat-templated); otherwise a raw
+            // `prompt`. Exactly one source of prompt text must be present.
+            let prompt = match (request.messages, request.prompt) {
+                (Some(messages), _) => self.render_chat(&messages)?,
+                (None, Some(prompt)) => prompt,
+                (None, None) => {
+                    return Err(CandleLlmError::InvalidRequest {
+                        alias: self.alias.clone(),
+                        detail: "generation request must carry `messages` or `prompt`".to_owned(),
+                    })
+                }
+            };
             ParsedGenerationRequest {
-                prompt: request.prompt,
+                prompt,
                 max_new_tokens: request
                     .max_new_tokens
                     .unwrap_or(self.limits.default_max_new_tokens),
-                _temperature: request.temperature,
-                _seed: request.seed,
+                sampling: resolve_sampling(request.temperature, request.top_p, request.seed),
+                stop: sanitize_stop(request.stop),
             }
         } else {
             ParsedGenerationRequest {
                 prompt: raw.to_owned(),
                 max_new_tokens: self.limits.default_max_new_tokens,
-                _temperature: None,
-                _seed: None,
+                sampling: resolve_sampling(None, None, None),
+                stop: Vec::new(),
             }
         };
 
@@ -647,6 +758,207 @@ impl CandleLlmRuntime {
         }
 
         Ok(request)
+    }
+}
+
+/// Resolve an OpenAI-style `temperature`/`top_p`/`seed` triple into a sampling
+/// policy. `temperature <= 0` (or absent) yields deterministic greedy decoding;
+/// an absent `seed` falls back to a fixed seed so an un-seeded sampled request
+/// stays reproducible. `top_p` is only meaningful in `(0, 1)`.
+fn resolve_sampling(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+) -> SamplingPolicy {
+    let temperature = temperature
+        .map(f64::from)
+        .filter(|value| *value > 1e-7 && value.is_finite());
+    let top_p = top_p
+        .map(f64::from)
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0);
+    SamplingPolicy {
+        seed: seed.unwrap_or(DEFAULT_SAMPLING_SEED),
+        temperature,
+        top_p,
+    }
+}
+
+/// Clamp a caller-supplied stop list to a bounded, non-empty set so a request
+/// cannot force unbounded substring scans during decoding.
+fn sanitize_stop(stop: Option<Vec<String>>) -> Vec<String> {
+    stop.unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.is_empty() && s.len() <= MAX_STOP_SEQUENCE_BYTES)
+        .take(MAX_STOP_SEQUENCES)
+        .collect()
+}
+
+/// Trim decoded text at the earliest stop sequence, dropping the match and
+/// everything after it — mirroring OpenAI's `stop` semantics.
+fn trim_at_stop(text: &str, stop: &[String]) -> String {
+    let cut = stop
+        .iter()
+        .filter_map(|needle| text.find(needle.as_str()))
+        .min();
+    match cut {
+        Some(index) => text[..index].to_owned(),
+        None => text.to_owned(),
+    }
+}
+
+/// Generic chat rendering used when a checkpoint ships no `chat_template`:
+/// one `role: content` line per turn, ending on an open `assistant:` turn so
+/// the model continues as the assistant.
+fn render_generic_chat(messages: &[ChatTurn]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str(message.role.trim());
+        prompt.push_str(": ");
+        prompt.push_str(message.content.trim());
+        prompt.push('\n');
+    }
+    prompt.push_str("assistant:");
+    prompt
+}
+
+/// A checkpoint's chat template, extracted once from `tokenizer_config.json`.
+/// Rendering uses minijinja with the Python-compatibility method set so real
+/// Hugging Face instruct templates (which call `.strip()`, `.split()`, …) work.
+struct ChatTemplate {
+    source: String,
+    bos_token: String,
+    eos_token: String,
+}
+
+/// `chat_template` may be a single Jinja string or a list of named templates
+/// (the multi-template form some tool-calling checkpoints ship).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ChatTemplateField {
+    Single(String),
+    Named(Vec<NamedChatTemplate>),
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedChatTemplate {
+    name: String,
+    template: String,
+}
+
+/// `bos_token`/`eos_token` may be a bare string or an `AddedToken` object whose
+/// `content` holds the literal token text.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SpecialToken {
+    Str(String),
+    Obj { content: String },
+}
+
+impl SpecialToken {
+    fn into_string(self) -> String {
+        match self {
+            SpecialToken::Str(s) => s,
+            SpecialToken::Obj { content } => content,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenizerConfig {
+    #[serde(default)]
+    chat_template: Option<ChatTemplateField>,
+    #[serde(default)]
+    bos_token: Option<SpecialToken>,
+    #[serde(default)]
+    eos_token: Option<SpecialToken>,
+}
+
+impl ChatTemplateField {
+    /// Resolve to a single template source: the bare string, or the entry named
+    /// `default` (falling back to the first) from the multi-template form.
+    fn into_source(self) -> Option<String> {
+        match self {
+            ChatTemplateField::Single(source) => Some(source),
+            ChatTemplateField::Named(mut templates) => {
+                if let Some(index) = templates.iter().position(|t| t.name == "default") {
+                    return Some(templates.swap_remove(index).template);
+                }
+                templates.into_iter().next().map(|t| t.template)
+            }
+        }
+    }
+}
+
+impl ChatTemplate {
+    /// Load the model's chat template from `tokenizer_config.json`, or `None`
+    /// when the file or the `chat_template` field is absent.
+    fn load(alias: &str, root: &Path) -> Result<Option<Self>, CandleLlmError> {
+        let path = root.join(TOKENIZER_CONFIG_JSON);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(&path).map_err(|error| CandleLlmError::InvalidComponent {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            component: TOKENIZER_CONFIG_JSON,
+            detail: error.to_string(),
+        })?;
+        let config: TokenizerConfig =
+            serde_json::from_slice(&raw).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: TOKENIZER_CONFIG_JSON,
+                detail: error.to_string(),
+            })?;
+        let Some(source) = config
+            .chat_template
+            .and_then(ChatTemplateField::into_source)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            source,
+            bos_token: config
+                .bos_token
+                .map(SpecialToken::into_string)
+                .unwrap_or_default(),
+            eos_token: config
+                .eos_token
+                .map(SpecialToken::into_string)
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// Render `messages` through the Jinja template with `add_generation_prompt`
+    /// set, so the prompt ends ready for the assistant to continue.
+    fn render(&self, messages: &[ChatTurn]) -> Result<String, String> {
+        let mut env = minijinja::Environment::new();
+        // Real HF templates call `raise_exception(...)` to reject malformed
+        // conversations (e.g. a system turn where the model forbids one).
+        env.add_function(
+            "raise_exception",
+            |message: String| -> std::result::Result<minijinja::Value, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    message,
+                ))
+            },
+        );
+        // Map Python string methods (`.strip()`, `.split()`, …) used by templates.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_template("chat", &self.source)
+            .map_err(|error| error.to_string())?;
+        let template = env
+            .get_template("chat")
+            .map_err(|error| error.to_string())?;
+        template
+            .render(minijinja::context! {
+                messages => messages,
+                add_generation_prompt => true,
+                bos_token => self.bos_token,
+                eos_token => self.eos_token,
+            })
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1157,6 +1469,172 @@ mod tests {
             "greedy decoding the same prompt must be reproducible"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sampled_generation_is_reproducible_for_a_fixed_seed() {
+        let (runtime, dir) = load_fixture("sampled-seeded");
+        // temperature > 0 selects the sampling path; a pinned seed must make two
+        // runs byte-identical, proving the seed actually drives the RNG.
+        let request: &[u8] =
+            br#"{"prompt":"hello mesh","max_new_tokens":6,"temperature":0.9,"seed":42}"#;
+        let first = runtime
+            .generate(&[request])
+            .expect("first sampled generation");
+        let second = runtime
+            .generate(&[request])
+            .expect("second sampled generation");
+        assert_eq!(
+            first, second,
+            "sampling with a pinned seed must be reproducible"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stop_sequence_truncates_the_decoded_text() {
+        let (runtime, dir) = load_fixture("stop-seq");
+        // First, the un-stopped greedy output (deterministic on this fixture).
+        let plain: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":8}"#;
+        let full = String::from_utf8(runtime.generate(&[plain]).expect("plain generation"))
+            .expect("utf-8 output");
+
+        // Pick an interior character of that output as a stop sequence and assert
+        // the stopped output is a strict prefix that no longer contains it.
+        let chars: Vec<char> = full.chars().collect();
+        if chars.len() >= 2 {
+            let needle = chars[chars.len() / 2].to_string();
+            let request = serde_json::json!({
+                "prompt": "hello mesh",
+                "max_new_tokens": 8,
+                "stop": [needle],
+            })
+            .to_string();
+            let stopped =
+                String::from_utf8(runtime.generate(&[request.as_bytes()]).expect("stopped"))
+                    .expect("utf-8 output");
+            assert!(
+                full.starts_with(&stopped),
+                "stopped output `{stopped}` must be a prefix of `{full}`"
+            );
+            assert!(
+                !stopped.contains(needle.as_str()),
+                "the matched stop sequence must be trimmed from `{stopped}`"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn messages_request_renders_through_the_generic_fallback() {
+        // The tiny fixture ships no `tokenizer_config.json`, so a structured
+        // chat request must still run via the generic chat rendering.
+        let (runtime, dir) = load_fixture("messages-fallback");
+        let request = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"},
+            ],
+            "max_new_tokens": 4,
+        })
+        .to_string();
+        let bytes = runtime
+            .generate(&[request.as_bytes()])
+            .expect("a messages request must run on a checkpoint without a template");
+        assert!(!bytes.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_chat_template_is_loaded_and_rendered() {
+        // Drop a `tokenizer_config.json` carrying a ChatML-style template that
+        // exercises the Jinja path (loop, special tokens, `.strip()` via pycompat,
+        // and `add_generation_prompt`). The base fixture is reloaded so the
+        // template is picked up at load time.
+        let (_runtime, dir) = load_fixture("chat-template");
+        // `.strip()` is a Python str method (not a Jinja filter): it exercises the
+        // minijinja-contrib pycompat callback that real HF templates depend on.
+        let template = "{{ bos_token }}{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'].strip() }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        let config = serde_json::json!({
+            "bos_token": "<s>",
+            "eos_token": {"content": "</s>"},
+            "chat_template": template,
+        });
+        fs::write(dir.join(TOKENIZER_CONFIG_JSON), config.to_string()).expect("write config");
+        let reloaded = CandleLlmRuntime::try_load("tiny", &dir, "cpu")
+            .expect("reload should not error")
+            .expect("fixture is supported");
+
+        let messages = vec![ChatTurn {
+            role: "user".to_owned(),
+            content: "  hi  ".to_owned(),
+        }];
+        let rendered = reloaded
+            .render_chat(&messages)
+            .expect("model template should render");
+        assert_eq!(
+            rendered, "<s><|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+            "the checkpoint's own template (with bos_token, trim, and the \
+             generation prompt) must drive rendering"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_sampling_collapses_nonpositive_temperature_to_greedy() {
+        // Absent or non-positive temperature => deterministic argmax.
+        assert!(resolve_sampling(None, None, None).temperature.is_none());
+        assert!(resolve_sampling(Some(0.0), Some(0.9), Some(7))
+            .temperature
+            .is_none());
+        // A real temperature is kept; top_p is only honoured inside (0, 1).
+        let policy = resolve_sampling(Some(0.8), Some(1.0), Some(7));
+        assert_eq!(policy.seed, 7);
+        assert_eq!(policy.temperature, Some(f64::from(0.8_f32)));
+        assert!(
+            policy.top_p.is_none(),
+            "top_p of 1.0 disables nucleus filtering"
+        );
+        assert_eq!(
+            resolve_sampling(Some(0.8), Some(0.5), None).top_p,
+            Some(f64::from(0.5_f32))
+        );
+        // An un-seeded sampled request falls back to the fixed default seed.
+        assert_eq!(
+            resolve_sampling(Some(0.8), None, None).seed,
+            DEFAULT_SAMPLING_SEED
+        );
+    }
+
+    #[test]
+    fn sanitize_stop_filters_empty_and_bounds_the_set() {
+        let raw = Some(vec![
+            "".to_owned(),
+            "a".to_owned(),
+            "x".repeat(MAX_STOP_SEQUENCE_BYTES + 1),
+            "b".to_owned(),
+            "c".to_owned(),
+            "d".to_owned(),
+            "e".to_owned(),
+            "f".to_owned(),
+            "g".to_owned(),
+            "h".to_owned(),
+            "i".to_owned(),
+        ]);
+        let stops = sanitize_stop(raw);
+        assert!(stops.len() <= MAX_STOP_SEQUENCES);
+        assert!(!stops.iter().any(String::is_empty));
+        assert!(!stops.iter().any(|s| s.len() > MAX_STOP_SEQUENCE_BYTES));
+    }
+
+    #[test]
+    fn trim_at_stop_cuts_at_the_earliest_match() {
+        let stops = vec!["END".to_owned(), "stop".to_owned()];
+        assert_eq!(trim_at_stop("keep me END drop", &stops), "keep me ");
+        // Earliest of several matches wins.
+        assert_eq!(trim_at_stop("a stop b END c", &stops), "a ");
+        // No match returns the text unchanged.
+        assert_eq!(trim_at_stop("nothing here", &stops), "nothing here");
     }
 
     #[test]
