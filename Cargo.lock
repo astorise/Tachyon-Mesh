@@ -745,6 +745,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-transformers"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f59d08c89e9f4af9c464e2f3a8e16199e7cc601e6f34538c2cfbb42b623b1783"
+dependencies = [
+ "byteorder",
+ "candle-core",
+ "candle-nn",
+ "fancy-regex",
+ "num-traits",
+ "rand 0.9.4",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serde_plain",
+ "tracing",
+]
+
+[[package]]
 name = "cap-fs-ext"
 version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1191,6 +1210,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-onnx",
+ "candle-transformers",
  "clap",
  "ed25519-dalek",
  "flate2",
@@ -7222,6 +7242,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_plain"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce1fc6db65a611022b23a0dec6975d63fb80a302cb3388835ff02c097258d50"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7954,10 +7983,12 @@ dependencies = [
 name = "system-faas-model-broker"
 version = "1.0.0"
 dependencies = [
+ "flate2",
  "hex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "uuid",
  "wit-bindgen 0.57.1",
 ]

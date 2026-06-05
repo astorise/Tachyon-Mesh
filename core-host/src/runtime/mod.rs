@@ -49,7 +49,13 @@ pub(crate) fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeStat
         instance_pool,
         linker_cache,
         #[cfg(feature = "ai-inference")]
-        ai_runtime: Arc::new(ai_inference::AiInferenceRuntime::from_config(&config)?),
+        ai_runtime: Arc::new(
+            ai_inference::AiInferenceRuntime::from_config(&config)?.with_dynamic_models_root(Some(
+                crate::system_storage::model_broker_models_dir(
+                    &crate::host_core::integrity_manifest_path(),
+                ),
+            )),
+        ),
         config,
     })
 }

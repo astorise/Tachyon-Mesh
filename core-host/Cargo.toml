@@ -9,7 +9,7 @@ default = ["ring"]
 # candle-onnx executes .onnx models; wasmtime-wasi-nn (no ORT) provides the
 # WASI-NN guest interface backed by our CandleOnnxBackend.
 ai-inference = [
-    "dep:candle-core", "dep:candle-nn", "dep:candle-onnx",
+    "dep:candle-core", "dep:candle-nn", "dep:candle-onnx", "dep:candle-transformers",
     "dep:lru", "dep:prost", "dep:tokenizers", "dep:turboquant-sys",
     "dep:wasmtime-wasi-nn",
 ]
@@ -42,6 +42,10 @@ bytes = "1.5"
 candle-core = { version = "0.10.0", optional = true }
 candle-nn = { version = "0.10.0", optional = true }
 candle-onnx = { version = "0.10.2", optional = true }
+# Standard transformer architectures (Llama family) for running real, uploaded
+# checkpoints. Weights are mmapped from the model directory at runtime — never
+# compiled into the Tachyon artifact.
+candle-transformers = { version = "0.10.0", optional = true, default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = "2"
 flate2 = "1"

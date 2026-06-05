@@ -608,17 +608,19 @@ async fn import_faas_package(
         .map_err(|error| error.to_string())
 }
 
-/// Open a native file-open dialog and return the chosen model file path, or
-/// `None` if the operator cancelled. Implemented as an app command (no plugin
-/// capability needed) wrapping the dialog plugin's Rust API.
+/// Open a native folder-open dialog and return the chosen model directory path,
+/// or `None` if the operator cancelled. A complete model is a directory (weights
+/// plus `tokenizer.json`, and `config.json` for safetensors); the client tars
+/// and gzips it on the fly during upload. Implemented as an app command (no
+/// plugin capability needed) wrapping the dialog plugin's Rust API.
 #[tauri::command]
 async fn pick_model_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .set_title("Select a model file")
-        .pick_file(move |path| {
+        .set_title("Select a model folder")
+        .pick_folder(move |path| {
             let _ = tx.send(path);
         });
     let picked = rx.await.map_err(|error| error.to_string())?;

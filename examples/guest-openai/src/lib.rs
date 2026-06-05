@@ -3,21 +3,28 @@
 //!
 //! It is the merger of the former `system-faas-openai-adapter` and
 //! `system-faas-ai-list-model` system FaaS into a single user-role example.
-//! Because the `faas-guest` world imports `kv-partition`, the registry is read
-//! and written directly against the shared `ai-models-registry` table — no
-//! separate registry FaaS and no outbound mesh hop are needed.
+//! Its `openai-faas-guest` world imports `kv-partition` (the shared
+//! `ai-models-registry` table is read and written directly — no separate
+//! registry FaaS and no outbound mesh hop) and `tachyon:accelerator/cpu`, so
+//! `/v1/chat/completions` runs real inference on the host CPU accelerator.
 //!
-//! The list is read fresh from `kv-partition` on every request (no in-guest
+//! The registry is read fresh from `kv-partition` on every request (no in-guest
 //! cache), so a model registered on any instance — e.g. via the
 //! `system-faas-model-broker` upload notification — is immediately visible from
-//! every instance.
+//! every instance. Chat completions load the named model by alias; the host
+//! lazily materialises broker-uploaded models on first use.
 
 mod bindings {
     use super::Component;
 
     wit_bindgen::generate!({
-        path: "../../wit/tachyon.wit",
-        world: "faas-guest",
+        path: [
+            "../../wit/tachyon.wit",
+            "../../wit/accelerator",
+            "wit",
+        ],
+        world: "tachyon:openai/openai-faas-guest",
+        generate_all,
     });
 
     export!(Component);
@@ -36,7 +43,44 @@ const ROUTE_DEREGISTER_PREFIX: &str = "/internal/guest-openai/deregister/";
 const ROUTE_MODELS: &str = "/v1/models";
 const ROUTE_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 
+/// Generation defaults when the request omits them. The host clamps these to its
+/// own hard caps (`HOST_MAX_NEW_TOKENS`, context window).
+const DEFAULT_MAX_TOKENS: u32 = 256;
+const DEFAULT_TEMPERATURE: f32 = 0.0;
+
 struct Component;
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionResponse {
+    id: &'static str,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatChoice {
+    index: u32,
+    message: ChatMessage,
+    finish_reason: &'static str,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,11 +155,7 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
     }
 
     if method.eq_ignore_ascii_case("POST") && path == ROUTE_CHAT_COMPLETIONS {
-        return Ok(openai_error_payload(
-            501,
-            "chat completions not yet implemented".to_owned(),
-            "not_implemented",
-        ));
+        return handle_chat_completions(body);
     }
 
     Ok(openai_error_payload(
@@ -123,6 +163,74 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         format!("route `{method} {path}` not found"),
         "invalid_request_error",
     ))
+}
+
+/// Run `/v1/chat/completions` against the host CPU accelerator: load the named
+/// model (lazily materialised by the host from the broker upload directory on
+/// first use), run the flattened prompt, and reshape the output into an
+/// OpenAI-compatible response. A model the host cannot load surfaces as 404.
+fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let request: ChatCompletionRequest = serde_json::from_slice(body)
+        .map_err(|e| format!("invalid chat completion request: {e}"))?;
+    if request.model.trim().is_empty() {
+        return Err("chat completion request must name a model".to_owned());
+    }
+    if request.messages.is_empty() {
+        return Err("chat completion request must include at least one message".to_owned());
+    }
+
+    let model_id = match bindings::tachyon::accelerator::cpu::load_model(&request.model) {
+        Ok(model_id) => model_id,
+        Err(error) => {
+            return Ok(openai_error_payload(
+                404,
+                format!("model `{}` is unavailable: {error}", request.model),
+                "model_not_found",
+            ))
+        }
+    };
+
+    let generation = serde_json::to_string(&serde_json::json!({
+        "prompt": flatten_messages(&request.messages),
+        "max_new_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "temperature": request.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+    }))
+    .map_err(|e| format!("failed to encode generation request: {e}"))?;
+
+    let output = bindings::tachyon::accelerator::cpu::compute(model_id, &generation)
+        .map_err(|e| format!("inference failed for model `{}`: {e}", request.model))?;
+
+    let response = ChatCompletionResponse {
+        id: "chatcmpl-tachyon",
+        object: "chat.completion",
+        created: 0,
+        model: request.model,
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_owned(),
+                content: output,
+            },
+            finish_reason: "stop",
+        }],
+    };
+    serde_json::to_vec(&response)
+        .map(|body| (200, body))
+        .map_err(|e| format!("failed to encode chat completion response: {e}"))
+}
+
+/// Flatten OpenAI chat messages into a single prompt the host tokenizes, ending
+/// on an open `assistant:` turn so the model continues as the assistant.
+fn flatten_messages(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        prompt.push_str(message.role.trim());
+        prompt.push_str(": ");
+        prompt.push_str(message.content.trim());
+        prompt.push('\n');
+    }
+    prompt.push_str("assistant:");
+    prompt
 }
 
 /// Read the registry fresh from kv-partition and reshape into the OpenAI
@@ -205,10 +313,27 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_returns_501() {
-        let (status, _) = route_request("POST", ROUTE_CHAT_COMPLETIONS, b"{}")
-            .expect("chat completions route should return a response");
-        assert_eq!(status, 501);
+    fn chat_completions_rejects_a_malformed_request() {
+        // A body with neither `model` nor `messages` is rejected during request
+        // validation, before any host accelerator import is invoked.
+        let result = route_request("POST", ROUTE_CHAT_COMPLETIONS, b"{}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn flatten_messages_ends_on_an_open_assistant_turn() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_owned(),
+                content: "be terse".to_owned(),
+            },
+            ChatMessage {
+                role: "user".to_owned(),
+                content: "hello".to_owned(),
+            },
+        ];
+        let prompt = flatten_messages(&messages);
+        assert_eq!(prompt, "system: be terse\nuser: hello\nassistant:");
     }
 
     #[test]

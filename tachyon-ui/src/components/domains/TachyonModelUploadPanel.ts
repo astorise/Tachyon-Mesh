@@ -7,8 +7,9 @@ import { t } from "../../utils/i18n";
 type UploadState = "idle" | "uploading" | "success" | "error";
 
 /**
- * `<tachyon-model-upload-panel>` — lets an operator pick a local model file and
- * upload it to the cluster via the model broker.
+ * `<tachyon-model-upload-panel>` — lets an operator pick a local model folder
+ * (weights plus tokenizer) and upload it to the cluster via the model broker.
+ * The client tars and gzips the folder on the fly during the upload.
  *
  * The upload goes through `resilientInvoke("push_large_model", …)`, which is a
  * step-up command, so MFA is enforced by the privileged-command wrapper — this

@@ -7,9 +7,15 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+# Pure-Rust gzip (miniz_oxide) + tar so the broker can unpack the on-the-fly
+# `tar.gz` model archive streamed by the MCP / Tachyon-UI uploader. Both compile
+# to wasm32-wasip2; extraction is done manually (no permission/mtime/xattr
+# restoration) to stay within the WASI filesystem surface.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+tar = { version = "0.4", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 wit-bindgen = "0.57"

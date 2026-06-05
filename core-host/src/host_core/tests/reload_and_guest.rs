@@ -397,6 +397,7 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
         path: "mock:llama3".to_owned(),
         device: ModelDevice::Cuda,
         qos: RouteQos::Standard,
+        dynamic: false,
     }];
     let config = IntegrityConfig {
         routes: vec![route.clone()],

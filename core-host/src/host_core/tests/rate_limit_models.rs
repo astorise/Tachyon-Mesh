@@ -143,6 +143,7 @@ fn validate_integrity_config_normalizes_model_bindings() {
         path: "  /models/llama3.gguf ".to_owned(),
         device: ModelDevice::Cuda,
         qos: RouteQos::Standard,
+        dynamic: false,
     }];
     config.routes = vec![route];
 
@@ -158,6 +159,7 @@ fn validate_integrity_config_normalizes_model_bindings() {
             path: "/models/llama3.gguf".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::Standard,
+            dynamic: false,
         }]
     );
 }
@@ -170,6 +172,7 @@ fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
         path: "/models/shared-a.gguf".to_owned(),
         device: ModelDevice::Cpu,
         qos: RouteQos::Standard,
+        dynamic: false,
     }];
     let mut second = IntegrityRoute::user("/api/assistant");
     second.models = vec![IntegrityModelBinding {
@@ -177,6 +180,7 @@ fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
         path: "/models/shared-b.gguf".to_owned(),
         device: ModelDevice::Metal,
         qos: RouteQos::Standard,
+        dynamic: false,
     }];
 
     let error = validate_integrity_config(IntegrityConfig {

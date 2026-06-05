@@ -283,6 +283,7 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
         path: "mock:llama3".to_owned(),
         device: ModelDevice::Cuda,
         qos: RouteQos::RealTime,
+        dynamic: false,
     }];
     let mut gossip_route = system_targeted_route("/system/gossip", "gossip");
     let peer_urls = format!("http://{wrong_address},http://{right_address}");
@@ -461,6 +462,7 @@ async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
         path: "mock:llama3".to_owned(),
         device: ModelDevice::Cuda,
         qos: RouteQos::RealTime,
+        dynamic: false,
     }];
     let mut gossip_route = system_targeted_route("/system/gossip", "gossip");
     let peer_urls = format!("http://{peer_address}");
@@ -780,12 +782,14 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
             path: "mock:gpu-live-chat".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
+            dynamic: false,
         },
         IntegrityModelBinding {
             alias: "gpu-batch".to_owned(),
             path: "mock:gpu-batch".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::Batch,
+            dynamic: false,
         },
     ];
     let config = IntegrityConfig {
@@ -890,12 +894,14 @@ async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold()
             path: "mock:gpu-live-chat".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
+            dynamic: false,
         },
         IntegrityModelBinding {
             alias: "gpu-batch".to_owned(),
             path: "mock:gpu-batch".to_owned(),
             device: ModelDevice::Cuda,
             qos: RouteQos::Batch,
+            dynamic: false,
         },
     ];
     let config = IntegrityConfig {

@@ -301,6 +301,8 @@ struct AssetUploadResponse {
 struct InitModelUploadRequest<'a> {
     expected_hash: &'a str,
     size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alias: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3475,19 +3477,122 @@ pub async fn push_large_model(file_path: &str) -> Result<String> {
     push_large_model_with_progress(file_path, |_| {}).await
 }
 
-pub async fn push_large_model_with_progress<F>(file_path: &str, mut progress: F) -> Result<String>
+pub async fn push_large_model_with_progress<F>(file_path: &str, progress: F) -> Result<String>
 where
     F: FnMut(f32) + Send,
 {
-    let size_bytes = tokio::fs::metadata(file_path)
+    // The broker expects a gzip+tar archive it unpacks into the model directory.
+    // Build it on the fly from the selected path (a complete model directory, or
+    // a single self-contained file), then upload the archive. The temp archive is
+    // always cleaned up, success or failure.
+    let source = std::path::Path::new(file_path);
+    let metadata = tokio::fs::metadata(file_path)
         .await
-        .with_context(|| format!("failed to read metadata for model `{file_path}`"))?
-        .len();
-    if size_bytes == 0 {
+        .with_context(|| format!("failed to read metadata for model `{file_path}`"))?;
+    if metadata.is_file() && metadata.len() == 0 {
         anyhow::bail!("model payload `{file_path}` must not be empty");
     }
 
-    let expected_hash = hash_file_sha256(file_path).await?;
+    let source_owned = source.to_path_buf();
+    let (archive_path, alias) =
+        tokio::task::spawn_blocking(move || build_model_archive(&source_owned))
+            .await
+            .context("model archive build task panicked")??;
+
+    let result = upload_model_archive(&archive_path, &alias, progress).await;
+    let _ = tokio::fs::remove_file(&archive_path).await;
+    result
+}
+
+/// Tar+gzip `source` (a model directory or a single file) into a temp archive and
+/// derive the model alias from its name. Files are placed at the archive root so
+/// the broker unpacks them straight into `models/{alias}/`.
+fn build_model_archive(source: &std::path::Path) -> Result<(std::path::PathBuf, String)> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let is_dir = source.is_dir();
+    let alias = derive_model_alias(source, is_dir);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let archive_path =
+        std::env::temp_dir().join(format!("tachyon-model-upload-{alias}-{stamp}.tar.gz"));
+
+    let file = std::fs::File::create(&archive_path).with_context(|| {
+        format!(
+            "failed to create model upload archive `{}`",
+            archive_path.display()
+        )
+    })?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    if is_dir {
+        builder
+            .append_dir_all(".", source)
+            .with_context(|| format!("failed to archive model directory `{}`", source.display()))?;
+    } else {
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model.bin");
+        builder
+            .append_path_with_name(source, name)
+            .with_context(|| format!("failed to archive model file `{}`", source.display()))?;
+    }
+    builder
+        .into_inner()
+        .context("failed to finalize model upload tar stream")?
+        .finish()
+        .context("failed to finalize model upload gzip stream")?;
+
+    Ok((archive_path, alias))
+}
+
+/// Derive a safe model alias (a single path component) from the source name.
+fn derive_model_alias(source: &std::path::Path, is_dir: bool) -> String {
+    let raw = if is_dir {
+        source.file_name()
+    } else {
+        source.file_stem()
+    }
+    .and_then(|name| name.to_str())
+    .unwrap_or("model");
+    let mut alias: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while alias.starts_with('.') {
+        alias.remove(0);
+    }
+    if alias.is_empty() {
+        "model".to_owned()
+    } else {
+        alias
+    }
+}
+
+async fn upload_model_archive<F>(
+    archive_path: &std::path::Path,
+    alias: &str,
+    mut progress: F,
+) -> Result<String>
+where
+    F: FnMut(f32) + Send,
+{
+    let archive_display = archive_path.display().to_string();
+    let size_bytes = tokio::fs::metadata(archive_path)
+        .await
+        .with_context(|| format!("failed to read model archive metadata `{archive_display}`"))?
+        .len();
+
+    let expected_hash = hash_file_sha256(&archive_display).await?;
     let config = require_connection()?;
     let client = build_http_client(&config)?;
     let init_response = client
@@ -3496,10 +3601,11 @@ where
         .json(&InitModelUploadRequest {
             expected_hash: &expected_hash,
             size_bytes,
+            alias: Some(alias),
         })
         .send()
         .await
-        .with_context(|| format!("failed to initialize model upload for `{file_path}`"))?;
+        .with_context(|| format!("failed to initialize model upload for `{alias}`"))?;
     let init_status = init_response.status();
     let init_body = init_response
         .bytes()
@@ -3514,9 +3620,9 @@ where
     let init_payload: InitModelUploadResponse = serde_json::from_slice(&init_body)
         .context("failed to decode model-init response payload")?;
 
-    let mut file = tokio::fs::File::open(file_path)
+    let mut file = tokio::fs::File::open(archive_path)
         .await
-        .with_context(|| format!("failed to open model `{file_path}` for upload"))?;
+        .with_context(|| format!("failed to open model archive `{archive_display}` for upload"))?;
     let mut buffer = vec![0_u8; MODEL_CHUNK_BYTES];
     let mut uploaded_bytes = 0_u64;
     let mut part = 1_u64;
@@ -3525,7 +3631,7 @@ where
         let read = file
             .read(&mut buffer)
             .await
-            .with_context(|| format!("failed to read model `{file_path}`"))?;
+            .with_context(|| format!("failed to read model archive `{archive_display}`"))?;
         if read == 0 {
             break;
         }
@@ -3542,7 +3648,7 @@ where
             .body(buffer[..read].to_vec())
             .send()
             .await
-            .with_context(|| format!("failed to upload chunk {part} for model `{file_path}`"))?;
+            .with_context(|| format!("failed to upload chunk {part} for model `{alias}`"))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response
@@ -3567,7 +3673,7 @@ where
         .bearer_auth(&config.token)
         .send()
         .await
-        .with_context(|| format!("failed to commit model upload for `{file_path}`"))?;
+        .with_context(|| format!("failed to commit model upload for `{alias}`"))?;
     let commit_status = commit_response.status();
     let commit_body = commit_response
         .bytes()
@@ -3994,6 +4100,64 @@ async fn hash_file_sha256(file_path: &str) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn derive_model_alias_sanitizes_names() {
+        assert_eq!(
+            derive_model_alias(std::path::Path::new("/models/TinyLlama-1.1B"), true),
+            "TinyLlama-1.1B"
+        );
+        // Single file → stem without extension.
+        assert_eq!(
+            derive_model_alias(std::path::Path::new("/models/llama3.gguf"), false),
+            "llama3"
+        );
+        // Disallowed characters become `-`, leading dots stripped.
+        assert_eq!(
+            derive_model_alias(std::path::Path::new("/models/.weird name!"), true),
+            "weird-name-"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn build_model_archive_round_trips_a_directory() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tachyon-client-archive-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("temp model dir");
+        std::fs::write(dir.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
+        std::fs::write(dir.join("model.safetensors"), b"\x00\x01\x02").unwrap();
+
+        let (archive, alias) = build_model_archive(&dir).expect("archive should build");
+        assert_eq!(alias, dir.file_name().unwrap().to_str().unwrap());
+
+        // The archive is a gzip stream that untars back to the same files.
+        let file = std::fs::File::open(&archive).unwrap();
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        let mut names: Vec<String> = tar
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .trim_start_matches("./")
+                    .to_owned()
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.sort();
+        assert!(names.contains(&"config.json".to_owned()));
+        assert!(names.contains(&"model.safetensors".to_owned()));
+
+        let _ = std::fs::remove_file(&archive);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_engine_status_summarizes_routes_and_batches() {
