@@ -834,7 +834,6 @@ pub(crate) async fn handle_streaming_http_request(
     route: IntegrityRoute,
     function_name: String,
     request: GuestRequest,
-    completion_guard: Option<RouteResponseGuard>,
 ) -> std::result::Result<Response, (StatusCode, String)> {
     let volume_leases = state
         .volume_manager
@@ -856,6 +855,7 @@ pub(crate) async fn handle_streaming_http_request(
                 format!("streaming route `{}` is missing a concurrency limiter", route.path),
             )
         })?;
+    let active_request_guard = semaphore.begin_request();
     let permit = acquire_route_permit(semaphore)
         .await
         .map_err(|error| match error {
@@ -947,7 +947,7 @@ pub(crate) async fn handle_streaming_http_request(
 
     let body = GuestStreamingBody {
         receiver: chunks_rx,
-        _completion_guard: completion_guard,
+        _completion_guard: Some(active_request_guard.into_response_guard()),
     };
 
     let mut response = Response::builder()

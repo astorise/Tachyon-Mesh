@@ -1903,7 +1903,6 @@ pub(crate) async fn faas_handler(
                                     route.clone(),
                                     selected_target.module.clone(),
                                     request,
-                                    None,
                                 )
                                 .await
                                 {
@@ -1985,7 +1984,6 @@ pub(crate) async fn faas_handler(
                                     route.clone(),
                                     selected_target.module.clone(),
                                     request,
-                                    None,
                                 )
                                 .await
                                 {

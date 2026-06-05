@@ -57,6 +57,9 @@
 - [x] 6.5 Wire the integration test into CI: build `guest-openai` to
       `wasm32-wasip2` in the `quality` job and run it with
       `TACHYON_REQUIRE_GUEST_OPENAI=1` so a missing artifact fails the job.
+- [x] 6.6 Thread `RouteResponseGuard` through `handle_streaming_http_request` so
+      streaming responses participate in graceful-drain accounting (`active_requests`
+      counter held until the SSE body is fully consumed).
 
 ## 7. Documentation
 

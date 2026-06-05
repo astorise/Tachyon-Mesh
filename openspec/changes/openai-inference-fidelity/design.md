@@ -87,6 +87,7 @@ replacing the unary contract:
   without the artifact still skips gracefully).
 - Streaming bypasses QoS batching. Acceptable: a streamed request is a single
   sequence and decode is bounded by `max_new_tokens`.
-- Streaming requests are dispatched with no `RouteResponseGuard`, so they do not
-  yet participate in graceful-drain response accounting; long-lived SSE streams
-  could outlive a drain. A follow-up can thread a guard through the transport.
+- Streaming requests participate in graceful-drain response accounting:
+  `handle_streaming_http_request` calls `semaphore.begin_request()` and stores the
+  resulting `RouteResponseGuard` in `GuestStreamingBody._completion_guard`, so
+  `active_requests` stays incremented until the SSE body is fully consumed.
