@@ -885,7 +885,10 @@ pub(crate) fn execute_streaming_guest(
         Ok(c) => c,
         Err(e) => {
             let _ = headers_tx.send((StatusCode::INTERNAL_SERVER_ERROR, vec![]));
-            tracing::error!("failed to load streaming guest component from {}: {e:#}", module_path.display());
+            tracing::error!(
+                "failed to load streaming guest component from {}: {e:#}",
+                module_path.display()
+            );
             return;
         }
     };
@@ -921,65 +924,82 @@ pub(crate) fn execute_streaming_component_guest(
     let shape = route_scope_shape(route);
     #[cfg(feature = "ai-inference")]
     let ai_runtime_ref = Arc::clone(&execution.ai_runtime);
-    let build_streaming_linker = || -> std::result::Result<ComponentLinker<ComponentHostState>, ExecutionError> {
-        let mut l = ComponentLinker::new(engine);
-        wasmtime_wasi::p2::add_to_linker_sync(&mut l).map_err(|error| {
-            guest_execution_error(error, "failed to add WASI to streaming component linker")
-        })?;
-        if shape.grants(ScopeCategory::Secrets) {
-            component_bindings::tachyon::mesh::secrets_vault::add_to_linker::<
+    let build_streaming_linker =
+        || -> std::result::Result<ComponentLinker<ComponentHostState>, ExecutionError> {
+            let mut l = ComponentLinker::new(engine);
+            wasmtime_wasi::p2::add_to_linker_sync(&mut l).map_err(|error| {
+                guest_execution_error(error, "failed to add WASI to streaming component linker")
+            })?;
+            if shape.grants(ScopeCategory::Secrets) {
+                component_bindings::tachyon::mesh::secrets_vault::add_to_linker::<
+                    ComponentHostState,
+                    ComponentHostState,
+                >(&mut l, |s| s)
+                .map_err(|e| {
+                    guest_execution_error(e, "failed to add secrets to streaming linker")
+                })?;
+            }
+            if shape.grants(ScopeCategory::Bridge) {
+                component_bindings::tachyon::mesh::bridge_controller::add_to_linker::<
+                    ComponentHostState,
+                    ComponentHostState,
+                >(&mut l, |s| s)
+                .map_err(|e| {
+                    guest_execution_error(e, "failed to add bridge to streaming linker")
+                })?;
+            }
+            if shape.grants(ScopeCategory::Vector) {
+                component_bindings::tachyon::mesh::vector::add_to_linker::<
+                    ComponentHostState,
+                    ComponentHostState,
+                >(&mut l, |s| s)
+                .map_err(|e| {
+                    guest_execution_error(e, "failed to add vector to streaming linker")
+                })?;
+            }
+            if shape.grants(ScopeCategory::Training) {
+                component_bindings::tachyon::mesh::training::add_to_linker::<
+                    ComponentHostState,
+                    ComponentHostState,
+                >(&mut l, |s| s)
+                .map_err(|e| {
+                    guest_execution_error(e, "failed to add training to streaming linker")
+                })?;
+            }
+            if shape.grants(ScopeCategory::Kv) {
+                component_bindings::tachyon::mesh::kv_partition::add_to_linker::<
+                    ComponentHostState,
+                    ComponentHostState,
+                >(&mut l, |s| s)
+                .map_err(|e| {
+                    guest_execution_error(e, "failed to add kv-partition to streaming linker")
+                })?;
+                component_bindings::tachyon::mesh::graph::add_to_linker::<
+                    ComponentHostState,
+                    ComponentHostState,
+                >(&mut l, |s| s)
+                .map_err(|e| guest_execution_error(e, "failed to add graph to streaming linker"))?;
+            }
+            component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
                 ComponentHostState,
                 ComponentHostState,
             >(&mut l, |s| s)
-            .map_err(|e| guest_execution_error(e, "failed to add secrets to streaming linker"))?;
-        }
-        if shape.grants(ScopeCategory::Bridge) {
-            component_bindings::tachyon::mesh::bridge_controller::add_to_linker::<
+            .map_err(|e| guest_execution_error(e, "failed to add metrics to streaming linker"))?;
+            component_bindings::tachyon::mesh::response_body::add_to_linker::<
                 ComponentHostState,
                 ComponentHostState,
             >(&mut l, |s| s)
-            .map_err(|e| guest_execution_error(e, "failed to add bridge to streaming linker"))?;
-        }
-        if shape.grants(ScopeCategory::Vector) {
-            component_bindings::tachyon::mesh::vector::add_to_linker::<
-                ComponentHostState,
-                ComponentHostState,
-            >(&mut l, |s| s)
-            .map_err(|e| guest_execution_error(e, "failed to add vector to streaming linker"))?;
-        }
-        if shape.grants(ScopeCategory::Training) {
-            component_bindings::tachyon::mesh::training::add_to_linker::<
-                ComponentHostState,
-                ComponentHostState,
-            >(&mut l, |s| s)
-            .map_err(|e| guest_execution_error(e, "failed to add training to streaming linker"))?;
-        }
-        if shape.grants(ScopeCategory::Kv) {
-            component_bindings::tachyon::mesh::kv_partition::add_to_linker::<
-                ComponentHostState,
-                ComponentHostState,
-            >(&mut l, |s| s)
-            .map_err(|e| guest_execution_error(e, "failed to add kv-partition to streaming linker"))?;
-            component_bindings::tachyon::mesh::graph::add_to_linker::<
-                ComponentHostState,
-                ComponentHostState,
-            >(&mut l, |s| s)
-            .map_err(|e| guest_execution_error(e, "failed to add graph to streaming linker"))?;
-        }
-        component_bindings::tachyon::mesh::custom_metrics::add_to_linker::<
-            ComponentHostState,
-            ComponentHostState,
-        >(&mut l, |s| s)
-        .map_err(|e| guest_execution_error(e, "failed to add metrics to streaming linker"))?;
-        component_bindings::tachyon::mesh::response_body::add_to_linker::<
-            ComponentHostState,
-            ComponentHostState,
-        >(&mut l, |s| s)
-        .map_err(|e| guest_execution_error(e, "failed to add response-body to streaming linker"))?;
-        #[cfg(feature = "ai-inference")]
-        add_accelerator_interfaces_to_component_linker(&mut l, &ai_runtime_ref, "streaming linker")?;
-        Ok(l)
-    };
+            .map_err(|e| {
+                guest_execution_error(e, "failed to add response-body to streaming linker")
+            })?;
+            #[cfg(feature = "ai-inference")]
+            add_accelerator_interfaces_to_component_linker(
+                &mut l,
+                &ai_runtime_ref,
+                "streaming linker",
+            )?;
+            Ok(l)
+        };
     let linker: Arc<ComponentLinker<ComponentHostState>> = match &execution.linker_cache {
         Some(cache) => match cache.get_or_build("faas", &shape, build_streaming_linker) {
             Ok(l) => l,
@@ -1037,21 +1057,30 @@ pub(crate) fn execute_streaming_component_guest(
     store.limiter(|s| &mut s.limits);
     if let Err(e) = maybe_set_guest_fuel_budget(&mut store, execution) {
         let slot = store.data_mut().streaming_body.take();
-        let _ = slot.map(|s| s.headers_tx.send((StatusCode::INTERNAL_SERVER_ERROR, vec![])));
+        let _ = slot.map(|s| {
+            s.headers_tx
+                .send((StatusCode::INTERNAL_SERVER_ERROR, vec![]))
+        });
         tracing::error!("failed to set guest fuel budget: {e}");
         return;
     }
 
-    let bindings =
-        match component_bindings::FaasGuest::instantiate(&mut store, component, &*linker) {
-            Ok(b) => b,
-            Err(e) => {
-                let slot = store.data_mut().streaming_body.take();
-                let _ = slot.map(|s| s.headers_tx.send((StatusCode::INTERNAL_SERVER_ERROR, vec![])));
-                tracing::error!("failed to instantiate streaming guest component from {}: {e:#}", component_path.display());
-                return;
-            }
-        };
+    let bindings = match component_bindings::FaasGuest::instantiate(&mut store, component, &*linker)
+    {
+        Ok(b) => b,
+        Err(e) => {
+            let slot = store.data_mut().streaming_body.take();
+            let _ = slot.map(|s| {
+                s.headers_tx
+                    .send((StatusCode::INTERNAL_SERVER_ERROR, vec![]))
+            });
+            tracing::error!(
+                "failed to instantiate streaming guest component from {}: {e:#}",
+                component_path.display()
+            );
+            return;
+        }
+    };
 
     record_wasm_start(execution.telemetry.as_ref());
     let response = bindings.tachyon_mesh_handler().call_handle_request(
@@ -1073,17 +1102,15 @@ pub(crate) fn execute_streaming_component_guest(
         // Buffered fallback: guest did not call get-streaming-response.
         match response {
             Ok(r) => {
-                let status = StatusCode::from_u16(r.status)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let status =
+                    StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let _ = slot.headers_tx.send((status, r.headers));
                 if !r.body.is_empty() {
                     let _ = slot.chunk_tx.blocking_send(Bytes::from(r.body));
                 }
             }
             Err(e) => {
-                tracing::error!(
-                    "streaming guest component `handle-request` trapped: {e:#}"
-                );
+                tracing::error!("streaming guest component `handle-request` trapped: {e:#}");
                 let _ = slot
                     .headers_tx
                     .send((StatusCode::INTERNAL_SERVER_ERROR, vec![]));

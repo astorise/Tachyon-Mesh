@@ -638,8 +638,10 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     // The streaming execution path is used for both calls; the buffered case
     // uses the channel-based fallback (guest returns normally without calling
     // get-streaming-response).
-    let (hrx_ref, mut crx_ref) =
-        run_streaming(serde_json::json!({"model": "llama3", "messages": messages}), 91);
+    let (hrx_ref, mut crx_ref) = run_streaming(
+        serde_json::json!({"model": "llama3", "messages": messages}),
+        91,
+    );
     let (ref_status, ref_headers) = hrx_ref.await.expect("reference headers should arrive");
     let mut ref_body_bytes = Vec::new();
     while let Some(chunk) = crx_ref.recv().await {
@@ -665,8 +667,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     );
 
     // Headers must arrive before any body bytes (true TTFT signal).
-    let (stream_status, stream_headers) =
-        hrx_s.await.expect("streaming headers should arrive");
+    let (stream_status, stream_headers) = hrx_s.await.expect("streaming headers should arrive");
     assert_eq!(stream_status, StatusCode::OK);
     assert!(
         stream_headers

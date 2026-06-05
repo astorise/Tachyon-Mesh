@@ -561,8 +561,7 @@ pub(crate) struct HostWebSocketConnection {
 /// slot. If the guest never calls `get-streaming-response`, the thread's
 /// fallback path sends the buffered return value through the same channels.
 pub(crate) struct HostStreamingBodySlot {
-    pub(crate) headers_tx:
-        tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>,
+    pub(crate) headers_tx: tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>,
     pub(crate) chunk_tx: tokio::sync::mpsc::Sender<Bytes>,
 }
 
@@ -572,8 +571,7 @@ pub(crate) struct HostStreamingBodySlot {
 #[allow(dead_code)]
 pub(crate) struct HostStreamingResponseResource {
     /// `None` once `begin()` has been called (sender consumed).
-    pub(crate) headers_tx:
-        Option<tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>>,
+    pub(crate) headers_tx: Option<tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>>,
     pub(crate) chunk_tx: tokio::sync::mpsc::Sender<Bytes>,
 }
 

@@ -2853,10 +2853,7 @@ impl component_bindings::tachyon::mesh::response_body::HostStreamingResponse
     ) -> std::result::Result<(), String> {
         let handle =
             wasmtime::component::Resource::<HostStreamingResponseResource>::new_borrow(self_.rep());
-        let res = self
-            .table
-            .get_mut(&handle)
-            .map_err(|e| format!("{e:#}"))?;
+        let res = self.table.get_mut(&handle).map_err(|e| format!("{e:#}"))?;
         let tx = res
             .headers_tx
             .take()

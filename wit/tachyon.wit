@@ -1,9 +1,10 @@
+package tachyon:mesh@1.1.0;
+
 // This file is the single source of truth for all Tachyon Mesh WIT interfaces.
 // Do NOT fork worlds or create `-with-X` variants. Per-deployment import
 // authorization is layered on top by the host at link time and in runtime host
 // closures — the guest binary is unchanged. See `core-host/src/host_core/scoping/`
 // for the host-side implementation of the authorization layer.
-package tachyon:mesh@1.1.0;
 
 interface handler {
     type headers = list<tuple<string, string>>;

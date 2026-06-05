@@ -1907,9 +1907,7 @@ pub(crate) async fn faas_handler(
                                 .await
                                 {
                                     Ok(response) => response,
-                                    Err((status, message)) => {
-                                        (status, message).into_response()
-                                    }
+                                    Err((status, message)) => (status, message).into_response(),
                                 };
                             }
                             match execute_route_with_middleware(
@@ -1988,9 +1986,7 @@ pub(crate) async fn faas_handler(
                                 .await
                                 {
                                     Ok(response) => response,
-                                    Err((status, message)) => {
-                                        (status, message).into_response()
-                                    }
+                                    Err((status, message)) => (status, message).into_response(),
                                 };
                             }
                             match execute_route_with_middleware(

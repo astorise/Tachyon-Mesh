@@ -852,7 +852,10 @@ pub(crate) async fn handle_streaming_http_request(
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("streaming route `{}` is missing a concurrency limiter", route.path),
+                format!(
+                    "streaming route `{}` is missing a concurrency limiter",
+                    route.path
+                ),
             )
         })?;
     let active_request_guard = semaphore.begin_request();
@@ -883,7 +886,9 @@ pub(crate) async fn handle_streaming_http_request(
     let instance_pool = Arc::clone(&runtime.instance_pool);
     let linker_cache = Arc::clone(&runtime.linker_cache);
     let async_log_sender = state.async_log_sender.clone();
-    let request_headers = request.headers.iter()
+    let request_headers = request
+        .headers
+        .iter()
         .filter_map(|(k, v)| {
             let name = HeaderName::from_bytes(k.as_bytes()).ok()?;
             let value = HeaderValue::from_str(v).ok()?;

@@ -314,7 +314,12 @@ fn handle_chat_completions_streaming(
 
     let generation = build_generation_request(&request)?;
     let token_stream = bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation)
-        .map_err(|e| format!("failed to start streaming inference for `{}`: {e}", request.model))?;
+        .map_err(|e| {
+        format!(
+            "failed to start streaming inference for `{}`: {e}",
+            request.model
+        )
+    })?;
 
     loop {
         match token_stream.next() {
