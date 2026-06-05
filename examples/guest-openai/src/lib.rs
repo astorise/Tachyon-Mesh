@@ -510,6 +510,7 @@ mod tests {
             top_p: None,
             seed: None,
             stop: None,
+            stream: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -536,6 +537,7 @@ mod tests {
             top_p: Some(0.9),
             seed: Some(7),
             stop: Some(StopField::One("\n\n".to_owned())),
+            stream: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))

@@ -907,6 +907,7 @@ pub(crate) fn execute_streaming_guest(
 /// `handler::response` — the latter is the fallback path that fires
 /// `headers_tx` and enqueues the body after `handle-request` returns.
 #[cfg(feature = "ai-inference")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_streaming_component_guest(
     engine: &Engine,
     route: &IntegrityRoute,
