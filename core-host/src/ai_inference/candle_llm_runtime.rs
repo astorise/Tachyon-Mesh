@@ -455,7 +455,25 @@ impl CandleLlmRuntime {
         ))
     }
 
+    /// Buffered generation: run the decode and return the full UTF-8 output. A
+    /// thin accumulator over [`generate_streaming`], so the two paths always
+    /// agree byte-for-byte.
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>, CandleLlmError> {
+        let mut out = String::new();
+        self.generate_streaming(prompts, &mut |delta| out.push_str(delta))?;
+        Ok(out.into_bytes())
+    }
+
+    /// Streaming generation: identical decoding to [`generate`], but each newly
+    /// decoded, stop-trimmed text fragment is handed to `on_token` as it is
+    /// produced. The concatenation of every `on_token` fragment equals the
+    /// buffered `generate` output. Used by the streaming accelerator path so a
+    /// caller can forward tokens to the client as they arrive.
+    pub(crate) fn generate_streaming(
+        &self,
+        prompts: &[&[u8]],
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), CandleLlmError> {
         if prompts.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -492,15 +510,7 @@ impl CandleLlmRuntime {
             });
         }
 
-        let generated = self.decode(&prompt_ids, request)?;
-        let text =
-            self.tokenizer
-                .decode(&generated, true)
-                .map_err(|error| CandleLlmError::Execution {
-                    alias: self.alias.clone(),
-                    detail: format!("failed to decode generated tokens: {error}"),
-                })?;
-        Ok(trim_at_stop(&text, &request.stop).into_bytes())
+        self.decode(&prompt_ids, request, on_token)
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -517,7 +527,8 @@ impl CandleLlmRuntime {
         &self,
         prompt_ids: &[u32],
         request: &ParsedGenerationRequest,
-    ) -> Result<Vec<u32>, CandleLlmError> {
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), CandleLlmError> {
         let device = Device::Cpu;
         match &*self.inner {
             LoadedModel::Safetensors {
@@ -528,17 +539,25 @@ impl CandleLlmRuntime {
                 let mut cache = Cache::new(true, DType::F32, config, &device).map_err(|error| {
                     self.execution_error(format!("failed to build KV cache: {error}"))
                 })?;
-                self.decode_loop(prompt_ids, request, eos_tokens, |input, index_pos| {
-                    model.forward(input, index_pos, &mut cache)
-                })
+                self.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos, &mut cache),
+                )
             }
             LoadedModel::Gguf { model, eos_tokens } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
                 })?;
-                self.decode_loop(prompt_ids, request, eos_tokens, |input, index_pos| {
-                    guard.forward(input, index_pos)
-                })
+                self.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    on_token,
+                    |input, index_pos| guard.forward(input, index_pos),
+                )
             }
         }
     }
@@ -548,17 +567,33 @@ impl CandleLlmRuntime {
     /// final-position logits `[1, vocab]`. Shared by both backends. The next
     /// token is drawn by the request's `LogitsProcessor`; decoding halts on EOS,
     /// the token budget, the context window, or a matched stop sequence.
+    ///
+    /// Decoded text is streamed through `on_token` as it is produced. To honour
+    /// stop sequences without leaking a partial match, the tail of the decoded
+    /// text within one stop-length of the end is held back until a further token
+    /// confirms it is safe to emit (or the decode ends).
     fn decode_loop(
         &self,
         prompt_ids: &[u32],
         request: &ParsedGenerationRequest,
         eos_tokens: &[u32],
+        on_token: &mut dyn FnMut(&str),
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
-    ) -> Result<Vec<u32>, CandleLlmError> {
+    ) -> Result<(), CandleLlmError> {
         let device = Device::Cpu;
         let mut processor = request.sampling.processor();
         let mut tokens = prompt_ids.to_vec();
         let mut generated = Vec::with_capacity(request.max_new_tokens);
+        // Hold back this many trailing bytes so a stop sequence split across the
+        // last token(s) is never partially emitted before it is matched.
+        let hold = request
+            .stop
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let mut emitted = 0usize;
         let mut index_pos = 0usize;
         for step in 0..request.max_new_tokens {
             let context: &[u32] = if step == 0 {
@@ -586,24 +621,35 @@ impl CandleLlmRuntime {
             index_pos += context.len();
             tokens.push(next);
             generated.push(next);
+
+            let text = self.decode_generated(&generated)?;
+            // A matched stop ends the decode: emit up to (not including) it.
+            if let Some(stop_at) = find_earliest_stop(&text, &request.stop) {
+                emit_delta(on_token, &text, &mut emitted, stop_at);
+                return Ok(());
+            }
             if eos_tokens.contains(&next) {
-                break;
+                emit_delta(on_token, &text, &mut emitted, text.len());
+                return Ok(());
             }
-            // Stop sequences are matched against decoded text: cheap because the
-            // generated suffix is short and the loop is already token-bounded.
-            if !request.stop.is_empty() && self.generated_hits_stop(&generated, &request.stop) {
-                break;
-            }
+            // No stop yet: emit everything except the held-back tail.
+            let safe = floor_char_boundary(&text, text.len().saturating_sub(hold));
+            emit_delta(on_token, &text, &mut emitted, safe);
         }
-        Ok(generated)
+        // Token budget exhausted: flush the held-back tail, trimming any stop.
+        let text = self.decode_generated(&generated)?;
+        let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
+        emit_delta(on_token, &text, &mut emitted, end);
+        Ok(())
     }
 
-    /// Whether the decoded text of `generated` contains any stop sequence.
-    fn generated_hits_stop(&self, generated: &[u32], stop: &[String]) -> bool {
-        let Ok(text) = self.tokenizer.decode(generated, true) else {
-            return false;
-        };
-        stop.iter().any(|needle| text.contains(needle.as_str()))
+    /// Decode the full generated token sequence to UTF-8 text (special tokens
+    /// skipped). Always valid UTF-8, so byte offsets into it land on codepoint
+    /// boundaries that grow monotonically as tokens are appended.
+    fn decode_generated(&self, generated: &[u32]) -> Result<String, CandleLlmError> {
+        self.tokenizer
+            .decode(generated, true)
+            .map_err(|error| self.execution_error(format!("failed to decode tokens: {error}")))
     }
 
     fn execution_error(&self, detail: String) -> CandleLlmError {
@@ -793,17 +839,33 @@ fn sanitize_stop(stop: Option<Vec<String>>) -> Vec<String> {
         .collect()
 }
 
-/// Trim decoded text at the earliest stop sequence, dropping the match and
-/// everything after it — mirroring OpenAI's `stop` semantics.
-fn trim_at_stop(text: &str, stop: &[String]) -> String {
-    let cut = stop
-        .iter()
+/// Byte offset of the earliest stop sequence in `text`, or `None`. The offset
+/// is a substring-match start, so it always lands on a UTF-8 codepoint boundary.
+fn find_earliest_stop(text: &str, stop: &[String]) -> Option<usize> {
+    stop.iter()
         .filter_map(|needle| text.find(needle.as_str()))
-        .min();
-    match cut {
-        Some(index) => text[..index].to_owned(),
-        None => text.to_owned(),
+        .min()
+}
+
+/// Emit `text[*emitted..end]` through `on_token` (when non-empty) and advance
+/// `*emitted`. `end` and `*emitted` must be codepoint boundaries.
+fn emit_delta(on_token: &mut dyn FnMut(&str), text: &str, emitted: &mut usize, end: usize) {
+    if *emitted < end && end <= text.len() {
+        on_token(&text[*emitted..end]);
+        *emitted = end;
     }
+}
+
+/// Largest codepoint boundary `<= idx` (a stable stand-in for the unstable
+/// `str::floor_char_boundary`).
+fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 /// Generic chat rendering used when a checkpoint ships no `chat_template`:
@@ -1628,13 +1690,30 @@ mod tests {
     }
 
     #[test]
-    fn trim_at_stop_cuts_at_the_earliest_match() {
+    fn find_earliest_stop_returns_the_earliest_match() {
         let stops = vec!["END".to_owned(), "stop".to_owned()];
-        assert_eq!(trim_at_stop("keep me END drop", &stops), "keep me ");
+        assert_eq!(find_earliest_stop("keep me END drop", &stops), Some(8));
         // Earliest of several matches wins.
-        assert_eq!(trim_at_stop("a stop b END c", &stops), "a ");
-        // No match returns the text unchanged.
-        assert_eq!(trim_at_stop("nothing here", &stops), "nothing here");
+        assert_eq!(find_earliest_stop("a stop b END c", &stops), Some(2));
+        // No match.
+        assert_eq!(find_earliest_stop("nothing here", &stops), None);
+    }
+
+    #[test]
+    fn streaming_deltas_concatenate_to_the_buffered_output() {
+        let (runtime, dir) = load_fixture("stream-concat");
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
+        let buffered =
+            String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+        let mut streamed = String::new();
+        runtime
+            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .expect("streamed");
+        assert_eq!(
+            streamed, buffered,
+            "the concatenation of streamed deltas must equal the buffered output"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
