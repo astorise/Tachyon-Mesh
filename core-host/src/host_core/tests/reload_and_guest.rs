@@ -574,8 +574,15 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     let engine = build_test_engine(&config);
     let ai_runtime = test_ai_runtime(&config);
 
-    // Skip if the wasm component was not built.
-    if resolve_guest_module_path("guest-openai").is_err() {
+    // Skip if the wasm component was not built — unless a CI run pins
+    // `TACHYON_REQUIRE_GUEST_OPENAI`, in which case a missing artifact is a
+    // hard failure (a silent skip would be a false green).
+    if let Err(missing) = resolve_guest_module_path("guest-openai") {
+        assert!(
+            std::env::var_os("TACHYON_REQUIRE_GUEST_OPENAI").is_none(),
+            "guest-openai wasm artifact required but not found ({missing}); \
+             build it with `cargo build -p guest-openai --target wasm32-wasip2 --release`"
+        );
         eprintln!("SKIP: guest-openai artifact not present; run `cargo build -p guest-openai --target wasm32-wasip2` first");
         return;
     }

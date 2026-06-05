@@ -81,9 +81,10 @@ replacing the unary contract:
   (streaming guest-execution + guest SSE export) is covered by an integration
   test that drives `execute_streaming_guest` and asserts the concatenated SSE
   deltas equal the buffered content; it requires the `wasm32-wasip2`
-  `guest-openai` artifact and skips when absent. That test runs only with
-  `--features ai-inference`, so wiring it into a CI step (and building
-  `guest-openai` to wasm there) is the remaining coverage gap.
+  `guest-openai` artifact. The `quality` CI job builds that artifact and runs the
+  test with `--features ai-inference` and `TACHYON_REQUIRE_GUEST_OPENAI=1`, so a
+  missing artifact fails the job instead of silently skipping (a local run
+  without the artifact still skips gracefully).
 - Streaming bypasses QoS batching. Acceptable: a streamed request is a single
   sequence and decode is bounded by `max_new_tokens`.
 - Streaming requests are dispatched with no `RouteResponseGuard`, so they do not

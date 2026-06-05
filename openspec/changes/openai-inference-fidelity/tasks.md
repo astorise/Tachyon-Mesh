@@ -54,6 +54,9 @@
       `content-type: text/event-stream`.
 - [x] 6.4 Integration test: an OpenAI streaming client receives incremental
       frames whose deltas concatenate to the non-streamed response.
+- [x] 6.5 Wire the integration test into CI: build `guest-openai` to
+      `wasm32-wasip2` in the `quality` job and run it with
+      `TACHYON_REQUIRE_GUEST_OPENAI=1` so a missing artifact fails the job.
 
 ## 7. Documentation
 
