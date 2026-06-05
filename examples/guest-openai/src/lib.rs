@@ -58,12 +58,36 @@ struct ChatCompletionRequest {
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stop: Option<StopField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
     content: String,
+}
+
+/// OpenAI's `stop` is either a single string or an array of strings. Normalised
+/// to a list before it is handed to the accelerator.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum StopField {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopField {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            StopField::One(value) => vec![value],
+            StopField::Many(values) => values,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -167,8 +191,10 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
 
 /// Run `/v1/chat/completions` against the host CPU accelerator: load the named
 /// model (lazily materialised by the host from the broker upload directory on
-/// first use), run the flattened prompt, and reshape the output into an
-/// OpenAI-compatible response. A model the host cannot load surfaces as 404.
+/// first use), hand the structured conversation and sampling parameters to the
+/// host (which renders the model's chat template and samples), and reshape the
+/// output into an OpenAI-compatible response. A model the host cannot load
+/// surfaces as 404.
 fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let request: ChatCompletionRequest = serde_json::from_slice(body)
         .map_err(|e| format!("invalid chat completion request: {e}"))?;
@@ -190,13 +216,7 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
         }
     };
 
-    let generation = serde_json::to_string(&serde_json::json!({
-        "prompt": flatten_messages(&request.messages),
-        "max_new_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-        "temperature": request.temperature.unwrap_or(DEFAULT_TEMPERATURE),
-    }))
-    .map_err(|e| format!("failed to encode generation request: {e}"))?;
-
+    let generation = build_generation_request(&request)?;
     let output = bindings::tachyon::accelerator::cpu::compute(model_id, &generation)
         .map_err(|e| format!("inference failed for model `{}`: {e}", request.model))?;
 
@@ -219,18 +239,29 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
         .map_err(|e| format!("failed to encode chat completion response: {e}"))
 }
 
-/// Flatten OpenAI chat messages into a single prompt the host tokenizes, ending
-/// on an open `assistant:` turn so the model continues as the assistant.
-fn flatten_messages(messages: &[ChatMessage]) -> String {
-    let mut prompt = String::new();
-    for message in messages {
-        prompt.push_str(message.role.trim());
-        prompt.push_str(": ");
-        prompt.push_str(message.content.trim());
-        prompt.push('\n');
+/// Encode the host generation request: the structured chat turns (the host
+/// renders the model's own chat template) plus the resolved sampling
+/// parameters. Defaults are applied here so the host always receives concrete
+/// values; the host still clamps them to its hard caps.
+fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, String> {
+    let mut payload = serde_json::json!({
+        "messages": request.messages,
+        "max_new_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "temperature": request.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+    });
+    let object = payload
+        .as_object_mut()
+        .ok_or("generation payload must be a JSON object")?;
+    if let Some(top_p) = request.top_p {
+        object.insert("top_p".to_owned(), serde_json::json!(top_p));
     }
-    prompt.push_str("assistant:");
-    prompt
+    if let Some(seed) = request.seed {
+        object.insert("seed".to_owned(), serde_json::json!(seed));
+    }
+    if let Some(stop) = request.stop.clone() {
+        object.insert("stop".to_owned(), serde_json::json!(stop.into_vec()));
+    }
+    serde_json::to_string(&payload).map_err(|e| format!("failed to encode generation request: {e}"))
 }
 
 /// Read the registry fresh from kv-partition and reshape into the OpenAI
@@ -321,19 +352,60 @@ mod tests {
     }
 
     #[test]
-    fn flatten_messages_ends_on_an_open_assistant_turn() {
-        let messages = vec![
-            ChatMessage {
-                role: "system".to_owned(),
-                content: "be terse".to_owned(),
-            },
-            ChatMessage {
+    fn build_generation_request_carries_messages_and_defaults() {
+        // No sampling params set: messages are forwarded structurally (the host
+        // owns chat templating) and the defaults are made concrete.
+        let request = ChatCompletionRequest {
+            model: "m".to_owned(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_owned(),
+                    content: "be terse".to_owned(),
+                },
+                ChatMessage {
+                    role: "user".to_owned(),
+                    content: "hello".to_owned(),
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: None,
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                .expect("valid json");
+        assert_eq!(payload["messages"][0]["role"], "system");
+        assert_eq!(payload["messages"][1]["content"], "hello");
+        assert_eq!(payload["max_new_tokens"], DEFAULT_MAX_TOKENS);
+        // Optional params are omitted when unset, so the host applies its own.
+        assert!(payload.get("top_p").is_none());
+        assert!(payload.get("seed").is_none());
+        assert!(payload.get("stop").is_none());
+    }
+
+    #[test]
+    fn build_generation_request_forwards_sampling_params_and_normalizes_stop() {
+        let request = ChatCompletionRequest {
+            model: "m".to_owned(),
+            messages: vec![ChatMessage {
                 role: "user".to_owned(),
-                content: "hello".to_owned(),
-            },
-        ];
-        let prompt = flatten_messages(&messages);
-        assert_eq!(prompt, "system: be terse\nuser: hello\nassistant:");
+                content: "hi".to_owned(),
+            }],
+            max_tokens: Some(32),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            seed: Some(7),
+            stop: Some(StopField::One("\n\n".to_owned())),
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                .expect("valid json");
+        assert_eq!(payload["max_new_tokens"], 32);
+        assert_eq!(payload["seed"], 7);
+        // A scalar `stop` is normalised to a single-element array for the host.
+        assert_eq!(payload["stop"], serde_json::json!(["\n\n"]));
     }
 
     #[test]
