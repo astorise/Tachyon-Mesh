@@ -61,19 +61,31 @@ replacing the unary contract:
    dedicated thread that pushes fragments into a channel the resource drains.
    Streaming bypasses the batch scheduler (a single sequence; the backend
    serialises its own execution). The sealed-alias scope gate is unchanged.
-3. **HTTP transport.** `guest-openai` exposes OpenAI SSE for `stream: true`,
-   pulling fragments from `compute-stream` and emitting `chat.completion.chunk`
-   frames terminated by `data: [DONE]`. Because the OpenAI surface must remain a
-   user FaaS, the framing lives in the guest; the host provides a generic
-   streaming guest-execution path that flushes body chunks as the guest
-   produces them, mirroring the existing websocket execution path.
+3. **HTTP transport.** A generic `tachyon:mesh/response-body` interface gives the
+   guest a `streaming-response` resource (`begin(status, headers)` then `write`).
+   The host routes a request carrying `Accept: text/event-stream` to a streaming
+   guest-execution path that runs the guest on a dedicated thread with the sink
+   pre-installed, awaits the `begin` headers over a oneshot, and returns an axum
+   `Body::from_stream` fed by a bounded channel — so headers and first bytes
+   reach the client before generation ends. A guest that never calls `begin`
+   falls back to buffered delivery through the same channel pair. Because the
+   OpenAI surface must remain a user FaaS, the SSE framing lives in `guest-openai`
+   (it pulls `compute-stream` fragments and emits `chat.completion.chunk` frames
+   terminated by `data: [DONE]`); the host transport is interface-agnostic. This
+   mirrors the existing websocket execution path.
 
 ### Risks / Trade-offs
 
 - The host-side engine, the accelerator streaming primitive, sampling, chat
-  templates, and stop are unit-testable natively. The HTTP wire transport
-  (streaming guest-execution path + guest SSE export) requires the `wasm32-
-  wasip2` guest and wasmtime integration, which is validated where the wasm
-  toolchain runs, not in a CPU-only host unit test.
+  templates, and stop are unit-testable natively. The end-to-end HTTP wire path
+  (streaming guest-execution + guest SSE export) is covered by an integration
+  test that drives `execute_streaming_guest` and asserts the concatenated SSE
+  deltas equal the buffered content; it requires the `wasm32-wasip2`
+  `guest-openai` artifact and skips when absent. That test runs only with
+  `--features ai-inference`, so wiring it into a CI step (and building
+  `guest-openai` to wasm there) is the remaining coverage gap.
 - Streaming bypasses QoS batching. Acceptable: a streamed request is a single
   sequence and decode is bounded by `max_new_tokens`.
+- Streaming requests are dispatched with no `RouteResponseGuard`, so they do not
+  yet participate in graceful-drain response accounting; long-lived SSE streams
+  could outlive a drain. A follow-up can thread a guard through the transport.

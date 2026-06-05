@@ -46,14 +46,23 @@ None.
   streaming primitive.
 - `openai-compatible-faas`: `/v1/chat/completions` runs real inference (no longer
   a stub), forwards sampling parameters, and supports streaming responses.
+- `core-host`: a generic incremental body-flush streaming transport
+  (`tachyon:mesh/response-body`) with a buffered fallback, plus the scope-gated
+  `kv-partition`/`graph` linker fix that lets the user-role FaaS linker
+  instantiate components importing those interfaces.
 
 ## Impact
 
 - Affected code: `core-host/src/ai_inference.rs`,
   `core-host/src/ai_inference/candle_llm_runtime.rs`,
-  `core-host/src/host_core/component_hosts.rs`, `wit/accelerator/accelerator-cpu.wit`,
-  `examples/guest-openai/`, and the AI inference tests.
+  `core-host/src/host_core/component_hosts.rs`,
+  `core-host/src/host_core/guest_runtime.rs`, `core-host/src/host_core/app_runtime.rs`,
+  `core-host/src/network/mod.rs`, `wit/accelerator/accelerator-cpu.wit`,
+  `wit/tachyon.wit` (the `response-body` interface), `examples/guest-openai/`, and
+  the AI inference + streaming integration tests.
 - Affected dependencies: `minijinja` + `minijinja-contrib` (pycompat) under the
   existing `ai-inference` feature; no dependency is added to default builds.
-- The WIT change is additive (`compute-stream`), so existing guests are
-  unaffected. Streaming is CPU-first, where the real Candle backend runs.
+- The WIT changes are additive (`compute-stream` on the accelerator, the
+  `response-body` interface imported by `faas-guest`), so existing guests are
+  unaffected. Streaming is CPU-first, where the real Candle backend runs, and the
+  streaming HTTP path is gated behind `ai-inference`.
