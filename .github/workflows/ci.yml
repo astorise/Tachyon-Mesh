@@ -187,7 +187,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@nextest
 
       - name: Download guest artifacts
         uses: actions/download-artifact@v8
@@ -359,7 +359,7 @@ jobs:
           sudo apt-get install -y cmake nasm protobuf-compiler
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@nextest
 
       - name: Download guest artifacts
         uses: actions/download-artifact@v8
@@ -416,7 +416,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@nextest
 
       - name: Download guest artifacts
         uses: actions/download-artifact@v8
