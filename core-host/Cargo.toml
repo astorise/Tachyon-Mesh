@@ -10,8 +10,8 @@ default = ["ring"]
 # WASI-NN guest interface backed by our CandleOnnxBackend.
 ai-inference = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-onnx", "dep:candle-transformers",
-    "dep:lru", "dep:prost", "dep:tokenizers", "dep:turboquant-sys",
-    "dep:wasmtime-wasi-nn",
+    "dep:lru", "dep:minijinja", "dep:minijinja-contrib", "dep:prost", "dep:tokenizers",
+    "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
 ]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
@@ -55,6 +55,11 @@ forwarded-header-value = { version = "0.1", optional = true }
 globset = "0.4"
 governor = { version = "0.10", optional = true }
 memmap2 = "0.9"
+# Renders Hugging Face `chat_template` (Jinja2) strings for OpenAI-style chat
+# requests. `pycompat` adds the Python string methods (e.g. `.strip()`) that
+# real instruct templates rely on. Both are gated behind `ai-inference`.
+minijinja = { version = "2", optional = true }
+minijinja-contrib = { version = "2", optional = true, features = ["pycompat"] }
 moka = { version = "0.12", features = ["sync"] }
 notify = { version = "8.0", default-features = false, features = ["macos_kqueue"] }
 h3 = { version = "0.0.8", optional = true }

@@ -821,6 +821,155 @@ pub(crate) async fn handle_websocket_connection(
     Ok(())
 }
 
+/// Handle a streaming HTTP request for user-role FaaS components. Mirrors
+/// `handle_websocket_connection`: spawns a blocking thread to run the WASM
+/// guest, wires up `tachyon:mesh/response-body` channels, and returns an
+/// axum `Response` with a `GuestStreamingBody` body that drains live as the
+/// guest produces chunks. Triggered by `Accept: text/event-stream` on
+/// ai-inference routes.
+#[cfg(feature = "ai-inference")]
+pub(crate) async fn handle_streaming_http_request(
+    state: AppState,
+    runtime: Arc<RuntimeState>,
+    route: IntegrityRoute,
+    function_name: String,
+    request: GuestRequest,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    let volume_leases = state
+        .volume_manager
+        .acquire_route_volumes(&route, Arc::clone(&state.storage_broker))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to acquire streaming route volumes: {error}"),
+            )
+        })?;
+    let semaphore = runtime
+        .concurrency_limits
+        .get(&route.path)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "streaming route `{}` is missing a concurrency limiter",
+                    route.path
+                ),
+            )
+        })?;
+    let active_request_guard = semaphore.begin_request();
+    let permit = acquire_route_permit(semaphore)
+        .await
+        .map_err(|error| match error {
+            RoutePermitError::Closed => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("streaming route `{}` is unavailable", route.path),
+            ),
+            RoutePermitError::TimedOut => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("streaming route `{}` is saturated", route.path),
+            ),
+        })?;
+
+    let engine = runtime.engine.clone();
+    let config = runtime.config.clone();
+    let runtime_telemetry = state.telemetry.clone();
+    let secret_access = SecretAccess::from_route(&route, &state.secrets_vault);
+    let host_identity = Arc::clone(&state.host_identity);
+    let storage_broker = Arc::clone(&state.storage_broker);
+    let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
+    let bridge_manager = Arc::clone(&state.bridge_manager);
+    let route_overrides = Arc::clone(&state.route_overrides);
+    let host_load = Arc::clone(&state.host_load);
+    let ai_runtime = Arc::clone(&runtime.ai_runtime);
+    let instance_pool = Arc::clone(&runtime.instance_pool);
+    let linker_cache = Arc::clone(&runtime.linker_cache);
+    let async_log_sender = state.async_log_sender.clone();
+    let request_headers = request
+        .headers
+        .iter()
+        .filter_map(|(k, v)| {
+            let name = HeaderName::from_bytes(k.as_bytes()).ok()?;
+            let value = HeaderValue::from_str(v).ok()?;
+            Some((name, value))
+        })
+        .collect::<HeaderMap>();
+
+    let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();
+    let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+
+    std::thread::Builder::new()
+        .name(format!("tachyon-streaming-{}", route.path))
+        .spawn(move || {
+            let _volume_leases = volume_leases;
+            let _permit = permit;
+            let execution = GuestExecutionContext {
+                config,
+                sampled_execution: false,
+                runtime_telemetry,
+                async_log_sender,
+                secret_access,
+                request_headers,
+                host_identity,
+                storage_broker,
+                bridge_manager,
+                telemetry: None,
+                concurrency_limits,
+                propagated_headers: Vec::new(),
+                route_overrides,
+                host_load,
+                ai_runtime,
+                instance_pool: Some(instance_pool),
+                linker_cache: Some(linker_cache),
+            };
+            execute_streaming_guest(
+                &engine,
+                &route,
+                &function_name,
+                request,
+                headers_tx,
+                chunks_tx,
+                &execution,
+            );
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to spawn streaming guest thread: {e}"),
+            )
+        })?;
+
+    // Wait for the guest to commit status + headers (via `begin()`) or for
+    // `handle-request` to return (buffered fallback). Either way headers_rx
+    // fires before any body bytes can be read.
+    let (status, guest_headers) = headers_rx.await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "streaming guest exited without sending response headers".to_owned(),
+        )
+    })?;
+
+    let body = GuestStreamingBody {
+        receiver: chunks_rx,
+        _completion_guard: Some(active_request_guard.into_response_guard()),
+    };
+
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::new(body))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build streaming response: {e}"),
+            )
+        })?;
+    if let Err(e) = insert_guest_fields(response.headers_mut(), &guest_headers, "response header") {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
+    Ok(response)
+}
+
 pub(crate) async fn handle_tcp_layer4_connection(
     state: AppState,
     route: IntegrityRoute,

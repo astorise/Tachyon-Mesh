@@ -152,6 +152,7 @@ impl ComponentHostState {
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
+            streaming_body: None,
         })
     }
 
@@ -336,6 +337,55 @@ impl ComponentHostState {
                 &prompt,
                 self.adapter_id.as_deref(),
             )
+    }
+
+    /// Begin a streaming generation: resolve the model handle (the same scope
+    /// and accelerator checks as `compute_accelerator_prompt`), then run the
+    /// decode on a dedicated thread that pushes each decoded text fragment into
+    /// a channel. The returned receiver is drained by the `token-stream`
+    /// resource's `next` calls, giving the guest real time-to-first-token.
+    #[cfg(feature = "ai-inference")]
+    pub(crate) fn stream_accelerator_prompt(
+        &self,
+        expected_accelerator: ai_inference::AcceleratorKind,
+        model_id: u32,
+        prompt: String,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<String, String>>, String>
+    {
+        let loaded = self
+            .accelerator_models
+            .get(&model_id)
+            .ok_or_else(|| format!("accelerator model handle `{model_id}` is unknown"))?;
+        if loaded.accelerator != expected_accelerator {
+            return Err(format!(
+                "accelerator model handle `{model_id}` was loaded for `{}` not `{}`",
+                loaded.accelerator.as_str(),
+                expected_accelerator.as_str()
+            ));
+        }
+        let alias = loaded.alias.clone();
+        let ai_runtime =
+            Arc::clone(self.ai_runtime.as_ref().ok_or_else(|| {
+                "AI inference runtime is unavailable for this component".to_owned()
+            })?);
+        let (sender, receiver) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
+        std::thread::Builder::new()
+            .name("tachyon-stream-gen".to_owned())
+            .spawn(move || {
+                // The closure forwards each fragment; a closed receiver (the
+                // guest dropped the stream) just makes `send` fail, which we
+                // ignore — the bounded decode finishes on its own.
+                let mut sink = |fragment: &str| {
+                    let _ = sender.send(Ok(fragment.to_owned()));
+                };
+                if let Err(error) = ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
+                    let _ = sender.send(Err(error));
+                }
+                // `sender` drops here: the channel closes and `next` reports the
+                // end of the stream.
+            })
+            .map_err(|error| format!("failed to spawn streaming generation thread: {error}"))?;
+        Ok(receiver)
     }
 }
 
@@ -1855,6 +1905,14 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     }
 }
 
+/// Host state behind a `tachyon:accelerator/cpu` `token-stream` resource: the
+/// receiving end of the channel the generation thread writes decoded fragments
+/// into. `next` drains it; a closed channel marks the end of the stream.
+#[cfg(feature = "ai-inference")]
+pub(crate) struct HostTokenStream {
+    receiver: std::sync::mpsc::Receiver<std::result::Result<String, String>>,
+}
+
 #[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for ComponentHostState {
     fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
@@ -1863,6 +1921,63 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
+    }
+
+    fn compute_stream(
+        &mut self,
+        model_id: u32,
+        prompt: String,
+    ) -> std::result::Result<
+        wasmtime::component::Resource<
+            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+        >,
+        String,
+    > {
+        let receiver =
+            self.stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)?;
+        let handle = self
+            .table
+            .push(HostTokenStream { receiver })
+            .map_err(|error| format!("failed to register token stream resource: {error}"))?;
+        Ok(wasmtime::component::Resource::new_own(handle.rep()))
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
+    for ComponentHostState
+{
+    fn next(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+        >,
+    ) -> std::result::Result<Option<String>, String> {
+        let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
+        let stream = self
+            .table
+            .get(&handle)
+            .map_err(|error| format!("failed to access token stream resource: {error}"))?;
+        // `recv` blocks until the next fragment; a disconnected channel means the
+        // generation thread finished, so the stream is complete.
+        match stream.receiver.recv() {
+            Ok(Ok(fragment)) => Ok(Some(fragment)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn drop(
+        &mut self,
+        rep: wasmtime::component::Resource<
+            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+        >,
+    ) -> wasmtime::Result<()> {
+        self.table
+            .delete(wasmtime::component::Resource::<HostTokenStream>::new_own(
+                rep.rep(),
+            ))?;
+        Ok(())
     }
 }
 
@@ -2695,5 +2810,84 @@ pub(crate) fn loopback_ip_for(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    }
+}
+
+// ── tachyon:mesh/response-body ────────────────────────────────────────────────
+
+impl component_bindings::tachyon::mesh::response_body::Host for ComponentHostState {
+    fn get_streaming_response(
+        &mut self,
+    ) -> std::result::Result<
+        wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::response_body::StreamingResponse,
+        >,
+        String,
+    > {
+        let slot = self
+            .streaming_body
+            .take()
+            .ok_or_else(|| "no streaming response available for this request".to_owned())?;
+        let resource = HostStreamingResponseResource {
+            headers_tx: Some(slot.headers_tx),
+            chunk_tx: slot.chunk_tx,
+        };
+        let owned = self
+            .table
+            .push(resource)
+            .expect("resource table push failed");
+        Ok(wasmtime::component::Resource::new_own(owned.rep()))
+    }
+}
+
+impl component_bindings::tachyon::mesh::response_body::HostStreamingResponse
+    for ComponentHostState
+{
+    fn begin(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::response_body::StreamingResponse,
+        >,
+        status: u16,
+        headers: Vec<(String, String)>,
+    ) -> std::result::Result<(), String> {
+        let handle =
+            wasmtime::component::Resource::<HostStreamingResponseResource>::new_borrow(self_.rep());
+        let res = self.table.get_mut(&handle).map_err(|e| format!("{e:#}"))?;
+        let tx = res
+            .headers_tx
+            .take()
+            .ok_or_else(|| "begin() called more than once on streaming-response".to_owned())?;
+        let sc = StatusCode::from_u16(status)
+            .map_err(|e| format!("invalid status code {status}: {e}"))?;
+        let _ = tx.send((sc, headers));
+        Ok(())
+    }
+
+    fn write(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::response_body::StreamingResponse,
+        >,
+        chunk: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        let handle =
+            wasmtime::component::Resource::<HostStreamingResponseResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        res.chunk_tx
+            .blocking_send(Bytes::from(chunk))
+            .map_err(|_| "streaming body channel closed".to_owned())
+    }
+
+    fn drop(
+        &mut self,
+        rep: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::response_body::StreamingResponse,
+        >,
+    ) -> wasmtime::Result<()> {
+        self.table.delete(
+            wasmtime::component::Resource::<HostStreamingResponseResource>::new_own(rep.rep()),
+        )?;
+        Ok(())
     }
 }

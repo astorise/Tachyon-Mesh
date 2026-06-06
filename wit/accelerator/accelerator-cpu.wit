@@ -1,6 +1,20 @@
 package tachyon:accelerator@1.1.0;
 
 interface cpu {
+    /// A handle to an in-progress streaming generation. The caller pulls decoded
+    /// text fragments with `next` until it returns `none`, which signals that
+    /// generation is complete. Dropping the handle abandons the generation.
+    resource token-stream {
+        /// Block until the next decoded text fragment is available. Returns
+        /// `none` once generation finishes, or an error string if it failed.
+        next: func() -> result<option<string>, string>;
+    }
+
     load-model: func(name: string) -> result<u32, string>;
     compute: func(model-id: u32, prompt: string) -> result<string, string>;
+    /// Begin a streaming generation for a previously loaded model. The returned
+    /// `token-stream` yields decoded text fragments as the host produces them,
+    /// giving the caller real time-to-first-token instead of a buffered result.
+    /// The concatenation of every fragment equals the buffered `compute` output.
+    compute-stream: func(model-id: u32, prompt: string) -> result<token-stream, string>;
 }

@@ -151,6 +151,18 @@ jobs:
       - name: Test real Candle LLM fixture
         run: cargo test -p core-host --features ai-inference --bin core-host real_candle_llm_runtime
 
+      # Build the guest the streaming integration test drives, then run it. The
+      # test resolves `target/wasm32-wasip2/release/guest_openai.wasm`; with
+      # TACHYON_REQUIRE_GUEST_OPENAI set it fails hard instead of skipping if the
+      # artifact is missing, so this can never become a false green.
+      - name: Build guest-openai (wasm) for the streaming integration test
+        run: cargo build -p guest-openai --target wasm32-wasip2 --release
+
+      - name: Test AI streaming SSE transport end-to-end
+        env:
+          TACHYON_REQUIRE_GUEST_OPENAI: "1"
+        run: cargo test -p core-host --features ai-inference --bin core-host streaming_guest_openai -- --nocapture
+
       - name: Check s3-persistence host build
         run: cargo check -p core-host --features s3-persistence
 

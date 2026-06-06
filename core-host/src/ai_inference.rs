@@ -195,6 +195,25 @@ trait BackendModel: Send + Sync {
     fn residency(&self) -> AcceleratorMemoryResidency;
     fn as_any(&self) -> &dyn Any;
     fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>>;
+
+    /// Stream decoded text fragments through `on_token` as they are produced.
+    /// The default implementation runs `execute` and emits the entire output as
+    /// a single fragment — a correct, non-incremental fallback for backends that
+    /// cannot stream (mock, NVFP4). Backends that can decode token-by-token
+    /// override this for real time-to-first-token.
+    fn stream_text(
+        &self,
+        inputs: &[SharedInputTensor],
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let output = self.execute(inputs)?;
+        let text =
+            String::from_utf8(output).map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
+        if !text.is_empty() {
+            on_token(&text);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -483,6 +502,46 @@ impl AiInferenceRuntime {
             )
             .map_err(|error| error.to_string())?;
         String::from_utf8(output).map_err(|error| error.to_string())
+    }
+
+    /// Stream a prompt's decoded output, invoking `on_token` for each text
+    /// fragment as it is produced. The scope gate (sealed alias) is enforced by
+    /// the caller before this point, exactly as for [`compute_component_prompt`].
+    ///
+    /// Streaming bypasses the batch scheduler: a streamed request is inherently a
+    /// single sequence, and the backend serialises its own execution (the GGUF
+    /// runtime behind a mutex, safetensors per-request). It therefore runs on the
+    /// caller's blocking thread rather than the QoS dispatcher.
+    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    pub(crate) fn stream_component_prompt(
+        &self,
+        alias: &str,
+        prompt: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
+        self.ensure_model_loaded(alias)?;
+        let model = {
+            let models = self.models.read().expect("model registry lock poisoned");
+            models
+                .get(alias)
+                .cloned()
+                .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
+        };
+        if self.scheduler_for(model.accelerator).is_none() {
+            return Err(format!(
+                "{} accelerator is unavailable on this host",
+                model.accelerator.as_str()
+            ));
+        }
+        let input = SharedInputTensor {
+            dimensions: vec![prompt.len() as u32],
+            ty: TensorType::U8,
+            data: Arc::from(prompt.as_bytes()),
+        };
+        model
+            .backend_model
+            .stream_text(&[input], on_token)
+            .map_err(|error| error.to_string())
     }
 
     fn scheduler_for(&self, accelerator: AcceleratorKind) -> Option<AcceleratorScheduler> {
@@ -976,6 +1035,46 @@ impl BackendModel for CandleBackendModel {
                 .context("failed to prepare candle mock batch")?;
         let _resident_weights = self.source.model_bytes.len();
         Ok(b"MOCK_LLM_RESPONSE".to_vec())
+    }
+
+    fn stream_text(
+        &self,
+        inputs: &[SharedInputTensor],
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        // Only the text-generation backend decodes incrementally; everything
+        // else (mock, NVFP4) uses the trait's buffered emit-once fallback.
+        let CandleBackendModelKind::TextGeneration(runtime) = &self.kind else {
+            let output = self.execute(inputs)?;
+            let text = String::from_utf8(output)
+                .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
+            if !text.is_empty() {
+                on_token(&text);
+            }
+            return Ok(());
+        };
+        if inputs
+            .iter()
+            .any(|input| !matches!(input.ty, TensorType::U8))
+        {
+            return Err(anyhow!(
+                "Candle LLM model `{}` only accepts U8 prompt tensors",
+                self.source.alias
+            ));
+        }
+        let prompts = inputs
+            .iter()
+            .map(|input| input.data.as_ref())
+            .collect::<Vec<_>>();
+        runtime
+            .generate_streaming(&prompts, on_token)
+            .map_err(|error| {
+                anyhow!(
+                    "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                    self.source.alias,
+                    runtime.root().display()
+                )
+            })
     }
 }
 
@@ -1815,6 +1914,34 @@ mod tests {
             "a real forward pass should decode at least one token"
         );
         assert_ne!(output, MOCK_INFERENCE_RESPONSE);
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn streamed_prompt_matches_the_buffered_output() {
+        let model_dir = unique_candle_llm_dir("stream-vs-buffered");
+        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
+            .expect("fixture should be written");
+        let runtime =
+            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
+                .expect("runtime should load real Candle LLM fixture");
+
+        let buffered = runtime
+            .compute_component_prompt("tiny", "hello")
+            .expect("buffered generation");
+        let mut streamed = String::new();
+        let mut fragments = 0usize;
+        runtime
+            .stream_component_prompt("tiny", "hello", &mut |delta| {
+                streamed.push_str(delta);
+                fragments += 1;
+            })
+            .expect("streamed generation");
+        assert_eq!(
+            streamed, buffered,
+            "streamed fragments must reconstruct the buffered output exactly"
+        );
+        assert!(fragments >= 1, "streaming must emit at least one fragment");
         let _ = fs::remove_dir_all(model_dir);
     }
 

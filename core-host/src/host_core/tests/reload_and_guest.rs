@@ -549,3 +549,157 @@ fn execute_guest_persists_volume_data_for_component_guest() {
 
     let _ = fs::remove_dir_all(volume_dir);
 }
+
+/// Integration test: `guest-openai` with `stream: true` delivers incremental
+/// SSE frames whose deltas concatenate to the non-streamed response content.
+/// Both the buffered reference and the streaming call go through
+/// `execute_streaming_guest` so the same linker path is used for both.
+/// Skipped automatically when the wasm32-wasip2 artifact is not present
+/// (requires `cargo build -p guest-openai --target wasm32-wasip2` first).
+#[cfg(feature = "ai-inference")]
+#[tokio::test]
+async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
+    let mut route = IntegrityRoute::user("/v1/chat/completions");
+    route.models = vec![IntegrityModelBinding {
+        alias: "llama3".to_owned(),
+        path: "mock:llama3".to_owned(),
+        device: ModelDevice::Cpu,
+        qos: RouteQos::Standard,
+        dynamic: false,
+    }];
+    let config = IntegrityConfig {
+        routes: vec![route.clone()],
+        ..IntegrityConfig::default_sealed()
+    };
+    let engine = build_test_engine(&config);
+    let ai_runtime = test_ai_runtime(&config);
+
+    // Skip if the wasm component was not built — unless a CI run pins
+    // `TACHYON_REQUIRE_GUEST_OPENAI`, in which case a missing artifact is a
+    // hard failure (a silent skip would be a false green).
+    if let Err(missing) = resolve_guest_module_path("guest-openai") {
+        assert!(
+            std::env::var_os("TACHYON_REQUIRE_GUEST_OPENAI").is_none(),
+            "guest-openai wasm artifact required but not found ({missing}); \
+             build it with `cargo build -p guest-openai --target wasm32-wasip2 --release`"
+        );
+        eprintln!("SKIP: guest-openai artifact not present; run `cargo build -p guest-openai --target wasm32-wasip2` first");
+        return;
+    }
+
+    let messages = serde_json::json!([{"role": "user", "content": "ping"}]);
+
+    // Helper: run execute_streaming_guest, return (status, headers, body_string).
+    let run_streaming = |body_json: serde_json::Value, seed: u8| {
+        let route_c = route.clone();
+        let engine_c = engine.clone();
+        let config_c = config.clone();
+        let ai_runtime_c = Arc::clone(&ai_runtime);
+        let req = GuestRequest::new(
+            "POST",
+            "/v1/chat/completions",
+            Bytes::from(serde_json::to_vec(&body_json).expect("encode")),
+        );
+        let (htx, hrx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();
+        let (ctx, crx) = tokio::sync::mpsc::channel::<Bytes>(64);
+        std::thread::spawn(move || {
+            execute_streaming_guest(
+                &engine_c,
+                &route_c,
+                "guest-openai",
+                req,
+                htx,
+                ctx,
+                &GuestExecutionContext {
+                    config: config_c,
+                    sampled_execution: false,
+                    runtime_telemetry: telemetry::init_test_telemetry(),
+                    async_log_sender: test_log_sender(),
+                    secret_access: SecretAccess::default(),
+                    request_headers: HeaderMap::new(),
+                    host_identity: test_host_identity(seed),
+                    storage_broker: Arc::new(StorageBrokerManager::default()),
+                    bridge_manager: Arc::new(BridgeManager::default()),
+                    telemetry: None,
+                    concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
+                    propagated_headers: Vec::new(),
+                    route_overrides: test_route_overrides(),
+                    host_load: test_host_load(),
+                    ai_runtime: ai_runtime_c,
+                    instance_pool: None,
+                    linker_cache: None,
+                },
+            );
+        });
+        (hrx, crx)
+    };
+
+    // ── Buffered reference: no `stream` field → fallback path sends JSON body ──
+    // The streaming execution path is used for both calls; the buffered case
+    // uses the channel-based fallback (guest returns normally without calling
+    // get-streaming-response).
+    let (hrx_ref, mut crx_ref) = run_streaming(
+        serde_json::json!({"model": "llama3", "messages": messages}),
+        91,
+    );
+    let (ref_status, ref_headers) = hrx_ref.await.expect("reference headers should arrive");
+    let mut ref_body_bytes = Vec::new();
+    while let Some(chunk) = crx_ref.recv().await {
+        ref_body_bytes.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        ref_status,
+        StatusCode::OK,
+        "buffered reference returned non-200; headers={ref_headers:?} body={}",
+        String::from_utf8_lossy(&ref_body_bytes)
+    );
+    let ref_json: Value =
+        serde_json::from_slice(&ref_body_bytes).expect("buffered reference should be JSON");
+    let buffered_content = ref_json["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("buffered reference must have content")
+        .to_owned();
+
+    // ── Streaming call: stream: true → SSE path ──────────────────────────
+    let (hrx_s, mut crx_s) = run_streaming(
+        serde_json::json!({"model": "llama3", "messages": messages, "stream": true}),
+        92,
+    );
+
+    // Headers must arrive before any body bytes (true TTFT signal).
+    let (stream_status, stream_headers) = hrx_s.await.expect("streaming headers should arrive");
+    assert_eq!(stream_status, StatusCode::OK);
+    assert!(
+        stream_headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream")),
+        "streaming response must carry content-type: text/event-stream; got: {stream_headers:?}"
+    );
+
+    let mut sse_body = String::new();
+    while let Some(chunk) = crx_s.recv().await {
+        sse_body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+
+    assert!(
+        sse_body.contains("data: [DONE]"),
+        "SSE stream must end with data: [DONE]\n{sse_body:?}"
+    );
+
+    // Concatenated deltas == buffered content.
+    let delta_content: String = sse_body
+        .lines()
+        .filter(|l| l.starts_with("data: ") && !l.contains("[DONE]"))
+        .filter_map(|l| {
+            let v: Value = serde_json::from_str(&l["data: ".len()..]).ok()?;
+            v["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+
+    assert_eq!(
+        delta_content, buffered_content,
+        "concatenated SSE deltas must equal the buffered response content"
+    );
+}

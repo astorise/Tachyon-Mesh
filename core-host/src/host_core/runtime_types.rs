@@ -131,6 +131,10 @@ pub(crate) struct ComponentHostState {
     pub(crate) accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
     #[cfg(feature = "ai-inference")]
     pub(crate) next_accelerator_model_id: u32,
+    /// Set by `execute_streaming_component_guest` before calling
+    /// `handle-request`. `None` on the buffered path — `get-streaming-response`
+    /// returns an error, and the guest falls back to the buffered return value.
+    pub(crate) streaming_body: Option<HostStreamingBodySlot>,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -549,6 +553,52 @@ pub(crate) enum HostWebSocketFrame {
 pub(crate) struct HostWebSocketConnection {
     pub(crate) incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
     pub(crate) outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+}
+
+/// Pre-populated by `execute_streaming_component_guest` before the WASM call.
+/// The guest acquires a `streaming-response` resource via
+/// `tachyon:mesh/response-body::get-streaming-response`, which consumes this
+/// slot. If the guest never calls `get-streaming-response`, the thread's
+/// fallback path sends the buffered return value through the same channels.
+pub(crate) struct HostStreamingBodySlot {
+    pub(crate) headers_tx: tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>,
+    pub(crate) chunk_tx: tokio::sync::mpsc::Sender<Bytes>,
+}
+
+/// Host state stored in the `ResourceTable` behind a
+/// `tachyon:mesh/response-body::streaming-response` resource handle. Produced
+/// by the `get-streaming-response` host function from a `HostStreamingBodySlot`.
+#[allow(dead_code)]
+pub(crate) struct HostStreamingResponseResource {
+    /// `None` once `begin()` has been called (sender consumed).
+    pub(crate) headers_tx: Option<tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>>,
+    pub(crate) chunk_tx: tokio::sync::mpsc::Sender<Bytes>,
+}
+
+/// Streaming HTTP response body backed by a tokio channel. Produced by the
+/// streaming guest-execution path; drained asynchronously by axum as the
+/// WASM guest writes chunks.
+#[cfg(feature = "ai-inference")]
+pub(crate) struct GuestStreamingBody {
+    pub(crate) receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    pub(crate) _completion_guard: Option<RouteResponseGuard>,
+}
+
+#[cfg(feature = "ai-inference")]
+impl hyper::body::Body for GuestStreamingBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        match self.receiver.poll_recv(cx) {
+            Poll::Ready(Some(bytes)) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]

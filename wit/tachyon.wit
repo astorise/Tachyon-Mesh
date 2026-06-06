@@ -1,9 +1,10 @@
+package tachyon:mesh@1.1.0;
+
 // This file is the single source of truth for all Tachyon Mesh WIT interfaces.
 // Do NOT fork worlds or create `-with-X` variants. Per-deployment import
 // authorization is layered on top by the host at link time and in runtime host
 // closures — the guest binary is unchanged. See `core-host/src/host_core/scoping/`
 // for the host-side implementation of the authorization layer.
-package tachyon:mesh@1.1.0;
 
 interface handler {
     type headers = list<tuple<string, string>>;
@@ -276,6 +277,31 @@ interface kv-partition {
     }
 }
 
+/// Generic incremental body-flush transport. A guest acquires the
+/// `streaming-response` handle via `get-streaming-response`, commits the
+/// HTTP status and headers with `begin`, then flushes body bytes with
+/// `write`. Each `write` is forwarded to the client immediately; the stream
+/// terminates when the handle is dropped. Only available when the host
+/// execution path was set up for streaming (i.e. the request included
+/// `Accept: text/event-stream`). Non-streaming requests receive an error
+/// from `get-streaming-response` and fall back to the buffered
+/// `handler::response` return value.
+interface response-body {
+    resource streaming-response {
+        /// Commit the response status and headers; the HTTP layer starts
+        /// sending them to the client immediately. Must be called before
+        /// any `write` call. Calling it more than once is an error.
+        begin: func(status: u16, headers: list<tuple<string, string>>) -> result<_, string>;
+        /// Flush a response body chunk to the client immediately.
+        write: func(chunk: list<u8>) -> result<_, string>;
+    }
+
+    /// Obtain the streaming-response sink for this execution context.
+    /// Returns an error when the host did not set up a streaming context for
+    /// this request (no streaming slot pre-allocated).
+    get-streaming-response: func() -> result<streaming-response, string>;
+}
+
 world faas-guest {
     import bridge-controller;
     import secrets-vault;
@@ -284,6 +310,7 @@ world faas-guest {
     import kv-partition;
     import graph;
     import custom-metrics;
+    import response-body;
     export handler;
 }
 

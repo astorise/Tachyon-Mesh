@@ -1888,6 +1888,28 @@ pub(crate) async fn faas_handler(
                                 None,
                             )
                         } else {
+                            #[cfg(feature = "ai-inference")]
+                            if is_streaming_accept_request(&headers) {
+                                let request = GuestRequest {
+                                    method: method.to_string(),
+                                    uri: uri.to_string(),
+                                    headers: header_map_to_guest_fields(&headers),
+                                    body: body.clone(),
+                                    trailers: trailer_fields.clone(),
+                                };
+                                return match network::handle_streaming_http_request(
+                                    state.clone(),
+                                    Arc::clone(&runtime),
+                                    route.clone(),
+                                    selected_target.module.clone(),
+                                    request,
+                                )
+                                .await
+                                {
+                                    Ok(response) => response,
+                                    Err((status, message)) => (status, message).into_response(),
+                                };
+                            }
                             match execute_route_with_middleware(
                                 &state,
                                 &runtime,
@@ -1945,6 +1967,28 @@ pub(crate) async fn faas_handler(
                                 None,
                             )
                         } else {
+                            #[cfg(feature = "ai-inference")]
+                            if is_streaming_accept_request(&headers) {
+                                let request = GuestRequest {
+                                    method: method.to_string(),
+                                    uri: uri.to_string(),
+                                    headers: header_map_to_guest_fields(&headers),
+                                    body: body.clone(),
+                                    trailers: trailer_fields.clone(),
+                                };
+                                return match network::handle_streaming_http_request(
+                                    state.clone(),
+                                    Arc::clone(&runtime),
+                                    route.clone(),
+                                    selected_target.module.clone(),
+                                    request,
+                                )
+                                .await
+                                {
+                                    Ok(response) => response,
+                                    Err((status, message)) => (status, message).into_response(),
+                                };
+                            }
                             match execute_route_with_middleware(
                                 &state,
                                 &runtime,
@@ -3147,6 +3191,18 @@ pub(crate) fn request_header_matches(headers: &HeaderMap, matcher: &HeaderMatch)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .is_some_and(|value| value == matcher.value)
+}
+
+/// Returns true when the client requested a streaming SSE response
+/// (`Accept: text/event-stream`). Used to route ai-inference requests through
+/// the incremental body-flush path instead of the buffered one.
+#[cfg(feature = "ai-inference")]
+pub(crate) fn is_streaming_accept_request(headers: &HeaderMap) -> bool {
+    headers
+        .get(hyper::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn is_websocket_upgrade_request(headers: &HeaderMap) -> bool {

@@ -82,4 +82,3 @@ The `guest-openai` route SHALL declare deployment scopes that grant `kv` access 
 - **WHEN** `model-broker` completes a model upload and notifies `guest-openai`'s register endpoint
 - **THEN** the model is written to `ai-models-registry`
 - **AND** a subsequent `GET /v1/models` includes that model
-
