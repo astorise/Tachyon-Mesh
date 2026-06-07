@@ -5,6 +5,18 @@ import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
 type UploadState = "idle" | "uploading" | "success" | "error";
+type UploadStatus = {
+  phase?: string;
+  percentage?: number;
+  alias?: string | null;
+  file?: string | null;
+  filesIncluded?: number;
+  bytesIncluded?: number;
+  archiveBytes?: number | null;
+  uploadedBytes?: number | null;
+  totalBytes?: number | null;
+  part?: number | null;
+};
 
 /**
  * `<tachyon-model-upload-panel>` — lets an operator pick a local model folder
@@ -22,7 +34,10 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
   private progress = 0;
   private selectedPath: string | null = null;
   private resultMessage = "";
-  private unlisten: UnlistenFn | null = null;
+  private statusMessage = "";
+  private includedFiles: string[] = [];
+  private uploadStatus: UploadStatus | null = null;
+  private unlisten: UnlistenFn[] = [];
   private readonly onLanguageChanged = () => {
     this.render();
     this.bindEvents();
@@ -63,6 +78,9 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     this.state = "uploading";
     this.progress = 0;
     this.resultMessage = "";
+    this.statusMessage = t("ai.upload.scanning");
+    this.includedFiles = [];
+    this.uploadStatus = null;
     this.render();
     this.bindEvents();
 
@@ -87,6 +105,22 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     this.bindEvents();
   }
 
+  onStatus(status: UploadStatus): void {
+    if (this.state !== "uploading") {
+      return;
+    }
+    this.uploadStatus = status;
+    if (typeof status.percentage === "number") {
+      this.progress = Math.max(0, Math.min(100, Math.round(status.percentage)));
+    }
+    if (status.file && !this.includedFiles.includes(status.file)) {
+      this.includedFiles = [...this.includedFiles, status.file].slice(-8);
+    }
+    this.statusMessage = this.describeStatus(status);
+    this.render();
+    this.bindEvents();
+  }
+
   private onSuccess(assetRef: string): void {
     this.state = "success";
     this.progress = 100;
@@ -105,15 +139,19 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
 
   private async startProgressListener(): Promise<void> {
     await this.stopProgressListener();
-    this.unlisten = await listen<number>("upload_progress", (event) => {
+    const progressUnlisten = await listen<number>("upload_progress", (event) => {
       this.onProgress(Number(event.payload));
     });
+    const statusUnlisten = await listen<UploadStatus>("upload_status", (event) => {
+      this.onStatus(event.payload);
+    });
+    this.unlisten = [progressUnlisten, statusUnlisten];
   }
 
   private async stopProgressListener(): Promise<void> {
-    if (this.unlisten) {
-      const unlisten = this.unlisten;
-      this.unlisten = null;
+    const listeners = this.unlisten;
+    this.unlisten = [];
+    for (const unlisten of listeners) {
       await unlisten();
     }
   }
@@ -121,7 +159,7 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
   private render(): void {
     const uploading = this.state === "uploading";
     const selectedLine = this.selectedPath
-      ? `<p class="font-mono text-[11px] text-slate-500" data-upload-selected>${t("ai.upload.selected").replace("{path}", this.selectedPath)}</p>`
+      ? `<p class="font-mono text-[11px] text-slate-500" data-upload-selected>${this.escape(t("ai.upload.selected").replace("{path}", this.selectedPath))}</p>`
       : "";
 
     this.renderTemplate(`
@@ -139,6 +177,7 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
         ${selectedLine}
 
         ${uploading ? this.renderProgress() : ""}
+        ${uploading ? this.renderUploadDetails() : ""}
         ${this.renderResult()}
       </section>
     `);
@@ -155,6 +194,73 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
         </div>
       </div>
     `;
+  }
+
+  private renderUploadDetails(): string {
+    const status = this.uploadStatus;
+    const files = Number(status?.filesIncluded ?? 0);
+    const bytes = Number(status?.bytesIncluded ?? 0);
+    const archiveBytes = status?.archiveBytes ?? status?.totalBytes ?? null;
+    const uploadedBytes = status?.uploadedBytes ?? null;
+    const fileRows = this.includedFiles
+      .map((file) => `<li class="truncate font-mono text-[10px] text-slate-400" title="${this.escape(file)}">${this.escape(file)}</li>`)
+      .join("");
+    return `
+      <div data-upload-details class="space-y-2 rounded border border-slate-700 bg-slate-900/70 px-3 py-2 text-[11px] text-slate-400">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span class="text-slate-300">${this.escape(this.statusMessage || t("ai.upload.scanning"))}</span>
+          ${status?.part ? `<span class="font-mono text-cyan-300">${t("ai.upload.part").replace("{part}", String(status.part))}</span>` : ""}
+        </div>
+        <div class="grid gap-1 sm:grid-cols-3">
+          <span>${t("ai.upload.files").replace("{count}", String(files))}</span>
+          <span>${t("ai.upload.inputSize").replace("{size}", this.formatBytes(bytes))}</span>
+          <span>${t("ai.upload.archiveSize").replace("{size}", this.formatBytes(archiveBytes))}</span>
+        </div>
+        ${uploadedBytes !== null ? `<p>${t("ai.upload.sent").replace("{sent}", this.formatBytes(uploadedBytes)).replace("{total}", this.formatBytes(status?.totalBytes ?? archiveBytes))}</p>` : ""}
+        ${fileRows ? `<ul class="max-h-28 space-y-1 overflow-auto border-t border-slate-800 pt-2">${fileRows}</ul>` : ""}
+      </div>
+    `;
+  }
+
+  private describeStatus(status: UploadStatus): string {
+    const phase = status.phase ?? "";
+    if (phase === "included") {
+      return t("ai.upload.including").replace("{file}", status.file ?? "");
+    }
+    if (phase === "prepared") {
+      return t("ai.upload.prepared")
+        .replace("{count}", String(status.filesIncluded ?? 0))
+        .replace("{size}", this.formatBytes(status.archiveBytes ?? status.totalBytes));
+    }
+    if (phase === "uploading") {
+      return t("ai.upload.sending");
+    }
+    if (phase === "committing") {
+      return t("ai.upload.committing");
+    }
+    return t("ai.upload.scanning");
+  }
+
+  private formatBytes(value: number | null | undefined): string {
+    if (!Number.isFinite(value ?? NaN) || (value ?? 0) <= 0) {
+      return "0 B";
+    }
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let size = Number(value);
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit += 1;
+    }
+    return `${size >= 10 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
+  }
+
+  private escape(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
 
   private renderResult(): string {

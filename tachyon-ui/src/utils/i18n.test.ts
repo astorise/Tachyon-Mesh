@@ -62,8 +62,11 @@ describe("t()", () => {
   it("resolves model-upload panel keys in both languages", () => {
     const keys = [
       "ai.upload.title", "ai.upload.subtitle", "ai.upload.select",
-      "ai.upload.selected", "ai.upload.uploading", "ai.upload.cancelled",
-      "ai.upload.success", "ai.upload.registryHint", "ai.upload.error",
+      "ai.upload.selected", "ai.upload.uploading", "ai.upload.scanning",
+      "ai.upload.including", "ai.upload.prepared", "ai.upload.sending",
+      "ai.upload.committing", "ai.upload.files", "ai.upload.inputSize",
+      "ai.upload.archiveSize", "ai.upload.sent", "ai.upload.part",
+      "ai.upload.cancelled", "ai.upload.success", "ai.upload.registryHint", "ai.upload.error",
     ];
     for (const lang of ["en", "fr"] as const) {
       setLanguage(lang);

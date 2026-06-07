@@ -629,8 +629,9 @@ async fn pick_model_file(app: tauri::AppHandle) -> Result<Option<String>, String
 
 #[tauri::command]
 async fn push_large_model(app: tauri::AppHandle, path: String) -> Result<String, String> {
-    tachyon_client::push_large_model_with_progress(&path, |percentage| {
-        let _ = app.emit("upload_progress", percentage);
+    tachyon_client::push_large_model_with_status(&path, |status| {
+        let _ = app.emit("upload_progress", status.percentage);
+        let _ = app.emit("upload_status", status);
     })
     .await
     .map_err(|error| error.to_string())

@@ -3481,10 +3481,22 @@ pub async fn push_large_model_with_progress<F>(file_path: &str, progress: F) -> 
 where
     F: FnMut(f32) + Send,
 {
+    let mut progress = progress;
+    push_large_model_with_status(file_path, move |status| {
+        progress(status.percentage);
+    })
+    .await
+}
+
+pub async fn push_large_model_with_status<F>(file_path: &str, mut status: F) -> Result<String>
+where
+    F: FnMut(ModelUploadStatus) + Send,
+{
     // The broker expects a gzip+tar archive it unpacks into the model directory.
     // The upload protocol requires the compressed size and hash up front, so the
     // client performs a dry compression pass into a counter/hasher, then streams a
     // second compression pass directly to the node without writing a temp archive.
+    status(ModelUploadStatus::stage("scanning", 0.0));
     let source = std::path::Path::new(file_path);
     let metadata = tokio::fs::metadata(file_path)
         .await
@@ -3498,8 +3510,17 @@ where
         tokio::task::spawn_blocking(move || model_archive_metadata(&source_owned))
             .await
             .context("model archive build task panicked")??;
+    for file in archive_metadata.files.iter().take(25) {
+        status(ModelUploadStatus::included(
+            &archive_metadata.alias,
+            archive_metadata.files.len(),
+            archive_metadata.included_bytes,
+            file,
+        ));
+    }
+    status(ModelUploadStatus::prepared(&archive_metadata));
 
-    upload_model_archive_streaming(source.to_path_buf(), archive_metadata, progress).await
+    upload_model_archive_streaming(archive_metadata, status).await
 }
 
 #[derive(Clone, Debug)]
@@ -3507,52 +3528,154 @@ struct ModelArchiveMetadata {
     alias: String,
     expected_hash: String,
     size_bytes: u64,
+    included_bytes: u64,
+    files: Vec<ModelArchiveFile>,
+}
+
+#[derive(Clone, Debug)]
+struct ModelArchiveFile {
+    path: std::path::PathBuf,
+    relative: std::path::PathBuf,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUploadStatus {
+    pub phase: String,
+    pub percentage: f32,
+    pub alias: Option<String>,
+    pub file: Option<String>,
+    pub files_included: usize,
+    pub bytes_included: u64,
+    pub archive_bytes: Option<u64>,
+    pub uploaded_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub part: Option<u64>,
+}
+
+impl ModelUploadStatus {
+    fn stage(phase: &str, percentage: f32) -> Self {
+        Self {
+            phase: phase.to_owned(),
+            percentage,
+            alias: None,
+            file: None,
+            files_included: 0,
+            bytes_included: 0,
+            archive_bytes: None,
+            uploaded_bytes: None,
+            total_bytes: None,
+            part: None,
+        }
+    }
+
+    fn included(
+        alias: &str,
+        files_included: usize,
+        bytes_included: u64,
+        file: &ModelArchiveFile,
+    ) -> Self {
+        Self {
+            phase: "included".to_owned(),
+            percentage: 0.0,
+            alias: Some(alias.to_owned()),
+            file: Some(file.relative.to_string_lossy().into_owned()),
+            files_included,
+            bytes_included,
+            archive_bytes: None,
+            uploaded_bytes: None,
+            total_bytes: None,
+            part: None,
+        }
+    }
+
+    fn prepared(archive: &ModelArchiveMetadata) -> Self {
+        Self {
+            phase: "prepared".to_owned(),
+            percentage: 0.0,
+            alias: Some(archive.alias.clone()),
+            file: None,
+            files_included: archive.files.len(),
+            bytes_included: archive.included_bytes,
+            archive_bytes: Some(archive.size_bytes),
+            uploaded_bytes: None,
+            total_bytes: Some(archive.size_bytes),
+            part: None,
+        }
+    }
+
+    fn uploading(archive: &ModelArchiveMetadata, uploaded_bytes: u64, part: u64) -> Self {
+        Self {
+            phase: "uploading".to_owned(),
+            percentage: ((uploaded_bytes as f64 / archive.size_bytes as f64) * 100.0) as f32,
+            alias: Some(archive.alias.clone()),
+            file: None,
+            files_included: archive.files.len(),
+            bytes_included: archive.included_bytes,
+            archive_bytes: Some(archive.size_bytes),
+            uploaded_bytes: Some(uploaded_bytes),
+            total_bytes: Some(archive.size_bytes),
+            part: Some(part),
+        }
+    }
+
+    fn committing(archive: &ModelArchiveMetadata) -> Self {
+        Self {
+            phase: "committing".to_owned(),
+            percentage: 100.0,
+            alias: Some(archive.alias.clone()),
+            file: None,
+            files_included: archive.files.len(),
+            bytes_included: archive.included_bytes,
+            archive_bytes: Some(archive.size_bytes),
+            uploaded_bytes: Some(archive.size_bytes),
+            total_bytes: Some(archive.size_bytes),
+            part: None,
+        }
+    }
 }
 
 fn model_archive_metadata(source: &std::path::Path) -> Result<ModelArchiveMetadata> {
     let is_dir = source.is_dir();
     let alias = derive_model_alias(source, is_dir);
+    let files = collect_model_archive_files(source)?;
+    if files.is_empty() {
+        anyhow::bail!(
+            "model directory `{}` does not contain supported model files",
+            source.display()
+        );
+    }
+    let included_bytes = files.iter().map(|file| file.size_bytes).sum();
     let mut writer = HashCountingWriter::default();
-    write_model_archive(source, &mut writer)?;
+    write_model_archive(&files, &mut writer)?;
     let size_bytes = writer.bytes_written;
     let expected_hash = writer.expected_hash();
     Ok(ModelArchiveMetadata {
         alias,
         expected_hash,
         size_bytes,
+        included_bytes,
+        files,
     })
 }
 
-fn write_model_archive<W: Write>(source: &std::path::Path, writer: W) -> Result<usize> {
+fn write_model_archive<W: Write>(files: &[ModelArchiveFile], writer: W) -> Result<usize> {
     let encoder = flate2::GzBuilder::new()
         .mtime(0)
         .write(writer, flate2::Compression::default());
     let mut builder = tar::Builder::new(encoder);
-    let archived_files = if source.is_dir() {
-        append_model_directory(&mut builder, source, std::path::Path::new(""))
-            .with_context(|| format!("failed to archive model directory `{}`", source.display()))?
-    } else {
-        let name = source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("model.bin");
+    for file in files {
         builder
-            .append_path_with_name(source, name)
-            .with_context(|| format!("failed to archive model file `{}`", source.display()))?;
-        1
-    };
-    if archived_files == 0 {
-        anyhow::bail!(
-            "model directory `{}` does not contain supported model files",
-            source.display()
-        );
+            .append_path_with_name(&file.path, &file.relative)
+            .with_context(|| format!("failed to archive model file `{}`", file.path.display()))?;
     }
     builder
         .into_inner()
         .context("failed to finalize model upload tar stream")?
         .finish()
         .context("failed to finalize model upload gzip stream")?;
-    Ok(archived_files)
+    Ok(files.len())
 }
 
 #[derive(Default)]
@@ -3579,17 +3702,38 @@ impl Write for HashCountingWriter {
     }
 }
 
-fn append_model_directory<W: std::io::Write>(
-    builder: &mut tar::Builder<W>,
+fn collect_model_archive_files(source: &std::path::Path) -> Result<Vec<ModelArchiveFile>> {
+    if source.is_file() {
+        let relative = source
+            .file_name()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("model.bin"));
+        return Ok(vec![ModelArchiveFile {
+            path: source.to_path_buf(),
+            relative,
+            size_bytes: std::fs::metadata(source)
+                .with_context(|| format!("failed to read metadata for `{}`", source.display()))?
+                .len(),
+        }]);
+    }
+
+    let mut files = Vec::new();
+    collect_model_archive_files_from_dir(source, std::path::Path::new(""), &mut files)?;
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Ok(files)
+}
+
+fn collect_model_archive_files_from_dir(
     source: &std::path::Path,
     relative: &std::path::Path,
-) -> Result<usize> {
-    let mut archived_files = 0_usize;
-    for entry in std::fs::read_dir(source)
+    files: &mut Vec<ModelArchiveFile>,
+) -> Result<()> {
+    let mut entries = std::fs::read_dir(source)
         .with_context(|| format!("failed to read model directory `{}`", source.display()))?
-    {
-        let entry = entry
-            .with_context(|| format!("failed to scan model directory `{}`", source.display()))?;
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to scan model directory `{}`", source.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
         let file_name = entry.file_name();
         if should_skip_model_archive_entry(&file_name) {
             continue;
@@ -3601,15 +3745,16 @@ fn append_model_directory<W: std::io::Write>(
             .metadata()
             .with_context(|| format!("failed to read metadata for `{}`", path.display()))?;
         if metadata.is_dir() {
-            archived_files += append_model_directory(builder, &path, &entry_relative)?;
+            collect_model_archive_files_from_dir(&path, &entry_relative, files)?;
         } else if metadata.is_file() && is_supported_model_archive_file(&path) {
-            builder
-                .append_path_with_name(&path, &entry_relative)
-                .with_context(|| format!("failed to archive model file `{}`", path.display()))?;
-            archived_files += 1;
+            files.push(ModelArchiveFile {
+                path,
+                relative: entry_relative,
+                size_bytes: metadata.len(),
+            });
         }
     }
-    Ok(archived_files)
+    Ok(())
 }
 
 fn should_skip_model_archive_entry(name: &std::ffi::OsStr) -> bool {
@@ -3672,12 +3817,11 @@ fn derive_model_alias(source: &std::path::Path, is_dir: bool) -> String {
 }
 
 async fn upload_model_archive_streaming<F>(
-    source: std::path::PathBuf,
     archive: ModelArchiveMetadata,
-    mut progress: F,
+    mut status: F,
 ) -> Result<String>
 where
-    F: FnMut(f32) + Send,
+    F: FnMut(ModelUploadStatus) + Send,
 {
     let config = require_connection()?;
     let client = build_http_client(&config)?;
@@ -3707,10 +3851,10 @@ where
         .context("failed to decode model-init response payload")?;
 
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(2);
-    let compression_source = source.clone();
+    let files = archive.files.clone();
     let compression_task = tokio::task::spawn_blocking(move || {
         let mut writer = ChunkSenderWriter::new(chunk_tx);
-        let result = write_model_archive(&compression_source, &mut writer)
+        let result = write_model_archive(&files, &mut writer)
             .and_then(|_| writer.finish())
             .map(|_| ());
         if let Err(error) = result {
@@ -3722,6 +3866,7 @@ where
     let mut part = 1_u64;
     while let Some(chunk) = chunk_rx.recv().await {
         let chunk = chunk.map_err(|error| anyhow::anyhow!(error))?;
+        let chunk_len = chunk.len() as u64;
         let upload_url = format!(
             "{}/{}?part={part}",
             build_endpoint_url(&config.url, ADMIN_MODEL_UPLOAD_PATH)?,
@@ -3749,21 +3894,14 @@ where
             anyhow::bail!("model chunk upload failed with {status}: {}", body.trim());
         }
 
-        uploaded_bytes = uploaded_bytes.saturating_add(
-            MODEL_CHUNK_BYTES.min(
-                archive
-                    .size_bytes
-                    .saturating_sub(uploaded_bytes)
-                    .try_into()
-                    .unwrap_or(MODEL_CHUNK_BYTES),
-            ) as u64,
-        );
-        progress(((uploaded_bytes as f64 / archive.size_bytes as f64) * 100.0) as f32);
+        uploaded_bytes = uploaded_bytes.saturating_add(chunk_len);
+        status(ModelUploadStatus::uploading(&archive, uploaded_bytes, part));
         part = part.saturating_add(1);
     }
     compression_task
         .await
         .context("model archive streaming task panicked")?;
+    status(ModelUploadStatus::committing(&archive));
 
     let commit_url = format!(
         "{}/{}",
@@ -3788,7 +3926,7 @@ where
         );
     }
 
-    progress(100.0);
+    status(ModelUploadStatus::stage("done", 100.0));
     let payload: CommitModelUploadResponse = serde_json::from_slice(&commit_body)
         .context("failed to decode model-commit response payload")?;
     Ok(payload.model_path)
@@ -4273,6 +4411,8 @@ mod tests {
 
         // The archive is a gzip stream that untars back to the same files.
         let archive = model_archive_bytes(&dir);
+        let second_archive = model_archive_bytes(&dir);
+        assert_eq!(sha256_hash(&archive), sha256_hash(&second_archive));
         assert_eq!(metadata.size_bytes, archive.len() as u64);
         assert_eq!(metadata.expected_hash, sha256_hash(&archive));
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&archive[..]));
@@ -4336,7 +4476,8 @@ mod tests {
 
     fn model_archive_bytes(source: &std::path::Path) -> Vec<u8> {
         let mut archive = Vec::new();
-        write_model_archive(source, &mut archive).expect("archive should build");
+        let files = collect_model_archive_files(source).expect("files should collect");
+        write_model_archive(&files, &mut archive).expect("archive should build");
         archive
     }
 

@@ -74,8 +74,10 @@ describe("TachyonModelUploadPanel", () => {
   it("renders live progress from upload_progress events", async () => {
     const push = deferred<string>();
     let progressCb: ((event: { payload: number }) => void) | undefined;
-    listenMock.mockImplementation((_event, cb) => {
-      progressCb = cb as unknown as (event: { payload: number }) => void;
+    listenMock.mockImplementation((event, cb) => {
+      if (event === "upload_progress") {
+        progressCb = cb as unknown as (event: { payload: number }) => void;
+      }
       return Promise.resolve(vi.fn());
     });
     invokeMock.mockImplementation((command: string) => {
@@ -97,6 +99,58 @@ describe("TachyonModelUploadPanel", () => {
     push.resolve("gguf/llama");
     await done;
     expect(panel.shadowRoot?.querySelector("[data-upload-result]")?.textContent).toContain("gguf/llama");
+  });
+
+  it("renders upload status details from included files and sent bytes", async () => {
+    const push = deferred<string>();
+    let statusCb: ((event: { payload: Record<string, unknown> }) => void) | undefined;
+    listenMock.mockImplementation((event, cb) => {
+      if (event === "upload_status") {
+        statusCb = cb as unknown as (event: { payload: Record<string, unknown> }) => void;
+      }
+      return Promise.resolve(vi.fn());
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "pick_model_file") return Promise.resolve("/models/Qwen");
+      if (command === "push_large_model") return push.promise;
+      return Promise.reject(new Error(`unexpected ${command}`));
+    });
+
+    const panel = mountPanel();
+    const done = panel.selectAndUpload();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    statusCb?.({
+      payload: {
+        phase: "included",
+        percentage: 0,
+        alias: "Qwen",
+        file: "model-00001-of-00003.safetensors",
+        filesIncluded: 4,
+        bytesIncluded: 24 * 1024 * 1024,
+      },
+    });
+    statusCb?.({
+      payload: {
+        phase: "uploading",
+        percentage: 50,
+        alias: "Qwen",
+        filesIncluded: 4,
+        bytesIncluded: 24 * 1024 * 1024,
+        archiveBytes: 20 * 1024 * 1024,
+        uploadedBytes: 10 * 1024 * 1024,
+        totalBytes: 20 * 1024 * 1024,
+        part: 2,
+      },
+    });
+
+    const details = panel.shadowRoot?.querySelector("[data-upload-details]");
+    expect(details?.textContent).toContain("model-00001-of-00003.safetensors");
+    expect(details?.textContent).toContain("4 file");
+    expect(details?.textContent).toContain("Sent 10 MiB / 20 MiB");
+
+    push.resolve("models/Qwen");
+    await done;
   });
 
   it("treats a cancelled file selection as a no-op (no upload)", async () => {
