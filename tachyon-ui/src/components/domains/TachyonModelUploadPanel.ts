@@ -227,6 +227,11 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     if (phase === "included") {
       return t("ai.upload.including").replace("{file}", status.file ?? "");
     }
+    if (phase === "preparing") {
+      return t("ai.upload.preparing")
+        .replace("{count}", String(status.filesIncluded ?? 0))
+        .replace("{size}", this.formatBytes(status.bytesIncluded));
+    }
     if (phase === "prepared") {
       return t("ai.upload.prepared")
         .replace("{count}", String(status.filesIncluded ?? 0))

@@ -3506,30 +3506,54 @@ where
     }
 
     let source_owned = source.to_path_buf();
-    let archive_metadata =
-        tokio::task::spawn_blocking(move || model_archive_metadata(&source_owned))
-            .await
-            .context("model archive build task panicked")??;
-    for file in archive_metadata.files.iter().take(25) {
+    let archive_plan = tokio::task::spawn_blocking(move || model_archive_plan(&source_owned))
+        .await
+        .context("model archive scan task panicked")??;
+    for file in archive_plan.files.iter().take(25) {
         status(ModelUploadStatus::included(
-            &archive_metadata.alias,
-            archive_metadata.files.len(),
-            archive_metadata.included_bytes,
+            &archive_plan.alias,
+            archive_plan.files.len(),
+            archive_plan.included_bytes,
             file,
         ));
     }
+    status(ModelUploadStatus::planned(&archive_plan));
+
+    let archive_metadata =
+        tokio::task::spawn_blocking(move || model_archive_metadata(archive_plan))
+            .await
+            .context("model archive metadata task panicked")??;
     status(ModelUploadStatus::prepared(&archive_metadata));
 
     upload_model_archive_streaming(archive_metadata, status).await
 }
 
 #[derive(Clone, Debug)]
-struct ModelArchiveMetadata {
+struct ModelArchivePlan {
     alias: String,
-    expected_hash: String,
-    size_bytes: u64,
     included_bytes: u64,
     files: Vec<ModelArchiveFile>,
+}
+
+#[derive(Clone, Debug)]
+struct ModelArchiveMetadata {
+    plan: ModelArchivePlan,
+    expected_hash: String,
+    size_bytes: u64,
+}
+
+impl ModelArchiveMetadata {
+    fn alias(&self) -> &str {
+        &self.plan.alias
+    }
+
+    fn included_bytes(&self) -> u64 {
+        self.plan.included_bytes
+    }
+
+    fn files(&self) -> &[ModelArchiveFile] {
+        &self.plan.files
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3590,14 +3614,29 @@ impl ModelUploadStatus {
         }
     }
 
+    fn planned(plan: &ModelArchivePlan) -> Self {
+        Self {
+            phase: "preparing".to_owned(),
+            percentage: 0.0,
+            alias: Some(plan.alias.clone()),
+            file: None,
+            files_included: plan.files.len(),
+            bytes_included: plan.included_bytes,
+            archive_bytes: None,
+            uploaded_bytes: None,
+            total_bytes: None,
+            part: None,
+        }
+    }
+
     fn prepared(archive: &ModelArchiveMetadata) -> Self {
         Self {
             phase: "prepared".to_owned(),
             percentage: 0.0,
-            alias: Some(archive.alias.clone()),
+            alias: Some(archive.alias().to_owned()),
             file: None,
-            files_included: archive.files.len(),
-            bytes_included: archive.included_bytes,
+            files_included: archive.files().len(),
+            bytes_included: archive.included_bytes(),
             archive_bytes: Some(archive.size_bytes),
             uploaded_bytes: None,
             total_bytes: Some(archive.size_bytes),
@@ -3609,10 +3648,10 @@ impl ModelUploadStatus {
         Self {
             phase: "uploading".to_owned(),
             percentage: ((uploaded_bytes as f64 / archive.size_bytes as f64) * 100.0) as f32,
-            alias: Some(archive.alias.clone()),
+            alias: Some(archive.alias().to_owned()),
             file: None,
-            files_included: archive.files.len(),
-            bytes_included: archive.included_bytes,
+            files_included: archive.files().len(),
+            bytes_included: archive.included_bytes(),
             archive_bytes: Some(archive.size_bytes),
             uploaded_bytes: Some(uploaded_bytes),
             total_bytes: Some(archive.size_bytes),
@@ -3624,10 +3663,10 @@ impl ModelUploadStatus {
         Self {
             phase: "committing".to_owned(),
             percentage: 100.0,
-            alias: Some(archive.alias.clone()),
+            alias: Some(archive.alias().to_owned()),
             file: None,
-            files_included: archive.files.len(),
-            bytes_included: archive.included_bytes,
+            files_included: archive.files().len(),
+            bytes_included: archive.included_bytes(),
             archive_bytes: Some(archive.size_bytes),
             uploaded_bytes: Some(archive.size_bytes),
             total_bytes: Some(archive.size_bytes),
@@ -3636,7 +3675,7 @@ impl ModelUploadStatus {
     }
 }
 
-fn model_archive_metadata(source: &std::path::Path) -> Result<ModelArchiveMetadata> {
+fn model_archive_plan(source: &std::path::Path) -> Result<ModelArchivePlan> {
     let is_dir = source.is_dir();
     let alias = derive_model_alias(source, is_dir);
     let files = collect_model_archive_files(source)?;
@@ -3647,16 +3686,22 @@ fn model_archive_metadata(source: &std::path::Path) -> Result<ModelArchiveMetada
         );
     }
     let included_bytes = files.iter().map(|file| file.size_bytes).sum();
+    Ok(ModelArchivePlan {
+        alias,
+        included_bytes,
+        files,
+    })
+}
+
+fn model_archive_metadata(plan: ModelArchivePlan) -> Result<ModelArchiveMetadata> {
     let mut writer = HashCountingWriter::default();
-    write_model_archive(&files, &mut writer)?;
+    write_model_archive(&plan.files, &mut writer)?;
     let size_bytes = writer.bytes_written;
     let expected_hash = writer.expected_hash();
     Ok(ModelArchiveMetadata {
-        alias,
+        plan,
         expected_hash,
         size_bytes,
-        included_bytes,
-        files,
     })
 }
 
@@ -3831,11 +3876,16 @@ where
         .json(&InitModelUploadRequest {
             expected_hash: &archive.expected_hash,
             size_bytes: archive.size_bytes,
-            alias: Some(&archive.alias),
+            alias: Some(archive.alias()),
         })
         .send()
         .await
-        .with_context(|| format!("failed to initialize model upload for `{}`", archive.alias))?;
+        .with_context(|| {
+            format!(
+                "failed to initialize model upload for `{}`",
+                archive.alias()
+            )
+        })?;
     let init_status = init_response.status();
     let init_body = init_response
         .bytes()
@@ -3851,7 +3901,7 @@ where
         .context("failed to decode model-init response payload")?;
 
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(2);
-    let files = archive.files.clone();
+    let files = archive.files().to_vec();
     let compression_task = tokio::task::spawn_blocking(move || {
         let mut writer = ChunkSenderWriter::new(chunk_tx);
         let result = write_model_archive(&files, &mut writer)
@@ -3882,7 +3932,7 @@ where
             .with_context(|| {
                 format!(
                     "failed to upload chunk {part} for model `{}`",
-                    archive.alias
+                    archive.alias()
                 )
             })?;
         if !response.status().is_success() {
@@ -3913,7 +3963,7 @@ where
         .bearer_auth(&config.token)
         .send()
         .await
-        .with_context(|| format!("failed to commit model upload for `{}`", archive.alias))?;
+        .with_context(|| format!("failed to commit model upload for `{}`", archive.alias()))?;
     let commit_status = commit_response.status();
     let commit_body = commit_response
         .bytes()
@@ -4406,8 +4456,9 @@ mod tests {
         std::fs::write(dir.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();
         std::fs::write(dir.join("model.safetensors"), b"\x00\x01\x02").unwrap();
 
-        let metadata = model_archive_metadata(&dir).expect("metadata should build");
-        assert_eq!(metadata.alias, dir.file_name().unwrap().to_str().unwrap());
+        let plan = model_archive_plan(&dir).expect("plan should build");
+        let metadata = model_archive_metadata(plan).expect("metadata should build");
+        assert_eq!(metadata.alias(), dir.file_name().unwrap().to_str().unwrap());
 
         // The archive is a gzip stream that untars back to the same files.
         let archive = model_archive_bytes(&dir);
@@ -4433,6 +4484,44 @@ mod tests {
         names.sort();
         assert!(names.contains(&"config.json".to_owned()));
         assert!(names.contains(&"model.safetensors".to_owned()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn model_archive_plan_detects_sharded_safetensors_immediately() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tachyon-client-qwen-plan-{stamp}"));
+        std::fs::create_dir_all(dir.join(".git").join("lfs")).expect("temp git dir");
+        std::fs::write(dir.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
+        std::fs::write(dir.join("hf_quant_config.json"), br#"{"quantization":{}}"#).unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            br#"{"weight_map":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("model-00001-of-00003.safetensors"), b"one").unwrap();
+        std::fs::write(dir.join("model-00002-of-00003.safetensors"), b"two").unwrap();
+        std::fs::write(dir.join("README.md"), b"ignored").unwrap();
+
+        let plan = model_archive_plan(&dir).expect("plan should detect model files");
+        let names: Vec<String> = plan
+            .files
+            .iter()
+            .map(|file| file.relative.to_string_lossy().to_string())
+            .collect();
+
+        assert!(names.contains(&"config.json".to_owned()));
+        assert!(names.contains(&"hf_quant_config.json".to_owned()));
+        assert!(names.contains(&"model.safetensors.index.json".to_owned()));
+        assert!(names.contains(&"model-00001-of-00003.safetensors".to_owned()));
+        assert!(names.contains(&"model-00002-of-00003.safetensors".to_owned()));
+        assert!(names.iter().all(|name| !name.contains(".git")));
+        assert!(names.iter().all(|name| !name.ends_with("README.md")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
