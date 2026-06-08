@@ -6170,7 +6170,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -6189,7 +6189,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -6202,7 +6202,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7822,14 +7822,14 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
 name = "system-faas-authz"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7838,7 +7838,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7847,14 +7847,14 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
 name = "system-faas-cdc"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7863,7 +7863,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7883,7 +7883,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spki",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
  "x509-cert",
  "x509-parser",
 ]
@@ -7894,7 +7894,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7903,7 +7903,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7923,7 +7923,7 @@ dependencies = [
 name = "system-faas-gateway"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7937,7 +7937,7 @@ dependencies = [
  "gix",
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7946,21 +7946,21 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
 name = "system-faas-k8s-scaler"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
 name = "system-faas-keda"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7969,14 +7969,14 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
 name = "system-faas-media-server"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7987,7 +7987,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -7995,7 +7995,7 @@ name = "system-faas-metering"
 version = "1.0.0"
 dependencies = [
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8020,7 +8020,7 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "uuid",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8034,7 +8034,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8043,14 +8043,14 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
 name = "system-faas-openapi"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8059,14 +8059,14 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
 name = "system-faas-prom"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8077,7 +8077,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8086,7 +8086,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8097,7 +8097,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8106,7 +8106,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8115,14 +8115,14 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
 name = "system-faas-storage-broker"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8132,7 +8132,7 @@ dependencies = [
  "aes-gcm",
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8141,7 +8141,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8150,7 +8150,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8159,7 +8159,7 @@ version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8184,7 +8184,7 @@ dependencies = [
 name = "tachyon-faas-sdk"
 version = "1.0.0"
 dependencies = [
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -8213,7 +8213,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-stronghold",
  "tokio",
- "wit-bindgen 0.57.1",
+ "wit-bindgen 0.58.0",
 ]
 
 [[package]]
@@ -9636,6 +9636,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-encoder"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a879a421bd17c528b74721b2abf4c62e8f1d1889c2ba8c3c50d02deaf2ce395"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.251.0",
+]
+
+[[package]]
 name = "wasm-metadata"
 version = "0.239.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9669,6 +9679,18 @@ dependencies = [
  "indexmap 2.14.0",
  "wasm-encoder 0.247.0",
  "wasmparser 0.247.0",
+]
+
+[[package]]
+name = "wasm-metadata"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f998ccc6e012f7b86865eb2a106c8a0422017a1a88977ce01a69f2244be2e57"
+dependencies = [
+ "anyhow",
+ "indexmap 2.14.0",
+ "wasm-encoder 0.251.0",
+ "wasmparser 0.251.0",
 ]
 
 [[package]]
@@ -9753,6 +9775,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071d99cdfb8111603ed05500506c3298a940b58d609dd0259d3981785dd33556"
 dependencies = [
  "bitflags 2.11.1",
+ "indexmap 2.14.0",
+ "semver",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "437970b35b1a85cfde9c74b2398352d8d653f3bd8e3a3db0c063ea8f5b4b36ff"
+dependencies = [
+ "bitflags 2.11.1",
+ "hashbrown 0.17.0",
  "indexmap 2.14.0",
  "semver",
 ]
@@ -10896,6 +10930,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a43552cfa071f246cfd99e5dbb23710dfe7336b3259e09339818483359470749"
+dependencies = [
+ "bitflags 2.11.1",
+ "wit-bindgen-rust-macro 0.58.0",
+]
+
+[[package]]
 name = "wit-bindgen-core"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10926,6 +10970,17 @@ dependencies = [
  "anyhow",
  "heck 0.5.0",
  "wit-parser 0.247.0",
+]
+
+[[package]]
+name = "wit-bindgen-core"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4738d1c9a78e97bc7f664bfafd5d8e67d7bb26faa5c41e6d628e8bbdad3ec351"
+dependencies = [
+ "anyhow",
+ "heck 0.5.0",
+ "wit-parser 0.251.0",
 ]
 
 [[package]]
@@ -10977,6 +11032,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen-rust"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1130ce1f531bc9f9a75922244aa773bf5e2117fda1ef4a86b9f98d6b8135eb46"
+dependencies = [
+ "anyhow",
+ "heck 0.5.0",
+ "indexmap 2.14.0",
+ "prettyplease",
+ "syn 2.0.117",
+ "wasm-metadata 0.251.0",
+ "wit-bindgen-core 0.58.0",
+ "wit-component 0.251.0",
+]
+
+[[package]]
 name = "wit-bindgen-rust-macro"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11020,6 +11091,22 @@ dependencies = [
  "syn 2.0.117",
  "wit-bindgen-core 0.57.1",
  "wit-bindgen-rust 0.57.1",
+]
+
+[[package]]
+name = "wit-bindgen-rust-macro"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07296369e4d598e7e79b64eef66f724d83324ea671bcf677d78fc5cf92604ae5"
+dependencies = [
+ "anyhow",
+ "macro-string",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "wit-bindgen-core 0.58.0",
+ "wit-bindgen-rust 0.58.0",
 ]
 
 [[package]]
@@ -11077,6 +11164,25 @@ dependencies = [
  "wasm-metadata 0.247.0",
  "wasmparser 0.247.0",
  "wit-parser 0.247.0",
+]
+
+[[package]]
+name = "wit-component"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83a5e60173c413659c689f0581b0cf5d1a2404077568f9ffdce748a9eb2fc913"
+dependencies = [
+ "anyhow",
+ "bitflags 2.11.1",
+ "indexmap 2.14.0",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "wasm-encoder 0.251.0",
+ "wasm-metadata 0.251.0",
+ "wasmparser 0.251.0",
+ "wit-parser 0.251.0",
 ]
 
 [[package]]
@@ -11151,6 +11257,25 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.248.0",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e960732e824fab95099971a09e638979347c94ca48568d3c854c945729196947"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.17.0",
+ "id-arena",
+ "indexmap 2.14.0",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
+ "wasmparser 0.251.0",
 ]
 
 [[package]]

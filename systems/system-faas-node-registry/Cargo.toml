@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
-wit-bindgen = "0.57"
+wit-bindgen = "0.58"
 # Pure-Rust (wasm-safe) RS256 JWT verification for machine-identity enrollment.
 rsa = "0.9"
 # Pinned to 0.10 on purpose: rsa 0.9 is built on the `digest`/`signature` 0.10
