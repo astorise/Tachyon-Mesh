@@ -1,7 +1,13 @@
 use super::support_and_cache::*;
-use crate::auth::{AuditLogQuery, IamUserSummaryResponse};
+use crate::auth::{AuditLogQuery, AuthClaims, IamUserSummaryResponse, UpdateUserRequest};
 use crate::iam_audit::{IamAuditEntry, MAX_TAIL};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
+#[cfg(feature = "experimental")]
+use axum::http::header::AUTHORIZATION;
+#[cfg(feature = "experimental")]
+use axum::http::HeaderMap;
+use axum::Extension;
+use std::sync::Arc;
 
 // =====================================================================
 // Endpoint surface tests — exercise the admin middleware without
@@ -401,4 +407,149 @@ fn user_summary_response_serializes_to_camel_case() {
     assert_eq!(serialized["disabledAt"], 1_700_000_000);
     assert_eq!(serialized["createdAt"], 1_699_000_000);
     assert_eq!(serialized["lastLoginAt"], 1_700_001_000);
+}
+
+fn admin_claims() -> AuthClaims {
+    AuthClaims {
+        subject: "admin".to_owned(),
+        roles: vec!["admin".to_owned()],
+        scopes: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn iam_handlers_surface_missing_authn_guest_errors() {
+    let mut state = build_test_state(
+        IntegrityConfig::default_sealed(),
+        telemetry::init_test_telemetry(),
+    );
+    state.auth_manager = Arc::new(auth::test_auth_manager_with_modules(
+        "missing-authn",
+        "missing-authz",
+        unique_test_dir("missing-authn-state"),
+    ));
+    let claims = admin_claims();
+
+    let users = auth::list_users_handler(State(state.clone()), Extension(claims.clone())).await;
+    assert!(
+        users.is_err(),
+        "list_users_handler must not synthesize an empty success response"
+    );
+
+    let groups = auth::list_groups_handler(State(state.clone()), Extension(claims.clone())).await;
+    assert!(
+        groups.is_err(),
+        "list_groups_handler must not synthesize an empty success response"
+    );
+
+    let delete_user = auth::delete_user_handler(
+        State(state.clone()),
+        Extension(claims.clone()),
+        Path("alice".to_owned()),
+    )
+    .await;
+    assert!(
+        delete_user.is_err(),
+        "delete_user_handler must propagate authn delete errors"
+    );
+
+    let delete_group = auth::delete_group_handler(
+        State(state),
+        Extension(claims),
+        Path("platform-admins".to_owned()),
+    )
+    .await;
+    assert!(
+        delete_group.is_err(),
+        "delete_group_handler must propagate authn delete errors"
+    );
+}
+
+#[tokio::test]
+async fn update_user_handler_records_action_for_requested_state_change() {
+    for (disabled, expected_action) in [
+        (Some(true), "user.disable"),
+        (Some(false), "user.enable"),
+        (None, "user.update"),
+    ] {
+        let mut state = build_test_state(
+            IntegrityConfig::default_sealed(),
+            telemetry::init_test_telemetry(),
+        );
+        state.auth_manager = Arc::new(auth::test_auth_manager_with_modules(
+            "missing-authn",
+            "missing-authz",
+            unique_test_dir("missing-authn-state"),
+        ));
+
+        let result = auth::update_user_handler(
+            State(state.clone()),
+            Extension(admin_claims()),
+            Path("alice".to_owned()),
+            axum::Json(UpdateUserRequest {
+                add_groups: None,
+                remove_groups: None,
+                add_roles: None,
+                remove_roles: None,
+                add_scopes: None,
+                remove_scopes: None,
+                disabled,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let entries = state.iam_audit_log.snapshot(Some("alice"), 10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, expected_action);
+        assert_eq!(entries[0].outcome, "error");
+    }
+}
+
+#[tokio::test]
+async fn admin_status_handler_reports_runtime_counts() {
+    let state = build_test_state(
+        IntegrityConfig::default_sealed(),
+        telemetry::init_test_telemetry(),
+    );
+
+    let body = auth::admin_status_handler(State(state)).await;
+
+    assert!(body.contains("routes="));
+    assert!(body.contains("batch_targets="));
+    assert!(body.contains("status=ready"));
+}
+
+#[cfg(feature = "experimental")]
+#[tokio::test]
+async fn authorize_admin_headers_only_handles_admin_paths_and_propagates_auth_errors() {
+    let mut state = build_test_state(
+        IntegrityConfig::default_sealed(),
+        telemetry::init_test_telemetry(),
+    );
+    state.auth_manager = Arc::new(auth::test_auth_manager_with_modules(
+        "missing-authn",
+        "missing-authz",
+        unique_test_dir("missing-authn-state"),
+    ));
+
+    let headers = HeaderMap::new();
+    assert!(
+        auth::authorize_admin_headers(&state, "GET", "/api/user", &headers)
+            .await
+            .is_none(),
+        "non-admin paths must bypass this helper"
+    );
+
+    let response = auth::authorize_admin_headers(&state, "GET", "/admin/status", &headers)
+        .await
+        .expect("missing bearer should produce a response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, "Bearer token".parse().expect("header"));
+    let response = auth::authorize_admin_headers(&state, "GET", "/admin/status", &headers)
+        .await
+        .expect("authn failure should produce a response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }

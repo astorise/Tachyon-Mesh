@@ -1,0 +1,12 @@
+exclude_re = [
+    # These functions are compiled only with `--features experimental`, but
+    # cargo-mutants still discovers them from source during the default-feature
+    # weekly auth run. Mutating inactive cfg blocks is equivalent for that run;
+    # feature-specific tests cover them separately.
+    "AuthzPurgeEvent::enqueue",
+    "authorize_admin_headers",
+    # `flush_auth_state` is intentionally a no-op unless the `s3-persistence`
+    # feature is enabled. The weekly auth mutation run exercises default
+    # features, so replacing this function with `()` is behaviorally equivalent.
+    "replace flush_auth_state with \\(\\)",
+]

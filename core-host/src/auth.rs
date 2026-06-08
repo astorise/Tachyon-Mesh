@@ -752,6 +752,21 @@ impl AuthManager {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_auth_manager_with_modules(
+    authn_module_name: &str,
+    authz_module_name: &str,
+    state_dir: PathBuf,
+) -> AuthManager {
+    AuthManager {
+        authn_module_name: authn_module_name.to_owned(),
+        authz_module_name: authz_module_name.to_owned(),
+        state_dir,
+        jwt_secret: "test-secret".to_owned(),
+        decision_cache: AuthDecisionCache::new(),
+    }
+}
+
 /// Event payload written into the `authz_purge_outbox` redb table. Producers
 /// (`system-faas-authz` mutation paths) emit one of these whenever a token is
 /// revoked, a role assignment changes, or a user is banned. The host's
@@ -1724,6 +1739,336 @@ mod tests {
         assert!(cache.get("tok-b1", "GET", "/api/x").is_some());
     }
 
+    #[test]
+    fn default_pat_ttl_is_thirty_days() {
+        assert_eq!(default_pat_ttl_days(), 30);
+    }
+
+    #[test]
+    fn auth_state_dir_uses_manifest_parent() {
+        let manifest = Path::new("/tmp/tachyon/manifest.json");
+        assert_eq!(
+            auth_state_dir(manifest),
+            Path::new("/tmp/tachyon/auth-state")
+        );
+        assert_eq!(
+            auth_state_dir(Path::new("manifest.json")),
+            PathBuf::from("auth-state")
+        );
+    }
+
+    #[test]
+    fn manager_exposes_its_own_decision_cache() {
+        let manager = AuthManager {
+            authn_module_name: "missing-authn".to_owned(),
+            authz_module_name: "missing-authz".to_owned(),
+            state_dir: PathBuf::from("unused-auth-state"),
+            jwt_secret: "secret".to_owned(),
+            decision_cache: AuthDecisionCache::new(),
+        };
+        manager.decision_cache.put(
+            "tok",
+            "GET",
+            "/admin/status",
+            fresh_claims("alice", &["admin"]),
+        );
+
+        let cached = manager
+            .decision_cache()
+            .get("tok", "GET", "/admin/status")
+            .expect("manager should return the configured cache");
+        assert_eq!(cached.subject, "alice");
+    }
+
+    #[test]
+    fn auth_manager_methods_fail_when_guest_module_is_missing() {
+        let dir = tempdir();
+        let manager = AuthManager {
+            authn_module_name: "missing-authn".to_owned(),
+            authz_module_name: "missing-authz".to_owned(),
+            state_dir: dir.path().join("auth-state"),
+            jwt_secret: "secret".to_owned(),
+            decision_cache: AuthDecisionCache::new(),
+        };
+        let engine = Engine::default();
+
+        assert!(manager
+            .validate_registration_token(&engine, "invalid-registration-token")
+            .is_err());
+        assert!(manager
+            .stage_user(
+                &engine,
+                StageSignupRequest {
+                    token: "invalid-registration-token".to_owned(),
+                    first_name: "Alice".to_owned(),
+                    last_name: "Mesh".to_owned(),
+                    username: "alice".to_owned(),
+                    password: "correct horse battery staple".to_owned(),
+                },
+            )
+            .is_err());
+        assert!(manager
+            .finalize_enrollment(&engine, "missing-session", "123456")
+            .is_err());
+        assert!(manager
+            .stage_login(&engine, "alice", "wrong-password")
+            .is_err());
+        assert!(manager
+            .finalize_login(&engine, "missing-session", "123456")
+            .is_err());
+        assert!(manager.generate_recovery_codes(&engine, "alice").is_err());
+        assert!(manager
+            .consume_recovery_code(&engine, "alice", "bad-code")
+            .is_err());
+        assert!(manager
+            .issue_pat(&engine, "alice", "laptop", &["scope:a".to_owned()], 30)
+            .is_err());
+        assert!(manager.list_users(&engine).is_err());
+        assert!(manager
+            .update_user(
+                &engine,
+                "admin",
+                "alice",
+                AuthnUserUpdate {
+                    add_groups: None,
+                    remove_groups: None,
+                    add_roles: None,
+                    remove_roles: None,
+                    add_scopes: None,
+                    remove_scopes: None,
+                    disabled: None,
+                },
+            )
+            .is_err());
+        assert!(manager.delete_user(&engine, "admin", "alice").is_err());
+        assert!(manager.list_groups(&engine).is_err());
+        assert!(manager
+            .upsert_group(
+                &engine,
+                AuthnGroupInput {
+                    name: "ops".to_owned(),
+                    description: String::new(),
+                    roles: Vec::new(),
+                    scopes: Vec::new(),
+                },
+            )
+            .is_err());
+        assert!(manager.delete_group(&engine, "ops").is_err());
+        assert!(manager
+            .authorize(&engine, &fresh_claims("alice", &[]), "GET", "/admin/status")
+            .is_err());
+    }
+
+    #[test]
+    fn authn_guest_can_stage_user_with_preopened_mutable_state_dir() {
+        if let Err(error) = crate::resolve_guest_module_path("system-faas-authn") {
+            eprintln!("SKIP: system-faas-authn artifact not present: {error}");
+            return;
+        }
+
+        let dir = tempdir();
+        let manager = test_auth_manager_with_modules(
+            "system-faas-authn",
+            "system-faas-authz",
+            dir.path().join("auth-state"),
+        );
+        let engine = Engine::default();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let token = issue_registration_token_for_auth_test(
+            "test-secret",
+            "invite:alice",
+            &["admin"],
+            &["scope:admin"],
+            now,
+            now + 600,
+        );
+
+        let staged = manager
+            .stage_user(
+                &engine,
+                StageSignupRequest {
+                    token,
+                    first_name: "Alice".to_owned(),
+                    last_name: "Mesh".to_owned(),
+                    username: format!("alice-{}", Uuid::new_v4().simple()),
+                    password: "correct horse battery staple".to_owned(),
+                },
+            )
+            .expect("authn guest should be able to write pending enrollment state");
+
+        assert_eq!(staged.roles, vec!["admin"]);
+        assert_eq!(staged.scopes, vec!["scope:admin"]);
+        assert!(staged.provisioning_uri.starts_with("otpauth://totp/"));
+    }
+
+    #[test]
+    fn apply_authz_purge_rejects_bad_token_hash_and_evicts_subject_events() {
+        let cache = AuthDecisionCache::new();
+        cache.put("tok-a", "GET", "/api/x", fresh_claims("alice", &["admin"]));
+        cache.put("tok-b", "GET", "/api/x", fresh_claims("bob", &["user"]));
+
+        let bad_hex = AuthzPurgeEvent::Token {
+            token_hash: "not-hex".to_owned(),
+            ts_ms: 1,
+        };
+        assert!(apply_authz_purge(&cache, &bad_hex)
+            .expect_err("invalid hex must fail")
+            .to_string()
+            .contains("hex"));
+
+        let short_hash = AuthzPurgeEvent::Token {
+            token_hash: "abcd".to_owned(),
+            ts_ms: 1,
+        };
+        assert!(apply_authz_purge(&cache, &short_hash)
+            .expect_err("short hashes must fail")
+            .to_string()
+            .contains("32 bytes"));
+
+        apply_authz_purge(
+            &cache,
+            &AuthzPurgeEvent::Role {
+                user_id: "alice".to_owned(),
+                ts_ms: 2,
+            },
+        )
+        .expect("role event should apply");
+        cache.inner.run_pending_tasks();
+        assert!(cache.get("tok-a", "GET", "/api/x").is_none());
+        assert!(cache.get("tok-b", "GET", "/api/x").is_some());
+
+        apply_authz_purge(
+            &cache,
+            &AuthzPurgeEvent::UserBan {
+                user_id: "bob".to_owned(),
+                ts_ms: 3,
+            },
+        )
+        .expect("ban event should apply");
+        cache.inner.run_pending_tasks();
+        assert!(cache.get("tok-b", "GET", "/api/x").is_none());
+    }
+
+    #[test]
+    fn bearer_token_accepts_only_nonempty_bearer_scheme() {
+        let mut headers = HeaderMap::new();
+        assert!(matches!(
+            bearer_token(&headers),
+            Err(AuthFailure::Unauthorized(message)) if message.contains("missing")
+        ));
+
+        headers.insert(AUTHORIZATION, "Token abc".parse().expect("header"));
+        assert!(matches!(
+            bearer_token(&headers),
+            Err(AuthFailure::Unauthorized(message)) if message.contains("Bearer")
+        ));
+
+        headers.insert(AUTHORIZATION, "Bearer    ".parse().expect("header"));
+        assert!(matches!(
+            bearer_token(&headers),
+            Err(AuthFailure::Unauthorized(message)) if message.contains("Bearer")
+        ));
+
+        headers.insert(AUTHORIZATION, "Bearer abc123   ".parse().expect("header"));
+        assert_eq!(bearer_token(&headers).expect("token"), "abc123");
+    }
+
+    #[tokio::test]
+    async fn issue_step_up_session_requires_six_digit_code_and_twenty_minute_ttl() {
+        let claims = fresh_claims("alice", &["admin"]);
+        for bad_code in ["12345", "1234567", "12a456", ""] {
+            let response = issue_step_up_session_handler(
+                Extension(claims.clone()),
+                Json(StepUpSessionRequest {
+                    totp_code: bad_code.to_owned(),
+                }),
+            )
+            .await
+            .expect_err("invalid MFA code should fail");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let response = issue_step_up_session_handler(
+            Extension(claims),
+            Json(StepUpSessionRequest {
+                totp_code: " 123456 ".to_owned(),
+            }),
+        )
+        .await
+        .expect("valid MFA code should issue a session")
+        .0;
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+
+        assert!(response.mfa_session_token.starts_with("mfa.alice."));
+        assert!(response.expires_at >= before + 20 * 60);
+        assert!(response.expires_at <= after + 20 * 60);
+    }
+
+    #[test]
+    fn string_error_to_response_maps_known_client_errors_to_bad_request() {
+        for message in [
+            "name must not be empty",
+            "username must match allowed pattern",
+            "invalid token",
+            "token expired",
+            "user already exists",
+            "ttl must be between 1 and 365",
+        ] {
+            let response = string_error_to_response(anyhow!(message));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{message}");
+        }
+
+        let response = string_error_to_response(anyhow!("storage backend unavailable"));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn issue_registration_token_for_auth_test(
+        secret: &str,
+        subject: &str,
+        roles: &[&str],
+        scopes: &[&str],
+        issued_at: u64,
+        expires_at: u64,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use hmac::{Hmac, KeyInit, Mac};
+        use serde_json::json;
+        type HmacSha256 = Hmac<sha2::Sha256>;
+
+        let header = json!({
+            "alg": "HS256",
+            "typ": "JWT",
+        });
+        let payload = json!({
+            "sub": subject,
+            "iat": issued_at,
+            "exp": expires_at,
+            "token_use": "registration",
+            "invite_roles": roles,
+            "invite_scopes": scopes,
+        });
+        let encoded_header =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header should encode"));
+        let encoded_payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("payload should encode"));
+        let signing_input = format!("{encoded_header}.{encoded_payload}");
+        let mut mac =
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC should initialize");
+        mac.update(signing_input.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{signature}")
+    }
+
     #[cfg(feature = "experimental")]
     #[test]
     fn enqueue_round_trips_through_outbox_and_apply_evicts() {
@@ -1759,23 +2104,19 @@ mod tests {
     }
 
     // Tiny inline tempdir helper. Keeps the test file from pulling in `tempfile`.
-    #[cfg(feature = "experimental")]
     struct TempDir {
         path: std::path::PathBuf,
     }
-    #[cfg(feature = "experimental")]
     impl TempDir {
         fn path(&self) -> &Path {
             &self.path
         }
     }
-    #[cfg(feature = "experimental")]
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
-    #[cfg(feature = "experimental")]
     fn tempdir() -> TempDir {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
