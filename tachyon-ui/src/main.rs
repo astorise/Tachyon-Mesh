@@ -638,6 +638,15 @@ async fn push_large_model(app: tauri::AppHandle, path: String) -> Result<String,
 }
 
 #[tauri::command]
+async fn preview_large_model_upload(
+    path: String,
+) -> Result<tachyon_client::ModelUploadPlanPreview, String> {
+    tachyon_client::preview_large_model_upload(&path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_resources() -> Result<Vec<tachyon_client::MeshResource>, String> {
     tachyon_client::read_resources()
         .await
@@ -1332,6 +1341,7 @@ fn main() {
             push_asset,
             import_faas_package,
             pick_model_file,
+            preview_large_model_upload,
             push_large_model,
             get_resources,
             get_hardware_status,

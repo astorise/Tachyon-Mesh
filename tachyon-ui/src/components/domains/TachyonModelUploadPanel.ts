@@ -17,6 +17,12 @@ type UploadStatus = {
   totalBytes?: number | null;
   part?: number | null;
 };
+type UploadPreview = {
+  alias: string;
+  filesIncluded: number;
+  bytesIncluded: number;
+  files: string[];
+};
 
 /**
  * `<tachyon-model-upload-panel>` — lets an operator pick a local model folder
@@ -84,8 +90,10 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     this.render();
     this.bindEvents();
 
-    await this.startProgressListener();
     try {
+      const preview = await invoke<UploadPreview>("preview_large_model_upload", { path });
+      this.applyPreview(preview);
+      await this.startProgressListener();
       const assetRef = await invoke<string>("push_large_model", { path });
       this.onSuccess(assetRef);
     } catch (error) {
@@ -116,6 +124,21 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     if (status.file && !this.includedFiles.includes(status.file)) {
       this.includedFiles = [...this.includedFiles, status.file].slice(-8);
     }
+    this.statusMessage = this.describeStatus(status);
+    this.render();
+    this.bindEvents();
+  }
+
+  private applyPreview(preview: UploadPreview): void {
+    const status: UploadStatus = {
+      phase: "preparing",
+      percentage: 0,
+      alias: preview.alias,
+      filesIncluded: preview.filesIncluded,
+      bytesIncluded: preview.bytesIncluded,
+    };
+    this.uploadStatus = status;
+    this.includedFiles = preview.files.slice(-8);
     this.statusMessage = this.describeStatus(status);
     this.render();
     this.bindEvents();

@@ -3488,6 +3488,41 @@ where
     .await
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUploadPlanPreview {
+    pub alias: String,
+    pub files_included: usize,
+    pub bytes_included: u64,
+    pub files: Vec<String>,
+}
+
+pub async fn preview_large_model_upload(file_path: &str) -> Result<ModelUploadPlanPreview> {
+    let source = std::path::Path::new(file_path);
+    let metadata = tokio::fs::metadata(file_path)
+        .await
+        .with_context(|| format!("failed to read metadata for model `{file_path}`"))?;
+    if metadata.is_file() && metadata.len() == 0 {
+        anyhow::bail!("model payload `{file_path}` must not be empty");
+    }
+
+    let source_owned = source.to_path_buf();
+    let archive_plan = tokio::task::spawn_blocking(move || model_archive_plan(&source_owned))
+        .await
+        .context("model archive scan task panicked")??;
+    Ok(ModelUploadPlanPreview {
+        alias: archive_plan.alias,
+        files_included: archive_plan.files.len(),
+        bytes_included: archive_plan.included_bytes,
+        files: archive_plan
+            .files
+            .iter()
+            .take(50)
+            .map(|file| file.relative.to_string_lossy().into_owned())
+            .collect(),
+    })
+}
+
 pub async fn push_large_model_with_status<F>(file_path: &str, mut status: F) -> Result<String>
 where
     F: FnMut(ModelUploadStatus) + Send,
@@ -4522,6 +4557,40 @@ mod tests {
         assert!(names.contains(&"model-00002-of-00003.safetensors".to_owned()));
         assert!(names.iter().all(|name| !name.contains(".git")));
         assert!(names.iter().all(|name| !name.ends_with("README.md")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn preview_large_model_upload_reports_included_files() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tachyon-client-qwen-preview-{stamp}"));
+        std::fs::create_dir_all(dir.join(".git").join("lfs")).expect("temp git dir");
+        std::fs::write(dir.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
+        std::fs::write(dir.join("model-00001-of-00003.safetensors"), b"one").unwrap();
+        std::fs::write(dir.join("README.md"), b"ignored").unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let preview = runtime
+            .block_on(preview_large_model_upload(dir.to_str().unwrap()))
+            .expect("preview should detect model files");
+
+        assert_eq!(preview.alias, dir.file_name().unwrap().to_str().unwrap());
+        assert_eq!(preview.files_included, 2);
+        assert_eq!(
+            preview.files,
+            vec![
+                "config.json".to_owned(),
+                "model-00001-of-00003.safetensors".to_owned()
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

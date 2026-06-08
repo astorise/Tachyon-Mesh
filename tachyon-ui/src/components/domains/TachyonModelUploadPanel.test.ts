@@ -22,6 +22,12 @@ import type { TachyonModelUploadPanel } from "./TachyonModelUploadPanel";
 
 const invokeMock = vi.mocked(resilientInvoke);
 const listenMock = vi.mocked(listen);
+const previewPayload = {
+  alias: "Qwen",
+  filesIncluded: 15,
+  bytesIncluded: 23 * 1024 * 1024 * 1024,
+  files: ["config.json", "model-00001-of-00003.safetensors"],
+};
 
 function mountPanel(): TachyonModelUploadPanel {
   const el = document.createElement("tachyon-model-upload-panel") as TachyonModelUploadPanel;
@@ -55,6 +61,7 @@ describe("TachyonModelUploadPanel", () => {
   it("uploads via the privileged wrapper, never a bare core invoke", async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === "pick_model_file") return Promise.resolve("/models/llama.gguf");
+      if (command === "preview_large_model_upload") return Promise.resolve(previewPayload);
       if (command === "push_large_model") return Promise.resolve("gguf/llama");
       return Promise.reject(new Error(`unexpected ${command}`));
     });
@@ -63,6 +70,7 @@ describe("TachyonModelUploadPanel", () => {
     await panel.selectAndUpload();
 
     expect(invokeMock).toHaveBeenCalledWith("pick_model_file");
+    expect(invokeMock).toHaveBeenCalledWith("preview_large_model_upload", { path: "/models/llama.gguf" });
     expect(invokeMock).toHaveBeenCalledWith("push_large_model", { path: "/models/llama.gguf" });
     expect(coreInvoke).not.toHaveBeenCalled();
 
@@ -82,6 +90,7 @@ describe("TachyonModelUploadPanel", () => {
     });
     invokeMock.mockImplementation((command: string) => {
       if (command === "pick_model_file") return Promise.resolve("/models/llama.gguf");
+      if (command === "preview_large_model_upload") return Promise.resolve(previewPayload);
       if (command === "push_large_model") return push.promise;
       return Promise.reject(new Error(`unexpected ${command}`));
     });
@@ -112,6 +121,7 @@ describe("TachyonModelUploadPanel", () => {
     });
     invokeMock.mockImplementation((command: string) => {
       if (command === "pick_model_file") return Promise.resolve("/models/Qwen");
+      if (command === "preview_large_model_upload") return Promise.resolve(previewPayload);
       if (command === "push_large_model") return push.promise;
       return Promise.reject(new Error(`unexpected ${command}`));
     });
@@ -153,6 +163,27 @@ describe("TachyonModelUploadPanel", () => {
     await done;
   });
 
+  it("shows the scanned model files before the privileged upload completes", async () => {
+    const push = deferred<string>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "pick_model_file") return Promise.resolve("/models/Qwen");
+      if (command === "preview_large_model_upload") return Promise.resolve(previewPayload);
+      if (command === "push_large_model") return push.promise;
+      return Promise.reject(new Error(`unexpected ${command}`));
+    });
+
+    const panel = mountPanel();
+    const done = panel.selectAndUpload();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const details = panel.shadowRoot?.querySelector("[data-upload-details]");
+    expect(details?.textContent).toContain("model-00001-of-00003.safetensors");
+    expect(details?.textContent).toContain("15 file");
+
+    push.resolve("models/Qwen");
+    await done;
+  });
+
   it("treats a cancelled file selection as a no-op (no upload)", async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === "pick_model_file") return Promise.resolve(null);
@@ -170,6 +201,7 @@ describe("TachyonModelUploadPanel", () => {
   it("shows the error and re-enables the control on failure", async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === "pick_model_file") return Promise.resolve("/models/llama.gguf");
+      if (command === "preview_large_model_upload") return Promise.resolve(previewPayload);
       if (command === "push_large_model") return Promise.reject(new Error("broker unavailable"));
       return Promise.reject(new Error(`unexpected ${command}`));
     });
