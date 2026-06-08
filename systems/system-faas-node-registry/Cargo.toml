@@ -14,6 +14,11 @@ hex = "0.4"
 wit-bindgen = "0.57"
 # Pure-Rust (wasm-safe) RS256 JWT verification for machine-identity enrollment.
 rsa = "0.9"
+# Pinned to 0.10 on purpose: rsa 0.9 is built on the `digest`/`signature` 0.10
+# trait families, so its signing/verification API only accepts a sha2 0.10
+# `Digest`. The rest of the workspace is on sha2 0.11; do NOT bump this to 0.11
+# until rsa releases a build against digest 0.11, or RS256 verification stops
+# compiling. The duplicate sha2 version is therefore expected here.
 sha2 = { version = "0.10", features = ["oid"] }
 base64 = "0.22"
 

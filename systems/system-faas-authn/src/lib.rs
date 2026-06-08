@@ -25,7 +25,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_JWT_SECRET: &str = "tachyon-dev-secret";
 const JWT_SECRET_ENV: &str = "TACHYON_AUTH_JWT_SECRET";
 const AUTH_STATE_DIR_ENV: &str = "TACHYON_AUTH_STATE_DIR";
 const PAT_PREFIX: &str = "tpat_";
@@ -953,7 +952,25 @@ fn issue_jwt(
 }
 
 fn jwt_secret() -> String {
-    env::var(JWT_SECRET_ENV).unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_owned())
+    // core-host (`auth.rs`) injects TACHYON_AUTH_JWT_SECRET into this guest's WASI
+    // environment before every invocation, so the variable is always present in
+    // production. We never fall back to a constant compiled into the binary: test
+    // builds use a deterministic hermetic secret, and a (theoretical) missing
+    // secret in a release build yields an unpredictable per-call value that fails
+    // every signature check closed rather than trusting a shared default.
+    if let Ok(secret) = env::var(JWT_SECRET_ENV) {
+        if !secret.trim().is_empty() {
+            return secret;
+        }
+    }
+    #[cfg(test)]
+    {
+        "authn-unit-test-secret".to_owned()
+    }
+    #[cfg(not(test))]
+    {
+        hex::encode(rand::random::<[u8; 32]>())
+    }
 }
 
 fn unix_timestamp_seconds() -> Result<u64, std::time::SystemTimeError> {

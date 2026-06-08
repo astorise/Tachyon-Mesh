@@ -69,5 +69,12 @@ members = [
 resolver = "2"
 
 [profile.release]
-opt-level = "z"
+# Tachyon brands itself as a high-performance runtime (AI inference, near-zero
+# cold start). Optimise for speed rather than size: `opt-level = 3` plus a single
+# codegen unit lets fat LTO inline across the whole graph. `strip = "debuginfo"`
+# trims the heavy DWARF tables from the operator binary while keeping the symbol
+# names that make panic backtraces readable. Trade-off: longer release builds.
+opt-level = 3
 lto = true
+codegen-units = 1
+strip = "debuginfo"

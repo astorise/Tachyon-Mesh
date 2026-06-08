@@ -36,8 +36,8 @@ mod authz_bindings {
     });
 }
 
-const DEFAULT_JWT_SECRET: &str = "tachyon-dev-secret";
 const JWT_SECRET_ENV: &str = "TACHYON_AUTH_JWT_SECRET";
+const JWT_SECRET_FILE: &str = "jwt.secret";
 const AUTH_STATE_DIR_ENV: &str = "TACHYON_AUTH_STATE_DIR";
 const DEFAULT_PAT_TTL_DAYS: u32 = 30;
 
@@ -372,6 +372,64 @@ pub(crate) fn auth_state_dir(manifest_path: &Path) -> PathBuf {
         .join("auth-state")
 }
 
+/// Resolve the HS256 signing secret used for identity tokens.
+///
+/// Fail-secure — never a constant compiled into the binary (the same rationale
+/// as the TDE volume key in `component_hosts::tde_key_bytes`). Resolution order:
+///
+/// 1. `TACHYON_AUTH_JWT_SECRET` when set and non-empty. This is **required** for
+///    multi-node meshes, where every node must share the same secret for tokens
+///    to validate across nodes (see `manifests/deploy-mesh.yaml`).
+/// 2. A secret previously persisted under `<state_dir>/jwt.secret`, so a single
+///    node keeps a stable secret across restarts.
+/// 3. A freshly generated 256-bit random secret, persisted for restart
+///    stability. A warning is emitted because a per-node generated secret cannot
+///    be shared across a mesh.
+fn resolve_jwt_secret(state_dir: &Path) -> String {
+    if let Ok(secret) = std::env::var(JWT_SECRET_ENV) {
+        if !secret.trim().is_empty() {
+            return secret;
+        }
+    }
+
+    let secret_path = state_dir.join(JWT_SECRET_FILE);
+    if let Ok(persisted) = fs::read_to_string(&secret_path) {
+        let persisted = persisted.trim();
+        if !persisted.is_empty() {
+            return persisted.to_owned();
+        }
+    }
+
+    let generated = hex::encode(rand::random::<[u8; 32]>());
+    match persist_jwt_secret(&secret_path, &generated) {
+        Ok(()) => tracing::warn!(
+            secret_path = %secret_path.display(),
+            "{JWT_SECRET_ENV} is not set; generated a random per-node JWT secret. \
+             Set {JWT_SECRET_ENV} to a shared value for multi-node deployments."
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "{JWT_SECRET_ENV} is not set and the generated secret could not be \
+             persisted; tokens will not survive a restart. Set {JWT_SECRET_ENV} \
+             explicitly."
+        ),
+    }
+    generated
+}
+
+/// Persist the generated JWT secret with owner-only permissions where the
+/// platform supports it. Best-effort: a failure here is surfaced by the caller
+/// as a warning, not a hard error.
+fn persist_jwt_secret(path: &Path, secret: &str) -> std::io::Result<()> {
+    fs::write(path, secret)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 impl AuthManager {
     pub(crate) fn new(manifest_path: &Path) -> Result<Self> {
         let state_dir = auth_state_dir(manifest_path);
@@ -385,9 +443,8 @@ impl AuthManager {
         Ok(Self {
             authn_module_name: "system-faas-authn".to_owned(),
             authz_module_name: "system-faas-authz".to_owned(),
+            jwt_secret: resolve_jwt_secret(&state_dir),
             state_dir,
-            jwt_secret: std::env::var(JWT_SECRET_ENV)
-                .unwrap_or_else(|_| DEFAULT_JWT_SECRET.to_owned()),
             decision_cache: AuthDecisionCache::new(),
         })
     }
@@ -1689,6 +1746,30 @@ mod tests {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(token.as_bytes());
         hex::encode(digest)
+    }
+
+    #[test]
+    fn resolve_jwt_secret_prefers_env_then_persists_a_random_fallback() {
+        // No other test in this crate touches TACHYON_AUTH_JWT_SECRET, so the
+        // sequential set/remove below is race-free against the rest of the suite.
+        let dir = tempfile::tempdir().expect("temp state dir");
+
+        // 1. An explicit operator-provided secret always wins.
+        std::env::set_var(JWT_SECRET_ENV, "explicit-operator-secret");
+        assert_eq!(resolve_jwt_secret(dir.path()), "explicit-operator-secret");
+
+        // 2. With no secret configured, a random 256-bit value is generated and
+        //    persisted — never the old hard-coded constant.
+        std::env::remove_var(JWT_SECRET_ENV);
+        let generated = resolve_jwt_secret(dir.path());
+        assert_eq!(generated.len(), 64);
+        assert!(generated.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(generated, "tachyon-dev-secret");
+        assert!(dir.path().join(JWT_SECRET_FILE).exists());
+
+        // 3. The persisted secret is reused on the next resolution, so a single
+        //    node keeps a stable secret across restarts.
+        assert_eq!(resolve_jwt_secret(dir.path()), generated);
     }
 
     #[test]

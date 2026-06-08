@@ -1,3 +1,16 @@
+# Shared HS256 signing secret. Every mesh node must use the SAME value so that
+# identity tokens issued by one node validate on the others. Without this the
+# host generates a per-node random secret (fail-secure but not shareable).
+# REPLACE this example value before production — source it from a real secret
+# manager (e.g. sealed-secrets, External Secrets, Vault) instead of committing it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tachyon-mesh-auth
+type: Opaque
+stringData:
+  jwt-secret: "CHANGE-ME-shared-mesh-jwt-secret-0123456789abcdef"
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -56,6 +69,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: TACHYON_AUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: tachyon-mesh-auth
+                  key: jwt-secret
           volumeMounts:
             - name: tachyon-store
               mountPath: /app/data

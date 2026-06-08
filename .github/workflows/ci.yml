@@ -90,7 +90,7 @@ jobs:
         # RUSTSEC-2023-0071 (rsa Marvin attack) targets RSA private-key
         # decryption timing; we only verify JWT signatures with public keys
         # (no private-key ops), so it does not apply. See deny.toml for detail.
-        run: cargo audit --ignore RUSTSEC-2026-0149 --ignore RUSTSEC-2023-0071
+        run: cargo audit --ignore RUSTSEC-2023-0071
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
