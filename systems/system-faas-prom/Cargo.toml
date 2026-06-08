@@ -8,4 +8,4 @@ name = "metrics"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.57"
+wit-bindgen = "0.58"
