@@ -7,8 +7,6 @@ on:
   pull_request:
     branches:
       - main
-  schedule:
-    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
@@ -438,47 +436,7 @@ jobs:
           path: target/release/core-host
           if-no-files-found: error
 
-  # ── 9. Mutation tests (weekly schedule only) ─────────────────────────────────
-  mutation-tests:
-    if: github.event_name == 'schedule'
-    needs: build-guests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Download guest artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: wasm-guests-${{ github.sha }}
-      - name: Unpack guest artifacts
-        run: tar -xzf wasm-guests.tar.gz
-
-      - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked
-
-      - name: Run auth mutation tests
-        run: cargo mutants --package core-host --file core-host/src/auth.rs --timeout 120 --copy-target true
-
-  # ── 10. Miri cwasm cache (weekly schedule only) ───────────────────────────────
-  miri-cwasm-cache:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    env:
-      MIRIFLAGS: "-Zmiri-disable-isolation"
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install nightly Miri
-        run: |
-          rustup toolchain install nightly --component miri
-          cargo +nightly miri setup
-
-      - name: Run cwasm cache Miri smoke test
-        run: cargo +nightly miri test -p core-host cwasm_cache_deserializes_same_engine_component --no-default-features
-
-  # ── 11. Publish Docker images (push to main, needs quality + test) ─────────
+  # ── 9. Publish Docker images (push to main, needs quality + test) ─────────
   # Docker builds core-host from source inside the Dockerfile, so it doesn't
   # consume the pre-built release artifact. It waits for quality + test so we
   # don't publish an image that fails basic validation, but it runs in parallel

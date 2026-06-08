@@ -1,0 +1,32 @@
+name: Miri cwasm cache
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "47 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  miri-cwasm-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      MIRIFLAGS: "-Zmiri-disable-isolation"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri-cwasm-cache
+          cache-on-failure: true
+
+      - name: Install nightly Miri
+        run: |
+          rustup toolchain install nightly --component miri
+          cargo +nightly miri setup
+
+      - name: Run cwasm cache Miri smoke test
+        run: cargo +nightly miri test -p core-host cwasm_cache_deserializes_same_engine_component --no-default-features
