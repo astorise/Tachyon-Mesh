@@ -142,6 +142,7 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
         Arc::clone(&state.storage_broker),
     )?;
     spawn_metering_exporter(state.clone(), export_receiver);
+    spawn_metering_outbox_retry_sweeper(state.clone());
     spawn_async_log_exporter(state.clone(), async_log_receiver);
     spawn_reload_watcher(state.clone());
     spawn_manifest_file_watcher(state.clone());
