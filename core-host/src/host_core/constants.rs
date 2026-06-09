@@ -69,10 +69,15 @@ pub(crate) const DRAINING_REAPER_TICK_INTERVAL: Duration = Duration::from_secs(1
 pub(crate) const DRAINING_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const TELEMETRY_EXPORT_QUEUE_CAPACITY: usize = 1024;
 pub(crate) const TELEMETRY_EXPORT_BATCH_SIZE: usize = 32;
+pub(crate) const METERING_OUTBOX_RETRY_BATCH_LIMIT: usize = TELEMETRY_EXPORT_BATCH_SIZE;
 #[cfg(not(test))]
 pub(crate) const TELEMETRY_EXPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
 pub(crate) const TELEMETRY_EXPORT_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+pub(crate) const METERING_OUTBOX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+pub(crate) const METERING_OUTBOX_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const UDP_LAYER4_QUEUE_CAPACITY: usize = 256;
 pub(crate) const UDP_LAYER4_MAX_WORKERS_PER_LISTENER: usize = 8;
 pub(crate) const UDP_LAYER4_MAX_DATAGRAM_SIZE: usize = 65_507;

@@ -170,6 +170,45 @@ async fn router_skips_telemetry_export_for_unsampled_requests() {
 }
 
 #[tokio::test]
+async fn metering_outbox_retry_drain_removes_successfully_exported_records() {
+    let state = build_test_state(
+        IntegrityConfig::default_sealed(),
+        telemetry::init_test_telemetry(),
+    );
+
+    state
+        .core_store
+        .append_outbox(
+            store::CoreStoreBucket::MeteringOutbox,
+            br#"{"trace_id":"retry","sampled":true}"#,
+        )
+        .expect("metering outbox record should persist");
+
+    assert_eq!(
+        state
+            .core_store
+            .peek_outbox(store::CoreStoreBucket::MeteringOutbox, 16)
+            .expect("metering outbox should be readable")
+            .len(),
+        1
+    );
+
+    let drained = drain_metering_outbox_once(&state, 16)
+        .await
+        .expect("metering outbox retry drain should succeed");
+
+    assert_eq!(drained, 1);
+    assert!(
+        state
+            .core_store
+            .peek_outbox(store::CoreStoreBucket::MeteringOutbox, 16)
+            .expect("metering outbox should be readable after drain")
+            .is_empty(),
+        "successful retry export should delete durable outbox entries"
+    );
+}
+
+#[tokio::test]
 async fn metering_exporter_drains_sampled_records_off_request_path() {
     use std::time::Duration;
 
