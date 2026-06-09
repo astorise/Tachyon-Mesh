@@ -1228,6 +1228,68 @@ pub(crate) fn persist_metering_batch(state: &AppState, batch: &[String]) -> Vec<
     keys
 }
 
+pub(crate) fn spawn_metering_outbox_retry_sweeper(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(METERING_OUTBOX_RETRY_INTERVAL);
+        loop {
+            interval.tick().await;
+            match drain_metering_outbox_once(&state, METERING_OUTBOX_RETRY_BATCH_LIMIT).await {
+                Ok(0) => {}
+                Ok(drained) => {
+                    tracing::debug!("metering outbox retry sweeper exported {drained} record(s)");
+                }
+                Err(error) => {
+                    tracing::warn!("metering outbox retry sweep failed: {error}");
+                }
+            }
+        }
+    });
+}
+
+pub(crate) async fn drain_metering_outbox_once(
+    state: &AppState,
+    limit: usize,
+) -> std::result::Result<usize, String> {
+    if limit == 0 {
+        return Ok(0);
+    }
+
+    let core_store = Arc::clone(&state.core_store);
+    let rows = tokio::task::spawn_blocking(move || {
+        core_store.peek_outbox(store::CoreStoreBucket::MeteringOutbox, limit)
+    })
+    .await
+    .map_err(|error| format!("metering outbox peek task failed: {error}"))?
+    .map_err(|error| format!("failed to peek metering outbox: {error:#}"))?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut keys = Vec::with_capacity(rows.len());
+    let mut batch = Vec::with_capacity(rows.len());
+    for (key, payload) in rows {
+        let record = String::from_utf8(payload)
+            .map_err(|error| format!("metering outbox entry `{key}` is not UTF-8: {error}"))?;
+        keys.push(key);
+        batch.push(record);
+    }
+
+    export_metering_batch(state, batch).await?;
+
+    let drained = keys.len();
+    for key in keys {
+        if let Err(error) = state
+            .core_store
+            .delete(store::CoreStoreBucket::MeteringOutbox, &key)
+        {
+            tracing::warn!("metering outbox retry cleanup for `{key}` failed: {error:#}");
+        }
+    }
+
+    Ok(drained)
+}
+
 pub(crate) fn spawn_async_log_exporter(
     state: AppState,
     mut receiver: mpsc::Receiver<AsyncLogEntry>,
