@@ -37,8 +37,10 @@
       (in-memory batching + size / `TELEMETRY_EXPORT_FLUSH_INTERVAL` flush).
 - [x] 5.2 Specify the durable `metering_outbox` staging: persist before export,
       delete on success, retain on failure.
-- [x] 5.3 Keep the requirements within what the code guarantees — no claim of
-      automatic re-export of retained entries.
+- [x] 5.3 Specify the retry sweeper added by PR #144: bounded cadence
+      (`METERING_OUTBOX_RETRY_INTERVAL`), peek up to
+      `METERING_OUTBOX_RETRY_BATCH_LIMIT`, re-export, delete on success,
+      retain on failure for the next sweep.
 
 ## 6. Verification
 

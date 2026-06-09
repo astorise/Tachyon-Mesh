@@ -51,8 +51,10 @@ code.
   TEE response-annotation headers.
 - **Metering exporter ownership + durable outbox (`tracing-metering`).**
   Realigns the existing requirement so the host exporter owns the in-memory
-  aggregation and size/interval flush, and adds the durable `metering_outbox`
-  staging (persist-before-export, delete-on-success, retain-on-failure).
+  aggregation and size/interval flush, adds the durable `metering_outbox`
+  staging (persist-before-export, delete-on-success, retain-on-failure), and
+  adds the retry sweeper (PR #144) that re-exports retained entries on a
+  bounded cadence.
 
 ## Capabilities
 
@@ -73,10 +75,11 @@ code.
 
 - Documentation-only: no code, dependency, WIT, or interface change. The behaviors
   ship in `systems/system-faas-prom/src/lib.rs`, `tachyon-mcp/src/main.rs`,
-  `systems/system-faas-dist-limiter/src/lib.rs`, and — after PR #141 —
-  `core-host/src/host_core/app_runtime.rs` (TEE delegation + metering exporter),
-  `core-host/src/host_core/constants.rs`, and `core-host/src/store/mod.rs`
-  (`MeteringOutbox`).
+  `systems/system-faas-dist-limiter/src/lib.rs`, and — after PRs #141 and
+  #144 — `core-host/src/host_core/app_runtime.rs` (TEE delegation, metering
+  exporter, outbox retry sweeper), `core-host/src/host_core/constants.rs`,
+  `core-host/src/host_core/entrypoint.rs` (sweeper wiring), and
+  `core-host/src/store/mod.rs` (`MeteringOutbox`).
 - Specs affected: new `system-faas-prom`; deltas to `mcp-server`,
   `distributed-crdt-rate-limiter`, `confidential-computing-tee`, and
   `tracing-metering`.
