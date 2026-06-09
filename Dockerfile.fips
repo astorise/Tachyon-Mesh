@@ -2,7 +2,7 @@
 #
 # Architecture multi-stage :
 #   wasm-builder  (Ubuntu)       → guest modules WASM (inchangé)
-#   fips-builder  (rust:alpine)  → core-host static-pie musl + FIPS
+#   fips-builder  (rust:alpine3.20) → core-host static-pie musl + FIPS
 #   *-builder                    → guests polyglots (tinygo, javy, dotnet, java)
 #   runtime       (scratch)      → image finale ~32 MB, aucune dépendance dynamique
 #
@@ -54,13 +54,15 @@ RUN cargo build -p guest-loop --target wasm32-wasip1 --release
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 
 # ── core-host FIPS — Alpine musl natif ───────────────────────────────────────
-# rust:alpine : Rust stable pré-installé, musl est la libc native.
+# rust:alpine3.20 : Rust stable pré-installé, musl est la libc native. Pinned to
+# Alpine 3.20 (GCC 13) — Alpine 3.21+ ships GCC 14 which generates
+# .data.rel.ro.local sections that aws-lc-fips-sys 0.13.x delocator rejects.
 # Dépendances C découvertes lors des tests CI sur experiment/fips-musl-zigbuild :
 #   cmake, nasm     → compilation aws-lc-fips-sys (C/ASM)
 #   go              → génération de code aws-lc (go.cmake)
 #   perl            → find_package(Perl) dans aws-lc/CMakeLists.txt:141
 #   linux-headers   → headers kernel musl-compatibles (linux/random.h etc.)
-FROM rust:alpine AS fips-builder
+FROM rust:alpine3.20 AS fips-builder
 
 RUN apk add --no-cache \
     build-base cmake nasm \

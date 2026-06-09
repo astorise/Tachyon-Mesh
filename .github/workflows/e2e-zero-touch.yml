@@ -84,7 +84,11 @@ jobs:
           kubectl create namespace tachyon
 
       - name: Import image into k3d
-        run: k3d image import "$IMAGE" -c tachyon-zt
+        run: |
+          # k3s/containerd normalises unqualified refs to docker.io/library/…
+          # when resolving imagePullPolicy:Never; retag before import so names match.
+          docker tag "$IMAGE" "docker.io/library/${IMAGE}"
+          k3d image import "docker.io/library/${IMAGE}" -c tachyon-zt
 
       - name: Deploy mock OIDC issuer
         run: |
@@ -134,7 +138,7 @@ jobs:
           SEED=$(openssl rand -hex 32)
           # One replica is enough to drive the enrollment API and keeps rollout fast.
           sed \
-            -e "s|ghcr.io/astorise/tachyon-mesh:latest|${IMAGE}|g" \
+            -e "s|ghcr.io/astorise/tachyon-mesh:latest|docker.io/library/${IMAGE}|g" \
             -e "s|imagePullPolicy: Always|imagePullPolicy: Never|g" \
             -e "s|replicas: 3|replicas: 1|g" \
             -e "s|REPLACE_WITH_64_HEX_CHAR_ED25519_SEED|${SEED}|g" \
