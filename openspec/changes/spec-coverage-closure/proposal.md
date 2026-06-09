@@ -2,16 +2,14 @@
 
 An OpenSpec coverage audit cross-referenced every shipped code surface — the 37
 WASM system components, `core-host`, the sibling crates, the WIT contracts, the
-Tachyon-UI web components, the MCP tools, and the SDKs — against the 137
-capability specs, the active change, and the 259 archived changes. Coverage was
-~98%: nearly every module, interface, panel, and tool already maps to a
-governing requirement. Three shipped, observable behaviors were the exception —
-they have no requirement anywhere:
+Tachyon-UI web components, the MCP tools, and the SDKs — against the capability
+specs, the active change, and the archived changes. Coverage was ~98%. This
+change documents the behaviors that had no governing requirement.
+
+The first pass found three shipped surfaces with no requirement anywhere:
 
 - **`system-faas-prom`** renders a Prometheus text exposition on every request,
-  but no spec pins the metric set or its format. The privileged telemetry-read
-  mechanism it consumes is specified (`faas-observability`); the exposition
-  contract it produces is not.
+  but no spec pins the metric set or its format.
 - **`tachyon_upload_model`** is a registered, rate-limited MCP tool, yet the MCP
   spec enumerates every other lifecycle tool and omits this one.
 - **`system-faas-dist-limiter`** has a documented *intent* (identity-scoped CRDT
@@ -19,25 +17,42 @@ they have no requirement anywhere:
   `/check`, `/merge`, `/state` HTTP surface, the windowed keying, and the
   G-counter convergence rule — is unspecified.
 
-This change documents the existing behavior as it ships so the specs match
-reality. It changes no code. Four separate spec↔code *discrepancies* surfaced by
-the same audit are handled as code defects rather than doc edits and are listed
-in `design.md` for follow-up.
+A follow-up pass after the discrepancy fixes landed (PR #141 closed issues
+#135–#138) found that fixing two of them introduced new observable surfaces that
+are themselves undocumented:
+
+- **TEE delegation** is now implemented: `requires_tee` routes dispatch to a
+  configured `tee_backend` (`LocalEnclave` or `Enarx { keep_endpoint }`) with a
+  Keep invocation protocol and `x-tachyon-runtime` / `x-tachyon-tee-backend`
+  response annotations. The spec only described delegation at a high level.
+- **Host metering exporter + durable outbox**: the host exporter now owns the
+  in-memory aggregation and the periodic (60 s) / batch-size flush, staging each
+  batch in a durable `metering_outbox` before forwarding to `system-faas-metering`.
+  The `tracing-metering` requirement still attributed in-memory batching to
+  `system-faas-metering`.
+
+This change documents all of the above as the code behaves today. It changes no
+code.
 
 ## What Changes
 
-- **`system-faas-prom` exposition contract (new capability).** Specifies that
-  the component reads the host telemetry snapshot through the privileged reader
-  world and renders a fixed set of nine `tachyon_*` series as Prometheus text
-  with `# TYPE` lines, returning `200` for any request.
+- **`system-faas-prom` exposition contract (new capability).** Specifies the
+  privileged telemetry read and the fixed set of nine `tachyon_*` series rendered
+  as Prometheus text with `# TYPE` lines, returning `200` for any request.
 - **`tachyon_upload_model` MCP tool (`mcp-server`).** Specifies the tool name,
-  the required `path` argument, delegation to
-  `tachyon_client::push_large_model`, the registered tool schema, and the tight
-  per-tool rate-limit budget shared with other large mutators.
+  the required `path` argument, delegation to `tachyon_client::push_large_model`,
+  the registered schema, and the rate-limit budget.
 - **Distributed limiter sync surface (`distributed-crdt-rate-limiter`).**
   Specifies the `/check` / `/merge` / `/state` endpoints, the `{key}:{window}`
-  time-windowed keying derived from `DIST_LIMIT_WINDOW_SECONDS`, and the
-  per-(key,node) maxima merge that makes the G-counter convergent.
+  time-windowed keying, and the per-(key,node) maxima merge.
+- **TEE backend contract (`confidential-computing-tee`).** Specifies backend
+  selection and the `503` fail-closed path, the `LocalEnclave` (no hardware
+  isolation) vs `Enarx` Keep distinction, the Keep invocation protocol, and the
+  TEE response-annotation headers.
+- **Metering exporter ownership + durable outbox (`tracing-metering`).**
+  Realigns the existing requirement so the host exporter owns the in-memory
+  aggregation and size/interval flush, and adds the durable `metering_outbox`
+  staging (persist-before-export, delete-on-success, retain-on-failure).
 
 ## Capabilities
 
@@ -48,17 +63,25 @@ in `design.md` for follow-up.
 ### Modified Capabilities
 - `mcp-server`: adds the `tachyon_upload_model` lifecycle-tool requirement.
 - `distributed-crdt-rate-limiter`: adds the limiter's HTTP sync surface,
-  time-window keying, and merge-convergence requirements (existing intent
-  requirements are unchanged).
+  time-window keying, and merge-convergence requirements.
+- `confidential-computing-tee`: adds the concrete backend-selection, Enarx Keep
+  protocol, and response-annotation requirements.
+- `tracing-metering`: realigns the metering-aggregation ownership to the host
+  exporter and adds the durable metering-outbox requirement.
 
 ## Impact
 
-- Documentation-only: no code, dependency, WIT, or interface change. The three
-  behaviors already ship in `systems/system-faas-prom/src/lib.rs`,
-  `tachyon-mcp/src/main.rs`, and `systems/system-faas-dist-limiter/src/lib.rs`.
-- Specs affected: new `system-faas-prom`, plus deltas to `mcp-server` and
-  `distributed-crdt-rate-limiter`.
-- Out of scope, tracked separately as code defects (see `design.md`): metering
-  batch semantics, TEE enclave delegation, the cdc-broadcaster status code, and
-  the buffer replay header — each a case where an existing requirement describes
-  behavior the code does not implement.
+- Documentation-only: no code, dependency, WIT, or interface change. The behaviors
+  ship in `systems/system-faas-prom/src/lib.rs`, `tachyon-mcp/src/main.rs`,
+  `systems/system-faas-dist-limiter/src/lib.rs`, and — after PR #141 —
+  `core-host/src/host_core/app_runtime.rs` (TEE delegation + metering exporter),
+  `core-host/src/host_core/constants.rs`, and `core-host/src/store/mod.rs`
+  (`MeteringOutbox`).
+- Specs affected: new `system-faas-prom`; deltas to `mcp-server`,
+  `distributed-crdt-rate-limiter`, `confidential-computing-tee`, and
+  `tracing-metering`.
+- The four spec↔code discrepancies the audit originally flagged
+  (cdc-broadcaster `401`, buffer `x-tachyon-buffered`, metering flush, TEE
+  delegation) were fixed in code by PR #141; the cdc-broadcaster and buffer fixes
+  brought the code into line with specs that were already correct, so they need no
+  new documentation here.
