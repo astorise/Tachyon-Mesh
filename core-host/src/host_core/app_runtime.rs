@@ -2619,6 +2619,31 @@ impl ResourcePolicy {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct EnarxTeeInvocation {
+    module: String,
+    route_path: String,
+    method: String,
+    uri: String,
+    headers: GuestHttpFields,
+    body: Vec<u8>,
+    trailers: GuestHttpFields,
+    trace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnarxTeeResponse {
+    status: u16,
+    #[serde(default)]
+    headers: GuestHttpFields,
+    #[serde(default)]
+    body: Vec<u8>,
+    #[serde(default)]
+    trailers: GuestHttpFields,
+    #[serde(default)]
+    fuel_consumed: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_route_request_with_acquired_permit(
     state: &AppState,
@@ -2731,6 +2756,16 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
     };
     let request_config = runtime.config.clone();
     let response_config = runtime.config.clone();
+    let tee_backend_label = route
+        .requires_tee
+        .then(|| {
+            runtime
+                .config
+                .tee_backend
+                .as_ref()
+                .map(tee_backend_header_value)
+        })
+        .flatten();
     let route_registry = Arc::clone(&runtime.route_registry);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let storage_broker = Arc::clone(&state.storage_broker);
@@ -2775,46 +2810,114 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
             return Err(translate_admission_rejection(&route.path, rejection));
         }
     };
-    let result = tokio::task::spawn_blocking(move || {
-        let _guard = admission_guard; // drop on closure exit releases the slot
-        execute_guest(
-            &engine,
-            &task_function_name,
-            guest_request,
-            &task_route,
-            GuestExecutionContext {
-                config: request_config,
-                sampled_execution,
-                runtime_telemetry,
-                async_log_sender: task_async_log_sender,
-                secret_access,
-                request_headers: task_request_headers,
-                host_identity: task_host_identity,
-                storage_broker,
-                bridge_manager: task_bridge_manager,
-                telemetry: telemetry_context,
-                concurrency_limits,
-                propagated_headers: task_propagated_headers,
-                route_overrides: task_route_overrides,
-                host_load: task_host_load,
-                #[cfg(feature = "ai-inference")]
-                ai_runtime: task_ai_runtime,
-                instance_pool: if route_requires_tee {
-                    None
-                } else {
-                    Some(task_instance_pool)
+    let result = if route_requires_tee {
+        let backend = runtime.config.tee_backend.clone().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "route `{}` requires a TEE backend but none is configured",
+                    route.path
+                ),
+            )
+        })?;
+        match backend {
+            TeeBackendConfig::LocalEnclave => {
+                tokio::task::spawn_blocking(move || {
+                    let _guard = admission_guard; // drop on closure exit releases the slot
+                    let mut outcome = execute_guest(
+                        &engine,
+                        &task_function_name,
+                        guest_request,
+                        &task_route,
+                        GuestExecutionContext {
+                            config: request_config,
+                            sampled_execution,
+                            runtime_telemetry,
+                            async_log_sender: task_async_log_sender,
+                            secret_access,
+                            request_headers: task_request_headers,
+                            host_identity: task_host_identity,
+                            storage_broker,
+                            bridge_manager: task_bridge_manager,
+                            telemetry: telemetry_context,
+                            concurrency_limits,
+                            propagated_headers: task_propagated_headers,
+                            route_overrides: task_route_overrides,
+                            host_load: task_host_load,
+                            #[cfg(feature = "ai-inference")]
+                            ai_runtime: task_ai_runtime,
+                            instance_pool: None,
+                            linker_cache: Some(task_linker_cache),
+                        },
+                    )?;
+                    annotate_tee_outcome(&mut outcome, "local-enclave");
+                    Ok(outcome)
+                })
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("TEE guest execution task failed: {error}"),
+                    )
+                })?
+            }
+            TeeBackendConfig::Enarx { keep_endpoint } => {
+                let _guard = admission_guard;
+                invoke_enarx_tee_backend(
+                    &state.http_client,
+                    &keep_endpoint,
+                    EnarxTeeInvocation {
+                        module: selected_module.clone(),
+                        route_path: route.path.clone(),
+                        method: method.to_string(),
+                        uri: uri.to_string(),
+                        headers: header_map_to_guest_fields(&headers),
+                        body: body.to_vec(),
+                        trailers: trailers.clone(),
+                        trace_id: trace_id.clone(),
+                    },
+                )
+                .await
+            }
+        }
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let _guard = admission_guard; // drop on closure exit releases the slot
+            execute_guest(
+                &engine,
+                &task_function_name,
+                guest_request,
+                &task_route,
+                GuestExecutionContext {
+                    config: request_config,
+                    sampled_execution,
+                    runtime_telemetry,
+                    async_log_sender: task_async_log_sender,
+                    secret_access,
+                    request_headers: task_request_headers,
+                    host_identity: task_host_identity,
+                    storage_broker,
+                    bridge_manager: task_bridge_manager,
+                    telemetry: telemetry_context,
+                    concurrency_limits,
+                    propagated_headers: task_propagated_headers,
+                    route_overrides: task_route_overrides,
+                    host_load: task_host_load,
+                    #[cfg(feature = "ai-inference")]
+                    ai_runtime: task_ai_runtime,
+                    instance_pool: Some(task_instance_pool),
+                    linker_cache: Some(task_linker_cache),
                 },
-                linker_cache: Some(task_linker_cache),
-            },
-        )
-    })
-    .await
-    .map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("guest execution task failed: {error}"),
-        )
-    })?;
+            )
+        })
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("guest execution task failed: {error}"),
+            )
+        })?
+    };
     seal_encrypted_route_volumes(route).map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2822,7 +2925,7 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
         )
     })?;
 
-    let (response, fuel_consumed) = match result {
+    let (mut response, fuel_consumed) = match result {
         Ok(outcome) => match outcome.output {
             GuestExecutionOutput::Http(response) => (response, outcome.fuel_consumed),
             GuestExecutionOutput::LegacyStdout(stdout) => (
@@ -2836,6 +2939,10 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
             return Err((status, message));
         }
     };
+
+    if let Some(backend) = tee_backend_label {
+        annotate_tee_response(&mut response, backend);
+    }
 
     let response = resolve_mesh_response(
         &state.http_client,
@@ -2856,6 +2963,117 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
         fuel_consumed,
         completion_guard: Some(active_request_guard.into_response_guard()),
     })
+}
+
+fn annotate_tee_outcome(outcome: &mut GuestExecutionOutcome, backend: &'static str) {
+    if let GuestExecutionOutput::Http(response) = &mut outcome.output {
+        annotate_tee_response(response, backend);
+    }
+}
+
+fn tee_backend_header_value(backend: &TeeBackendConfig) -> &'static str {
+    match backend {
+        TeeBackendConfig::LocalEnclave => "local-enclave",
+        TeeBackendConfig::Enarx { .. } => "enarx",
+    }
+}
+
+fn annotate_tee_response(response: &mut GuestHttpResponse, backend: &'static str) {
+    response
+        .headers
+        .retain(|(name, _)| name != "x-tachyon-runtime" && name != "x-tachyon-tee-backend");
+    response
+        .headers
+        .push(("x-tachyon-runtime".to_owned(), format!("tee-{backend}")));
+    response
+        .headers
+        .push(("x-tachyon-tee-backend".to_owned(), backend.to_owned()));
+}
+
+async fn invoke_enarx_tee_backend(
+    client: &Client,
+    keep_endpoint: &str,
+    invocation: EnarxTeeInvocation,
+) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
+    let payload = serde_json::to_vec(&invocation).map_err(|error| {
+        ExecutionError::Internal(format!(
+            "failed to encode Enarx TEE backend `{keep_endpoint}` invocation: {error}"
+        ))
+    })?;
+    let response = client
+        .post(keep_endpoint)
+        .header("content-type", "application/json")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|error| {
+            ExecutionError::Internal(format!(
+                "failed to invoke Enarx TEE backend `{keep_endpoint}`: {error}"
+            ))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(ExecutionError::Internal(format!(
+            "Enarx TEE backend `{keep_endpoint}` returned {status}: {body}"
+        )));
+    }
+
+    let response_body = response.bytes().await.map_err(|error| {
+        ExecutionError::Internal(format!(
+            "failed to read Enarx TEE backend `{keep_endpoint}` response: {error}"
+        ))
+    })?;
+    let tee_response =
+        serde_json::from_slice::<EnarxTeeResponse>(&response_body).map_err(|error| {
+            ExecutionError::Internal(format!(
+                "failed to decode Enarx TEE backend `{keep_endpoint}` response: {error}"
+            ))
+        })?;
+    let status = StatusCode::from_u16(tee_response.status).map_err(|error| {
+        ExecutionError::Internal(format!(
+            "Enarx TEE backend `{keep_endpoint}` returned invalid status `{}`: {error}",
+            tee_response.status
+        ))
+    })?;
+    let mut guest_response = GuestHttpResponse {
+        status,
+        headers: tee_response.headers,
+        body: Bytes::from(tee_response.body),
+        trailers: tee_response.trailers,
+    };
+    annotate_tee_response(&mut guest_response, "enarx");
+    Ok(GuestExecutionOutcome {
+        output: GuestExecutionOutput::Http(guest_response),
+        fuel_consumed: tee_response.fuel_consumed,
+    })
+}
+
+#[cfg(test)]
+mod tee_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn tee_annotation_marks_http_outcomes_with_backend_headers() {
+        let mut outcome = GuestExecutionOutcome {
+            output: GuestExecutionOutput::Http(GuestHttpResponse::new(StatusCode::OK, "ok")),
+            fuel_consumed: Some(7),
+        };
+
+        annotate_tee_outcome(&mut outcome, "local-enclave");
+
+        let GuestExecutionOutput::Http(response) = outcome.output else {
+            panic!("TEE annotation should preserve HTTP outcomes");
+        };
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "x-tachyon-runtime" && value == "tee-local-enclave" }));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "x-tachyon-tee-backend" && value == "local-enclave" }));
+    }
 }
 
 /// Map an `AdmissionRejection` to the `(StatusCode, String)` error shape
