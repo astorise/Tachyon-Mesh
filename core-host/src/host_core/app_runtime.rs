@@ -1134,46 +1134,82 @@ pub(crate) async fn export_metering_batch(
 
 pub(crate) fn spawn_metering_exporter(state: AppState, mut receiver: mpsc::Receiver<String>) {
     tokio::spawn(async move {
-        while let Some(first_record) = receiver.recv().await {
-            let mut batch = vec![first_record];
-            while batch.len() < TELEMETRY_EXPORT_BATCH_SIZE {
-                match receiver.try_recv() {
-                    Ok(record) => batch.push(record),
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
-                }
-            }
+        let mut batch = Vec::with_capacity(TELEMETRY_EXPORT_BATCH_SIZE);
+        let flush_deadline = tokio::time::sleep(TELEMETRY_EXPORT_FLUSH_INTERVAL);
+        tokio::pin!(flush_deadline);
 
-            // Durably stash each record in the metering outbox before attempting the
-            // HTTP export. If the host crashes between here and the export, the records
-            // are recoverable on the next boot. On successful export, the entries are
-            // removed; on failure, they remain and a later sweep can retry.
-            //
-            // This is the implementation of the `async-zero-blocking-metering` change:
-            // the request critical path remains untouched (the original `mpsc` emit was
-            // already async), but the durability story is now an explicit outbox table
-            // rather than an in-memory channel that vanishes on a crash.
-            let outbox_keys = persist_metering_batch(&state, &batch);
+        loop {
+            tokio::select! {
+                received = receiver.recv() => {
+                    match received {
+                        Some(record) => {
+                            batch.push(record);
+                            while batch.len() < TELEMETRY_EXPORT_BATCH_SIZE {
+                                match receiver.try_recv() {
+                                    Ok(record) => batch.push(record),
+                                    Err(mpsc::error::TryRecvError::Empty) => break,
+                                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                                }
+                            }
 
-            match export_metering_batch(&state, batch).await {
-                Ok(()) => {
-                    for key in outbox_keys {
-                        if let Err(error) = state
-                            .core_store
-                            .delete(store::CoreStoreBucket::MeteringOutbox, &key)
-                        {
-                            tracing::warn!("metering outbox cleanup for `{key}` failed: {error:#}");
+                            if batch.len() >= TELEMETRY_EXPORT_BATCH_SIZE {
+                                flush_metering_batch(&state, &mut batch).await;
+                                let next_flush = next_metering_flush_deadline();
+                                flush_deadline.as_mut().reset(next_flush);
+                            }
+                        }
+                        None => {
+                            flush_metering_batch(&state, &mut batch).await;
+                            break;
                         }
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        "telemetry metering export failed; outbox entries retained: {error}",
-                    );
+                () = &mut flush_deadline => {
+                    flush_metering_batch(&state, &mut batch).await;
+                    let next_flush = next_metering_flush_deadline();
+                    flush_deadline.as_mut().reset(next_flush);
                 }
             }
         }
     });
+}
+
+fn next_metering_flush_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + TELEMETRY_EXPORT_FLUSH_INTERVAL
+}
+
+async fn flush_metering_batch(state: &AppState, batch: &mut Vec<String>) {
+    if batch.is_empty() {
+        return;
+    }
+
+    let pending = std::mem::take(batch);
+
+    // Durably stash each record in the metering outbox before attempting the
+    // HTTP export. If the host crashes between here and the export, the records
+    // are recoverable on the next boot. On successful export, the entries are
+    // removed; on failure, they remain and a later sweep can retry.
+    //
+    // The exporter is the in-memory aggregation owner for system-faas-metering:
+    // records are accumulated off the request path and flushed either when the
+    // batch fills or when the periodic flush interval expires.
+    let outbox_keys = persist_metering_batch(state, &pending);
+
+    match export_metering_batch(state, pending).await {
+        Ok(()) => {
+            for key in outbox_keys {
+                if let Err(error) = state
+                    .core_store
+                    .delete(store::CoreStoreBucket::MeteringOutbox, &key)
+                {
+                    tracing::warn!("metering outbox cleanup for `{key}` failed: {error:#}");
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!("telemetry metering export failed; outbox entries retained: {error}",);
+        }
+    }
 }
 
 pub(crate) fn persist_metering_batch(state: &AppState, batch: &[String]) -> Vec<String> {

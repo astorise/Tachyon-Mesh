@@ -25,6 +25,7 @@ const REPLAY_RAM_LIMIT_ENV: &str = "REPLAY_RAM_LIMIT";
 const REPLAY_BATCH_SIZE_ENV: &str = "REPLAY_BATCH_SIZE";
 const ORIGINAL_ROUTE_HEADER: &str = "x-tachyon-original-route";
 const REPLAY_HEADER: &str = "x-tachyon-buffer-replay";
+const BUFFERED_HEADER: &str = "x-tachyon-buffered";
 const DEFAULT_BUFFER_DIR: &str = "/buffer";
 const DEFAULT_RAM_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_REPLAY_CPU_LIMIT: u8 = 65;
@@ -61,22 +62,26 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
                 return response(503, b"memory pressure is critical".to_vec(), &[]);
             }
             return match enqueue_request(req) {
-                Ok(queue_file) => response(
+                Ok((queue_file, tier)) => response(
                     202,
                     format!(r#"{{"job_id":"{queue_file}","status":"queued"}}"#).into_bytes(),
-                    &[("content-type", "application/json")],
+                    &[
+                        ("content-type", "application/json"),
+                        (BUFFERED_HEADER, tier.as_str()),
+                    ],
                 ),
                 Err(error) => response(500, error.into_bytes(), &[]),
             };
         }
         if req.method.eq_ignore_ascii_case("POST") && route == "/pop" {
             return match pop_request() {
-                Ok(Some((id, body))) => response(
+                Ok(Some((id, tier, body))) => response(
                     200,
                     body,
                     &[
                         ("content-type", "application/json"),
                         ("x-tachyon-job-id", &id),
+                        (BUFFERED_HEADER, tier.as_str()),
                     ],
                 ),
                 Ok(None) => response(204, Vec::new(), &[]),
@@ -95,10 +100,13 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
             return response(503, b"memory pressure is critical".to_vec(), &[]);
         }
         match enqueue_request(req) {
-            Ok(queue_file) => response(
+            Ok((queue_file, tier)) => response(
                 202,
                 format!("buffered:{queue_file}").into_bytes(),
-                &[("content-type", "text/plain; charset=utf-8")],
+                &[
+                    ("content-type", "text/plain; charset=utf-8"),
+                    (BUFFERED_HEADER, tier.as_str()),
+                ],
             ),
             Err(error) => response(500, error.into_bytes(), &[]),
         }
@@ -120,7 +128,7 @@ fn queue_depth() -> usize {
         .unwrap_or(0)
 }
 
-fn pop_request() -> Result<Option<(String, Vec<u8>)>, String> {
+fn pop_request() -> Result<Option<(String, BufferTier, Vec<u8>)>, String> {
     let Some(path) = queued_files(&buffer_root())?.into_iter().next() else {
         return Ok(None);
     };
@@ -129,8 +137,9 @@ fn pop_request() -> Result<Option<(String, Vec<u8>)>, String> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| "queued file name is invalid".to_owned())?
         .to_owned();
+    let tier = BufferTier::from_queue_path(&path)?;
     let body = fs::read(&path).map_err(|error| format!("failed to read queued job: {error}"))?;
-    Ok(Some((id, body)))
+    Ok(Some((id, tier, body)))
 }
 
 fn ack_request(id: &str) -> Result<bool, String> {
@@ -147,7 +156,7 @@ fn ack_request(id: &str) -> Result<bool, String> {
 
 fn enqueue_request(
     req: bindings::exports::tachyon::mesh::handler::Request,
-) -> Result<String, String> {
+) -> Result<(String, BufferTier), String> {
     let root = buffer_root();
     let ram_dir = root.join("ram");
     let disk_dir = root.join("disk");
@@ -158,10 +167,10 @@ fn enqueue_request(
     let original_route = original_route(&req)?;
     let priority = request_priority(&req.headers);
     let ram_capacity = parse_usize_env(RAM_QUEUE_CAPACITY_ENV, DEFAULT_RAM_QUEUE_CAPACITY);
-    let target_dir = if queue_len(&ram_dir) < ram_capacity {
-        ram_dir
+    let (target_dir, tier) = if queue_len(&ram_dir) < ram_capacity {
+        (ram_dir, BufferTier::Ram)
     } else {
-        disk_dir
+        (disk_dir, BufferTier::Disk)
     };
 
     let envelope = BufferedRequestEnvelope {
@@ -181,7 +190,7 @@ fn enqueue_request(
             file_path.display()
         )
     })?;
-    Ok(file_name)
+    Ok((file_name, tier))
 }
 
 fn replay_queued_requests() -> Result<(), String> {
@@ -201,10 +210,12 @@ fn replay_queued_requests() -> Result<(), String> {
 
         let payload =
             fs::read(&path).map_err(|error| format!("failed to read buffered request: {error}"))?;
+        let tier = BufferTier::from_queue_path(&path)?;
         let envelope = serde_json::from_slice::<BufferedRequestEnvelope>(&payload)
             .map_err(|error| format!("failed to decode buffered request: {error}"))?;
         let mut headers = envelope.headers.clone();
         headers.push((REPLAY_HEADER.to_owned(), "1".to_owned()));
+        headers.push((BUFFERED_HEADER.to_owned(), tier.as_str().to_owned()));
         let response = bindings::tachyon::mesh::outbound_http::send_request(
             &envelope.method,
             &format!("http://mesh{}", envelope.original_route),
@@ -363,6 +374,34 @@ fn response(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufferTier {
+    Ram,
+    Disk,
+}
+
+impl BufferTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ram => "ram",
+            Self::Disk => "disk",
+        }
+    }
+
+    fn from_queue_path(path: &Path) -> Result<Self, String> {
+        match path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+        {
+            Some("ram") => Ok(Self::Ram),
+            Some("disk") => Ok(Self::Disk),
+            Some(queue) => Err(format!("unknown buffer tier `{queue}`")),
+            None => Err("queued file path is missing a tier directory".to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequestPriority {
     High,
     Normal,
@@ -421,6 +460,23 @@ mod tests {
     fn rejects_new_requests_at_critical_ram_pressure() {
         assert!(accepts_new_requests_at_ram_pressure(89));
         assert!(!accepts_new_requests_at_ram_pressure(90));
+    }
+
+    #[test]
+    fn buffer_tier_reports_queue_directory() {
+        let ram_path = PathBuf::from("/tmp/tachyon-buffer/ram/job.json");
+        let disk_path = PathBuf::from("/tmp/tachyon-buffer/disk/job.json");
+
+        assert_eq!(
+            BufferTier::from_queue_path(&ram_path).unwrap(),
+            BufferTier::Ram
+        );
+        assert_eq!(
+            BufferTier::from_queue_path(&disk_path).unwrap(),
+            BufferTier::Disk
+        );
+        assert_eq!(BufferTier::Ram.as_str(), "ram");
+        assert_eq!(BufferTier::Disk.as_str(), "disk");
     }
 
     #[test]
