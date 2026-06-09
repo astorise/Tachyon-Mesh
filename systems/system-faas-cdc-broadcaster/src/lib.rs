@@ -28,7 +28,7 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
     ) -> bindings::exports::tachyon::mesh::handler::Response {
         match filter_event(&req.body, header_value(&req.headers, "authorization")) {
             Ok(body) => response(200, body),
-            Err(error) => response(403, error),
+            Err(error) => response(401, error),
         }
     }
 }
@@ -68,10 +68,25 @@ fn response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::exports::tachyon::mesh::handler::Guest;
 
     #[test]
     fn rejects_missing_bearer_token() {
         assert!(filter_event(br#"{"namespace":"n","key":"k","op":"insert"}"#, None).is_err());
+    }
+
+    #[test]
+    fn fail_closed_rejection_returns_unauthorized() {
+        let response =
+            Component::handle_request(bindings::exports::tachyon::mesh::handler::Request {
+                method: "POST".to_owned(),
+                uri: "/cdc".to_owned(),
+                headers: vec![],
+                body: br#"{"namespace":"n","key":"k","op":"insert"}"#.to_vec(),
+                trailers: vec![],
+            });
+
+        assert_eq!(response.status, 401);
     }
 
     #[test]
