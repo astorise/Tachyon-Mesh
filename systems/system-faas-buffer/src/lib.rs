@@ -468,11 +468,12 @@ mod tests {
         let disk_path = PathBuf::from("/tmp/tachyon-buffer/disk/job.json");
 
         assert_eq!(
-            BufferTier::from_queue_path(&ram_path).unwrap(),
+            BufferTier::from_queue_path(&ram_path).expect("RAM queue path should map to RAM tier"),
             BufferTier::Ram
         );
         assert_eq!(
-            BufferTier::from_queue_path(&disk_path).unwrap(),
+            BufferTier::from_queue_path(&disk_path)
+                .expect("disk queue path should map to disk tier"),
             BufferTier::Disk
         );
         assert_eq!(BufferTier::Ram.as_str(), "ram");

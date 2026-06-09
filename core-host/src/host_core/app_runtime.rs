@@ -3049,33 +3049,6 @@ async fn invoke_enarx_tee_backend(
     })
 }
 
-#[cfg(test)]
-mod tee_dispatch_tests {
-    use super::*;
-
-    #[test]
-    fn tee_annotation_marks_http_outcomes_with_backend_headers() {
-        let mut outcome = GuestExecutionOutcome {
-            output: GuestExecutionOutput::Http(GuestHttpResponse::new(StatusCode::OK, "ok")),
-            fuel_consumed: Some(7),
-        };
-
-        annotate_tee_outcome(&mut outcome, "local-enclave");
-
-        let GuestExecutionOutput::Http(response) = outcome.output else {
-            panic!("TEE annotation should preserve HTTP outcomes");
-        };
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, value)| { name == "x-tachyon-runtime" && value == "tee-local-enclave" }));
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, value)| { name == "x-tachyon-tee-backend" && value == "local-enclave" }));
-    }
-}
-
 /// Map an `AdmissionRejection` to the `(StatusCode, String)` error shape
 /// expected by `BufferedRouteResult`. Includes an `X-Tachyon-Leader` hint
 /// when applicable so clients can retry against the elected leader.
@@ -4059,5 +4032,32 @@ impl HopLimit {
 
     pub(crate) fn decremented(self) -> u32 {
         self.0.saturating_sub(1)
+    }
+}
+
+#[cfg(test)]
+mod tee_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn tee_annotation_marks_http_outcomes_with_backend_headers() {
+        let mut outcome = GuestExecutionOutcome {
+            output: GuestExecutionOutput::Http(GuestHttpResponse::new(StatusCode::OK, "ok")),
+            fuel_consumed: Some(7),
+        };
+
+        annotate_tee_outcome(&mut outcome, "local-enclave");
+
+        let GuestExecutionOutput::Http(response) = outcome.output else {
+            panic!("TEE annotation should preserve HTTP outcomes");
+        };
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "x-tachyon-runtime" && value == "tee-local-enclave" }));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "x-tachyon-tee-backend" && value == "local-enclave" }));
     }
 }
