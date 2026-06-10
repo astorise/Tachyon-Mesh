@@ -320,21 +320,50 @@ fn stage_pending_user(token: &str, profile: SignupProfile) -> Result<StagedUserS
     }
 
     let username = normalize_username(&profile.username)?;
+    let token_hash = hash_registration_token(token);
+    let first_name = normalize_person_name(&profile.first_name, "first name")?;
+    let last_name = normalize_person_name(&profile.last_name, "last name")?;
+    let password_hash = hash_user_password(&username, &profile.password)?;
+    let roles = claims.roles.clone();
+    let scopes = claims.scopes.clone();
     prune_expired_pending_enrollments()?;
-    ensure_user_is_available(&username)?;
+    ensure_user_is_not_enrolled(&username)?;
+
+    if let Some(existing) = active_pending_enrollment_for_username(&username)? {
+        if existing.registration_token_hash == token_hash
+            && existing.first_name == first_name
+            && existing.last_name == last_name
+            && existing.password_hash == password_hash
+            && existing.roles == roles
+            && existing.scopes == scopes
+        {
+            return Ok(StagedUserSession {
+                session_id: existing.session_id.clone(),
+                username,
+                provisioning_uri: build_totp_provisioning_uri(
+                    &existing.username,
+                    &existing.totp_secret,
+                ),
+                roles,
+                scopes,
+                expires_at: existing.expires_at,
+            });
+        }
+        delete_pending_enrollment(&existing.session_id)?;
+    }
 
     let now = unix_timestamp_seconds().map_err(|error| error.to_string())?;
     let pending = PendingEnrollmentRecord {
         session_id: generate_pending_enrollment_id(),
-        registration_token_hash: hash_registration_token(token),
+        registration_token_hash: token_hash,
         invite_subject: claims.subject.clone(),
-        first_name: normalize_person_name(&profile.first_name, "first name")?,
-        last_name: normalize_person_name(&profile.last_name, "last name")?,
+        first_name,
+        last_name,
         username: username.clone(),
-        password_hash: hash_user_password(&username, &profile.password)?,
+        password_hash,
         totp_secret: generate_totp_secret(),
-        roles: claims.roles.clone(),
-        scopes: claims.scopes.clone(),
+        roles: roles.clone(),
+        scopes: scopes.clone(),
         created_at: now,
         expires_at: claims.expires_at,
     };
@@ -344,8 +373,8 @@ fn stage_pending_user(token: &str, profile: SignupProfile) -> Result<StagedUserS
         session_id: pending.session_id.clone(),
         username,
         provisioning_uri: build_totp_provisioning_uri(&pending.username, &pending.totp_secret),
-        roles: claims.roles,
-        scopes: claims.scopes,
+        roles,
+        scopes,
         expires_at: pending.expires_at,
     })
 }
@@ -642,15 +671,21 @@ fn consume_registration_token(token_hash: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_user_is_available(username: &str) -> Result<(), String> {
+fn ensure_user_is_not_enrolled(username: &str) -> Result<(), String> {
     let user_record = load_user_record(username)?;
     if user_record.profile.is_some() {
         return Err("username is already enrolled".to_owned());
     }
 
+    Ok(())
+}
+
+fn active_pending_enrollment_for_username(
+    username: &str,
+) -> Result<Option<PendingEnrollmentRecord>, String> {
     let pending_dir = pending_enrollment_dir();
     if !pending_dir.exists() {
-        return Ok(());
+        return Ok(None);
     }
 
     let now = unix_timestamp_seconds().map_err(|error| error.to_string())?;
@@ -685,11 +720,11 @@ fn ensure_user_is_available(username: &str) -> Result<(), String> {
         })?;
 
         if record.username == username && record.expires_at > now {
-            return Err("username already has a pending enrollment".to_owned());
+            return Ok(Some(record));
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn prune_expired_pending_enrollments() -> Result<(), String> {
@@ -1894,6 +1929,42 @@ mod tests {
                 assert_eq!(session.username, "jane");
                 assert_eq!(session.roles, vec!["admin".to_owned(), "ops".to_owned()]);
                 assert!(validate_registration_token_claims(&token).is_err());
+            });
+            std::env::remove_var(JWT_SECRET_ENV);
+        });
+    }
+
+    #[test]
+    fn staging_same_pending_enrollment_is_replayable() {
+        with_test_env(|| {
+            with_temp_state_dir(|| {
+                let secret = "signup-replay-unit-test-secret";
+                let issued_at = unix_timestamp_seconds().expect("clock should be available");
+                let expires_at = issued_at + 300;
+                let token = issue_registration_token_for_test(
+                    secret,
+                    "invite:ops-admin",
+                    &["admin"],
+                    &["deploy:wasm"],
+                    issued_at,
+                    expires_at,
+                );
+                let profile = || SignupProfile {
+                    first_name: "Jane".to_owned(),
+                    last_name: "Mesh".to_owned(),
+                    username: "jane".to_owned(),
+                    password: "correct horse battery staple".to_owned(),
+                };
+
+                let first = stage_pending_user(&token, profile())
+                    .expect("initial signup session should stage");
+                let replay = stage_pending_user(&token, profile())
+                    .expect("same pending signup session should replay");
+
+                assert_eq!(replay.session_id, first.session_id);
+                assert_eq!(replay.provisioning_uri, first.provisioning_uri);
+                assert_eq!(replay.roles, first.roles);
+                assert_eq!(replay.scopes, first.scopes);
             });
             std::env::remove_var(JWT_SECRET_ENV);
         });
