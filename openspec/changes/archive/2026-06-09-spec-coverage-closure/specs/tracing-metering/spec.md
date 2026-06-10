@@ -27,3 +27,16 @@ Before forwarding a metering batch, the host SHALL persist each record to the du
 - **WHEN** a metering batch is forwarded successfully
 - **THEN** the host deletes the corresponding `metering_outbox` entries
 - **AND** a failed forward instead retains those entries durably for recovery
+
+### Requirement: Retained metering records are re-exported by a retry sweeper
+The host SHALL run a background retry sweeper that drains the `metering_outbox` on a bounded cadence (`METERING_OUTBOX_RETRY_INTERVAL`, default 60 seconds): each sweep peeks up to the configured batch limit (`METERING_OUTBOX_RETRY_BATCH_LIMIT`), re-forwards those records through the same metering export path, and deletes them only after the forward succeeds. Records whose re-export fails SHALL remain in the outbox for a later sweep, so staged usage records are eventually delivered once the sink recovers rather than requiring manual recovery.
+
+#### Scenario: Successful retry clears the staged entries
+- **WHEN** the sweeper drains an outbox containing previously staged records and the export succeeds
+- **THEN** the records are forwarded through the metering export path
+- **AND** the corresponding `metering_outbox` entries are deleted
+
+#### Scenario: Failed retry leaves entries for the next sweep
+- **WHEN** a sweep's re-export fails because the sink is still unavailable
+- **THEN** the peeked entries remain in the `metering_outbox`
+- **AND** the sweeper retries them on a subsequent cadence tick without blocking request handling

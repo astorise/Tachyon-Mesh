@@ -31,16 +31,15 @@ rather than specifying an aspirational target. These are stable, shipped surface
   provides none.
 - **metering** modifies the existing `tracing-metering` requirement so the host
   exporter — not `system-faas-metering` — owns the in-memory aggregation and the
-  size/interval flush, and adds a requirement for the durable `metering_outbox`
-  staging. The new requirements claim only what the code guarantees: durable
-  staging before export, deletion on success, and retention on failure. They do
-  **not** claim automatic re-export of retained entries (see follow-up below).
+  size/interval flush, and adds requirements for the durable `metering_outbox`
+  staging and for the retry sweeper that re-exports retained entries.
 
-## Discrepancies fixed in PR #141
+## Issues fixed in PRs #141 and #144
 
 The audit's first pass flagged four places where an existing requirement
-described behavior the code did not implement. These were filed as code defects
-(issues #135–#138) and fixed in PR #141:
+described behavior the code did not implement (issues #135–#138, fixed in
+PR #141); the re-audit of that fix flagged the missing outbox retry (issue
+#142, fixed in PR #144):
 
 1. **cdc-broadcaster status** (#135) — now returns `401` (was `403`). The
    `remediation-plan` spec was already correct; no doc change needed.
@@ -54,14 +53,12 @@ described behavior the code did not implement. These were filed as code defects
    configured backend. This introduced the backend contract documented by the
    `confidential-computing-tee` delta in this change.
 
-## Follow-up not covered here
-
-- **Metering outbox drain/retry is not wired.** Retained `metering_outbox`
-  entries are durable but there is currently no sweeper that re-exports them
-  (unlike `AuthzPurgeOutbox` and `ConfigUpdateOutbox`, which have steady-cadence
-  drains in `supervisors.rs`). The `tracing-metering` delta therefore documents
-  durability and retention only, not automatic recovery. Wiring a drain is a
-  code follow-up, out of scope for this documentation change.
+5. **metering outbox retry** (#142) — the first version of this change noted
+   that retained `metering_outbox` entries were never re-exported. PR #144 wired
+   a retry sweeper (`spawn_metering_outbox_retry_sweeper` /
+   `drain_metering_outbox_once`: peek up to the batch limit, re-export, delete
+   on success), mirroring the existing `AuthzPurgeOutbox` / `ConfigUpdateOutbox`
+   drains. The `tracing-metering` delta now documents this automatic recovery.
 
 ## Notes
 
