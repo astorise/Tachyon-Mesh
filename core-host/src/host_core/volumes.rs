@@ -1092,5 +1092,16 @@ pub(crate) fn build_s3_store(bucket: &str) -> anyhow::Result<impl object_store::
     if let Ok(endpoint) = std::env::var("TACHYON_S3_ENDPOINT") {
         builder = builder.with_endpoint(endpoint);
     }
+    if std::env::var("TACHYON_S3_FORCE_PATH_STYLE")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+    {
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
     builder.build().map_err(|e| anyhow::anyhow!("{e}"))
 }

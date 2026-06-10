@@ -14,6 +14,7 @@ const S3_ACCESS_KEY_ENV: &str = "TACHYON_S3_ACCESS_KEY_ID";
 const S3_SECRET_KEY_ENV: &str = "TACHYON_S3_SECRET_ACCESS_KEY";
 const S3_PREFIX_ENV: &str = "TACHYON_S3_PREFIX";
 const S3_REGION_ENV: &str = "TACHYON_S3_REGION";
+const S3_FORCE_PATH_STYLE_ENV: &str = "TACHYON_S3_FORCE_PATH_STYLE";
 
 const DEFAULT_REGION: &str = "us-east-1";
 const BACKGROUND_FLUSH_INTERVAL: Duration = Duration::from_secs(300);
@@ -25,6 +26,7 @@ pub(crate) struct S3PersistenceConfig {
     secret_key: String,
     prefix: String,
     region: String,
+    force_path_style: bool,
 }
 
 impl S3PersistenceConfig {
@@ -37,8 +39,20 @@ impl S3PersistenceConfig {
             secret_key: std::env::var(S3_SECRET_KEY_ENV).unwrap_or_default(),
             prefix: std::env::var(S3_PREFIX_ENV).unwrap_or_default(),
             region: std::env::var(S3_REGION_ENV).unwrap_or_else(|_| DEFAULT_REGION.to_owned()),
+            force_path_style: parse_bool_env(S3_FORCE_PATH_STYLE_ENV),
         })
     }
+}
+
+fn parse_bool_env(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) struct S3PersistenceBackend {
@@ -57,6 +71,9 @@ impl S3PersistenceBackend {
             .with_allow_http(true);
         if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
+        }
+        if config.force_path_style {
+            builder = builder.with_virtual_hosted_style_request(false);
         }
         let store = builder.build().context("failed to build S3 client")?;
         Ok(Self {

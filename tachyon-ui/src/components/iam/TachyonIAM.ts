@@ -58,6 +58,7 @@ export class TachyonIAM extends HTMLElement {
   private stagedSignup: StagedSignupSession | null = null;
   private stagedLogin: AuthLoginResponse | null = null;
   private stagedCredentials: CredentialsSubmittedDetail | null = null;
+  private finalizeSignupSubmitting = false;
 
   constructor() {
     super();
@@ -357,6 +358,9 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private async finalizeSignup(): Promise<void> {
+    if (this.finalizeSignupSubmitting) {
+      return;
+    }
     if (!this.stagedSignup) {
       this.showError(t("iam.error.no-staged-signup"));
       return;
@@ -365,12 +369,19 @@ export class TachyonIAM extends HTMLElement {
       this.showError(t("iam.error.url-required"));
       return;
     }
+    const totpCode = this.value("signup-totp-code").replace(/\s+/g, "");
+    if (!/^\d{6}$/.test(totpCode)) {
+      this.showError(t("iam.error.totp-format"));
+      return;
+    }
+    this.finalizeSignupSubmitting = true;
+    this.setSignupFinalizeSubmitting(true);
     try {
       const response = await invoke<AuthLoginResponse>("finalize_signup", {
         payload: {
           url: this.signupUrl(),
           sessionId: this.stagedSignup.sessionId,
-          totpCode: this.value("signup-totp-code"),
+          totpCode,
           cert: this.stagedCredentials?.cert ?? null,
         },
       });
@@ -381,7 +392,21 @@ export class TachyonIAM extends HTMLElement {
       });
     } catch (error) {
       this.emitError(error, "signup_finalize_failed");
+    } finally {
+      this.finalizeSignupSubmitting = false;
+      this.setSignupFinalizeSubmitting(false);
     }
+  }
+
+  private setSignupFinalizeSubmitting(isSubmitting: boolean): void {
+    const button = this.button("btn-signup-totp-submit");
+    if (!button) {
+      return;
+    }
+    button.disabled = isSubmitting;
+    button.setAttribute("aria-busy", String(isSubmitting));
+    button.classList.toggle("opacity-60", isSubmitting);
+    button.classList.toggle("cursor-not-allowed", isSubmitting);
   }
 
   private async completeAuthentication(detail: AuthenticatedDetail): Promise<void> {

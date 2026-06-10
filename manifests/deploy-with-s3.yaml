@@ -30,6 +30,21 @@
 ##   /data/certs/           — TLS/ACME certificates
 
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tachyon-auth-state
+  namespace: tachyon
+  labels:
+    app: tachyon-host
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -98,9 +113,29 @@ spec:
           value: "/data/integrity.lock"
         - name: TACHYON_CONFIG_STORE_DIR
           value: "/data/config-store"
+        - name: TACHYON_S3_ENDPOINT
+          value: ""                     # Leave empty for AWS S3; set for other providers
+        - name: TACHYON_S3_BUCKET
+          value: "tachyon-data"         # Your S3 bucket name
+        - name: TACHYON_S3_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: tachyon-s3-creds
+              key: access-key-id
+        - name: TACHYON_S3_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tachyon-s3-creds
+              key: secret-access-key
+        - name: TACHYON_S3_REGION
+          value: "us-east-1"
+        - name: TACHYON_S3_FORCE_PATH_STYLE
+          value: "false"                # Set to "true" for MinIO, RustFS, and other self-hosted providers
         volumeMounts:
         - name: tachyon-data
           mountPath: /data
+        - name: tachyon-auth-state
+          mountPath: /data/auth-state
         - name: tachyon-data
           mountPath: /app/certs
           subPath: certs
@@ -165,6 +200,9 @@ spec:
       volumes:
       - name: tachyon-data
         emptyDir: {}
+      - name: tachyon-auth-state
+        persistentVolumeClaim:
+          claimName: tachyon-auth-state
 
 ---
 apiVersion: v1

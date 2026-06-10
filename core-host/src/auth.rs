@@ -366,6 +366,10 @@ fn default_pat_ttl_days() -> u32 {
 }
 
 pub(crate) fn auth_state_dir(manifest_path: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os(AUTH_STATE_DIR_ENV).filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+
     manifest_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -1040,6 +1044,7 @@ pub(crate) async fn stage_signup_handler(
         })?
         .map_err(string_error_to_response)?;
 
+    flush_auth_state(&state).await;
     Ok(Json(session))
 }
 
@@ -1826,8 +1831,12 @@ mod tests {
     }
 
     #[test]
-    fn auth_state_dir_uses_manifest_parent() {
+    fn auth_state_dir_prefers_explicit_env_then_manifest_parent() {
         let manifest = Path::new("/tmp/tachyon/manifest.json");
+        std::env::set_var(AUTH_STATE_DIR_ENV, "/app/auth-state");
+        assert_eq!(auth_state_dir(manifest), PathBuf::from("/app/auth-state"));
+
+        std::env::remove_var(AUTH_STATE_DIR_ENV);
         assert_eq!(
             auth_state_dir(manifest),
             Path::new("/tmp/tachyon/auth-state")
