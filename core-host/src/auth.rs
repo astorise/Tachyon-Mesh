@@ -11,7 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 use wasmtime::{
@@ -39,6 +39,7 @@ mod authz_bindings {
 const JWT_SECRET_ENV: &str = "TACHYON_AUTH_JWT_SECRET";
 const JWT_SECRET_FILE: &str = "jwt.secret";
 const AUTH_STATE_DIR_ENV: &str = "TACHYON_AUTH_STATE_DIR";
+const AUTH_STATE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PAT_TTL_DAYS: u32 = 30;
 
 use authn_bindings::exports::tachyon::identity::authn::{
@@ -1707,8 +1708,17 @@ async fn flush_auth_state(state: &crate::AppState) {
     #[cfg(feature = "s3-persistence")]
     if let Some(backend) = state.s3_backend.as_deref() {
         let auth_dir = auth_state_dir(&state.manifest_path);
-        if let Err(error) = backend.flush_path(&auth_dir).await {
-            tracing::warn!(error = %error, "failed to flush auth state to S3");
+        match tokio::time::timeout(AUTH_STATE_FLUSH_TIMEOUT, backend.flush_path(&auth_dir)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "failed to flush auth state to S3");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = AUTH_STATE_FLUSH_TIMEOUT.as_millis(),
+                    "timed out flushing auth state to S3"
+                );
+            }
         }
     }
     #[cfg(not(feature = "s3-persistence"))]

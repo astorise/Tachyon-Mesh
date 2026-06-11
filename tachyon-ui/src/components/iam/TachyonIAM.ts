@@ -154,7 +154,10 @@ export class TachyonIAM extends HTMLElement {
             <input type="text" id="signup-totp-code" placeholder="000000" maxlength="6" class="w-full bg-slate-950 border border-slate-700 p-4 rounded-lg text-cyan-400 text-center text-3xl tracking-[0.35em] font-mono focus:border-cyan-500 focus:outline-none" />
             <div class="grid gap-3 md:grid-cols-2">
               <button type="button" id="btn-signup-totp-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">${t("iam.back")}</button>
-              <button id="btn-signup-totp-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">${t("iam.signup.finalize")}</button>
+              <button id="btn-signup-totp-submit" class="flex w-full items-center justify-center gap-2 bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">
+                <span id="signup-finalize-spinner" class="hidden h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" aria-hidden="true"></span>
+                <span id="signup-finalize-label">${t("iam.signup.finalize")}</span>
+              </button>
             </div>
           </form>
           <div id="auth-error" class="hidden mt-4 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 text-center">${t("iam.error.generic")}</div>
@@ -431,6 +434,8 @@ export class TachyonIAM extends HTMLElement {
 
   private setSignupFinalizeSubmitting(isSubmitting: boolean): void {
     const button = this.button("btn-signup-totp-submit");
+    const spinner = this.root.getElementById("signup-finalize-spinner");
+    const label = this.root.getElementById("signup-finalize-label");
     if (!button) {
       return;
     }
@@ -438,6 +443,10 @@ export class TachyonIAM extends HTMLElement {
     button.setAttribute("aria-busy", String(isSubmitting));
     button.classList.toggle("opacity-60", isSubmitting);
     button.classList.toggle("cursor-not-allowed", isSubmitting);
+    spinner?.classList.toggle("hidden", !isSubmitting);
+    if (label) {
+      label.textContent = isSubmitting ? t("iam.signup.finalize-loading") : t("iam.signup.finalize");
+    }
   }
 
   private async completeAuthentication(detail: AuthenticatedDetail): Promise<void> {
