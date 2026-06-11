@@ -34,7 +34,6 @@ const COMMIT_PREFIX: &str = "/admin/models/commit/";
 const ABORT_PREFIX: &str = "/admin/models/abort/";
 const AUTH_SESSION_CDC_PATH: &str = "/internal/model-broker/cdc/auth-session";
 const PROMPT_FINISHED_PATH: &str = "/internal/model-broker/prompt-finished";
-const MODEL_REGISTRY_REGISTER_URL: &str = "http://mesh/internal/guest-openai/register";
 const STANDARD_VRAM_TTL_SECONDS: u64 = 300;
 const EXTENDED_VRAM_TTL_SECONDS: u64 = 1_800;
 const HIGH_FOLLOWUP_PROBABILITY: f32 = 0.8;
@@ -118,15 +117,6 @@ struct PendingUpload {
     alias: Option<String>,
     #[serde(default)]
     files: Vec<ModelUploadFileManifest>,
-}
-
-#[derive(Debug, Serialize)]
-struct ModelRegistryEntry {
-    alias: String,
-    engine: String,
-    #[serde(rename = "vramRequiredMb")]
-    vram_required_mb: u64,
-    status: String,
 }
 
 impl bindings::exports::tachyon::mesh::handler::Guest for Component {
@@ -379,9 +369,9 @@ fn commit_upload(uri: &str) -> Result<String, String> {
             cleanup_staging(&upload_id);
         })?;
     write_meta_sidecar(&model_dir, format, &alias)?;
+    publish_model_uploaded(&alias, format, &model_dir, &pending.files)?;
 
     cleanup_staging(&upload_id);
-    notify_model_registry(&alias, format);
 
     Ok(model_dir.to_string_lossy().to_string())
 }
@@ -498,6 +488,29 @@ fn path_to_manifest_key(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn publish_model_uploaded(
+    alias: &str,
+    engine: &str,
+    model_dir: &Path,
+    files: &[ModelUploadFileManifest],
+) -> Result<(), String> {
+    let event = bindings::tachyon::mesh::model_events::ModelUploaded {
+        alias: alias.to_owned(),
+        engine: engine.to_owned(),
+        model_path: model_dir.to_string_lossy().into_owned(),
+        files: files
+            .iter()
+            .map(|file| bindings::tachyon::mesh::model_events::ModelFile {
+                path: file.path.clone(),
+                size_bytes: file.size_bytes,
+                sha256: file.sha256.clone(),
+            })
+            .collect(),
+    };
+    bindings::tachyon::mesh::model_events::publish_model_uploaded(&event)
+        .map_err(|error| format!("failed to publish model upload event: {error}"))
 }
 
 /// Stream a gzip+tar archive into `dest`, writing only regular files and
@@ -626,27 +639,6 @@ fn validate_alias(alias: &str) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// Best-effort notification to the `guest-openai` model registry that a model is now
-/// available. Failures are swallowed — the commit has already succeeded and the registry
-/// can be refreshed on the next model upload or operator intervention.
-fn notify_model_registry(alias: &str, engine: &str) {
-    let entry = ModelRegistryEntry {
-        alias: alias.to_owned(),
-        engine: engine.to_owned(),
-        vram_required_mb: 0,
-        status: "available".to_owned(),
-    };
-    let Ok(body) = serde_json::to_vec(&entry) else {
-        return;
-    };
-    let _ = bindings::tachyon::mesh::outbound_http::send_request(
-        "POST",
-        MODEL_REGISTRY_REGISTER_URL,
-        &[("content-type".to_owned(), "application/json".to_owned())],
-        &body,
-    );
 }
 
 /// Explicit client-driven cleanup for an in-progress upload. The broker is request-driven

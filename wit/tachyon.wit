@@ -186,6 +186,23 @@ interface storage-broker {
     restore-volume: func(volume-id: string, snapshot-path: string, destination-path: string) -> result<_, string>;
 }
 
+interface model-events {
+    record model-file {
+        path: string,
+        size-bytes: u64,
+        sha256: string,
+    }
+
+    record model-uploaded {
+        alias: string,
+        engine: string,
+        model-path: string,
+        files: list<model-file>,
+    }
+
+    publish-model-uploaded: func(event: model-uploaded) -> result<_, string>;
+}
+
 interface outbound-http {
     type headers = list<tuple<string, string>>;
 
@@ -332,6 +349,7 @@ world system-faas-guest {
     import custom-metrics;
     import scaling-metrics;
     import storage-broker;
+    import model-events;
     import outbound-http;
     export handler;
 }

@@ -6,9 +6,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http_body_util::BodyExt;
+use serde::Serialize;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use wasmtime::{
     component::{Component, Linker as ComponentLinker},
@@ -32,7 +34,10 @@ mod bindings {
 struct StorageComponentState {
     ctx: WasiCtx,
     table: ResourceTable,
+    core_store: Arc<crate::store::CoreStore>,
 }
+
+const AI_MODELS_REGISTRY_TABLE: &str = "ai-models-registry";
 
 struct ComponentRequest {
     method: String,
@@ -122,6 +127,7 @@ async fn proxy_request_to_component(
 ) -> Response {
     let manifest_path = state.manifest_path.clone();
     let engine = state.runtime.load().engine.clone();
+    let core_store = state.core_store.clone();
     let component_request = match collect_component_request(request).await {
         Ok(request) => request,
         Err(error) => {
@@ -135,7 +141,13 @@ async fn proxy_request_to_component(
     let root_dir = working_dir(&manifest_path);
 
     match tokio::task::spawn_blocking(move || {
-        invoke_storage_component(&engine, module_name, &root_dir, component_request)
+        invoke_storage_component(
+            &engine,
+            module_name,
+            &root_dir,
+            core_store,
+            component_request,
+        )
     })
     .await
     {
@@ -167,6 +179,7 @@ fn invoke_storage_component(
     engine: &Engine,
     module_name: &str,
     root_dir: &Path,
+    core_store: Arc<crate::store::CoreStore>,
     request: ComponentRequest,
 ) -> Result<ComponentResponse> {
     fs::create_dir_all(root_dir).with_context(|| {
@@ -188,6 +201,11 @@ fn invoke_storage_component(
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
         anyhow!("failed to add WASI preview2 functions to storage component linker: {error}")
     })?;
+    bindings::tachyon::mesh::model_events::add_to_linker::<_, StorageComponentState>(
+        &mut linker,
+        |state| state,
+    )
+    .map_err(|error| anyhow!("failed to add model-events functions to storage linker: {error}"))?;
 
     let mut builder = WasiCtxBuilder::new();
     builder
@@ -209,6 +227,7 @@ fn invoke_storage_component(
         StorageComponentState {
             ctx: builder.build(),
             table: ResourceTable::new(),
+            core_store,
         },
     );
     let bindings = bindings::SystemFaasGuest::instantiate(&mut store, &component, &linker)
@@ -238,6 +257,41 @@ fn invoke_storage_component(
         body: response.body,
         trailers: response.trailers,
     })
+}
+
+#[derive(Serialize)]
+struct RegistryModelInfo<'a> {
+    alias: &'a str,
+    engine: &'a str,
+    vram_required_mb: u64,
+    status: &'a str,
+    model_path: &'a str,
+}
+
+impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
+    fn publish_model_uploaded(
+        &mut self,
+        event: bindings::tachyon::mesh::model_events::ModelUploaded,
+    ) -> std::result::Result<(), String> {
+        if event.alias.trim().is_empty() {
+            return Err("model upload event alias must not be empty".to_owned());
+        }
+        if event.engine.trim().is_empty() {
+            return Err("model upload event engine must not be empty".to_owned());
+        }
+        let info = RegistryModelInfo {
+            alias: &event.alias,
+            engine: &event.engine,
+            vram_required_mb: 0,
+            status: "available",
+            model_path: &event.model_path,
+        };
+        let value = serde_json::to_vec(&info)
+            .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
+        self.core_store
+            .kv_partition_set(AI_MODELS_REGISTRY_TABLE, &event.alias, &value)
+            .map_err(|error| format!("failed to publish model upload event: {error:#}"))
+    }
 }
 
 fn component_response_to_http(response: ComponentResponse) -> Response {

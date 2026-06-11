@@ -2480,6 +2480,42 @@ impl background_component_bindings::tachyon::mesh::routing_control::Host for Com
     }
 }
 
+#[derive(Serialize)]
+struct ModelRegistryRecord<'a> {
+    alias: &'a str,
+    engine: &'a str,
+    vram_required_mb: u64,
+    status: &'a str,
+    model_path: &'a str,
+}
+
+impl system_component_bindings::tachyon::mesh::model_events::Host for ComponentHostState {
+    fn publish_model_uploaded(
+        &mut self,
+        event: system_component_bindings::tachyon::mesh::model_events::ModelUploaded,
+    ) -> std::result::Result<(), String> {
+        if event.alias.trim().is_empty() {
+            return Err("model upload event alias must not be empty".to_owned());
+        }
+        if event.engine.trim().is_empty() {
+            return Err("model upload event engine must not be empty".to_owned());
+        }
+        let record = ModelRegistryRecord {
+            alias: &event.alias,
+            engine: &event.engine,
+            vram_required_mb: 0,
+            status: "available",
+            model_path: &event.model_path,
+        };
+        let value = serde_json::to_vec(&record)
+            .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
+        self.storage_broker
+            .core_store
+            .kv_partition_set("ai-models-registry", &event.alias, &value)
+            .map_err(|error| format!("failed to publish model upload event: {error:#}"))
+    }
+}
+
 impl background_component_bindings::tachyon::mesh::outbound_http::Host for ComponentHostState {
     fn send_request(
         &mut self,
