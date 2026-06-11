@@ -13,6 +13,7 @@ type UploadStatus = {
   filesIncluded?: number;
   bytesIncluded?: number;
   archiveBytes?: number | null;
+  processedBytes?: number | null;
   uploadedBytes?: number | null;
   totalBytes?: number | null;
   part?: number | null;
@@ -224,7 +225,9 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     const files = Number(status?.filesIncluded ?? 0);
     const bytes = Number(status?.bytesIncluded ?? 0);
     const archiveBytes = status?.archiveBytes ?? status?.totalBytes ?? null;
+    const processedBytes = status?.processedBytes ?? null;
     const uploadedBytes = status?.uploadedBytes ?? null;
+    const phase = status?.phase ?? "";
     const fileRows = this.includedFiles
       .map((file) => `<li class="truncate font-mono text-[10px] text-slate-400" title="${this.escape(file)}">${this.escape(file)}</li>`)
       .join("");
@@ -239,6 +242,7 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
           <span>${t("ai.upload.inputSize").replace("{size}", this.formatBytes(bytes))}</span>
           <span>${t("ai.upload.archiveSize").replace("{size}", this.formatBytes(archiveBytes))}</span>
         </div>
+        ${processedBytes !== null && phase === "preparing" ? `<p>${t("ai.upload.preparedBytes").replace("{done}", this.formatBytes(processedBytes)).replace("{total}", this.formatBytes(status?.totalBytes ?? bytes))}</p>` : ""}
         ${uploadedBytes !== null ? `<p>${t("ai.upload.sent").replace("{sent}", this.formatBytes(uploadedBytes)).replace("{total}", this.formatBytes(status?.totalBytes ?? archiveBytes))}</p>` : ""}
         ${fileRows ? `<ul class="max-h-28 space-y-1 overflow-auto border-t border-slate-800 pt-2">${fileRows}</ul>` : ""}
       </div>
@@ -251,6 +255,11 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
       return t("ai.upload.including").replace("{file}", status.file ?? "");
     }
     if (phase === "preparing") {
+      if (typeof status.processedBytes === "number") {
+        return t("ai.upload.preparingProgress")
+          .replace("{done}", this.formatBytes(status.processedBytes))
+          .replace("{total}", this.formatBytes(status.totalBytes ?? status.bytesIncluded));
+      }
       return t("ai.upload.preparing")
         .replace("{count}", String(status.filesIncluded ?? 0))
         .replace("{size}", this.formatBytes(status.bytesIncluded));

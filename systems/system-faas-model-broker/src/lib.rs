@@ -43,10 +43,19 @@ struct Component;
 
 #[derive(Debug, Deserialize)]
 struct InitUploadRequest {
-    expected_hash: String,
     size_bytes: u64,
     #[serde(default)]
     alias: Option<String>,
+    #[serde(default)]
+    files: Vec<ModelUploadFileManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelUploadFileManifest {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,12 +111,13 @@ struct PromptTtlResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingUpload {
-    expected_hash: String,
     size_bytes: u64,
     bytes_received: u64,
     last_part: u64,
     #[serde(default)]
     alias: Option<String>,
+    #[serde(default)]
+    files: Vec<ModelUploadFileManifest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,7 +263,10 @@ fn init_upload(body: &[u8]) -> Result<String, String> {
     ensure_dirs()?;
     let payload: InitUploadRequest = serde_json::from_slice(body)
         .map_err(|error| format!("failed to decode model-init payload: {error}"))?;
-    validate_hash(&payload.expected_hash)?;
+    validate_file_manifest(&payload.files)?;
+    if payload.files.is_empty() {
+        return Err("model upload init must include a files manifest".to_owned());
+    }
     if payload.size_bytes == 0 {
         return Err("model upload size must be greater than zero".to_owned());
     }
@@ -267,11 +280,11 @@ fn init_upload(body: &[u8]) -> Result<String, String> {
     save_pending_upload(
         &upload_id,
         &PendingUpload {
-            expected_hash: payload.expected_hash,
             size_bytes: payload.size_bytes,
             bytes_received: 0,
             last_part: 0,
             alias: payload.alias,
+            files: payload.files,
         },
     )?;
 
@@ -326,23 +339,17 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     ensure_dirs()?;
     let upload_id = upload_id_from_uri(uri, COMMIT_PREFIX)?;
     let pending = load_pending_upload(&upload_id)?;
-    if pending.bytes_received != pending.size_bytes {
+    if pending.bytes_received == 0 || pending.bytes_received > pending.size_bytes {
         return Err(format!(
-            "model upload `{upload_id}` expected {} bytes but received {}",
-            pending.size_bytes, pending.bytes_received
+            "model upload `{upload_id}` received {} bytes, declared limit {}",
+            pending.bytes_received, pending.size_bytes
         ));
     }
 
     let staging_path = staging_path(&upload_id);
-    let computed_hash = hash_file(&staging_path)?;
-    if computed_hash != pending.expected_hash {
-        // Hash mismatch means the staged content is unusable. Delete the .part and the
-        // metadata so the upload slot is freed and the broker never accidentally
-        // promotes a corrupted archive to the final model directory.
-        cleanup_staging(&upload_id);
+    if !staging_path.exists() {
         return Err(format!(
-            "model upload `{upload_id}` hash mismatch: expected `{}`, computed `{computed_hash}`",
-            pending.expected_hash
+            "model upload `{upload_id}` staging archive is missing"
         ));
     }
 
@@ -363,6 +370,7 @@ fn commit_upload(uri: &str) -> Result<String, String> {
         .map_err(|error| format!("failed to create model directory: {error}"))?;
 
     let format = unpack_targz(&staging_path, &model_dir)
+        .and_then(|()| validate_extracted_file_manifest(&model_dir, &pending.files))
         .and_then(|()| detect_format(&model_dir))
         .inspect_err(|_error| {
             // The archive is unusable: drop the half-written directory and the
@@ -384,10 +392,112 @@ fn commit_upload(uri: &str) -> Result<String, String> {
 fn model_alias(pending: &PendingUpload) -> String {
     pending.alias.clone().unwrap_or_else(|| {
         pending
-            .expected_hash
-            .trim_start_matches("sha256:")
-            .to_owned()
+            .files
+            .first()
+            .map(|file| file.sha256.trim_start_matches("sha256:").to_owned())
+            .unwrap_or_else(|| "model".to_owned())
     })
+}
+
+fn validate_file_manifest(files: &[ModelUploadFileManifest]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for file in files {
+        validate_hash(&file.sha256)?;
+        let clean = sanitize_relative(Path::new(&file.path))?;
+        let clean_path = path_to_manifest_key(&clean);
+        if clean_path != file.path {
+            return Err(format!(
+                "model file manifest path `{}` must be normalized as `{clean_path}`",
+                file.path
+            ));
+        }
+        if !seen.insert(file.path.clone()) {
+            return Err(format!(
+                "model file manifest contains duplicate path `{}`",
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_extracted_file_manifest(
+    model_dir: &Path,
+    manifest: &[ModelUploadFileManifest],
+) -> Result<(), String> {
+    if manifest.is_empty() {
+        return Ok(());
+    }
+
+    let expected: std::collections::BTreeMap<String, &ModelUploadFileManifest> = manifest
+        .iter()
+        .map(|file| (file.path.clone(), file))
+        .collect();
+    let actual = collect_regular_files(model_dir, model_dir)?;
+    for path in actual.keys() {
+        if !expected.contains_key(path) {
+            return Err(format!(
+                "model archive contains unexpected file `{path}` not declared in manifest"
+            ));
+        }
+    }
+    for (path, file) in expected {
+        let Some(actual_path) = actual.get(&path) else {
+            return Err(format!("model archive is missing declared file `{path}`"));
+        };
+        let metadata = fs::metadata(actual_path)
+            .map_err(|error| format!("failed to inspect extracted file `{path}`: {error}"))?;
+        if metadata.len() != file.size_bytes {
+            return Err(format!(
+                "model file `{path}` size mismatch: expected {}, found {}",
+                file.size_bytes,
+                metadata.len()
+            ));
+        }
+        let computed_hash = hash_file(actual_path)?;
+        if computed_hash != file.sha256 {
+            return Err(format!(
+                "model file `{path}` hash mismatch: expected `{}`, computed `{computed_hash}`",
+                file.sha256
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collect_regular_files(
+    root: &Path,
+    dir: &Path,
+) -> Result<std::collections::BTreeMap<String, PathBuf>, String> {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in
+        fs::read_dir(dir).map_err(|error| format!("failed to scan `{}`: {error}", dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("failed to read directory entry: {error}"))?;
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("failed to inspect `{}`: {error}", path.display()))?;
+        if metadata.is_dir() {
+            files.extend(collect_regular_files(root, &path)?);
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| format!("failed to relativize `{}`: {error}", path.display()))?;
+            files.insert(path_to_manifest_key(relative), path);
+        }
+    }
+    Ok(files)
+}
+
+fn path_to_manifest_key(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Stream a gzip+tar archive into `dest`, writing only regular files and
@@ -863,6 +973,49 @@ mod tests {
         assert!(dest.join("model.gguf").exists());
         assert!(dest.join("tokenizer.json").exists());
         assert_eq!(detect_format(&dest).expect("format"), FORMAT_GGUF);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extracted_file_manifest_accepts_matching_files() {
+        let tmp = unique_tmp("manifest-ok");
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        let model = tmp.join("model.gguf");
+        fs::write(&model, b"GGUFmodel").expect("model");
+        let tokenizer = tmp.join("tokenizer.json");
+        fs::write(&tokenizer, b"{}").expect("tokenizer");
+        let manifest = vec![
+            ModelUploadFileManifest {
+                path: "model.gguf".to_owned(),
+                size_bytes: 9,
+                sha256: hash_file(&model).expect("hash model"),
+            },
+            ModelUploadFileManifest {
+                path: "tokenizer.json".to_owned(),
+                size_bytes: 2,
+                sha256: hash_file(&tokenizer).expect("hash tokenizer"),
+            },
+        ];
+
+        validate_extracted_file_manifest(&tmp, &manifest).expect("manifest should match");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extracted_file_manifest_rejects_hash_mismatch() {
+        let tmp = unique_tmp("manifest-bad");
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        fs::write(tmp.join("model.gguf"), b"GGUFmodel").expect("model");
+        let manifest = vec![ModelUploadFileManifest {
+            path: "model.gguf".to_owned(),
+            size_bytes: 9,
+            sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_owned(),
+        }];
+
+        let error = validate_extracted_file_manifest(&tmp, &manifest)
+            .expect_err("hash mismatch should fail");
+        assert!(error.contains("hash mismatch"));
         let _ = fs::remove_dir_all(&tmp);
     }
 

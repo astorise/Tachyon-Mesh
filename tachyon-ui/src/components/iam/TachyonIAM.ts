@@ -58,6 +58,7 @@ export class TachyonIAM extends HTMLElement {
   private stagedSignup: StagedSignupSession | null = null;
   private stagedLogin: AuthLoginResponse | null = null;
   private stagedCredentials: CredentialsSubmittedDetail | null = null;
+  private stageSignupSubmitting = false;
   private finalizeSignupSubmitting = false;
 
   constructor() {
@@ -125,7 +126,10 @@ export class TachyonIAM extends HTMLElement {
             <p id="signup-token-summary" class="text-xs text-slate-500">${t("iam.signup.no-invite")}</p>
             <div class="grid gap-3 md:grid-cols-2 pt-2">
               <button type="button" id="btn-signup-profile-back" class="w-full bg-slate-800 hover:bg-slate-700 py-3 rounded-xl text-white font-semibold transition-all border border-slate-700">${t("iam.back")}</button>
-              <button id="btn-signup-profile-submit" class="w-full bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">${t("iam.signup.stage-account")}</button>
+              <button id="btn-signup-profile-submit" class="flex w-full items-center justify-center gap-2 bg-cyan-600 hover:bg-cyan-500 py-3 rounded-xl text-white font-bold transition-all">
+                <span id="signup-stage-spinner" class="hidden h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" aria-hidden="true"></span>
+                <span id="signup-stage-label">${t("iam.signup.stage-account")}</span>
+              </button>
             </div>
           </form>
           <form id="auth-step-signup-totp" class="auth-step hidden space-y-4">
@@ -328,6 +332,9 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private async stageAccount(): Promise<void> {
+    if (this.stageSignupSubmitting) {
+      return;
+    }
     if (!this.signupUrl()) {
       this.showError(t("iam.error.url-required"));
       return;
@@ -337,6 +344,8 @@ export class TachyonIAM extends HTMLElement {
       this.showError(t("iam.error.password-rules"));
       return;
     }
+    this.stageSignupSubmitting = true;
+    this.setSignupStageSubmitting(true);
     try {
       this.stagedSignup = await invoke<StagedSignupSession>("stage_signup", {
         payload: {
@@ -354,6 +363,28 @@ export class TachyonIAM extends HTMLElement {
       await this.switchStep("signup-totp");
     } catch (error) {
       this.emitError(error, "signup_stage_failed");
+    } finally {
+      this.stageSignupSubmitting = false;
+      this.setSignupStageSubmitting(false);
+    }
+  }
+
+  private setSignupStageSubmitting(isSubmitting: boolean): void {
+    const button = this.button("btn-signup-profile-submit");
+    const spinner = this.root.getElementById("signup-stage-spinner");
+    const label = this.root.getElementById("signup-stage-label");
+    if (!button) {
+      return;
+    }
+    button.disabled = isSubmitting;
+    button.setAttribute("aria-busy", String(isSubmitting));
+    button.classList.toggle("opacity-60", isSubmitting);
+    button.classList.toggle("cursor-not-allowed", isSubmitting);
+    spinner?.classList.toggle("hidden", !isSubmitting);
+    if (label) {
+      label.textContent = isSubmitting
+        ? t("iam.signup.stage-account-loading")
+        : t("iam.signup.stage-account");
     }
   }
 

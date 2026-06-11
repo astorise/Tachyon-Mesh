@@ -5,7 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     net::IpAddr,
     path::PathBuf,
     sync::{OnceLock, RwLock},
@@ -46,6 +46,7 @@ const ADMIN_NODES_PATH: &str = "/admin/nodes";
 const ADMIN_SYSTEMS_REGISTERED_PATH: &str = "/admin/systems/registered";
 const ADMIN_SYSTEMS_DEPLOYED_PATH: &str = "/admin/systems/deployed";
 const MODEL_CHUNK_BYTES: usize = 5 * 1024 * 1024;
+const MODEL_PREP_PROGRESS_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct InstanceConfig {
@@ -299,10 +300,18 @@ struct AssetUploadResponse {
 
 #[derive(Debug, Serialize)]
 struct InitModelUploadRequest<'a> {
-    expected_hash: &'a str,
     size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     alias: Option<&'a str>,
+    files: Vec<InitModelUploadFile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InitModelUploadFile {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3527,10 +3536,9 @@ pub async fn push_large_model_with_status<F>(file_path: &str, mut status: F) -> 
 where
     F: FnMut(ModelUploadStatus) + Send,
 {
-    // The broker expects a gzip+tar archive it unpacks into the model directory.
-    // The upload protocol requires the compressed size and hash up front, so the
-    // client performs a dry compression pass into a counter/hasher, then streams a
-    // second compression pass directly to the node without writing a temp archive.
+    // The broker still receives a gzip+tar archive for compatibility, but
+    // integrity is declared per extracted model file. This avoids a dry
+    // compression pass over multi-GiB model directories before upload starts.
     status(ModelUploadStatus::stage("scanning", 0.0));
     let source = std::path::Path::new(file_path);
     let metadata = tokio::fs::metadata(file_path)
@@ -3554,10 +3562,17 @@ where
     }
     status(ModelUploadStatus::planned(&archive_plan));
 
-    let archive_metadata =
-        tokio::task::spawn_blocking(move || model_archive_metadata(archive_plan))
-            .await
-            .context("model archive metadata task panicked")??;
+    let upload_limit_bytes = max_model_archive_upload_bytes(&archive_plan);
+    let (prep_tx, mut prep_rx) = tokio::sync::mpsc::channel::<ModelUploadStatus>(8);
+    let metadata_task = tokio::task::spawn_blocking(move || {
+        model_archive_file_manifest_with_progress(archive_plan, upload_limit_bytes, prep_tx)
+    });
+    while let Some(prep_status) = prep_rx.recv().await {
+        status(prep_status);
+    }
+    let archive_metadata = metadata_task
+        .await
+        .context("model archive metadata task panicked")??;
     status(ModelUploadStatus::prepared(&archive_metadata));
 
     upload_model_archive_streaming(archive_metadata, status).await
@@ -3573,7 +3588,7 @@ struct ModelArchivePlan {
 #[derive(Clone, Debug)]
 struct ModelArchiveMetadata {
     plan: ModelArchivePlan,
-    expected_hash: String,
+    file_manifest: Vec<InitModelUploadFile>,
     size_bytes: u64,
 }
 
@@ -3608,6 +3623,7 @@ pub struct ModelUploadStatus {
     pub files_included: usize,
     pub bytes_included: u64,
     pub archive_bytes: Option<u64>,
+    pub processed_bytes: Option<u64>,
     pub uploaded_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
     pub part: Option<u64>,
@@ -3623,6 +3639,7 @@ impl ModelUploadStatus {
             files_included: 0,
             bytes_included: 0,
             archive_bytes: None,
+            processed_bytes: None,
             uploaded_bytes: None,
             total_bytes: None,
             part: None,
@@ -3643,6 +3660,7 @@ impl ModelUploadStatus {
             files_included,
             bytes_included,
             archive_bytes: None,
+            processed_bytes: None,
             uploaded_bytes: None,
             total_bytes: None,
             part: None,
@@ -3658,8 +3676,35 @@ impl ModelUploadStatus {
             files_included: plan.files.len(),
             bytes_included: plan.included_bytes,
             archive_bytes: None,
+            processed_bytes: None,
             uploaded_bytes: None,
             total_bytes: None,
+            part: None,
+        }
+    }
+
+    fn preparing_progress(
+        alias: &str,
+        files_included: usize,
+        bytes_included: u64,
+        processed_bytes: u64,
+    ) -> Self {
+        let percentage = if bytes_included == 0 {
+            0.0
+        } else {
+            ((processed_bytes as f64 / bytes_included as f64) * 100.0).min(99.0) as f32
+        };
+        Self {
+            phase: "preparing".to_owned(),
+            percentage,
+            alias: Some(alias.to_owned()),
+            file: None,
+            files_included,
+            bytes_included,
+            archive_bytes: None,
+            processed_bytes: Some(processed_bytes),
+            uploaded_bytes: None,
+            total_bytes: Some(bytes_included),
             part: None,
         }
     }
@@ -3673,6 +3718,7 @@ impl ModelUploadStatus {
             files_included: archive.files().len(),
             bytes_included: archive.included_bytes(),
             archive_bytes: Some(archive.size_bytes),
+            processed_bytes: Some(archive.size_bytes),
             uploaded_bytes: None,
             total_bytes: Some(archive.size_bytes),
             part: None,
@@ -3688,6 +3734,7 @@ impl ModelUploadStatus {
             files_included: archive.files().len(),
             bytes_included: archive.included_bytes(),
             archive_bytes: Some(archive.size_bytes),
+            processed_bytes: None,
             uploaded_bytes: Some(uploaded_bytes),
             total_bytes: Some(archive.size_bytes),
             part: Some(part),
@@ -3703,6 +3750,7 @@ impl ModelUploadStatus {
             files_included: archive.files().len(),
             bytes_included: archive.included_bytes(),
             archive_bytes: Some(archive.size_bytes),
+            processed_bytes: None,
             uploaded_bytes: Some(archive.size_bytes),
             total_bytes: Some(archive.size_bytes),
             part: None,
@@ -3728,22 +3776,33 @@ fn model_archive_plan(source: &std::path::Path) -> Result<ModelArchivePlan> {
     })
 }
 
-fn model_archive_metadata(plan: ModelArchivePlan) -> Result<ModelArchiveMetadata> {
-    let mut writer = HashCountingWriter::default();
-    write_model_archive(&plan.files, &mut writer)?;
-    let size_bytes = writer.bytes_written;
-    let expected_hash = writer.expected_hash();
+fn model_archive_file_manifest_with_progress(
+    plan: ModelArchivePlan,
+    upload_limit_bytes: u64,
+    progress_tx: tokio::sync::mpsc::Sender<ModelUploadStatus>,
+) -> Result<ModelArchiveMetadata> {
+    let progress = ArchivePreparationProgress::new(&plan, progress_tx);
+    let file_manifest = hash_model_files_with_progress(&plan.files, progress)?;
     Ok(ModelArchiveMetadata {
         plan,
-        expected_hash,
-        size_bytes,
+        file_manifest,
+        size_bytes: upload_limit_bytes,
     })
+}
+
+fn max_model_archive_upload_bytes(plan: &ModelArchivePlan) -> u64 {
+    let one_percent = plan.included_bytes / 100;
+    let per_file_overhead = (plan.files.len() as u64).saturating_mul(4096);
+    plan.included_bytes
+        .saturating_add(one_percent)
+        .saturating_add(per_file_overhead)
+        .saturating_add(16 * 1024 * 1024)
 }
 
 fn write_model_archive<W: Write>(files: &[ModelArchiveFile], writer: W) -> Result<usize> {
     let encoder = flate2::GzBuilder::new()
         .mtime(0)
-        .write(writer, flate2::Compression::default());
+        .write(writer, flate2::Compression::fast());
     let mut builder = tar::Builder::new(encoder);
     for file in files {
         builder
@@ -3758,27 +3817,92 @@ fn write_model_archive<W: Write>(files: &[ModelArchiveFile], writer: W) -> Resul
     Ok(files.len())
 }
 
-#[derive(Default)]
-struct HashCountingWriter {
-    hasher: Sha256,
-    bytes_written: u64,
+fn hash_model_files_with_progress(
+    files: &[ModelArchiveFile],
+    mut progress: ArchivePreparationProgress,
+) -> Result<Vec<InitModelUploadFile>> {
+    let mut manifest = Vec::with_capacity(files.len());
+    let mut processed_bytes = 0_u64;
+    for file in files {
+        manifest.push(hash_model_file(file, Some((&mut progress, &mut processed_bytes)))?);
+    }
+    Ok(manifest)
 }
 
-impl HashCountingWriter {
-    fn expected_hash(self) -> String {
-        format!("sha256:{}", hex::encode(self.hasher.finalize()))
+fn hash_model_file(
+    file: &ModelArchiveFile,
+    mut progress: Option<(&mut ArchivePreparationProgress, &mut u64)>,
+) -> Result<InitModelUploadFile> {
+    let mut input = std::fs::File::open(&file.path)
+        .with_context(|| format!("failed to open model file `{}`", file.path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read model file `{}`", file.path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        if let Some((progress, processed_bytes)) = progress.as_mut() {
+            **processed_bytes = processed_bytes.saturating_add(read as u64);
+            progress.record(**processed_bytes);
+        }
     }
+    Ok(InitModelUploadFile {
+        path: archive_manifest_path(&file.relative),
+        size_bytes: file.size_bytes,
+        sha256: format!("sha256:{}", hex::encode(hasher.finalize())),
+    })
 }
 
-impl Write for HashCountingWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.update(buf);
-        self.bytes_written = self.bytes_written.saturating_add(buf.len() as u64);
-        Ok(buf.len())
+fn archive_manifest_path(path: &std::path::Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+struct ArchivePreparationProgress {
+    alias: String,
+    files_included: usize,
+    bytes_included: u64,
+    next_emit_bytes: u64,
+    tx: tokio::sync::mpsc::Sender<ModelUploadStatus>,
+}
+
+impl ArchivePreparationProgress {
+    fn new(plan: &ModelArchivePlan, tx: tokio::sync::mpsc::Sender<ModelUploadStatus>) -> Self {
+        Self {
+            alias: plan.alias.clone(),
+            files_included: plan.files.len(),
+            bytes_included: plan.included_bytes,
+            next_emit_bytes: MODEL_PREP_PROGRESS_BYTES,
+            tx,
+        }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    fn record(&mut self, archive_bytes: u64) {
+        if archive_bytes < self.next_emit_bytes {
+            return;
+        }
+        while self.next_emit_bytes <= archive_bytes {
+            self.next_emit_bytes = self
+                .next_emit_bytes
+                .saturating_add(MODEL_PREP_PROGRESS_BYTES);
+        }
+        let _ = self
+            .tx
+            .blocking_send(ModelUploadStatus::preparing_progress(
+                &self.alias,
+                self.files_included,
+                self.bytes_included,
+                archive_bytes,
+            ));
     }
 }
 
@@ -3909,9 +4033,9 @@ where
         .post(build_endpoint_url(&config.url, ADMIN_MODEL_INIT_PATH)?)
         .bearer_auth(&config.token)
         .json(&InitModelUploadRequest {
-            expected_hash: &archive.expected_hash,
             size_bytes: archive.size_bytes,
             alias: Some(archive.alias()),
+            files: archive.file_manifest.clone(),
         })
         .send()
         .await
@@ -4492,15 +4616,20 @@ mod tests {
         std::fs::write(dir.join("model.safetensors"), b"\x00\x01\x02").unwrap();
 
         let plan = model_archive_plan(&dir).expect("plan should build");
-        let metadata = model_archive_metadata(plan).expect("metadata should build");
-        assert_eq!(metadata.alias(), dir.file_name().unwrap().to_str().unwrap());
+        assert_eq!(plan.alias, dir.file_name().unwrap().to_str().unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let manifest =
+            hash_model_files_with_progress(&plan.files, ArchivePreparationProgress::new(&plan, tx))
+                .expect("file manifest should build");
 
         // The archive is a gzip stream that untars back to the same files.
         let archive = model_archive_bytes(&dir);
         let second_archive = model_archive_bytes(&dir);
         assert_eq!(sha256_hash(&archive), sha256_hash(&second_archive));
-        assert_eq!(metadata.size_bytes, archive.len() as u64);
-        assert_eq!(metadata.expected_hash, sha256_hash(&archive));
+        assert_eq!(manifest.len(), 2);
+        assert!(manifest
+            .iter()
+            .any(|file| file.path == "model.safetensors" && file.sha256 == sha256_hash(b"\x00\x01\x02")));
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&archive[..]));
         let mut names: Vec<String> = tar
             .entries()
