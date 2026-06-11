@@ -1709,7 +1709,9 @@ async fn flush_auth_state(state: &crate::AppState) {
     if let Some(backend) = state.s3_backend.as_deref() {
         let auth_dir = auth_state_dir(&state.manifest_path);
         match tokio::time::timeout(AUTH_STATE_FLUSH_TIMEOUT, backend.flush_path(&auth_dir)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                tracing::info!(path = %auth_dir.display(), "flushed auth state to S3");
+            }
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "failed to flush auth state to S3");
             }

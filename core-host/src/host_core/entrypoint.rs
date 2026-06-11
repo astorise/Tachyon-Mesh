@@ -62,6 +62,12 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
             None
         }
     };
+    #[cfg(not(feature = "s3-persistence"))]
+    if std::env::var_os("TACHYON_S3_BUCKET").is_some() {
+        tracing::warn!(
+            "TACHYON_S3_BUCKET is configured but core-host was built without s3-persistence; state will remain local-only"
+        );
+    }
 
     let core_store = open_core_store_for_manifest(&manifest_path).await?;
     secure_cache_bootstrap(core_store.as_ref(), &runtime)?;
