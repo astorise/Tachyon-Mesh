@@ -3824,7 +3824,10 @@ fn hash_model_files_with_progress(
     let mut manifest = Vec::with_capacity(files.len());
     let mut processed_bytes = 0_u64;
     for file in files {
-        manifest.push(hash_model_file(file, Some((&mut progress, &mut processed_bytes)))?);
+        manifest.push(hash_model_file(
+            file,
+            Some((&mut progress, &mut processed_bytes)),
+        )?);
     }
     Ok(manifest)
 }
@@ -3895,14 +3898,12 @@ impl ArchivePreparationProgress {
                 .next_emit_bytes
                 .saturating_add(MODEL_PREP_PROGRESS_BYTES);
         }
-        let _ = self
-            .tx
-            .blocking_send(ModelUploadStatus::preparing_progress(
-                &self.alias,
-                self.files_included,
-                self.bytes_included,
-                archive_bytes,
-            ));
+        let _ = self.tx.blocking_send(ModelUploadStatus::preparing_progress(
+            &self.alias,
+            self.files_included,
+            self.bytes_included,
+            archive_bytes,
+        ));
     }
 }
 
@@ -4629,7 +4630,8 @@ mod tests {
         assert_eq!(manifest.len(), 2);
         assert!(manifest
             .iter()
-            .any(|file| file.path == "model.safetensors" && file.sha256 == sha256_hash(b"\x00\x01\x02")));
+            .any(|file| file.path == "model.safetensors"
+                && file.sha256 == sha256_hash(b"\x00\x01\x02")));
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&archive[..]));
         let mut names: Vec<String> = tar
             .entries()
