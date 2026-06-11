@@ -7,11 +7,13 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "s3-persistence")]
+use std::time::Duration;
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 use wasmtime::{
@@ -39,6 +41,7 @@ mod authz_bindings {
 const JWT_SECRET_ENV: &str = "TACHYON_AUTH_JWT_SECRET";
 const JWT_SECRET_FILE: &str = "jwt.secret";
 const AUTH_STATE_DIR_ENV: &str = "TACHYON_AUTH_STATE_DIR";
+#[cfg(feature = "s3-persistence")]
 const AUTH_STATE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PAT_TTL_DAYS: u32 = 30;
 
