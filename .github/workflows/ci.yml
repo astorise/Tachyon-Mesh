@@ -13,7 +13,12 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on PR/feature branches, but never on main:
+  # publish-docker-images pushes mutable latest* tags, and cancelling a run
+  # mid-publish could leave GHCR with latest* tags from mixed commits. The
+  # group still serializes main runs, so a new push waits instead of killing
+  # an in-flight publish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # ── Shared env snippets used across multiple jobs ─────────────────────────────
 # RUSTFLAGS and CARGO_TERM_COLOR are repeated per-job so each job's env block
