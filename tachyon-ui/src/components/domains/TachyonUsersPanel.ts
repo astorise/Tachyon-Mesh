@@ -66,16 +66,12 @@ export class TachyonUsersPanel extends TachyonConfigDashboard {
   }
 
   private async refresh(): Promise<void> {
-    try {
-      this.users = await invoke<UserSummary[]>("iam_list_users");
-    } catch {
-      this.users = [];
-    }
-    try {
-      this.groups = await invoke<GroupSummary[]>("iam_list_groups");
-    } catch {
-      this.groups = [];
-    }
+    const [users, groups] = await Promise.all([
+      invoke<UserSummary[]>("iam_list_users").catch(() => []),
+      invoke<GroupSummary[]>("iam_list_groups").catch(() => []),
+    ]);
+    this.users = users;
+    this.groups = groups;
     this.render();
     this.bindEvents();
   }

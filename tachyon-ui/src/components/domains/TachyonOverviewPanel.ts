@@ -58,19 +58,11 @@ export class TachyonOverviewPanel extends TachyonConfigDashboard {
     this.render(this.metrics, this.status);
     this.animateEntrance();
     await this.withLoadingState(async () => {
-      const snapshot = await invoke<MeshGraphSnapshot>("get_mesh_graph");
-      let runtime: RuntimeMetrics | null = null;
-      try {
-        runtime = await invoke<RuntimeMetrics>("get_metrics");
-      } catch {
-        runtime = null;
-      }
-      let hardware: ClusterHardwareSummary | null = null;
-      try {
-        hardware = await invoke<ClusterHardwareSummary>("get_cluster_hardware_summary");
-      } catch {
-        hardware = null;
-      }
+      const [snapshot, runtime, hardware] = await Promise.all([
+        invoke<MeshGraphSnapshot>("get_mesh_graph"),
+        invoke<RuntimeMetrics>("get_metrics").catch(() => null),
+        invoke<ClusterHardwareSummary>("get_cluster_hardware_summary").catch(() => null),
+      ]);
       this.metrics = this.metricsFromSources(snapshot, runtime, hardware);
       this.status = runtime?.source ? `${runtime.source}` : snapshot.status || t("overview.online");
       this.render(this.metrics, this.status);

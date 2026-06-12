@@ -109,7 +109,7 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     if (this.state !== "uploading") {
       return;
     }
-    this.progress = Math.max(0, Math.min(100, Math.round(percentage)));
+    this.progress = Math.max(this.progress, Math.max(0, Math.min(100, Math.round(percentage))));
     this.render();
     this.bindEvents();
   }
@@ -123,7 +123,7 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     }
     this.uploadStatus = status;
     if (typeof status.percentage === "number") {
-      this.progress = Math.max(0, Math.min(100, Math.round(status.percentage)));
+      this.progress = Math.max(this.progress, Math.max(0, Math.min(100, Math.round(status.percentage))));
     }
     if (status.file && !this.includedFiles.includes(status.file)) {
       this.includedFiles = [...this.includedFiles, status.file].slice(-8);
@@ -134,6 +134,10 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
   }
 
   private isStaleUploadStatus(status: UploadStatus): boolean {
+    if (this.uploadStatus && this.phaseRank(status.phase) < this.phaseRank(this.uploadStatus.phase)) {
+      return true;
+    }
+
     if (status.phase !== "uploading" || this.uploadStatus?.phase !== "uploading") {
       return false;
     }
@@ -147,6 +151,24 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     const previousPart = this.uploadStatus.part ?? 0;
     const nextPart = status.part ?? 0;
     return nextUploaded === previousUploaded && nextPart < previousPart;
+  }
+
+  private phaseRank(phase: string | undefined): number {
+    switch (phase) {
+      case "included":
+      case "preparing":
+        return 1;
+      case "prepared":
+        return 2;
+      case "uploading":
+        return 3;
+      case "committing":
+        return 4;
+      case "done":
+        return 5;
+      default:
+        return 0;
+    }
   }
 
   private applyPreview(preview: UploadPreview): void {

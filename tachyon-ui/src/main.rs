@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use tauri_plugin_stronghold::stronghold::Stronghold;
 
@@ -16,6 +16,7 @@ const STRONGHOLD_PROFILE_CLIENT: &[u8] = b"tachyon-ui-auth";
 const AUTH_PROFILE_RECORD: &[u8] = b"auth_profile";
 const STRONGHOLD_PROFILE_KEY_BYTES: usize = 32;
 const MFA_SESSION_TTL_SECONDS: u64 = 20 * 60;
+const UPLOAD_STATUS_EMIT_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -629,12 +630,115 @@ async fn pick_model_file(app: tauri::AppHandle) -> Result<Option<String>, String
 
 #[tauri::command]
 async fn push_large_model(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let mut last_phase = String::new();
+    let mut last_percent = i32::MIN;
+    let mut last_emit = None;
     tachyon_client::push_large_model_with_status(&path, |status| {
-        let _ = app.emit("upload_progress", status.percentage);
-        let _ = app.emit("upload_status", status);
+        let now = Instant::now();
+        if should_emit_upload_status(&status, &last_phase, last_percent, last_emit, now) {
+            let phase = status.phase.clone();
+            let percent = rounded_upload_percent(status.percentage);
+            let _ = app.emit("upload_progress", status.percentage);
+            let _ = app.emit("upload_status", status);
+            last_phase = phase;
+            last_percent = percent;
+            last_emit = Some(now);
+        }
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+fn should_emit_upload_status(
+    status: &tachyon_client::ModelUploadStatus,
+    last_phase: &str,
+    last_percent: i32,
+    last_emit: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if status.phase != last_phase {
+        return true;
+    }
+    let percent = rounded_upload_percent(status.percentage);
+    if percent != last_percent {
+        return true;
+    }
+    last_emit
+        .map(|emitted_at| now.saturating_duration_since(emitted_at) >= UPLOAD_STATUS_EMIT_INTERVAL)
+        .unwrap_or(true)
+}
+
+fn rounded_upload_percent(percentage: f32) -> i32 {
+    percentage.clamp(0.0, 100.0).round() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upload_status(phase: &str, percentage: f32) -> tachyon_client::ModelUploadStatus {
+        tachyon_client::ModelUploadStatus {
+            phase: phase.to_owned(),
+            percentage,
+            alias: None,
+            file: None,
+            files_included: 0,
+            bytes_included: 0,
+            archive_bytes: None,
+            processed_bytes: None,
+            uploaded_bytes: None,
+            total_bytes: None,
+            part: None,
+        }
+    }
+
+    #[test]
+    fn upload_status_emits_on_phase_change() {
+        let now = Instant::now();
+        assert!(should_emit_upload_status(
+            &upload_status("uploading", 10.0),
+            "preparing",
+            10,
+            Some(now),
+            now
+        ));
+    }
+
+    #[test]
+    fn upload_status_emits_on_rounded_percent_change() {
+        let now = Instant::now();
+        assert!(should_emit_upload_status(
+            &upload_status("uploading", 11.0),
+            "uploading",
+            10,
+            Some(now),
+            now
+        ));
+    }
+
+    #[test]
+    fn upload_status_suppresses_duplicate_updates_inside_interval() {
+        let now = Instant::now();
+        assert!(!should_emit_upload_status(
+            &upload_status("uploading", 10.2),
+            "uploading",
+            10,
+            Some(now),
+            now + Duration::from_millis(50)
+        ));
+    }
+
+    #[test]
+    fn upload_status_emits_duplicate_updates_after_interval() {
+        let now = Instant::now();
+        assert!(should_emit_upload_status(
+            &upload_status("uploading", 10.2),
+            "uploading",
+            10,
+            Some(now),
+            now + UPLOAD_STATUS_EMIT_INTERVAL
+        ));
+    }
 }
 
 #[tauri::command]

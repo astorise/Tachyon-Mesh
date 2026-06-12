@@ -68,6 +68,7 @@ export class TachyonAppShell extends HTMLElement {
   private activeUser = t("shell.unknown");
   private activeRole = "operator";
   private shellStarted = false;
+  private visibleRoute = "";
   private requiresSeal = false;
   private applyingSeal = false;
   private readonly onAuthenticated = (event: Event) => {
@@ -147,6 +148,7 @@ export class TachyonAppShell extends HTMLElement {
   }
 
   private render(): void {
+    this.visibleRoute = "";
     // configLinks are now rendered by TachyonAppShellNav; the variable is kept
     // for reference during incremental adoption but is no longer inserted here.
     this.root.innerHTML = `
@@ -237,6 +239,7 @@ export class TachyonAppShell extends HTMLElement {
   private showRoute(route: string): void {
     const normalized = this.normalizeRoute(route);
     const componentRoute = resolveComponentRoute(normalized);
+    const previousRoute = this.activeRoute;
     if (componentRoute?.requires !== undefined && !isFeatureAvailable(componentRoute.requires)) {
       window.location.hash = "overview";
       this.activeRoute = "overview";
@@ -244,12 +247,16 @@ export class TachyonAppShell extends HTMLElement {
     } else {
       this.activeRoute = normalized;
     }
+    if (this.visibleRoute === this.activeRoute) {
+      return;
+    }
     const staticPanel = this.root.querySelector<HTMLElement>(`[data-route-panel="${this.activeRoute}"]`);
     this.root.querySelectorAll<HTMLElement>("[data-route-panel]").forEach((panel) => {
       panel.classList.toggle("hidden", panel !== staticPanel);
     });
 
     if (staticPanel) {
+      this.visibleRoute = this.activeRoute;
       return;
     }
 
@@ -268,11 +275,15 @@ export class TachyonAppShell extends HTMLElement {
         "rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200";
       warning.textContent = `Unknown route: ${route}`;
       dynamicPanel.appendChild(warning);
+      this.visibleRoute = this.activeRoute;
       return;
     }
 
-    dynamicPanel.replaceChildren();
-    dynamicPanel.appendChild(document.createElement(tagName));
+    if (previousRoute !== this.activeRoute || dynamicPanel.firstElementChild?.tagName.toLowerCase() !== tagName) {
+      dynamicPanel.replaceChildren();
+      dynamicPanel.appendChild(document.createElement(tagName));
+    }
+    this.visibleRoute = this.activeRoute;
   }
 
   private ensureDynamicPanel(routerView: HTMLElement): HTMLElement {

@@ -110,6 +110,36 @@ describe("TachyonModelUploadPanel", () => {
     expect(panel.shadowRoot?.querySelector("[data-upload-result]")?.textContent).toContain("gguf/llama");
   });
 
+  it("keeps the progress bar monotonic when progress events arrive out of order", async () => {
+    const push = deferred<string>();
+    let progressCb: ((event: { payload: number }) => void) | undefined;
+    listenMock.mockImplementation((event, cb) => {
+      if (event === "upload_progress") {
+        progressCb = cb as unknown as (event: { payload: number }) => void;
+      }
+      return Promise.resolve(vi.fn());
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "pick_model_file") return Promise.resolve("/models/llama.gguf");
+      if (command === "preview_large_model_upload") return Promise.resolve(previewPayload);
+      if (command === "push_large_model") return push.promise;
+      return Promise.reject(new Error(`unexpected ${command}`));
+    });
+
+    const panel = mountPanel();
+    const done = panel.selectAndUpload();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    progressCb?.({ payload: 64 });
+    progressCb?.({ payload: 41 });
+
+    const bar = panel.shadowRoot?.querySelector("[data-upload-progress] div div") as HTMLElement | null;
+    expect(bar?.style.width).toBe("64%");
+
+    push.resolve("gguf/llama");
+    await done;
+  });
+
   it("renders upload status details from included files and sent bytes", async () => {
     const push = deferred<string>();
     let statusCb: ((event: { payload: Record<string, unknown> }) => void) | undefined;
@@ -211,6 +241,57 @@ describe("TachyonModelUploadPanel", () => {
     const details = panel.shadowRoot?.querySelector("[data-upload-details]");
     expect(details?.textContent).toContain("part 3");
     expect(details?.textContent).toContain("Sent 15 MiB / 20 MiB");
+
+    push.resolve("models/Qwen");
+    await done;
+  });
+
+  it("ignores stale phase updates after upload has started", async () => {
+    const push = deferred<string>();
+    let statusCb: ((event: { payload: Record<string, unknown> }) => void) | undefined;
+    listenMock.mockImplementation((event, cb) => {
+      if (event === "upload_status") {
+        statusCb = cb as unknown as (event: { payload: Record<string, unknown> }) => void;
+      }
+      return Promise.resolve(vi.fn());
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "pick_model_file") return Promise.resolve("/models/Qwen");
+      if (command === "preview_large_model_upload") return Promise.resolve(previewPayload);
+      if (command === "push_large_model") return push.promise;
+      return Promise.reject(new Error(`unexpected ${command}`));
+    });
+
+    const panel = mountPanel();
+    const done = panel.selectAndUpload();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    statusCb?.({
+      payload: {
+        phase: "uploading",
+        percentage: 25,
+        alias: "Qwen",
+        filesIncluded: 4,
+        bytesIncluded: 24 * 1024 * 1024,
+        archiveBytes: 20 * 1024 * 1024,
+        uploadedBytes: 5 * 1024 * 1024,
+        totalBytes: 20 * 1024 * 1024,
+        part: 1,
+      },
+    });
+    statusCb?.({
+      payload: {
+        phase: "preparing",
+        percentage: 0,
+        alias: "Qwen",
+        filesIncluded: 4,
+        bytesIncluded: 24 * 1024 * 1024,
+      },
+    });
+
+    const details = panel.shadowRoot?.querySelector("[data-upload-details]");
+    expect(details?.textContent).toContain("part 1");
+    expect(details?.textContent).toContain("Sent 5.0 MiB / 20 MiB");
 
     push.resolve("models/Qwen");
     await done;

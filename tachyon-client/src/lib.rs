@@ -45,7 +45,7 @@ const ADMIN_MODEL_COMMIT_PATH: &str = "/admin/models/commit";
 const ADMIN_NODES_PATH: &str = "/admin/nodes";
 const ADMIN_SYSTEMS_REGISTERED_PATH: &str = "/admin/systems/registered";
 const ADMIN_SYSTEMS_DEPLOYED_PATH: &str = "/admin/systems/deployed";
-const MODEL_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const MODEL_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const MODEL_PREP_PROGRESS_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -58,6 +58,7 @@ pub struct InstanceConfig {
 
 static CONNECTION_STATE: OnceLock<RwLock<Option<InstanceConfig>>> = OnceLock::new();
 static SESSION_OPERATOR: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+static HTTP_CLIENT_CACHE: OnceLock<RwLock<BTreeMap<String, reqwest::Client>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4490,6 +4491,16 @@ where
 }
 
 fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
+    let cache_key = http_client_cache_key(config);
+    if let Some(client) = http_client_cache()
+        .read()
+        .expect("HTTP client cache should not be poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(client);
+    }
+
     let url = reqwest::Url::parse(&config.url)
         .with_context(|| format!("invalid Tachyon node URL `{}`", config.url))?;
     let mut builder = reqwest::Client::builder();
@@ -4502,9 +4513,37 @@ fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
         builder = builder.identity(parse_identity(identity_bytes, config.mtls_key.as_deref())?);
     }
 
-    builder
+    let client = builder
         .build()
-        .context("failed to build authenticated HTTP client")
+        .context("failed to build authenticated HTTP client")?;
+    http_client_cache()
+        .write()
+        .expect("HTTP client cache should not be poisoned")
+        .insert(cache_key, client.clone());
+    Ok(client)
+}
+
+fn http_client_cache() -> &'static RwLock<BTreeMap<String, reqwest::Client>> {
+    HTTP_CLIENT_CACHE.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+fn http_client_cache_key(config: &InstanceConfig) -> String {
+    let cert_hash = config
+        .mtls_cert
+        .as_deref()
+        .map(short_hash)
+        .unwrap_or_else(|| "none".to_owned());
+    let key_hash = config
+        .mtls_key
+        .as_deref()
+        .map(short_hash)
+        .unwrap_or_else(|| "none".to_owned());
+    format!("{}|cert:{cert_hash}|key:{key_hash}", config.url.trim())
+}
+
+fn short_hash(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(&digest[..8])
 }
 
 fn parse_identity(cert_bytes: &[u8], key_bytes: Option<&[u8]>) -> Result<reqwest::Identity> {
@@ -4588,7 +4627,34 @@ mod tests {
 
     #[test]
     fn model_upload_chunks_are_large_enough_for_local_uploads() {
-        assert_eq!(MODEL_CHUNK_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MODEL_CHUNK_BYTES, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn http_client_cache_key_tracks_endpoint_and_identity() {
+        let base = InstanceConfig {
+            url: " https://127.0.0.1:9443 ".to_owned(),
+            token: "token-a".to_owned(),
+            mtls_cert: Some(b"cert-a".to_vec()),
+            mtls_key: Some(b"key-a".to_vec()),
+        };
+        let same_transport = InstanceConfig {
+            token: "token-b".to_owned(),
+            ..base.clone()
+        };
+        let different_identity = InstanceConfig {
+            mtls_cert: Some(b"cert-b".to_vec()),
+            ..base.clone()
+        };
+
+        assert_eq!(
+            http_client_cache_key(&base),
+            http_client_cache_key(&same_transport)
+        );
+        assert_ne!(
+            http_client_cache_key(&base),
+            http_client_cache_key(&different_identity)
+        );
     }
 
     #[test]
