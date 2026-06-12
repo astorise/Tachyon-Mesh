@@ -82,16 +82,10 @@ jobs:
           shared-key: mutation-tests-core-host-auth
           cache-on-failure: true
 
-      - name: Cache cargo-mutants
-        id: cargo-mutants-cache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/bin/cargo-mutants
-          key: cargo-mutants-${{ runner.os }}-${{ env.CARGO_MUTANTS_VERSION }}
-
       - name: Install cargo-mutants
-        if: steps.cargo-mutants-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-mutants --version "${CARGO_MUTANTS_VERSION}" --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@${{ env.CARGO_MUTANTS_VERSION }}
 
       - name: Download guest artifacts
         uses: actions/download-artifact@v8

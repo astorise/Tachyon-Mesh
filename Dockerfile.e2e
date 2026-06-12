@@ -35,21 +35,17 @@ WORKDIR /workspace
 
 COPY . .
 
-RUN cargo build -p guest-example --target wasm32-wasip2 --release
-RUN cargo build -p guest-volume --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-authn --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-authz --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-node-registry --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-cert-manager --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-logger --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-registry --target wasm32-wasip2 --release
-RUN cargo build -p guest-ai --target wasm32-wasip1 --release
-RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
-RUN cargo build -p guest-loop --target wasm32-wasip1 --release
+# Single multi-package invocations let cargo build the dependency graph and
+# compile units for each target in parallel, instead of sequential
+# cargo invocations that each re-resolve the workspace.
+RUN cargo build --target wasm32-wasip2 --release \
+    -p guest-example -p guest-volume \
+    -p system-faas-authn -p system-faas-authz -p system-faas-keda \
+    -p system-faas-k8s-scaler -p system-faas-model-broker \
+    -p system-faas-node-registry -p system-faas-cert-manager \
+    -p system-faas-logger -p system-faas-prom -p system-faas-registry
+RUN cargo build --target wasm32-wasip1 --release \
+    -p guest-ai -p guest-call-legacy -p guest-loop
 RUN cargo build -p core-host --target x86_64-unknown-linux-musl --release
 
 FROM scratch AS runtime

@@ -11,6 +11,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs on PR/feature branches, but never on main:
+  # publish-docker-images pushes mutable latest* tags, and cancelling a run
+  # mid-publish could leave GHCR with latest* tags from mixed commits. The
+  # group still serializes main runs, so a new push waits instead of killing
+  # an in-flight publish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 # ── Shared env snippets used across multiple jobs ─────────────────────────────
 # RUSTFLAGS and CARGO_TERM_COLOR are repeated per-job so each job's env block
 # is self-contained and readable without cross-referencing.
@@ -73,18 +82,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache security tools
-        id: cache-sec-tools
-        uses: actions/cache@v5
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          path: |
-            ~/.cargo/bin/cargo-audit
-            ~/.cargo/bin/cargo-deny
-          key: sec-tools-${{ runner.os }}-v1
-
-      - name: Install security tooling
-        if: steps.cache-sec-tools.outputs.cache-hit != 'true'
-        run: cargo install cargo-audit cargo-deny --locked
+          tool: cargo-audit,cargo-deny
 
       - name: Run cargo audit
         # RUSTSEC-2023-0071 (rsa Marvin attack) targets RSA private-key
@@ -100,7 +101,7 @@ jobs:
   # validation and per-feature compilation checks.
   # cargo build -p tachyon-ui --release is intentionally absent: clippy
   # --workspace already verifies the crate compiles, and the Publish Tachyon
-  # Desktop workflow handles the full Tauri bundle on every branch in parallel.
+  # Desktop workflow handles the full Tauri bundle on main and version tags.
   quality:
     runs-on: ubuntu-latest
     env:
@@ -225,16 +226,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Cache cargo-llvm-cov
-        id: cache-llvm-cov
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-llvm-cov-${{ runner.os }}-v1
-
       - name: Install cargo-llvm-cov
-        if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
-        run: cargo install cargo-llvm-cov --locked
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Download guest artifacts
         uses: actions/download-artifact@v8
@@ -263,6 +256,10 @@ jobs:
       CARGO_TERM_COLOR: always
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       RUSTFLAGS: "-D dead_code"
+      # This binary is a CI validation artifact, not a published release —
+      # thin LTO trades a little runtime perf for much faster builds.
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v6
 
@@ -369,6 +366,55 @@ jobs:
       - name: Test core-host feature set
         run: cargo nextest run -p core-host ${{ matrix.features }}
 
+  # ── 7b. Feature matrix release artifacts (decoupled from tests) ─────────────
+  # Builds and uploads a per-variant release binary for manual download/
+  # debugging. Not consumed by any downstream job, so it is intentionally NOT
+  # a dependency of publish-docker-images (which builds its own images from
+  # source). Runs in parallel with feature-matrix-tests rather than after it.
+  feature-matrix-artifacts:
+    needs: [quality, build-guests]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--no-default-features"
+          - "--all-features"
+          - "--features http3"
+          - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D dead_code"
+      # This binary is a CI validation artifact, not a published release —
+      # thin LTO trades a little runtime perf for much faster builds.
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: feature-matrix
+          save-if: ${{ matrix.features == '' }}
+
+      - name: Install FIPS build dependencies
+        if: matrix.features == '--all-features'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm protobuf-compiler
+
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: wasm-guests-${{ github.sha }}
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
+
       - name: Build release binary for artifact
         run: cargo build -p core-host --release ${{ matrix.features }}
 
@@ -426,6 +472,40 @@ jobs:
       - name: Test core-host FIPS feature
         run: cargo nextest run -p core-host --features fips
 
+  # ── 8b. FIPS release artifact (decoupled from tests) ────────────────────────
+  # Not consumed by any downstream job, so it is intentionally NOT a
+  # dependency of publish-docker-images (which builds its own FIPS image
+  # from source via Dockerfile.fips).
+  fips-artifacts:
+    needs: [quality, build-guests]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # This binary is a CI validation artifact, not a published release —
+      # thin LTO trades a little runtime perf for much faster builds.
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-wasip2
+
+      - name: Install FIPS build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download guest artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: wasm-guests-${{ github.sha }}
+      - name: Unpack guest artifacts
+        run: tar -xzf wasm-guests.tar.gz
+
       - name: Build FIPS release binary for artifact
         run: cargo build -p core-host --release --features fips
 
@@ -438,9 +518,10 @@ jobs:
 
   # ── 9. Publish Docker images (push to main, needs quality + test) ─────────
   # Docker builds core-host from source inside the Dockerfile, so it doesn't
-  # consume the pre-built release artifact. It waits for quality + test so we
-  # don't publish an image that fails basic validation, but it runs in parallel
-  # with cover and release to reduce the push-to-publish wall time.
+  # consume the pre-built release artifact. It waits on the *test* jobs only
+  # (not the artifact-build jobs above, which are unused by this job and were
+  # previously on its critical path) so we don't publish an image that fails
+  # basic validation, while starting as early as possible.
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [quality, test, cover, release, feature-matrix-tests, fips-tests]
@@ -454,31 +535,41 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The 4 ./Dockerfile variants share a "docker-default" GHA cache
+          # scope: the FaaS/system wasm + legacy-mock layers (everything
+          # before the CARGO_FEATURES ARG) are feature-independent, so a
+          # cache populated by one variant (or by the E2E workflows, which
+          # build the same Dockerfile) is reused by the others.
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
             cargo_features: "s3-persistence"
             feature_tag: ""
+            cache_scope: docker-default
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile.fips
             context: .
             cargo_features: ""
             feature_tag: "-fips"
+            cache_scope: docker-fips
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
             cargo_features: "http3"
             feature_tag: "-http3"
+            cache_scope: docker-default
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
             cargo_features: "rate-limit,resiliency,mtls,secrets-vault,websockets"
             feature_tag: "-security"
+            cache_scope: docker-default
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
             cargo_features: "ai-inference,ebpf-loader,experimental,http3,mtls,rate-limit,resiliency,s3-persistence,secrets-vault,websockets"
             feature_tag: "-all-features"
+            cache_scope: docker-default
     steps:
       - uses: actions/checkout@v6
 
@@ -519,5 +610,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             CARGO_FEATURES=${{ matrix.cargo_features }}
-          cache-from: type=gha,scope=${{ matrix.feature_tag || 'default' }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.feature_tag || 'default' }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}

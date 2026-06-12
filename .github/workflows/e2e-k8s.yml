@@ -17,33 +17,33 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-k8s-deployment:
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev build-essential libssl-dev cmake nasm
-
-      - name: Build core-host release binary
-        run: cargo build --release --bin core-host
-
+      # Shared GHA cache scope with publish-docker-images and the other E2E
+      # workflows: the FaaS/system wasm + legacy-mock layers are
+      # feature-independent (the cargo-feature ARG comes later in the
+      # Dockerfile), so a cache hit here skips ~15 min of compilation.
       - name: Build local Docker image
-        run: docker build -t tachyon-mesh:local .
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: .
+          tags: tachyon-mesh:local
+          load: true
+          cache-from: type=gha,scope=docker-default
+          cache-to: type=gha,mode=max,scope=docker-default
 
       - name: Install k3d
         run: |
