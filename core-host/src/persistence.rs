@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
 use futures::StreamExt as _;
-use object_store::{aws::AmazonS3Builder, path::Path as OsPath, ObjectStore, ObjectStoreExt};
+use object_store::{
+    aws::AmazonS3Builder, path::Path as OsPath, ObjectStore, ObjectStoreExt, PutPayload,
+};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const S3_ENDPOINT_ENV: &str = "TACHYON_S3_ENDPOINT";
 const S3_BUCKET_ENV: &str = "TACHYON_S3_BUCKET";
@@ -18,6 +21,8 @@ const S3_FORCE_PATH_STYLE_ENV: &str = "TACHYON_S3_FORCE_PATH_STYLE";
 
 const DEFAULT_REGION: &str = "us-east-1";
 const BACKGROUND_FLUSH_INTERVAL: Duration = Duration::from_secs(300);
+const S3_SINGLE_PUT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const S3_MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) struct S3PersistenceConfig {
     endpoint: Option<String>,
@@ -138,18 +143,22 @@ impl S3PersistenceBackend {
                     .with_context(|| format!("failed to create directory {}", parent.display()))?;
             }
 
-            let bytes = self
+            let mut object = self
                 .store
                 .get(&meta.location)
                 .await
                 .with_context(|| format!("failed to GET {}", meta.location))?
-                .bytes()
+                .into_stream();
+            let mut output = fs::File::create(&local_path)
                 .await
-                .with_context(|| format!("failed to read bytes for {}", meta.location))?;
-
-            fs::write(&local_path, &bytes)
-                .await
-                .with_context(|| format!("failed to write {}", local_path.display()))?;
+                .with_context(|| format!("failed to create {}", local_path.display()))?;
+            while let Some(chunk) = object.next().await {
+                let chunk = chunk.with_context(|| format!("failed to read {}", meta.location))?;
+                output
+                    .write_all(&chunk)
+                    .await
+                    .with_context(|| format!("failed to write {}", local_path.display()))?;
+            }
             restored += 1;
         }
 
@@ -179,13 +188,7 @@ impl S3PersistenceBackend {
                 }
             } else {
                 let key = self.s3_key(&entry_path)?;
-                let bytes = fs::read(&entry_path)
-                    .await
-                    .with_context(|| format!("failed to read {}", entry_path.display()))?;
-                self.store
-                    .put(&key, bytes.into())
-                    .await
-                    .with_context(|| format!("failed to PUT {key}"))?;
+                self.upload_file(&entry_path, &key, metadata.len()).await?;
                 flushed += 1;
             }
         }
@@ -197,6 +200,50 @@ impl S3PersistenceBackend {
                 "S3 flush complete"
             );
         }
+        Ok(())
+    }
+
+    async fn upload_file(&self, local_path: &Path, key: &OsPath, size_bytes: u64) -> Result<()> {
+        if size_bytes <= S3_SINGLE_PUT_MAX_BYTES {
+            let bytes = fs::read(local_path)
+                .await
+                .with_context(|| format!("failed to read {}", local_path.display()))?;
+            self.store
+                .put(key, bytes.into())
+                .await
+                .with_context(|| format!("failed to PUT {key}"))?;
+            return Ok(());
+        }
+
+        let mut file = fs::File::open(local_path)
+            .await
+            .with_context(|| format!("failed to open {}", local_path.display()))?;
+        let mut upload = self
+            .store
+            .put_multipart(key)
+            .await
+            .with_context(|| format!("failed to start multipart PUT {key}"))?;
+
+        loop {
+            let mut chunk = vec![0; S3_MULTIPART_CHUNK_BYTES];
+            let read = file
+                .read(&mut chunk)
+                .await
+                .with_context(|| format!("failed to read {}", local_path.display()))?;
+            if read == 0 {
+                break;
+            }
+            chunk.truncate(read);
+            if let Err(error) = upload.put_part(PutPayload::from(chunk)).await {
+                let _ = upload.abort().await;
+                return Err(error).with_context(|| format!("failed to PUT multipart part {key}"));
+            }
+        }
+
+        upload
+            .complete()
+            .await
+            .with_context(|| format!("failed to complete multipart PUT {key}"))?;
         Ok(())
     }
 
@@ -248,5 +295,28 @@ mod tests {
     fn from_env_returns_none_when_bucket_absent() {
         std::env::remove_var(S3_BUCKET_ENV);
         assert!(S3PersistenceConfig::from_env().is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_path_uploads_large_files_without_single_put_buffer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("models").join("llama").join("model.gguf");
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("create model dir");
+        let payload = vec![7u8; S3_SINGLE_PUT_MAX_BYTES as usize + 1024];
+        std::fs::write(&file_path, &payload).expect("write large model file");
+
+        let backend = make_backend("tachyon", dir.path().to_str().expect("utf-8 temp path"));
+        backend.flush_path(&file_path).await.expect("flush file");
+
+        let key = OsPath::parse("tachyon/models/llama/model.gguf").expect("valid key");
+        let stored = backend
+            .store
+            .get(&key)
+            .await
+            .expect("stored object")
+            .bytes()
+            .await
+            .expect("stored bytes");
+        assert_eq!(stored.as_ref(), payload.as_slice());
     }
 }

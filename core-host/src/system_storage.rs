@@ -35,6 +35,12 @@ struct StorageComponentState {
     ctx: WasiCtx,
     table: ResourceTable,
     core_store: Arc<crate::store::CoreStore>,
+    #[cfg(feature = "s3-persistence")]
+    s3_backend: Option<Arc<crate::persistence::S3PersistenceBackend>>,
+    #[cfg(feature = "s3-persistence")]
+    root_dir: PathBuf,
+    #[cfg(feature = "s3-persistence")]
+    core_store_path: PathBuf,
 }
 
 const AI_MODELS_REGISTRY_TABLE: &str = "ai-models-registry";
@@ -128,6 +134,10 @@ async fn proxy_request_to_component(
     let manifest_path = state.manifest_path.clone();
     let engine = state.runtime.load().engine.clone();
     let core_store = state.core_store.clone();
+    #[cfg(feature = "s3-persistence")]
+    let s3_backend = state.s3_backend.clone();
+    #[cfg(feature = "s3-persistence")]
+    let core_store_path = crate::host_core::core_store_path(&manifest_path);
     let component_request = match collect_component_request(request).await {
         Ok(request) => request,
         Err(error) => {
@@ -146,6 +156,10 @@ async fn proxy_request_to_component(
             module_name,
             &root_dir,
             core_store,
+            #[cfg(feature = "s3-persistence")]
+            s3_backend,
+            #[cfg(feature = "s3-persistence")]
+            core_store_path,
             component_request,
         )
     })
@@ -180,6 +194,10 @@ fn invoke_storage_component(
     module_name: &str,
     root_dir: &Path,
     core_store: Arc<crate::store::CoreStore>,
+    #[cfg(feature = "s3-persistence")] s3_backend: Option<
+        Arc<crate::persistence::S3PersistenceBackend>,
+    >,
+    #[cfg(feature = "s3-persistence")] core_store_path: PathBuf,
     request: ComponentRequest,
 ) -> Result<ComponentResponse> {
     fs::create_dir_all(root_dir).with_context(|| {
@@ -228,6 +246,12 @@ fn invoke_storage_component(
             ctx: builder.build(),
             table: ResourceTable::new(),
             core_store,
+            #[cfg(feature = "s3-persistence")]
+            s3_backend,
+            #[cfg(feature = "s3-persistence")]
+            root_dir: root_dir.to_path_buf(),
+            #[cfg(feature = "s3-persistence")]
+            core_store_path,
         },
     );
     let bindings = bindings::SystemFaasGuest::instantiate(&mut store, &component, &linker)
@@ -290,8 +314,64 @@ impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
             .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
         self.core_store
             .kv_partition_set(AI_MODELS_REGISTRY_TABLE, &event.alias, &value)
-            .map_err(|error| format!("failed to publish model upload event: {error:#}"))
+            .map_err(|error| format!("failed to publish model upload event: {error:#}"))?;
+        self.flush_uploaded_model_to_s3(&event.alias);
+        Ok(())
     }
+}
+
+impl StorageComponentState {
+    fn flush_uploaded_model_to_s3(&self, _alias: &str) {
+        #[cfg(feature = "s3-persistence")]
+        {
+            let Some(backend) = self.s3_backend.clone() else {
+                return;
+            };
+            let Some(model_dir) = uploaded_model_dir(&self.root_dir, _alias) else {
+                tracing::warn!(alias = %_alias, "skipping S3 model flush for invalid upload alias");
+                return;
+            };
+            let alias = _alias.to_owned();
+            let core_store_path = self.core_store_path.clone();
+            tokio::spawn(async move {
+                if let Err(error) = backend.flush_path(&model_dir).await {
+                    tracing::warn!(
+                        alias = %alias,
+                        path = %model_dir.display(),
+                        error = %error,
+                        "failed to flush uploaded model to S3"
+                    );
+                } else {
+                    tracing::info!(
+                        alias = %alias,
+                        path = %model_dir.display(),
+                        "flushed uploaded model files to S3"
+                    );
+                }
+                if let Err(error) = backend.flush_path(&core_store_path).await {
+                    tracing::warn!(
+                        path = %core_store_path.display(),
+                        error = %error,
+                        "failed to flush model registry to S3"
+                    );
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "s3-persistence")]
+fn uploaded_model_dir(root_dir: &Path, alias: &str) -> Option<PathBuf> {
+    let alias = alias.trim();
+    if alias.is_empty()
+        || alias.contains(['/', '\\'])
+        || Path::new(alias)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(root_dir.join("models").join(alias))
 }
 
 fn component_response_to_http(response: ComponentResponse) -> Response {
@@ -388,4 +468,27 @@ impl WasiView for StorageComponentState {
 
 impl wasmtime::component::HasData for StorageComponentState {
     type Data<'a> = &'a mut Self;
+}
+
+#[cfg(all(test, feature = "s3-persistence"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uploaded_model_dir_accepts_single_component_alias() {
+        let root = Path::new("/tachyon/tachyon_data");
+        assert_eq!(
+            uploaded_model_dir(root, "llama-3"),
+            Some(PathBuf::from("/tachyon/tachyon_data/models/llama-3"))
+        );
+    }
+
+    #[test]
+    fn uploaded_model_dir_rejects_path_like_aliases() {
+        let root = Path::new("/tachyon/tachyon_data");
+        assert!(uploaded_model_dir(root, "").is_none());
+        assert!(uploaded_model_dir(root, "../llama").is_none());
+        assert!(uploaded_model_dir(root, "models/llama").is_none());
+        assert!(uploaded_model_dir(root, r"models\llama").is_none());
+    }
 }

@@ -211,6 +211,24 @@ struct IssuePatResponse {
     token: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableAiModel {
+    pub id: String,
+    pub alias: String,
+    pub engine: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelListResponse {
+    data: Vec<OpenAiModelResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelResponse {
+    id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AdminEnrollmentStartRequest<'a> {
@@ -2810,6 +2828,24 @@ pub fn recommend_concurrency_policy(
     }
 }
 
+pub async fn list_available_ai_models() -> Result<Vec<AvailableAiModel>> {
+    let response: OpenAiModelListResponse = get_admin_json("/v1/models").await?;
+    Ok(response
+        .data
+        .into_iter()
+        .map(|model| available_model_from_openai_id(&model.id))
+        .collect())
+}
+
+fn available_model_from_openai_id(id: &str) -> AvailableAiModel {
+    let (engine, alias) = id.split_once('/').unwrap_or(("unknown", id));
+    AvailableAiModel {
+        id: id.to_owned(),
+        alias: alias.to_owned(),
+        engine: engine.to_owned(),
+    }
+}
+
 pub async fn remove_overlay_resource(name: &str) -> Result<()> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -4654,6 +4690,26 @@ mod tests {
         assert_ne!(
             http_client_cache_key(&base),
             http_client_cache_key(&different_identity)
+        );
+    }
+
+    #[test]
+    fn available_model_from_openai_id_splits_engine_and_alias() {
+        assert_eq!(
+            available_model_from_openai_id("gguf/llama-3"),
+            AvailableAiModel {
+                id: "gguf/llama-3".to_owned(),
+                alias: "llama-3".to_owned(),
+                engine: "gguf".to_owned(),
+            }
+        );
+        assert_eq!(
+            available_model_from_openai_id("legacy-model"),
+            AvailableAiModel {
+                id: "legacy-model".to_owned(),
+                alias: "legacy-model".to_owned(),
+                engine: "unknown".to_owned(),
+            }
         );
     }
 

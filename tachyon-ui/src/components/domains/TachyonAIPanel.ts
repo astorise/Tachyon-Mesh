@@ -15,8 +15,18 @@ type RuntimeMetrics = {
   ramOffloadActive: boolean;
 };
 
+type AvailableAiModel = {
+  id: string;
+  alias: string;
+  engine: string;
+};
+
+type ModelLoadMode = "integrity" | "layer" | "layer-batch";
+
 export class TachyonAIPanel extends TachyonConfigDashboard {
   private metrics: RuntimeMetrics | null = null;
+  private models: AvailableAiModel[] = [];
+  private modelLoadModes: Record<string, ModelLoadMode> = {};
   private readonly onLanguageChanged = () => { this.render(); this.bindEvents(); };
 
   async connectedCallback(): Promise<void> {
@@ -24,19 +34,21 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
     this.render();
     this.bindEvents();
     this.animateGlitchEntrance();
-    await this.refreshMetrics();
+    await this.refreshAiState();
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
   }
 
-  private async refreshMetrics(): Promise<void> {
-    try {
-      this.metrics = await invoke<RuntimeMetrics>("get_metrics");
-    } catch {
-      this.metrics = null;
-    }
+  private async refreshAiState(): Promise<void> {
+    const [metrics, models] = await Promise.all([
+      invoke<RuntimeMetrics>("get_metrics").catch(() => null),
+      invoke<AvailableAiModel[]>("list_available_models").catch(() => []),
+    ]);
+    this.metrics = metrics;
+    this.models = models;
+    this.reconcileModelLoadModes();
     this.render();
     this.bindEvents();
   }
@@ -58,6 +70,8 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
         ${this.renderVramMetrics()}
 
         <tachyon-model-upload-panel data-stagger-panel></tachyon-model-upload-panel>
+
+        ${this.renderModelLoadModes()}
 
         <form class="space-y-6">
           <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -143,7 +157,23 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
     });
 
     this.root.getElementById("btn-refresh-vram")?.addEventListener("click", () => {
-      void this.refreshMetrics();
+      void this.refreshAiState();
+    });
+
+    this.root.getElementById("btn-refresh-models")?.addEventListener("click", () => {
+      void this.refreshAiState();
+    });
+
+    this.root.querySelectorAll<HTMLSelectElement>("[data-model-load-mode]").forEach((select) => {
+      select.addEventListener("change", () => {
+        const alias = select.dataset.modelAlias;
+        if (alias) {
+          this.modelLoadModes = {
+            ...this.modelLoadModes,
+            [alias]: this.normalizeLoadMode(select.value),
+          };
+        }
+      });
     });
   }
 
@@ -153,11 +183,73 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
           lora_mode: this.value("lora-mode", "dynamic"),
           kv_cache_size: this.numberValue("kv-cache-range", 32),
           tde_key: this.value("tde-key", ""),
+          model_loading_modes: this.modelLoadModes,
       });
       this.showFeedback(response.success ? "success" : "error", response.message);
     } catch (error) {
       this.showFeedback("error", error instanceof Error ? error.message : String(error));
     }
+  }
+
+  private renderModelLoadModes(): string {
+    const rows = this.models
+      .map((model) => {
+        const mode = this.modelLoadModes[model.alias] ?? "integrity";
+        return `
+          <tr class="border-t border-slate-800">
+            <td class="py-2 pr-3">
+              <div class="font-mono text-xs text-slate-200">${this.escape(model.alias)}</div>
+              <div class="text-[10px] uppercase tracking-widest text-slate-500">${this.escape(model.engine)}</div>
+            </td>
+            <td class="py-2">
+              <select data-model-load-mode data-model-alias="${this.escape(model.alias)}" class="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-cyan-300 outline-none focus:border-cyan-400">
+                <option value="integrity" ${mode === "integrity" ? "selected" : ""}>${t("ai.model.mode.integrity")}</option>
+                <option value="layer" ${mode === "layer" ? "selected" : ""}>${t("ai.model.mode.layer")}</option>
+                <option value="layer-batch" ${mode === "layer-batch" ? "selected" : ""}>${t("ai.model.mode.layer-batch")}</option>
+              </select>
+            </td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    return `
+      <section data-stagger-panel class="rounded border border-slate-700 bg-slate-800/70 p-5">
+        <div class="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <h3 class="text-sm font-bold uppercase tracking-widest text-slate-200">${t("ai.model.title")}</h3>
+            <p class="text-[11px] text-slate-500">${t("ai.model.subtitle")}</p>
+          </div>
+          <button id="btn-refresh-models" type="button" class="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-300 hover:bg-slate-700">${t("ai.model.refresh")}</button>
+        </div>
+        ${
+          rows
+            ? `<table class="w-full table-fixed text-left"><thead><tr class="text-[10px] uppercase tracking-widest text-slate-500"><th class="w-1/2 pb-2 pr-3">${t("ai.model.column.model")}</th><th class="pb-2">${t("ai.model.column.mode")}</th></tr></thead><tbody>${rows}</tbody></table>`
+            : `<div class="rounded border border-slate-700 bg-slate-900/70 px-3 py-2 text-[11px] text-slate-500">${t("ai.model.empty")}</div>`
+        }
+      </section>
+    `;
+  }
+
+  private reconcileModelLoadModes(): void {
+    const aliases = new Set(this.models.map((model) => model.alias));
+    const next: Record<string, ModelLoadMode> = {};
+    for (const alias of aliases) {
+      next[alias] = this.modelLoadModes[alias] ?? "integrity";
+    }
+    this.modelLoadModes = next;
+  }
+
+  private normalizeLoadMode(value: string): ModelLoadMode {
+    return value === "layer" || value === "layer-batch" ? value : "integrity";
+  }
+
+  private escape(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
 
   private animateGlitchEntrance(): void {

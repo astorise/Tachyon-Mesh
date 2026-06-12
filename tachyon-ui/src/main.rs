@@ -763,6 +763,13 @@ async fn get_hardware_status() -> Result<tachyon_client::HardwareStatus, String>
 }
 
 #[tauri::command]
+async fn list_available_models() -> Result<Vec<tachyon_client::AvailableAiModel>, String> {
+    tachyon_client::list_available_ai_models()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn list_enrolled_nodes() -> Result<Vec<tachyon_client::EnrolledNode>, String> {
     tachyon_client::list_enrolled_nodes()
         .await
@@ -1449,6 +1456,7 @@ fn main() {
             push_large_model,
             get_resources,
             get_hardware_status,
+            list_available_models,
             list_enrolled_nodes,
             get_node_capabilities,
             list_registered_systems,
