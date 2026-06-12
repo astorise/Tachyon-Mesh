@@ -118,6 +118,9 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     if (this.state !== "uploading") {
       return;
     }
+    if (this.isStaleUploadStatus(status)) {
+      return;
+    }
     this.uploadStatus = status;
     if (typeof status.percentage === "number") {
       this.progress = Math.max(0, Math.min(100, Math.round(status.percentage)));
@@ -128,6 +131,22 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     this.statusMessage = this.describeStatus(status);
     this.render();
     this.bindEvents();
+  }
+
+  private isStaleUploadStatus(status: UploadStatus): boolean {
+    if (status.phase !== "uploading" || this.uploadStatus?.phase !== "uploading") {
+      return false;
+    }
+
+    const previousUploaded = this.uploadStatus.uploadedBytes ?? 0;
+    const nextUploaded = status.uploadedBytes ?? 0;
+    if (nextUploaded < previousUploaded) {
+      return true;
+    }
+
+    const previousPart = this.uploadStatus.part ?? 0;
+    const nextPart = status.part ?? 0;
+    return nextUploaded === previousUploaded && nextPart < previousPart;
   }
 
   private applyPreview(preview: UploadPreview): void {

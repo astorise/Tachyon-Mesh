@@ -163,6 +163,59 @@ describe("TachyonModelUploadPanel", () => {
     await done;
   });
 
+  it("ignores stale upload status events that would move the part backwards", async () => {
+    const push = deferred<string>();
+    let statusCb: ((event: { payload: Record<string, unknown> }) => void) | undefined;
+    listenMock.mockImplementation((event, cb) => {
+      if (event === "upload_status") {
+        statusCb = cb as unknown as (event: { payload: Record<string, unknown> }) => void;
+      }
+      return Promise.resolve(vi.fn());
+    });
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "pick_model_file") return Promise.resolve("/models/Qwen");
+      if (command === "preview_large_model_upload") return Promise.resolve(previewPayload);
+      if (command === "push_large_model") return push.promise;
+      return Promise.reject(new Error(`unexpected ${command}`));
+    });
+
+    const panel = mountPanel();
+    const done = panel.selectAndUpload();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const base = {
+      phase: "uploading",
+      alias: "Qwen",
+      filesIncluded: 4,
+      bytesIncluded: 24 * 1024 * 1024,
+      archiveBytes: 20 * 1024 * 1024,
+      totalBytes: 20 * 1024 * 1024,
+    };
+    statusCb?.({
+      payload: {
+        ...base,
+        percentage: 75,
+        uploadedBytes: 15 * 1024 * 1024,
+        part: 3,
+      },
+    });
+    statusCb?.({
+      payload: {
+        ...base,
+        percentage: 50,
+        uploadedBytes: 10 * 1024 * 1024,
+        part: 2,
+      },
+    });
+
+    const details = panel.shadowRoot?.querySelector("[data-upload-details]");
+    expect(details?.textContent).toContain("part 3");
+    expect(details?.textContent).toContain("Sent 15 MiB / 20 MiB");
+
+    push.resolve("models/Qwen");
+    await done;
+  });
+
   it("shows the scanned model files before the privileged upload completes", async () => {
     const push = deferred<string>();
     invokeMock.mockImplementation((command: string) => {

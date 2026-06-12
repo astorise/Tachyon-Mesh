@@ -45,7 +45,7 @@ const ADMIN_MODEL_COMMIT_PATH: &str = "/admin/models/commit";
 const ADMIN_NODES_PATH: &str = "/admin/nodes";
 const ADMIN_SYSTEMS_REGISTERED_PATH: &str = "/admin/systems/registered";
 const ADMIN_SYSTEMS_DEPLOYED_PATH: &str = "/admin/systems/deployed";
-const MODEL_CHUNK_BYTES: usize = 5 * 1024 * 1024;
+const MODEL_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const MODEL_PREP_PROGRESS_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -4585,6 +4585,11 @@ fn sha256_hash(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn model_upload_chunks_are_large_enough_for_local_uploads() {
+        assert_eq!(MODEL_CHUNK_BYTES, 64 * 1024 * 1024);
+    }
 
     #[test]
     fn derive_model_alias_sanitizes_names() {

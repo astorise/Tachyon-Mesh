@@ -18,7 +18,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const MODEL_CHUNK_BYTES: usize = 5 * 1024 * 1024;
+const MODEL_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 /// Host dispatch sidecar written into each unpacked model directory. Mirrors
 /// `core-host`'s `candle_llm_runtime::MODEL_META_JSON` — the broker performs the
 /// format *detection* and records the result; the host honours the declared
@@ -288,7 +288,7 @@ fn append_chunk(uri: &str, chunk: &[u8]) -> Result<(), String> {
     }
     if chunk.len() > MODEL_CHUNK_BYTES {
         return Err(format!(
-            "model upload chunk exceeds the 5 MiB protocol limit ({} bytes)",
+            "model upload chunk exceeds the 64 MiB protocol limit ({} bytes)",
             chunk.len()
         ));
     }
@@ -815,6 +815,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_upload_accepts_large_local_chunks() {
+        assert_eq!(MODEL_CHUNK_BYTES, 64 * 1024 * 1024);
+    }
 
     #[test]
     fn upload_id_extraction_requires_identifier() {
