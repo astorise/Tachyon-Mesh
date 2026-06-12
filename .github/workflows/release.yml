@@ -224,6 +224,11 @@ jobs:
               target/release/bundle/msi/*.msi
               target/release/bundle/nsis/*.exe
     runs-on: ${{ matrix.platform }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: 10
+      CARGO_HTTP_MULTIPLEXING: false
+      CARGO_HTTP_TIMEOUT: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -239,6 +244,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tauri-${{ matrix.platform }}-${{ matrix.rust_targets }}
+          workspaces: |
+            . -> target
 
       - name: Install Linux system dependencies for Tauri
         if: matrix.platform == 'ubuntu-22.04'
@@ -263,6 +275,17 @@ jobs:
       - name: Install frontend dependencies
         working-directory: ./tachyon-ui
         run: npm install
+
+      - name: Fetch Rust dependencies
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if cargo fetch --locked --manifest-path tachyon-ui/Cargo.toml; then
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          cargo fetch --locked --manifest-path tachyon-ui/Cargo.toml
 
       - name: Generate Rust SBOM
         if: matrix.platform == 'ubuntu-22.04'
