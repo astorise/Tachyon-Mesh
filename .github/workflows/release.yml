@@ -3,9 +3,13 @@ name: Publish Tachyon Desktop
 on:
   push:
     branches:
-      - "**"
+      - main
     tags:
       - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ── Server-side binary tarballs (core-host + tachyon-mcp) ────────────────────

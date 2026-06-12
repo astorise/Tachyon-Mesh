@@ -16,7 +16,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install wasm-tools
-        run: cargo install wasm-tools --locked
+        uses: taiki-e/install-action@wasm-tools
 
       - name: Check WIT package declarations
         shell: bash

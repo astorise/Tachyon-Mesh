@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # ── Shared env snippets used across multiple jobs ─────────────────────────────
 # RUSTFLAGS and CARGO_TERM_COLOR are repeated per-job so each job's env block
 # is self-contained and readable without cross-referencing.
@@ -73,18 +77,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache security tools
-        id: cache-sec-tools
-        uses: actions/cache@v5
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          path: |
-            ~/.cargo/bin/cargo-audit
-            ~/.cargo/bin/cargo-deny
-          key: sec-tools-${{ runner.os }}-v1
-
-      - name: Install security tooling
-        if: steps.cache-sec-tools.outputs.cache-hit != 'true'
-        run: cargo install cargo-audit cargo-deny --locked
+          tool: cargo-audit,cargo-deny
 
       - name: Run cargo audit
         # RUSTSEC-2023-0071 (rsa Marvin attack) targets RSA private-key
@@ -100,7 +96,7 @@ jobs:
   # validation and per-feature compilation checks.
   # cargo build -p tachyon-ui --release is intentionally absent: clippy
   # --workspace already verifies the crate compiles, and the Publish Tachyon
-  # Desktop workflow handles the full Tauri bundle on every branch in parallel.
+  # Desktop workflow handles the full Tauri bundle on main and version tags.
   quality:
     runs-on: ubuntu-latest
     env:
@@ -225,16 +221,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Cache cargo-llvm-cov
-        id: cache-llvm-cov
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-llvm-cov-${{ runner.os }}-v1
-
       - name: Install cargo-llvm-cov
-        if: steps.cache-llvm-cov.outputs.cache-hit != 'true'
-        run: cargo install cargo-llvm-cov --locked
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Download guest artifacts
         uses: actions/download-artifact@v8
@@ -263,6 +251,10 @@ jobs:
       CARGO_TERM_COLOR: always
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       RUSTFLAGS: "-D dead_code"
+      # This binary is a CI validation artifact, not a published release —
+      # thin LTO trades a little runtime perf for much faster builds.
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v6
 
@@ -338,6 +330,10 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D dead_code"
+      # These binaries are CI validation artifacts, not published releases —
+      # thin LTO trades a little runtime perf for much faster builds.
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v6
 
@@ -399,6 +395,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+      # This binary is a CI validation artifact, not a published release —
+      # thin LTO trades a little runtime perf for much faster builds.
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v6
 

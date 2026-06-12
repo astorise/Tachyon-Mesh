@@ -22,12 +22,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   e2e-vcluster:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      CARGO_TERM_COLOR: always
       VCLUSTER_NAME: tachyon-vc
       VCLUSTER_NAMESPACE: vcluster-tachyon
       KIND_CLUSTER: tachyon-host
@@ -36,18 +39,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev build-essential libssl-dev cmake nasm
 
       - name: Build local Docker image
         run: docker build -t $IMAGE_TAG .
