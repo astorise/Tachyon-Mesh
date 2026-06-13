@@ -6,7 +6,7 @@
 # size and are irrelevant to the mesh/enrollment E2E, which only exercises
 # core-host + system FaaS (node-registry, cert-manager, …). Keeping this
 # separate avoids any risk to the release image build.
-FROM ubuntu:24.04 AS rust-builder
+FROM ubuntu:24.04 AS rust-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -33,11 +33,34 @@ RUN rustup target add wasm32-wasip1 wasm32-wasip2 x86_64-unknown-linux-musl
 
 WORKDIR /workspace
 
+# cargo-chef dependency layer — see Dockerfile for rationale. Keyed on
+# Cargo.toml/Cargo.lock only, so it survives source-only commits.
+FROM rust-base AS chef
+RUN cargo install cargo-chef --locked
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS rust-builder
+COPY --from=planner /workspace/recipe.json recipe.json
+RUN cargo chef cook --release --target wasm32-wasip2 --recipe-path recipe.json \
+    -p guest-example -p guest-volume \
+    -p system-faas-authn -p system-faas-authz -p system-faas-keda \
+    -p system-faas-k8s-scaler -p system-faas-model-broker \
+    -p system-faas-node-registry -p system-faas-cert-manager \
+    -p system-faas-logger -p system-faas-prom -p system-faas-registry
+RUN cargo chef cook --release --target wasm32-wasip1 --recipe-path recipe.json \
+    -p guest-ai -p guest-call-legacy -p guest-loop
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json \
+    -p core-host
+
 COPY . .
 
 # Single multi-package invocations let cargo build the dependency graph and
 # compile units for each target in parallel, instead of sequential
-# cargo invocations that each re-resolve the workspace.
+# cargo invocations that each re-resolve the workspace. Dependencies were
+# already compiled by `cargo chef cook` above, so these only build our crates.
 RUN cargo build --target wasm32-wasip2 --release \
     -p guest-example -p guest-volume \
     -p system-faas-authn -p system-faas-authz -p system-faas-keda \

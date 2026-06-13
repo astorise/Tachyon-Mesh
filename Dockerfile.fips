@@ -11,7 +11,7 @@
 # approuvées, avec assertion au démarrage via provider.fips().
 
 # ── WASM guest modules ────────────────────────────────────────────────────────
-FROM ubuntu:24.04 AS wasm-builder
+FROM ubuntu:24.04 AS wasm-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -34,21 +34,41 @@ RUN rustup target add wasm32-wasip1 wasm32-wasip2 x86_64-unknown-linux-musl
 
 WORKDIR /workspace
 
+# cargo-chef dependency layer — see Dockerfile for rationale. recipe.json is
+# OS-independent, so the same recipe (from `planner`, built here on Ubuntu) is
+# also reused by the Alpine-based fips-builder stage below.
+FROM wasm-base AS chef
+RUN cargo install cargo-chef --locked
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS wasm-builder
+COPY --from=planner /workspace/recipe.json recipe.json
+RUN cargo chef cook --release --target wasm32-wasip2 --recipe-path recipe.json \
+    -p guest-example -p guest-volume \
+    -p system-faas-authn -p system-faas-authz -p system-faas-keda \
+    -p system-faas-k8s-scaler -p system-faas-model-broker \
+    -p system-faas-node-registry -p system-faas-prom -p system-faas-registry
+RUN cargo chef cook --release --target wasm32-wasip1 --recipe-path recipe.json \
+    -p guest-ai -p guest-call-legacy -p guest-loop
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json \
+    -p legacy-mock
+
 COPY . .
 
-RUN cargo build -p guest-example --target wasm32-wasip2 --release
-RUN cargo build -p guest-volume --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-authn --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-authz --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-keda --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-node-registry --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-prom --target wasm32-wasip2 --release
-RUN cargo build -p system-faas-registry --target wasm32-wasip2 --release
-RUN cargo build -p guest-ai --target wasm32-wasip1 --release
-RUN cargo build -p guest-call-legacy --target wasm32-wasip1 --release
-RUN cargo build -p guest-loop --target wasm32-wasip1 --release
+# Single multi-package invocations let cargo build the dependency graph and
+# compile units for each target in parallel, instead of sequential cargo
+# invocations that each re-resolve the workspace. Dependencies were already
+# compiled by `cargo chef cook` above, so these only build our crates.
+RUN cargo build --target wasm32-wasip2 --release \
+    -p guest-example -p guest-volume \
+    -p system-faas-authn -p system-faas-authz -p system-faas-keda \
+    -p system-faas-k8s-scaler -p system-faas-model-broker \
+    -p system-faas-node-registry -p system-faas-prom -p system-faas-registry
+RUN cargo build --target wasm32-wasip1 --release \
+    -p guest-ai -p guest-call-legacy -p guest-loop
 
 # legacy-mock nécessite musl (musl-tools installé dans le bloc apt initial)
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
@@ -71,11 +91,19 @@ RUN apk add --no-cache \
     openssl-dev pkgconf \
     protobuf
 
+RUN cargo install cargo-chef --locked
+
 WORKDIR /workspace
+
+# Reuse the recipe extracted on the Ubuntu side (recipe.json is OS-independent)
+# so the FIPS dependency cook is keyed on Cargo.toml/Cargo.lock too.
+COPY --from=planner /workspace/recipe.json recipe.json
+
+# --no-default-features retire ring ; fips active aws-lc-fips-sys + TLS 1.3 only
+RUN cargo chef cook --release --no-default-features --features fips --recipe-path recipe.json -p core-host
 
 COPY . .
 
-# --no-default-features retire ring ; fips active aws-lc-fips-sys + TLS 1.3 only
 RUN cargo build -p core-host \
     --no-default-features \
     --features fips \
