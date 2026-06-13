@@ -95,6 +95,15 @@ RUN cargo install cargo-chef --locked
 
 WORKDIR /workspace
 
+# The rust:alpine3.20 tag is frozen at rustc 1.94.1, but the workspace pins
+# 1.96.0 (rust-toolchain.toml) and dependencies such as sysinfo 0.39 require
+# rustc >= 1.95. Copy the toolchain file before the dependency cook so rustup
+# installs and uses the pinned toolchain in this stage too — the cook runs
+# before `COPY . .`, so without this it would silently fall back to the image's
+# default 1.94.1. We stay on Alpine 3.20 (GCC 13) for the aws-lc-fips-sys
+# delocator compatibility documented above.
+COPY rust-toolchain.toml .
+
 # Reuse the recipe extracted on the Ubuntu side (recipe.json is OS-independent)
 # so the FIPS dependency cook is keyed on Cargo.toml/Cargo.lock too.
 COPY --from=planner /workspace/recipe.json recipe.json
