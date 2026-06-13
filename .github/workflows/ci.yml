@@ -184,7 +184,12 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            protobuf-compiler
+            protobuf-compiler \
+            mold
+          # Make mold the default host linker (drop-in for /usr/bin/ld) so every
+          # cargo link in this job is faster; wasm32 cross-links use rust-lld and
+          # are unaffected, and RUSTFLAGS is untouched.
+          sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -224,7 +229,8 @@ jobs:
         run: cargo check -p core-host --features s3-persistence
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
-  # Runs chaos + full workspace nextest suite + doc tests.
+  # Runs the full workspace nextest suite — including the core-host chaos
+  # integration test — plus doc tests.
   # Separate job means it gets its own 14 GB disk, avoiding the exhaustion
   # that plagued the previous monolithic rust-ci job.
   test:
@@ -241,6 +247,16 @@ jobs:
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
+      # mold links our many statically-linked host test/bin targets far faster
+      # than GNU ld; symlinking it over /usr/bin/ld makes cargo's default cc
+      # driver use it without touching RUSTFLAGS or the wasm32/musl
+      # cross-linkers (which use rust-lld).
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          sudo ln -sf "$(command -v mold)" /usr/bin/ld
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-nextest
@@ -252,9 +268,6 @@ jobs:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
         run: tar -xzf wasm-guests.tar.gz
-
-      - name: Run chaos test harness
-        run: cargo nextest run -p core-host --test chaos_test
 
       # tachyon-ui is a Tauri desktop app with no unit tests (covered by
       # Playwright E2E in e2e.yml). Excluding it avoids pulling in GTK/WebKit
@@ -281,6 +294,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
       - uses: Swatinem/rust-cache@v2
 
@@ -324,6 +343,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
       - uses: Swatinem/rust-cache@v2
 
@@ -399,6 +424,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
       - uses: Swatinem/rust-cache@v2
         with:
