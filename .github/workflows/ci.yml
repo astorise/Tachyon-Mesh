@@ -93,8 +93,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ./Dockerfile splits its builder into a feature-independent
+          # wasm-builder (shared by every variant) and a feature-dependent
+          # host-builder; warming host-builder with empty features still
+          # populates its pre-ARG default core-host / FaaS dependency cooks,
+          # which all variants share. Both feed the same docker-default scope.
           - dockerfile: ./Dockerfile
-            target: rust-builder
+            target: wasm-builder
+            cache_scope: docker-default
+          - dockerfile: ./Dockerfile
+            target: host-builder
             cache_scope: docker-default
           - dockerfile: ./Dockerfile.e2e
             target: rust-builder

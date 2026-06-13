@@ -42,7 +42,12 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS rust-builder
+# ── wasm-builder: feature-INDEPENDENT guest/system FaaS wasm + legacy-mock ───
+# Nothing in this stage reads CARGO_FEATURES, so the whole layer chain (and the
+# docker-default cache it feeds) is identical for every image variant. The
+# docker-base CI job warms it once and all 4 ./Dockerfile feature variants plus
+# the E2E workflows reuse it instead of recompiling these crates per variant.
+FROM chef AS wasm-builder
 COPY --from=planner /workspace/recipe.json recipe.json
 
 # Cook dependencies for exactly the package/target sets built below, mirroring
@@ -52,31 +57,18 @@ RUN cargo chef cook --release --target wasm32-wasip2 --recipe-path recipe.json \
     -p system-faas-authn -p system-faas-authz -p system-faas-keda \
     -p system-faas-k8s-scaler -p system-faas-model-broker \
     -p system-faas-node-registry -p system-faas-cert-manager \
-    -p system-faas-logger -p system-faas-prom -p system-faas-registry \
-    -p system-faas-vector-search -p system-faas-s3-proxy \
-    -p system-faas-storage-broker -p system-faas-media-server \
-    -p system-faas-tee-runtime
+    -p system-faas-logger -p system-faas-prom -p system-faas-registry
 RUN cargo chef cook --release --target wasm32-wasip1 --recipe-path recipe.json \
     -p guest-ai -p guest-call-legacy -p guest-loop
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json \
-    -p legacy-mock -p core-host
-
-# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=http3
-# to produce a feature-specific image variant. Cooking core-host's
-# feature-specific deps here keeps this layer cacheable independently of the
-# real source copy below.
-ARG CARGO_FEATURES=""
-RUN if [ -n "$CARGO_FEATURES" ]; then \
-      cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json \
-        -p core-host --features "$CARGO_FEATURES"; \
-    fi
+    -p legacy-mock
 
 COPY . .
 
 # Single multi-package invocations let cargo build the dependency graph and
-# compile units for each target in parallel, instead of 17 sequential
-# cargo invocations that each re-resolve the workspace. Dependencies were
-# already compiled by `cargo chef cook` above, so these only build our crates.
+# compile units for each target in parallel, instead of sequential cargo
+# invocations that each re-resolve the workspace. Dependencies were already
+# compiled by `cargo chef cook` above, so these only build our crates.
 RUN cargo build --target wasm32-wasip2 --release \
     -p guest-example -p guest-volume \
     -p system-faas-authn -p system-faas-authz -p system-faas-keda \
@@ -86,6 +78,39 @@ RUN cargo build --target wasm32-wasip2 --release \
 RUN cargo build --target wasm32-wasip1 --release \
     -p guest-ai -p guest-call-legacy -p guest-loop
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
+
+# ── host-builder: feature-DEPENDENT core-host + gated FaaS modules ───────────
+# A sibling of wasm-builder (FROM chef, not FROM wasm-builder) so cargo-chef can
+# cook core-host's dependencies — including the feature-specific ones — BEFORE
+# `COPY . .`. Keeping this stage separate is what lets the CARGO_FEATURES ARG
+# live here without invalidating the shared wasm/legacy layers above: each
+# feature value only re-keys host-builder, never wasm-builder.
+FROM chef AS host-builder
+COPY --from=planner /workspace/recipe.json recipe.json
+
+# Default core-host deps and the gated FaaS crates' deps are feature-INDEPENDENT
+# (cooking a recipe compiles the dependency tree regardless of which features
+# are later enabled), so they sit before the ARG: shared across variants and
+# warmable by docker-base.
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json \
+    -p core-host
+RUN cargo chef cook --release --target wasm32-wasip2 --recipe-path recipe.json \
+    -p system-faas-vector-search -p system-faas-s3-proxy \
+    -p system-faas-storage-broker -p system-faas-media-server \
+    -p system-faas-tee-runtime
+
+# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg
+# CARGO_FEATURES=http3 for a feature-specific variant. Cooking the feature deps
+# in this CARGO_FEATURES-keyed layer keeps them cached across source-only
+# commits (recipe + features unchanged) instead of recompiling every push.
+ARG CARGO_FEATURES=""
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+      cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json \
+        -p core-host --features "$CARGO_FEATURES"; \
+    fi
+
+COPY . .
+
 # Build and stage system FaaS modules that are gated behind feature flags.
 # The staging directory is copied into the runtime image in one COPY step.
 RUN CARGO_FEATURES="${CARGO_FEATURES}" bash scripts/build-feature-system-faas.sh /workspace/staging-modules
@@ -207,8 +232,8 @@ FROM scratch AS legacy-runtime
 
 WORKDIR /app
 
-COPY --from=rust-builder /etc/ssl/certs /etc/ssl/certs
-COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/legacy-mock /app/legacy-mock
+COPY --from=wasm-builder /etc/ssl/certs /etc/ssl/certs
+COPY --from=wasm-builder /workspace/target/x86_64-unknown-linux-musl/release/legacy-mock /app/legacy-mock
 
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
@@ -220,28 +245,28 @@ FROM scratch AS runtime
 
 WORKDIR /app
 
-COPY --from=rust-builder /etc/ssl/certs /etc/ssl/certs
-COPY --from=rust-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/guest_volume.wasm /app/guest-modules/guest_volume.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_authn.wasm /app/guest-modules/system_faas_authn.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_authz.wasm /app/guest-modules/system_faas_authz.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/k8s_scaler.wasm /app/guest-modules/k8s_scaler.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /app/guest-modules/metrics.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_model_broker.wasm /app/guest-modules/system_faas_model_broker.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_node_registry.wasm /app/guest-modules/system_faas_node_registry.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_cert_manager.wasm /app/guest-modules/system_faas_cert_manager.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_logger.wasm /app/guest-modules/system_faas_logger.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip2/release/system_faas_registry.wasm /app/guest-modules/system_faas_registry.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_ai.wasm /app/guest-modules/guest_ai.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
-COPY --from=rust-builder /workspace/target/wasm32-wasip1/release/guest_loop.wasm /app/guest-modules/guest_loop.wasm
+COPY --from=wasm-builder /etc/ssl/certs /etc/ssl/certs
+COPY --from=host-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/guest_volume.wasm /app/guest-modules/guest_volume.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/system_faas_authn.wasm /app/guest-modules/system_faas_authn.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/system_faas_authz.wasm /app/guest-modules/system_faas_authz.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/k8s_scaler.wasm /app/guest-modules/k8s_scaler.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/metrics.wasm /app/guest-modules/metrics.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/scaling.wasm /app/guest-modules/scaling.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/system_faas_model_broker.wasm /app/guest-modules/system_faas_model_broker.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/system_faas_node_registry.wasm /app/guest-modules/system_faas_node_registry.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/system_faas_cert_manager.wasm /app/guest-modules/system_faas_cert_manager.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/system_faas_logger.wasm /app/guest-modules/system_faas_logger.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/system_faas_registry.wasm /app/guest-modules/system_faas_registry.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip1/release/guest_ai.wasm /app/guest-modules/guest_ai.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip1/release/guest_call_legacy.wasm /app/guest-modules/guest_call_legacy.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip1/release/guest_loop.wasm /app/guest-modules/guest_loop.wasm
 COPY --from=tinygo-builder /workspace/guest-modules/guest_go.wasm /app/guest-modules/guest_go.wasm
 COPY --from=javy-builder /workspace/guest-modules/guest_js.wasm /app/guest-modules/guest_js.wasm
 COPY --from=dotnet-builder /workspace/guest-modules/. /app/guest-modules/
 COPY --from=java-builder /workspace/guest-modules/guest_java.wasm /app/guest-modules/guest_java.wasm
-COPY --from=rust-builder /workspace/staging-modules/ /app/guest-modules/
+COPY --from=host-builder /workspace/staging-modules/ /app/guest-modules/
 
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
