@@ -72,6 +72,56 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # ── 1b. Docker layer cache warm-up (runs in parallel with build-guests) ─────
+  # Pre-builds the shared builder stages of Dockerfile / Dockerfile.fips /
+  # Dockerfile.e2e (apt+rustup setup, cargo-chef `planner`/cook layers — see
+  # the `chef`/`planner`/`*-builder` stages) and exports them with
+  # `cache-to: type=gha,mode=max`. This warms the docker-default, docker-fips
+  # and docker-e2e-slim scopes BEFORE publish-docker-images' 5-way matrix and
+  # the e2e-mesh/e2e-k8s/integration/e2e-zero-touch workflows read from them
+  # (all triggered by this same push to main), so the shared ~16-package
+  # dependency compile happens once instead of cold-starting in parallel
+  # everywhere.
+  # `outputs: type=cacheonly` skips producing a loadable image — only the
+  # layer cache is exported. `continue-on-error: true` makes this strictly
+  # best-effort: a warm-up failure just leaves a scope cold (today's
+  # behavior), it never blocks publish-docker-images.
+  docker-base:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: ./Dockerfile
+            target: rust-builder
+            cache_scope: docker-default
+          - dockerfile: ./Dockerfile.e2e
+            target: rust-builder
+            cache_scope: docker-e2e-slim
+          - dockerfile: ./Dockerfile.fips
+            target: wasm-builder
+            cache_scope: docker-fips
+          - dockerfile: ./Dockerfile.fips
+            target: fips-builder
+            cache_scope: docker-fips
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Warm ${{ matrix.cache_scope }} cache (${{ matrix.dockerfile }} → ${{ matrix.target }})
+        uses: docker/build-push-action@v7.2.0
+        continue-on-error: true
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+
   # ── 2. Security audit (runs in parallel with build-guests) ──────────────────
   security-audit:
     runs-on: ubuntu-latest
@@ -521,10 +571,13 @@ jobs:
   # consume the pre-built release artifact. It waits on the *test* jobs only
   # (not the artifact-build jobs above, which are unused by this job and were
   # previously on its critical path) so we don't publish an image that fails
-  # basic validation, while starting as early as possible.
+  # basic validation, while starting as early as possible. It also depends on
+  # docker-base purely for sequencing (so the matrix below sees a warm GHA
+  # cache); docker-base is best-effort (continue-on-error), so this never
+  # blocks on it.
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [quality, test, cover, release, feature-matrix-tests, fips-tests]
+    needs: [docker-base, quality, test, cover, release, feature-matrix-tests, fips-tests]
     runs-on: ubuntu-latest
     env:
       BUILDKIT_PROGRESS: plain

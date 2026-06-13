@@ -1,4 +1,4 @@
-FROM ubuntu:24.04 AS rust-builder
+FROM ubuntu:24.04 AS rust-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -30,11 +30,53 @@ RUN rustup target add wasm32-wasip1 wasm32-wasip2 x86_64-unknown-linux-musl
 
 WORKDIR /workspace
 
+# ── cargo-chef dependency layer ──────────────────────────────────────────────
+# `prepare` extracts a Cargo.toml/Cargo.lock-only recipe (hash independent of
+# source-file edits); `cook` compiles just those third-party dependencies.
+# This layer is keyed on the recipe, so it survives commits that don't touch
+# Cargo.toml/Cargo.lock instead of being busted by every `COPY . .`.
+FROM rust-base AS chef
+RUN cargo install cargo-chef --locked
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS rust-builder
+COPY --from=planner /workspace/recipe.json recipe.json
+
+# Cook dependencies for exactly the package/target sets built below, mirroring
+# the -p/--target lists so the recipe matches the real build.
+RUN cargo chef cook --release --target wasm32-wasip2 --recipe-path recipe.json \
+    -p guest-example -p guest-volume \
+    -p system-faas-authn -p system-faas-authz -p system-faas-keda \
+    -p system-faas-k8s-scaler -p system-faas-model-broker \
+    -p system-faas-node-registry -p system-faas-cert-manager \
+    -p system-faas-logger -p system-faas-prom -p system-faas-registry \
+    -p system-faas-vector-search -p system-faas-s3-proxy \
+    -p system-faas-storage-broker -p system-faas-media-server \
+    -p system-faas-tee-runtime
+RUN cargo chef cook --release --target wasm32-wasip1 --recipe-path recipe.json \
+    -p guest-ai -p guest-call-legacy -p guest-loop
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json \
+    -p legacy-mock -p core-host
+
+# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=http3
+# to produce a feature-specific image variant. Cooking core-host's
+# feature-specific deps here keeps this layer cacheable independently of the
+# real source copy below.
+ARG CARGO_FEATURES=""
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+      cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json \
+        -p core-host --features "$CARGO_FEATURES"; \
+    fi
+
 COPY . .
 
 # Single multi-package invocations let cargo build the dependency graph and
 # compile units for each target in parallel, instead of 17 sequential
-# cargo invocations that each re-resolve the workspace.
+# cargo invocations that each re-resolve the workspace. Dependencies were
+# already compiled by `cargo chef cook` above, so these only build our crates.
 RUN cargo build --target wasm32-wasip2 --release \
     -p guest-example -p guest-volume \
     -p system-faas-authn -p system-faas-authz -p system-faas-keda \
@@ -44,10 +86,6 @@ RUN cargo build --target wasm32-wasip2 --release \
 RUN cargo build --target wasm32-wasip1 --release \
     -p guest-ai -p guest-call-legacy -p guest-loop
 RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
-# CARGO_FEATURES is empty for the default build; pass e.g. --build-arg CARGO_FEATURES=http3
-# to produce a feature-specific image variant.
-# Layers above this ARG are cached independently of the feature set.
-ARG CARGO_FEATURES=""
 # Build and stage system FaaS modules that are gated behind feature flags.
 # The staging directory is copied into the runtime image in one COPY step.
 RUN CARGO_FEATURES="${CARGO_FEATURES}" bash scripts/build-feature-system-faas.sh /workspace/staging-modules
