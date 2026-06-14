@@ -576,7 +576,8 @@ mod registry_casing_tests {
         assert_eq!(parsed.status, "available");
 
         // Lock the on-the-wire key casing too, so the contract is explicit.
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("registry entry must be valid JSON");
         assert!(
             value.get("vramRequiredMb").is_some(),
             "registry entry must serialize camelCase `vramRequiredMb`"
