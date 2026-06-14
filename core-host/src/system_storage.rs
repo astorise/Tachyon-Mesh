@@ -12,10 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use wasmtime::{
-    component::{Component, Linker as ComponentLinker},
-    Engine, Store,
-};
+use wasmtime::{component::Linker as ComponentLinker, Engine, Store};
 use wasmtime_wasi::{
     DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
@@ -208,12 +205,20 @@ fn invoke_storage_component(
     })?;
     let module_path = crate::resolve_guest_module_path(module_name)
         .map_err(|error| anyhow!(error.to_string()))?;
-    let component = Component::from_file(engine, &module_path).map_err(|error| {
-        anyhow!(
-            "failed to load storage component `{module_name}` from `{}`: {error}",
-            module_path.display()
-        )
-    })?;
+    // Large model uploads are split into many chunked requests (one per
+    // `MODEL_CHUNK_BYTES`), each of which proxies through this function. Loading
+    // through the cwasm cache means only the first request per engine pays the
+    // Cranelift compile; every later chunk just deserializes the cached
+    // precompiled artifact, so per-chunk host overhead stays flat instead of
+    // growing with the number of chunks (and thus the model size).
+    let component =
+        crate::load_component_with_core_store(engine, &module_path, &core_store, "default")
+            .map_err(|error| {
+                anyhow!(
+                    "failed to load storage component `{module_name}` from `{}`: {error:#}",
+                    module_path.display()
+                )
+            })?;
 
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
