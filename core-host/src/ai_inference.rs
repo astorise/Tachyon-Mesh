@@ -91,11 +91,15 @@ struct BackendModelSource {
     requested_target: String,
     accelerator: AcceleratorKind,
     qos: RouteQos,
-    model_bytes: Arc<[u8]>,
+    /// On-disk size of the model artifact, in bytes. Used only for telemetry of
+    /// the resident weight footprint — the weights themselves are streamed/mmaped
+    /// by the concrete backend (e.g. `CandleLlmRuntime`), so we deliberately do
+    /// not buffer the whole file in host RAM here.
+    model_size_bytes: u64,
 }
 
-fn load_model_bytes(path: &str) -> Arc<[u8]> {
-    fs::read(path).unwrap_or_default().into()
+fn model_file_size_bytes(path: &str) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
 // Guests load ONNX models directly via graph_load(bytes). No pre-registered
@@ -917,7 +921,7 @@ impl CandleBackendModel {
                 requested_target: binding.device.as_str().to_owned(),
                 accelerator: AcceleratorKind::from_model_device(&binding.device),
                 qos: binding.qos,
-                model_bytes: load_model_bytes(&binding.path),
+                model_size_bytes: model_file_size_bytes(&binding.path),
             },
             kind: CandleBackendModelKind::Mock,
         })
@@ -961,7 +965,7 @@ impl CandleBackendModel {
                 requested_target: binding.device.as_str().to_owned(),
                 accelerator: AcceleratorKind::from_model_device(&binding.device),
                 qos: binding.qos,
-                model_bytes: load_model_bytes(&binding.path),
+                model_size_bytes: model_file_size_bytes(&binding.path),
             },
             kind,
         })
@@ -1033,7 +1037,7 @@ impl BackendModel for CandleBackendModel {
         let _prompt_batch =
             CandleTensor::zeros((batch_size, longest_prompt), DType::F32, &Device::Cpu)
                 .context("failed to prepare candle mock batch")?;
-        let _resident_weights = self.source.model_bytes.len();
+        let _resident_weights = self.source.model_size_bytes;
         Ok(b"MOCK_LLM_RESPONSE".to_vec())
     }
 
