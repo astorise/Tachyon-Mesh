@@ -2480,7 +2480,13 @@ impl background_component_bindings::tachyon::mesh::routing_control::Host for Com
     }
 }
 
+// Must match the casing `guest-openai` uses to read the `ai-models-registry`
+// table (`#[serde(rename_all = "camelCase")]`); otherwise its `list_models`
+// drops the row on a deserialize miss and the model never appears in
+// `GET /v1/models`. See the matching note on `RegistryModelInfo` in
+// `system_storage.rs`.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ModelRegistryRecord<'a> {
     alias: &'a str,
     engine: &'a str,
@@ -2509,6 +2515,15 @@ impl system_component_bindings::tachyon::mesh::model_events::Host for ComponentH
         };
         let value = serde_json::to_vec(&record)
             .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
+        // NOTE: unlike the storage-proxy path (`StorageComponentState`), this
+        // general component-host path does NOT flush the model to S3. If this log
+        // fires during an upload, that is why the bucket stays empty.
+        tracing::info!(
+            alias = %event.alias,
+            engine = %event.engine,
+            model_path = %event.model_path,
+            "publishing uploaded model to registry via ComponentHostState (no S3 flush on this path)"
+        );
         self.storage_broker
             .core_store
             .kv_partition_set("ai-models-registry", &event.alias, &value)

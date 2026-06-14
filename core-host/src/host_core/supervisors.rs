@@ -67,6 +67,14 @@ pub(crate) fn spawn_manifest_file_watcher(state: AppState) {
                 if !touches_manifest {
                     return;
                 }
+                // DEBUG: surface what is rewriting the manifest. A steady stream
+                // of these (with the same path) means something is touching
+                // integrity.lock in a loop and churning hot reloads.
+                tracing::info!(
+                    event_kind = ?event.kind,
+                    paths = ?event.paths,
+                    "manifest file watcher: change detected, scheduling hot reload"
+                );
                 // Use try_send so a flood of OS events cannot back-pressure the
                 // notify worker thread; we only need to know "something changed".
                 let _ = event_tx.try_send(());

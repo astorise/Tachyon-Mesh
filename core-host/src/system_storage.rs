@@ -197,6 +197,13 @@ fn invoke_storage_component(
     #[cfg(feature = "s3-persistence")] core_store_path: PathBuf,
     request: ComponentRequest,
 ) -> Result<ComponentResponse> {
+    tracing::info!(
+        module = module_name,
+        method = %request.method,
+        uri = %request.uri,
+        body_bytes = request.body.len(),
+        "storage component request received"
+    );
     fs::create_dir_all(root_dir).with_context(|| {
         format!(
             "failed to initialize storage component root directory `{}`",
@@ -275,6 +282,12 @@ fn invoke_storage_component(
         )
         .map_err(|error| anyhow!("storage component trapped: {error}"))?;
 
+    tracing::info!(
+        module = module_name,
+        status = response.status,
+        body_bytes = response.body.len(),
+        "storage component request completed"
+    );
     Ok(ComponentResponse {
         status: StatusCode::from_u16(response.status).map_err(|error| {
             anyhow!(
@@ -288,7 +301,14 @@ fn invoke_storage_component(
     })
 }
 
+// The `ai-models-registry` kv-partition table is owned by `guest-openai`, which
+// reads/writes its `ModelInfo` with `#[serde(rename_all = "camelCase")]`. The
+// broker writes the same table directly on upload, so it MUST use the identical
+// casing — otherwise `guest-openai`'s `list_models` fails to deserialize the
+// row (missing required `vramRequiredMb`) and silently drops it, so uploaded
+// models never surface in `GET /v1/models`.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RegistryModelInfo<'a> {
     alias: &'a str,
     engine: &'a str,
@@ -317,9 +337,16 @@ impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
         };
         let value = serde_json::to_vec(&info)
             .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
+        tracing::info!(
+            alias = %event.alias,
+            engine = %event.engine,
+            model_path = %event.model_path,
+            "publishing uploaded model to registry `{AI_MODELS_REGISTRY_TABLE}`"
+        );
         self.core_store
             .kv_partition_set(AI_MODELS_REGISTRY_TABLE, &event.alias, &value)
             .map_err(|error| format!("failed to publish model upload event: {error:#}"))?;
+        tracing::info!(alias = %event.alias, "model registry entry written; scheduling S3 flush");
         self.flush_uploaded_model_to_s3(&event.alias);
         Ok(())
     }
@@ -330,12 +357,21 @@ impl StorageComponentState {
         #[cfg(feature = "s3-persistence")]
         {
             let Some(backend) = self.s3_backend.clone() else {
+                tracing::warn!(
+                    alias = %_alias,
+                    "S3 model flush skipped: no S3 backend configured (TACHYON_S3_* unset or backend init failed)"
+                );
                 return;
             };
             let Some(model_dir) = uploaded_model_dir(&self.root_dir, _alias) else {
                 tracing::warn!(alias = %_alias, "skipping S3 model flush for invalid upload alias");
                 return;
             };
+            tracing::info!(
+                alias = %_alias,
+                model_dir = %model_dir.display(),
+                "starting S3 flush of uploaded model"
+            );
             let alias = _alias.to_owned();
             let core_store_path = self.core_store_path.clone();
             tokio::spawn(async move {
@@ -495,5 +531,63 @@ mod tests {
         assert!(uploaded_model_dir(root, "../llama").is_none());
         assert!(uploaded_model_dir(root, "models/llama").is_none());
         assert!(uploaded_model_dir(root, r"models\llama").is_none());
+    }
+}
+
+#[cfg(test)]
+mod registry_casing_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    /// Mirror of `guest-openai`'s `ModelInfo` reader, which owns the
+    /// `ai-models-registry` table and reads rows with `#[serde(rename_all =
+    /// "camelCase")]` and a *required* `vram_required_mb`. If the host writer
+    /// drifts back to snake_case, deserialization fails here exactly as it does
+    /// in `guest-openai::list_models` (which silently `filter_map(...ok())`s the
+    /// miss), making uploaded models invisible in `GET /v1/models`.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[allow(dead_code)]
+    struct GuestOpenAiModelInfoReader {
+        alias: String,
+        engine: String,
+        vram_required_mb: u64,
+        status: String,
+    }
+
+    #[test]
+    fn registry_entry_is_readable_by_guest_openai_camelcase_reader() {
+        let info = RegistryModelInfo {
+            alias: "tinyllama",
+            engine: "gguf",
+            vram_required_mb: 0,
+            status: "available",
+            model_path: "/data/tachyon_data/models/tinyllama",
+        };
+        let bytes = serde_json::to_vec(&info).expect("serialize registry entry");
+
+        // Reproduces `guest-openai::list_models`, which does
+        // `serde_json::from_slice::<ModelInfo>(&v)` and drops any miss.
+        let parsed: GuestOpenAiModelInfoReader = serde_json::from_slice(&bytes)
+            .expect("guest-openai must be able to read host-written registry rows");
+        assert_eq!(parsed.alias, "tinyllama");
+        assert_eq!(parsed.engine, "gguf");
+        assert_eq!(parsed.vram_required_mb, 0);
+        assert_eq!(parsed.status, "available");
+
+        // Lock the on-the-wire key casing too, so the contract is explicit.
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            value.get("vramRequiredMb").is_some(),
+            "registry entry must serialize camelCase `vramRequiredMb`"
+        );
+        assert!(
+            value.get("modelPath").is_some(),
+            "registry entry must serialize camelCase `modelPath`"
+        );
+        assert!(
+            value.get("vram_required_mb").is_none(),
+            "registry entry must not emit snake_case keys"
+        );
     }
 }
