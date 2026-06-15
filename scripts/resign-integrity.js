@@ -55,6 +55,11 @@ function isExampleRoute(route) {
     const p = route.path || '';
     const name = route.name || '';
     const targets = (route.targets || []).map(t => t.module || '');
+    // `guest-openai` is the OpenAI-compatible API surface (/v1/models,
+    // /v1/chat/completions, /internal/guest-openai/*), not a demo. Keep it
+    // sealed even when stripping the other example guest-* routes, otherwise
+    // `GET /v1/models` 404s and uploaded models never appear in the list.
+    if (targets.some(m => m === 'guest-openai')) return false;
     return p.startsWith('/api/guest-')
         || name.startsWith('guest-')
         || targets.some(m => m.startsWith('guest-'));
