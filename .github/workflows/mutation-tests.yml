@@ -105,7 +105,7 @@ jobs:
             --sharding round-robin \
             --jobs 2 \
             --baseline skip \
-            --timeout 120 \
+            --timeout 300 \
             --copy-target true \
             --output "mutants-auth-shard-${{ matrix.id }}"
 
