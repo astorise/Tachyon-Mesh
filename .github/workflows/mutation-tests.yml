@@ -55,22 +55,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # cargo-mutants uses 0-indexed shards: --shard k/n requires k < n.
         include:
-          - shard: 1/8
+          - shard: 0/8
             id: 1
-          - shard: 2/8
+          - shard: 1/8
             id: 2
-          - shard: 3/8
+          - shard: 2/8
             id: 3
-          - shard: 4/8
+          - shard: 3/8
             id: 4
-          - shard: 5/8
+          - shard: 4/8
             id: 5
-          - shard: 6/8
+          - shard: 5/8
             id: 6
-          - shard: 7/8
+          - shard: 6/8
             id: 7
-          - shard: 8/8
+          - shard: 7/8
             id: 8
     steps:
       - uses: actions/checkout@v6
