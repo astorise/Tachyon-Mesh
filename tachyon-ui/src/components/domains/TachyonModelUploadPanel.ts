@@ -192,6 +192,12 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     this.resultMessage = t("ai.upload.success").replace("{asset}", assetRef);
     this.render();
     this.bindEvents();
+    // Notify the parent AI panel so it re-fetches `/v1/models` and the freshly
+    // uploaded model shows up without requiring a manual refresh. `composed` lets
+    // the event escape this panel's shadow root and reach the parent's host.
+    this.dispatchEvent(
+      new CustomEvent("tachyon:model-uploaded", { bubbles: true, composed: true }),
+    );
   }
 
   private onError(error: unknown): void {
