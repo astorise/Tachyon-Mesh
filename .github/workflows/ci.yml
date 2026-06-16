@@ -692,7 +692,28 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
+      # GHCR intermittently returns "error writing layer blob: not_found" when
+      # the matrix variants push their shared base-layer blobs to the same repo
+      # concurrently (blob cross-mount race). The build itself is cached, so the
+      # first attempt is left as continue-on-error and a single retry rides out
+      # the transient push failure (re-pushing from the warm buildkit/gha cache).
       - name: Build and publish Docker image
+        id: build
+        uses: docker/build-push-action@v7.2.0
+        continue-on-error: true
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CARGO_FEATURES=${{ matrix.cargo_features }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+
+      - name: Build and publish Docker image (retry)
+        if: steps.build.outcome == 'failure'
         uses: docker/build-push-action@v7.2.0
         with:
           context: ${{ matrix.context }}
