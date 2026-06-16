@@ -28,9 +28,14 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
   private models: AvailableAiModel[] = [];
   private modelLoadModes: Record<string, ModelLoadMode> = {};
   private readonly onLanguageChanged = () => { this.render(); this.bindEvents(); };
+  // The child `<tachyon-model-upload-panel>` fires this (bubbling/composed) on a
+  // successful upload; re-fetch the model list so the new model appears without a
+  // manual refresh.
+  private readonly onModelUploaded = () => { void this.refreshAiState(); };
 
   async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
+    this.addEventListener("tachyon:model-uploaded", this.onModelUploaded);
     this.render();
     this.bindEvents();
     this.animateGlitchEntrance();
@@ -39,18 +44,27 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
 
   disconnectedCallback(): void {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
+    this.removeEventListener("tachyon:model-uploaded", this.onModelUploaded);
   }
 
   private async refreshAiState(): Promise<void> {
-    const [metrics, models] = await Promise.all([
-      invoke<RuntimeMetrics>("get_metrics").catch(() => null),
-      invoke<AvailableAiModel[]>("list_available_models").catch(() => []),
-    ]);
+    const metrics = await invoke<RuntimeMetrics>("get_metrics").catch(() => null);
+    // Unlike metrics (best-effort), a failed model-list fetch is surfaced: silently
+    // swallowing it (`catch(() => [])`) is exactly what made an uploaded-but-
+    // unlistable model look like "nothing happened". Keep the previous list on error.
+    let modelsError: string | null = null;
+    try {
+      this.models = await invoke<AvailableAiModel[]>("list_available_models");
+    } catch (error) {
+      modelsError = error instanceof Error ? error.message : String(error);
+    }
     this.metrics = metrics;
-    this.models = models;
     this.reconcileModelLoadModes();
     this.render();
     this.bindEvents();
+    if (modelsError) {
+      this.showFeedback("error", t("ai.model.loadError").replace("{message}", modelsError));
+    }
   }
 
   private render(): void {
