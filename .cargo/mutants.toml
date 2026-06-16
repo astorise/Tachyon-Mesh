@@ -9,4 +9,11 @@ exclude_re = [
     # feature is enabled. The weekly auth mutation run exercises default
     # features, so replacing this function with `()` is behaviorally equivalent.
     "replace flush_auth_state with \\(\\)",
+    # In `instantiate_authn` the preopen permissions are built from disjoint
+    # single-bit `wasmtime_wasi` flags (`FilePerms::READ` = 0b1, `WRITE` = 0b10;
+    # `DirPerms::READ` = 0b1, `MUTATE` = 0b10). For non-overlapping bits `a | b`
+    # and `a ^ b` yield the identical value, so swapping `|` for `^` is an
+    # equivalent mutation that no test can distinguish. The `| -> &` variant
+    # (which clears the bits) stays in scope and is caught by the suite.
+    "replace \\| with \\^ in AuthManager::instantiate_authn",
 ]
