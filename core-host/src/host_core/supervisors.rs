@@ -33,8 +33,20 @@ pub(crate) const MANIFEST_FILE_WATCHER_DEBOUNCE: Duration = Duration::from_milli
 /// (a `/admin/manifest` update *writes* it), and on some filesystems every read —
 /// including the periodic S3 backup flush reading `integrity.lock` — emits one;
 /// reacting to those re-armed the watcher into an infinite reload loop.
+///
+/// The one access event that *is* a mutation signal is `Close(Write)` (inotify's
+/// `IN_CLOSE_WRITE`): a writer that finished an in-place write. We keep it so an
+/// in-place edit still triggers a reload even if the earlier `Modify` fired while
+/// the file was still incomplete. This cannot re-arm the loop because the only
+/// reader in play (the S3 backup flush) opens the manifest read-only and never
+/// emits `Close(Write)`.
 fn watcher_event_is_ignorable(kind: &notify::EventKind) -> bool {
-    matches!(kind, notify::EventKind::Access(_))
+    use notify::event::{AccessKind, AccessMode};
+    match kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => false,
+        notify::EventKind::Access(_) => true,
+        _ => false,
+    }
 }
 
 /// Spawn a file watcher that triggers a hot reload whenever the integrity manifest is
@@ -940,17 +952,35 @@ mod tests {
     fn watcher_ignores_access_events_but_not_writes() {
         use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
         use notify::EventKind;
-        // The exact event the WSL2/k3s `local-path` PVC emits on every read of the
-        // manifest (e.g. the S3 backup flush) — must NOT trigger a reload.
-        assert!(watcher_event_is_ignorable(&EventKind::Access(AccessKind::Open(
-            AccessMode::Any
-        ))));
-        assert!(watcher_event_is_ignorable(&EventKind::Access(AccessKind::Read)));
-        assert!(watcher_event_is_ignorable(&EventKind::Access(AccessKind::Any)));
+        // Non-mutating access — the events the WSL2/k3s `local-path` PVC emits on
+        // every read of the manifest (e.g. the S3 backup flush) — must NOT reload.
+        assert!(watcher_event_is_ignorable(&EventKind::Access(
+            AccessKind::Open(AccessMode::Any)
+        )));
+        assert!(watcher_event_is_ignorable(&EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(watcher_event_is_ignorable(&EventKind::Access(
+            AccessKind::Any
+        )));
+        assert!(watcher_event_is_ignorable(&EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+        // `Close(Write)` (IN_CLOSE_WRITE) is a completed in-place write — it MUST
+        // still trigger a reload (a reader never emits it, so no loop risk).
+        assert!(!watcher_event_is_ignorable(&EventKind::Access(
+            AccessKind::Close(AccessMode::Write)
+        )));
         // Content-changing events (a real `/admin/manifest` write/rename) still do.
-        assert!(!watcher_event_is_ignorable(&EventKind::Modify(ModifyKind::Any)));
-        assert!(!watcher_event_is_ignorable(&EventKind::Create(CreateKind::Any)));
-        assert!(!watcher_event_is_ignorable(&EventKind::Remove(RemoveKind::Any)));
+        assert!(!watcher_event_is_ignorable(&EventKind::Modify(
+            ModifyKind::Any
+        )));
+        assert!(!watcher_event_is_ignorable(&EventKind::Create(
+            CreateKind::Any
+        )));
+        assert!(!watcher_event_is_ignorable(&EventKind::Remove(
+            RemoveKind::Any
+        )));
     }
 
     fn overlay_route(env: &[(&str, &str)]) -> IntegrityRoute {
