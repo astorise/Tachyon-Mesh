@@ -28,6 +28,15 @@ pub(crate) fn spawn_reload_watcher(_state: AppState) {}
 
 pub(crate) const MANIFEST_FILE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// Whether a filesystem event on the manifest directory should be ignored by the
+/// hot-reload watcher. Pure access/open events do not change the file's contents
+/// (a `/admin/manifest` update *writes* it), and on some filesystems every read —
+/// including the periodic S3 backup flush reading `integrity.lock` — emits one;
+/// reacting to those re-armed the watcher into an infinite reload loop.
+fn watcher_event_is_ignorable(kind: &notify::EventKind) -> bool {
+    matches!(kind, notify::EventKind::Access(_))
+}
+
 /// Spawn a file watcher that triggers a hot reload whenever the integrity manifest is
 /// modified or atomically replaced on disk. Many editors and CI/CD tools save the file
 /// by writing a temp file and renaming it over the original, so the watcher is set up
@@ -60,6 +69,18 @@ pub(crate) fn spawn_manifest_file_watcher(state: AppState) {
     let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         match res {
             Ok(event) => {
+                // Ignore pure access/open events. On some filesystems (notably the
+                // WSL2/k3s `local-path` PVC backing `/data`) every *read* of the
+                // manifest emits an `Access(Open)` event — including the periodic
+                // S3 backup flush reading `integrity.lock` to upload it. Treating
+                // those as changes triggered a hot reload that re-read the file,
+                // which emitted another access event, sustaining an infinite
+                // reload loop. Only react to events that can alter the contents
+                // (Create/Modify/Remove/rename); a real `/admin/manifest` update
+                // writes the file, so legitimate hot reloads are unaffected.
+                if watcher_event_is_ignorable(&event.kind) {
+                    return;
+                }
                 let touches_manifest = event
                     .paths
                     .iter()
@@ -67,9 +88,6 @@ pub(crate) fn spawn_manifest_file_watcher(state: AppState) {
                 if !touches_manifest {
                     return;
                 }
-                // DEBUG: surface what is rewriting the manifest. A steady stream
-                // of these (with the same path) means something is touching
-                // integrity.lock in a loop and churning hot reloads.
                 tracing::info!(
                     event_kind = ?event.kind,
                     paths = ?event.paths,
@@ -917,6 +935,23 @@ fn cron_field_matches(field: &str, value: u32) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn watcher_ignores_access_events_but_not_writes() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
+        use notify::EventKind;
+        // The exact event the WSL2/k3s `local-path` PVC emits on every read of the
+        // manifest (e.g. the S3 backup flush) — must NOT trigger a reload.
+        assert!(watcher_event_is_ignorable(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(watcher_event_is_ignorable(&EventKind::Access(AccessKind::Read)));
+        assert!(watcher_event_is_ignorable(&EventKind::Access(AccessKind::Any)));
+        // Content-changing events (a real `/admin/manifest` write/rename) still do.
+        assert!(!watcher_event_is_ignorable(&EventKind::Modify(ModifyKind::Any)));
+        assert!(!watcher_event_is_ignorable(&EventKind::Create(CreateKind::Any)));
+        assert!(!watcher_event_is_ignorable(&EventKind::Remove(RemoveKind::Any)));
+    }
 
     fn overlay_route(env: &[(&str, &str)]) -> IntegrityRoute {
         IntegrityRoute {
