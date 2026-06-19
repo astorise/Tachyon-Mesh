@@ -124,13 +124,13 @@ interface parallel-execution {
     /// single-device execution plan.
     variant topology-error {
         /// Requested device count exceeds what is available on the target.
-        insufficient-device-count: tuple<u32, u32>,
+        insufficient-device-count(tuple<u32, u32>),
         /// The interconnect between requested devices does not meet the
         /// strategy's bandwidth/latency requirement.
         incompatible-interconnect,
         /// A computed per-shard VRAM requirement exceeds a target device's
         /// available VRAM. Payload is (required-bytes, available-bytes).
-        vram-per-shard-exceeded: tuple<u64, u64>,
+        vram-per-shard-exceeded(tuple<u64, u64>),
     }
 
     /// Validates that a requested plan can be satisfied by the cluster's
