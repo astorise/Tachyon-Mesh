@@ -27,17 +27,17 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@v3
 
       # Shared GHA cache scope with publish-docker-images and the other E2E
       # workflows: the FaaS/system wasm + legacy-mock layers are
       # feature-independent (the cargo-feature ARG comes later in the
       # Dockerfile), so a cache hit here skips ~15 min of compilation.
       - name: Build local Docker image
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@v6
         with:
           context: .
           tags: tachyon-mesh:local
