@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -37,7 +37,7 @@ jobs:
         run: tar -czf wasm-guests.tar.gz target/wasm32-wasip1/release/*.wasm target/wasm32-wasip2/release/*.wasm
 
       - name: Upload guest artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: wasm-guests-${{ github.sha }}
           path: wasm-guests.tar.gz
@@ -74,7 +74,7 @@ jobs:
           - shard: 7/8
             id: 8
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -89,7 +89,7 @@ jobs:
           tool: cargo-mutants@${{ env.CARGO_MUTANTS_VERSION }}
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           name: wasm-guests-${{ github.sha }}
 
@@ -111,7 +111,7 @@ jobs:
 
       - name: Upload mutation output
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: mutants-auth-shard-${{ matrix.id }}-${{ github.sha }}
           path: mutants-auth-shard-${{ matrix.id }}
