@@ -16,7 +16,7 @@ jobs:
       CARGO_TERM_COLOR: always
       MIRIFLAGS: "-Zmiri-disable-isolation"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: Swatinem/rust-cache@v2
         with:
