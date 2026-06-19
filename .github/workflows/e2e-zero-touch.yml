@@ -60,13 +60,13 @@ jobs:
         run: node scripts/e2e/seal-zero-touch.js "$ISSUER"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@v4
 
       # Dockerfile.e2e builds only core-host + Rust wasm (no tauri-ui / polyglot
       # guests) — far smaller and faster to build and to import into k3d.
       # GHA cache scope persists across runs of this workflow.
       - name: Build slim image (embeds the sealed zero-touch config + cert-manager)
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.e2e
