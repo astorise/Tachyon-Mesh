@@ -147,6 +147,23 @@ pub fn validate_parallel_topology(
         });
     }
 
+    // `required > available` only catches a too-small cluster; a plan can
+    // also name device IDs that simply do not exist in `topology` (stale or
+    // typo'd IDs), which must be rejected the same way rather than silently
+    // admitted and only discovered when the runtime tries to dispatch onto a
+    // nonexistent device.
+    let known = plan
+        .device_ids
+        .iter()
+        .filter(|id| topology.device(**id).is_some())
+        .count() as u32;
+    if known < required {
+        return Err(TopologyError::InsufficientDeviceCount {
+            required,
+            available: known,
+        });
+    }
+
     if plan.strategy == ParallelStrategy::TensorParallel
         && topology.interconnect > TENSOR_PARALLEL_MIN_INTERCONNECT
     {
@@ -201,10 +218,15 @@ pub fn validate_plan_shape(plan: &ParallelExecutionPlan) -> Result<(), String> {
                 ));
             }
             let mut previous_end: Option<u32> = None;
-            for &(start, end) in &plan.stage_layer_ranges {
+            for (index, &(start, end)) in plan.stage_layer_ranges.iter().enumerate() {
                 if start > end {
                     return Err(format!(
                         "pipeline-parallel stage range ({start}, {end}) has start > end"
+                    ));
+                }
+                if index == 0 && start != 0 {
+                    return Err(format!(
+                        "pipeline-parallel's first stage must start at layer 0, got {start}"
                     ));
                 }
                 if let Some(prev) = previous_end {
@@ -289,6 +311,22 @@ mod tests {
     }
 
     #[test]
+    fn unknown_device_id_is_rejected_even_with_enough_total_devices() {
+        // Topology has 2 devices (ids 0, 1), but the plan names ids 2 and 3:
+        // a stale/typo'd device id must be rejected like an undersized
+        // cluster, not silently admitted because the *count* matches.
+        let p = plan(ParallelStrategy::TensorParallel, vec![2, 3]);
+        let t = topology(2, InterconnectClass::HighBandwidth, 0);
+        assert_eq!(
+            validate_parallel_topology(&p, &t),
+            Err(TopologyError::InsufficientDeviceCount {
+                required: 2,
+                available: 0
+            })
+        );
+    }
+
+    #[test]
     fn incompatible_interconnect_is_rejected_for_tensor_parallel() {
         let p = plan(ParallelStrategy::TensorParallel, vec![0, 1]);
         let t = topology(2, InterconnectClass::CrossNode, 0);
@@ -341,6 +379,14 @@ mod tests {
     fn shape_check_rejects_non_contiguous_pipeline_stage_ranges() {
         let mut p = plan(ParallelStrategy::PipelineParallel, vec![0, 1]);
         p.stage_layer_ranges = vec![(0, 5), (7, 10)];
+        p.pipeline_depth = 1;
+        assert!(validate_plan_shape(&p).is_err());
+    }
+
+    #[test]
+    fn shape_check_rejects_pipeline_first_stage_not_starting_at_zero() {
+        let mut p = plan(ParallelStrategy::PipelineParallel, vec![0, 1]);
+        p.stage_layer_ranges = vec![(1, 5), (6, 10)];
         p.pipeline_depth = 1;
         assert!(validate_plan_shape(&p).is_err());
     }

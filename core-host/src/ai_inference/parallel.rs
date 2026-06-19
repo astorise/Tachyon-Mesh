@@ -106,10 +106,17 @@ pub(crate) struct ColumnParallelLinear {
 impl ColumnParallelLinear {
     /// Splits `weight` (`[out_features, in_features]`) into `devices.len()`
     /// equal column shards. `out_features` must be evenly divisible by
-    /// `devices.len()`.
+    /// `devices.len()`; an uneven split would silently drop the remainder
+    /// output features rather than computing them on any shard, so it is
+    /// rejected instead.
     pub(crate) fn shard(weight: &Tensor, devices: &[Device]) -> CandleResult<Self> {
         let n = devices.len();
         let out_features = weight.dim(0)?;
+        if out_features % n != 0 {
+            candle_core::bail!(
+                "column-parallel shard requires out_features ({out_features}) to be evenly divisible by the device count ({n})"
+            );
+        }
         let shard_size = out_features / n;
         let mut shards = Vec::with_capacity(n);
         for (i, device) in devices.iter().enumerate() {
@@ -149,10 +156,18 @@ pub(crate) struct RowParallelLinear {
 
 impl RowParallelLinear {
     /// Splits `weight` (`[out_features, in_features]`) into `devices.len()`
-    /// equal row (input-feature) shards.
+    /// equal row (input-feature) shards. `in_features` must be evenly
+    /// divisible by `devices.len()`; an uneven split would silently drop the
+    /// remainder input features from every shard's partial sum, so it is
+    /// rejected instead.
     pub(crate) fn shard(weight: &Tensor, devices: &[Device]) -> CandleResult<Self> {
         let n = devices.len();
         let in_features = weight.dim(1)?;
+        if in_features % n != 0 {
+            candle_core::bail!(
+                "row-parallel shard requires in_features ({in_features}) to be evenly divisible by the device count ({n})"
+            );
+        }
         let shard_size = in_features / n;
         let mut shards = Vec::with_capacity(n);
         for (i, device) in devices.iter().enumerate() {
@@ -194,10 +209,18 @@ impl RowParallelLinear {
 
 /// Splits a `[batch, features]` tensor into `devices.len()` equal column
 /// slices, one per device, for handoff from a `ColumnParallelLinear`'s
-/// gathered output into a following `RowParallelLinear`.
+/// gathered output into a following `RowParallelLinear`. `features` must be
+/// evenly divisible by `devices.len()`, matching the shard width
+/// `RowParallelLinear::shard` requires; an uneven split would silently drop
+/// the remainder activation features.
 pub(crate) fn split_for_row_parallel(x: &Tensor, devices: &[Device]) -> CandleResult<Vec<Tensor>> {
     let n = devices.len();
     let features = x.dim(1)?;
+    if features % n != 0 {
+        candle_core::bail!(
+            "split-for-row-parallel requires features ({features}) to be evenly divisible by the device count ({n})"
+        );
+    }
     let shard_size = features / n;
     let mut parts = Vec::with_capacity(n);
     for (i, device) in devices.iter().enumerate() {
@@ -255,11 +278,14 @@ impl StageTransport for InProcessTransport {
     }
 }
 
+/// A pipeline's ordered stages, each paired with the layer range it executes.
+pub(crate) type PipelineStages = [(Box<dyn PipelineStageExecutor>, (u32, u32))];
+
 /// Runs an ordered sequence of pipeline stages against a single input,
 /// handing the activation off between stages via `transports[i]` after stage
 /// `i` runs. `transports.len()` must equal `stages.len() - 1`.
 pub(crate) fn run_pipeline(
-    stages: &[(Box<dyn PipelineStageExecutor>, (u32, u32))],
+    stages: &PipelineStages,
     transports: &[Box<dyn StageTransport>],
     input: &Tensor,
 ) -> CandleResult<Tensor> {
@@ -321,7 +347,7 @@ impl PipelineDepthGate {
 /// admission/ordering logic without yet producing real wall-clock overlap —
 /// that requires one execution thread per stage, left as follow-up.
 pub(crate) fn run_pipeline_microbatched(
-    stages: &[(Box<dyn PipelineStageExecutor>, (u32, u32))],
+    stages: &PipelineStages,
     transports: &[Box<dyn StageTransport>],
     micro_batches: Vec<Tensor>,
     depth_gate: &mut PipelineDepthGate,
@@ -705,6 +731,7 @@ impl ExpertParallelMlp {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -762,6 +789,28 @@ mod tests {
         for (a, b) in reference.iter().zip(gathered.iter()) {
             assert!((a - b).abs() < 1e-5, "{a} != {b}");
         }
+    }
+
+    #[test]
+    fn column_parallel_shard_rejects_uneven_out_features() {
+        let w = weight(5, 4, 9); // out_features=5 does not divide evenly by 2 devices.
+        let devices = vec![cpu(), cpu()];
+        assert!(ColumnParallelLinear::shard(&w, &devices).is_err());
+    }
+
+    #[test]
+    fn row_parallel_shard_rejects_uneven_in_features() {
+        let w = weight(4, 5, 10); // in_features=5 does not divide evenly by 2 devices.
+        let devices = vec![cpu(), cpu()];
+        assert!(RowParallelLinear::shard(&w, &devices).is_err());
+    }
+
+    #[test]
+    fn split_for_row_parallel_rejects_uneven_features() {
+        let device = cpu();
+        let x = Tensor::from_vec(vec![1.0f32; 5], (1, 5), &device).unwrap();
+        let devices = vec![cpu(), cpu()];
+        assert!(split_for_row_parallel(&x, &devices).is_err());
     }
 
     #[test]
@@ -959,7 +1008,7 @@ mod tests {
 
     #[test]
     fn detect_expert_count_finds_the_highest_expert_id_for_a_moe_layer() {
-        let names = vec![
+        let names = [
             "model.layers.0.block_sparse_moe.gate.weight",
             "model.layers.0.block_sparse_moe.experts.0.w1.weight",
             "model.layers.0.block_sparse_moe.experts.0.w2.weight",
@@ -972,7 +1021,7 @@ mod tests {
 
     #[test]
     fn detect_expert_count_returns_none_for_a_dense_layer() {
-        let names = vec![
+        let names = [
             "model.layers.0.mlp.gate_proj.weight",
             "model.layers.0.mlp.up_proj.weight",
             "model.layers.0.mlp.down_proj.weight",

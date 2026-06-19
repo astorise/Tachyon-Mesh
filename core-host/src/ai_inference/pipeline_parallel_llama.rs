@@ -155,18 +155,41 @@ impl PipelineParallelLlama {
     /// exactly once, and have one entry per `devices[i]` — the same shape
     /// `parallel_topology::validate_plan_shape` already enforces for a
     /// pipeline-parallel plan at `apply-model-deployment` time.
+    ///
+    /// Builds one `VarBuilder` per stage, each bound to that stage's own
+    /// `devices[i]`, so every weight a stage owns (embedding, attention,
+    /// norms, MLP, LM head) materialises on its target device — not just the
+    /// MLP, and not on whatever device a single shared builder happened to
+    /// be constructed with.
     pub(crate) fn load(
-        vb: VarBuilder,
+        weight_paths: &[std::path::PathBuf],
+        dtype: DType,
         cfg: &Config,
         stage_layer_ranges: &[(u32, u32)],
         devices: &[Device],
     ) -> CandleResult<Self> {
+        // `parallel_topology::validate_plan_shape` checks internal shape
+        // (contiguity, first stage starting at 0) without knowing the
+        // model's actual layer count; the final stage's end must also reach
+        // `cfg.num_hidden_layers - 1`, or transformer layers would silently
+        // go unexecuted.
+        if let Some(&(_, last_end)) = stage_layer_ranges.last() {
+            let last_layer = cfg.num_hidden_layers as u32 - 1;
+            if last_end != last_layer {
+                candle_core::bail!(
+                    "pipeline stage ranges must cover up to the model's last layer ({last_layer}), but the last stage ends at {last_end}"
+                );
+            }
+        }
+
         let n = stage_layer_ranges.len();
         let stages = stage_layer_ranges
             .iter()
             .zip(devices.iter())
             .enumerate()
             .map(|(i, (&(start, end), device))| {
+                let vb =
+                    unsafe { VarBuilder::from_mmaped_safetensors(weight_paths, dtype, device) }?;
                 PipelineStage::load(&vb, cfg, start, end, device, i == 0, i == n - 1)
             })
             .collect::<CandleResult<Vec<_>>>()?;
@@ -196,6 +219,7 @@ impl PipelineParallelLlama {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::ai_inference::candle_llm_runtime::write_tachyon_tiny_fixture;
@@ -215,15 +239,8 @@ mod tests {
         stage_ranges: &[(u32, u32)],
     ) -> PipelineParallelLlama {
         let devices = vec![Device::Cpu; stage_ranges.len()];
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[root.join("model.safetensors")],
-                DType::F32,
-                &Device::Cpu,
-            )
-            .unwrap()
-        };
-        PipelineParallelLlama::load(vb, cfg, stage_ranges, &devices).unwrap()
+        let weight_paths = vec![root.join("model.safetensors")];
+        PipelineParallelLlama::load(&weight_paths, DType::F32, cfg, stage_ranges, &devices).unwrap()
     }
 
     #[test]

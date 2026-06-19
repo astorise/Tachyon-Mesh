@@ -389,6 +389,7 @@ impl TensorParallelLlama {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::ai_inference::candle_llm_runtime::write_tachyon_tiny_fixture;
