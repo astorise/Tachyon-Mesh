@@ -1,15 +1,16 @@
 # Implementation Tasks
 
-- [ ] **Task 1: WIT contract**
+- [x] **Task 1: WIT contract**
   - Add `parallel-strategy`, `parallel-execution-plan`, and `validate-parallel-topology` to `wit/ai/inference.wit` as defined in `design.md`.
-  - Regenerate host/guest bindings.
+  - Regenerate host/guest bindings. *(No-op: `wit/ai/inference.wit` is not currently consumed by any `wit_bindgen::generate!` call site in the tree — confirmed by grep — so there are no generated bindings to regenerate. This mirrors the rest of `inference.wit`, which is documented as unwired v1.2 scaffolding.)*
 
-- [ ] **Task 2: Topology discovery**
-  - Extend the existing hardware capability discovery (consumed by `hardware-capabilities`/`heterogeneous-accelerator-orchestration`) to report interconnect class (NVLink/PCIe/cross-node network) and per-GPU free VRAM, needed to validate a `parallel-execution-plan`.
+- [x] **Task 2: Topology discovery**
+  - Added `discover_cluster_topology()` in `core-host/src/ai_inference/parallel.rs`. Always reports CPU device 0; under the `nvfp4-cuda` feature it probes additional CUDA ordinals via `candle_core::Device::cuda_if_available` and stops at the first unavailable ordinal.
+  - **Caveat**: `candle-core`'s own `cuda` Cargo feature is not enabled by `nvfp4-cuda` in `core-host/Cargo.toml` (confirmed — `nvfp4-cuda = ["ai-inference"]` only), so `cuda_is_available()` is always `false` in the current build and this function reports a single CPU device today. Per-GPU free VRAM is reported as `0` (unknown) on every device, since neither `candle_core` nor this crate bind NVML/`cudaMemGetInfo`. Real multi-GPU enumeration and VRAM telemetry depend on the CUDA backend wiring tracked by `2026-06-19-gpu-accelerated-inference-execution`; interconnect class (NVLink vs. PCIe) detection is not implemented and conservatively defaults to `Pcie` whenever more than one device is discovered.
 
 - [ ] **Task 3: Topology validation**
-  - Implement `validate-parallel-topology` in `system-faas-model-broker`, wired into the existing `apply-model-deployment` path from `config-ai.wit`.
-  - Return typed `TopologyError` variants (insufficient GPU count, incompatible interconnect, per-shard VRAM exceeded) instead of silently downgrading to single-GPU.
+  - `validate_parallel_topology` is implemented and unit-tested in `core-host/src/ai_inference/parallel.rs` (the real enforcement logic with typed `TopologyError` variants).
+  - **Blocked/deferred, documented finding**: there is no existing host-side call path that invokes a guest's `apply-model-deployment` export — grepping `core-host` for `model_deployment`/`ModelDeployment`/`hardware_strategy` returns zero results. The only code that implements `apply-model-deployment` today is `systems/system-faas-config-api/src/lib.rs`'s `pub fn apply_model_deployment<T>(_deployment: T) -> Result<(), String> { Ok(()) }`, which is a generic, type-erased stub identical in shape to ~30 other unwired config-domain functions in that file (none of them call the real `wit_bindgen`-generated types from `ai_contract`, which is marked `#[allow(dead_code)]`). Additionally, `config-ai.wit`'s `hardware-strategy` record (`multi-gpu: bool`, `distribution-mode: gpu-distribution`) does not carry the device-ids/VRAM/layer-range fields `validate-parallel-topology` needs, so wiring this "for real" requires either (a) extending `config-ai.wit` to carry a `parallel-execution-plan`-shaped payload, or (b) adding a host-side deployment-admission path in `core-host` that doesn't exist yet. Recommend splitting this into its own follow-up task/change once the deployment-admission call path itself is built, rather than special-casing one of ~30 identical stubs in `system-faas-config-api` with logic it cannot actually exercise end-to-end.
 
 - [ ] **Task 4: Tensor-parallel execution**
   - Implement column/row-parallel weight sharding for attention and MLP blocks in the Candle execution path.

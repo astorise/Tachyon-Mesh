@@ -4,6 +4,8 @@ mod candle_llm_runtime;
 mod candle_onnx_backend;
 #[path = "ai_inference/modelopt_nvfp4.rs"]
 mod modelopt_nvfp4;
+#[path = "ai_inference/parallel.rs"]
+pub(crate) mod parallel;
 #[path = "ai_inference/vram_manager.rs"]
 pub(crate) mod vram_manager;
 
