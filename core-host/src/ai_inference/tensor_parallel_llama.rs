@@ -293,7 +293,13 @@ impl TensorParallelMlp {
     }
 }
 
-struct TensorParallelBlock {
+/// A single tensor-parallel transformer block. Also reused, unmodified, as
+/// the per-stage local unit of work for pipeline parallelism
+/// (`pipeline_parallel_llama.rs`): a pipeline stage is just a contiguous run
+/// of these blocks loaded with a single-device `devices` slice (which
+/// degenerates `TensorParallelMlp`'s sharding to the dense case), with stage
+/// boundaries handled by the caller via `PipelineStageExecutor`/`StageTransport`.
+pub(crate) struct TensorParallelBlock {
     rms_1: RmsNorm,
     attn: ReplicatedAttention,
     rms_2: RmsNorm,
@@ -301,7 +307,7 @@ struct TensorParallelBlock {
 }
 
 impl TensorParallelBlock {
-    fn load(vb: VarBuilder, cfg: &Config, devices: &[Device]) -> CandleResult<Self> {
+    pub(crate) fn load(vb: VarBuilder, cfg: &Config, devices: &[Device]) -> CandleResult<Self> {
         Ok(Self {
             attn: ReplicatedAttention::load(vb.pp("self_attn"), cfg)?,
             mlp: TensorParallelMlp::load(vb.pp("mlp"), cfg, devices)?,
@@ -314,7 +320,7 @@ impl TensorParallelBlock {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         x: &Tensor,
         index_pos: usize,

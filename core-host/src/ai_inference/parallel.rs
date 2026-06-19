@@ -284,6 +284,187 @@ impl PipelineDepthGate {
     }
 }
 
+/// Drives `micro_batches` through `stages`/`transports` with a GPipe-style
+/// schedule: at each tick, every microbatch currently admitted is advanced by
+/// exactly one stage, and new microbatches are admitted as soon as
+/// `depth_gate` has spare capacity. This is the schedule that lets stage `i`
+/// work on microbatch `k` while stage `i-1` works on microbatch `k+1` once
+/// each stage runs on its own device/thread; this reference scheduler still
+/// executes every tick in-process and sequentially, so it proves the
+/// admission/ordering logic without yet producing real wall-clock overlap —
+/// that requires one execution thread per stage, left as follow-up.
+pub(crate) fn run_pipeline_microbatched(
+    stages: &[(Box<dyn PipelineStageExecutor>, (u32, u32))],
+    transports: &[Box<dyn StageTransport>],
+    micro_batches: Vec<Tensor>,
+    depth_gate: &mut PipelineDepthGate,
+) -> CandleResult<Vec<Tensor>> {
+    let num_stages = stages.len();
+    let total = micro_batches.len();
+    let mut cursor = vec![0usize; total];
+    let mut activation: Vec<Option<Tensor>> = micro_batches.into_iter().map(Some).collect();
+    let mut outputs: Vec<Option<Tensor>> = vec![None; total];
+    let mut admitted = vec![false; total];
+    let mut next_to_admit = 0usize;
+    let mut finished = 0usize;
+
+    while finished < total {
+        while next_to_admit < total && depth_gate.try_admit() {
+            admitted[next_to_admit] = true;
+            next_to_admit += 1;
+        }
+
+        for k in 0..total {
+            if !admitted[k] || outputs[k].is_some() {
+                continue;
+            }
+            let stage_idx = cursor[k];
+            let input = activation[k]
+                .take()
+                .expect("an admitted, unfinished microbatch always has a pending activation");
+            let (stage, layer_range) = &stages[stage_idx];
+            let mut next = stage.run_stage(*layer_range, &input)?;
+            if let Some(transport) = transports.get(stage_idx) {
+                next = transport.send(next)?;
+            }
+            if stage_idx + 1 == num_stages {
+                outputs[k] = Some(next);
+                depth_gate.release();
+                finished += 1;
+            } else {
+                activation[k] = Some(next);
+                cursor[k] = stage_idx + 1;
+            }
+        }
+    }
+
+    Ok(outputs
+        .into_iter()
+        .map(|o| o.expect("every microbatch is finished by the time the loop above exits"))
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node activation transport over a plain TCP socket.
+//
+// `design.md` for this change describes reusing "the existing mesh transport
+// (gRPC/HTTP2 capability `grpc-http2`)" for this hand-off. That turned out to
+// be inaccurate: `grpc-http2` (see `openspec/specs/grpc-http2/spec.md`) is the
+// FaaS guest-request HTTP/gRPC router, not a node-to-node transport — there
+// was no existing mesh transport to reuse. `TcpStageTransport` below is a new,
+// minimal, genuinely networked transport built for this purpose: it performs
+// a real OS-socket round trip and satisfies the `StageTransport` contract
+// (push an activation, get back the tensor the peer produced), so pointing
+// `addr` at a remote host requires no further code changes to run cross-node.
+// Real gRPC/HTTP2 framing can replace the wire format later without changing
+// `StageTransport`'s contract or any caller.
+// ---------------------------------------------------------------------------
+
+fn io_err(err: std::io::Error) -> candle_core::Error {
+    candle_core::Error::Msg(format!("pipeline-stage TCP transport I/O error: {err}"))
+}
+
+/// Encodes a tensor as `[ndims:u32][dims:u32 * ndims][f32 data, little-endian]`.
+/// Activations are always moved through CPU memory for transport; each end
+/// handles its own device placement.
+fn encode_tensor(tensor: &Tensor) -> CandleResult<Vec<u8>> {
+    let dims = tensor.dims().to_vec();
+    let data = tensor.flatten_all()?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+    let mut bytes = Vec::with_capacity(4 + dims.len() * 4 + data.len() * 4);
+    bytes.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+    for dim in &dims {
+        bytes.extend_from_slice(&(*dim as u32).to_le_bytes());
+    }
+    for value in &data {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+/// Inverse of [`encode_tensor`]; rebuilds the tensor directly on `device`.
+fn decode_tensor(bytes: &[u8], device: &Device) -> CandleResult<Tensor> {
+    let read_u32 = |offset: usize| -> CandleResult<u32> {
+        bytes
+            .get(offset..offset + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| candle_core::Error::Msg("truncated tensor frame: missing header".into()))
+    };
+    let ndims = read_u32(0)? as usize;
+    let mut dims = Vec::with_capacity(ndims);
+    let mut offset = 4;
+    for _ in 0..ndims {
+        dims.push(read_u32(offset)? as usize);
+        offset += 4;
+    }
+    let elem_count: usize = dims.iter().product();
+    let data_bytes = bytes
+        .get(offset..offset + elem_count * 4)
+        .ok_or_else(|| candle_core::Error::Msg("truncated tensor frame: missing payload".into()))?;
+    let data: Vec<f32> = data_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    Tensor::from_vec(data, dims, device)
+}
+
+fn write_frame(stream: &mut std::net::TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    stream.write_all(bytes)?;
+    stream.flush()
+}
+
+fn read_frame(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut len_bytes = [0u8; 4];
+    stream.read_exact(&mut len_bytes)?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Client-side cross-node [`StageTransport`]: connects to `addr` (the node
+/// hosting the next pipeline stage), pushes the activation, and blocks for
+/// the response tensor the peer computed.
+pub(crate) struct TcpStageTransport {
+    addr: std::net::SocketAddr,
+}
+
+impl TcpStageTransport {
+    pub(crate) fn new(addr: std::net::SocketAddr) -> Self {
+        Self { addr }
+    }
+
+    /// Peer-side counterpart: accepts exactly one activation frame on
+    /// `listener`, runs `handle` (typically the next stage's
+    /// `PipelineStageExecutor::run_stage`) on the decoded tensor, and writes
+    /// the result back on the same connection.
+    pub(crate) fn serve_one(
+        listener: &std::net::TcpListener,
+        device: &Device,
+        handle: impl FnOnce(Tensor) -> CandleResult<Tensor>,
+    ) -> CandleResult<()> {
+        let (mut stream, _) = listener.accept().map_err(io_err)?;
+        let request = read_frame(&mut stream).map_err(io_err)?;
+        let input = decode_tensor(&request, device)?;
+        let output = handle(input)?;
+        let response = encode_tensor(&output)?;
+        write_frame(&mut stream, &response).map_err(io_err)
+    }
+}
+
+impl StageTransport for TcpStageTransport {
+    fn send(&self, activation: Tensor) -> CandleResult<Tensor> {
+        let device = activation.device().clone();
+        let bytes = encode_tensor(&activation)?;
+        let mut stream = std::net::TcpStream::connect(self.addr).map_err(io_err)?;
+        write_frame(&mut stream, &bytes).map_err(io_err)?;
+        let response = read_frame(&mut stream).map_err(io_err)?;
+        decode_tensor(&response, &device)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Expert parallelism: MoE expert placement and token routing.
 // ---------------------------------------------------------------------------
@@ -486,6 +667,58 @@ mod tests {
         assert_eq!(gate.in_flight(), 2);
         gate.release();
         assert!(gate.try_admit());
+    }
+
+    #[test]
+    fn microbatched_pipeline_matches_running_each_microbatch_through_run_pipeline_alone() {
+        let device = cpu();
+        let stage0 = ClosureStageExecutor(|_range: (u32, u32), t: &Tensor| t * 2.0);
+        let stage1 = ClosureStageExecutor(|_range: (u32, u32), t: &Tensor| t + 1.0);
+        let stages: Vec<(Box<dyn PipelineStageExecutor>, (u32, u32))> = vec![
+            (Box::new(stage0), (0, 1)),
+            (Box::new(stage1), (2, 3)),
+        ];
+        let transports: Vec<Box<dyn StageTransport>> =
+            vec![Box::new(InProcessTransport { next_device: device.clone() })];
+
+        let micro_batches: Vec<Tensor> = (0..5)
+            .map(|i| Tensor::from_vec(vec![i as f32], (1, 1), &device).unwrap())
+            .collect();
+        let expected: Vec<f32> = micro_batches
+            .iter()
+            .map(|x| ((x * 2.0).unwrap() + 1.0).unwrap().to_vec2::<f32>().unwrap()[0][0])
+            .collect();
+
+        // Depth 2: never more than 2 microbatches in flight, but every
+        // microbatch must still reach the same output as the single-batch
+        // `run_pipeline` reference.
+        let mut gate = PipelineDepthGate::new(2);
+        let outputs =
+            run_pipeline_microbatched(&stages, &transports, micro_batches, &mut gate).unwrap();
+        assert_eq!(gate.in_flight(), 0, "every microbatch must release its slot on completion");
+
+        let outputs: Vec<f32> =
+            outputs.iter().map(|t| t.to_vec2::<f32>().unwrap()[0][0]).collect();
+        assert_eq!(outputs, expected);
+    }
+
+    #[test]
+    fn tcp_stage_transport_round_trips_an_activation_over_a_real_socket() {
+        let device = cpu();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            TcpStageTransport::serve_one(&listener, &Device::Cpu, |t| t + 1.0).unwrap();
+        });
+
+        let transport = TcpStageTransport::new(addr);
+        let activation = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), &device).unwrap();
+        let response = transport.send(activation).unwrap();
+        server.join().unwrap();
+
+        let response: Vec<f32> = response.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(response, vec![2.0, 3.0, 4.0]);
     }
 
     // --- Expert parallelism ---------------------------------------------------

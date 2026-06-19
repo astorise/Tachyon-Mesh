@@ -17,8 +17,8 @@ config-ai.wit (existing)        ai-inference (this change)        candle (vendor
 - Synchronization uses a host-local all-reduce (NCCL if compiled with `nvfp4-cuda`/CUDA, otherwise a CPU-staged reduce for correctness on non-NCCL builds) — must not block the existing single-GPU path when `multi_gpu: false`.
 
 ## 3. Pipeline Parallelism (cross-node)
-- Reuses `ai-layer-wise-inference`'s per-layer mmap streaming as the local execution primitive for a *stage* (a contiguous layer range assigned to one node).
-- Activations between stage `N` and `N+1` cross the existing mesh transport (gRPC/HTTP2 capability `grpc-http2`), not a new wire protocol.
+- A *stage* (a contiguous layer range assigned to one node) executes a real transformer-block forward locally — see Task 5's notes in `tasks.md` for why this reuses Task 4's tensor-parallel block (degenerated to single-device/dense) rather than `ai-layer-wise-inference`'s per-layer streaming primitive, which turned out to be a placeholder forward pass, not real transformer math.
+- Activations between stage `N` and `N+1` cross a point-to-point transport implementing the `StageTransport` trait. **Correction**: `grpc-http2` is the FaaS guest-request HTTP/gRPC router, not a node-to-node mesh transport — there was nothing existing to reuse. Task 5 added a minimal real TCP-socket transport instead; gRPC/HTTP2 framing can replace its wire format later without changing the trait contract or callers.
 - A bounded number of micro-batches are kept in flight per stage (configurable pipeline depth) to avoid stage idling, mirroring GPipe-style scheduling, while staying within the existing host-RAM KV-cache paging budget from `vram-optimization`.
 
 ## 4. Expert Parallelism (MoE)
