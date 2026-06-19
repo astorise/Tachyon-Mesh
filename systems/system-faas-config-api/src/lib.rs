@@ -765,8 +765,13 @@ mod tests {
     fn tensor_parallel_strategy_rejects_a_single_device() {
         use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
 
-        let strategy =
-            hardware_strategy(GpuDistribution::TensorParallelism, vec![0], vec![], vec![], 0);
+        let strategy = hardware_strategy(
+            GpuDistribution::TensorParallelism,
+            vec![0],
+            vec![],
+            vec![],
+            0,
+        );
         validate_hardware_strategy(&strategy).expect_err("tensor-parallel requires >= 2 devices");
     }
 

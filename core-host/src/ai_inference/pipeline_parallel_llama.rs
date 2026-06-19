@@ -22,7 +22,9 @@
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor};
 use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::llama::Config;
-use candle_transformers::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
+use candle_transformers::models::with_tracing::{
+    linear_no_bias as linear, Embedding, Linear, RmsNorm,
+};
 
 use super::parallel::{PipelineStageExecutor, StageTransport};
 use super::tensor_parallel_llama::{TensorParallelBlock, TensorParallelCache};
@@ -75,11 +77,8 @@ impl PipelineStage {
         let head = if is_last_stage {
             let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
             let lm_head = if cfg.tie_word_embeddings {
-                let wte_for_head = Embedding::new(
-                    cfg.vocab_size,
-                    cfg.hidden_size,
-                    vb.pp("model.embed_tokens"),
-                )?;
+                let wte_for_head =
+                    Embedding::new(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
                 Linear::from_weights(wte_for_head.embeddings().clone(), None)
             } else {
                 linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
@@ -200,7 +199,9 @@ impl PipelineParallelLlama {
 mod tests {
     use super::*;
     use crate::ai_inference::candle_llm_runtime::write_tachyon_tiny_fixture;
-    use candle_transformers::models::llama::{Cache as DenseCache, Llama as DenseLlama, LlamaConfig};
+    use candle_transformers::models::llama::{
+        Cache as DenseCache, Llama as DenseLlama, LlamaConfig,
+    };
 
     fn load_config(root: &std::path::Path) -> Config {
         let raw = std::fs::read(root.join("config.json")).unwrap();
@@ -208,7 +209,11 @@ mod tests {
         llama_config.into_config(false)
     }
 
-    fn build_model(root: &std::path::Path, cfg: &Config, stage_ranges: &[(u32, u32)]) -> PipelineParallelLlama {
+    fn build_model(
+        root: &std::path::Path,
+        cfg: &Config,
+        stage_ranges: &[(u32, u32)],
+    ) -> PipelineParallelLlama {
         let devices = vec![Device::Cpu; stage_ranges.len()];
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
@@ -246,7 +251,9 @@ mod tests {
         let dense_logits = dense_model.forward(&tokens, 0, &mut dense_cache).unwrap();
 
         let transports: Vec<Box<dyn StageTransport>> = vec![Box::new(
-            crate::ai_inference::parallel::InProcessTransport { next_device: Device::Cpu },
+            crate::ai_inference::parallel::InProcessTransport {
+                next_device: Device::Cpu,
+            },
         )];
         let pipeline_logits = pipeline_model.forward(&tokens, &transports).unwrap();
 
@@ -271,9 +278,13 @@ mod tests {
         let reference_model = build_model(tmp.path(), &cfg, &stage_ranges);
         let tokens = Tensor::from_vec(vec![1u32, 2, 1], (1, 3), &Device::Cpu).unwrap();
         let in_process_transports: Vec<Box<dyn StageTransport>> = vec![Box::new(
-            crate::ai_inference::parallel::InProcessTransport { next_device: Device::Cpu },
+            crate::ai_inference::parallel::InProcessTransport {
+                next_device: Device::Cpu,
+            },
         )];
-        let reference_logits = reference_model.forward(&tokens, &in_process_transports).unwrap();
+        let reference_logits = reference_model
+            .forward(&tokens, &in_process_transports)
+            .unwrap();
 
         // Same forward, but stage 0 -> stage 1's hand-off goes over a real
         // TCP socket: a background thread runs stage 1's forward when the
@@ -284,9 +295,11 @@ mod tests {
         let server = std::thread::spawn(move || {
             let stage1 = &stage1_model.stages[1];
             let layer_range = stage1.layer_range;
-            crate::ai_inference::parallel::TcpStageTransport::serve_one(&listener, &Device::Cpu, |x| {
-                stage1.run_stage(layer_range, &x)
-            })
+            crate::ai_inference::parallel::TcpStageTransport::serve_one(
+                &listener,
+                &Device::Cpu,
+                |x| stage1.run_stage(layer_range, &x),
+            )
             .unwrap();
         });
 

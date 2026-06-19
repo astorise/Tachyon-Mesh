@@ -20,7 +20,9 @@ use std::f32::consts::PI;
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
 use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::llama::{Config, Llama3RopeConfig, Llama3RopeType};
-use candle_transformers::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
+use candle_transformers::models::with_tracing::{
+    linear_no_bias as linear, Embedding, Linear, RmsNorm,
+};
 use candle_transformers::utils::{build_causal_mask, repeat_kv};
 
 use super::parallel::{split_for_row_parallel, ColumnParallelLinear, RowParallelLinear};
@@ -390,7 +392,9 @@ impl TensorParallelLlama {
 mod tests {
     use super::*;
     use crate::ai_inference::candle_llm_runtime::write_tachyon_tiny_fixture;
-    use candle_transformers::models::llama::{Cache as DenseCache, Llama as DenseLlama, LlamaConfig};
+    use candle_transformers::models::llama::{
+        Cache as DenseCache, Llama as DenseLlama, LlamaConfig,
+    };
 
     fn load_config(root: &std::path::Path) -> Config {
         let raw = std::fs::read(root.join("config.json")).unwrap();

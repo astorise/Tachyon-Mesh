@@ -52,7 +52,10 @@ pub(crate) use parallel_topology::{
 /// is irrelevant when only one device is present.
 pub(crate) fn discover_cluster_topology() -> ClusterTopology {
     #[cfg_attr(not(feature = "nvfp4-cuda"), allow(unused_mut))]
-    let mut devices = vec![DeviceInfo { device_id: 0, free_vram_bytes: 0 }];
+    let mut devices = vec![DeviceInfo {
+        device_id: 0,
+        free_vram_bytes: 0,
+    }];
 
     #[cfg(feature = "nvfp4-cuda")]
     {
@@ -60,7 +63,10 @@ pub(crate) fn discover_cluster_topology() -> ClusterTopology {
         loop {
             match Device::cuda_if_available(ordinal as usize) {
                 Ok(Device::Cuda(_)) => {
-                    devices.push(DeviceInfo { device_id: ordinal + 1, free_vram_bytes: 0 });
+                    devices.push(DeviceInfo {
+                        device_id: ordinal + 1,
+                        free_vram_bytes: 0,
+                    });
                     ordinal += 1;
                 }
                 _ => break,
@@ -71,10 +77,16 @@ pub(crate) fn discover_cluster_topology() -> ClusterTopology {
         }
     }
 
-    let interconnect =
-        if devices.len() > 1 { InterconnectClass::Pcie } else { InterconnectClass::HighBandwidth };
+    let interconnect = if devices.len() > 1 {
+        InterconnectClass::Pcie
+    } else {
+        InterconnectClass::HighBandwidth
+    };
 
-    ClusterTopology { devices, interconnect }
+    ClusterTopology {
+        devices,
+        interconnect,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +113,9 @@ impl ColumnParallelLinear {
         let shard_size = out_features / n;
         let mut shards = Vec::with_capacity(n);
         for (i, device) in devices.iter().enumerate() {
-            let shard = weight.narrow(0, i * shard_size, shard_size)?.to_device(device)?;
+            let shard = weight
+                .narrow(0, i * shard_size, shard_size)?
+                .to_device(device)?;
             shards.push((shard, device.clone()));
         }
         Ok(Self { shards })
@@ -142,7 +156,9 @@ impl RowParallelLinear {
         let shard_size = in_features / n;
         let mut shards = Vec::with_capacity(n);
         for (i, device) in devices.iter().enumerate() {
-            let shard = weight.narrow(1, i * shard_size, shard_size)?.to_device(device)?;
+            let shard = weight
+                .narrow(1, i * shard_size, shard_size)?
+                .to_device(device)?;
             shards.push((shard, device.clone()));
         }
         Ok(Self { shards })
@@ -156,7 +172,11 @@ impl RowParallelLinear {
     /// device per shard there is nothing else to synchronize, and on real
     /// multi-GPU hardware this is exactly the payload an NCCL all-reduce
     /// would sum across devices.
-    pub(crate) fn forward(&self, x_shards: &[Tensor], reduce_device: &Device) -> CandleResult<Tensor> {
+    pub(crate) fn forward(
+        &self,
+        x_shards: &[Tensor],
+        reduce_device: &Device,
+    ) -> CandleResult<Tensor> {
         let mut acc: Option<Tensor> = None;
         for ((shard, device), x_local) in self.shards.iter().zip(x_shards.iter()) {
             let x_local = x_local.to_device(device)?;
@@ -166,7 +186,9 @@ impl RowParallelLinear {
                 None => partial,
             });
         }
-        acc.ok_or_else(|| candle_core::Error::Msg("row-parallel forward requires at least one shard".into()))
+        acc.ok_or_else(|| {
+            candle_core::Error::Msg("row-parallel forward requires at least one shard".into())
+        })
     }
 }
 
@@ -263,7 +285,10 @@ pub(crate) struct PipelineDepthGate {
 
 impl PipelineDepthGate {
     pub(crate) fn new(depth: u32) -> Self {
-        Self { depth: depth.max(1), in_flight: 0 }
+        Self {
+            depth: depth.max(1),
+            in_flight: 0,
+        }
     }
 
     /// Returns `true` and reserves a slot if the pipeline has spare depth,
@@ -371,7 +396,10 @@ fn io_err(err: std::io::Error) -> candle_core::Error {
 /// handles its own device placement.
 fn encode_tensor(tensor: &Tensor) -> CandleResult<Vec<u8>> {
     let dims = tensor.dims().to_vec();
-    let data = tensor.flatten_all()?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+    let data = tensor
+        .flatten_all()?
+        .to_dtype(candle_core::DType::F32)?
+        .to_vec1::<f32>()?;
     let mut bytes = Vec::with_capacity(4 + dims.len() * 4 + data.len() * 4);
     bytes.extend_from_slice(&(dims.len() as u32).to_le_bytes());
     for dim in &dims {
@@ -486,7 +514,9 @@ impl ExpertPlacementPlan {
         for expert_id in 0..expert_count {
             expert_device_index.insert(expert_id, (expert_id as usize) % device_count.max(1));
         }
-        Self { expert_device_index }
+        Self {
+            expert_device_index,
+        }
     }
 
     pub(crate) fn device_index_for(&self, expert_id: u32) -> Option<usize> {
@@ -512,10 +542,14 @@ pub(crate) fn route_tokens_to_experts(
     selections: &[TokenExpertSelection],
     plan: &ExpertPlacementPlan,
 ) -> std::collections::BTreeMap<usize, Vec<usize>> {
-    let mut routed: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    let mut routed: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
     for selection in selections {
         if let Some(device_index) = plan.device_index_for(selection.expert_id) {
-            routed.entry(device_index).or_default().push(selection.token_index);
+            routed
+                .entry(device_index)
+                .or_default()
+                .push(selection.token_index);
         }
     }
     routed
@@ -641,7 +675,10 @@ impl ExpertParallelMlp {
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).expect("gate logits are finite"))
                 .expect("at least one expert");
-            tokens_by_expert.entry(expert_id).or_default().push(token_index);
+            tokens_by_expert
+                .entry(expert_id)
+                .or_default()
+                .push(token_index);
         }
 
         let mut rows_by_token: Vec<Option<Tensor>> = vec![None; num_tokens];
@@ -791,12 +828,11 @@ mod tests {
         let stage0 = ClosureStageExecutor(|_range: (u32, u32), t: &Tensor| t * 2.0);
         let stage1 = ClosureStageExecutor(|_range: (u32, u32), t: &Tensor| t + 1.0);
 
-        let stages: Vec<(Box<dyn PipelineStageExecutor>, (u32, u32))> = vec![
-            (Box::new(stage0), (0, 1)),
-            (Box::new(stage1), (2, 3)),
-        ];
-        let transports: Vec<Box<dyn StageTransport>> =
-            vec![Box::new(InProcessTransport { next_device: device.clone() })];
+        let stages: Vec<(Box<dyn PipelineStageExecutor>, (u32, u32))> =
+            vec![(Box::new(stage0), (0, 1)), (Box::new(stage1), (2, 3))];
+        let transports: Vec<Box<dyn StageTransport>> = vec![Box::new(InProcessTransport {
+            next_device: device.clone(),
+        })];
 
         let output = run_pipeline(&stages, &transports, &x).unwrap();
         let expected = ((&x * 2.0).unwrap() + 1.0).unwrap();
@@ -822,19 +858,23 @@ mod tests {
         let device = cpu();
         let stage0 = ClosureStageExecutor(|_range: (u32, u32), t: &Tensor| t * 2.0);
         let stage1 = ClosureStageExecutor(|_range: (u32, u32), t: &Tensor| t + 1.0);
-        let stages: Vec<(Box<dyn PipelineStageExecutor>, (u32, u32))> = vec![
-            (Box::new(stage0), (0, 1)),
-            (Box::new(stage1), (2, 3)),
-        ];
-        let transports: Vec<Box<dyn StageTransport>> =
-            vec![Box::new(InProcessTransport { next_device: device.clone() })];
+        let stages: Vec<(Box<dyn PipelineStageExecutor>, (u32, u32))> =
+            vec![(Box::new(stage0), (0, 1)), (Box::new(stage1), (2, 3))];
+        let transports: Vec<Box<dyn StageTransport>> = vec![Box::new(InProcessTransport {
+            next_device: device.clone(),
+        })];
 
         let micro_batches: Vec<Tensor> = (0..5)
             .map(|i| Tensor::from_vec(vec![i as f32], (1, 1), &device).unwrap())
             .collect();
         let expected: Vec<f32> = micro_batches
             .iter()
-            .map(|x| ((x * 2.0).unwrap() + 1.0).unwrap().to_vec2::<f32>().unwrap()[0][0])
+            .map(|x| {
+                ((x * 2.0).unwrap() + 1.0)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap()[0][0]
+            })
             .collect();
 
         // Depth 2: never more than 2 microbatches in flight, but every
@@ -843,10 +883,16 @@ mod tests {
         let mut gate = PipelineDepthGate::new(2);
         let outputs =
             run_pipeline_microbatched(&stages, &transports, micro_batches, &mut gate).unwrap();
-        assert_eq!(gate.in_flight(), 0, "every microbatch must release its slot on completion");
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "every microbatch must release its slot on completion"
+        );
 
-        let outputs: Vec<f32> =
-            outputs.iter().map(|t| t.to_vec2::<f32>().unwrap()[0][0]).collect();
+        let outputs: Vec<f32> = outputs
+            .iter()
+            .map(|t| t.to_vec2::<f32>().unwrap()[0][0])
+            .collect();
         assert_eq!(outputs, expected);
     }
 
@@ -884,9 +930,18 @@ mod tests {
     fn tokens_are_routed_only_to_their_selected_experts_device() {
         let plan = ExpertPlacementPlan::round_robin(2, 2);
         let selections = vec![
-            TokenExpertSelection { token_index: 0, expert_id: 0 },
-            TokenExpertSelection { token_index: 1, expert_id: 1 },
-            TokenExpertSelection { token_index: 2, expert_id: 0 },
+            TokenExpertSelection {
+                token_index: 0,
+                expert_id: 0,
+            },
+            TokenExpertSelection {
+                token_index: 1,
+                expert_id: 1,
+            },
+            TokenExpertSelection {
+                token_index: 2,
+                expert_id: 0,
+            },
         ];
         let routed = route_tokens_to_experts(&selections, &plan);
         assert_eq!(routed.get(&0), Some(&vec![0usize, 2usize]));
@@ -996,13 +1051,23 @@ mod tests {
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                 .unwrap();
-            let w1 = weights.get(&format!("experts.{expert_id}.w1.weight")).unwrap();
-            let w3 = weights.get(&format!("experts.{expert_id}.w3.weight")).unwrap();
-            let w2 = weights.get(&format!("experts.{expert_id}.w2.weight")).unwrap();
+            let w1 = weights
+                .get(&format!("experts.{expert_id}.w1.weight"))
+                .unwrap();
+            let w3 = weights
+                .get(&format!("experts.{expert_id}.w3.weight"))
+                .unwrap();
+            let w2 = weights
+                .get(&format!("experts.{expert_id}.w2.weight"))
+                .unwrap();
             let token_row = x.i(token).unwrap().reshape((1, hidden)).unwrap();
-            let gate_out = candle_nn::ops::silu(&token_row.matmul(&w1.t().unwrap()).unwrap()).unwrap();
+            let gate_out =
+                candle_nn::ops::silu(&token_row.matmul(&w1.t().unwrap()).unwrap()).unwrap();
             let up_out = token_row.matmul(&w3.t().unwrap()).unwrap();
-            let out = (gate_out * up_out).unwrap().matmul(&w2.t().unwrap()).unwrap();
+            let out = (gate_out * up_out)
+                .unwrap()
+                .matmul(&w2.t().unwrap())
+                .unwrap();
             reference_rows.push(out);
         }
         let reference = Tensor::cat(&reference_rows, 0).unwrap();

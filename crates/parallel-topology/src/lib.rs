@@ -84,9 +84,18 @@ pub struct ParallelExecutionPlan {
 /// hardware topology. Mirrors `topology-error` in `wit/ai/inference.wit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopologyError {
-    InsufficientDeviceCount { required: u32, available: u32 },
-    IncompatibleInterconnect { required: InterconnectClass, available: InterconnectClass },
-    VramPerShardExceeded { required_bytes: u64, available_bytes: u64 },
+    InsufficientDeviceCount {
+        required: u32,
+        available: u32,
+    },
+    IncompatibleInterconnect {
+        required: InterconnectClass,
+        available: InterconnectClass,
+    },
+    VramPerShardExceeded {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
 }
 
 impl fmt::Display for TopologyError {
@@ -132,7 +141,10 @@ pub fn validate_parallel_topology(
     let required = plan.device_ids.len() as u32;
     let available = topology.devices.len() as u32;
     if required > available {
-        return Err(TopologyError::InsufficientDeviceCount { required, available });
+        return Err(TopologyError::InsufficientDeviceCount {
+            required,
+            available,
+        });
     }
 
     if plan.strategy == ParallelStrategy::TensorParallel
@@ -228,10 +240,17 @@ pub fn validate_plan_shape(plan: &ParallelExecutionPlan) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn topology(device_count: usize, interconnect: InterconnectClass, free_vram: u64) -> ClusterTopology {
+    fn topology(
+        device_count: usize,
+        interconnect: InterconnectClass,
+        free_vram: u64,
+    ) -> ClusterTopology {
         ClusterTopology {
             devices: (0..device_count as u32)
-                .map(|device_id| DeviceInfo { device_id, free_vram_bytes: free_vram })
+                .map(|device_id| DeviceInfo {
+                    device_id,
+                    free_vram_bytes: free_vram,
+                })
                 .collect(),
             interconnect,
         }
@@ -262,7 +281,10 @@ mod tests {
         let t = topology(2, InterconnectClass::HighBandwidth, 0);
         assert_eq!(
             validate_parallel_topology(&p, &t),
-            Err(TopologyError::InsufficientDeviceCount { required: 3, available: 2 })
+            Err(TopologyError::InsufficientDeviceCount {
+                required: 3,
+                available: 2
+            })
         );
     }
 
