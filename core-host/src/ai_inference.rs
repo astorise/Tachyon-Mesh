@@ -6,6 +6,8 @@ mod candle_onnx_backend;
 mod modelopt_nvfp4;
 #[path = "ai_inference/parallel.rs"]
 pub(crate) mod parallel;
+#[path = "ai_inference/tensor_parallel_llama.rs"]
+pub(crate) mod tensor_parallel_llama;
 #[path = "ai_inference/vram_manager.rs"]
 pub(crate) mod vram_manager;
 
