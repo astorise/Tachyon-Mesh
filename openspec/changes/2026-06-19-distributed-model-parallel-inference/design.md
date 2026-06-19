@@ -22,9 +22,9 @@ config-ai.wit (existing)        ai-inference (this change)        candle (vendor
 - A bounded number of micro-batches are kept in flight per stage (configurable pipeline depth) to avoid stage idling, mirroring GPipe-style scheduling, while staying within the existing host-RAM KV-cache paging budget from `vram-optimization`.
 
 ## 4. Expert Parallelism (MoE)
-- At load time, the broker partitions the checkpoint's expert tensors across the configured GPU/node set (`ExpertPlacementPlan: expert_id -> device`).
-- The router (gate) layer runs on every node holding a model replica; once top-k experts are selected per token, only the tokens routed to a given expert are shipped to that expert's device — avoiding all-to-all replication of dense weights.
-- Falls back to the existing dense path (no MoE) when the loaded checkpoint declares no expert tensors.
+- MoE checkpoints are detected by tensor name (`detect_expert_count`, Task 6) rather than a config flag, since expert count is a property of the checkpoint, not the deployment: a layer with no `.experts.` tensors is dense.
+- The router (gate) layer runs once per forward pass; once each token's top-1 expert is selected, tokens are grouped **by expert id** (`ExpertParallelMlp::forward`, Task 6) and only the tokens routed to a given expert are gathered and shipped to that expert's device — avoiding all-to-all replication of dense weights. Top-1 (not top-k) is implemented; top-k routing is not in this change's verified surface.
+- Falls back to the existing dense path (`TensorParallelMlp`/`TensorParallelBlock`) when the loaded checkpoint declares no expert tensors. **Caveat (same class as §2/§3)**: this is true today only because no live MoE checkpoint loader exists in `candle_llm_runtime.rs` yet — see Task 6's notes in `tasks.md`. `ExpertPlacementPlan: expert_id -> device` is implemented and reused unchanged from pre-existing scaffolding.
 
 ## 5. Topology validation (fail fast)
 `apply-model-deployment` (existing `config-ai.wit` function) already returns `result<_, string>`. This change adds a validation pass invoked from that path:

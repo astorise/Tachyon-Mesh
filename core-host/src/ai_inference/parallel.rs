@@ -13,7 +13,9 @@
 //! `Device::Cuda(ordinal)` handles on real multi-GPU hardware — this module
 //! does not special-case CPU vs. GPU placement.
 
-use candle_core::{Device, Result as CandleResult, Tensor};
+use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear};
 
 /// Pure validation types/logic (no GPU runtime dependency) live in the
 /// `parallel-topology` crate so they can be shared with
@@ -519,6 +521,152 @@ pub(crate) fn route_tokens_to_experts(
     routed
 }
 
+/// Scans a checkpoint's tensor names for the `<prefix>.layers.<layer_idx>.*.experts.<id>.*`
+/// naming convention used by Mixtral/Qwen-MoE-style checkpoints to detect
+/// whether a given layer is a dense layer or an MoE layer, and if the
+/// latter, how many experts it declares. Returns `None` for a dense layer
+/// (no `.experts.` tensors found for that layer index), which callers use as
+/// the signal to fall back to the existing dense execution path unchanged.
+pub(crate) fn detect_expert_count<'a>(
+    tensor_names: impl Iterator<Item = &'a str>,
+    layer_idx: usize,
+) -> Option<usize> {
+    let layer_prefix = format!(".layers.{layer_idx}.");
+    let mut max_expert_id: Option<usize> = None;
+    for name in tensor_names {
+        let Some(layer_pos) = name.find(&layer_prefix) else {
+            continue;
+        };
+        let after_layer = &name[layer_pos + layer_prefix.len()..];
+        let Some(experts_pos) = after_layer.find(".experts.") else {
+            continue;
+        };
+        let after_experts = &after_layer[experts_pos + ".experts.".len()..];
+        let Some(id_str) = after_experts.split('.').next() else {
+            continue;
+        };
+        if let Ok(id) = id_str.parse::<usize>() {
+            max_expert_id = Some(max_expert_id.map_or(id, |current| current.max(id)));
+        }
+    }
+    max_expert_id.map(|id| id + 1)
+}
+
+/// A single expert's SwiGLU MLP (Mixtral convention: `w2(silu(w1(x)) * w3(x))`),
+/// resident on whichever device `ExpertPlacementPlan` assigned it to.
+pub(crate) struct ExpertMlp {
+    w1: Linear,
+    w3: Linear,
+    w2: Linear,
+    device: Device,
+}
+
+impl ExpertMlp {
+    fn load(
+        vb: VarBuilder,
+        hidden_size: usize,
+        intermediate_size: usize,
+        device: &Device,
+    ) -> CandleResult<Self> {
+        Ok(Self {
+            w1: linear(hidden_size, intermediate_size, vb.pp("w1"))?,
+            w3: linear(hidden_size, intermediate_size, vb.pp("w3"))?,
+            w2: linear(intermediate_size, hidden_size, vb.pp("w2"))?,
+            device: device.clone(),
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let gate = candle_nn::ops::silu(&self.w1.forward(x)?)?;
+        let up = self.w3.forward(x)?;
+        self.w2.forward(&(gate * up)?)
+    }
+}
+
+/// Expert-parallel MoE MLP: a replicated gate (top-1 routing) plus one
+/// `ExpertMlp` per expert, each pinned to a device per `ExpertPlacementPlan`.
+/// `forward` performs genuine gate-then-route dispatch — every token is
+/// gathered into a per-expert batch and only that expert's MLP runs over
+/// only its assigned tokens, rather than every expert running over every
+/// token (dense replication). This is the building block that, once a live
+/// MoE checkpoint loader exists in `candle_llm_runtime.rs`, would replace
+/// `TensorParallelMlp` for MoE layers; today nothing in this codebase loads
+/// an MoE checkpoint, so the dense path (`TensorParallelMlp`,
+/// `TensorParallelBlock`) remains the only one ever exercised at runtime —
+/// see Task 6's notes in `tasks.md`.
+pub(crate) struct ExpertParallelMlp {
+    gate: Tensor,
+    experts: Vec<ExpertMlp>,
+}
+
+impl ExpertParallelMlp {
+    pub(crate) fn load(
+        vb: VarBuilder,
+        hidden_size: usize,
+        intermediate_size: usize,
+        num_experts: usize,
+        plan: &ExpertPlacementPlan,
+        devices: &[Device],
+    ) -> CandleResult<Self> {
+        let gate = vb.pp("gate").get((num_experts, hidden_size), "weight")?;
+        let mut experts = Vec::with_capacity(num_experts);
+        for expert_id in 0..num_experts {
+            let device_index = plan.device_index_for(expert_id as u32).unwrap_or(0);
+            let device = &devices[device_index.min(devices.len() - 1)];
+            experts.push(ExpertMlp::load(
+                vb.pp("experts").pp(expert_id),
+                hidden_size,
+                intermediate_size,
+                device,
+            )?);
+        }
+        Ok(Self { gate, experts })
+    }
+
+    /// `x` is a 2-D `[tokens, hidden]` activation on the gate's (primary)
+    /// device. Returns the routed `[tokens, hidden]` output in the original
+    /// token order.
+    pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let (num_tokens, _hidden) = x.dims2()?;
+        let num_experts = self.experts.len();
+        let logits = x.matmul(&self.gate.t()?)?;
+        let logits: Vec<f32> = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+        let mut tokens_by_expert: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for token_index in 0..num_tokens {
+            let row = &logits[token_index * num_experts..(token_index + 1) * num_experts];
+            let (expert_id, _) = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).expect("gate logits are finite"))
+                .expect("at least one expert");
+            tokens_by_expert.entry(expert_id).or_default().push(token_index);
+        }
+
+        let mut rows_by_token: Vec<Option<Tensor>> = vec![None; num_tokens];
+        for (expert_id, token_indices) in tokens_by_expert {
+            let expert = &self.experts[expert_id];
+            let idx = Tensor::from_vec(
+                token_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                token_indices.len(),
+                x.device(),
+            )?;
+            let gathered = x.index_select(&idx, 0)?.to_device(&expert.device)?;
+            let computed = expert.forward(&gathered)?.to_device(x.device())?;
+            for (row_idx, &token_index) in token_indices.iter().enumerate() {
+                rows_by_token[token_index] = Some(computed.i(row_idx)?);
+            }
+        }
+
+        let rows: Vec<Tensor> = rows_by_token
+            .into_iter()
+            .map(|row| row.expect("every token routed to exactly one expert"))
+            .collect();
+        Tensor::stack(&rows, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,5 +900,118 @@ mod tests {
         let plan = ExpertPlacementPlan::round_robin(0, 4);
         let routed = route_tokens_to_experts(&[], &plan);
         assert!(routed.is_empty());
+    }
+
+    #[test]
+    fn detect_expert_count_finds_the_highest_expert_id_for_a_moe_layer() {
+        let names = vec![
+            "model.layers.0.block_sparse_moe.gate.weight",
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+            "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+            "model.layers.0.block_sparse_moe.experts.1.w1.weight",
+            "model.layers.0.block_sparse_moe.experts.2.w1.weight",
+            "model.layers.1.mlp.gate_proj.weight",
+        ];
+        assert_eq!(detect_expert_count(names.iter().copied(), 0), Some(3));
+    }
+
+    #[test]
+    fn detect_expert_count_returns_none_for_a_dense_layer() {
+        let names = vec![
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ];
+        assert_eq!(detect_expert_count(names.iter().copied(), 0), None);
+    }
+
+    fn random_tensor(rows: usize, cols: usize, device: &Device) -> Tensor {
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.037).sin())
+            .collect();
+        Tensor::from_vec(data, (rows, cols), device).unwrap()
+    }
+
+    fn load_expert_parallel_mlp(
+        hidden: usize,
+        intermediate: usize,
+        num_experts: usize,
+        devices: &[Device],
+    ) -> (ExpertParallelMlp, std::collections::HashMap<String, Tensor>) {
+        let device = devices[0].clone();
+        let mut weights = std::collections::HashMap::new();
+        weights.insert(
+            "gate.weight".to_string(),
+            random_tensor(num_experts, hidden, &device),
+        );
+        for expert_id in 0..num_experts {
+            for (suffix, (out_dim, in_dim)) in [
+                ("w1", (intermediate, hidden)),
+                ("w3", (intermediate, hidden)),
+                ("w2", (hidden, intermediate)),
+            ] {
+                weights.insert(
+                    format!("experts.{expert_id}.{suffix}.weight"),
+                    random_tensor(out_dim, in_dim, &device),
+                );
+            }
+        }
+        let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &device);
+        let plan = ExpertPlacementPlan::round_robin(num_experts as u32, devices.len());
+        let mlp =
+            ExpertParallelMlp::load(vb, hidden, intermediate, num_experts, &plan, devices).unwrap();
+        (mlp, weights)
+    }
+
+    #[test]
+    fn expert_parallel_mlp_matches_per_token_dense_dispatch_reference() {
+        let hidden = 8;
+        let intermediate = 16;
+        let num_experts = 4;
+        let num_tokens = 6;
+        let device = cpu();
+        // Two simulated devices, both CPU (this build has no live CUDA
+        // backend — see Task 2's caveat), so experts 0/2 land on device 0
+        // and experts 1/3 land on device 1, exercising real cross-device
+        // gather/scatter even though both "devices" are the same backend.
+        let devices = vec![device.clone(), device.clone()];
+        let (mlp, weights) = load_expert_parallel_mlp(hidden, intermediate, num_experts, &devices);
+
+        let x = random_tensor(num_tokens, hidden, &device);
+        let batched = mlp.forward(&x).unwrap();
+
+        // Reference: route each token to its top-1 expert exactly as
+        // `ExpertParallelMlp::forward` would, but compute every token's
+        // expert MLP one row at a time directly from the same weights,
+        // proving the grouped/multi-device computation is numerically
+        // identical to literal per-token sparse dispatch.
+        let gate = weights.get("gate.weight").unwrap();
+        let logits = x.matmul(&gate.t().unwrap()).unwrap();
+        let logits: Vec<f32> = logits.flatten_all().unwrap().to_vec1().unwrap();
+        let mut reference_rows = Vec::with_capacity(num_tokens);
+        for token in 0..num_tokens {
+            let row = &logits[token * num_experts..(token + 1) * num_experts];
+            let (expert_id, _) = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap();
+            let w1 = weights.get(&format!("experts.{expert_id}.w1.weight")).unwrap();
+            let w3 = weights.get(&format!("experts.{expert_id}.w3.weight")).unwrap();
+            let w2 = weights.get(&format!("experts.{expert_id}.w2.weight")).unwrap();
+            let token_row = x.i(token).unwrap().reshape((1, hidden)).unwrap();
+            let gate_out = candle_nn::ops::silu(&token_row.matmul(&w1.t().unwrap()).unwrap()).unwrap();
+            let up_out = token_row.matmul(&w3.t().unwrap()).unwrap();
+            let out = (gate_out * up_out).unwrap().matmul(&w2.t().unwrap()).unwrap();
+            reference_rows.push(out);
+        }
+        let reference = Tensor::cat(&reference_rows, 0).unwrap();
+
+        let batched_vec: Vec<f32> = batched.flatten_all().unwrap().to_vec1().unwrap();
+        let reference_vec: Vec<f32> = reference.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(batched_vec.len(), reference_vec.len());
+        for (a, b) in batched_vec.iter().zip(reference_vec.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
     }
 }
