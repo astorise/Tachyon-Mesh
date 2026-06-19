@@ -117,10 +117,10 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@v4
 
       - name: Warm ${{ matrix.cache_scope }} cache (${{ matrix.dockerfile }} → ${{ matrix.target }})
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@v7
         continue-on-error: true
         with:
           context: .
@@ -666,7 +666,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@v4
 
       - name: Normalize image owner
         id: owner
@@ -674,7 +674,7 @@ jobs:
         run: echo "value=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4.2.0
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -682,7 +682,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6.1.0
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ steps.owner.outputs.value }}/${{ matrix.image_name }}
           tags: |
@@ -699,7 +699,7 @@ jobs:
       # the transient push failure (re-pushing from the warm buildkit/gha cache).
       - name: Build and publish Docker image
         id: build
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@v7
         continue-on-error: true
         with:
           context: ${{ matrix.context }}
@@ -714,7 +714,7 @@ jobs:
 
       - name: Build and publish Docker image (retry)
         if: steps.build.outcome == 'failure'
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}

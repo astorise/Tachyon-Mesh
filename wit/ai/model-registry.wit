@@ -1,4 +1,4 @@
-package tachyon:ai@1.1.0;
+package tachyon:mesh@1.1.0;
 
 /// Persistent index of AI models available on this Tachyon node.
 /// system-faas-ai-list-model is the authoritative implementation;
