@@ -120,7 +120,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Warm ${{ matrix.cache_scope }} cache (${{ matrix.dockerfile }} → ${{ matrix.target }})
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         continue-on-error: true
         with:
           context: .
@@ -699,7 +699,7 @@ jobs:
       # the transient push failure (re-pushing from the warm buildkit/gha cache).
       - name: Build and publish Docker image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         continue-on-error: true
         with:
           context: ${{ matrix.context }}
@@ -714,7 +714,7 @@ jobs:
 
       - name: Build and publish Docker image (retry)
         if: steps.build.outcome == 'failure'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
