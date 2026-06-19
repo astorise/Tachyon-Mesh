@@ -13,60 +13,20 @@
 //! `Device::Cuda(ordinal)` handles on real multi-GPU hardware — this module
 //! does not special-case CPU vs. GPU placement.
 
-use std::fmt;
-
 use candle_core::{Device, Result as CandleResult, Tensor};
 
-/// How a model's forward pass is split across more than one accelerator.
-/// Mirrors `parallel-strategy` in `wit/ai/inference.wit`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ParallelStrategy {
-    /// No splitting; the model runs entirely on one device.
-    #[default]
-    None,
-    /// Column/row-parallel weight sharding across the GPUs of one node.
-    TensorParallel,
-    /// Contiguous layer ranges assigned to different nodes/GPUs.
-    PipelineParallel,
-    /// Mixture-of-Experts: experts placed on distinct GPUs/nodes.
-    ExpertParallel,
-}
-
-/// Interconnect class between two devices, used to gate tensor-parallel
-/// plans that require low-latency, high-bandwidth synchronization.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum InterconnectClass {
-    /// Same-host, high-bandwidth GPU-to-GPU link (e.g. NVLink).
-    HighBandwidth,
-    /// Same-host PCIe, no direct GPU-to-GPU link.
-    Pcie,
-    /// Cross-node network (Ethernet/InfiniBand between hosts).
-    CrossNode,
-}
-
-/// One device's reported capacity, as produced by hardware capability
-/// discovery (`hardware-capabilities` / `heterogeneous-accelerator-orchestration`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DeviceInfo {
-    pub(crate) device_id: u32,
-    pub(crate) free_vram_bytes: u64,
-}
-
-/// The cluster's discovered hardware topology, as known at deployment-validation
-/// time. `interconnect` reports the worst-case (most constrained) interconnect
-/// class across the participating device set, which is sufficient to gate a
-/// tensor-parallel plan: a plan is only as fast as its slowest link.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ClusterTopology {
-    pub(crate) devices: Vec<DeviceInfo>,
-    pub(crate) interconnect: InterconnectClass,
-}
-
-impl ClusterTopology {
-    pub(crate) fn device(&self, device_id: u32) -> Option<&DeviceInfo> {
-        self.devices.iter().find(|d| d.device_id == device_id)
-    }
-}
+/// Pure validation types/logic (no GPU runtime dependency) live in the
+/// `parallel-topology` crate so they can be shared with
+/// `system-faas-config-api`, which validates a plan's *shape* at
+/// `apply-model-deployment` time before any hardware topology is known.
+// Re-exported for the dispatch path that wires a validated plan into the
+// real tensor/pipeline/expert execution below (tracked separately; not yet
+// wired), hence `allow(unused_imports)` until that caller lands.
+#[allow(unused_imports)]
+pub(crate) use parallel_topology::{
+    validate_parallel_topology, ClusterTopology, DeviceInfo, InterconnectClass,
+    ParallelExecutionPlan, ParallelStrategy, TopologyError,
+};
 
 /// Discovers the cluster topology that `validate_parallel_topology` checks
 /// plans against. Always reports CPU device 0; on builds where the CUDA
@@ -113,108 +73,6 @@ pub(crate) fn discover_cluster_topology() -> ClusterTopology {
         if devices.len() > 1 { InterconnectClass::Pcie } else { InterconnectClass::HighBandwidth };
 
     ClusterTopology { devices, interconnect }
-}
-
-/// A requested execution plan, validated against `ClusterTopology` before any
-/// weights are loaded. Mirrors `parallel-execution-plan` in
-/// `wit/ai/inference.wit`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParallelExecutionPlan {
-    pub(crate) strategy: ParallelStrategy,
-    pub(crate) device_ids: Vec<u32>,
-    /// For pipeline-parallel: inclusive (start, end) layer range per device,
-    /// indexed by position in `device_ids`.
-    pub(crate) stage_layer_ranges: Vec<(u32, u32)>,
-    /// For expert-parallel: (expert_id, device_ids index) placement pairs.
-    pub(crate) expert_device_map: Vec<(u32, u32)>,
-    /// Bytes of VRAM required per shard/device, computed from the model's
-    /// size and the chosen strategy. Required for `VramPerShardExceeded`
-    /// validation; zero means "not yet sized" and is never rejected on VRAM
-    /// grounds.
-    pub(crate) required_vram_bytes_per_device: u64,
-    pub(crate) pipeline_depth: u32,
-}
-
-/// Typed reasons a plan cannot be satisfied by the cluster's discovered
-/// hardware topology. Mirrors `topology-error` in `wit/ai/inference.wit`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TopologyError {
-    InsufficientDeviceCount { required: u32, available: u32 },
-    IncompatibleInterconnect { required: InterconnectClass, available: InterconnectClass },
-    VramPerShardExceeded { required_bytes: u64, available_bytes: u64 },
-}
-
-impl fmt::Display for TopologyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InsufficientDeviceCount { required, available } => write!(
-                f,
-                "plan requires {required} device(s) but only {available} are available"
-            ),
-            Self::IncompatibleInterconnect { required, available } => write!(
-                f,
-                "plan requires {required:?} interconnect but cluster only provides {available:?}"
-            ),
-            Self::VramPerShardExceeded { required_bytes, available_bytes } => write!(
-                f,
-                "shard requires {required_bytes} bytes of VRAM but target device has {available_bytes} free"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TopologyError {}
-
-/// Minimum interconnect class required for tensor parallelism, which
-/// synchronizes (all-reduce/all-gather) on every transformer block and is
-/// therefore latency-sensitive. Pipeline and expert parallelism only
-/// exchange activations/tokens between stages and tolerate any interconnect,
-/// including cross-node.
-const TENSOR_PARALLEL_MIN_INTERCONNECT: InterconnectClass = InterconnectClass::Pcie;
-
-/// Validates that `plan` can be satisfied by `topology` without loading or
-/// sharding a model. Called from `apply-model-deployment` (config-ai.wit)
-/// before admitting a deployment; a rejected plan must not be silently
-/// downgraded to a single-device plan.
-pub(crate) fn validate_parallel_topology(
-    plan: &ParallelExecutionPlan,
-    topology: &ClusterTopology,
-) -> Result<(), TopologyError> {
-    if plan.strategy == ParallelStrategy::None {
-        return Ok(());
-    }
-
-    let required = plan.device_ids.len() as u32;
-    let available = topology.devices.len() as u32;
-    if required > available {
-        return Err(TopologyError::InsufficientDeviceCount { required, available });
-    }
-
-    if plan.strategy == ParallelStrategy::TensorParallel
-        && topology.interconnect > TENSOR_PARALLEL_MIN_INTERCONNECT
-    {
-        return Err(TopologyError::IncompatibleInterconnect {
-            required: TENSOR_PARALLEL_MIN_INTERCONNECT,
-            available: topology.interconnect,
-        });
-    }
-
-    if plan.required_vram_bytes_per_device > 0 {
-        for &device_id in &plan.device_ids {
-            let device = topology.device(device_id).ok_or(TopologyError::InsufficientDeviceCount {
-                required,
-                available,
-            })?;
-            if plan.required_vram_bytes_per_device > device.free_vram_bytes {
-                return Err(TopologyError::VramPerShardExceeded {
-                    required_bytes: plan.required_vram_bytes_per_device,
-                    available_bytes: device.free_vram_bytes,
-                });
-            }
-        }
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -514,84 +372,9 @@ mod tests {
         }
     }
 
-    // --- Topology validation -------------------------------------------------
-
-    fn topology(device_count: usize, interconnect: InterconnectClass, free_vram: u64) -> ClusterTopology {
-        ClusterTopology {
-            devices: (0..device_count as u32)
-                .map(|device_id| DeviceInfo { device_id, free_vram_bytes: free_vram })
-                .collect(),
-            interconnect,
-        }
-    }
-
-    fn plan(strategy: ParallelStrategy, device_ids: Vec<u32>, required_vram: u64) -> ParallelExecutionPlan {
-        ParallelExecutionPlan {
-            strategy,
-            device_ids,
-            stage_layer_ranges: Vec::new(),
-            expert_device_map: Vec::new(),
-            required_vram_bytes_per_device: required_vram,
-            pipeline_depth: 1,
-        }
-    }
-
-    #[test]
-    fn none_strategy_always_validates() {
-        let topo = topology(1, InterconnectClass::CrossNode, 0);
-        let p = plan(ParallelStrategy::None, vec![0, 1, 2, 3], 0);
-        assert!(validate_parallel_topology(&p, &topo).is_ok());
-    }
-
-    #[test]
-    fn insufficient_device_count_is_rejected() {
-        let topo = topology(2, InterconnectClass::HighBandwidth, 0);
-        let p = plan(ParallelStrategy::TensorParallel, vec![0, 1, 2, 3], 0);
-        let err = validate_parallel_topology(&p, &topo).unwrap_err();
-        assert_eq!(
-            err,
-            TopologyError::InsufficientDeviceCount { required: 4, available: 2 }
-        );
-    }
-
-    #[test]
-    fn incompatible_interconnect_is_rejected_for_tensor_parallel() {
-        let topo = topology(2, InterconnectClass::CrossNode, 0);
-        let p = plan(ParallelStrategy::TensorParallel, vec![0, 1], 0);
-        let err = validate_parallel_topology(&p, &topo).unwrap_err();
-        assert_eq!(
-            err,
-            TopologyError::IncompatibleInterconnect {
-                required: InterconnectClass::Pcie,
-                available: InterconnectClass::CrossNode,
-            }
-        );
-    }
-
-    #[test]
-    fn cross_node_interconnect_is_fine_for_pipeline_parallel() {
-        let topo = topology(2, InterconnectClass::CrossNode, 0);
-        let p = plan(ParallelStrategy::PipelineParallel, vec![0, 1], 0);
-        assert!(validate_parallel_topology(&p, &topo).is_ok());
-    }
-
-    #[test]
-    fn vram_per_shard_exceeded_is_rejected() {
-        let topo = topology(2, InterconnectClass::HighBandwidth, 1_000);
-        let p = plan(ParallelStrategy::TensorParallel, vec![0, 1], 2_000);
-        let err = validate_parallel_topology(&p, &topo).unwrap_err();
-        assert_eq!(
-            err,
-            TopologyError::VramPerShardExceeded { required_bytes: 2_000, available_bytes: 1_000 }
-        );
-    }
-
-    #[test]
-    fn sufficient_topology_validates() {
-        let topo = topology(2, InterconnectClass::HighBandwidth, 4_000);
-        let p = plan(ParallelStrategy::TensorParallel, vec![0, 1], 2_000);
-        assert!(validate_parallel_topology(&p, &topo).is_ok());
-    }
+    // Topology validation itself (insufficient device count, incompatible
+    // interconnect, VRAM-per-shard exceeded) is tested in the
+    // `parallel-topology` crate, which owns `validate_parallel_topology`.
 
     // --- Tensor parallelism: numeric equivalence vs. single-device --------
 

@@ -12,6 +12,7 @@ interface config-ai {
         single,
         tensor-parallelism,
         pipeline-parallelism,
+        expert-parallelism,
     }
 
     enum sharing-mode {
@@ -29,6 +30,17 @@ interface config-ai {
     record hardware-strategy {
         multi-gpu: bool,
         distribution-mode: gpu-distribution,
+        /// Device IDs participating in a tensor/pipeline/expert-parallel plan.
+        /// Empty/ignored when `distribution-mode` is `single`.
+        device-ids: list<u32>,
+        /// For pipeline-parallelism: inclusive (start, end) layer-index range
+        /// per device, indexed by position in `device-ids`.
+        stage-layer-ranges: list<tuple<u32, u32>>,
+        /// For expert-parallelism: (expert-id, device-ids index) placement pairs.
+        expert-device-map: list<tuple<u32, u32>>,
+        /// Bounded number of micro-batches kept in flight across pipeline
+        /// stages. Ignored outside `pipeline-parallelism`.
+        pipeline-depth: u32,
     }
 
     record lora-adapter {
