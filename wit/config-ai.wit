@@ -8,6 +8,14 @@ interface config-ai {
         auto-detect,
     }
 
+    /// `tensor-parallelism`/`pipeline-parallelism`/`expert-parallelism` are
+    /// executable, not configuration-only: `core-host`'s
+    /// `ai_inference::parallel` module implements real shard partitioning,
+    /// pipeline staging, and MoE expert routing for these strategies (see
+    /// `openspec/changes/2026-06-19-distributed-model-parallel-inference`).
+    /// No deployment currently wires this `hardware-strategy` into model
+    /// loading yet, so a `single` deployment remains the only strategy
+    /// exercised end-to-end at runtime today.
     enum gpu-distribution {
         single,
         tensor-parallelism,

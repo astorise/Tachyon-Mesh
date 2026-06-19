@@ -24,8 +24,8 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 - **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` across N nodes
 - **WHEN** the model broker loads the model
 - **THEN** each node is assigned a contiguous, non-overlapping range of layers
-- **AND** each node executes its layer range using the existing layer-wise streaming primitive
-- **AND** activations are transmitted to the next stage over the mesh's existing gRPC/HTTP2 transport
+- **AND** each node executes its layer range with a real transformer-block forward pass (not the placeholder `ai-layer-wise-inference` per-layer streaming primitive, which performs mock matmuls — see `tasks.md` Task 5)
+- **AND** activations are transmitted to the next stage over a point-to-point transport implementing the `StageTransport` trait (a real TCP-socket implementation today; `grpc-http2` is the unrelated FaaS guest-request router, not a mesh transport — see `tasks.md` Task 5 and `design.md` §3)
 
 #### Scenario: Pipeline depth bounds in-flight micro-batches
 - **GIVEN** a pipeline-parallel deployment with a configured pipeline depth
@@ -52,7 +52,7 @@ The runtime SHALL reject, with a typed topology error, any `tensor_parallelism`,
 
 #### Scenario: Insufficient GPU count is rejected at deploy time
 - **WHEN** a deployment requests `tensor_parallelism` across more GPUs than are available on the target node
-- **THEN** `apply-model-deployment` fails with a typed `InsufficientGpuCount` error
+- **THEN** `apply-model-deployment` fails with a typed `InsufficientDeviceCount` error
 - **AND** no partial model load is attempted
 
 #### Scenario: Incompatible interconnect is rejected at deploy time
@@ -63,3 +63,16 @@ The runtime SHALL reject, with a typed topology error, any `tensor_parallelism`,
 - **WHEN** a deployment's computed per-shard VRAM requirement exceeds any target GPU's available VRAM
 - **THEN** `apply-model-deployment` fails with a typed `VramPerShardExceeded` error
 - **AND** the runtime does not silently downgrade to a single-GPU execution plan
+
+## Implementation status as of this change
+
+The tensor-parallel (`TensorParallelLlama`), pipeline-parallel (`PipelineParallelLlama`,
+`TcpStageTransport`), expert-parallel (`ExpertParallelMlp`, `detect_expert_count`), and
+topology-validation (`validate_parallel_topology`/`validate_plan_shape`) engines described
+above are implemented in `core-host/src/ai_inference/` and `crates/parallel-topology/`, each
+proven numerically equivalent to a dense/single-device reference on a real (tiny) checkpoint.
+**No live caller in `candle_llm_runtime.rs` yet selects any of these engines for a real
+deployment** — `try_load` still only ever loads the pre-existing dense `LoadedModel` path,
+unchanged and unaffected by this work. Wiring a deployment's `hardware_strategy` into that
+load path is tracked as follow-up work gated on real multi-GPU/NCCL execution
+(`gpu-accelerated-inference-execution`). See `tasks.md` Tasks 4-6 for the per-engine detail.

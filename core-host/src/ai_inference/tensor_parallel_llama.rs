@@ -437,6 +437,48 @@ mod tests {
     }
 
     #[test]
+    fn tensor_parallel_llama_with_a_single_device_matches_dense_reference() {
+        // Regression guard for `multi_gpu: false` / `distribution_mode: single`
+        // deployments (Task 7): a single-device plan must degenerate
+        // `TensorParallelMlp`'s sharding to the dense case and produce output
+        // identical to the pre-change dense engine, not just "close" output
+        // from a real 2-device split.
+        let dir = tempfile::tempdir().unwrap();
+        write_tachyon_tiny_fixture(dir.path()).unwrap();
+        let config = load_config(dir.path());
+        let weight_paths = vec![dir.path().join("model.safetensors")];
+
+        let dense_device = Device::Cpu;
+        let dense_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &dense_device)
+        }
+        .unwrap();
+        let dense_model = DenseLlama::load(dense_vb, &config).unwrap();
+        let mut dense_cache = DenseCache::new(false, DType::F32, &config, &dense_device).unwrap();
+
+        let tp_devices = vec![Device::Cpu];
+        let tp_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &tp_devices[0])
+        }
+        .unwrap();
+        let tp_model = TensorParallelLlama::load(tp_vb, &config, &tp_devices).unwrap();
+        let mut tp_cache =
+            TensorParallelCache::new(false, DType::F32, &config, &tp_devices[0]).unwrap();
+
+        let input = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &dense_device).unwrap();
+
+        let dense_logits = dense_model.forward(&input, 0, &mut dense_cache).unwrap();
+        let tp_logits = tp_model.forward(&input, 0, &mut tp_cache).unwrap();
+
+        let dense_logits: Vec<f32> = dense_logits.flatten_all().unwrap().to_vec1().unwrap();
+        let tp_logits: Vec<f32> = tp_logits.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(dense_logits.len(), tp_logits.len());
+        for (a, b) in dense_logits.iter().zip(tp_logits.iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} != {b}");
+        }
+    }
+
+    #[test]
     fn tensor_parallel_llama_decodes_a_second_token_with_kv_cache() {
         let dir = tempfile::tempdir().unwrap();
         write_tachyon_tiny_fixture(dir.path()).unwrap();

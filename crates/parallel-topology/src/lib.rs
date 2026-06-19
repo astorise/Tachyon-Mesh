@@ -280,6 +280,28 @@ mod tests {
     }
 
     #[test]
+    fn vram_per_shard_exceeded_is_rejected() {
+        let mut p = plan(ParallelStrategy::TensorParallel, vec![0, 1]);
+        p.required_vram_bytes_per_device = 16_000_000_000;
+        let t = topology(2, InterconnectClass::HighBandwidth, 8_000_000_000);
+        assert_eq!(
+            validate_parallel_topology(&p, &t),
+            Err(TopologyError::VramPerShardExceeded {
+                required_bytes: 16_000_000_000,
+                available_bytes: 8_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn vram_per_shard_within_budget_is_accepted() {
+        let mut p = plan(ParallelStrategy::TensorParallel, vec![0, 1]);
+        p.required_vram_bytes_per_device = 4_000_000_000;
+        let t = topology(2, InterconnectClass::HighBandwidth, 8_000_000_000);
+        assert!(validate_parallel_topology(&p, &t).is_ok());
+    }
+
+    #[test]
     fn shape_check_rejects_single_device_parallel_plan() {
         let p = plan(ParallelStrategy::TensorParallel, vec![0]);
         assert!(validate_plan_shape(&p).is_err());
