@@ -41,7 +41,7 @@ jobs:
       # feature-independent (the cargo-feature ARG comes later in the
       # Dockerfile), so a cache hit here skips ~15 min of compilation.
       - name: Build tachyon-mesh image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           tags: tachyon-mesh:test
@@ -50,7 +50,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=docker-default
 
       - name: Build legacy-mock image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: legacy-runtime

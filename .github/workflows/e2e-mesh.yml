@@ -48,7 +48,7 @@ jobs:
       # feature-independent (the cargo-feature ARG comes later in the
       # Dockerfile), so a cache hit here skips ~15 min of compilation.
       - name: Build local Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           tags: ${{ env.IMAGE_TAG }}
