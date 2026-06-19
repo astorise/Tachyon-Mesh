@@ -10,8 +10,8 @@ default = ["ring"]
 # WASI-NN guest interface backed by our CandleOnnxBackend.
 ai-inference = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-onnx", "dep:candle-transformers",
-    "dep:lru", "dep:minijinja", "dep:minijinja-contrib", "dep:prost", "dep:tokenizers",
-    "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
+    "dep:lru", "dep:minijinja", "dep:minijinja-contrib", "dep:parallel-topology", "dep:prost",
+    "dep:tokenizers", "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
 ]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
@@ -46,6 +46,7 @@ candle-onnx = { version = "0.10.2", optional = true }
 # checkpoints. Weights are mmapped from the model directory at runtime — never
 # compiled into the Tachyon artifact.
 candle-transformers = { version = "0.10.0", optional = true, default-features = false }
+parallel-topology = { path = "../crates/parallel-topology", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = "2"
 flate2 = "1"
