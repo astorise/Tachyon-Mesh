@@ -1165,11 +1165,13 @@ mod hardware_strategy_tests {
     fn binding_without_hardware_strategy_defaults_to_single() {
         // A config that predates the field must deserialize to the default
         // single-device strategy.
-        let binding: IntegrityModelBinding = serde_json::from_str(
-            r#"{"alias":"m","path":"/models/m","device":"cpu"}"#,
-        )
-        .expect("legacy binding should deserialize");
-        assert_eq!(binding.hardware_strategy.distribution_mode, GpuDistribution::Single);
+        let binding: IntegrityModelBinding =
+            serde_json::from_str(r#"{"alias":"m","path":"/models/m","device":"cpu"}"#)
+                .expect("legacy binding should deserialize");
+        assert_eq!(
+            binding.hardware_strategy.distribution_mode,
+            GpuDistribution::Single
+        );
         assert!(binding.hardware_strategy.is_single());
     }
 
@@ -1207,8 +1209,7 @@ mod hardware_strategy_tests {
         };
         let json = serde_json::to_string(&binding).expect("serialize");
         assert!(json.contains("tensor_parallelism"));
-        let restored: IntegrityModelBinding =
-            serde_json::from_str(&json).expect("deserialize");
+        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, binding);
         assert!(!restored.hardware_strategy.is_single());
     }

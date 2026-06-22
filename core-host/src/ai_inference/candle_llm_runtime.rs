@@ -16,7 +16,7 @@ use tokenizers::Tokenizer;
 
 use crate::{GpuDistribution, HardwareStrategy};
 
-use super::parallel::{discover_cluster_topology, InProcessTransport, StageTransport};
+use super::parallel::discover_cluster_topology;
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
 use parallel_topology::{
@@ -163,6 +163,7 @@ fn pipeline_prefill_forward(
     model: &PipelineParallelLlama,
     input: &Tensor,
 ) -> candle_core::Result<Tensor> {
+    use super::parallel::{InProcessTransport, StageTransport};
     let transports: Vec<Box<dyn StageTransport>> = model
         .stages
         .iter()
@@ -650,7 +651,9 @@ impl CandleLlmRuntime {
                      (e.g. Mixtral) checkpoint"
                         .to_owned(),
             }),
-            GpuDistribution::Single => unreachable!("load_parallel is only reached for non-single strategies"),
+            GpuDistribution::Single => {
+                unreachable!("load_parallel is only reached for non-single strategies")
+            }
         }
     }
 
@@ -995,7 +998,9 @@ impl CandleLlmRuntime {
                     ..
                 } => {
                     let primary = &devices[0];
-                    let input = input.to_device(primary).expect("input should move to device");
+                    let input = input
+                        .to_device(primary)
+                        .expect("input should move to device");
                     let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
                         .expect("cache should build");
                     model
@@ -1975,9 +1980,10 @@ mod tests {
             "chat_template": template,
         });
         fs::write(dir.join(TOKENIZER_CONFIG_JSON), config.to_string()).expect("write config");
-        let reloaded = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
-            .expect("reload should not error")
-            .expect("fixture is supported");
+        let reloaded =
+            CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
+                .expect("reload should not error")
+                .expect("fixture is supported");
 
         let messages = vec![ChatTurn {
             role: "user".to_owned(),
@@ -2120,9 +2126,10 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("tachyon-gguf-{tag}-{}-{nanos}", std::process::id()));
         write_tachyon_tiny_gguf_fixture(&dir).expect("gguf fixture should be written");
-        let runtime = CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
-            .expect("gguf fixture should load without error")
-            .expect("gguf fixture is a supported Llama model");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
+                .expect("gguf fixture should load without error")
+                .expect("gguf fixture is a supported Llama model");
         (runtime, dir)
     }
 
@@ -2173,9 +2180,10 @@ mod tests {
         // Drop the broker sidecar: the host must still pick the GGUF path by
         // finding the `.gguf` file (operator-provisioned model).
         fs::remove_file(dir.join(MODEL_META_JSON)).expect("sidecar should be removed");
-        let runtime = CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
-            .expect("content inference should not error")
-            .expect("a directory with a .gguf file is a GGUF model");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
+                .expect("content inference should not error")
+                .expect("a directory with a .gguf file is a GGUF model");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
             .expect("inferred GGUF model should still run");
@@ -2194,8 +2202,9 @@ mod tests {
             serde_json::json!({ "format": "onnx" }).to_string(),
         )
         .expect("sidecar rewrite");
-        let error = CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
-            .expect_err("an unsupported declared format must be rejected");
+        let error =
+            CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
+                .expect_err("an unsupported declared format must be rejected");
         assert!(matches!(error, CandleLlmError::UnsupportedModel { .. }));
         let _ = fs::remove_dir_all(dir);
     }
@@ -2263,7 +2272,10 @@ mod tests {
         .expect("supported model");
 
         // The dispatch selected the parallel engine, not the dense path.
-        assert!(matches!(&*tp.inner, LoadedModel::Parallel(ParallelModel::Tensor { .. })));
+        assert!(matches!(
+            &*tp.inner,
+            LoadedModel::Parallel(ParallelModel::Tensor { .. })
+        ));
 
         let dense_logits = dense.debug_last_logits("hello mesh");
         let tp_logits = tp.debug_parallel_prefill_logits("hello mesh");
