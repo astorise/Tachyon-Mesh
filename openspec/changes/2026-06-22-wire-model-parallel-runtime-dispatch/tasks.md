@@ -1,38 +1,41 @@
 # Implementation Tasks
 
-- [ ] **Task 1: Carry `hardware-strategy` into `IntegrityModelBinding`**
-  - Add a `HardwareStrategy` struct (`distribution_mode`, `device_ids`, `stage_layer_ranges`, `expert_device_map`, `pipeline_depth`) and a `hardware_strategy` field on `IntegrityModelBinding` in `core-host/src/host_core/domain_types.rs`, with `#[serde(default, skip_serializing_if = "HardwareStrategy::is_single")]` so existing configs and fixtures are byte-for-byte unaffected.
-  - Map the already-validated WIT `hardware-strategy` record onto the emitted binding in `system-faas-config-api` (the strategy is currently validated structurally and then dropped).
-  - Regression: a config with no `hardware_strategy` deserializes to `single` and re-serializes without the field.
+- [x] **Task 1: Carry `hardware-strategy` into `IntegrityModelBinding`**
+  - Added `GpuDistribution` (single/tensor/pipeline/expert) and `HardwareStrategy` (`distribution_mode`, `device_ids`, `stage_layer_ranges`, `expert_device_map`, `pipeline_depth`) to `core-host/src/host_core/domain_types.rs`, plus a `hardware_strategy` field on `IntegrityModelBinding` with `#[serde(default, skip_serializing_if = "HardwareStrategy::is_single")]`.
+  - All ~29 existing binding literals (production + integration tests) updated with `hardware_strategy: Default::default()`.
+  - Verified by `hardware_strategy_tests` (3 tests): a legacy binding with no field deserializes to `single`; a default strategy is omitted from serialized output; a tensor-parallel strategy round-trips.
+  - **Note**: mapping the WIT `hardware-strategy` onto the emitted binding in `system-faas-config-api` was *not* changed here — that crate validates the plan shape in the Wasm guest and does not itself construct `IntegrityModelBinding` (the host-side `core-host` config path does). The host binding now carries the field; the config-api guest already validates plan shape (distributed change, Task 3).
 
-- [ ] **Task 2: `LoadedModel::Parallel` variant + engine construction**
-  - Add `LoadedModel::Parallel(ParallelModel)` and the `ParallelModel { Tensor, Pipeline, Expert }` enum in `candle_llm_runtime.rs`, boxing the engines.
-  - Add `ParallelExecutionPlan::from_strategy(&HardwareStrategy)` and `resolve_devices(&[u32])` (CUDA ordinals under the CUDA feature, `Device::Cpu` otherwise).
+- [x] **Task 2: `LoadedModel::Parallel` variant + engine construction**
+  - Added `LoadedModel::Parallel(ParallelModel)` with `ParallelModel { Tensor, Pipeline }` (boxed engines via the enum). `load_parallel` + `plan_from_strategy` + `resolve_devices` + `load_llama_config` added to `candle_llm_runtime.rs`.
+  - **Scope correction (no `Expert` variant)**: there is no full MoE model in the tree — only the verified per-layer `ExpertParallelMlp` primitive — so an `expert_parallelism` strategy is validated and device-placed but returns a typed `UnsupportedModel` error at load ("requires an MoE checkpoint loader, which is not yet implemented") rather than constructing a non-existent full model. A `ParallelModel::Expert` variant is intentionally omitted until a Mixtral-style loader lands.
 
-- [ ] **Task 3: Dispatch in `try_load` + generation routing**
-  - Thread a `&HardwareStrategy` parameter into `CandleLlmRuntime::try_load` and the call site in `core-host/src/ai_inference.rs:951` (the mock/ONNX/NVFP4 branches pass the default single strategy).
-  - When `distribution_mode != single`: build the plan, run hardware-aware `validate_parallel_topology` against `discover_cluster_topology()`, resolve devices, construct the matching engine, return `LoadedModel::Parallel`.
-  - Relax the line-258 device check to "reject GPU devices unless `candle-cuda` is compiled in"; the `single` path keeps the existing typed `UnsupportedModel` error verbatim on CUDA-less builds.
-  - Add a `Parallel` arm to the generation/decode dispatch. Pipeline parallelism returns prompt logits (prefill) and a typed "decode not yet supported for pipeline parallelism" error for token streaming; tensor and expert parallelism support full decode.
+- [x] **Task 3: Dispatch in `try_load` + generation routing**
+  - `try_load` gains a `&HardwareStrategy` parameter (call site in `core-host/src/ai_inference.rs:952` passes `&binding.hardware_strategy`). Factored a `try_load_with_topology` inner fn so tests can inject a `ClusterTopology` (production calls `discover_cluster_topology()`).
+  - When `distribution_mode != single`: builds the plan, runs hardware-aware `validate_parallel_topology` *before loading weights*, resolves devices, constructs `TensorParallelLlama` or `PipelineParallelLlama`.
+  - Line-258 device check is now `strategy.is_single() && requested_device != "cpu"` — the single dense path remains CPU-only and rejects a GPU request verbatim; the parallel path resolves its devices from the validated plan instead.
+  - Generation routing: `decode` gains a `Parallel` arm. Tensor parallelism drives the full `decode_loop` with a `TensorParallelCache` (decode_loop now takes an `input_device` so the input tensor lands on the engine's primary device). Pipeline parallelism returns a typed `Execution` error ("prefill-only, pending a per-stage KV cache across decode steps") rather than producing wrong output.
 
-- [ ] **Task 4: Activate the candle CUDA build**
-  - Change `nvfp4-cuda = ["ai-inference"]` to `nvfp4-cuda = ["ai-inference", "candle-cuda"]` in `core-host/Cargo.toml` so the FP4 GPU build pulls the existing `candle-cuda` feature (`candle-core/cuda` et al.). Keep `default = ["ring"]` CUDA-free.
-  - Confirm the default build, `--features ai-inference`, and `wasm32-wasip2` builds are unchanged (no CUDA toolchain required).
+- [x] **Task 4: Activate the candle CUDA build**
+  - `nvfp4-cuda = ["ai-inference"]` → `nvfp4-cuda = ["ai-inference", "candle-cuda"]` in `core-host/Cargo.toml`. `default = ["ring"]` stays CUDA-free.
+  - Verified the default build (`cargo check -p core-host`) and the `ai-inference` build/tests still compile and pass without a CUDA toolchain.
 
-- [ ] **Task 5: Real multi-GPU enumeration + VRAM (NVML)**
-  - Under `#[cfg(feature = "candle-cuda")]`, make `discover_cluster_topology()` enumerate all available CUDA ordinals and report real free VRAM per device via `nvml-wrapper` (new dep, gated on the CUDA feature). Read NVLink/PCIe interconnect class from NVML where available; default to `Pcie` when unknown.
-  - Without the feature, the function reports exactly today's single-CPU topology (regression-guarded).
+- [~] **Task 5: Real multi-GPU enumeration + VRAM (NVML)**
+  - **Enumeration (done)**: `discover_cluster_topology()`'s CUDA-ordinal enumeration loop is re-gated from `nvfp4-cuda` to `candle-cuda`; with Task 4's wire, `cuda_if_available` now actually opens devices, so the loop enumerates every real GPU on a `candle-cuda` build (it reported a single CPU device before only because the backend was never compiled in). `resolve_devices` maps plan device IDs to CUDA ordinals on that build, CPU stand-ins otherwise.
+  - **VRAM via NVML (deferred, hardware-gated)**: `free_vram_bytes` is still reported as `0` (unknown). Binding NVML (`nvml-wrapper`) cannot be compile-verified in this CPU-only environment without the CUDA toolchain, so to avoid shipping an unverifiable `candle-cuda` build it is left for the CUDA CI lane (#196/#197). `validate_parallel_topology` only enforces the VRAM check for a non-zero `required_vram_bytes_per_device`, so a `0` here never causes a spurious rejection.
 
-- [ ] **Task 6: NCCL all-reduce**
-  - Under `#[cfg(feature = "candle-cuda")]` with >1 real device, replace the CPU-staged summation in `RowParallelLinear::forward` with an NCCL all-reduce. Keep the CPU summation for single-device, CPU, and CUDA-less builds.
-  - The numeric contract is unchanged (NCCL sum == CPU sum within tolerance); the existing dense-equivalence tests remain the oracle.
+- [ ] **Task 6: NCCL all-reduce (deferred, hardware-gated)**
+  - The tensor-parallel all-reduce in `RowParallelLinear::forward` remains the CPU-staged summation, which is numerically identical to an NCCL sum and is the path exercised by every CPU/CI test. Replacing it with an NCCL all-reduce requires candle's `cudarc`/`comm` NCCL surface, which only compiles against a real CUDA toolchain; writing it blind here would ship an un-compile-verified `candle-cuda` build, so it is deferred to the CUDA CI lane. The numeric contract (output == dense reference within tolerance) is unchanged, so the existing equivalence tests remain the oracle once NCCL lands.
 
-- [ ] **Task 7: Tests**
-  - Dispatch selection (CPU stand-ins, no CUDA needed): a `tensor_parallelism` binding loads `LoadedModel::Parallel(Tensor(..))` and produces logits equal (within `1e-3`) to the dense `Safetensors` path on the same tiny checkpoint; same for `pipeline_parallelism` (prefill) and `expert_parallelism`.
-  - Topology rejection: a binding requesting more devices than discovered fails `try_load` with the typed topology error and loads no weights.
-  - Regression: a `single` / absent-strategy binding loads the existing `Safetensors`/`Gguf` path unchanged and a GPU request on a CUDA-less build still returns the original `UnsupportedModel` error verbatim.
-  - Hardware-gated lane (skipped without CUDA, run on the CI CUDA jobs #196/#197): NCCL all-reduce output matches the CPU-summation reference; `discover_cluster_topology()` reports >1 device with non-zero VRAM.
+- [x] **Task 7: Tests**
+  - `tensor_parallel_strategy_dispatches_and_matches_the_dense_runtime`: a `tensor_parallelism` binding loads `LoadedModel::Parallel(Tensor)`, its prefill logits match the dense runtime within `1e-3`, and full generation runs the decode loop.
+  - `pipeline_parallel_strategy_matches_dense_prefill_and_refuses_decode`: a `pipeline_parallelism` binding loads `LoadedModel::Parallel(Pipeline)`, prefill logits match the dense runtime within `1e-3`, and `generate` returns the typed prefill-only error.
+  - `expert_parallel_strategy_is_rejected_until_a_moe_loader_exists`: typed `UnsupportedModel` error mentioning MoE.
+  - `a_parallel_plan_exceeding_discovered_devices_is_rejected_before_loading`: a 2-device plan against a 1-device topology fails with the typed topology error and loads no weights.
+  - `single_strategy_still_rejects_a_gpu_device_request`: the dense path still returns the verbatim "cpu execution only" error for a GPU request.
+  - Plus the 3 `hardware_strategy_tests` serde regressions. All run on `Device::Cpu` stand-ins (no CUDA in CI), injecting a multi-device topology. Full suite: `core-host --features ai-inference ai_inference::` = 96 passed, 0 failed; `parallel-topology` = 13 passed.
 
-- [ ] **Task 8: Docs**
-  - Update the `README.md` roadmap bullet and the `wit/config-ai.wit` `gpu-distribution` doc comment (both currently say "no deployment wires `hardware-strategy` into model loading yet") to state that the dispatch path now selects the parallel engines, while documenting the remaining P1 gaps (pipeline decode KV-cache, threaded stage overlap) honestly.
-  - Update `CHANGELOG.md` with the runtime now selecting TP/PP/MoE engines and the `nvfp4-cuda` → `candle-cuda` activation.
+- [x] **Task 8: Docs**
+  - `wit/config-ai.wit` `gpu-distribution` comment rewritten: the strategy is now wired into model loading, with the per-mode status (tensor full decode / pipeline prefill-only / expert pending MoE loader) and the CUDA-lane caveat stated plainly.
+  - `README.md` roadmap updated: a new bullet marks the dispatch path as landed and documents the remaining follow-ups (pipeline decode, MoE loader, CUDA/NCCL).
+  - `CHANGELOG.md` "Unreleased" gains the dispatch + `nvfp4-cuda`→`candle-cuda` entry.

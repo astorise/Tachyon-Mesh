@@ -58,11 +58,15 @@ enum LoadedModel {
 }
 
 enum ParallelModel {
-    Tensor(Box<TensorParallelLlama>),
-    Pipeline(Box<PipelineParallelLlama>),
-    Expert(Box<ExpertParallelMlp /* per-layer; composed into a full forward */>),
+    Tensor { model: Box<TensorParallelLlama>, config: Config, eos_tokens: Vec<u32>, devices: Vec<Device> },
+    Pipeline { model: Box<PipelineParallelLlama> },
+    // No `Expert` variant: there is no full MoE model in the tree, only the
+    // verified per-layer `ExpertParallelMlp` primitive. An `expert_parallelism`
+    // strategy is validated and device-placed, then rejected at load with a
+    // typed error until a Mixtral-style loader lands (see below).
 }
 ```
+(Boxed so the enum's largest variant stays small — `clippy::large_enum_variant`.)
 
 `try_load` is threaded a `&HardwareStrategy` (new parameter from the `ai_inference.rs` call site, defaulting to single for the mock/ONNX/NVFP4 branches that don't use it). The branch is:
 
@@ -79,16 +83,16 @@ match strategy.distribution_mode {
         let devices = resolve_devices(&plan.device_ids)?;
         // 4. Construct the matching engine from the on-disk checkpoint.
         let model = match mode {
-            tensor   => ParallelModel::Tensor(Box::new(TensorParallelLlama::load(vb, &cfg, &devices)?)),
-            pipeline => ParallelModel::Pipeline(Box::new(PipelineParallelLlama::load(.., &plan.stage_layer_ranges, &devices)?)),
-            expert   => ParallelModel::Expert(/* detect_expert_count per layer, build ExpertPlacementPlan from expert_device_map */),
+            tensor   => ParallelModel::Tensor { model: Box::new(TensorParallelLlama::load(vb, &cfg, &devices)?), .. },
+            pipeline => ParallelModel::Pipeline { model: Box::new(PipelineParallelLlama::load(.., &plan.stage_layer_ranges, &devices)?) },
+            expert   => return Err(/* typed: full MoE checkpoint loader not yet implemented */),
         };
         LoadedModel::Parallel(model)
     }
 }
 ```
 
-Generation (`forward`/decode) gets a parallel arm alongside the existing `Safetensors`/`Gguf` arms, delegating to the engine's `forward`. The pipeline arm is **prefill-only today** (the engine itself is prefill-only); it returns logits for the prompt and a typed "decode not yet supported for pipeline parallelism" error if asked to stream tokens, rather than silently producing wrong output. Tensor and expert parallelism support full decode (TP carries the existing `TensorParallelCache`).
+Generation (`forward`/decode) gets a parallel arm alongside the existing `Safetensors`/`Gguf` arms, delegating to the engine's `forward`. **Tensor** parallelism carries the existing `TensorParallelCache`, so it supports the full autoregressive decode loop. The **pipeline** arm is **prefill-only today** (the engine itself is prefill-only): generation returns a typed "decode not yet wired for pipeline parallelism" error rather than silently producing wrong output, while prefill logits are proven equal to the dense reference. **Expert** parallelism never constructs a model — there is no full MoE loader — so it is rejected at load with a typed error after the plan is validated and placed.
 
 ### Why the line-258 check moves rather than disappears
 The `requested_device != "cpu"` rejection stays the correct behaviour on a **CUDA-less build**: without `candle-core/cuda`, asking for a GPU genuinely can't be served. The check becomes "reject a GPU device unless the CUDA backend is compiled in," so CPU/CI builds keep the exact same typed error and the parallel path on those builds runs on `Device::Cpu` stand-ins (as every existing parallel test already does).

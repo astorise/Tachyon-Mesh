@@ -19,11 +19,11 @@ When a model deployment declares `hardware_strategy.distribution_mode` other tha
 - **AND** a prefill request returns prompt logits equivalent to the dense reference
 - **AND** a token-streaming (decode) request returns a typed "decode not yet supported for pipeline parallelism" error rather than incorrect output
 
-#### Scenario: An expert-parallel deployment is dispatched to the MoE engine
-- **GIVEN** a model binding whose `distribution_mode` is `expert_parallelism` and a checkpoint declaring expert tensors
+#### Scenario: An expert-parallel deployment is validated but refused until a MoE loader exists
+- **GIVEN** a model binding whose `distribution_mode` is `expert_parallelism`
 - **WHEN** the runtime loads the model
-- **THEN** the model is loaded as an expert-parallel engine using the binding's `expert_device_map`
-- **AND** each token is routed only to the device hosting its selected expert
+- **THEN** the plan is validated against the discovered hardware topology
+- **AND** the load returns a typed error indicating that a full MoE checkpoint loader is not yet implemented (only the numerically-verified per-expert `ExpertParallelMlp` primitive exists), rather than constructing a non-existent full MoE model or silently downgrading to the dense path
 
 #### Scenario: Single-device deployments are byte-for-byte unaffected
 - **WHEN** a model binding declares `distribution_mode: single` or carries no `hardware_strategy`
@@ -47,11 +47,13 @@ The runtime SHALL accept a GPU `device` request only on a build where the candle
 - **WHEN** a binding requests a non-`cpu` device on the `single` path
 - **THEN** `try_load` returns the existing `UnsupportedModel` error verbatim ("the Candle LLM runtime supports `cpu` execution only")
 
-#### Scenario: Multi-GPU topology and NCCL all-reduce are exercised on real hardware
+#### Scenario: Multi-GPU topology is enumerated on a CUDA build
 - **GIVEN** a build with the `candle-cuda` feature on a host with more than one CUDA device
 - **WHEN** `discover_cluster_topology()` runs
-- **THEN** it enumerates every available CUDA device with non-zero reported free VRAM
-- **AND** a tensor-parallel row-parallel reduction across those devices uses an NCCL all-reduce whose output matches the CPU-summation reference within tolerance
+- **THEN** it enumerates every available CUDA device (the enumeration loop is live once the candle CUDA backend is compiled in)
+- **AND** per-device free-VRAM telemetry (NVML) and the NCCL all-reduce are validated on the CUDA CI lane as hardware-gated follow-ups (see `tasks.md` Tasks 5–6); the CPU-staged summation remains the numerically-equivalent reduction on every non-CUDA build
 
 ## Implementation status as of this change
-This change wires the parallel engines delivered by `2026-06-19-distributed-model-parallel-inference` into the live model-load path and activates the candle CUDA build they target. Known limits carried forward intentionally: pipeline parallelism is prefill-only (no decode-time per-stage KV cache) and its scheduler does not yet produce real wall-clock stage overlap; MoE routing is top-1; ONNX/NVFP4 GPU forward passes remain the scope of `gpu-accelerated-inference-execution`. The NCCL all-reduce and real multi-GPU enumeration are only reachable on a `candle-cuda` build and are exercised by a hardware-gated CI lane.
+This change wires the parallel engines delivered by `2026-06-19-distributed-model-parallel-inference` into the live model-load path and activates the candle CUDA *build* they target. Delivered and CPU-tested: tensor-parallel selection + full decode, pipeline-parallel selection + prefill (decode returns a typed error), expert-parallel validation + placement (load returns a typed error pending a full MoE loader), hardware-aware topology rejection before any weight load, and the `nvfp4-cuda`→`candle-cuda` feature wire (which makes `discover_cluster_topology`'s GPU enumeration live on a CUDA build).
+
+Deferred, hardware-gated (cannot be compile-verified without a CUDA toolchain, so left for the CUDA CI lane #196/#197): per-device free-VRAM telemetry via NVML (`free_vram_bytes` is reported as `0`/unknown), and the NCCL all-reduce in `RowParallelLinear::forward` (still the CPU-staged summation, numerically identical and the path every CI test exercises). Known limits carried forward intentionally: pipeline parallelism is prefill-only (no decode-time per-stage KV cache) and its scheduler does not yet produce real wall-clock stage overlap; MoE routing is top-1 and has no full-model loader; ONNX/NVFP4 GPU forward passes remain the scope of `gpu-accelerated-inference-execution`.

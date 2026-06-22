@@ -284,6 +284,7 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
         device: ModelDevice::Cuda,
         qos: RouteQos::RealTime,
         dynamic: false,
+        hardware_strategy: Default::default(),
     }];
     let mut gossip_route = system_targeted_route("/system/gossip", "gossip");
     let peer_urls = format!("http://{wrong_address},http://{right_address}");
@@ -463,6 +464,7 @@ async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
         device: ModelDevice::Cuda,
         qos: RouteQos::RealTime,
         dynamic: false,
+        hardware_strategy: Default::default(),
     }];
     let mut gossip_route = system_targeted_route("/system/gossip", "gossip");
     let peer_urls = format!("http://{peer_address}");
@@ -783,6 +785,7 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
             dynamic: false,
+            hardware_strategy: Default::default(),
         },
         IntegrityModelBinding {
             alias: "gpu-batch".to_owned(),
@@ -790,6 +793,7 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
             device: ModelDevice::Cuda,
             qos: RouteQos::Batch,
             dynamic: false,
+            hardware_strategy: Default::default(),
         },
     ];
     let config = IntegrityConfig {
@@ -895,6 +899,7 @@ async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold()
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
             dynamic: false,
+            hardware_strategy: Default::default(),
         },
         IntegrityModelBinding {
             alias: "gpu-batch".to_owned(),
@@ -902,6 +907,7 @@ async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold()
             device: ModelDevice::Cuda,
             qos: RouteQos::Batch,
             dynamic: false,
+            hardware_strategy: Default::default(),
         },
     ];
     let config = IntegrityConfig {

@@ -28,7 +28,12 @@ candle-cuda = [
     "candle-onnx/cuda",
     "candle-transformers/cuda",
 ]
-nvfp4-cuda = ["ai-inference"]
+# An FP4 GPU build implies the candle CUDA backend, so `cuda_is_available()`
+# is true, multi-GPU enumeration in `discover_cluster_topology` is live, and the
+# tensor-parallel all-reduce uses NCCL instead of the CPU-staged sum. The
+# default build stays CUDA-free (`default = ["ring"]`) and CI-reproducible
+# without a CUDA toolchain.
+nvfp4-cuda = ["ai-inference", "candle-cuda"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
 ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]

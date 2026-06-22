@@ -351,6 +351,7 @@ impl AiInferenceRuntime {
             device: crate::ModelDevice::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
+            hardware_strategy: Default::default(),
         };
         let backend_model: Arc<dyn BackendModel> =
             Arc::new(CandleBackendModel::load(&binding).map_err(|error| error.to_string())?);
@@ -952,6 +953,7 @@ impl CandleBackendModel {
                     &binding.alias,
                     &binding.path,
                     binding.device.as_str(),
+                    &binding.hardware_strategy,
                 )? {
                     Some(model) => CandleBackendModelKind::TextGeneration(Box::new(model)),
                     None => {
@@ -1879,6 +1881,7 @@ mod tests {
                 device: ModelDevice::Cuda,
                 qos: RouteQos::Standard,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             },
             IntegrityModelBinding {
                 alias: "tiny".to_owned(),
@@ -1886,6 +1889,7 @@ mod tests {
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Standard,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             },
         ];
         let config = IntegrityConfig {
@@ -2177,6 +2181,7 @@ mod tests {
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
             dynamic: true,
+            hardware_strategy: Default::default(),
         }];
         let config = IntegrityConfig {
             routes: vec![route],
@@ -2209,6 +2214,7 @@ mod tests {
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
+            hardware_strategy: Default::default(),
         }];
         let config = IntegrityConfig {
             routes: vec![route],
@@ -2282,6 +2288,7 @@ mod tests {
                 device: ModelDevice::Cuda,
                 qos: RouteQos::Batch,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             })
             .expect("batch model should load")
             .with_mock_latency(Duration::from_millis(20)),
@@ -2293,6 +2300,7 @@ mod tests {
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             })
             .expect("realtime model should load")
             .with_mock_latency(Duration::from_millis(20)),
@@ -2357,6 +2365,7 @@ mod tests {
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             },
             IntegrityModelBinding {
                 alias: "tiny".to_owned(),
@@ -2364,6 +2373,7 @@ mod tests {
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Batch,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             },
         ];
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
@@ -2415,6 +2425,7 @@ mod tests {
             device: ModelDevice::Cuda,
             qos: RouteQos::RealTime,
             dynamic: false,
+            hardware_strategy: Default::default(),
         }];
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![route],
@@ -2446,6 +2457,7 @@ mod tests {
                 device: ModelDevice::Cpu,
                 qos: RouteQos::Standard,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             },
             IntegrityModelBinding {
                 alias: "gpu-llama".to_owned(),
@@ -2453,6 +2465,7 @@ mod tests {
                 device: ModelDevice::Cuda,
                 qos: RouteQos::RealTime,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             },
             IntegrityModelBinding {
                 alias: "npu-whisper".to_owned(),
@@ -2460,6 +2473,7 @@ mod tests {
                 device: ModelDevice::Npu,
                 qos: RouteQos::RealTime,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             },
             IntegrityModelBinding {
                 alias: "tpu-embed".to_owned(),
@@ -2467,6 +2481,7 @@ mod tests {
                 device: ModelDevice::Tpu,
                 qos: RouteQos::Batch,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             },
         ];
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
@@ -2638,6 +2653,7 @@ mod tests {
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
+            hardware_strategy: Default::default(),
         }];
         IntegrityConfig {
             routes: vec![route],
@@ -2653,6 +2669,7 @@ mod tests {
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
+            hardware_strategy: Default::default(),
         }];
         IntegrityConfig {
             routes: vec![route],
