@@ -251,6 +251,24 @@ jobs:
         with:
           shared-key: cuda-quality
 
+      # The ARC GPU runner ships the CUDA toolkit under /usr/local/cuda* but does
+      # not always expose `nvcc` on PATH for the job's non-login shell, which made
+      # cudarc's build script fail with "nvcc --version failed". Locate the
+      # toolkit and export its bin dir (plus CUDA_PATH) for all downstream steps.
+      - name: Put CUDA toolkit on PATH
+        run: |
+          for cuda in "${CUDA_HOME:-}" "${CUDA_PATH:-}" /usr/local/cuda /usr/local/cuda-*; do
+            if [ -n "$cuda" ] && [ -x "$cuda/bin/nvcc" ]; then
+              echo "Found CUDA toolkit at $cuda"
+              echo "$cuda/bin" >> "$GITHUB_PATH"
+              echo "CUDA_PATH=$cuda" >> "$GITHUB_ENV"
+              echo "CUDA_HOME=$cuda" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+          echo "::error::nvcc not found under /usr/local/cuda*; the CUDA toolkit is not installed on this runner" >&2
+          exit 1
+
       - name: Verify CUDA toolchain
         run: |
           nvidia-smi
@@ -446,7 +464,12 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          - "--all-features"
+          # "All CPU features": every feature except core-host/candle-cuda, which
+          # pulls in cudarc and requires `nvcc` (validated separately by the
+          # cuda-quality job on the GPU runner). A bare `--all-features` would
+          # break on these CPU-only runners. Mirrors publish-docker-images'
+          # "-all-features" variant.
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
@@ -471,7 +494,7 @@ jobs:
           save-if: ${{ matrix.features == '' }}
 
       - name: Install FIPS build dependencies
-        if: matrix.features == '--all-features'
+        if: contains(matrix.features, 'fips')
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
@@ -503,7 +526,12 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          - "--all-features"
+          # "All CPU features": every feature except core-host/candle-cuda, which
+          # pulls in cudarc and requires `nvcc` (validated separately by the
+          # cuda-quality job on the GPU runner). A bare `--all-features` would
+          # break on these CPU-only runners. Mirrors publish-docker-images'
+          # "-all-features" variant.
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
@@ -526,7 +554,7 @@ jobs:
           save-if: ${{ matrix.features == '' }}
 
       - name: Install FIPS build dependencies
-        if: matrix.features == '--all-features'
+        if: contains(matrix.features, 'fips')
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
@@ -548,7 +576,7 @@ jobs:
           case "${{ matrix.features }}" in
             "")                                                        label="default" ;;
             "--no-default-features")                                   label="no-default" ;;
-            "--all-features")                                          label="all" ;;
+            "--features ai-inference,"*)                               label="all" ;;
             "--features http3")                                        label="http3" ;;
             "--features rate-limit,resiliency,mtls,secrets-vault,websockets") label="security" ;;
             *)                                                         label="custom" ;;
