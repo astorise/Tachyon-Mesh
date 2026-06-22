@@ -99,15 +99,16 @@ The `requested_device != "cpu"` rejection stays the correct behaviour on a **CUD
 
 ## 4. CUDA build activation (`Cargo.toml` + `parallel.rs`)
 
-The audit reported `nvfp4-cuda` doesn't enable candle CUDA — correct, but note a `candle-cuda` feature **already exists** and does enable `candle-core/cuda` + `candle-nn/cuda` + `candle-onnx/cuda` + `candle-transformers/cuda`. The fix is to connect the wires, not author them:
+The audit reported `nvfp4-cuda` doesn't enable candle CUDA — correct, but note a `candle-cuda` feature **already exists** and does enable `candle-core/cuda` + `candle-nn/cuda` + `candle-onnx/cuda` + `candle-transformers/cuda`. So the CUDA backend is already *activatable*; this change makes the dispatch, multi-GPU enumeration, and all-reduce key off it.
+
+**Why not make `nvfp4-cuda` pull `candle-cuda`?** That was the first attempt, but it broke the standard feature matrix: CI builds an all-features combo (including `nvfp4-cuda`) on a non-CUDA runner, and pulling `candle-core/cuda` drags in `cudarc`, whose build script requires `nvcc`. `nvfp4-cuda` must therefore stay CPU-buildable. The CUDA activation lives entirely behind the pre-existing `candle-cuda` feature:
 
 ```toml
-# before:  nvfp4-cuda = ["ai-inference"]
-# after:
-nvfp4-cuda = ["ai-inference", "candle-cuda"]   # FP4 GPU build implies candle CUDA
+nvfp4-cuda = ["ai-inference"]   # unchanged — stays in the non-CUDA matrix
+# candle-cuda (pre-existing) = ["ai-inference", "candle-core/cuda", ...]  — the CUDA activation
 ```
 
-`default = ["ring"]` stays CUDA-free so the standard build and CI remain CPU-only and reproducible without a GPU toolchain.
+`default = ["ring"]` stays CUDA-free so the standard build and CI remain CPU-only and reproducible without a GPU toolchain; `candle-cuda` is built and clippy-checked by the dedicated `cuda-quality` CI job.
 
 Two runtime changes behind `#[cfg(feature = "candle-cuda")]`:
 

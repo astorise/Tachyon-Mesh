@@ -17,8 +17,9 @@
   - Generation routing: `decode` gains a `Parallel` arm. Tensor parallelism drives the full `decode_loop` with a `TensorParallelCache` (decode_loop now takes an `input_device` so the input tensor lands on the engine's primary device). Pipeline parallelism returns a typed `Execution` error ("prefill-only, pending a per-stage KV cache across decode steps") rather than producing wrong output.
 
 - [x] **Task 4: Activate the candle CUDA build**
-  - `nvfp4-cuda = ["ai-inference"]` → `nvfp4-cuda = ["ai-inference", "candle-cuda"]` in `core-host/Cargo.toml`. `default = ["ring"]` stays CUDA-free.
-  - Verified the default build (`cargo check -p core-host`) and the `ai-inference` build/tests still compile and pass without a CUDA toolchain.
+  - The candle CUDA backend is activated by the pre-existing `candle-cuda` feature (`candle-core/cuda` + friends), which the dispatch, enumeration, and all-reduce gate on (`#[cfg(feature = "candle-cuda")]`). `default = ["ring"]` stays CUDA-free.
+  - **Correction (CI)**: an initial attempt wired `nvfp4-cuda = ["ai-inference", "candle-cuda"]`, but that broke the standard feature matrix — CI builds an all-features combo (including `nvfp4-cuda`) on a non-CUDA runner, and pulling `candle-core/cuda` drags in `cudarc`, whose build script requires `nvcc`. Reverted: `nvfp4-cuda` stays `["ai-inference"]` (CPU-buildable, remains in the matrix); CUDA lives entirely behind `candle-cuda`, exercised by the dedicated `cuda-quality` job.
+  - Verified the default build, the `ai-inference` build/tests, and the full feature matrix compile without a CUDA toolchain; `cuda-quality` (clippy `--features candle-cuda`) is green on the CUDA lane.
 
 - [~] **Task 5: Real multi-GPU enumeration + VRAM (NVML)**
   - **Enumeration (done)**: `discover_cluster_topology()`'s CUDA-ordinal enumeration loop is re-gated from `nvfp4-cuda` to `candle-cuda`; with Task 4's wire, `cuda_if_available` now actually opens devices, so the loop enumerates every real GPU on a `candle-cuda` build (it reported a single CPU device before only because the backend was never compiled in). `resolve_devices` maps plan device IDs to CUDA ordinals on that build, CPU stand-ins otherwise.
@@ -38,4 +39,4 @@
 - [x] **Task 8: Docs**
   - `wit/config-ai.wit` `gpu-distribution` comment rewritten: the strategy is now wired into model loading, with the per-mode status (tensor full decode / pipeline prefill-only / expert pending MoE loader) and the CUDA-lane caveat stated plainly.
   - `README.md` roadmap updated: a new bullet marks the dispatch path as landed and documents the remaining follow-ups (pipeline decode, MoE loader, CUDA/NCCL).
-  - `CHANGELOG.md` "Unreleased" gains the dispatch + `nvfp4-cuda`→`candle-cuda` entry.
+  - `CHANGELOG.md` "Unreleased" gains the dispatch + `candle-cuda` activation entry.
