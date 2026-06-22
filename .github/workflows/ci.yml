@@ -251,10 +251,63 @@ jobs:
         with:
           shared-key: cuda-quality
 
+      # The ARC GPU runner on Talos has the NVIDIA driver (nvidia-smi works) but
+      # cudarc/candle-kernels need `nvcc` from the CUDA toolkit at build time.
+      # The toolkit's bin dir is not always on PATH for the job's non-login
+      # shell, so discover nvcc (PATH, then the usual roots, then a bounded
+      # filesystem search) and export its bin dir + CUDA_PATH/CUDA_HOME. Print
+      # diagnostics so a genuinely missing toolkit is easy to spot in the log.
+      - name: Put CUDA toolkit on PATH
+        run: |
+          echo "PATH=$PATH"
+          echo "CUDA_HOME=${CUDA_HOME:-<unset>} CUDA_PATH=${CUDA_PATH:-<unset>}"
+          nvcc_bin=""
+          # 1. Already on PATH?
+          if command -v nvcc >/dev/null 2>&1; then
+            nvcc_bin="$(command -v nvcc)"
+          fi
+          # 2. Well-known install roots.
+          if [ -z "$nvcc_bin" ]; then
+            for cuda in "${CUDA_HOME:-}" "${CUDA_PATH:-}" \
+                        /usr/local/cuda /usr/local/cuda-* \
+                        /opt/cuda /opt/cuda-* /usr/lib/cuda /usr/cuda; do
+              if [ -n "$cuda" ] && [ -x "$cuda/bin/nvcc" ]; then
+                nvcc_bin="$cuda/bin/nvcc"
+                break
+              fi
+            done
+          fi
+          # 3. Last resort: bounded search of likely roots.
+          if [ -z "$nvcc_bin" ]; then
+            nvcc_bin="$(find /usr /opt -maxdepth 5 -name nvcc -type f -executable 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "$nvcc_bin" ]; then
+            echo "::error::nvcc not found on this runner. The CUDA *toolkit* (not just the driver) must be installed in the arc-gpu-runners image. nvidia-smi alone is not enough — candle-kernels/cudarc compile .cu kernels with nvcc at build time."
+            echo "--- diagnostics ---"
+            echo "ls /usr/local:"; ls -la /usr/local 2>/dev/null || true
+            echo "ls /opt:";       ls -la /opt 2>/dev/null || true
+            echo "dpkg cuda pkgs:"; dpkg -l 2>/dev/null | grep -i cuda || echo "  (none)"
+            exit 1
+          fi
+          cuda_root="$(dirname "$(dirname "$nvcc_bin")")"
+          echo "Found nvcc at $nvcc_bin (CUDA root: $cuda_root)"
+          echo "$(dirname "$nvcc_bin")" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=$cuda_root" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$cuda_root" >> "$GITHUB_ENV"
+
       - name: Verify CUDA toolchain
         run: |
           nvidia-smi
           nvcc --version
+
+      # candle-onnx's build script compiles the ONNX .proto and needs `protoc`.
+      # The CPU jobs get it from `apt-get install protobuf-compiler`, but this
+      # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
+      # distro-agnostic way. Skipped if the runner image already ships protoc.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check Candle CUDA host build
         run: cargo check -p core-host --features candle-cuda
@@ -446,7 +499,12 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          - "--all-features"
+          # "All CPU features": every feature except core-host/candle-cuda, which
+          # pulls in cudarc and requires `nvcc` (validated separately by the
+          # cuda-quality job on the GPU runner). A bare `--all-features` would
+          # break on these CPU-only runners. Mirrors publish-docker-images'
+          # "-all-features" variant.
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
@@ -471,7 +529,7 @@ jobs:
           save-if: ${{ matrix.features == '' }}
 
       - name: Install FIPS build dependencies
-        if: matrix.features == '--all-features'
+        if: contains(matrix.features, 'fips')
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
@@ -503,7 +561,12 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          - "--all-features"
+          # "All CPU features": every feature except core-host/candle-cuda, which
+          # pulls in cudarc and requires `nvcc` (validated separately by the
+          # cuda-quality job on the GPU runner). A bare `--all-features` would
+          # break on these CPU-only runners. Mirrors publish-docker-images'
+          # "-all-features" variant.
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
@@ -526,7 +589,7 @@ jobs:
           save-if: ${{ matrix.features == '' }}
 
       - name: Install FIPS build dependencies
-        if: matrix.features == '--all-features'
+        if: contains(matrix.features, 'fips')
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
@@ -548,7 +611,7 @@ jobs:
           case "${{ matrix.features }}" in
             "")                                                        label="default" ;;
             "--no-default-features")                                   label="no-default" ;;
-            "--all-features")                                          label="all" ;;
+            "--features ai-inference,"*)                               label="all" ;;
             "--features http3")                                        label="http3" ;;
             "--features rate-limit,resiliency,mtls,secrets-vault,websockets") label="security" ;;
             *)                                                         label="custom" ;;
