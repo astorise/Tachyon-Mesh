@@ -201,8 +201,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::unwrap_used
+      - name: Lint workspace (CPU features)
+        # Keep the general quality gate on ubuntu-latest CPU runners: CUDA is
+        # validated separately by the arc-gpu-runners job below. `--all-features`
+        # would enable core-host/candle-cuda and require nvcc on this runner.
+        run: cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
 
       - name: Cross-Layer Validation
         run: bash scripts/validate_cross_layer.sh
@@ -227,6 +230,37 @@ jobs:
 
       - name: Check s3-persistence host build
         run: cargo check -p core-host --features s3-persistence
+
+  # ── 3b. CUDA quality gate (requires the self-hosted ARC GPU runner) ────────
+  # This job owns the CUDA-enabled Candle build so the default ubuntu-latest
+  # quality job can stay CPU-only while still validating GPU ONNX inference code.
+  cuda-quality:
+    runs-on: arc-gpu-runners
+    env:
+      CARGO_TERM_COLOR: always
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFLAGS: "-D dead_code"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cuda-quality
+
+      - name: Verify CUDA toolchain
+        run: |
+          nvidia-smi
+          nvcc --version
+
+      - name: Check Candle CUDA host build
+        run: cargo check -p core-host --features candle-cuda
+
+      - name: Lint Candle CUDA host build
+        run: cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos
