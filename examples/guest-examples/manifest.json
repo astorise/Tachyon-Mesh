@@ -95,39 +95,6 @@
       "max_concurrency": 100,
       "version": "0.0.0",
       "dependencies": {}
-    },
-    {
-      "path": "/v1/models",
-      "role": "user",
-      "name": "openai-models",
-      "targets": [{ "module": "guest-openai", "weight": 100 }],
-      "min_instances": 0,
-      "max_concurrency": 100,
-      "version": "1.0.0",
-      "scopes": { "kv": ["ai-models-registry"] },
-      "dependencies": {}
-    },
-    {
-      "path": "/v1/chat/completions",
-      "role": "user",
-      "name": "openai-chat",
-      "targets": [{ "module": "guest-openai", "weight": 100 }],
-      "min_instances": 0,
-      "max_concurrency": 100,
-      "version": "1.0.0",
-      "scopes": { "kv": ["ai-models-registry"] },
-      "dependencies": {}
-    },
-    {
-      "path": "/internal/guest-openai/register",
-      "role": "user",
-      "name": "openai-registry",
-      "targets": [{ "module": "guest-openai", "weight": 100 }],
-      "min_instances": 0,
-      "max_concurrency": 100,
-      "version": "1.0.0",
-      "scopes": { "kv": ["ai-models-registry"] },
-      "dependencies": {}
     }
   ]
 }
