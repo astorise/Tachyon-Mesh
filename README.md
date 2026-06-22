@@ -236,6 +236,7 @@ scripts/build-guest-artifacts.sh examples/guest-example
 ## 🗺 Roadmap
 
 - [x] VRAM-aware routing and multi-GPU optimization.
+- [x] Tensor/pipeline/expert-parallel inference engines (intra-node tensor sharding, cross-node pipeline stages, MoE expert routing — see `openspec/changes/2026-06-19-distributed-model-parallel-inference`). Not yet wired into the live model-load path; see that change's `tasks.md` for the remaining dispatch-path gap.
 - [x] Distributed KV-Store (Partitioning V2).
 - [x] Tauri Interface (Phase 3: Routing Dashboards complete).
 - [ ] **Upcoming**: GPU pressure-based auto-scaling (KEDA integration).

@@ -1252,6 +1252,7 @@ dependencies = [
  "moka",
  "notify",
  "object_store",
+ "parallel-topology",
  "prometheus",
  "proptest",
  "prost 0.14.4",
@@ -5934,6 +5935,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "parallel-topology"
+version = "1.0.0"
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8154,6 +8159,7 @@ dependencies = [
 name = "system-faas-config-api"
 version = "1.0.0"
 dependencies = [
+ "parallel-topology",
  "serde",
  "serde_json",
  "wit-bindgen 0.58.0",

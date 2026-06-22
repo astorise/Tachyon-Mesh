@@ -9,20 +9,34 @@ mod bindings {
     export!(Component);
 }
 
+// The `*_contract` modules below pull in WIT-generated *types* for config
+// domains that this component does not (yet) export directly. Each
+// `generate!` invocation embeds a component-type requirement for its own
+// world in the compiled object, independent of whether `export!` is called
+// for it — so without `stubs`, `wasm-component-ld` fails to encode the
+// final component because those exports are declared but never implemented.
+// `stubs` auto-generates an `unreachable!()`-bodied `Stub` and calls
+// `export!(Stub)` for us, satisfying the linker while keeping these domains
+// inert (consistent with their current scaffold-only status). `ai_contract`
+// is the exception: its `apply-model-deployment` export is implemented for
+// real below, so it is not stubbed.
 #[allow(dead_code)]
 mod routing_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-routing.wit",
         world: "traffic-management-config",
+        stubs,
     });
 }
 
-#[allow(dead_code)]
 mod ai_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-ai.wit",
         world: "ai-orchestration-config",
     });
+
+    use super::AiConfigComponent;
+    export!(AiConfigComponent);
 }
 
 #[allow(dead_code)]
@@ -30,6 +44,7 @@ mod assets_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-assets.wit",
         world: "air-gapped-asset-config",
+        stubs,
     });
 }
 
@@ -38,6 +53,7 @@ mod cache_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-cache.wit",
         world: "distributed-cache-config",
+        stubs,
     });
 }
 
@@ -46,6 +62,7 @@ mod fleet_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-fleet.wit",
         world: "fleet-profile-config",
+        stubs,
     });
 }
 
@@ -54,6 +71,7 @@ mod hardware_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-hardware.wit",
         world: "hardware-acceleration-config",
+        stubs,
     });
 }
 
@@ -62,6 +80,7 @@ mod topology_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-topology.wit",
         world: "mesh-topology-config",
+        stubs,
     });
 }
 
@@ -70,6 +89,7 @@ mod observability_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-observability.wit",
         world: "observability-compute-config",
+        stubs,
     });
 }
 
@@ -78,6 +98,7 @@ mod resilience_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-resilience.wit",
         world: "resilience-chaos-config",
+        stubs,
     });
 }
 
@@ -86,6 +107,7 @@ mod security_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-security.wit",
         world: "security-identity-config",
+        stubs,
     });
 }
 
@@ -94,6 +116,7 @@ mod storage_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-storage.wit",
         world: "storage-state-config",
+        stubs,
     });
 }
 
@@ -102,6 +125,7 @@ mod workloads_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-workloads.wit",
         world: "workload-orchestration-config",
+        stubs,
     });
 }
 
@@ -110,6 +134,7 @@ mod rbac_contract {
     wit_bindgen::generate!({
         path: "../../wit/config-rbac.wit",
         world: "control-plane-rbac-config",
+        stubs,
     });
 }
 
@@ -340,6 +365,8 @@ const ENVIRONMENT_HEADER: &str = "x-tachyon-environment";
 
 struct Component;
 
+struct AiConfigComponent;
+
 pub fn validate_traffic_config<T>(_config: T) -> Result<(), String> {
     Ok(())
 }
@@ -350,6 +377,59 @@ pub fn validate_ai_config<T>(_config: T) -> Result<(), String> {
 
 pub fn apply_model_deployment<T>(_deployment: T) -> Result<(), String> {
     Ok(())
+}
+
+/// Maps a WIT `hardware-strategy` record into the shared, hardware-agnostic
+/// `parallel_topology::ParallelExecutionPlan`, then runs `validate_plan_shape`
+/// against it. This component has no access to live hardware topology (it is
+/// a Wasm guest), so only structural shape is checked here; hardware-aware
+/// checks (`validate_parallel_topology`) run in `core-host` once the plan is
+/// actually dispatched against discovered devices.
+fn validate_hardware_strategy(
+    strategy: &ai_contract::exports::tachyon::ai_config::config_ai::HardwareStrategy,
+) -> Result<(), String> {
+    use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
+    use parallel_topology::{ParallelExecutionPlan, ParallelStrategy};
+
+    let parallel_strategy = match strategy.distribution_mode {
+        GpuDistribution::Single => ParallelStrategy::None,
+        GpuDistribution::TensorParallelism => ParallelStrategy::TensorParallel,
+        GpuDistribution::PipelineParallelism => ParallelStrategy::PipelineParallel,
+        GpuDistribution::ExpertParallelism => ParallelStrategy::ExpertParallel,
+    };
+
+    let plan = ParallelExecutionPlan {
+        strategy: parallel_strategy,
+        device_ids: strategy.device_ids.clone(),
+        stage_layer_ranges: strategy.stage_layer_ranges.clone(),
+        expert_device_map: strategy.expert_device_map.clone(),
+        required_vram_bytes_per_device: 0,
+        pipeline_depth: strategy.pipeline_depth,
+    };
+
+    parallel_topology::validate_plan_shape(&plan)
+}
+
+impl ai_contract::exports::tachyon::ai_config::config_ai::Guest for AiConfigComponent {
+    fn validate_ai_config(
+        config: ai_contract::exports::tachyon::ai_config::config_ai::AiConfiguration,
+    ) -> Result<(), String> {
+        for deployment in &config.deployments {
+            validate_hardware_strategy(&deployment.strategy)?;
+        }
+        Ok(())
+    }
+
+    fn get_ai_config(
+    ) -> Result<ai_contract::exports::tachyon::ai_config::config_ai::AiConfiguration, String> {
+        Err("AI configuration store is not wired in this component yet".to_owned())
+    }
+
+    fn apply_model_deployment(
+        deployment: ai_contract::exports::tachyon::ai_config::config_ai::ModelDeployment,
+    ) -> Result<(), String> {
+        validate_hardware_strategy(&deployment.strategy)
+    }
 }
 
 pub fn validate_asset_config<T>(_config: T) -> Result<(), String> {
@@ -654,6 +734,89 @@ mod tests {
     fn ai_config_scaffold_accepts_model_deployments() {
         validate_ai_config(()).expect("AI config scaffold accepts payloads");
         apply_model_deployment(()).expect("AI deployment scaffold accepts payloads");
+    }
+
+    fn hardware_strategy(
+        distribution_mode: ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution,
+        device_ids: Vec<u32>,
+        stage_layer_ranges: Vec<(u32, u32)>,
+        expert_device_map: Vec<(u32, u32)>,
+        pipeline_depth: u32,
+    ) -> ai_contract::exports::tachyon::ai_config::config_ai::HardwareStrategy {
+        ai_contract::exports::tachyon::ai_config::config_ai::HardwareStrategy {
+            multi_gpu: !device_ids.is_empty(),
+            distribution_mode,
+            device_ids,
+            stage_layer_ranges,
+            expert_device_map,
+            pipeline_depth,
+        }
+    }
+
+    #[test]
+    fn single_gpu_strategy_always_validates() {
+        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
+
+        let strategy = hardware_strategy(GpuDistribution::Single, vec![], vec![], vec![], 0);
+        validate_hardware_strategy(&strategy).expect("single-device plan is always valid");
+    }
+
+    #[test]
+    fn tensor_parallel_strategy_rejects_a_single_device() {
+        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
+
+        let strategy = hardware_strategy(
+            GpuDistribution::TensorParallelism,
+            vec![0],
+            vec![],
+            vec![],
+            0,
+        );
+        validate_hardware_strategy(&strategy).expect_err("tensor-parallel requires >= 2 devices");
+    }
+
+    #[test]
+    fn pipeline_parallel_strategy_accepts_contiguous_stage_ranges() {
+        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
+
+        let strategy = hardware_strategy(
+            GpuDistribution::PipelineParallelism,
+            vec![0, 1],
+            vec![(0, 5), (6, 10)],
+            vec![],
+            4,
+        );
+        validate_hardware_strategy(&strategy).expect("contiguous pipeline stages are valid");
+    }
+
+    #[test]
+    fn pipeline_parallel_strategy_rejects_non_contiguous_stage_ranges() {
+        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
+
+        let strategy = hardware_strategy(
+            GpuDistribution::PipelineParallelism,
+            vec![0, 1],
+            vec![(0, 5), (7, 10)],
+            vec![],
+            4,
+        );
+        validate_hardware_strategy(&strategy)
+            .expect_err("non-contiguous pipeline stages must be rejected");
+    }
+
+    #[test]
+    fn expert_parallel_strategy_rejects_out_of_bounds_device_index() {
+        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
+
+        let strategy = hardware_strategy(
+            GpuDistribution::ExpertParallelism,
+            vec![0, 1],
+            vec![],
+            vec![(0, 0), (1, 5)],
+            0,
+        );
+        validate_hardware_strategy(&strategy)
+            .expect_err("expert-device-map index must reference a declared device-id");
     }
 
     #[test]

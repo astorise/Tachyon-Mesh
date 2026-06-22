@@ -10,8 +10,8 @@ default = ["ring"]
 # WASI-NN guest interface backed by our CandleOnnxBackend.
 ai-inference = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-onnx", "dep:candle-transformers",
-    "dep:lru", "dep:minijinja", "dep:minijinja-contrib", "dep:prost", "dep:tokenizers",
-    "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
+    "dep:lru", "dep:minijinja", "dep:minijinja-contrib", "dep:parallel-topology", "dep:prost",
+    "dep:tokenizers", "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
 ]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
@@ -52,7 +52,12 @@ candle-onnx = { git = "https://github.com/astorise/candle", rev = "f4d314a31bbb9
 # Standard transformer architectures (Llama family) for running real, uploaded
 # checkpoints. Weights are mmapped from the model directory at runtime — never
 # compiled into the Tachyon artifact.
+
 candle-transformers = { git = "https://github.com/astorise/candle", rev = "f4d314a31bbb9cb557f7ee3cad35b771515bb243", version = "0.10.2", optional = true, default-features = false }
+
+candle-transformers = { version = "0.10.0", optional = true, default-features = false }
+parallel-topology = { path = "../crates/parallel-topology", optional = true }
+
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = "2"
 flate2 = "1"

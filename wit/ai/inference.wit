@@ -84,7 +84,64 @@ interface layer-execution {
     drop-tensor: func(handle: tensor-handle);
 }
 
+/// Declarative multi-GPU/multi-node execution planning for a single model
+/// instance. This is orthogonal to `inference`'s per-call options: a plan is
+/// established once at model-load time and applies to every subsequent call
+/// against that model alias.
+interface parallel-execution {
+    /// How a model's forward pass is split across more than one accelerator.
+    enum parallel-strategy {
+        /// No splitting; the model runs entirely on one device (existing behaviour).
+        none,
+        /// Column/row-parallel weight sharding across the GPUs of one node, with
+        /// an all-reduce/all-gather sync point per transformer block.
+        tensor-parallel,
+        /// Contiguous layer ranges assigned to different nodes/GPUs, with
+        /// activations streamed between stages.
+        pipeline-parallel,
+        /// Mixture-of-Experts checkpoints: experts placed on distinct
+        /// GPUs/nodes, tokens routed only to their selected expert's device.
+        expert-parallel,
+    }
+
+    /// A requested execution plan, validated against discovered hardware
+    /// topology before any weights are loaded.
+    record parallel-execution-plan {
+        strategy: parallel-strategy,
+        /// Logical device identifiers participating in this plan.
+        device-ids: list<u32>,
+        /// For pipeline-parallel: inclusive (start, end) layer index range per
+        /// device, indexed by position in `device-ids`.
+        stage-layer-ranges: list<tuple<u32, u32>>,
+        /// For expert-parallel: (expert-id, device-ids index) placement pairs.
+        expert-device-map: list<tuple<u32, u32>>,
+        /// Bounded number of micro-batches kept in flight across pipeline stages.
+        pipeline-depth: u32,
+    }
+
+    /// Typed reasons a plan cannot be satisfied by the cluster's discovered
+    /// hardware topology, returned instead of silently downgrading to a
+    /// single-device execution plan.
+    variant topology-error {
+        /// Requested device count exceeds what is available on the target.
+        insufficient-device-count(tuple<u32, u32>),
+        /// The interconnect between requested devices does not meet the
+        /// strategy's bandwidth/latency requirement.
+        incompatible-interconnect,
+        /// A computed per-shard VRAM requirement exceeds a target device's
+        /// available VRAM. Payload is (required-bytes, available-bytes).
+        vram-per-shard-exceeded(tuple<u64, u64>),
+    }
+
+    /// Validates that a requested plan can be satisfied by the cluster's
+    /// discovered hardware topology before any weights are loaded. Does not
+    /// load or shard a model; `apply-model-deployment` (config-ai.wit) calls
+    /// this as part of admitting a deployment.
+    validate-parallel-topology: func(plan: parallel-execution-plan) -> result<_, topology-error>;
+}
+
 world inference-host {
     export inference;
     export layer-execution;
+    export parallel-execution;
 }
