@@ -251,23 +251,49 @@ jobs:
         with:
           shared-key: cuda-quality
 
-      # The ARC GPU runner ships the CUDA toolkit under /usr/local/cuda* but does
-      # not always expose `nvcc` on PATH for the job's non-login shell, which made
-      # cudarc's build script fail with "nvcc --version failed". Locate the
-      # toolkit and export its bin dir (plus CUDA_PATH) for all downstream steps.
+      # The ARC GPU runner on Talos has the NVIDIA driver (nvidia-smi works) but
+      # cudarc/candle-kernels need `nvcc` from the CUDA toolkit at build time.
+      # The toolkit's bin dir is not always on PATH for the job's non-login
+      # shell, so discover nvcc (PATH, then the usual roots, then a bounded
+      # filesystem search) and export its bin dir + CUDA_PATH/CUDA_HOME. Print
+      # diagnostics so a genuinely missing toolkit is easy to spot in the log.
       - name: Put CUDA toolkit on PATH
         run: |
-          for cuda in "${CUDA_HOME:-}" "${CUDA_PATH:-}" /usr/local/cuda /usr/local/cuda-*; do
-            if [ -n "$cuda" ] && [ -x "$cuda/bin/nvcc" ]; then
-              echo "Found CUDA toolkit at $cuda"
-              echo "$cuda/bin" >> "$GITHUB_PATH"
-              echo "CUDA_PATH=$cuda" >> "$GITHUB_ENV"
-              echo "CUDA_HOME=$cuda" >> "$GITHUB_ENV"
-              exit 0
-            fi
-          done
-          echo "::error::nvcc not found under /usr/local/cuda*; the CUDA toolkit is not installed on this runner" >&2
-          exit 1
+          echo "PATH=$PATH"
+          echo "CUDA_HOME=${CUDA_HOME:-<unset>} CUDA_PATH=${CUDA_PATH:-<unset>}"
+          nvcc_bin=""
+          # 1. Already on PATH?
+          if command -v nvcc >/dev/null 2>&1; then
+            nvcc_bin="$(command -v nvcc)"
+          fi
+          # 2. Well-known install roots.
+          if [ -z "$nvcc_bin" ]; then
+            for cuda in "${CUDA_HOME:-}" "${CUDA_PATH:-}" \
+                        /usr/local/cuda /usr/local/cuda-* \
+                        /opt/cuda /opt/cuda-* /usr/lib/cuda /usr/cuda; do
+              if [ -n "$cuda" ] && [ -x "$cuda/bin/nvcc" ]; then
+                nvcc_bin="$cuda/bin/nvcc"
+                break
+              fi
+            done
+          fi
+          # 3. Last resort: bounded search of likely roots.
+          if [ -z "$nvcc_bin" ]; then
+            nvcc_bin="$(find /usr /opt -maxdepth 5 -name nvcc -type f -executable 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "$nvcc_bin" ]; then
+            echo "::error::nvcc not found on this runner. The CUDA *toolkit* (not just the driver) must be installed in the arc-gpu-runners image. nvidia-smi alone is not enough — candle-kernels/cudarc compile .cu kernels with nvcc at build time."
+            echo "--- diagnostics ---"
+            echo "ls /usr/local:"; ls -la /usr/local 2>/dev/null || true
+            echo "ls /opt:";       ls -la /opt 2>/dev/null || true
+            echo "dpkg cuda pkgs:"; dpkg -l 2>/dev/null | grep -i cuda || echo "  (none)"
+            exit 1
+          fi
+          cuda_root="$(dirname "$(dirname "$nvcc_bin")")"
+          echo "Found nvcc at $nvcc_bin (CUDA root: $cuda_root)"
+          echo "$(dirname "$nvcc_bin")" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=$cuda_root" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$cuda_root" >> "$GITHUB_ENV"
 
       - name: Verify CUDA toolchain
         run: |
