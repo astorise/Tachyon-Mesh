@@ -1,0 +1,9 @@
+# Workspace cargo configuration.
+#
+# `net.retry` raises cargo's retry count for spurious network failures well
+# above the default of 3. CI has repeatedly hit transient crates.io download
+# errors during dependency resolution (e.g. `curl failed [55] SSL_ERROR_SYSCALL`,
+# `[56] Connection reset by peer`) that abort a job on the first miss; retrying
+# absorbs these blips so a healthy build is not failed by a flaky download.
+[net]
+retry = 10
