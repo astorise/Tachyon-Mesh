@@ -14,6 +14,15 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokenizers::Tokenizer;
 
+use crate::{GpuDistribution, HardwareStrategy};
+
+use super::parallel::discover_cluster_topology;
+use super::pipeline_parallel_llama::PipelineParallelLlama;
+use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
+use parallel_topology::{
+    validate_parallel_topology, ClusterTopology, ParallelExecutionPlan, ParallelStrategy,
+};
+
 /// HF `model_type` of the only architecture family currently executed. Real,
 /// uploaded Llama-family checkpoints (Llama 2/3, TinyLlama, Vicuna, …) carry
 /// this value in their `config.json`.
@@ -113,6 +122,59 @@ enum LoadedModel {
         model: Mutex<QuantizedLlama>,
         eos_tokens: Vec<u32>,
     },
+    /// A multi-device parallel engine, selected when the deployment's
+    /// `hardware_strategy.distribution_mode` is not `single`. The engines
+    /// themselves are the numerically-verified ones from
+    /// `tensor_parallel_llama`/`pipeline_parallel_llama`; this variant is the
+    /// runtime dispatch that finally selects them.
+    Parallel(ParallelModel),
+}
+
+/// The concrete parallel engine behind a [`LoadedModel::Parallel`]. Tensor
+/// parallelism supports the full autoregressive decode loop (it carries a
+/// [`TensorParallelCache`]); pipeline parallelism is prefill-only today (its
+/// per-stage KV cache across decode steps is a disclosed follow-up), so its
+/// generation path returns a typed error and only `prefill_logits` is exposed.
+/// Expert (MoE) parallelism is rejected at load time because no full MoE
+/// checkpoint loader exists in this runtime yet — only the verified per-expert
+/// `ExpertParallelMlp` primitive — so there is intentionally no `Expert`
+/// variant here.
+enum ParallelModel {
+    Tensor {
+        model: Box<TensorParallelLlama>,
+        config: Config,
+        eos_tokens: Vec<u32>,
+        /// Devices the plan sharded across; `devices[0]` is the primary device
+        /// the input tensor and KV cache are built on.
+        devices: Vec<Device>,
+    },
+    Pipeline {
+        model: Box<PipelineParallelLlama>,
+    },
+}
+
+/// Run a single prefill forward through every pipeline stage, building an
+/// in-process transport that moves the activation onto each next stage's
+/// device between stages. Used by the prefill-equivalence path; a real
+/// cross-node deployment swaps `InProcessTransport` for `TcpStageTransport`
+/// without changing this composition.
+#[cfg(test)]
+fn pipeline_prefill_forward(
+    model: &PipelineParallelLlama,
+    input: &Tensor,
+) -> candle_core::Result<Tensor> {
+    use super::parallel::{InProcessTransport, StageTransport};
+    let transports: Vec<Box<dyn StageTransport>> = model
+        .stages
+        .iter()
+        .skip(1)
+        .map(|stage| {
+            Box::new(InProcessTransport {
+                next_device: stage.device().clone(),
+            }) as Box<dyn StageTransport>
+        })
+        .collect();
+    model.forward(input, &transports)
 }
 
 /// Runtime guardrails applied to every generation request. Independent of the
@@ -243,6 +305,28 @@ impl CandleLlmRuntime {
         alias: &str,
         path: impl AsRef<Path>,
         requested_device: &str,
+        strategy: &HardwareStrategy,
+    ) -> Result<Option<Self>, CandleLlmError> {
+        // Discover the real cluster topology so a non-`single` strategy is
+        // validated against actual hardware before any weights load. On a
+        // CUDA-less build this reports a single CPU device, which correctly
+        // rejects multi-device plans unless a test injects a topology via
+        // `try_load_with_topology`.
+        Self::try_load_with_topology(
+            alias,
+            path,
+            requested_device,
+            strategy,
+            &discover_cluster_topology(),
+        )
+    }
+
+    fn try_load_with_topology(
+        alias: &str,
+        path: impl AsRef<Path>,
+        requested_device: &str,
+        strategy: &HardwareStrategy,
+        topology: &ClusterTopology,
     ) -> Result<Option<Self>, CandleLlmError> {
         let root = path.as_ref();
         if !root.is_dir() {
@@ -255,7 +339,13 @@ impl CandleLlmRuntime {
             return Ok(None);
         };
 
-        if requested_device != "cpu" {
+        // The single-device path remains CPU-only in this runtime (GPU
+        // execution of the dense path is the separate
+        // `gpu-accelerated-inference-execution` change), so a GPU request on a
+        // `single` deployment still returns the existing typed error. A
+        // non-`single` strategy resolves its devices from the validated plan
+        // instead, so it does not go through this check.
+        if strategy.is_single() && requested_device != "cpu" {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
@@ -288,9 +378,13 @@ impl CandleLlmRuntime {
         // `messages` requests render exactly as the checkpoint expects.
         let chat_template = ChatTemplate::load(alias, root)?.map(Arc::new);
 
-        let (inner, limits) = match format {
-            ModelFormat::Safetensors => Self::load_safetensors(alias, root)?,
-            ModelFormat::Gguf => Self::load_gguf(alias, root)?,
+        let (inner, limits) = if strategy.is_single() {
+            match format {
+                ModelFormat::Safetensors => Self::load_safetensors(alias, root)?,
+                ModelFormat::Gguf => Self::load_gguf(alias, root)?,
+            }
+        } else {
+            Self::load_parallel(alias, root, format, strategy, topology)?
         };
 
         Ok(Some(Self {
@@ -455,6 +549,153 @@ impl CandleLlmRuntime {
         ))
     }
 
+    /// Load a model under a non-`single` `hardware_strategy`: validate the
+    /// requested plan against the discovered hardware topology, then construct
+    /// the matching parallel engine. The engines themselves are the
+    /// numerically-verified ones from `tensor_parallel_llama`/
+    /// `pipeline_parallel_llama`; this is the dispatch that selects them.
+    fn load_parallel(
+        alias: &str,
+        root: &Path,
+        format: ModelFormat,
+        strategy: &HardwareStrategy,
+        topology: &ClusterTopology,
+    ) -> Result<(LoadedModel, GenerationLimits), CandleLlmError> {
+        // Parallel sharding operates on full-precision safetensors weights. GGUF
+        // is a single-file quantized format with no sharding path here.
+        if format != ModelFormat::Safetensors {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail:
+                    "parallel execution requires a safetensors checkpoint; GGUF is single-device only"
+                        .to_owned(),
+            });
+        }
+
+        // Fail fast against real hardware *before* loading any weights, so an
+        // unsatisfiable plan never triggers a partial allocation.
+        let plan = plan_from_strategy(strategy);
+        validate_parallel_topology(&plan, topology).map_err(|error| {
+            CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!("parallel topology rejected: {error}"),
+            }
+        })?;
+
+        let devices = resolve_devices(&plan.device_ids);
+        if devices.is_empty() {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: "a parallel deployment must declare at least one device_id".to_owned(),
+            });
+        }
+
+        let config = Self::load_llama_config(alias, root)?;
+        let limits = GenerationLimits::with_context(config.max_position_embeddings);
+        let eos_tokens = eos_token_ids(&config);
+        let weight_paths = safetensors_paths(alias, root)?;
+        let component = MODEL_SAFETENSORS;
+        let invalid = |error: candle_core::Error| CandleLlmError::InvalidComponent {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            component,
+            detail: error.to_string(),
+        };
+
+        match strategy.distribution_mode {
+            GpuDistribution::TensorParallelism => {
+                // SAFETY: weights live in the uploaded model directory and are
+                // not mutated for the lifetime of the mmap.
+                let var_builder = unsafe {
+                    VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &devices[0])
+                }
+                .map_err(invalid)?;
+                let model =
+                    TensorParallelLlama::load(var_builder, &config, &devices).map_err(invalid)?;
+                Ok((
+                    LoadedModel::Parallel(ParallelModel::Tensor {
+                        model: Box::new(model),
+                        config,
+                        eos_tokens,
+                        devices,
+                    }),
+                    limits,
+                ))
+            }
+            GpuDistribution::PipelineParallelism => {
+                let model = PipelineParallelLlama::load(
+                    &weight_paths,
+                    DType::F32,
+                    &config,
+                    &plan.stage_layer_ranges,
+                    &devices,
+                )
+                .map_err(invalid)?;
+                Ok((
+                    LoadedModel::Parallel(ParallelModel::Pipeline {
+                        model: Box::new(model),
+                    }),
+                    limits,
+                ))
+            }
+            GpuDistribution::ExpertParallelism => Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail:
+                    "expert-parallel execution requires an MoE checkpoint loader, which is not yet \
+                     implemented: the per-expert `ExpertParallelMlp` primitive exists and is \
+                     numerically verified, but this runtime does not yet load a full MoE \
+                     (e.g. Mixtral) checkpoint"
+                        .to_owned(),
+            }),
+            GpuDistribution::Single => {
+                unreachable!("load_parallel is only reached for non-single strategies")
+            }
+        }
+    }
+
+    /// Parse and validate a Llama `config.json` (shared by the safetensors and
+    /// parallel loaders).
+    fn load_llama_config(alias: &str, root: &Path) -> Result<Config, CandleLlmError> {
+        let raw_config =
+            fs::read(root.join(CONFIG_JSON)).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            })?;
+        let probe: ModelTypeProbe = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        if probe.model_type != LLAMA_MODEL_TYPE {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "expected a Llama-family checkpoint (`model_type` = `{LLAMA_MODEL_TYPE}`), got `{}`",
+                    probe.model_type
+                ),
+            });
+        }
+        let llama_config: LlamaConfig = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(llama_config.into_config(false))
+    }
+
     /// Buffered generation: run the decode and return the full UTF-8 output. A
     /// thin accumulator over [`generate_streaming`], so the two paths always
     /// agree byte-for-byte.
@@ -543,6 +784,7 @@ impl CandleLlmRuntime {
                     prompt_ids,
                     request,
                     eos_tokens,
+                    &device,
                     on_token,
                     |input, index_pos| model.forward(input, index_pos, &mut cache),
                 )
@@ -555,10 +797,43 @@ impl CandleLlmRuntime {
                     prompt_ids,
                     request,
                     eos_tokens,
+                    &device,
                     on_token,
                     |input, index_pos| guard.forward(input, index_pos),
                 )
             }
+            LoadedModel::Parallel(parallel) => match parallel {
+                ParallelModel::Tensor {
+                    model,
+                    config,
+                    eos_tokens,
+                    devices,
+                } => {
+                    // Tensor parallelism carries a real KV cache, so it drives
+                    // the full autoregressive decode loop like the dense path.
+                    let primary = &devices[0];
+                    let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
+                        .map_err(|error| {
+                            self.execution_error(format!(
+                                "failed to build tensor-parallel KV cache: {error}"
+                            ))
+                        })?;
+                    self.decode_loop(
+                        prompt_ids,
+                        request,
+                        eos_tokens,
+                        primary,
+                        on_token,
+                        |input, index_pos| model.forward(input, index_pos, &mut cache),
+                    )
+                }
+                ParallelModel::Pipeline { .. } => Err(self.execution_error(
+                    "pipeline-parallel generation (the autoregressive decode loop) is not yet \
+                     wired: the engine is prefill-only, pending a per-stage KV cache across \
+                     decode steps"
+                        .to_owned(),
+                )),
+            },
         }
     }
 
@@ -577,10 +852,11 @@ impl CandleLlmRuntime {
         prompt_ids: &[u32],
         request: &ParsedGenerationRequest,
         eos_tokens: &[u32],
+        input_device: &Device,
         on_token: &mut dyn FnMut(&str),
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(), CandleLlmError> {
-        let device = Device::Cpu;
+        let device = input_device;
         let mut processor = request.sampling.processor();
         let mut tokens = prompt_ids.to_vec();
         let mut generated = Vec::with_capacity(request.max_new_tokens);
@@ -604,7 +880,7 @@ impl CandleLlmRuntime {
             if index_pos + context.len() > self.limits.max_position_embeddings {
                 break;
             }
-            let input = Tensor::new(context, &device)
+            let input = Tensor::new(context, device)
                 .and_then(|tensor| tensor.unsqueeze(0))
                 .map_err(|error| {
                     self.execution_error(format!("failed to build input tensor: {error}"))
@@ -714,11 +990,49 @@ impl CandleLlmRuntime {
                 let mut guard = model.lock().expect("gguf mutex should not be poisoned");
                 guard.forward(&input, 0).expect("forward pass should run")
             }
+            LoadedModel::Parallel(parallel) => match parallel {
+                ParallelModel::Tensor {
+                    model,
+                    config,
+                    devices,
+                    ..
+                } => {
+                    let primary = &devices[0];
+                    let input = input
+                        .to_device(primary)
+                        .expect("input should move to device");
+                    let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
+                        .expect("cache should build");
+                    model
+                        .forward(&input, 0, &mut cache)
+                        .expect("forward pass should run")
+                }
+                ParallelModel::Pipeline { model } => {
+                    let stage0_device = model
+                        .stages
+                        .first()
+                        .map(|stage| stage.device().clone())
+                        .unwrap_or(Device::Cpu);
+                    let input = input
+                        .to_device(&stage0_device)
+                        .expect("input should move to stage 0 device");
+                    pipeline_prefill_forward(model, &input).expect("pipeline forward should run")
+                }
+            },
         };
         logits
             .squeeze(0)
             .and_then(|row| row.to_vec1::<f32>())
             .expect("logits should be an f32 vector")
+    }
+
+    /// Test-only: the prefill logits produced by a parallel engine for `prompt`.
+    /// For tensor parallelism this is equivalent to `debug_last_logits`; for the
+    /// prefill-only pipeline engine it is the only generation-shaped output
+    /// available, used to prove equivalence to the dense reference.
+    #[cfg(test)]
+    pub(crate) fn debug_parallel_prefill_logits(&self, prompt: &str) -> Vec<f32> {
+        self.debug_last_logits(prompt)
     }
 
     fn parse_request(&self, data: &[u8]) -> Result<ParsedGenerationRequest, CandleLlmError> {
@@ -1129,6 +1443,49 @@ fn eos_token_ids(config: &Config) -> Vec<u32> {
     }
 }
 
+/// Map a deployment's `hardware_strategy` onto the hardware-agnostic
+/// `ParallelExecutionPlan` validated by `parallel-topology`. VRAM-per-shard is
+/// left `0` ("not yet sized"), so the plan is only rejected on device-count or
+/// interconnect grounds until real VRAM sizing lands.
+fn plan_from_strategy(strategy: &HardwareStrategy) -> ParallelExecutionPlan {
+    let parallel_strategy = match strategy.distribution_mode {
+        GpuDistribution::Single => ParallelStrategy::None,
+        GpuDistribution::TensorParallelism => ParallelStrategy::TensorParallel,
+        GpuDistribution::PipelineParallelism => ParallelStrategy::PipelineParallel,
+        GpuDistribution::ExpertParallelism => ParallelStrategy::ExpertParallel,
+    };
+    ParallelExecutionPlan {
+        strategy: parallel_strategy,
+        device_ids: strategy.device_ids.clone(),
+        stage_layer_ranges: strategy.stage_layer_ranges.clone(),
+        expert_device_map: strategy.expert_device_map.clone(),
+        required_vram_bytes_per_device: 0,
+        pipeline_depth: strategy.pipeline_depth,
+    }
+}
+
+/// Resolve plan device IDs to candle `Device` handles. On a CUDA build each ID
+/// maps to its CUDA ordinal; on a CUDA-less build every ID degenerates to
+/// `Device::Cpu`, which the parallel engines treat as a multi-device stand-in
+/// (the same simulation the engines' own equivalence tests use). A CUDA ordinal
+/// that cannot be opened falls back to CPU rather than failing the load.
+fn resolve_devices(device_ids: &[u32]) -> Vec<Device> {
+    device_ids
+        .iter()
+        .map(|&id| {
+            #[cfg(feature = "candle-cuda")]
+            {
+                Device::cuda_if_available(id as usize).unwrap_or(Device::Cpu)
+            }
+            #[cfg(not(feature = "candle-cuda"))]
+            {
+                let _ = id;
+                Device::Cpu
+            }
+        })
+        .collect()
+}
+
 /// Resolve the safetensors shard paths for a model directory: the HF index when
 /// the checkpoint is sharded, otherwise the single `model.safetensors`.
 fn safetensors_paths(alias: &str, root: &Path) -> Result<Vec<PathBuf>, CandleLlmError> {
@@ -1485,7 +1842,7 @@ mod tests {
             std::process::id()
         ));
         write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
-        let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cpu")
+        let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
             .expect("fixture should load without error")
             .expect("fixture is a supported Llama model");
         (runtime, dir)
@@ -1623,9 +1980,10 @@ mod tests {
             "chat_template": template,
         });
         fs::write(dir.join(TOKENIZER_CONFIG_JSON), config.to_string()).expect("write config");
-        let reloaded = CandleLlmRuntime::try_load("tiny", &dir, "cpu")
-            .expect("reload should not error")
-            .expect("fixture is supported");
+        let reloaded =
+            CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
+                .expect("reload should not error")
+                .expect("fixture is supported");
 
         let messages = vec![ChatTurn {
             role: "user".to_owned(),
@@ -1737,7 +2095,7 @@ mod tests {
         fs::write(dir.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON).expect("tokenizer");
         fs::write(dir.join(MODEL_SAFETENSORS), b"marker").expect("weights marker");
 
-        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu")
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
             .expect_err("a non-Llama model_type must be rejected");
         assert!(matches!(error, CandleLlmError::UnsupportedModel { .. }));
         let _ = fs::remove_dir_all(dir);
@@ -1754,7 +2112,7 @@ mod tests {
         candle_core::safetensors::save(&tensors, dir.join(MODEL_SAFETENSORS))
             .expect("trimmed weights should save");
 
-        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu")
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
             .expect_err("a model missing lm_head.weight must fail to load");
         assert!(matches!(error, CandleLlmError::InvalidComponent { .. }));
         let _ = fs::remove_dir_all(dir);
@@ -1768,9 +2126,10 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("tachyon-gguf-{tag}-{}-{nanos}", std::process::id()));
         write_tachyon_tiny_gguf_fixture(&dir).expect("gguf fixture should be written");
-        let runtime = CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu")
-            .expect("gguf fixture should load without error")
-            .expect("gguf fixture is a supported Llama model");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
+                .expect("gguf fixture should load without error")
+                .expect("gguf fixture is a supported Llama model");
         (runtime, dir)
     }
 
@@ -1821,9 +2180,10 @@ mod tests {
         // Drop the broker sidecar: the host must still pick the GGUF path by
         // finding the `.gguf` file (operator-provisioned model).
         fs::remove_file(dir.join(MODEL_META_JSON)).expect("sidecar should be removed");
-        let runtime = CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu")
-            .expect("content inference should not error")
-            .expect("a directory with a .gguf file is a GGUF model");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
+                .expect("content inference should not error")
+                .expect("a directory with a .gguf file is a GGUF model");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
             .expect("inferred GGUF model should still run");
@@ -1842,9 +2202,226 @@ mod tests {
             serde_json::json!({ "format": "onnx" }).to_string(),
         )
         .expect("sidecar rewrite");
-        let error = CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu")
-            .expect_err("an unsupported declared format must be rejected");
+        let error =
+            CandleLlmRuntime::try_load("tiny-gguf", &dir, "cpu", &HardwareStrategy::default())
+                .expect_err("an unsupported declared format must be rejected");
         assert!(matches!(error, CandleLlmError::UnsupportedModel { .. }));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel dispatch (Task 7). The runtime now selects the tensor/pipeline
+    // engines from a deployment's `hardware_strategy`. These run on
+    // `Device::Cpu` stand-ins (this build has no CUDA backend), exactly as the
+    // engines' own equivalence tests do, and inject a multi-device topology so
+    // the hardware-aware validation admits the plan.
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    fn write_fixture_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-llama-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
+        dir
+    }
+
+    #[cfg(test)]
+    fn two_device_topology() -> ClusterTopology {
+        use parallel_topology::{DeviceInfo, InterconnectClass};
+        ClusterTopology {
+            devices: vec![
+                DeviceInfo {
+                    device_id: 0,
+                    free_vram_bytes: 0,
+                },
+                DeviceInfo {
+                    device_id: 1,
+                    free_vram_bytes: 0,
+                },
+            ],
+            interconnect: InterconnectClass::Pcie,
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_strategy_dispatches_and_matches_the_dense_runtime() {
+        let dir = write_fixture_dir("tp-dispatch");
+
+        let dense = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
+            .expect("dense load")
+            .expect("supported model");
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::TensorParallelism,
+            device_ids: vec![0, 1],
+            ..Default::default()
+        };
+        let tp = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect("tensor-parallel load")
+        .expect("supported model");
+
+        // The dispatch selected the parallel engine, not the dense path.
+        assert!(matches!(
+            &*tp.inner,
+            LoadedModel::Parallel(ParallelModel::Tensor { .. })
+        ));
+
+        let dense_logits = dense.debug_last_logits("hello mesh");
+        let tp_logits = tp.debug_parallel_prefill_logits("hello mesh");
+        assert_eq!(dense_logits.len(), tp_logits.len());
+        for (a, b) in dense_logits.iter().zip(tp_logits.iter()) {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "tensor-parallel logits must match the dense runtime within 1e-3, got {a} vs {b}"
+            );
+        }
+
+        // Tensor parallelism carries a KV cache, so full generation works.
+        let generated = tp
+            .generate(&[&b"hello"[..]])
+            .expect("tensor-parallel generation should run the decode loop");
+        assert!(!generated.is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pipeline_parallel_strategy_matches_dense_prefill_and_refuses_decode() {
+        let dir = write_fixture_dir("pp-dispatch");
+
+        let dense = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
+            .expect("dense load")
+            .expect("supported model");
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::PipelineParallelism,
+            device_ids: vec![0, 1],
+            stage_layer_ranges: vec![(0, 0), (1, 1)],
+            ..Default::default()
+        };
+        let pipeline = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect("pipeline-parallel load")
+        .expect("supported model");
+
+        assert!(matches!(
+            &*pipeline.inner,
+            LoadedModel::Parallel(ParallelModel::Pipeline { .. })
+        ));
+
+        let dense_logits = dense.debug_last_logits("hello mesh");
+        let pp_logits = pipeline.debug_parallel_prefill_logits("hello mesh");
+        assert_eq!(dense_logits.len(), pp_logits.len());
+        for (a, b) in dense_logits.iter().zip(pp_logits.iter()) {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "pipeline prefill logits must match the dense runtime within 1e-3, got {a} vs {b}"
+            );
+        }
+
+        // The pipeline engine is prefill-only: the autoregressive decode loop is
+        // not yet wired, so generation returns a typed error rather than wrong
+        // output.
+        let error = pipeline
+            .generate(&[&b"hello"[..]])
+            .expect_err("pipeline generation must be refused until decode is wired");
+        assert!(matches!(error, CandleLlmError::Execution { .. }));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expert_parallel_strategy_is_rejected_until_a_moe_loader_exists() {
+        let dir = write_fixture_dir("ep-dispatch");
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::ExpertParallelism,
+            device_ids: vec![0, 1],
+            expert_device_map: vec![(0, 0), (1, 1)],
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect_err("expert-parallel must be rejected: no MoE checkpoint loader yet");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(detail.contains("MoE"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_parallel_plan_exceeding_discovered_devices_is_rejected_before_loading() {
+        use parallel_topology::{DeviceInfo, InterconnectClass};
+        let dir = write_fixture_dir("topology-reject");
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::TensorParallelism,
+            device_ids: vec![0, 1],
+            ..Default::default()
+        };
+        // Only one device is discovered, but the plan wants two.
+        let single_device = ClusterTopology {
+            devices: vec![DeviceInfo {
+                device_id: 0,
+                free_vram_bytes: 0,
+            }],
+            interconnect: InterconnectClass::HighBandwidth,
+        };
+        let error = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &single_device,
+        )
+        .expect_err("a plan requiring more devices than exist must be rejected");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("topology rejected"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn single_strategy_still_rejects_a_gpu_device_request() {
+        let dir = write_fixture_dir("single-gpu-reject");
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &HardwareStrategy::default())
+            .expect_err("single-device path is cpu-only and must reject a gpu request");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("cpu` execution only"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(dir);
     }
 }

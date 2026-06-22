@@ -398,6 +398,7 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
         device: ModelDevice::Cuda,
         qos: RouteQos::Standard,
         dynamic: false,
+        hardware_strategy: Default::default(),
     }];
     let config = IntegrityConfig {
         routes: vec![route.clone()],
@@ -566,6 +567,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         device: ModelDevice::Cpu,
         qos: RouteQos::Standard,
         dynamic: false,
+        hardware_strategy: Default::default(),
     }];
     let config = IntegrityConfig {
         routes: vec![route.clone()],

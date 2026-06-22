@@ -387,6 +387,64 @@ impl ModelDevice {
     }
 }
 
+/// How a model's forward pass is split across more than one accelerator.
+/// Mirrors `gpu-distribution` in `wit/config-ai.wit`; the variant selected by
+/// a deployment's `hardware-strategy` is what the runtime reads to pick a
+/// tensor/pipeline/expert-parallel engine over the dense single-device path.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GpuDistribution {
+    #[default]
+    Single,
+    TensorParallelism,
+    PipelineParallelism,
+    ExpertParallelism,
+}
+
+/// Multi-accelerator execution strategy for a model binding. Mirrors the
+/// `hardware-strategy` record in `wit/config-ai.wit`. The default (`single`
+/// with empty placement lists) preserves the pre-existing single-device load
+/// path byte-for-byte and is skipped during serialization, so configs that
+/// predate this field round-trip unchanged.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct HardwareStrategy {
+    #[serde(default)]
+    pub(crate) distribution_mode: GpuDistribution,
+    /// Device IDs participating in a tensor/pipeline/expert-parallel plan.
+    /// Empty/ignored when `distribution_mode` is `single`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) device_ids: Vec<u32>,
+    /// For pipeline-parallelism: inclusive (start, end) layer-index range per
+    /// device, indexed by position in `device_ids`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) stage_layer_ranges: Vec<(u32, u32)>,
+    /// For expert-parallelism: (expert_id, device_ids index) placement pairs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) expert_device_map: Vec<(u32, u32)>,
+    /// Bounded number of micro-batches kept in flight across pipeline stages.
+    /// Ignored outside `pipeline_parallelism`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub(crate) pipeline_depth: u32,
+}
+
+impl HardwareStrategy {
+    /// `true` for the default single-device strategy (`distribution_mode:
+    /// single` with no placement data), used to skip the field during
+    /// serialization and to short-circuit the dispatch path to the existing
+    /// single-device loader.
+    pub(crate) fn is_single(&self) -> bool {
+        self.distribution_mode == GpuDistribution::Single
+            && self.device_ids.is_empty()
+            && self.stage_layer_ranges.is_empty()
+            && self.expert_device_map.is_empty()
+            && self.pipeline_depth == 0
+    }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct IntegrityLayer4Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -651,6 +709,14 @@ pub(crate) struct IntegrityModelBinding {
     /// if their `path` is missing or invalid.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) dynamic: bool,
+    /// Multi-accelerator execution strategy (mirrors `wit/config-ai.wit`'s
+    /// `hardware-strategy`). Default = `single`, which loads the existing
+    /// single-device path unchanged; a non-`single` `distribution_mode`
+    /// selects the matching tensor/pipeline/expert-parallel engine at load
+    /// time. Skipped during serialization when `single`, so configs that
+    /// predate this field deserialize and re-serialize unchanged.
+    #[serde(default, skip_serializing_if = "HardwareStrategy::is_single")]
+    pub(crate) hardware_strategy: HardwareStrategy,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1089,4 +1155,62 @@ pub(crate) struct RunCommand {
     pub(crate) manifest: Option<PathBuf>,
     #[arg(long)]
     pub(crate) target: String,
+}
+
+#[cfg(test)]
+mod hardware_strategy_tests {
+    use super::*;
+
+    #[test]
+    fn binding_without_hardware_strategy_defaults_to_single() {
+        // A config that predates the field must deserialize to the default
+        // single-device strategy.
+        let binding: IntegrityModelBinding =
+            serde_json::from_str(r#"{"alias":"m","path":"/models/m","device":"cpu"}"#)
+                .expect("legacy binding should deserialize");
+        assert_eq!(
+            binding.hardware_strategy.distribution_mode,
+            GpuDistribution::Single
+        );
+        assert!(binding.hardware_strategy.is_single());
+    }
+
+    #[test]
+    fn default_strategy_is_skipped_on_serialization() {
+        let binding = IntegrityModelBinding {
+            alias: "m".to_owned(),
+            path: "/models/m".to_owned(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: HardwareStrategy::default(),
+        };
+        let json = serde_json::to_string(&binding).expect("serialize");
+        assert!(
+            !json.contains("hardware_strategy"),
+            "a single-device strategy must not appear in serialized output: {json}"
+        );
+    }
+
+    #[test]
+    fn tensor_parallel_strategy_round_trips() {
+        let binding = IntegrityModelBinding {
+            alias: "m".to_owned(),
+            path: "/models/m".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: HardwareStrategy {
+                distribution_mode: GpuDistribution::TensorParallelism,
+                device_ids: vec![0, 1],
+                pipeline_depth: 0,
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&binding).expect("serialize");
+        assert!(json.contains("tensor_parallelism"));
+        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, binding);
+        assert!(!restored.hardware_strategy.is_single());
+    }
 }
