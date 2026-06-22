@@ -30,11 +30,7 @@ impl BackendInner for CandleOnnxBackend {
         GraphEncoding::Onnx
     }
 
-    fn load(
-        &mut self,
-        builders: &[&[u8]],
-        _target: ExecutionTarget,
-    ) -> Result<Graph, BackendError> {
+    fn load(&mut self, builders: &[&[u8]], target: ExecutionTarget) -> Result<Graph, BackendError> {
         let bytes = builders
             .first()
             .ok_or(BackendError::InvalidNumberOfBuilders(1, 0))?;
@@ -43,8 +39,9 @@ impl BackendInner for CandleOnnxBackend {
                 "failed to parse ONNX model: {e}"
             )))
         })?;
+        let device = candle_device(target)?;
         Ok(Graph::from(
-            Box::new(CandleOnnxGraph { model }) as Box<dyn BackendGraph>
+            Box::new(CandleOnnxGraph { model, device }) as Box<dyn BackendGraph>
         ))
     }
 
@@ -57,6 +54,7 @@ impl BackendInner for CandleOnnxBackend {
 
 struct CandleOnnxGraph {
     model: ModelProto,
+    device: Device,
 }
 
 impl BackendGraph for CandleOnnxGraph {
@@ -69,6 +67,7 @@ impl BackendGraph for CandleOnnxGraph {
             outputs: HashMap::new(),
             input_names,
             output_names,
+            device: self.device.clone(),
         })
             as Box<dyn BackendExecutionContext>))
     }
@@ -82,12 +81,14 @@ struct CandleOnnxContext {
     outputs: HashMap<String, CandleTensor>,
     input_names: Vec<String>,
     output_names: Vec<String>,
+    device: Device,
 }
 
 impl BackendExecutionContext for CandleOnnxContext {
     fn set_input(&mut self, id: Id, tensor: &WasiTensor) -> Result<(), BackendError> {
         let name = resolve_name(&id, &self.input_names)?;
-        self.inputs.insert(name, wasi_to_candle(tensor)?);
+        self.inputs
+            .insert(name, wasi_to_candle(tensor, &self.device)?);
         Ok(())
     }
 
@@ -107,16 +108,34 @@ impl BackendExecutionContext for CandleOnnxContext {
     ) -> Result<Option<Vec<NamedTensor>>, BackendError> {
         if let Some(named_inputs) = named {
             for nt in named_inputs {
-                self.inputs.insert(nt.name, wasi_to_candle(&nt.tensor)?);
+                self.inputs
+                    .insert(nt.name, wasi_to_candle(&nt.tensor, &self.device)?);
             }
         }
-        self.outputs = candle_onnx::simple_eval(&self.model, self.inputs.clone())
+        self.outputs = candle_onnx::simple_eval(&self.model, self.inputs.clone(), &self.device)
             .map_err(|e| BackendError::BackendAccess(wasmtime::Error::msg(e.to_string())))?;
         Ok(None)
     }
 }
 
 // Ã¢â€â‚¬Ã¢â€â‚¬ Helpers Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+
+fn candle_device(target: ExecutionTarget) -> Result<Device, BackendError> {
+    let device = match target {
+        ExecutionTarget::Cpu => Device::Cpu,
+        ExecutionTarget::Gpu => Device::cuda_if_available(0).map_err(|e| {
+            BackendError::BackendAccess(wasmtime::Error::msg(format!(
+                "failed to initialize Candle CUDA device for ONNX inference: {e}"
+            )))
+        })?,
+        other => {
+            return Err(BackendError::BackendAccess(wasmtime::Error::msg(format!(
+                "unsupported Candle ONNX execution target: {other:?}"
+            ))))
+        }
+    };
+    Ok(device)
+}
 
 fn graph_input_names(model: &ModelProto) -> Vec<String> {
     model
@@ -146,7 +165,7 @@ fn resolve_name(id: &Id, names: &[String]) -> Result<String, BackendError> {
     }
 }
 
-fn wasi_to_candle(tensor: &WasiTensor) -> Result<CandleTensor, BackendError> {
+fn wasi_to_candle(tensor: &WasiTensor, device: &Device) -> Result<CandleTensor, BackendError> {
     let shape: Vec<usize> = tensor.dimensions.iter().map(|&d| d as usize).collect();
     let dtype = match tensor.ty {
         TensorType::Fp32 => DType::F32,
@@ -156,10 +175,14 @@ fn wasi_to_candle(tensor: &WasiTensor) -> Result<CandleTensor, BackendError> {
         other => return Err(BackendError::UnsupportedTensorType(format!("{other:?}"))),
     };
     CandleTensor::from_raw_buffer(&tensor.data, dtype, &shape, &Device::Cpu)
+        .and_then(|tensor| tensor.to_device(device))
         .map_err(|e| BackendError::BackendAccess(wasmtime::Error::msg(e.to_string())))
 }
 
 fn candle_to_wasi(tensor: &CandleTensor) -> Result<WasiTensor, BackendError> {
+    let tensor = tensor
+        .to_device(&Device::Cpu)
+        .map_err(|e| BackendError::BackendAccess(wasmtime::Error::msg(e.to_string())))?;
     let dimensions = tensor.dims().iter().map(|&d| d as u32).collect();
     let (ty, data) = match tensor.dtype() {
         DType::F32 => {
