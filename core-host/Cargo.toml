@@ -52,7 +52,6 @@ candle-onnx = { git = "https://github.com/astorise/candle", rev = "f4d314a31bbb9
 # Standard transformer architectures (Llama family) for running real, uploaded
 # checkpoints. Weights are mmapped from the model directory at runtime — never
 # compiled into the Tachyon artifact.
-
 candle-transformers = { git = "https://github.com/astorise/candle", rev = "f4d314a31bbb9cb557f7ee3cad35b771515bb243", version = "0.10.2", optional = true, default-features = false }
 parallel-topology = { path = "../crates/parallel-topology", optional = true }
 
