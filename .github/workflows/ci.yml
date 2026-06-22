@@ -300,6 +300,15 @@ jobs:
           nvidia-smi
           nvcc --version
 
+      # candle-onnx's build script compiles the ONNX .proto and needs `protoc`.
+      # The CPU jobs get it from `apt-get install protobuf-compiler`, but this
+      # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
+      # distro-agnostic way. Skipped if the runner image already ships protoc.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Check Candle CUDA host build
         run: cargo check -p core-host --features candle-cuda
 
