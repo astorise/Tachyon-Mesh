@@ -144,6 +144,7 @@ fn validate_integrity_config_normalizes_model_bindings() {
         device: ModelDevice::Cuda,
         qos: RouteQos::Standard,
         dynamic: false,
+        hardware_strategy: Default::default(),
     }];
     config.routes = vec![route];
 
@@ -160,6 +161,7 @@ fn validate_integrity_config_normalizes_model_bindings() {
             device: ModelDevice::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
+            hardware_strategy: Default::default(),
         }]
     );
 }
@@ -173,6 +175,7 @@ fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
         device: ModelDevice::Cpu,
         qos: RouteQos::Standard,
         dynamic: false,
+        hardware_strategy: Default::default(),
     }];
     let mut second = IntegrityRoute::user("/api/assistant");
     second.models = vec![IntegrityModelBinding {
@@ -181,6 +184,7 @@ fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
         device: ModelDevice::Metal,
         qos: RouteQos::Standard,
         dynamic: false,
+        hardware_strategy: Default::default(),
     }];
 
     let error = validate_integrity_config(IntegrityConfig {

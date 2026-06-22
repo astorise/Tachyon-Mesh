@@ -1602,6 +1602,7 @@ pub(crate) fn normalize_route_models(
                 device: model.device,
                 qos: model.qos,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             });
     }
 
