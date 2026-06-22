@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "core-host",
+    "crates/parallel-topology",
     "crates/smolvm",
     "ebpf-probes",
     "faas-sdk",
