@@ -914,3 +914,68 @@ fn validate_integrity_config_rejects_writable_user_route_volumes() {
         .to_string()
         .contains("cannot request writable direct host mounts"));
 }
+
+fn asset_uri_route(path: &str, asset_uri: &str) -> IntegrityRoute {
+    let mut route = IntegrityRoute::user(path);
+    route.targets = vec![RouteTarget {
+        module: asset_uri.to_owned(),
+        weight: 100,
+        websocket: false,
+        match_header: None,
+        requires: Vec::new(),
+    }];
+    route
+}
+
+#[test]
+fn validate_route_asset_availability_rejects_missing_blob() {
+    let manifest_path = unique_test_dir("asset-availability-missing").join("integrity.lock");
+    fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
+        .expect("manifest dir should be created");
+
+    let digest = "0".repeat(64);
+    let asset_uri = format!("tachyon://sha256:{digest}");
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![asset_uri_route("/v1/models", &asset_uri)];
+
+    let error = validate_route_asset_availability(&config, &manifest_path)
+        .expect_err("a route pointing at a missing asset blob must be rejected at seal time");
+
+    let message = error.to_string();
+    assert!(message.contains("/v1/models"), "message: {message}");
+    assert!(
+        message.contains("not present in the registry"),
+        "message: {message}"
+    );
+}
+
+#[test]
+fn validate_route_asset_availability_accepts_present_blob() {
+    let root = unique_test_dir("asset-availability-present");
+    let manifest_path = root.join("integrity.lock");
+    let assets_dir = root.join("asset-registry").join("assets");
+    fs::create_dir_all(&assets_dir).expect("asset dir should be created");
+
+    let digest = "a".repeat(64);
+    fs::write(assets_dir.join(format!("{digest}.wasm")), b"\x00asm")
+        .expect("asset blob should be written");
+
+    let asset_uri = format!("tachyon://sha256:{digest}");
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![asset_uri_route("/v1/models", &asset_uri)];
+
+    validate_route_asset_availability(&config, &manifest_path)
+        .expect("a route whose asset blob exists must pass seal-time validation");
+}
+
+#[test]
+fn validate_route_asset_availability_ignores_module_name_targets() {
+    let manifest_path = unique_test_dir("asset-availability-module").join("integrity.lock");
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![asset_uri_route("/grpc/hello", "guest-grpc")];
+
+    // Plain module-name targets are resolved at link time, not from the asset
+    // registry, so the availability check must leave them untouched.
+    validate_route_asset_availability(&config, &manifest_path)
+        .expect("module-name targets must not trigger asset-registry checks");
+}
