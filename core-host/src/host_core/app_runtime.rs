@@ -1377,11 +1377,20 @@ pub(crate) async fn custom_domain_routing_middleware(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Some(host) = request_host(req.headers()) else {
+    // HTTP/1.1 carries the target host in the `Host` header, but HTTP/2 and
+    // HTTP/3 move it to the `:authority` pseudo-header, which hyper surfaces on
+    // the request URI rather than as a `host` header. Fall back to the URI
+    // authority so custom-domain routing works regardless of protocol version
+    // (otherwise an h2/h3 client hitting a custom domain misses its route and
+    // 404s on `/`).
+    let host = request_host(req.headers())
+        .map(str::to_owned)
+        .or_else(|| req.uri().host().map(str::to_owned));
+    let Some(host) = host else {
         return next.run(req).await;
     };
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.route_for_domain(host) else {
+    let Some(route) = runtime.config.route_for_domain(&host) else {
         return next.run(req).await;
     };
     let path = route_domain_request_path(route, req.uri());
