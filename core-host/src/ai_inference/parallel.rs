@@ -185,34 +185,66 @@ impl NcclShardGroup {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // NCCL requires that when one thread drives multiple communicators
+        // for distinct devices (our case: `self.comms` holds one communicator
+        // per participating GPU, all launched from this single thread), the
+        // per-device calls be enclosed in a group so they are all *posted*
+        // before any of them blocks waiting on its peers — otherwise the
+        // first iteration's `all_reduce` can hang waiting for ranks whose
+        // calls haven't been issued yet. See
+        // https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html
+        cudarc::nccl::group_start()
+            .map_err(|e| candle_core::Error::Msg(format!("NCCL group_start failed: {e:?}")))?;
+
         let mut reduced_on_device: Vec<Tensor> = Vec::with_capacity(partials.len());
+        let mut first_error: Option<candle_core::Error> = None;
         for (comm, partial) in self.comms.iter().zip(partials.iter()) {
-            let cuda_device = match partial.device() {
-                Device::Cuda(d) => d,
-                _ => candle_core::bail!(
-                    "NCCL all-reduce requires every partial to be on a CUDA device"
-                ),
+            let step = || -> CandleResult<Tensor> {
+                let cuda_device = match partial.device() {
+                    Device::Cuda(d) => d,
+                    _ => candle_core::bail!(
+                        "NCCL all-reduce requires every partial to be on a CUDA device"
+                    ),
+                };
+                let (storage, layout) = partial.storage_and_layout();
+                if !layout.is_contiguous() {
+                    candle_core::bail!("NCCL all-reduce requires a contiguous partial tensor");
+                }
+                let src = match &*storage {
+                    Storage::Cuda(cs) => cs.as_cuda_slice::<f32>()?,
+                    _ => candle_core::bail!("NCCL all-reduce requires CUDA storage"),
+                };
+                let mut dst = cuda_device.alloc_zeros::<f32>(src.len()).map_err(|e| {
+                    candle_core::Error::Msg(format!("NCCL all-reduce alloc failed: {e:?}"))
+                })?;
+                comm.all_reduce(src, &mut dst, &ReduceOp::Sum)
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("NCCL AllReduce failed: {e:?}"))
+                    })?;
+                let storage = CudaStorage::wrap_cuda_slice(dst, cuda_device.clone());
+                Ok(Tensor::from_storage(
+                    Storage::Cuda(storage),
+                    partial.shape().clone(),
+                    BackpropOp::none(),
+                    false,
+                ))
             };
-            let (storage, layout) = partial.storage_and_layout();
-            if !layout.is_contiguous() {
-                candle_core::bail!("NCCL all-reduce requires a contiguous partial tensor");
+            match step() {
+                Ok(tensor) => reduced_on_device.push(tensor),
+                Err(e) => {
+                    first_error = Some(e);
+                    break;
+                }
             }
-            let src = match &*storage {
-                Storage::Cuda(cs) => cs.as_cuda_slice::<f32>()?,
-                _ => candle_core::bail!("NCCL all-reduce requires CUDA storage"),
-            };
-            let mut dst = cuda_device.alloc_zeros::<f32>(src.len()).map_err(|e| {
-                candle_core::Error::Msg(format!("NCCL all-reduce alloc failed: {e:?}"))
-            })?;
-            comm.all_reduce(src, &mut dst, &ReduceOp::Sum)
-                .map_err(|e| candle_core::Error::Msg(format!("NCCL AllReduce failed: {e:?}")))?;
-            let storage = CudaStorage::wrap_cuda_slice(dst, cuda_device.clone());
-            reduced_on_device.push(Tensor::from_storage(
-                Storage::Cuda(storage),
-                partial.shape().clone(),
-                BackpropOp::none(),
-                false,
-            ));
+        }
+
+        // group_end() must run even on error: it's what actually posts the
+        // queued NCCL calls, and every rank's group must close in step or
+        // later collectives on these communicators will desync.
+        cudarc::nccl::group_end()
+            .map_err(|e| candle_core::Error::Msg(format!("NCCL group_end failed: {e:?}")))?;
+        if let Some(e) = first_error {
+            return Err(e);
         }
         // Every device's stream must finish the collective before the
         // freshly-allocated buffers are read back by the `to_device` move.
