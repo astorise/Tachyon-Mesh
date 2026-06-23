@@ -186,7 +186,13 @@ impl NcclShardGroup {
         };
 
         let comms = if all_distinct {
-            cudarc::nccl::Comm::from_devices(streams).ok()?
+            match cudarc::nccl::Comm::from_devices(streams) {
+                Ok(comms) => comms,
+                Err(err) => {
+                    eprintln!("NcclShardGroup: Comm::from_devices failed: {:?}", err.0);
+                    return None;
+                }
+            }
         } else {
             let world_size = streams.len();
             let id = cudarc::nccl::Id::new().ok()?;
@@ -199,7 +205,13 @@ impl NcclShardGroup {
             for (rank, stream) in streams.into_iter().enumerate() {
                 match cudarc::nccl::Comm::from_rank(stream, rank, world_size, id) {
                     Ok(comm) => comms.push(comm),
-                    Err(_) => break,
+                    Err(err) => {
+                        eprintln!(
+                            "NcclShardGroup: Comm::from_rank(rank={rank}, world_size={world_size}) failed: {:?}",
+                            err.0
+                        );
+                        break;
+                    }
                 }
             }
             cudarc::nccl::group_end().ok()?;
