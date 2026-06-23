@@ -754,6 +754,13 @@ pub(crate) async fn admin_manifest_update_handler(
             .into_response();
     }
 
+    // Reject sealing a manifest that points at asset blobs we don't actually
+    // hold: such a route resolves to `tachyon://sha256:` but 404s at request
+    // time, and the broken state survives restarts once persisted.
+    if let Err(error) = validate_route_asset_availability(&new_config, &state.manifest_path) {
+        return (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response();
+    }
+
     // Atomic write: stage to a tempfile, fsync, rename. The notify-based
     // watcher (Wave 1) sees the rename and triggers `reload_runtime_from_disk`.
     let manifest_path = state.manifest_path.clone();
@@ -878,6 +885,41 @@ pub(crate) fn validate_integrity_config(mut config: IntegrityConfig) -> Result<I
     config.resources = normalize_resources(config.resources, &config.routes, &route_registry)?;
     config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
     Ok(config)
+}
+
+/// Rejects a manifest whose route targets point at content-addressed asset
+/// blobs (`tachyon://sha256:…`) that are not present in the local asset
+/// registry. Called at **seal/import time** (the `/admin/manifest` and bundle
+/// apply handlers) so an unusable manifest can never be signed and persisted —
+/// and therefore can never be restored across restarts/redeploys.
+///
+/// This is deliberately *not* part of [`validate_integrity_config`], which also
+/// runs on the boot/restore path: a restored, operator-signed `integrity.lock`
+/// is the legitimate disaster-recovery payload and must load even if the asset
+/// blobs are still being rehydrated. The guarantee is enforced at the point the
+/// manifest is created, not at the point it is recovered.
+pub(crate) fn validate_route_asset_availability(
+    config: &IntegrityConfig,
+    manifest_path: &Path,
+) -> Result<()> {
+    for route in &config.routes {
+        for target in &route.targets {
+            if system_storage::is_asset_uri(&target.module) {
+                system_storage::resolve_asset_uri(manifest_path, &target.module).map_err(
+                    |error| {
+                        anyhow!(
+                            "Integrity Validation Failed: route `{}` target `{}` references an \
+                             asset blob that is not present in the registry; upload the module \
+                             before sealing it: {error:#}",
+                            route.path,
+                            target.module
+                        )
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_enrollment_config(enrollment: &EnrollmentConfig) -> Result<()> {
@@ -1602,6 +1644,7 @@ pub(crate) fn normalize_route_models(
                 device: model.device,
                 qos: model.qos,
                 dynamic: false,
+                hardware_strategy: Default::default(),
             });
     }
 
@@ -2419,6 +2462,12 @@ pub(crate) async fn admin_manifest_bundle_handler(
                 .into_response();
         }
     };
+
+    // Reject sealing a bundle whose route targets reference asset blobs that
+    // are not present in the registry — see `validate_route_asset_availability`.
+    if let Err(error) = validate_route_asset_availability(&new_config, &state.manifest_path) {
+        return (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response();
+    }
 
     let current_version = state.runtime.load().config.config_version;
     if new_config.config_version <= current_version {

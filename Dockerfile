@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     file \
+    git \
     golang-go \
     libayatana-appindicator3-dev \
     librsvg2-dev \
@@ -24,6 +25,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 ENV RUSTUP_HOME=/usr/local/rustup
+
+# Harden cargo's network access against the intermittent crates.io flakes that
+# repeatedly broke the Docker builds ("[16] Error in the HTTP2 framing layer",
+# "download of <crate> failed"). Disabling HTTP/2 multiplexing sidesteps the
+# framing-layer bug, the retry budget rides out brief blips, and fetching git
+# dependencies via the system git CLI is more robust than libgit2.
+ENV CARGO_NET_RETRY=10
+ENV CARGO_HTTP_MULTIPLEXING=false
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 RUN rustup target add wasm32-wasip1 wasm32-wasip2 x86_64-unknown-linux-musl

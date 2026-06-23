@@ -51,13 +51,21 @@ pub(crate) use parallel_topology::{
 /// device is discovered (NVLink/topology detection is not implemented), and
 /// is irrelevant when only one device is present.
 pub(crate) fn discover_cluster_topology() -> ClusterTopology {
-    #[cfg_attr(not(feature = "nvfp4-cuda"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "candle-cuda"), allow(unused_mut))]
     let mut devices = vec![DeviceInfo {
         device_id: 0,
         free_vram_bytes: 0,
     }];
 
-    #[cfg(feature = "nvfp4-cuda")]
+    // With the `candle-cuda` Cargo feature compiled in (a separate, sibling
+    // feature to `nvfp4-cuda` — enabling `nvfp4-cuda` alone does NOT pull in
+    // `candle-cuda`; see core-host/Cargo.toml), `cuda_if_available` actually
+    // opens devices, so this loop enumerates every real GPU ordinal.
+    // `free_vram_bytes` stays `0` (unknown) until NVML telemetry lands;
+    // `validate_parallel_topology` only enforces the VRAM check when the plan
+    // declares a non-zero per-shard requirement, so a `0` here never causes a
+    // spurious rejection.
+    #[cfg(feature = "candle-cuda")]
     {
         let mut ordinal = 0u32;
         loop {

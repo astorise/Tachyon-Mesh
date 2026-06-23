@@ -50,7 +50,7 @@ jobs:
         run: tar -czf wasm-guests.tar.gz target/wasm32-wasip1/release/*.wasm target/wasm32-wasip2/release/*.wasm
 
       - name: Upload guest artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wasm-guests-${{ github.sha }}
           path: wasm-guests.tar.gz
@@ -65,7 +65,7 @@ jobs:
             examples/guest-examples/manifest.json
 
       - name: Upload example guest modules archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: guest-examples-${{ github.sha }}
           path: guest-examples.tar.gz
@@ -201,8 +201,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::unwrap_used
+      - name: Lint workspace (CPU features)
+        # Keep the general quality gate on ubuntu-latest CPU runners: CUDA is
+        # validated separately by the arc-gpu-runners job below. `--all-features`
+        # would enable core-host/candle-cuda and require nvcc on this runner.
+        run: cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
 
       - name: Cross-Layer Validation
         run: bash scripts/validate_cross_layer.sh
@@ -227,6 +230,90 @@ jobs:
 
       - name: Check s3-persistence host build
         run: cargo check -p core-host --features s3-persistence
+
+  # ── 3b. CUDA quality gate (requires the self-hosted ARC GPU runner) ────────
+  # This job owns the CUDA-enabled Candle build so the default ubuntu-latest
+  # quality job can stay CPU-only while still validating GPU ONNX inference code.
+  cuda-quality:
+    runs-on: arc-gpu-runners
+    env:
+      CARGO_TERM_COLOR: always
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFLAGS: "-D dead_code"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cuda-quality
+
+      # The ARC GPU runner on Talos has the NVIDIA driver (nvidia-smi works) but
+      # cudarc/candle-kernels need `nvcc` from the CUDA toolkit at build time.
+      # The toolkit's bin dir is not always on PATH for the job's non-login
+      # shell, so discover nvcc (PATH, then the usual roots, then a bounded
+      # filesystem search) and export its bin dir + CUDA_PATH/CUDA_HOME. Print
+      # diagnostics so a genuinely missing toolkit is easy to spot in the log.
+      - name: Put CUDA toolkit on PATH
+        run: |
+          echo "PATH=$PATH"
+          echo "CUDA_HOME=${CUDA_HOME:-<unset>} CUDA_PATH=${CUDA_PATH:-<unset>}"
+          nvcc_bin=""
+          # 1. Already on PATH?
+          if command -v nvcc >/dev/null 2>&1; then
+            nvcc_bin="$(command -v nvcc)"
+          fi
+          # 2. Well-known install roots.
+          if [ -z "$nvcc_bin" ]; then
+            for cuda in "${CUDA_HOME:-}" "${CUDA_PATH:-}" \
+                        /usr/local/cuda /usr/local/cuda-* \
+                        /opt/cuda /opt/cuda-* /usr/lib/cuda /usr/cuda; do
+              if [ -n "$cuda" ] && [ -x "$cuda/bin/nvcc" ]; then
+                nvcc_bin="$cuda/bin/nvcc"
+                break
+              fi
+            done
+          fi
+          # 3. Last resort: bounded search of likely roots.
+          if [ -z "$nvcc_bin" ]; then
+            nvcc_bin="$(find /usr /opt -maxdepth 5 -name nvcc -type f -executable 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "$nvcc_bin" ]; then
+            echo "::error::nvcc not found on this runner. The CUDA *toolkit* (not just the driver) must be installed in the arc-gpu-runners image. nvidia-smi alone is not enough — candle-kernels/cudarc compile .cu kernels with nvcc at build time."
+            echo "--- diagnostics ---"
+            echo "ls /usr/local:"; ls -la /usr/local 2>/dev/null || true
+            echo "ls /opt:";       ls -la /opt 2>/dev/null || true
+            echo "dpkg cuda pkgs:"; dpkg -l 2>/dev/null | grep -i cuda || echo "  (none)"
+            exit 1
+          fi
+          cuda_root="$(dirname "$(dirname "$nvcc_bin")")"
+          echo "Found nvcc at $nvcc_bin (CUDA root: $cuda_root)"
+          echo "$(dirname "$nvcc_bin")" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=$cuda_root" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$cuda_root" >> "$GITHUB_ENV"
+
+      - name: Verify CUDA toolchain
+        run: |
+          nvidia-smi
+          nvcc --version
+
+      # candle-onnx's build script compiles the ONNX .proto and needs `protoc`.
+      # The CPU jobs get it from `apt-get install protobuf-compiler`, but this
+      # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
+      # distro-agnostic way. Skipped if the runner image already ships protoc.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check Candle CUDA host build
+        run: cargo check -p core-host --features candle-cuda
+
+      - name: Lint Candle CUDA host build
+        run: cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos
@@ -263,7 +350,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -307,7 +394,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -317,7 +404,7 @@ jobs:
         run: cargo llvm-cov -p core-host --lcov --output-path lcov.info
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-host-lcov-${{ github.sha }}
           if-no-files-found: error
@@ -353,7 +440,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -363,7 +450,7 @@ jobs:
         run: cargo build -p core-host --release
 
       - name: Upload CI build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tachyon-mesh-build-${{ github.sha }}
           if-no-files-found: error
@@ -412,7 +499,12 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          - "--all-features"
+          # "All CPU features": every feature except core-host/candle-cuda, which
+          # pulls in cudarc and requires `nvcc` (validated separately by the
+          # cuda-quality job on the GPU runner). A bare `--all-features` would
+          # break on these CPU-only runners. Mirrors publish-docker-images'
+          # "-all-features" variant.
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
@@ -437,7 +529,7 @@ jobs:
           save-if: ${{ matrix.features == '' }}
 
       - name: Install FIPS build dependencies
-        if: matrix.features == '--all-features'
+        if: contains(matrix.features, 'fips')
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
@@ -446,7 +538,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -469,7 +561,12 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          - "--all-features"
+          # "All CPU features": every feature except core-host/candle-cuda, which
+          # pulls in cudarc and requires `nvcc` (validated separately by the
+          # cuda-quality job on the GPU runner). A bare `--all-features` would
+          # break on these CPU-only runners. Mirrors publish-docker-images'
+          # "-all-features" variant.
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
@@ -492,13 +589,13 @@ jobs:
           save-if: ${{ matrix.features == '' }}
 
       - name: Install FIPS build dependencies
-        if: matrix.features == '--all-features'
+        if: contains(matrix.features, 'fips')
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -514,7 +611,7 @@ jobs:
           case "${{ matrix.features }}" in
             "")                                                        label="default" ;;
             "--no-default-features")                                   label="no-default" ;;
-            "--all-features")                                          label="all" ;;
+            "--features ai-inference,"*)                               label="all" ;;
             "--features http3")                                        label="http3" ;;
             "--features rate-limit,resiliency,mtls,secrets-vault,websockets") label="security" ;;
             *)                                                         label="custom" ;;
@@ -522,7 +619,7 @@ jobs:
           echo "label=${label}" >> "$GITHUB_OUTPUT"
 
       - name: Upload core-host binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-host-linux-x86_64-${{ steps.feat_label.outputs.label }}-${{ github.sha }}
           path: target/release/core-host
@@ -552,7 +649,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -589,7 +686,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -599,7 +696,7 @@ jobs:
         run: cargo build -p core-host --release --features fips
 
       - name: Upload FIPS core-host binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-host-linux-x86_64-fips-${{ github.sha }}
           path: target/release/core-host

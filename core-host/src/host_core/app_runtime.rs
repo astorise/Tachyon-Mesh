@@ -1377,11 +1377,20 @@ pub(crate) async fn custom_domain_routing_middleware(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Some(host) = request_host(req.headers()) else {
+    // HTTP/1.1 carries the target host in the `Host` header, but HTTP/2 and
+    // HTTP/3 move it to the `:authority` pseudo-header, which hyper surfaces on
+    // the request URI rather than as a `host` header. Fall back to the URI
+    // authority so custom-domain routing works regardless of protocol version
+    // (otherwise an h2/h3 client hitting a custom domain misses its route and
+    // 404s on `/`).
+    let host = request_host(req.headers())
+        .map(str::to_owned)
+        .or_else(|| req.uri().host().map(str::to_owned));
+    let Some(host) = host else {
         return next.run(req).await;
     };
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.route_for_domain(host) else {
+    let Some(route) = runtime.config.route_for_domain(&host) else {
         return next.run(req).await;
     };
     let path = route_domain_request_path(route, req.uri());
@@ -1401,8 +1410,17 @@ pub(crate) async fn custom_domain_routing_middleware(
 
 pub(crate) fn route_domain_request_path(route: &IntegrityRoute, uri: &Uri) -> String {
     let original_path = normalize_route_path(uri.path());
+    // A custom domain mounts its guest at the domain root: `/` maps to the
+    // route path and sub-paths are prefixed with it. Skip prefixing when the
+    // request already targets the route path (e.g. an h2/h3 client that sends
+    // the absolute route path in `:path`) so we don't double it up
+    // (`/api/x` -> `/api/x/api/x`).
+    let already_targets_route =
+        original_path == route.path || original_path.starts_with(&format!("{}/", route.path));
     let path = if original_path == "/" {
         route.path.clone()
+    } else if already_targets_route {
+        original_path
     } else {
         format!("{}{}", route.path, original_path)
     };

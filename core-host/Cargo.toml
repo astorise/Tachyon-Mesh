@@ -21,6 +21,20 @@ experimental = []
 fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
 mtls = []
+candle-cuda = [
+    "ai-inference",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-onnx/cuda",
+    "candle-transformers/cuda",
+]
+# `nvfp4-cuda` stays CPU-buildable (no `candle-core/cuda`) so it remains in the
+# standard non-CUDA feature matrix. The candle CUDA backend is activated by the
+# separate `candle-cuda` feature (which enables `candle-core/cuda` et al.) and is
+# what the parallel dispatch, multi-GPU enumeration, and tensor-parallel
+# all-reduce gate on (`#[cfg(feature = "candle-cuda")]`); it is exercised by the
+# dedicated `cuda-quality` CI job. The default build stays CUDA-free
+# (`default = ["ring"]`) and reproducible without a CUDA toolchain.
 nvfp4-cuda = ["ai-inference"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
@@ -39,13 +53,13 @@ arc-swap = "1.7"
 axum = "0.8"
 blake3 = "1.5"
 bytes = "1.5"
-candle-core = { version = "0.10.0", optional = true }
-candle-nn = { version = "0.10.0", optional = true }
-candle-onnx = { version = "0.10.2", optional = true }
+candle-core = { git = "https://github.com/astorise/candle", rev = "f4d314a31bbb9cb557f7ee3cad35b771515bb243", version = "0.10.2", optional = true }
+candle-nn = { git = "https://github.com/astorise/candle", rev = "f4d314a31bbb9cb557f7ee3cad35b771515bb243", version = "0.10.2", optional = true }
+candle-onnx = { git = "https://github.com/astorise/candle", rev = "f4d314a31bbb9cb557f7ee3cad35b771515bb243", version = "0.10.2", optional = true }
 # Standard transformer architectures (Llama family) for running real, uploaded
 # checkpoints. Weights are mmapped from the model directory at runtime — never
 # compiled into the Tachyon artifact.
-candle-transformers = { version = "0.10.0", optional = true, default-features = false }
+candle-transformers = { git = "https://github.com/astorise/candle", rev = "f4d314a31bbb9cb557f7ee3cad35b771515bb243", version = "0.10.2", optional = true, default-features = false }
 parallel-topology = { path = "../crates/parallel-topology", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = "2"
@@ -70,7 +84,7 @@ http-body-util = "0.1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio", "http1", "http2"] }
 lru = { version = "0.18", optional = true }
-object_store = { version = "0.13", optional = true, features = ["aws"] }
+object_store = { version = "0.14", optional = true, features = ["aws"] }
 prometheus = "0.14"
 prost = { version = "0.14", optional = true }
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -97,9 +111,9 @@ system-faas-enrollment = { path = "../systems/system-faas-enrollment" }
 system-faas-microvm-runner = { path = "../systems/system-faas-microvm-runner" }
 turboquant-sys = { path = "../turboquant-sys", optional = true }
 uuid = { version = "1", features = ["v4"] }
-wasmtime = { version = "45.0.0", features = ["component-model"] }
-wasmtime-wasi = { version = "45.0.0", features = ["p1"] }
-wasmtime-wasi-nn = { version = "45.0.0", optional = true, default-features = false }
+wasmtime = { version = "46.0.0", features = ["component-model"] }
+wasmtime-wasi = { version = "46.0.0", features = ["p1"] }
+wasmtime-wasi-nn = { version = "46.0.0", optional = true, default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13.1", optional = true }

@@ -236,7 +236,8 @@ scripts/build-guest-artifacts.sh examples/guest-example
 ## 🗺 Roadmap
 
 - [x] VRAM-aware routing and multi-GPU optimization.
-- [x] Tensor/pipeline/expert-parallel inference engines (intra-node tensor sharding, cross-node pipeline stages, MoE expert routing — see `openspec/changes/2026-06-19-distributed-model-parallel-inference`). Not yet wired into the live model-load path; see that change's `tasks.md` for the remaining dispatch-path gap.
+- [x] Tensor/pipeline/expert-parallel inference engines (intra-node tensor sharding, cross-node pipeline stages, MoE expert routing — see `openspec/changes/2026-06-19-distributed-model-parallel-inference`).
+- [x] Parallel engines wired into the live model-load path: `candle_llm_runtime::try_load` reads a deployment's `hardware_strategy`, validates the plan against discovered hardware, and selects the tensor/pipeline engine (see `openspec/changes/2026-06-22-wire-model-parallel-runtime-dispatch`). Tensor-parallelism runs the full decode loop today; pipeline-parallelism is prefill-correct with its decode loop as a follow-up; expert-parallelism awaits a full MoE checkpoint loader. The `candle-cuda` build (real GPU execution, multi-GPU VRAM telemetry, NCCL all-reduce) is validated on the CUDA CI lane, not the default CPU build.
 - [x] Distributed KV-Store (Partitioning V2).
 - [x] Tauri Interface (Phase 3: Routing Dashboards complete).
 - [ ] **Upcoming**: GPU pressure-based auto-scaling (KEDA integration).

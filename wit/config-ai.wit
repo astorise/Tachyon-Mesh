@@ -9,13 +9,19 @@ interface config-ai {
     }
 
     /// `tensor-parallelism`/`pipeline-parallelism`/`expert-parallelism` are
-    /// executable, not configuration-only: `core-host`'s
-    /// `ai_inference::parallel` module implements real shard partitioning,
-    /// pipeline staging, and MoE expert routing for these strategies (see
-    /// `openspec/changes/2026-06-19-distributed-model-parallel-inference`).
-    /// No deployment currently wires this `hardware-strategy` into model
-    /// loading yet, so a `single` deployment remains the only strategy
-    /// exercised end-to-end at runtime today.
+    /// executable, not configuration-only. The runtime now wires this
+    /// `hardware-strategy` into model loading: `candle_llm_runtime::try_load`
+    /// reads it, validates the plan against discovered hardware, and selects
+    /// the matching engine (see
+    /// `openspec/changes/2026-06-22-wire-model-parallel-runtime-dispatch`).
+    /// Status by mode: `tensor-parallelism` runs the full autoregressive
+    /// decode loop; `pipeline-parallelism` is loaded and prefill-correct but
+    /// its decode loop is a disclosed follow-up (generation returns a typed
+    /// error until then); `expert-parallelism` is validated and placed but
+    /// rejected at load until a full MoE checkpoint loader lands (only the
+    /// verified per-expert primitive exists today). Real GPU execution,
+    /// multi-GPU VRAM telemetry, and the NCCL all-reduce require the
+    /// `candle-cuda` build and are exercised on the CUDA CI lane.
     enum gpu-distribution {
         single,
         tensor-parallelism,
