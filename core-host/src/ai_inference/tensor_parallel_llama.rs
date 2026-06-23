@@ -25,6 +25,8 @@ use candle_transformers::models::with_tracing::{
 };
 use candle_transformers::utils::{build_causal_mask, repeat_kv};
 
+#[cfg(feature = "candle-cuda")]
+use super::parallel::NcclShardGroup;
 use super::parallel::{split_for_row_parallel, ColumnParallelLinear, RowParallelLinear};
 
 /// External KV cache + precomputed rotary tables for [`TensorParallelLlama`].
@@ -275,6 +277,15 @@ impl TensorParallelMlp {
         })
     }
 
+    /// Attaches a shared NCCL communicator group (one per tensor-parallel
+    /// shard group, built once by `TensorParallelLlama::load` and reused
+    /// across every layer) to this MLP's `down` projection.
+    #[cfg(feature = "candle-cuda")]
+    fn with_nccl_group(mut self, group: Option<std::sync::Arc<NcclShardGroup>>) -> Self {
+        self.down = self.down.with_nccl_group(group);
+        self
+    }
+
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         // `ColumnParallelLinear`/`RowParallelLinear` operate on 2-D
         // `[rows, features]` tensors; flatten the leading `(batch, seq)`
@@ -322,6 +333,15 @@ impl TensorParallelBlock {
         })
     }
 
+    /// Attaches a shared NCCL communicator group (built once per
+    /// tensor-parallel shard group by `TensorParallelLlama::load`) to this
+    /// block's MLP.
+    #[cfg(feature = "candle-cuda")]
+    pub(crate) fn with_nccl_group(mut self, group: Option<std::sync::Arc<NcclShardGroup>>) -> Self {
+        self.mlp = self.mlp.with_nccl_group(group);
+        self
+    }
+
     pub(crate) fn forward(
         &self,
         x: &Tensor,
@@ -360,8 +380,19 @@ impl TensorParallelLlama {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
         let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        // One NCCL communicator group per tensor-parallel shard group,
+        // shared (via `Arc`) across every layer's `RowParallelLinear`
+        // instead of paying communicator-init cost per layer.
+        #[cfg(feature = "candle-cuda")]
+        let nccl_group = NcclShardGroup::try_new(devices).map(std::sync::Arc::new);
         let blocks = (0..cfg.num_hidden_layers)
-            .map(|i| TensorParallelBlock::load(vb.pp(format!("model.layers.{i}")), cfg, devices))
+            .map(|i| {
+                let block =
+                    TensorParallelBlock::load(vb.pp(format!("model.layers.{i}")), cfg, devices)?;
+                #[cfg(feature = "candle-cuda")]
+                let block = block.with_nccl_group(nccl_group.clone());
+                Ok(block)
+            })
             .collect::<CandleResult<Vec<_>>>()?;
         Ok(Self {
             wte,

@@ -315,6 +315,12 @@ jobs:
       - name: Lint Candle CUDA host build
         run: cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
 
+      # Proves the tensor-parallel all-reduce path issues a real NCCL
+      # AllReduce on this runner's real GPU (via ncclCommInitAll loopback
+      # ranks, see parallel.rs), not just that candle-cuda compiles/lints.
+      - name: Run CUDA NCCL all-reduce proof
+        run: cargo test -p core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
+
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos
   # integration test — plus doc tests.
