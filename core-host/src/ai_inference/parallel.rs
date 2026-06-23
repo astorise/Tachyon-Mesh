@@ -16,6 +16,10 @@
 use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear};
+#[cfg(feature = "candle-cuda")]
+use candle_core::{op::BackpropOp, CudaStorage, Storage};
+#[cfg(feature = "candle-cuda")]
+use std::sync::OnceLock;
 
 /// Pure validation types/logic (no GPU runtime dependency) live in the
 /// `parallel-topology` crate so they can be shared with
@@ -73,7 +77,7 @@ pub(crate) fn discover_cluster_topology() -> ClusterTopology {
                 Ok(Device::Cuda(_)) => {
                     devices.push(DeviceInfo {
                         device_id: ordinal + 1,
-                        free_vram_bytes: 0,
+                        free_vram_bytes: free_vram_bytes(ordinal),
                     });
                     ordinal += 1;
                 }
@@ -94,6 +98,115 @@ pub(crate) fn discover_cluster_topology() -> ClusterTopology {
     ClusterTopology {
         devices,
         interconnect,
+    }
+}
+
+/// Reports `ordinal`'s free VRAM via NVML (`nvmlDeviceGetMemoryInfo`).
+/// `nvml-wrapper` dlopens `libnvidia-ml.so` at runtime rather than linking
+/// against it at build time, so `Nvml::init()` failing (no driver, no
+/// permissions, non-NVIDIA host) degrades to `0` ("unknown") exactly like
+/// the pre-NVML behavior — it never panics and never fails the build.
+/// `validate_parallel_topology` only enforces the VRAM check when a plan
+/// declares a non-zero per-shard requirement, so a `0` here never causes a
+/// spurious rejection.
+#[cfg(feature = "candle-cuda")]
+fn free_vram_bytes(ordinal: u32) -> u64 {
+    static NVML: OnceLock<Option<nvml_wrapper::Nvml>> = OnceLock::new();
+    let Some(nvml) = NVML.get_or_init(|| nvml_wrapper::Nvml::init().ok()) else {
+        return 0;
+    };
+    nvml.device_by_index(ordinal)
+        .and_then(|d| d.memory_info())
+        .map(|m| m.free)
+        .unwrap_or(0)
+}
+
+/// One tensor-parallel shard group's NCCL communicators, one per
+/// participating CUDA device, created once (NCCL communicator init is
+/// expensive: it allocates and exchanges out-of-band rendezvous state) and
+/// reused for every `RowParallelLinear::forward` call in that group's
+/// lifetime, mirroring how `TensorParallelCache` is built once per model and
+/// threaded through layers.
+#[cfg(feature = "candle-cuda")]
+pub(crate) struct NcclShardGroup {
+    comms: Vec<cudarc::nccl::Comm>,
+}
+
+#[cfg(feature = "candle-cuda")]
+impl NcclShardGroup {
+    /// Builds one communicator per device via `ncclCommInitAll`'s
+    /// single-process, multi-device path (`Comm::from_devices`) — the case
+    /// this codebase targets, since `TensorParallelBlock`/`TensorParallelLlama`
+    /// are single-process, multi-`Device` constructs. Returns `None` (rather
+    /// than an error) if fewer than 2 devices are given, any device is not
+    /// `Device::Cuda`, or communicator creation fails, so callers can
+    /// transparently fall back to the host-staged sum.
+    pub(crate) fn try_new(devices: &[Device]) -> Option<Self> {
+        let mut streams = Vec::with_capacity(devices.len());
+        for device in devices {
+            match device {
+                Device::Cuda(cuda_device) => streams.push(cuda_device.cuda_stream()),
+                _ => return None,
+            }
+        }
+        if streams.len() < 2 {
+            return None;
+        }
+        let comms = cudarc::nccl::Comm::from_devices(streams).ok()?;
+        Some(Self { comms })
+    }
+
+    /// Sums `partials[i]` (resident on the i-th participating CUDA device,
+    /// must be contiguous `DType::F32`) across every communicator via a real
+    /// NCCL `AllReduce`, then moves the reduced tensor onto `reduce_device`.
+    /// Every device ends up holding the identical sum, so any one of them
+    /// (here, the first) is a valid source for that final move.
+    fn all_reduce_sum(&self, partials: &[Tensor], reduce_device: &Device) -> CandleResult<Tensor> {
+        use cudarc::nccl::ReduceOp;
+
+        let mut reduced_on_device: Vec<Tensor> = Vec::with_capacity(partials.len());
+        for (comm, partial) in self.comms.iter().zip(partials.iter()) {
+            let cuda_device = match partial.device() {
+                Device::Cuda(d) => d,
+                _ => candle_core::bail!(
+                    "NCCL all-reduce requires every partial to be on a CUDA device"
+                ),
+            };
+            let (storage, layout) = partial.storage_and_layout();
+            if !layout.is_contiguous() {
+                candle_core::bail!("NCCL all-reduce requires a contiguous partial tensor");
+            }
+            let src = match &*storage {
+                Storage::Cuda(cs) => cs.as_cuda_slice::<f32>()?,
+                _ => candle_core::bail!("NCCL all-reduce requires CUDA storage"),
+            };
+            let mut dst = cuda_device
+                .alloc_zeros::<f32>(src.len())
+                .map_err(|e| candle_core::Error::Msg(format!("NCCL all-reduce alloc failed: {e:?}")))?;
+            comm.all_reduce(src, &mut dst, &ReduceOp::Sum)
+                .map_err(|e| candle_core::Error::Msg(format!("NCCL AllReduce failed: {e:?}")))?;
+            let storage = CudaStorage::wrap_cuda_slice(dst, cuda_device.clone());
+            reduced_on_device.push(Tensor::from_storage(
+                Storage::Cuda(storage),
+                partial.shape().clone(),
+                BackpropOp::none(),
+                false,
+            ));
+        }
+        // Every device's stream must finish the collective before the
+        // freshly-allocated buffers are read back by the `to_device` move.
+        for device in partials.iter().map(Tensor::device) {
+            if let Device::Cuda(cuda_device) = device {
+                cuda_device
+                    .cuda_stream()
+                    .synchronize()
+                    .map_err(|e| candle_core::Error::Msg(format!("CUDA stream sync failed: {e:?}")))?;
+            }
+        }
+        let result = reduced_on_device.into_iter().next().ok_or_else(|| {
+            candle_core::Error::Msg("NCCL all-reduce requires at least one shard".into())
+        })?;
+        result.to_device(reduce_device)
     }
 }
 
@@ -160,6 +273,12 @@ impl ColumnParallelLinear {
 pub(crate) struct RowParallelLinear {
     /// One weight shard per device: shape `[out_features, in_features / n]`.
     shards: Vec<(Tensor, Device)>,
+    /// Real NCCL communicators for this shard group, if one was attached via
+    /// `with_nccl_group`. `None` (the default from `shard`) means every
+    /// `forward` call uses the host-staged sum, matching pre-existing
+    /// behavior exactly.
+    #[cfg(feature = "candle-cuda")]
+    nccl_group: Option<std::sync::Arc<NcclShardGroup>>,
 }
 
 impl RowParallelLinear {
@@ -184,26 +303,69 @@ impl RowParallelLinear {
                 .to_device(device)?;
             shards.push((shard, device.clone()));
         }
-        Ok(Self { shards })
+        Ok(Self {
+            shards,
+            #[cfg(feature = "candle-cuda")]
+            nccl_group: None,
+        })
+    }
+
+    /// Attaches a real NCCL communicator group to this shard group, so
+    /// subsequent `forward` calls synchronize via NCCL instead of the
+    /// host-staged sum whenever every partial is a CUDA `DType::F32` tensor.
+    /// Passing `None` (or never calling this) preserves pre-existing
+    /// behavior exactly.
+    #[cfg(feature = "candle-cuda")]
+    pub(crate) fn with_nccl_group(mut self, group: Option<std::sync::Arc<NcclShardGroup>>) -> Self {
+        self.nccl_group = group;
+        self
     }
 
     /// `x_shards[i]` is the i-th input slice already resident on
     /// `self.shards[i]`'s device (typically the gathered output of a
     /// preceding `ColumnParallelLinear`, re-split). Computes the partial
     /// matmul per shard, then all-reduces (sums) the partial outputs on
-    /// `reduce_device`. This sum *is* the all-reduce: with one logical
-    /// device per shard there is nothing else to synchronize, and on real
-    /// multi-GPU hardware this is exactly the payload an NCCL all-reduce
-    /// would sum across devices.
+    /// `reduce_device`.
     pub(crate) fn forward(
         &self,
         x_shards: &[Tensor],
         reduce_device: &Device,
     ) -> CandleResult<Tensor> {
-        let mut acc: Option<Tensor> = None;
+        let mut partials = Vec::with_capacity(self.shards.len());
         for ((shard, device), x_local) in self.shards.iter().zip(x_shards.iter()) {
             let x_local = x_local.to_device(device)?;
-            let partial = x_local.matmul(&shard.t()?)?.to_device(reduce_device)?;
+            partials.push(x_local.matmul(&shard.t()?)?);
+        }
+        self.all_reduce(partials, reduce_device)
+    }
+
+    /// Real NCCL `AllReduce` when a communicator group is attached and every
+    /// partial is a CUDA `DType::F32` tensor with >1 device participating;
+    /// the existing host-staged manual sum otherwise (no `candle-cuda`,
+    /// single device, `Device::Cpu`, or a non-`F32` dtype not yet wired into
+    /// the NCCL fast path).
+    fn all_reduce(&self, partials: Vec<Tensor>, reduce_device: &Device) -> CandleResult<Tensor> {
+        #[cfg(feature = "candle-cuda")]
+        if let Some(group) = &self.nccl_group {
+            let eligible = partials.len() > 1
+                && partials
+                    .iter()
+                    .all(|t| matches!(t.device(), Device::Cuda(_)) && t.dtype() == DType::F32);
+            if eligible {
+                return group.all_reduce_sum(&partials, reduce_device);
+            }
+        }
+        self.cpu_staged_sum(partials, reduce_device)
+    }
+
+    /// Pre-existing manual sum across devices: moves each partial onto
+    /// `reduce_device` and accumulates. Used as-is when no NCCL group is
+    /// attached, when fewer than 2 CUDA devices participate, or on
+    /// `Device::Cpu` — unchanged from the original implementation.
+    fn cpu_staged_sum(&self, partials: Vec<Tensor>, reduce_device: &Device) -> CandleResult<Tensor> {
+        let mut acc: Option<Tensor> = None;
+        for partial in partials {
+            let partial = partial.to_device(reduce_device)?;
             acc = Some(match acc {
                 Some(prev) => (prev + partial)?,
                 None => partial,
@@ -844,6 +1006,63 @@ mod tests {
         assert_eq!(reference.len(), reduced.len());
         for (a, b) in reference.iter().zip(reduced.iter()) {
             assert!((a - b).abs() < 1e-5, "{a} != {b}");
+        }
+    }
+
+    /// Real GPU-proof: exercises `cudarc::nccl::Comm::all_reduce` against
+    /// real CUDA hardware via `ncclCommInitAll` loopback ranks (two ranks on
+    /// the single physical GPU the `arc-gpu-runners` CI runner exposes), and
+    /// asserts the result matches the existing CPU-staged-sum reference.
+    /// Skipped, not failed, on a `candle-cuda` build executed on a host with
+    /// zero CUDA devices.
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn nccl_all_reduce_matches_cpu_staged_reference() {
+        let device = match Device::cuda_if_available(0) {
+            Ok(d @ Device::Cuda(_)) => d,
+            _ => {
+                eprintln!(
+                    "skipping nccl_all_reduce_matches_cpu_staged_reference: no CUDA device available"
+                );
+                return;
+            }
+        };
+
+        let w = weight(4, 8, 2); // out_features=4, in_features=8
+        let x = Tensor::from_vec(
+            vec![1.0f32, -1.0, 0.5, 2.0, 0.25, -0.75, 1.5, -2.0],
+            (1, 8),
+            &cpu(),
+        )
+        .unwrap();
+
+        // CPU-staged reference: the same fallback math, on Device::Cpu.
+        let cpu_devices = vec![cpu(), cpu()];
+        let cpu_sharded = RowParallelLinear::shard(&w, &cpu_devices).unwrap();
+        let cpu_x_shards = split_for_row_parallel(&x, &cpu_devices).unwrap();
+        let reference = cpu_sharded.forward(&cpu_x_shards, &cpu()).unwrap();
+
+        // Real NCCL all-reduce across 2 loopback ranks on the one available GPU.
+        let devices = vec![device.clone(), device.clone()];
+        let group = NcclShardGroup::try_new(&devices)
+            .expect("NCCL communicator init should succeed with a CUDA device available");
+        let gpu_sharded = RowParallelLinear::shard(&w, &devices)
+            .unwrap()
+            .with_nccl_group(Some(std::sync::Arc::new(group)));
+        let gpu_x_shards = split_for_row_parallel(&x, &devices).unwrap();
+        let reduced = gpu_sharded.forward(&gpu_x_shards, &device).unwrap();
+
+        let reference: Vec<f32> = reference.flatten_all().unwrap().to_vec1().unwrap();
+        let reduced: Vec<f32> = reduced
+            .to_device(&cpu())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(reference.len(), reduced.len());
+        for (a, b) in reference.iter().zip(reduced.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} != {b}");
         }
     }
 

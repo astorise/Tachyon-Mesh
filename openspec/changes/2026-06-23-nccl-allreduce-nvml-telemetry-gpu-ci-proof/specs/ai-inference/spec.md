@@ -79,3 +79,30 @@ Inline documentation describing the relationship between the `nvfp4-cuda` and `c
 - **WHEN** they read the comment to understand what enables multi-GPU enumeration
 - **THEN** the comment states that the `candle-cuda` feature, not `nvfp4-cuda`, is required
 - **AND** the comment does not claim `nvfp4-cuda` pulls in or implies `candle-cuda`
+
+## Implementation status as of this change
+
+`RowParallelLinear::all_reduce` (`core-host/src/ai_inference/parallel.rs`) now dispatches to a
+real `cudarc::nccl::Comm::all_reduce` collective, via the new `NcclShardGroup` (one communicator
+per device, built once per `TensorParallelLlama::load` call and shared as `Arc<NcclShardGroup>`
+across every layer), whenever the runtime is built with `candle-cuda`, the shard group spans
+2+ CUDA devices, and every partial is a contiguous `DType::F32` CUDA tensor. The pre-existing
+host-staged `cpu_staged_sum` path is unchanged byte-for-byte and remains the fallback in every
+other case (CPU-only builds, single-device groups, non-F32 dtypes, non-contiguous tensors).
+`discover_cluster_topology`'s per-device `free_vram_bytes` is now sourced from real NVML
+telemetry (`Nvml::device_by_index(..).memory_info().free`) on `candle-cuda` builds, degrading
+to the pre-existing `0` ("unknown") on NVML init failure or non-CUDA builds — `0` is still never
+treated as a deployable amount of VRAM by `validate_parallel_topology`.
+
+**Locally verified**: the default `ai-inference` (non-CUDA) build and its full test suite
+(96/96 `ai_inference::` tests, including `row_parallel_all_reduce_matches_single_device_reference`)
+plus `clippy -D warnings -D clippy::unwrap_used` are unaffected — zero regressions. `cargo check
+--features candle-cuda` resolves the new `cudarc`/`nvml-wrapper` dependency graph successfully
+and fails only at `cudarc`'s build script's `nvcc` toolchain check, confirming this sandbox's
+absence of CUDA, not a code defect.
+
+**Not yet independently verified on real hardware**: this sandbox has no CUDA toolchain, so the
+new `nccl_all_reduce_matches_cpu_staged_reference` test and the `candle-cuda` clippy lint have
+not been run locally. The added `cuda-quality` CI step on `arc-gpu-runners` is the actual proof
+of this change's GPU-execution requirements; see `tasks.md` Task 5/6 for status and how to
+confirm it via `mcp__github__get_job_logs` once it runs.
