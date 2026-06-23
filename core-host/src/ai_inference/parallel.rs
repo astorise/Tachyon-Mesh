@@ -148,13 +148,23 @@ unsafe impl Sync for NcclShardGroup {}
 
 #[cfg(feature = "candle-cuda")]
 impl NcclShardGroup {
-    /// Builds one communicator per device via `ncclCommInitAll`'s
-    /// single-process, multi-device path (`Comm::from_devices`) — the case
-    /// this codebase targets, since `TensorParallelBlock`/`TensorParallelLlama`
-    /// are single-process, multi-`Device` constructs. Returns `None` (rather
-    /// than an error) if fewer than 2 devices are given, any device is not
+    /// Builds one communicator per device. Returns `None` (rather than an
+    /// error) if fewer than 2 devices are given, any device is not
     /// `Device::Cuda`, or communicator creation fails, so callers can
     /// transparently fall back to the host-staged sum.
+    ///
+    /// Real deployments (`TensorParallelBlock`/`TensorParallelLlama`) shard
+    /// across distinct physical GPUs, so the common path uses
+    /// `ncclCommInitAll`'s single-process, multi-device API
+    /// (`Comm::from_devices`), which requires every device ordinal to be
+    /// distinct. The one CI runner this is verified against
+    /// (`arc-gpu-runners`) exposes a single physical GPU, so the
+    /// `nccl_all_reduce_matches_cpu_staged_reference` test simulates 2 ranks
+    /// by passing the same device twice — `ncclCommInitAll` rejects that
+    /// (confirmed on real hardware: it returned an error here), so that case
+    /// falls back to the lower-level per-rank API (`Comm::from_rank`,
+    /// `ncclCommInitRank`) that NCCL's own `Comm::from_rank` doc example uses
+    /// for this exact "multiple ranks sharing one device" loopback pattern.
     pub(crate) fn try_new(devices: &[Device]) -> Option<Self> {
         let mut streams = Vec::with_capacity(devices.len());
         for device in devices {
@@ -166,7 +176,39 @@ impl NcclShardGroup {
         if streams.len() < 2 {
             return None;
         }
-        let comms = cudarc::nccl::Comm::from_devices(streams).ok()?;
+
+        let ordinals: Vec<usize> = streams.iter().map(|s| s.context().ordinal()).collect();
+        let all_distinct = {
+            let mut sorted = ordinals.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted.len() == ordinals.len()
+        };
+
+        let comms = if all_distinct {
+            cudarc::nccl::Comm::from_devices(streams).ok()?
+        } else {
+            let world_size = streams.len();
+            let id = cudarc::nccl::Id::new().ok()?;
+            // Per-rank `ncclCommInitRank` calls driven from one thread are
+            // subject to the same group requirement as the collective calls
+            // in `all_reduce_sum`: every rank's init must be posted before
+            // any of them blocks waiting on its peers.
+            cudarc::nccl::group_start().ok()?;
+            let mut comms = Vec::with_capacity(world_size);
+            for (rank, stream) in streams.into_iter().enumerate() {
+                match cudarc::nccl::Comm::from_rank(stream, rank, world_size, id) {
+                    Ok(comm) => comms.push(comm),
+                    Err(_) => break,
+                }
+            }
+            cudarc::nccl::group_end().ok()?;
+            if comms.len() != world_size {
+                return None;
+            }
+            comms
+        };
+
         Some(Self {
             comms,
             lock: std::sync::Mutex::new(()),
