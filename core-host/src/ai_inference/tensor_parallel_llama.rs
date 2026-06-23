@@ -25,9 +25,9 @@ use candle_transformers::models::with_tracing::{
 };
 use candle_transformers::utils::{build_causal_mask, repeat_kv};
 
-use super::parallel::{split_for_row_parallel, ColumnParallelLinear, RowParallelLinear};
 #[cfg(feature = "candle-cuda")]
 use super::parallel::NcclShardGroup;
+use super::parallel::{split_for_row_parallel, ColumnParallelLinear, RowParallelLinear};
 
 /// External KV cache + precomputed rotary tables for [`TensorParallelLlama`].
 /// Functionally identical to `candle_transformers::models::llama::Cache`,
