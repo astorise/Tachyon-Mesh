@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     file \
+    git \
     musl-tools \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -93,7 +94,7 @@ FROM rust:alpine3.20 AS fips-builder
 
 RUN apk add --no-cache \
     build-base cmake nasm \
-    go perl \
+    git go perl \
     linux-headers musl-dev \
     openssl-dev pkgconf \
     protobuf

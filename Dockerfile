@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     file \
+    git \
     golang-go \
     libayatana-appindicator3-dev \
     librsvg2-dev \
