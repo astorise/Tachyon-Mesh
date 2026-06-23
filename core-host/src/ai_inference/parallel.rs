@@ -157,14 +157,13 @@ impl NcclShardGroup {
     /// across distinct physical GPUs, so the common path uses
     /// `ncclCommInitAll`'s single-process, multi-device API
     /// (`Comm::from_devices`), which requires every device ordinal to be
-    /// distinct. The one CI runner this is verified against
-    /// (`arc-gpu-runners`) exposes a single physical GPU, so the
-    /// `nccl_all_reduce_matches_cpu_staged_reference` test simulates 2 ranks
-    /// by passing the same device twice — `ncclCommInitAll` rejects that
-    /// (confirmed on real hardware: it returned an error here), so that case
-    /// falls back to the lower-level per-rank API (`Comm::from_rank`,
-    /// `ncclCommInitRank`) that NCCL's own `Comm::from_rank` doc example uses
-    /// for this exact "multiple ranks sharing one device" loopback pattern.
+    /// distinct. The per-rank fallback (`Comm::from_rank`/`ncclCommInitRank`)
+    /// below is kept for callers that pass duplicate ordinals, but modern
+    /// NCCL rejects multiple ranks sharing one GPU even through that lower-
+    /// level API (confirmed on real hardware: `ncclGroupEnd` surfaces a
+    /// deferred error for it), so it is not expected to succeed in practice
+    /// — `nccl_all_reduce_matches_cpu_staged_reference` exercises the real
+    /// `Comm::from_devices` path with 2 distinct GPUs instead.
     pub(crate) fn try_new(devices: &[Device]) -> Option<Self> {
         let mut streams = Vec::with_capacity(devices.len());
         for device in devices {
@@ -195,12 +194,21 @@ impl NcclShardGroup {
             }
         } else {
             let world_size = streams.len();
-            let id = cudarc::nccl::Id::new().ok()?;
+            let id = match cudarc::nccl::Id::new() {
+                Ok(id) => id,
+                Err(err) => {
+                    eprintln!("NcclShardGroup: Id::new failed: {:?}", err.0);
+                    return None;
+                }
+            };
             // Per-rank `ncclCommInitRank` calls driven from one thread are
             // subject to the same group requirement as the collective calls
             // in `all_reduce_sum`: every rank's init must be posted before
             // any of them blocks waiting on its peers.
-            cudarc::nccl::group_start().ok()?;
+            if let Err(err) = cudarc::nccl::group_start() {
+                eprintln!("NcclShardGroup: group_start failed: {:?}", err.0);
+                return None;
+            }
             let mut comms = Vec::with_capacity(world_size);
             for (rank, stream) in streams.into_iter().enumerate() {
                 match cudarc::nccl::Comm::from_rank(stream, rank, world_size, id) {
@@ -214,8 +222,18 @@ impl NcclShardGroup {
                     }
                 }
             }
-            cudarc::nccl::group_end().ok()?;
+            if let Err(err) = cudarc::nccl::group_end() {
+                eprintln!(
+                    "NcclShardGroup: group_end failed (deferred error from per-rank init): {:?}",
+                    err.0
+                );
+                return None;
+            }
             if comms.len() != world_size {
+                eprintln!(
+                    "NcclShardGroup: only {}/{world_size} ranks initialized",
+                    comms.len()
+                );
                 return None;
             }
             comms
@@ -1137,6 +1155,18 @@ mod tests {
                 return;
             }
         };
+        // Modern NCCL rejects multiple ranks sharing one GPU ordinal (the
+        // "loopback" pattern), so this needs 2 distinct physical GPUs to
+        // exercise the real `ncclCommInitAll` tensor-parallel path.
+        let device1 = match Device::new_cuda(1) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!(
+                    "skipping nccl_all_reduce_matches_cpu_staged_reference: fewer than 2 CUDA devices available"
+                );
+                return;
+            }
+        };
 
         let w = weight(4, 8, 2); // out_features=4, in_features=8
         let x = Tensor::from_vec(
@@ -1152,8 +1182,8 @@ mod tests {
         let cpu_x_shards = split_for_row_parallel(&x, &cpu_devices).unwrap();
         let reference = cpu_sharded.forward(&cpu_x_shards, &cpu()).unwrap();
 
-        // Real NCCL all-reduce across 2 loopback ranks on the one available GPU.
-        let devices = vec![device.clone(), device.clone()];
+        // Real NCCL all-reduce across 2 distinct physical GPUs.
+        let devices = vec![device.clone(), device1];
         let group = NcclShardGroup::try_new(&devices)
             .expect("NCCL communicator init should succeed with a CUDA device available");
         let gpu_sharded = RowParallelLinear::shard(&w, &devices)
