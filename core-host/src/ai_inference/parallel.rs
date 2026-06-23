@@ -13,11 +13,11 @@
 //! `Device::Cuda(ordinal)` handles on real multi-GPU hardware — this module
 //! does not special-case CPU vs. GPU placement.
 
+#[cfg(feature = "candle-cuda")]
+use candle_core::{op::BackpropOp, CudaStorage, Storage};
 use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear};
-#[cfg(feature = "candle-cuda")]
-use candle_core::{op::BackpropOp, CudaStorage, Storage};
 #[cfg(feature = "candle-cuda")]
 use std::sync::OnceLock;
 
@@ -130,7 +130,21 @@ fn free_vram_bytes(ordinal: u32) -> u64 {
 #[cfg(feature = "candle-cuda")]
 pub(crate) struct NcclShardGroup {
     comms: Vec<cudarc::nccl::Comm>,
+    // `cudarc::nccl::Comm` wraps a raw `ncclComm_t` pointer and is therefore
+    // neither `Send` nor `Sync` on its own. NCCL only requires that a given
+    // communicator not be driven by multiple threads concurrently, so this
+    // lock serializes every collective call through `all_reduce_sum` to make
+    // sharing this group behind an `Arc` across worker threads sound.
+    lock: std::sync::Mutex<()>,
 }
+
+// SAFETY: see the `lock` field above — every access to `comms` is
+// serialized through `all_reduce_sum`, which holds `lock` for the duration
+// of every NCCL collective call.
+#[cfg(feature = "candle-cuda")]
+unsafe impl Send for NcclShardGroup {}
+#[cfg(feature = "candle-cuda")]
+unsafe impl Sync for NcclShardGroup {}
 
 #[cfg(feature = "candle-cuda")]
 impl NcclShardGroup {
@@ -153,7 +167,10 @@ impl NcclShardGroup {
             return None;
         }
         let comms = cudarc::nccl::Comm::from_devices(streams).ok()?;
-        Some(Self { comms })
+        Some(Self {
+            comms,
+            lock: std::sync::Mutex::new(()),
+        })
     }
 
     /// Sums `partials[i]` (resident on the i-th participating CUDA device,
@@ -164,6 +181,10 @@ impl NcclShardGroup {
     fn all_reduce_sum(&self, partials: &[Tensor], reduce_device: &Device) -> CandleResult<Tensor> {
         use cudarc::nccl::ReduceOp;
 
+        let _guard = match self.lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut reduced_on_device: Vec<Tensor> = Vec::with_capacity(partials.len());
         for (comm, partial) in self.comms.iter().zip(partials.iter()) {
             let cuda_device = match partial.device() {
@@ -180,9 +201,9 @@ impl NcclShardGroup {
                 Storage::Cuda(cs) => cs.as_cuda_slice::<f32>()?,
                 _ => candle_core::bail!("NCCL all-reduce requires CUDA storage"),
             };
-            let mut dst = cuda_device
-                .alloc_zeros::<f32>(src.len())
-                .map_err(|e| candle_core::Error::Msg(format!("NCCL all-reduce alloc failed: {e:?}")))?;
+            let mut dst = cuda_device.alloc_zeros::<f32>(src.len()).map_err(|e| {
+                candle_core::Error::Msg(format!("NCCL all-reduce alloc failed: {e:?}"))
+            })?;
             comm.all_reduce(src, &mut dst, &ReduceOp::Sum)
                 .map_err(|e| candle_core::Error::Msg(format!("NCCL AllReduce failed: {e:?}")))?;
             let storage = CudaStorage::wrap_cuda_slice(dst, cuda_device.clone());
@@ -197,10 +218,9 @@ impl NcclShardGroup {
         // freshly-allocated buffers are read back by the `to_device` move.
         for device in partials.iter().map(Tensor::device) {
             if let Device::Cuda(cuda_device) = device {
-                cuda_device
-                    .cuda_stream()
-                    .synchronize()
-                    .map_err(|e| candle_core::Error::Msg(format!("CUDA stream sync failed: {e:?}")))?;
+                cuda_device.cuda_stream().synchronize().map_err(|e| {
+                    candle_core::Error::Msg(format!("CUDA stream sync failed: {e:?}"))
+                })?;
             }
         }
         let result = reduced_on_device.into_iter().next().ok_or_else(|| {
@@ -362,7 +382,11 @@ impl RowParallelLinear {
     /// `reduce_device` and accumulates. Used as-is when no NCCL group is
     /// attached, when fewer than 2 CUDA devices participate, or on
     /// `Device::Cpu` — unchanged from the original implementation.
-    fn cpu_staged_sum(&self, partials: Vec<Tensor>, reduce_device: &Device) -> CandleResult<Tensor> {
+    fn cpu_staged_sum(
+        &self,
+        partials: Vec<Tensor>,
+        reduce_device: &Device,
+    ) -> CandleResult<Tensor> {
         let mut acc: Option<Tensor> = None;
         for partial in partials {
             let partial = partial.to_device(reduce_device)?;
