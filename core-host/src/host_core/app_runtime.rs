@@ -1410,8 +1410,17 @@ pub(crate) async fn custom_domain_routing_middleware(
 
 pub(crate) fn route_domain_request_path(route: &IntegrityRoute, uri: &Uri) -> String {
     let original_path = normalize_route_path(uri.path());
+    // A custom domain mounts its guest at the domain root: `/` maps to the
+    // route path and sub-paths are prefixed with it. Skip prefixing when the
+    // request already targets the route path (e.g. an h2/h3 client that sends
+    // the absolute route path in `:path`) so we don't double it up
+    // (`/api/x` -> `/api/x/api/x`).
+    let already_targets_route = original_path == route.path
+        || original_path.starts_with(&format!("{}/", route.path));
     let path = if original_path == "/" {
         route.path.clone()
+    } else if already_targets_route {
+        original_path
     } else {
         format!("{}{}", route.path, original_path)
     };
