@@ -1,0 +1,30 @@
+# Proposal: Per-Stage KV Cache for Pipeline-Parallel Decode
+
+## Why
+`2026-06-19-distributed-model-parallel-inference` (8/8 tasks, archived-in-spirit) shipped a real, numerically-verified pipeline-parallel Llama engine (`core-host/src/ai_inference/pipeline_parallel_llama.rs`), and `2026-06-22-wire-model-parallel-runtime-dispatch` wired it into the production load path. Both changes explicitly disclosed the same gap and deferred it:
+
+- `PipelineStage::run_stage` (`pipeline_parallel_llama.rs:116`) is documented as "a stateless, KV-cache-free, prefill-only forward: position 0 always and a fresh cache built per call." Concretely, every call does `let mut cache = TensorParallelCache::new(false, dtype, &self.cfg, &self.device)?;` (line 123) and then `block.forward(&x, 0, block_idx, &mut cache)?` (line 126) — `index_pos` is hard-coded to `0` and the cache is discarded the instant the call returns.
+- `PipelineParallelLlama::forward` (line 205) takes only `tokens` and `transports`, with no `index_pos` parameter and no way to carry state between calls — there is no decode-loop entry point at all, only a single prefill pass per invocation.
+- `candle_llm_runtime.rs`'s dispatch already special-cases this: `ParallelModel::Pipeline { .. } => Err(self.execution_error("pipeline-parallel generation (the autoregressive decode loop) is not yet wired: the engine is prefill-only, pending a per-stage KV cache across decode steps".to_owned()))`. Any deployment selecting `distribution_mode: pipeline_parallelism` today can load a checkpoint and run one prefill forward, but every subsequent decode call fails with this typed error — pipeline-parallel deployments cannot generate more than a single forward pass.
+
+This is functionally a hard blocker: a pipeline-parallel deployment cannot serve a real multi-token completion. `TensorParallelLlama` already proves the target pattern works — its `TensorParallelCache` persists across calls and `index_pos` is threaded through real decode steps (see `tensor_parallel_llama_decodes_a_second_token_with_kv_cache`). This change brings `PipelineParallelLlama` to parity.
+
+## What Changes
+1. **Persist a per-stage `TensorParallelCache` across calls.** `PipelineStage` gains an owned, mutable cache (built once at load time, not per call) instead of `run_stage` constructing and discarding a fresh one on every invocation.
+2. **Thread `index_pos` through the stage and pipeline forward path.** `PipelineStageExecutor::run_stage` and `PipelineStage::run_stage` gain an `index_pos: usize` parameter (mirroring `TensorParallelBlock::forward`'s existing signature), and `PipelineParallelLlama` gains a decode-capable entry point that accepts the position of the token(s) being processed and advances the position on every call, rather than always passing `0`.
+3. **Wire a real decode loop in `candle_llm_runtime.rs`.** Replace the `ParallelModel::Pipeline { .. } => Err(...)` rejection with a decode loop modeled on `ParallelModel::Tensor`'s existing dispatch (prefill at `index_pos = 0`, then repeated single-token decode steps at increasing `index_pos`, sampling and feeding back the next token exactly as the tensor-parallel path already does).
+4. **Extend `StageTransport` only if required by cache locality.** Because each `PipelineStage` now owns mutable, per-call state (the cache), evaluate whether `TcpStageTransport`'s existing stateless send/serve contract is sufficient (each stage's cache is local to the process holding that stage and is never transported — only activations cross the wire, unchanged) or whether the trait needs a session/connection concept to keep a single TCP connection open across the multiple decode calls of one generation request, instead of reconnecting per token.
+
+## Non-Goals
+- **No real wall-clock stage overlap / threaded pipelining.** `run_pipeline_microbatched`'s GPipe-style admission scheduler already exists and is unaffected; this change is scoped to making a *single* generation request's decode loop correct across stages, not to multi-request stage overlap.
+- **No tensor-parallelism-within-a-stage changes.** `TensorParallelBlock`/`TensorParallelCache` themselves are unmodified; this change only changes how `PipelineStage` owns and calls into them across multiple decode steps.
+- **No MoE/expert-parallel changes.** That gap is the separate `2026-06-23-moe-checkpoint-loader-dispatch` proposal.
+- **No changes to topology validation** (`crates/parallel-topology`) — `stage_layer_ranges` shape validation is already correct and unaffected by decode-time cache lifetime.
+
+## Impact
+- **Affected capability**: `ai-inference` (delta below) — pipeline-parallel deployments move from "prefill-only, decode hard-errors" to "fully generates."
+- **Affected code**:
+  - `core-host/src/ai_inference/pipeline_parallel_llama.rs` — `PipelineStage` gains an owned `cache: TensorParallelCache` field; `run_stage` signature gains `index_pos`; `PipelineParallelLlama` gains a decode-loop method.
+  - `core-host/src/ai_inference/parallel.rs` — `PipelineStageExecutor` trait signature change (`run_stage(&self, layer_range, index_pos, input)`), propagated to `ClosureStageExecutor` and any other implementors; `StageTransport` extended only if the TCP-session-lifetime issue (point 4 above) requires it.
+  - `core-host/src/ai_inference/candle_llm_runtime.rs` — `ParallelModel::Pipeline` dispatch arm replaces its hard error with a real decode loop.
+- **Risk**: `PipelineStage::run_stage`'s signature change is a breaking change to an internal trait (`PipelineStageExecutor`) with a small, fully-owned set of implementors (`PipelineStage`, `ClosureStageExecutor` in tests) — mechanical to update, low risk. The decode-loop wiring in `candle_llm_runtime.rs` is new control flow but follows the already-proven `ParallelModel::Tensor` pattern line-for-line; the existing prefill-vs-dense numeric-equivalence tests (`pipeline_parallel_llama_matches_dense_reference_on_a_real_checkpoint`) remain the baseline regression guard, extended with a new decode-equivalence test mirroring `tensor_parallel_llama_decodes_a_second_token_with_kv_cache`.
