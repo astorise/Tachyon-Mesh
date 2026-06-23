@@ -379,8 +379,11 @@ impl ColumnParallelLinear {
     pub(crate) fn forward(&self, x: &Tensor, gather_device: &Device) -> CandleResult<Tensor> {
         let mut parts = Vec::with_capacity(self.shards.len());
         for (shard, device) in &self.shards {
-            let x_local = x.to_device(device)?;
-            let out = x_local.matmul(&shard.t()?)?;
+            // `narrow`/`to_device` (here) and `t()` (below) both produce
+            // non-contiguous views; candle's CPU matmul tolerates that, but
+            // its CUDA matmul kernel requires contiguous operands.
+            let x_local = x.to_device(device)?.contiguous()?;
+            let out = x_local.matmul(&shard.t()?.contiguous()?)?;
             parts.push(out.to_device(gather_device)?);
         }
         Tensor::cat(&parts, 1)
@@ -457,8 +460,12 @@ impl RowParallelLinear {
     ) -> CandleResult<Tensor> {
         let mut partials = Vec::with_capacity(self.shards.len());
         for ((shard, device), x_local) in self.shards.iter().zip(x_shards.iter()) {
-            let x_local = x_local.to_device(device)?;
-            partials.push(x_local.matmul(&shard.t()?)?);
+            // `narrow`/`to_device` (caller's `split_for_row_parallel`, and
+            // here) and `t()` (below) both produce non-contiguous views;
+            // candle's CPU matmul tolerates that, but its CUDA matmul kernel
+            // requires contiguous operands.
+            let x_local = x_local.to_device(device)?.contiguous()?;
+            partials.push(x_local.matmul(&shard.t()?.contiguous()?)?);
         }
         self.all_reduce(partials, reduce_device)
     }
