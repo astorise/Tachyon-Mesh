@@ -130,11 +130,12 @@ enum LoadedModel {
     Parallel(ParallelModel),
 }
 
-/// The concrete parallel engine behind a [`LoadedModel::Parallel`]. Tensor
-/// parallelism supports the full autoregressive decode loop (it carries a
-/// [`TensorParallelCache`]); pipeline parallelism is prefill-only today (its
-/// per-stage KV cache across decode steps is a disclosed follow-up), so its
-/// generation path returns a typed error and only `prefill_logits` is exposed.
+/// The concrete parallel engine behind a [`LoadedModel::Parallel`]. Both
+/// tensor and pipeline parallelism support the full autoregressive decode
+/// loop: tensor parallelism carries a single [`TensorParallelCache`], while
+/// pipeline parallelism carries one per-stage cache built fresh per request
+/// via [`PipelineParallelLlama::new_caches`] and threaded through
+/// [`PipelineParallelLlama::forward_at`] on every prefill/decode call.
 /// Expert (MoE) parallelism is rejected at load time because no full MoE
 /// checkpoint loader exists in this runtime yet — only the verified per-expert
 /// `ExpertParallelMlp` primitive — so there is intentionally no `Expert`
@@ -150,21 +151,25 @@ enum ParallelModel {
     },
     Pipeline {
         model: Box<PipelineParallelLlama>,
+        config: Config,
+        eos_tokens: Vec<u32>,
+        /// Devices the plan sharded across, in stage order; `devices[0]` is
+        /// the primary device the input tensor is built on.
+        devices: Vec<Device>,
     },
 }
 
-/// Run a single prefill forward through every pipeline stage, building an
-/// in-process transport that moves the activation onto each next stage's
-/// device between stages. Used by the prefill-equivalence path; a real
-/// cross-node deployment swaps `InProcessTransport` for `TcpStageTransport`
-/// without changing this composition.
-#[cfg(test)]
-fn pipeline_prefill_forward(
+/// Build one in-process transport per stage boundary, moving the activation
+/// onto each next stage's device between stages. Used by both the production
+/// decode path (`decode`'s `ParallelModel::Pipeline` arm) and the
+/// prefill-equivalence test/debug helpers below; a real cross-node deployment
+/// would swap `InProcessTransport` for `TcpStageTransport` without changing
+/// this composition's shape.
+fn pipeline_stage_transports(
     model: &PipelineParallelLlama,
-    input: &Tensor,
-) -> candle_core::Result<Tensor> {
+) -> Vec<Box<dyn super::parallel::StageTransport>> {
     use super::parallel::{InProcessTransport, StageTransport};
-    let transports: Vec<Box<dyn StageTransport>> = model
+    model
         .stages
         .iter()
         .skip(1)
@@ -173,7 +178,19 @@ fn pipeline_prefill_forward(
                 next_device: stage.device().clone(),
             }) as Box<dyn StageTransport>
         })
-        .collect();
+        .collect()
+}
+
+/// Run a single prefill forward through every pipeline stage. Used by the
+/// prefill-equivalence test/debug path; the production decode path instead
+/// calls [`PipelineParallelLlama::forward_at`] directly so it can reuse the
+/// same per-stage caches across multiple decode steps.
+#[cfg(test)]
+fn pipeline_prefill_forward(
+    model: &PipelineParallelLlama,
+    input: &Tensor,
+) -> candle_core::Result<Tensor> {
+    let transports = pipeline_stage_transports(model);
     model.forward(input, &transports)
 }
 
@@ -637,6 +654,9 @@ impl CandleLlmRuntime {
                 Ok((
                     LoadedModel::Parallel(ParallelModel::Pipeline {
                         model: Box::new(model),
+                        config,
+                        eos_tokens,
+                        devices,
                     }),
                     limits,
                 ))
@@ -827,12 +847,33 @@ impl CandleLlmRuntime {
                         |input, index_pos| model.forward(input, index_pos, &mut cache),
                     )
                 }
-                ParallelModel::Pipeline { .. } => Err(self.execution_error(
-                    "pipeline-parallel generation (the autoregressive decode loop) is not yet \
-                     wired: the engine is prefill-only, pending a per-stage KV cache across \
-                     decode steps"
-                        .to_owned(),
-                )),
+                ParallelModel::Pipeline {
+                    model,
+                    eos_tokens,
+                    devices,
+                    ..
+                } => {
+                    // Pipeline parallelism carries one KV cache per stage,
+                    // built fresh per request and threaded through every
+                    // prefill/decode call via `forward_at`.
+                    let primary = &devices[0];
+                    let mut caches = model.new_caches().map_err(|error| {
+                        self.execution_error(format!(
+                            "failed to build pipeline-parallel KV caches: {error}"
+                        ))
+                    })?;
+                    let transports = pipeline_stage_transports(model);
+                    self.decode_loop(
+                        prompt_ids,
+                        request,
+                        eos_tokens,
+                        primary,
+                        on_token,
+                        |input, index_pos| {
+                            model.forward_at(index_pos, input, &transports, &mut caches)
+                        },
+                    )
+                }
             },
         }
     }
@@ -1007,7 +1048,7 @@ impl CandleLlmRuntime {
                         .forward(&input, 0, &mut cache)
                         .expect("forward pass should run")
                 }
-                ParallelModel::Pipeline { model } => {
+                ParallelModel::Pipeline { model, .. } => {
                     let stage0_device = model
                         .stages
                         .first()
@@ -2297,7 +2338,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_parallel_strategy_matches_dense_prefill_and_refuses_decode() {
+    fn pipeline_parallel_strategy_matches_dense_prefill_and_decodes() {
         let dir = write_fixture_dir("pp-dispatch");
 
         let dense = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
@@ -2334,13 +2375,13 @@ mod tests {
             );
         }
 
-        // The pipeline engine is prefill-only: the autoregressive decode loop is
-        // not yet wired, so generation returns a typed error rather than wrong
-        // output.
-        let error = pipeline
+        // Pipeline parallelism carries a per-stage KV cache, so full
+        // generation (prefill + decode) now works like the tensor-parallel
+        // and dense paths.
+        let generated = pipeline
             .generate(&[&b"hello"[..]])
-            .expect_err("pipeline generation must be refused until decode is wired");
-        assert!(matches!(error, CandleLlmError::Execution { .. }));
+            .expect("pipeline-parallel generation should run the decode loop");
+        assert!(!generated.is_empty());
 
         let _ = fs::remove_dir_all(dir);
     }

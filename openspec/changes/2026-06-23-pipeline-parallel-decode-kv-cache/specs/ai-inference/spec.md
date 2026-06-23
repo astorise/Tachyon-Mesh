@@ -26,12 +26,24 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 
 ## Implementation status as of this change
 
-`PipelineStage` (`core-host/src/ai_inference/pipeline_parallel_llama.rs`) owns a persistent
-`TensorParallelCache` constructed once at load time with `use_kv_cache: true`, and
-`PipelineParallelLlama` exposes `forward_prefill`/`forward_decode` entry points that thread
-`index_pos` through every stage on every call. `candle_llm_runtime.rs`'s dispatch for
-`ParallelModel::Pipeline` runs a real prefill-then-decode loop instead of returning the
-previous `"pipeline-parallel generation ... is not yet wired"` error. Real wall-clock,
-multi-process stage overlap (one OS thread/process genuinely executing each stage
-concurrently, as opposed to the existing in-process sequential `run_pipeline_microbatched`
-admission scheduler) remains out of scope and is tracked as a separate follow-up.
+`PipelineStage` (`core-host/src/ai_inference/pipeline_parallel_llama.rs`) gained
+`new_cache`/`forward_with_cache`, and `PipelineParallelLlama` gained `new_caches`/`forward_at`,
+which build one decode-capable `TensorParallelCache` per stage fresh per generation request and
+thread `index_pos` through every stage on every call — the cache is owned by the caller, not
+stored as a mutable field on `PipelineStage`, so concurrent requests against the same loaded
+model never share or corrupt each other's KV state (mirroring `tensor_parallel_llama.rs`'s
+existing per-request cache pattern; see `design.md` §5 for why the originally-designed
+cache-as-field/`&mut self` approach was revised during implementation).
+`candle_llm_runtime.rs`'s dispatch for `ParallelModel::Pipeline` runs a real prefill-then-decode
+loop through the shared `decode_loop` driver instead of returning the previous
+`"pipeline-parallel generation ... is not yet wired"` error; `ParallelModel::Pipeline` gained
+`config`/`eos_tokens`/`devices` fields to support this. `PipelineStageExecutor::run_stage`'s
+trait signature is unchanged (still `&self`, prefill-only, fresh throwaway cache per call) and
+remains the path used by the still-prefill-only `run_pipeline`/`run_pipeline_microbatched`
+schedulers. Verified by a new decode-equivalence test
+(`pipeline_parallel_llama_decodes_a_second_token_with_kv_cache`) and the full `ai_inference::`
+suite (97 tests, 0 regressions). Real wall-clock, multi-process stage overlap (one OS
+thread/process genuinely executing each stage concurrently, as opposed to the existing
+in-process sequential `run_pipeline_microbatched` admission scheduler) and real cross-node
+decode over `TcpStageTransport` (production wiring uses `InProcessTransport` only) remain out
+of scope and are tracked as separate follow-ups.

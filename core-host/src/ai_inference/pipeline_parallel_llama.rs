@@ -18,6 +18,17 @@
 //! a numerically-verified pipeline engine on it was not possible. This
 //! module instead reuses the real, already-tested `TensorParallelBlock`
 //! forward (built for Task 4) as the per-stage unit of work.
+//!
+//! [`PipelineStage::forward_with_cache`]/[`PipelineParallelLlama::forward_at`]
+//! provide the decode-capable path: each stage's KV cache is built fresh per
+//! generation request (see [`PipelineParallelLlama::new_caches`]) and passed
+//! in by the caller on every call, rather than stored on `PipelineStage`
+//! itself — mirroring `tensor_parallel_llama`'s existing per-request cache
+//! pattern so concurrent requests sharing one loaded model never corrupt
+//! each other's KV state. [`PipelineStageExecutor::run_stage`] (used by the
+//! still-prefill-only `parallel::run_pipeline`/`run_pipeline_microbatched`
+//! schedulers) remains a thin, throwaway-cache wrapper over the same
+//! per-stage math for backward compatibility with those callers.
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor};
 use candle_nn::{Module, VarBuilder};
@@ -42,17 +53,23 @@ pub(crate) struct PipelineStage {
     blocks: Vec<TensorParallelBlock>,
     head: Option<(RmsNorm, Linear)>,
     device: Device,
+    /// The dtype weights were loaded with — used to build a matching KV
+    /// cache (`new_cache`) without depending on the dtype of whatever
+    /// activation happens to flow through `forward_with_cache` first.
+    dtype: DType,
 }
 
 impl PipelineStage {
     /// `start`/`end` are an inclusive `[start, end]` layer range matching
     /// `parallel_topology::ParallelExecutionPlan::stage_layer_ranges`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load(
         vb: &VarBuilder,
         cfg: &Config,
         start: u32,
         end: u32,
         device: &Device,
+        dtype: DType,
         is_first_stage: bool,
         is_last_stage: bool,
     ) -> CandleResult<Self> {
@@ -94,36 +111,43 @@ impl PipelineStage {
             blocks,
             head,
             device: device.clone(),
+            dtype,
         })
     }
 
     pub(crate) fn device(&self) -> &Device {
         &self.device
     }
-}
 
-impl PipelineStageExecutor for PipelineStage {
-    /// `input` is token ids (`[batch, seq]`, stage 0) or the previous
-    /// stage's hidden-state activation (`[batch, seq, hidden]`, otherwise).
-    /// `layer_range` is ignored in favour of the range this stage was loaded
-    /// with — `run_pipeline`/`run_pipeline_microbatched` always pass the
-    /// same range back, so this is purely a sanity-check assertion.
-    ///
-    /// This is a stateless, KV-cache-free, prefill-only forward: position 0
-    /// always and a fresh cache built per call. Real decode-loop wiring
-    /// (carrying a cache across calls per stage) is left for the dispatch
-    /// path follow-up noted in `tasks.md`, matching Task 4's disclosed scope.
-    fn run_stage(&self, layer_range: (u32, u32), input: &Tensor) -> CandleResult<Tensor> {
-        debug_assert_eq!(layer_range, self.layer_range);
+    /// Builds a fresh, decode-capable (`use_kv_cache: true`) KV cache sized
+    /// for this stage's layer range. Caches are built externally (one per
+    /// stage, owned by the caller — see `PipelineParallelLlama::new_caches`)
+    /// rather than stored as a stage field, so that concurrent generation
+    /// requests against the same loaded model never share or corrupt each
+    /// other's KV state, mirroring how `candle_llm_runtime.rs` already builds
+    /// a fresh `TensorParallelCache` per request for `TensorParallelLlama`.
+    pub(crate) fn new_cache(&self) -> CandleResult<TensorParallelCache> {
+        TensorParallelCache::new(true, self.dtype, &self.cfg, &self.device)
+    }
+
+    /// Runs this stage's forward at `index_pos`, reusing `cache` across
+    /// calls so that decode steps after the first see the KV state from
+    /// every prior call. `input` is token ids (`[batch, seq]`, stage 0,
+    /// `index_pos == 0`) or the previous stage's hidden-state activation
+    /// (`[batch, seq, hidden]`, otherwise).
+    pub(crate) fn forward_with_cache(
+        &self,
+        index_pos: usize,
+        input: &Tensor,
+        cache: &mut TensorParallelCache,
+    ) -> CandleResult<Tensor> {
         let mut x = match &self.wte {
             Some(wte) => wte.forward(input)?,
             None => input.clone(),
         };
-        let dtype = x.dtype();
-        let mut cache = TensorParallelCache::new(false, dtype, &self.cfg, &self.device)?;
         for (offset, block) in self.blocks.iter().enumerate() {
             let block_idx = self.layer_range.0 as usize + offset;
-            x = block.forward(&x, 0, block_idx, &mut cache)?;
+            x = block.forward(&x, index_pos, block_idx, cache)?;
         }
         if let Some((ln_f, lm_head)) = &self.head {
             let x = ln_f.forward(&x)?;
@@ -137,6 +161,25 @@ impl PipelineStageExecutor for PipelineStage {
         } else {
             Ok(x)
         }
+    }
+}
+
+impl PipelineStageExecutor for PipelineStage {
+    /// `layer_range` is ignored in favour of the range this stage was loaded
+    /// with — `run_pipeline`/`run_pipeline_microbatched` always pass the
+    /// same range back, so this is purely a sanity-check assertion.
+    ///
+    /// This is a stateless, single-call forward: position 0 always and a
+    /// fresh, throwaway cache built per call. It exists for the prefill-only
+    /// `run_pipeline`/`run_pipeline_microbatched` schedulers (real wall-clock
+    /// stage overlap remains a follow-up, per `tasks.md`) and is unaffected
+    /// by decode support — real decode-loop callers use
+    /// [`PipelineStage::forward_with_cache`] with an externally-owned,
+    /// persisted-across-calls cache instead.
+    fn run_stage(&self, layer_range: (u32, u32), input: &Tensor) -> CandleResult<Tensor> {
+        debug_assert_eq!(layer_range, self.layer_range);
+        let mut cache = self.new_cache()?;
+        self.forward_with_cache(0, input, &mut cache)
     }
 }
 
@@ -190,7 +233,7 @@ impl PipelineParallelLlama {
             .map(|(i, (&(start, end), device))| {
                 let vb =
                     unsafe { VarBuilder::from_mmaped_safetensors(weight_paths, dtype, device) }?;
-                PipelineStage::load(&vb, cfg, start, end, device, i == 0, i == n - 1)
+                PipelineStage::load(&vb, cfg, start, end, device, dtype, i == 0, i == n - 1)
             })
             .collect::<CandleResult<Vec<_>>>()?;
         Ok(Self { stages })
@@ -210,6 +253,40 @@ impl PipelineParallelLlama {
         let mut activation = tokens.clone();
         for (i, stage) in self.stages.iter().enumerate() {
             activation = stage.run_stage(stage.layer_range, &activation)?;
+            if let Some(transport) = transports.get(i) {
+                activation = transport.send(activation)?;
+            }
+        }
+        Ok(activation)
+    }
+
+    /// Builds one fresh, decode-capable cache per stage, in stage order —
+    /// the per-request state a caller threads through repeated
+    /// [`Self::forward_at`] calls for prefill followed by per-token decode.
+    /// Built fresh per generation request (never stored on `self`) so that
+    /// concurrent requests against the same `Arc<PipelineParallelLlama>`
+    /// never share or corrupt each other's KV state.
+    pub(crate) fn new_caches(&self) -> CandleResult<Vec<TensorParallelCache>> {
+        self.stages.iter().map(PipelineStage::new_cache).collect()
+    }
+
+    /// Runs one forward pass at `index_pos` through every stage in order,
+    /// reusing `caches[i]` for stage `i` so KV state persists across calls —
+    /// the decode-loop counterpart to [`Self::forward`]'s prefill-only,
+    /// fresh-cache-per-call behaviour. `index_pos` is `0` for the initial
+    /// prefill call (covering the whole prompt) and the running token
+    /// position for each subsequent single-token decode step, matching
+    /// `TensorParallelLlama::forward`'s existing contract.
+    pub(crate) fn forward_at(
+        &self,
+        index_pos: usize,
+        tokens: &Tensor,
+        transports: &[Box<dyn StageTransport>],
+        caches: &mut [TensorParallelCache],
+    ) -> CandleResult<Tensor> {
+        let mut activation = tokens.clone();
+        for (i, (stage, cache)) in self.stages.iter().zip(caches.iter_mut()).enumerate() {
+            activation = stage.forward_with_cache(index_pos, &activation, cache)?;
             if let Some(transport) = transports.get(i) {
                 activation = transport.send(activation)?;
             }
@@ -337,5 +414,52 @@ mod tests {
 
     fn write_tachyon_fixture_or_panic(root: &std::path::Path) {
         write_tachyon_tiny_fixture(root).unwrap();
+    }
+
+    #[test]
+    fn pipeline_parallel_llama_decodes_a_second_token_with_kv_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tachyon_fixture_or_panic(tmp.path());
+        let cfg = load_config(tmp.path());
+
+        let dense_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(
+                &[tmp.path().join("model.safetensors")],
+                DType::F32,
+                &Device::Cpu,
+            )
+            .unwrap()
+        };
+        let dense_model = DenseLlama::load(dense_vb, &cfg).unwrap();
+        let mut dense_cache = DenseCache::new(true, DType::F32, &cfg, &Device::Cpu).unwrap();
+
+        let mid = (cfg.num_hidden_layers as u32) / 2;
+        let stage_ranges = vec![(0, mid - 1), (mid, cfg.num_hidden_layers as u32 - 1)];
+        let pipeline_model = build_model(tmp.path(), &cfg, &stage_ranges);
+        let mut pipeline_caches = pipeline_model.new_caches().unwrap();
+        let transports: Vec<Box<dyn StageTransport>> = vec![Box::new(
+            crate::ai_inference::parallel::InProcessTransport {
+                next_device: Device::Cpu,
+            },
+        )];
+
+        let prompt = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &Device::Cpu).unwrap();
+        dense_model.forward(&prompt, 0, &mut dense_cache).unwrap();
+        pipeline_model
+            .forward_at(0, &prompt, &transports, &mut pipeline_caches)
+            .unwrap();
+
+        let next = Tensor::from_vec(vec![0u32], (1, 1), &Device::Cpu).unwrap();
+        let dense_logits = dense_model.forward(&next, 3, &mut dense_cache).unwrap();
+        let pipeline_logits = pipeline_model
+            .forward_at(3, &next, &transports, &mut pipeline_caches)
+            .unwrap();
+
+        let dense: Vec<f32> = dense_logits.flatten_all().unwrap().to_vec1().unwrap();
+        let pipeline: Vec<f32> = pipeline_logits.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(dense.len(), pipeline.len());
+        for (a, b) in dense.iter().zip(pipeline.iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} != {b}");
+        }
     }
 }
