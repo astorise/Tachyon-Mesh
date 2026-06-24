@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use candle_core::{quantized::gguf_file, DType, Device, Tensor};
+use candle_core::{quantized::gguf_file, safetensors::MmapedSafetensors, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig, LlamaEosToks};
@@ -16,8 +16,11 @@ use tokenizers::Tokenizer;
 
 use crate::{GpuDistribution, HardwareStrategy};
 
-use super::parallel::discover_cluster_topology;
+use super::expert_parallel_llama::ExpertParallelLlama;
+use super::modelopt_nvfp4;
+use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
+use super::samplers::{FsmCache, FsmLogitProcessor};
 use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
 use parallel_topology::{
     validate_parallel_topology, ClusterTopology, ParallelExecutionPlan, ParallelStrategy,
@@ -27,6 +30,29 @@ use parallel_topology::{
 /// uploaded Llama-family checkpoints (Llama 2/3, TinyLlama, Vicuna, …) carry
 /// this value in their `config.json`.
 pub(crate) const LLAMA_MODEL_TYPE: &str = "llama";
+
+/// HF `model_type` of Mixtral-family (sparse MoE) checkpoints, recognized only
+/// for `GpuDistribution::ExpertParallelism` deployments.
+const MIXTRAL_MODEL_TYPE: &str = "mixtral";
+
+/// Mixtral `config.json` shape: every Llama field via `#[serde(flatten)]`
+/// (attention/embedding sizing is identical to dense Llama) plus the two
+/// MoE-only fields this runtime actually needs.
+#[derive(Debug, Deserialize)]
+struct RawMixtralConfig {
+    #[serde(flatten)]
+    base: LlamaConfig,
+    num_local_experts: usize,
+    num_experts_per_tok: usize,
+}
+
+/// Validated Mixtral config: the dense `Config` (for attention/embedding/
+/// generation limits, identical math to Llama) plus the expert count needed
+/// to build an [`ExpertPlacementPlan`].
+struct MixtralConfigJson {
+    config: Config,
+    num_local_experts: usize,
+}
 
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -130,15 +156,14 @@ enum LoadedModel {
     Parallel(ParallelModel),
 }
 
-/// The concrete parallel engine behind a [`LoadedModel::Parallel`]. Tensor
-/// parallelism supports the full autoregressive decode loop (it carries a
-/// [`TensorParallelCache`]); pipeline parallelism is prefill-only today (its
-/// per-stage KV cache across decode steps is a disclosed follow-up), so its
-/// generation path returns a typed error and only `prefill_logits` is exposed.
-/// Expert (MoE) parallelism is rejected at load time because no full MoE
-/// checkpoint loader exists in this runtime yet — only the verified per-expert
-/// `ExpertParallelMlp` primitive — so there is intentionally no `Expert`
-/// variant here.
+/// The concrete parallel engine behind a [`LoadedModel::Parallel`]. Tensor,
+/// pipeline, and expert (MoE) parallelism all support the full autoregressive
+/// decode loop: tensor and expert parallelism each carry a single
+/// [`TensorParallelCache`] (expert parallelism's attention is dense and
+/// replicated exactly like tensor parallelism's, only the MLP differs per
+/// layer), while pipeline parallelism carries one per-stage cache built fresh
+/// per request via [`PipelineParallelLlama::new_caches`] and threaded through
+/// [`PipelineParallelLlama::forward_at`] on every prefill/decode call.
 enum ParallelModel {
     Tensor {
         model: Box<TensorParallelLlama>,
@@ -150,21 +175,33 @@ enum ParallelModel {
     },
     Pipeline {
         model: Box<PipelineParallelLlama>,
+        config: Config,
+        eos_tokens: Vec<u32>,
+        /// Devices the plan sharded across, in stage order; `devices[0]` is
+        /// the primary device the input tensor is built on.
+        devices: Vec<Device>,
+    },
+    Expert {
+        model: Box<ExpertParallelLlama>,
+        config: Config,
+        eos_tokens: Vec<u32>,
+        /// Devices the plan sharded experts across; `devices[0]` is the
+        /// primary device the input tensor and KV cache are built on.
+        devices: Vec<Device>,
     },
 }
 
-/// Run a single prefill forward through every pipeline stage, building an
-/// in-process transport that moves the activation onto each next stage's
-/// device between stages. Used by the prefill-equivalence path; a real
-/// cross-node deployment swaps `InProcessTransport` for `TcpStageTransport`
-/// without changing this composition.
-#[cfg(test)]
-fn pipeline_prefill_forward(
+/// Build one in-process transport per stage boundary, moving the activation
+/// onto each next stage's device between stages. Used by both the production
+/// decode path (`decode`'s `ParallelModel::Pipeline` arm) and the
+/// prefill-equivalence test/debug helpers below; a real cross-node deployment
+/// would swap `InProcessTransport` for `TcpStageTransport` without changing
+/// this composition's shape.
+fn pipeline_stage_transports(
     model: &PipelineParallelLlama,
-    input: &Tensor,
-) -> candle_core::Result<Tensor> {
+) -> Vec<Box<dyn super::parallel::StageTransport>> {
     use super::parallel::{InProcessTransport, StageTransport};
-    let transports: Vec<Box<dyn StageTransport>> = model
+    model
         .stages
         .iter()
         .skip(1)
@@ -173,7 +210,19 @@ fn pipeline_prefill_forward(
                 next_device: stage.device().clone(),
             }) as Box<dyn StageTransport>
         })
-        .collect();
+        .collect()
+}
+
+/// Run a single prefill forward through every pipeline stage. Used by the
+/// prefill-equivalence test/debug path; the production decode path instead
+/// calls [`PipelineParallelLlama::forward_at`] directly so it can reuse the
+/// same per-stage caches across multiple decode steps.
+#[cfg(test)]
+fn pipeline_prefill_forward(
+    model: &PipelineParallelLlama,
+    input: &Tensor,
+) -> candle_core::Result<Tensor> {
+    let transports = pipeline_stage_transports(model);
     model.forward(input, &transports)
 }
 
@@ -220,6 +269,10 @@ pub(crate) struct CandleLlmRuntime {
     /// `None` when the checkpoint ships no template (the runtime then falls back
     /// to a generic chat rendering). Shared behind `Arc` so clones stay cheap.
     chat_template: Option<Arc<ChatTemplate>>,
+    /// Compiled JSON-Schema grammars for constrained decoding, keyed by the
+    /// schema's SHA-256 hash. Shared behind `Arc` so clones (and concurrent
+    /// requests) reuse the same cache instead of recompiling per-request.
+    fsm_cache: Arc<FsmCache>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,6 +320,11 @@ struct GenerationRequest {
     /// text, and the matched sequence (and anything after it) is trimmed.
     #[serde(default)]
     stop: Option<Vec<String>>,
+    /// Optional JSON Schema (source text) constraining generated output to a
+    /// grammar compiled from the schema. See `samplers::compile_schema` for
+    /// the supported subset.
+    #[serde(default)]
+    json_schema: Option<String>,
 }
 
 /// Token-selection policy resolved from a request's `temperature`/`top_p`/`seed`.
@@ -298,6 +356,9 @@ struct ParsedGenerationRequest {
     max_new_tokens: usize,
     sampling: SamplingPolicy,
     stop: Vec<String>,
+    /// Compiled grammar for constrained decoding, when the request supplied
+    /// `json_schema`.
+    fsm: Option<Arc<super::samplers::CompiledFsm>>,
 }
 
 impl CandleLlmRuntime {
@@ -394,6 +455,7 @@ impl CandleLlmRuntime {
             inner: Arc::new(inner),
             limits,
             chat_template,
+            fsm_cache: Arc::new(FsmCache::default()),
         }))
     }
 
@@ -471,6 +533,144 @@ impl CandleLlmRuntime {
             },
             limits,
         ))
+    }
+
+    /// Build a runnable dense Llama model from an already-detected
+    /// ModelOpt/NVFP4 checkpoint: every NVFP4-quantized linear is dequantized
+    /// to F32 at load time (the documented fallback execution path — native
+    /// FP4-kernel execution without eager dequantization remains a follow-up,
+    /// see the `gpu-accelerated-inference-execution` change), passthrough
+    /// tensors (norms, embeddings, anything not quantized) are read as-is,
+    /// and the resulting in-memory tensor map feeds the same already-tested
+    /// `Llama::load` engine `load_safetensors` uses. This makes NVFP4
+    /// checkpoints genuinely executable instead of unconditionally rejected.
+    pub(crate) fn try_load_modelopt_nvfp4(
+        directory: &modelopt_nvfp4::ModelOptNvfp4Directory,
+    ) -> Result<Self, CandleLlmError> {
+        let alias = directory.alias();
+        let root = directory.root();
+
+        let raw_config =
+            fs::read(root.join(CONFIG_JSON)).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            })?;
+        let probe: ModelTypeProbe = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        if probe.model_type != LLAMA_MODEL_TYPE {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "NVFP4 execution currently supports Llama-family checkpoints only (`model_type` = `{LLAMA_MODEL_TYPE}`), got `{}`",
+                    probe.model_type
+                ),
+            });
+        }
+        let llama_config: LlamaConfig = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        let config = llama_config.into_config(false);
+        let limits = GenerationLimits::with_context(config.max_position_embeddings);
+        let eos_tokens = eos_token_ids(&config);
+
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        for name in directory.tensor_names() {
+            if name.ends_with(".weight_scale")
+                || name.ends_with(".weight_scale_2")
+                || name.ends_with(".input_scale")
+            {
+                continue;
+            }
+            let Some(base_name) = name.strip_suffix(".weight") else {
+                let info = directory
+                    .tensor_info(name)
+                    .map_err(invalid_nvfp4(alias, root))?;
+                let tensor =
+                    raw_tensor_from_ref(&info, &device).map_err(invalid_nvfp4(alias, root))?;
+                tensors.insert(name.to_owned(), tensor);
+                continue;
+            };
+            let tensor = match directory
+                .modelopt_linear(base_name)
+                .map_err(invalid_nvfp4(alias, root))?
+            {
+                modelopt_nvfp4::ModelOptLinearTensors::Nvfp4(linear) => {
+                    dense_tensor_from_nvfp4(&linear, &device).map_err(invalid_nvfp4(alias, root))?
+                }
+                modelopt_nvfp4::ModelOptLinearTensors::Fp8(fp8) => {
+                    return Err(CandleLlmError::UnsupportedModel {
+                        alias: alias.to_owned(),
+                        path: root.to_path_buf(),
+                        detail: format!(
+                            "NVFP4 execution does not yet support the mixed FP8 linear `{}`",
+                            fp8.base_name
+                        ),
+                    });
+                }
+                modelopt_nvfp4::ModelOptLinearTensors::Passthrough(passthrough) => {
+                    raw_tensor_from_ref(&passthrough.tensor, &device)
+                        .map_err(invalid_nvfp4(alias, root))?
+                }
+            };
+            tensors.insert(name.to_owned(), tensor);
+        }
+
+        let var_builder = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let model = Llama::load(var_builder, &config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            }
+        })?;
+        let inner = LoadedModel::Safetensors {
+            model,
+            config,
+            eos_tokens,
+        };
+
+        if !root.join(TOKENIZER_JSON).exists() {
+            return Err(CandleLlmError::MissingFile {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                file: TOKENIZER_JSON,
+            });
+        }
+        let tokenizer = Tokenizer::from_file(root.join(TOKENIZER_JSON)).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: TOKENIZER_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        let chat_template = ChatTemplate::load(alias, root)?.map(Arc::new);
+
+        Ok(Self {
+            alias: alias.to_owned(),
+            root: root.to_path_buf(),
+            tokenizer,
+            inner: Arc::new(inner),
+            limits,
+            chat_template,
+            fsm_cache: Arc::new(FsmCache::default()),
+        })
     }
 
     /// Load a single GGUF Llama file. The architecture and hyper-parameters come
@@ -593,9 +793,6 @@ impl CandleLlmRuntime {
             });
         }
 
-        let config = Self::load_llama_config(alias, root)?;
-        let limits = GenerationLimits::with_context(config.max_position_embeddings);
-        let eos_tokens = eos_token_ids(&config);
         let weight_paths = safetensors_paths(alias, root)?;
         let component = MODEL_SAFETENSORS;
         let invalid = |error: candle_core::Error| CandleLlmError::InvalidComponent {
@@ -604,6 +801,58 @@ impl CandleLlmRuntime {
             component,
             detail: error.to_string(),
         };
+
+        // `ExpertParallelism` branches *before* `load_llama_config`: a real
+        // MoE checkpoint declares `model_type: "mixtral"`, which
+        // `load_llama_config` hard-rejects (it only accepts `"llama"`), and
+        // Mixtral's config shape genuinely differs (per-layer expert count,
+        // top-k routing) in ways `LlamaConfig`/`Config` have no field for.
+        // The `"llama"` path below (`load_llama_config`) is unchanged.
+        if strategy.distribution_mode == GpuDistribution::ExpertParallelism {
+            let mixtral_config = Self::load_mixtral_config(alias, root)?;
+            let config = mixtral_config.config.clone();
+            let limits = GenerationLimits::with_context(config.max_position_embeddings);
+            let eos_tokens = eos_token_ids(&config);
+            // SAFETY: weights live in the uploaded model directory and are not
+            // mutated for the lifetime of the mmap.
+            let tensor_index =
+                unsafe { MmapedSafetensors::multi(&weight_paths) }.map_err(invalid)?;
+            let tensor_names: Vec<String> = tensor_index
+                .tensors()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let expert_plan = ExpertPlacementPlan::from_explicit_map_or_round_robin(
+                &plan.expert_device_map,
+                mixtral_config.num_local_experts as u32,
+                devices.len(),
+            );
+            let var_builder = unsafe {
+                VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &devices[0])
+            }
+            .map_err(invalid)?;
+            let model = ExpertParallelLlama::load(
+                var_builder,
+                &config,
+                tensor_names.iter().map(String::as_str),
+                &expert_plan,
+                &devices,
+            )
+            .map_err(invalid)?;
+            return Ok((
+                LoadedModel::Parallel(ParallelModel::Expert {
+                    model: Box::new(model),
+                    config,
+                    eos_tokens,
+                    devices,
+                }),
+                limits,
+            ));
+        }
+
+        let config = Self::load_llama_config(alias, root)?;
+        let limits = GenerationLimits::with_context(config.max_position_embeddings);
+        let eos_tokens = eos_token_ids(&config);
 
         match strategy.distribution_mode {
             GpuDistribution::TensorParallelism => {
@@ -637,24 +886,76 @@ impl CandleLlmRuntime {
                 Ok((
                     LoadedModel::Parallel(ParallelModel::Pipeline {
                         model: Box::new(model),
+                        config,
+                        eos_tokens,
+                        devices,
                     }),
                     limits,
                 ))
             }
-            GpuDistribution::ExpertParallelism => Err(CandleLlmError::UnsupportedModel {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                detail:
-                    "expert-parallel execution requires an MoE checkpoint loader, which is not yet \
-                     implemented: the per-expert `ExpertParallelMlp` primitive exists and is \
-                     numerically verified, but this runtime does not yet load a full MoE \
-                     (e.g. Mixtral) checkpoint"
-                        .to_owned(),
-            }),
+            GpuDistribution::ExpertParallelism => {
+                unreachable!("handled by the early return above")
+            }
             GpuDistribution::Single => {
                 unreachable!("load_parallel is only reached for non-single strategies")
             }
         }
+    }
+
+    /// Parse and validate a Mixtral `config.json`: the `MixtralConfigJson`
+    /// branch of Task 1, kept entirely separate from [`Self::load_llama_config`]
+    /// (which only ever accepts `model_type: "llama"`) so the dense, tensor-,
+    /// and pipeline-parallel paths are unaffected by this addition.
+    fn load_mixtral_config(alias: &str, root: &Path) -> Result<MixtralConfigJson, CandleLlmError> {
+        let raw_config =
+            fs::read(root.join(CONFIG_JSON)).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            })?;
+        let probe: ModelTypeProbe = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        if probe.model_type != MIXTRAL_MODEL_TYPE {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "expected a Mixtral-family checkpoint (`model_type` = `{MIXTRAL_MODEL_TYPE}`) \
+                     for an expert-parallel deployment, got `{}`",
+                    probe.model_type
+                ),
+            });
+        }
+        let raw: RawMixtralConfig = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        if raw.num_experts_per_tok != 1 {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "expert-parallel execution only supports top-1 routing \
+                     (`num_experts_per_tok` == 1), got {}",
+                    raw.num_experts_per_tok
+                ),
+            });
+        }
+        Ok(MixtralConfigJson {
+            config: raw.base.into_config(false),
+            num_local_experts: raw.num_local_experts,
+        })
     }
 
     /// Parse and validate a Llama `config.json` (shared by the safetensors and
@@ -827,12 +1128,58 @@ impl CandleLlmRuntime {
                         |input, index_pos| model.forward(input, index_pos, &mut cache),
                     )
                 }
-                ParallelModel::Pipeline { .. } => Err(self.execution_error(
-                    "pipeline-parallel generation (the autoregressive decode loop) is not yet \
-                     wired: the engine is prefill-only, pending a per-stage KV cache across \
-                     decode steps"
-                        .to_owned(),
-                )),
+                ParallelModel::Pipeline {
+                    model,
+                    eos_tokens,
+                    devices,
+                    ..
+                } => {
+                    // Pipeline parallelism carries one KV cache per stage,
+                    // built fresh per request and threaded through every
+                    // prefill/decode call via `forward_at`.
+                    let primary = &devices[0];
+                    let mut caches = model.new_caches().map_err(|error| {
+                        self.execution_error(format!(
+                            "failed to build pipeline-parallel KV caches: {error}"
+                        ))
+                    })?;
+                    let transports = pipeline_stage_transports(model);
+                    self.decode_loop(
+                        prompt_ids,
+                        request,
+                        eos_tokens,
+                        primary,
+                        on_token,
+                        |input, index_pos| {
+                            model.forward_at(index_pos, input, &transports, &mut caches)
+                        },
+                    )
+                }
+                ParallelModel::Expert {
+                    model,
+                    config,
+                    eos_tokens,
+                    devices,
+                } => {
+                    // Expert parallelism's attention is dense and replicated
+                    // exactly like tensor parallelism's, so it drives the same
+                    // single-cache decode loop.
+                    let primary = &devices[0];
+                    let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
+                        .map_err(|error| {
+                            self.execution_error(format!(
+                                "failed to build expert-parallel KV cache: {error}"
+                            ))
+                        })?;
+                    self.decode_loop(
+                        prompt_ids,
+                        request,
+                        eos_tokens,
+                        primary,
+                        on_token,
+                        |input, index_pos| model.forward(input, index_pos, &mut cache),
+                    )
+                }
             },
         }
     }
@@ -858,6 +1205,11 @@ impl CandleLlmRuntime {
     ) -> Result<(), CandleLlmError> {
         let device = input_device;
         let mut processor = request.sampling.processor();
+        let mut fsm_processor = request
+            .fsm
+            .as_ref()
+            .map(|fsm| FsmLogitProcessor::new(Arc::clone(fsm)));
+        let vocab_size = self.tokenizer.get_vocab_size(true);
         let mut tokens = prompt_ids.to_vec();
         let mut generated = Vec::with_capacity(request.max_new_tokens);
         // Hold back this many trailing bytes so a stop sequence split across the
@@ -891,10 +1243,22 @@ impl CandleLlmRuntime {
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
             })?;
+            let row = match &fsm_processor {
+                Some(fsm) => self.mask_row_for_fsm(&row, fsm, vocab_size, eos_tokens)?,
+                None => row,
+            };
             let next = processor.sample(&row).map_err(|error| {
                 self.execution_error(format!("failed to sample next token: {error}"))
             })?;
             index_pos += context.len();
+            if let Some(fsm) = fsm_processor.as_mut() {
+                if !eos_tokens.contains(&next) {
+                    let text = self.tokenizer.decode(&[next], false).map_err(|error| {
+                        self.execution_error(format!("failed to decode token: {error}"))
+                    })?;
+                    fsm.commit(&text);
+                }
+            }
             tokens.push(next);
             generated.push(next);
 
@@ -917,6 +1281,33 @@ impl CandleLlmRuntime {
         let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
         emit_delta(on_token, &text, &mut emitted, end);
         Ok(())
+    }
+
+    /// Mask every vocabulary logit the grammar would reject for the next
+    /// token to `-inf`, given `fsm`'s current state, leaving everything else
+    /// untouched. Returns a new tensor; `row` itself is not mutated.
+    fn mask_row_for_fsm(
+        &self,
+        row: &Tensor,
+        fsm: &FsmLogitProcessor,
+        vocab_size: usize,
+        eos_tokens: &[u32],
+    ) -> Result<Tensor, CandleLlmError> {
+        let allowed = fsm.allowed_token_ids(vocab_size, eos_tokens, |id| {
+            self.tokenizer.decode(&[id], false).unwrap_or_default()
+        });
+        let allowed: std::collections::HashSet<u32> = allowed.into_iter().collect();
+        let mut values = row
+            .to_vec1::<f32>()
+            .map_err(|error| self.execution_error(format!("failed to read logits: {error}")))?;
+        for (id, value) in values.iter_mut().enumerate() {
+            if !allowed.contains(&(id as u32)) {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+        Tensor::from_vec(values, row.shape(), row.device()).map_err(|error| {
+            self.execution_error(format!("failed to build masked logits: {error}"))
+        })
     }
 
     /// Decode the full generated token sequence to UTF-8 text (special tokens
@@ -1007,7 +1398,7 @@ impl CandleLlmRuntime {
                         .forward(&input, 0, &mut cache)
                         .expect("forward pass should run")
                 }
-                ParallelModel::Pipeline { model } => {
+                ParallelModel::Pipeline { model, .. } => {
                     let stage0_device = model
                         .stages
                         .first()
@@ -1017,6 +1408,22 @@ impl CandleLlmRuntime {
                         .to_device(&stage0_device)
                         .expect("input should move to stage 0 device");
                     pipeline_prefill_forward(model, &input).expect("pipeline forward should run")
+                }
+                ParallelModel::Expert {
+                    model,
+                    config,
+                    devices,
+                    ..
+                } => {
+                    let primary = &devices[0];
+                    let input = input
+                        .to_device(primary)
+                        .expect("input should move to device");
+                    let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
+                        .expect("cache should build");
+                    model
+                        .forward(&input, 0, &mut cache)
+                        .expect("forward pass should run")
                 }
             },
         };
@@ -1070,6 +1477,15 @@ impl CandleLlmRuntime {
                     })
                 }
             };
+            let fsm = match request.json_schema {
+                Some(schema) => Some(self.fsm_cache.get_or_compile(&schema).map_err(|error| {
+                    CandleLlmError::InvalidRequest {
+                        alias: self.alias.clone(),
+                        detail: format!("invalid `json_schema`: {error}"),
+                    }
+                })?),
+                None => None,
+            };
             ParsedGenerationRequest {
                 prompt,
                 max_new_tokens: request
@@ -1077,6 +1493,7 @@ impl CandleLlmRuntime {
                     .unwrap_or(self.limits.default_max_new_tokens),
                 sampling: resolve_sampling(request.temperature, request.top_p, request.seed),
                 stop: sanitize_stop(request.stop),
+                fsm,
             }
         } else {
             ParsedGenerationRequest {
@@ -1084,6 +1501,7 @@ impl CandleLlmRuntime {
                 max_new_tokens: self.limits.default_max_new_tokens,
                 sampling: resolve_sampling(None, None, None),
                 stop: Vec::new(),
+                fsm: None,
             }
         };
 
@@ -1486,6 +1904,102 @@ fn resolve_devices(device_ids: &[u32]) -> Vec<Device> {
         .collect()
 }
 
+/// Wraps an `anyhow::Error` from the format-agnostic `modelopt_nvfp4` module
+/// (which knows nothing about Candle) into the typed `CandleLlmError` this
+/// module's callers expect.
+fn invalid_nvfp4<'a>(
+    alias: &'a str,
+    root: &'a Path,
+) -> impl Fn(anyhow::Error) -> CandleLlmError + 'a {
+    move |error| CandleLlmError::InvalidComponent {
+        alias: alias.to_owned(),
+        path: root.to_path_buf(),
+        component: MODEL_SAFETENSORS,
+        detail: error.to_string(),
+    }
+}
+
+/// Dequantizes one NVFP4 linear's packed weight into a dense F32 `Tensor`:
+/// the fallback (non-native-kernel) NVFP4 execution path. Reads the packed
+/// nibbles, FP8 block scales, and F32 tensor scale straight from the shard
+/// file and reuses the already-tested `dequantize_nvfp4_e4m3`.
+fn dense_tensor_from_nvfp4(
+    linear: &modelopt_nvfp4::Nvfp4LinearTensors,
+    device: &Device,
+) -> anyhow::Result<Tensor> {
+    let packed = linear.packed_weight.tensor.read_bytes()?;
+    let block_scales = linear.block_scales.tensor.read_bytes()?;
+    let tensor_scale_bytes = linear.tensor_scale.tensor.read_bytes()?;
+    let tensor_scale_bytes: [u8; 4] = tensor_scale_bytes
+        .get(..4)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "NVFP4 tensor scale for `{}` is shorter than 4 bytes",
+                linear.base_name
+            )
+        })?
+        .try_into()
+        .expect("length checked above");
+    let tensor_scale = f32::from_le_bytes(tensor_scale_bytes);
+    let n_rows = linear.packed_weight.tensor.info.shape[0];
+    let n_cols = linear
+        .packed_weight
+        .tensor
+        .info
+        .shape
+        .get(1)
+        .copied()
+        .unwrap_or_default()
+        * 2;
+    let dense = modelopt_nvfp4::dequantize_nvfp4_e4m3(
+        &packed,
+        &block_scales,
+        tensor_scale,
+        n_rows,
+        n_cols,
+        modelopt_nvfp4::Nvfp4OutputDType::F32,
+    )?;
+    let values = match dense {
+        modelopt_nvfp4::Nvfp4DenseValues::F32(values) => values,
+        modelopt_nvfp4::Nvfp4DenseValues::BF16(_) => {
+            anyhow::bail!("internal error: requested F32 NVFP4 dequantization but got BF16")
+        }
+    };
+    Ok(Tensor::from_vec(values, (n_rows, n_cols), device)?)
+}
+
+/// Reads an unquantized (passthrough) tensor straight from its shard, for
+/// the parameters an NVFP4 checkpoint does not quantize (norms, embeddings,
+/// any linear ModelOpt left in full precision).
+fn raw_tensor_from_ref(
+    reference: &modelopt_nvfp4::SafetensorsTensorRef,
+    device: &Device,
+) -> anyhow::Result<Tensor> {
+    let bytes = reference.read_bytes()?;
+    let dtype = candle_dtype_for(reference.info.dtype)?;
+    Ok(Tensor::from_raw_buffer(
+        &bytes,
+        dtype,
+        &reference.info.shape,
+        device,
+    )?)
+}
+
+fn candle_dtype_for(dtype: modelopt_nvfp4::SafetensorsDType) -> anyhow::Result<DType> {
+    use modelopt_nvfp4::SafetensorsDType;
+    Ok(match dtype {
+        SafetensorsDType::U8 => DType::U8,
+        SafetensorsDType::U32 => DType::U32,
+        SafetensorsDType::F16 => DType::F16,
+        SafetensorsDType::BF16 => DType::BF16,
+        SafetensorsDType::F32 => DType::F32,
+        SafetensorsDType::F8E4M3 => DType::F8E4M3,
+        SafetensorsDType::Other => {
+            anyhow::bail!("unsupported safetensors dtype for a passthrough NVFP4 tensor")
+        }
+    })
+}
+
 /// Resolve the safetensors shard paths for a model directory: the HF index when
 /// the checkpoint is sharded, otherwise the single `model.safetensors`.
 fn safetensors_paths(alias: &str, root: &Path) -> Result<Vec<PathBuf>, CandleLlmError> {
@@ -1682,6 +2196,229 @@ fn deterministic_fill(seed: u64, len: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Number of experts per layer in [`write_tachyon_tiny_mixtral_fixture`]. Kept
+/// at 1 so top-1 routing always selects the only expert, making the MoE
+/// block's output identical to a dense block built from the same weight
+/// values (the fixture writer duplicates each layer's MLP weights under both
+/// the `mlp.*` dense alias and the `block_sparse_moe.*` MoE alias).
+#[cfg(test)]
+pub(crate) const FIXTURE_NUM_EXPERTS: usize = 1;
+
+/// Write a complete, deterministic tiny **Mixtral-style MoE** checkpoint where
+/// every layer is MoE with a single expert per layer. Used to prove
+/// [`super::expert_parallel_llama::ExpertParallelLlama`]'s MoE block is
+/// numerically equivalent to a dense reference run with the same weights
+/// (top-1 routing over one expert is the identity routing).
+#[cfg(test)]
+pub(crate) fn write_tachyon_tiny_mixtral_fixture(root: &Path) -> anyhow::Result<()> {
+    let layers = [Some(FIXTURE_NUM_EXPERTS); FIXTURE_NUM_LAYERS];
+    write_tachyon_tiny_mixtral_fixture_with(root, &layers)
+}
+
+/// Write a tiny Mixtral-style checkpoint with a mixed dense/MoE layer stack:
+/// layer 0 is dense (no `.experts.` tensors), every other layer is MoE with
+/// [`FIXTURE_NUM_EXPERTS`] experts plus one extra expert (so routing among
+/// more than one expert is actually exercised).
+#[cfg(test)]
+pub(crate) fn write_tachyon_tiny_mixtral_mixed_fixture(root: &Path) -> anyhow::Result<()> {
+    let mut layers = vec![None; FIXTURE_NUM_LAYERS];
+    for expert_count in layers.iter_mut().skip(1) {
+        *expert_count = Some(FIXTURE_NUM_EXPERTS + 1);
+    }
+    write_tachyon_tiny_mixtral_fixture_with(root, &layers)
+}
+
+/// Shared implementation: `layer_experts[i]` is `Some(num_experts)` for an MoE
+/// layer or `None` for a dense layer. Every MoE layer's expert weights are
+/// distinct (seeded per expert), but an MoE layer's expert 0 always carries
+/// the same values as the layer's `mlp.*` dense alias, which
+/// `write_tachyon_tiny_mixtral_fixture`'s all-one-expert case relies on for
+/// exact dense-reference equivalence.
+#[cfg(test)]
+fn write_tachyon_tiny_mixtral_fixture_with(
+    root: &Path,
+    layer_experts: &[Option<usize>],
+) -> anyhow::Result<()> {
+    fs::create_dir_all(root)?;
+    fs::write(
+        root.join(CONFIG_JSON),
+        serde_json::json!({
+            "model_type": "mixtral",
+            "architectures": ["MixtralForCausalLM"],
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "num_hidden_layers": layer_experts.len(),
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null,
+            "num_local_experts": layer_experts.iter().filter_map(|c| *c).max().unwrap_or(0),
+            "num_experts_per_tok": 1
+        })
+        .to_string(),
+    )?;
+    fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON)?;
+    candle_core::safetensors::save(
+        &mixtral_fixture_weights(layer_experts)?,
+        root.join(MODEL_SAFETENSORS),
+    )?;
+    Ok(())
+}
+
+/// Deterministic weights for the Mixtral-style fixtures, in the tensor layout
+/// `expert_parallel_llama.rs` and (for dense layers / the dense-equivalence
+/// reference) `candle_transformers::models::llama::Llama` expect.
+#[cfg(test)]
+fn mixtral_fixture_weights(
+    layer_experts: &[Option<usize>],
+) -> anyhow::Result<HashMap<String, Tensor>> {
+    let hidden = FIXTURE_HIDDEN_SIZE;
+    let inter = FIXTURE_INTERMEDIATE_SIZE;
+    let head_dim = hidden / FIXTURE_NUM_HEADS;
+    let q = FIXTURE_NUM_HEADS * head_dim;
+    let kv = FIXTURE_NUM_HEADS * head_dim;
+    let mut tensors = HashMap::new();
+    let mut seed = 1u64;
+    let mut dense =
+        |tensors: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]| -> anyhow::Result<()> {
+            let len: usize = dims.iter().product();
+            let values = deterministic_fill(seed, len);
+            seed = seed.wrapping_add(1);
+            tensors.insert(
+                name.to_owned(),
+                Tensor::from_vec(values, dims.to_vec(), &Device::Cpu)?,
+            );
+            Ok(())
+        };
+    let norm = |tensors: &mut HashMap<String, Tensor>, name: &str| -> anyhow::Result<()> {
+        tensors.insert(
+            name.to_owned(),
+            Tensor::from_vec(vec![1f32; hidden], (hidden,), &Device::Cpu)?,
+        );
+        Ok(())
+    };
+
+    dense(
+        &mut tensors,
+        "model.embed_tokens.weight",
+        &[FIXTURE_VOCAB_SIZE, hidden],
+    )?;
+    for (layer, expert_count) in layer_experts.iter().enumerate() {
+        let prefix = format!("model.layers.{layer}");
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            &[q, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            &[kv, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            &[kv, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            &[hidden, q],
+        )?;
+        norm(&mut tensors, &format!("{prefix}.input_layernorm.weight"))?;
+        norm(
+            &mut tensors,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+        )?;
+        match expert_count {
+            None => {
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    &[inter, hidden],
+                )?;
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    &[inter, hidden],
+                )?;
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                    &[hidden, inter],
+                )?;
+            }
+            Some(num_experts) => {
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.block_sparse_moe.gate.weight"),
+                    &[*num_experts, hidden],
+                )?;
+                // Expert 0's weights are also written under the dense `mlp.*`
+                // alias, so a dense reference model built from the same file
+                // sees identical values for layers where `num_experts == 1`
+                // (the all-one-expert fixture's equivalence test relies on this).
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.block_sparse_moe.experts.0.w1.weight"),
+                    &[inter, hidden],
+                )?;
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.block_sparse_moe.experts.0.w3.weight"),
+                    &[inter, hidden],
+                )?;
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.block_sparse_moe.experts.0.w2.weight"),
+                    &[hidden, inter],
+                )?;
+                tensors.insert(
+                    format!("{prefix}.mlp.gate_proj.weight"),
+                    tensors[&format!("{prefix}.block_sparse_moe.experts.0.w1.weight")].clone(),
+                );
+                tensors.insert(
+                    format!("{prefix}.mlp.up_proj.weight"),
+                    tensors[&format!("{prefix}.block_sparse_moe.experts.0.w3.weight")].clone(),
+                );
+                tensors.insert(
+                    format!("{prefix}.mlp.down_proj.weight"),
+                    tensors[&format!("{prefix}.block_sparse_moe.experts.0.w2.weight")].clone(),
+                );
+                for expert_id in 1..*num_experts {
+                    dense(
+                        &mut tensors,
+                        &format!("{prefix}.block_sparse_moe.experts.{expert_id}.w1.weight"),
+                        &[inter, hidden],
+                    )?;
+                    dense(
+                        &mut tensors,
+                        &format!("{prefix}.block_sparse_moe.experts.{expert_id}.w3.weight"),
+                        &[inter, hidden],
+                    )?;
+                    dense(
+                        &mut tensors,
+                        &format!("{prefix}.block_sparse_moe.experts.{expert_id}.w2.weight"),
+                        &[hidden, inter],
+                    )?;
+                }
+            }
+        }
+    }
+    norm(&mut tensors, "model.norm.weight")?;
+    dense(
+        &mut tensors,
+        "lm_head.weight",
+        &[FIXTURE_VOCAB_SIZE, hidden],
+    )?;
+    Ok(tensors)
+}
+
 /// Write a complete, deterministic tiny **Llama GGUF** checkpoint (`model.gguf` +
 /// `tokenizer.json` + the broker's `.tachyon-model.json` sidecar) so tests
 /// exercise the real candle-transformers quantized Llama forward. Tensors are
@@ -1848,6 +2585,47 @@ mod tests {
         (runtime, dir)
     }
 
+    /// Same fixture as [`load_fixture`], but with a custom 4-token vocabulary
+    /// whose token id 1 decodes to the exact JSON text `tachyon`. Used to
+    /// exercise constrained decoding without needing a real tokenizer that
+    /// can spell out JSON punctuation one character at a time.
+    fn load_fixture_with_vocab(tag: &str, vocab: &str) -> (CandleLlmRuntime, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-llama-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
+        fs::write(
+            dir.join(TOKENIZER_JSON),
+            format!(
+                r#"{{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {{"type": "Whitespace"}},
+  "post_processor": null,
+  "decoder": null,
+  "model": {{
+    "type": "WordLevel",
+    "vocab": {vocab},
+    "unk_token": "<unk>"
+  }}
+}}"#
+            ),
+        )
+        .expect("custom tokenizer should write");
+        let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
+            .expect("fixture should load without error")
+            .expect("fixture is a supported Llama model");
+        (runtime, dir)
+    }
+
     #[test]
     fn generate_runs_a_real_llama_forward_and_is_not_a_mock() {
         let (runtime, dir) = load_fixture("real-forward");
@@ -1864,6 +2642,50 @@ mod tests {
     }
 
     #[test]
+    fn json_schema_constrained_generation_only_ever_emits_grammar_valid_text() {
+        // Token id 2 decodes to the exact, grammar-complete JSON text
+        // `{"ok":true}`; ids 0/1/3 decode to grammar-violating text. With the
+        // schema's FSM masking every non-matching id to `-inf`, sampling must
+        // pick id 2 regardless of the (untrained, deterministic-fill) model's
+        // raw logits.
+        let (runtime, dir) = load_fixture_with_vocab(
+            "constrained",
+            r#"{"<unk>": 0, "x": 1, "{\"ok\":true}": 2, "mesh": 3}"#,
+        );
+        let request = serde_json::json!({
+            "prompt": "hello",
+            "max_new_tokens": 1,
+            "json_schema": r#"{"type":"object","properties":{"ok":{"type":"boolean"}}}"#,
+        })
+        .to_string();
+        let bytes = runtime
+            .generate(&[request.as_bytes()])
+            .expect("constrained generation should run");
+        let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
+        assert_eq!(text, r#"{"ok":true}"#);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("output must be valid JSON");
+        assert_eq!(parsed["ok"], serde_json::Value::Bool(true));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_json_schema_is_rejected_before_generation() {
+        let (runtime, dir) = load_fixture("invalid-schema");
+        let request = serde_json::json!({
+            "prompt": "hello",
+            "json_schema": "{not valid json",
+        })
+        .to_string();
+        let error = runtime
+            .generate(&[request.as_bytes()])
+            .expect_err("malformed schema must be rejected");
+        assert!(matches!(error, CandleLlmError::InvalidRequest { .. }));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn next_token_logits_depend_on_the_prompt() {
         let (runtime, dir) = load_fixture("prompt-dependent");
         let hello = runtime.debug_last_logits("hello");
@@ -1875,6 +2697,177 @@ mod tests {
             "different prompts must flow through attention to different logits"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn modelopt_nvfp4_dequantized_forward_matches_a_dense_reference() {
+        // Quantizes only `down_proj.weight` (the one square-free linear in the
+        // fixture, [hidden, inter] = [8, 16], so its 16-wide row satisfies
+        // NVFP4's block-size-16 constraint with exactly one scale per row) using
+        // values drawn from NVFP4's own E2M1 levels with unit scales, so
+        // dequantization reproduces the dense reference's weights exactly
+        // rather than merely approximately.
+        const E2M1_LUT: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let hidden = FIXTURE_HIDDEN_SIZE;
+        let inter = FIXTURE_INTERMEDIATE_SIZE;
+        let down_values: Vec<f32> = (0..hidden)
+            .flat_map(|row| (0..inter).map(move |col| E2M1_LUT[(row + col) % 16]))
+            .collect();
+
+        let mut weights = fixture_weights().expect("fixture weights");
+        for layer in 0..FIXTURE_NUM_LAYERS {
+            weights.insert(
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                Tensor::from_vec(down_values.clone(), (hidden, inter), &Device::Cpu)
+                    .expect("down_proj override"),
+            );
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dense_dir = std::env::temp_dir().join(format!(
+            "tachyon-nvfp4-dense-ref-{}-{nanos}",
+            std::process::id()
+        ));
+        let nvfp4_dir = std::env::temp_dir().join(format!(
+            "tachyon-nvfp4-quant-{}-{nanos}",
+            std::process::id()
+        ));
+
+        fn write_config_and_tokenizer(root: &Path) {
+            fs::create_dir_all(root).expect("dir");
+            fs::write(
+                root.join(CONFIG_JSON),
+                serde_json::json!({
+                    "model_type": LLAMA_MODEL_TYPE,
+                    "architectures": ["LlamaForCausalLM"],
+                    "hidden_size": FIXTURE_HIDDEN_SIZE,
+                    "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+                    "vocab_size": FIXTURE_VOCAB_SIZE,
+                    "num_hidden_layers": FIXTURE_NUM_LAYERS,
+                    "num_attention_heads": FIXTURE_NUM_HEADS,
+                    "num_key_value_heads": FIXTURE_NUM_HEADS,
+                    "rms_norm_eps": 1e-5,
+                    "rope_theta": 10000.0,
+                    "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+                    "tie_word_embeddings": false,
+                    "bos_token_id": 1,
+                    "eos_token_id": null
+                })
+                .to_string(),
+            )
+            .expect("config");
+            fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON).expect("tokenizer");
+        }
+
+        // Dense reference: plain safetensors, the already-tested load path.
+        write_config_and_tokenizer(&dense_dir);
+        candle_core::safetensors::save(&weights, dense_dir.join(MODEL_SAFETENSORS))
+            .expect("dense reference weights should save");
+
+        // NVFP4 fixture: every tensor passthrough-F32 except each layer's
+        // `down_proj.weight`, which is packed/scaled so it dequantizes back to
+        // exactly `down_values`.
+        write_config_and_tokenizer(&nvfp4_dir);
+        let mut shard_entries: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> = Vec::new();
+        for (name, tensor) in &weights {
+            if name.ends_with(".mlp.down_proj.weight") {
+                continue;
+            }
+            let shape = tensor.dims().to_vec();
+            let values = tensor
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1::<f32>()
+                .expect("f32 values");
+            let bytes = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>();
+            shard_entries.push((name.clone(), "F32", shape, bytes));
+        }
+        for layer in 0..FIXTURE_NUM_LAYERS {
+            let base = format!("model.layers.{layer}.mlp.down_proj");
+            let pack_cols = inter / 2;
+            let mut packed = vec![0u8; hidden * pack_cols];
+            for row in 0..hidden {
+                for byte_idx in 0..pack_cols {
+                    let hi = (row + 2 * byte_idx) % 16;
+                    let lo = (row + 2 * byte_idx + 1) % 16;
+                    packed[row * pack_cols + byte_idx] = ((hi as u8) << 4) | (lo as u8);
+                }
+            }
+            shard_entries.push((
+                format!("{base}.weight"),
+                "U8",
+                vec![hidden, pack_cols],
+                packed,
+            ));
+            shard_entries.push((
+                format!("{base}.weight_scale"),
+                "F8_E4M3",
+                vec![hidden, inter / 16],
+                vec![0x38u8; hidden * (inter / 16)],
+            ));
+            shard_entries.push((
+                format!("{base}.weight_scale_2"),
+                "F32",
+                vec![1],
+                1.0f32.to_le_bytes().to_vec(),
+            ));
+        }
+        let shard_name = "model-00001-of-00001.safetensors";
+        let entries: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = shard_entries
+            .iter()
+            .map(|(name, dtype, shape, bytes)| {
+                (name.as_str(), *dtype, shape.clone(), bytes.clone())
+            })
+            .collect();
+        modelopt_nvfp4::tests_support::write_safetensors_shard(
+            &nvfp4_dir.join(shard_name),
+            entries,
+        );
+        let tensor_names: Vec<&str> = shard_entries
+            .iter()
+            .map(|(name, ..)| name.as_str())
+            .collect();
+        modelopt_nvfp4::tests_support::write_index(&nvfp4_dir, shard_name, &tensor_names);
+
+        let dense_runtime = CandleLlmRuntime::try_load(
+            "dense-ref",
+            &dense_dir,
+            "cpu",
+            &HardwareStrategy::default(),
+        )
+        .expect("dense reference should load")
+        .expect("dense reference is a supported llama model");
+        let directory = modelopt_nvfp4::ModelOptNvfp4Directory::try_load("nvfp4", &nvfp4_dir)
+            .expect("nvfp4 detection should not error")
+            .expect("nvfp4 directory should be detected");
+        let nvfp4_runtime = CandleLlmRuntime::try_load_modelopt_nvfp4(&directory)
+            .expect("nvfp4 checkpoint should load via the dequantized fallback path");
+
+        let dense_logits = dense_runtime.debug_last_logits("hello");
+        let nvfp4_logits = nvfp4_runtime.debug_last_logits("hello");
+        assert_eq!(dense_logits.len(), nvfp4_logits.len());
+        for (dense, nvfp4) in dense_logits.iter().zip(nvfp4_logits.iter()) {
+            assert!(
+                (dense - nvfp4).abs() < 1e-3,
+                "dense {dense} vs nvfp4 {nvfp4} should match within tolerance"
+            );
+        }
+
+        let generated = nvfp4_runtime
+            .generate(&[&b"hello"[..]])
+            .expect("nvfp4 checkpoint should run a real decode loop");
+        assert!(!generated.is_empty(), "decode output must not be empty");
+
+        let _ = fs::remove_dir_all(dense_dir);
+        let _ = fs::remove_dir_all(nvfp4_dir);
     }
 
     #[test]
@@ -2219,6 +3212,13 @@ mod tests {
 
     #[cfg(test)]
     fn write_fixture_dir(tag: &str) -> PathBuf {
+        write_fixture_dir_with(tag, write_tachyon_tiny_fixture)
+    }
+
+    fn write_fixture_dir_with(
+        tag: &str,
+        writer: impl FnOnce(&Path) -> anyhow::Result<()>,
+    ) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock should be after the epoch")
@@ -2227,7 +3227,7 @@ mod tests {
             "tachyon-llama-{tag}-{}-{nanos}",
             std::process::id()
         ));
-        write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
+        writer(&dir).expect("fixture should be written");
         dir
     }
 
@@ -2297,7 +3297,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_parallel_strategy_matches_dense_prefill_and_refuses_decode() {
+    fn pipeline_parallel_strategy_matches_dense_prefill_and_decodes() {
         let dir = write_fixture_dir("pp-dispatch");
 
         let dense = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
@@ -2334,20 +3334,23 @@ mod tests {
             );
         }
 
-        // The pipeline engine is prefill-only: the autoregressive decode loop is
-        // not yet wired, so generation returns a typed error rather than wrong
-        // output.
-        let error = pipeline
+        // Pipeline parallelism carries a per-stage KV cache, so full
+        // generation (prefill + decode) now works like the tensor-parallel
+        // and dense paths.
+        let generated = pipeline
             .generate(&[&b"hello"[..]])
-            .expect_err("pipeline generation must be refused until decode is wired");
-        assert!(matches!(error, CandleLlmError::Execution { .. }));
+            .expect("pipeline-parallel generation should run the decode loop");
+        assert!(!generated.is_empty());
 
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn expert_parallel_strategy_is_rejected_until_a_moe_loader_exists() {
-        let dir = write_fixture_dir("ep-dispatch");
+    fn expert_parallel_strategy_rejects_a_non_mixtral_checkpoint() {
+        // A dense Llama checkpoint declares `model_type: "llama"`, which the
+        // Mixtral-only expert-parallel loader must reject rather than
+        // silently treating as a dense single-expert MoE model.
+        let dir = write_fixture_dir("ep-dispatch-non-mixtral");
         let strategy = HardwareStrategy {
             distribution_mode: GpuDistribution::ExpertParallelism,
             device_ids: vec![0, 1],
@@ -2361,10 +3364,86 @@ mod tests {
             &strategy,
             &two_device_topology(),
         )
-        .expect_err("expert-parallel must be rejected: no MoE checkpoint loader yet");
+        .expect_err("expert-parallel must reject a non-Mixtral checkpoint");
         match error {
             CandleLlmError::UnsupportedModel { detail, .. } => {
-                assert!(detail.contains("MoE"), "unexpected detail: {detail}");
+                assert!(detail.contains("Mixtral"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expert_parallel_strategy_dispatches_and_decodes_a_mixtral_checkpoint() {
+        let dir = write_fixture_dir_with("ep-dispatch", write_tachyon_tiny_mixtral_mixed_fixture);
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::ExpertParallelism,
+            device_ids: vec![0, 1],
+            expert_device_map: vec![(0, 0), (1, 1)],
+            ..Default::default()
+        };
+        let expert = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect("expert-parallel load")
+        .expect("supported model");
+
+        assert!(matches!(
+            &*expert.inner,
+            LoadedModel::Parallel(ParallelModel::Expert { .. })
+        ));
+
+        // Expert parallelism carries a KV cache, so full generation works
+        // exactly like the tensor- and pipeline-parallel paths.
+        let generated = expert
+            .generate(&[&b"hello"[..]])
+            .expect("expert-parallel generation should run the decode loop");
+        assert!(!generated.is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expert_parallel_strategy_rejects_top_k_routing_above_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-mixtral-topk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        write_tachyon_tiny_mixtral_fixture(&dir).expect("fixture should be written");
+        // Patch `num_experts_per_tok` to 2, which this runtime does not
+        // support (only top-1 routing is implemented).
+        let config_path = dir.join(CONFIG_JSON);
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).expect("config should read"))
+                .expect("config should parse");
+        config["num_experts_per_tok"] = serde_json::json!(2);
+        fs::write(&config_path, config.to_string()).expect("config should write");
+
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::ExpertParallelism,
+            device_ids: vec![0, 1],
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect_err("top-2 routing must be rejected: only top-1 is implemented");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(detail.contains("top-1"), "unexpected detail: {detail}");
             }
             other => panic!("expected UnsupportedModel, got {other:?}"),
         }

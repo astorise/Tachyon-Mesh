@@ -209,6 +209,13 @@ impl ModelOptNvfp4Directory {
         &self.quantization
     }
 
+    /// Every tensor name the checkpoint declares, across all shards. Callers
+    /// building a dense in-memory model (the NVFP4 fallback execution path)
+    /// walk this to classify and materialize each parameter in turn.
+    pub(crate) fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.shard_index.tensor_names()
+    }
+
     pub(crate) fn tensor_location(&self, tensor_name: &str) -> Option<TensorShardLocation> {
         self.shard_index.tensor_location(&self.root, tensor_name)
     }
@@ -540,6 +547,10 @@ impl SafetensorsShardIndex {
             .any(|tensor| tensor.ends_with(suffix))
     }
 
+    pub(crate) fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.weight_map.keys().map(String::as_str)
+    }
+
     fn inferred_layer_count(&self) -> Option<usize> {
         self.weight_map
             .keys()
@@ -750,6 +761,56 @@ impl SafetensorsHeader {
 
     fn tensor(&self, tensor_name: &str) -> Option<SafetensorsTensorInfo> {
         self.tensors.get(tensor_name).cloned()
+    }
+}
+
+impl SafetensorsTensorRef {
+    /// Reads this tensor's raw little-endian bytes straight from its shard
+    /// file. Used by the dense (fallback) NVFP4 execution path to materialize
+    /// an in-memory model: the packed FP4 weight, its FP8 block scales, and
+    /// the F32 tensor scale are each read this way before dequantization, and
+    /// passthrough (unquantized) tensors are read this way to feed
+    /// `Tensor::from_raw_buffer` directly.
+    pub(crate) fn read_bytes(&self) -> Result<Vec<u8>> {
+        let mut file = File::open(&self.shard_path).with_context(|| {
+            format!(
+                "failed to open safetensors shard `{}`",
+                self.shard_path.display()
+            )
+        })?;
+        let mut prefix = [0u8; 8];
+        file.read_exact(&mut prefix).with_context(|| {
+            format!(
+                "failed to read safetensors header prefix from `{}`",
+                self.shard_path.display()
+            )
+        })?;
+        let header_len = u64::from_le_bytes(prefix) as usize;
+        let (start, end) = self.info.data_offsets;
+        let data_start = 8usize
+            .checked_add(header_len)
+            .and_then(|base| base.checked_add(start))
+            .ok_or_else(|| ModelOptNvfp4LoadError::UnsupportedQuantization {
+                alias: self.name.clone(),
+                detail: "tensor data offset overflows usize".to_owned(),
+            })?;
+        file.seek(SeekFrom::Start(data_start as u64))
+            .with_context(|| {
+                format!(
+                    "failed to seek to tensor `{}` data in `{}`",
+                    self.name,
+                    self.shard_path.display()
+                )
+            })?;
+        let mut buf = vec![0u8; end.saturating_sub(start)];
+        file.read_exact(&mut buf).with_context(|| {
+            format!(
+                "failed to read tensor `{}` data from `{}`",
+                self.name,
+                self.shard_path.display()
+            )
+        })?;
+        Ok(buf)
     }
 }
 
