@@ -128,7 +128,11 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> CandleResult<T
 /// "primary" device. Identical math to upstream
 /// `candle_transformers::models::llama::CausalSelfAttention::forward`, minus
 /// the `flash-attn` feature path (not enabled by this crate).
-struct ReplicatedAttention {
+///
+/// `pub(crate)` (rather than module-private) so `expert_parallel_llama.rs`
+/// can build MoE blocks that reuse this exact attention implementation
+/// instead of reimplementing it (see that module's doc comment).
+pub(crate) struct ReplicatedAttention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -140,7 +144,7 @@ struct ReplicatedAttention {
 }
 
 impl ReplicatedAttention {
-    fn load(vb: VarBuilder, cfg: &Config) -> CandleResult<Self> {
+    pub(crate) fn load(vb: VarBuilder, cfg: &Config) -> CandleResult<Self> {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
@@ -168,7 +172,7 @@ impl ReplicatedAttention {
         candle_nn::rotary_emb::rope(x, &cos, &sin)
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         x: &Tensor,
         index_pos: usize,
@@ -258,7 +262,10 @@ pub(crate) struct TensorParallelMlp {
 }
 
 impl TensorParallelMlp {
-    fn load(vb: VarBuilder, cfg: &Config, devices: &[Device]) -> CandleResult<Self> {
+    /// `pub(crate)` so `expert_parallel_llama.rs` can build this exact dense
+    /// MLP for a checkpoint's non-MoE layers, reusing its existing,
+    /// numerically-verified math rather than reimplementing it.
+    pub(crate) fn load(vb: VarBuilder, cfg: &Config, devices: &[Device]) -> CandleResult<Self> {
         let gate_w = vb
             .pp("gate_proj")
             .get((cfg.intermediate_size, cfg.hidden_size), "weight")?;
@@ -286,7 +293,7 @@ impl TensorParallelMlp {
         self
     }
 
-    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         // `ColumnParallelLinear`/`RowParallelLinear` operate on 2-D
         // `[rows, features]` tensors; flatten the leading `(batch, seq)`
         // dims down to `rows` and restore the original shape afterwards.

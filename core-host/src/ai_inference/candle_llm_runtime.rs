@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use candle_core::{quantized::gguf_file, DType, Device, Tensor};
+use candle_core::{quantized::gguf_file, safetensors::MmapedSafetensors, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig, LlamaEosToks};
@@ -16,7 +16,8 @@ use tokenizers::Tokenizer;
 
 use crate::{GpuDistribution, HardwareStrategy};
 
-use super::parallel::discover_cluster_topology;
+use super::expert_parallel_llama::ExpertParallelLlama;
+use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
 use parallel_topology::{
@@ -27,6 +28,29 @@ use parallel_topology::{
 /// uploaded Llama-family checkpoints (Llama 2/3, TinyLlama, Vicuna, …) carry
 /// this value in their `config.json`.
 pub(crate) const LLAMA_MODEL_TYPE: &str = "llama";
+
+/// HF `model_type` of Mixtral-family (sparse MoE) checkpoints, recognized only
+/// for `GpuDistribution::ExpertParallelism` deployments.
+const MIXTRAL_MODEL_TYPE: &str = "mixtral";
+
+/// Mixtral `config.json` shape: every Llama field via `#[serde(flatten)]`
+/// (attention/embedding sizing is identical to dense Llama) plus the two
+/// MoE-only fields this runtime actually needs.
+#[derive(Debug, Deserialize)]
+struct RawMixtralConfig {
+    #[serde(flatten)]
+    base: LlamaConfig,
+    num_local_experts: usize,
+    num_experts_per_tok: usize,
+}
+
+/// Validated Mixtral config: the dense `Config` (for attention/embedding/
+/// generation limits, identical math to Llama) plus the expert count needed
+/// to build an [`ExpertPlacementPlan`].
+struct MixtralConfigJson {
+    config: Config,
+    num_local_experts: usize,
+}
 
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -130,16 +154,14 @@ enum LoadedModel {
     Parallel(ParallelModel),
 }
 
-/// The concrete parallel engine behind a [`LoadedModel::Parallel`]. Both
-/// tensor and pipeline parallelism support the full autoregressive decode
-/// loop: tensor parallelism carries a single [`TensorParallelCache`], while
-/// pipeline parallelism carries one per-stage cache built fresh per request
-/// via [`PipelineParallelLlama::new_caches`] and threaded through
+/// The concrete parallel engine behind a [`LoadedModel::Parallel`]. Tensor,
+/// pipeline, and expert (MoE) parallelism all support the full autoregressive
+/// decode loop: tensor and expert parallelism each carry a single
+/// [`TensorParallelCache`] (expert parallelism's attention is dense and
+/// replicated exactly like tensor parallelism's, only the MLP differs per
+/// layer), while pipeline parallelism carries one per-stage cache built fresh
+/// per request via [`PipelineParallelLlama::new_caches`] and threaded through
 /// [`PipelineParallelLlama::forward_at`] on every prefill/decode call.
-/// Expert (MoE) parallelism is rejected at load time because no full MoE
-/// checkpoint loader exists in this runtime yet — only the verified per-expert
-/// `ExpertParallelMlp` primitive — so there is intentionally no `Expert`
-/// variant here.
 enum ParallelModel {
     Tensor {
         model: Box<TensorParallelLlama>,
@@ -155,6 +177,14 @@ enum ParallelModel {
         eos_tokens: Vec<u32>,
         /// Devices the plan sharded across, in stage order; `devices[0]` is
         /// the primary device the input tensor is built on.
+        devices: Vec<Device>,
+    },
+    Expert {
+        model: Box<ExpertParallelLlama>,
+        config: Config,
+        eos_tokens: Vec<u32>,
+        /// Devices the plan sharded experts across; `devices[0]` is the
+        /// primary device the input tensor and KV cache are built on.
         devices: Vec<Device>,
     },
 }
@@ -610,9 +640,6 @@ impl CandleLlmRuntime {
             });
         }
 
-        let config = Self::load_llama_config(alias, root)?;
-        let limits = GenerationLimits::with_context(config.max_position_embeddings);
-        let eos_tokens = eos_token_ids(&config);
         let weight_paths = safetensors_paths(alias, root)?;
         let component = MODEL_SAFETENSORS;
         let invalid = |error: candle_core::Error| CandleLlmError::InvalidComponent {
@@ -621,6 +648,58 @@ impl CandleLlmRuntime {
             component,
             detail: error.to_string(),
         };
+
+        // `ExpertParallelism` branches *before* `load_llama_config`: a real
+        // MoE checkpoint declares `model_type: "mixtral"`, which
+        // `load_llama_config` hard-rejects (it only accepts `"llama"`), and
+        // Mixtral's config shape genuinely differs (per-layer expert count,
+        // top-k routing) in ways `LlamaConfig`/`Config` have no field for.
+        // The `"llama"` path below (`load_llama_config`) is unchanged.
+        if strategy.distribution_mode == GpuDistribution::ExpertParallelism {
+            let mixtral_config = Self::load_mixtral_config(alias, root)?;
+            let config = mixtral_config.config.clone();
+            let limits = GenerationLimits::with_context(config.max_position_embeddings);
+            let eos_tokens = eos_token_ids(&config);
+            // SAFETY: weights live in the uploaded model directory and are not
+            // mutated for the lifetime of the mmap.
+            let tensor_index =
+                unsafe { MmapedSafetensors::multi(&weight_paths) }.map_err(invalid)?;
+            let tensor_names: Vec<String> = tensor_index
+                .tensors()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            let expert_plan = ExpertPlacementPlan::from_explicit_map_or_round_robin(
+                &plan.expert_device_map,
+                mixtral_config.num_local_experts as u32,
+                devices.len(),
+            );
+            let var_builder = unsafe {
+                VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &devices[0])
+            }
+            .map_err(invalid)?;
+            let model = ExpertParallelLlama::load(
+                var_builder,
+                &config,
+                tensor_names.iter().map(String::as_str),
+                &expert_plan,
+                &devices,
+            )
+            .map_err(invalid)?;
+            return Ok((
+                LoadedModel::Parallel(ParallelModel::Expert {
+                    model: Box::new(model),
+                    config,
+                    eos_tokens,
+                    devices,
+                }),
+                limits,
+            ));
+        }
+
+        let config = Self::load_llama_config(alias, root)?;
+        let limits = GenerationLimits::with_context(config.max_position_embeddings);
+        let eos_tokens = eos_token_ids(&config);
 
         match strategy.distribution_mode {
             GpuDistribution::TensorParallelism => {
@@ -661,20 +740,69 @@ impl CandleLlmRuntime {
                     limits,
                 ))
             }
-            GpuDistribution::ExpertParallelism => Err(CandleLlmError::UnsupportedModel {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                detail:
-                    "expert-parallel execution requires an MoE checkpoint loader, which is not yet \
-                     implemented: the per-expert `ExpertParallelMlp` primitive exists and is \
-                     numerically verified, but this runtime does not yet load a full MoE \
-                     (e.g. Mixtral) checkpoint"
-                        .to_owned(),
-            }),
+            GpuDistribution::ExpertParallelism => {
+                unreachable!("handled by the early return above")
+            }
             GpuDistribution::Single => {
                 unreachable!("load_parallel is only reached for non-single strategies")
             }
         }
+    }
+
+    /// Parse and validate a Mixtral `config.json`: the `MixtralConfigJson`
+    /// branch of Task 1, kept entirely separate from [`Self::load_llama_config`]
+    /// (which only ever accepts `model_type: "llama"`) so the dense, tensor-,
+    /// and pipeline-parallel paths are unaffected by this addition.
+    fn load_mixtral_config(alias: &str, root: &Path) -> Result<MixtralConfigJson, CandleLlmError> {
+        let raw_config =
+            fs::read(root.join(CONFIG_JSON)).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            })?;
+        let probe: ModelTypeProbe = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        if probe.model_type != MIXTRAL_MODEL_TYPE {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "expected a Mixtral-family checkpoint (`model_type` = `{MIXTRAL_MODEL_TYPE}`) \
+                     for an expert-parallel deployment, got `{}`",
+                    probe.model_type
+                ),
+            });
+        }
+        let raw: RawMixtralConfig = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        if raw.num_experts_per_tok != 1 {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "expert-parallel execution only supports top-1 routing \
+                     (`num_experts_per_tok` == 1), got {}",
+                    raw.num_experts_per_tok
+                ),
+            });
+        }
+        Ok(MixtralConfigJson {
+            config: raw.base.into_config(false),
+            num_local_experts: raw.num_local_experts,
+        })
     }
 
     /// Parse and validate a Llama `config.json` (shared by the safetensors and
@@ -874,6 +1002,31 @@ impl CandleLlmRuntime {
                         },
                     )
                 }
+                ParallelModel::Expert {
+                    model,
+                    config,
+                    eos_tokens,
+                    devices,
+                } => {
+                    // Expert parallelism's attention is dense and replicated
+                    // exactly like tensor parallelism's, so it drives the same
+                    // single-cache decode loop.
+                    let primary = &devices[0];
+                    let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
+                        .map_err(|error| {
+                            self.execution_error(format!(
+                                "failed to build expert-parallel KV cache: {error}"
+                            ))
+                        })?;
+                    self.decode_loop(
+                        prompt_ids,
+                        request,
+                        eos_tokens,
+                        primary,
+                        on_token,
+                        |input, index_pos| model.forward(input, index_pos, &mut cache),
+                    )
+                }
             },
         }
     }
@@ -1058,6 +1211,22 @@ impl CandleLlmRuntime {
                         .to_device(&stage0_device)
                         .expect("input should move to stage 0 device");
                     pipeline_prefill_forward(model, &input).expect("pipeline forward should run")
+                }
+                ParallelModel::Expert {
+                    model,
+                    config,
+                    devices,
+                    ..
+                } => {
+                    let primary = &devices[0];
+                    let input = input
+                        .to_device(primary)
+                        .expect("input should move to device");
+                    let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
+                        .expect("cache should build");
+                    model
+                        .forward(&input, 0, &mut cache)
+                        .expect("forward pass should run")
                 }
             },
         };
@@ -1723,6 +1892,229 @@ fn deterministic_fill(seed: u64, len: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Number of experts per layer in [`write_tachyon_tiny_mixtral_fixture`]. Kept
+/// at 1 so top-1 routing always selects the only expert, making the MoE
+/// block's output identical to a dense block built from the same weight
+/// values (the fixture writer duplicates each layer's MLP weights under both
+/// the `mlp.*` dense alias and the `block_sparse_moe.*` MoE alias).
+#[cfg(test)]
+pub(crate) const FIXTURE_NUM_EXPERTS: usize = 1;
+
+/// Write a complete, deterministic tiny **Mixtral-style MoE** checkpoint where
+/// every layer is MoE with a single expert per layer. Used to prove
+/// [`super::expert_parallel_llama::ExpertParallelLlama`]'s MoE block is
+/// numerically equivalent to a dense reference run with the same weights
+/// (top-1 routing over one expert is the identity routing).
+#[cfg(test)]
+pub(crate) fn write_tachyon_tiny_mixtral_fixture(root: &Path) -> anyhow::Result<()> {
+    let layers = [Some(FIXTURE_NUM_EXPERTS); FIXTURE_NUM_LAYERS];
+    write_tachyon_tiny_mixtral_fixture_with(root, &layers)
+}
+
+/// Write a tiny Mixtral-style checkpoint with a mixed dense/MoE layer stack:
+/// layer 0 is dense (no `.experts.` tensors), every other layer is MoE with
+/// [`FIXTURE_NUM_EXPERTS`] experts plus one extra expert (so routing among
+/// more than one expert is actually exercised).
+#[cfg(test)]
+pub(crate) fn write_tachyon_tiny_mixtral_mixed_fixture(root: &Path) -> anyhow::Result<()> {
+    let mut layers = vec![None; FIXTURE_NUM_LAYERS];
+    for expert_count in layers.iter_mut().skip(1) {
+        *expert_count = Some(FIXTURE_NUM_EXPERTS + 1);
+    }
+    write_tachyon_tiny_mixtral_fixture_with(root, &layers)
+}
+
+/// Shared implementation: `layer_experts[i]` is `Some(num_experts)` for an MoE
+/// layer or `None` for a dense layer. Every MoE layer's expert weights are
+/// distinct (seeded per expert), but an MoE layer's expert 0 always carries
+/// the same values as the layer's `mlp.*` dense alias, which
+/// `write_tachyon_tiny_mixtral_fixture`'s all-one-expert case relies on for
+/// exact dense-reference equivalence.
+#[cfg(test)]
+fn write_tachyon_tiny_mixtral_fixture_with(
+    root: &Path,
+    layer_experts: &[Option<usize>],
+) -> anyhow::Result<()> {
+    fs::create_dir_all(root)?;
+    fs::write(
+        root.join(CONFIG_JSON),
+        serde_json::json!({
+            "model_type": "mixtral",
+            "architectures": ["MixtralForCausalLM"],
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "num_hidden_layers": layer_experts.len(),
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null,
+            "num_local_experts": layer_experts.iter().filter_map(|c| *c).max().unwrap_or(0),
+            "num_experts_per_tok": 1
+        })
+        .to_string(),
+    )?;
+    fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON)?;
+    candle_core::safetensors::save(
+        &mixtral_fixture_weights(layer_experts)?,
+        root.join(MODEL_SAFETENSORS),
+    )?;
+    Ok(())
+}
+
+/// Deterministic weights for the Mixtral-style fixtures, in the tensor layout
+/// `expert_parallel_llama.rs` and (for dense layers / the dense-equivalence
+/// reference) `candle_transformers::models::llama::Llama` expect.
+#[cfg(test)]
+fn mixtral_fixture_weights(
+    layer_experts: &[Option<usize>],
+) -> anyhow::Result<HashMap<String, Tensor>> {
+    let hidden = FIXTURE_HIDDEN_SIZE;
+    let inter = FIXTURE_INTERMEDIATE_SIZE;
+    let head_dim = hidden / FIXTURE_NUM_HEADS;
+    let q = FIXTURE_NUM_HEADS * head_dim;
+    let kv = FIXTURE_NUM_HEADS * head_dim;
+    let mut tensors = HashMap::new();
+    let mut seed = 1u64;
+    let mut dense =
+        |tensors: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]| -> anyhow::Result<()> {
+            let len: usize = dims.iter().product();
+            let values = deterministic_fill(seed, len);
+            seed = seed.wrapping_add(1);
+            tensors.insert(
+                name.to_owned(),
+                Tensor::from_vec(values, dims.to_vec(), &Device::Cpu)?,
+            );
+            Ok(())
+        };
+    let norm = |tensors: &mut HashMap<String, Tensor>, name: &str| -> anyhow::Result<()> {
+        tensors.insert(
+            name.to_owned(),
+            Tensor::from_vec(vec![1f32; hidden], (hidden,), &Device::Cpu)?,
+        );
+        Ok(())
+    };
+
+    dense(
+        &mut tensors,
+        "model.embed_tokens.weight",
+        &[FIXTURE_VOCAB_SIZE, hidden],
+    )?;
+    for (layer, expert_count) in layer_experts.iter().enumerate() {
+        let prefix = format!("model.layers.{layer}");
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            &[q, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            &[kv, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            &[kv, hidden],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            &[hidden, q],
+        )?;
+        norm(&mut tensors, &format!("{prefix}.input_layernorm.weight"))?;
+        norm(
+            &mut tensors,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+        )?;
+        match expert_count {
+            None => {
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    &[inter, hidden],
+                )?;
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    &[inter, hidden],
+                )?;
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                    &[hidden, inter],
+                )?;
+            }
+            Some(num_experts) => {
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.block_sparse_moe.gate.weight"),
+                    &[*num_experts, hidden],
+                )?;
+                // Expert 0's weights are also written under the dense `mlp.*`
+                // alias, so a dense reference model built from the same file
+                // sees identical values for layers where `num_experts == 1`
+                // (the all-one-expert fixture's equivalence test relies on this).
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.block_sparse_moe.experts.0.w1.weight"),
+                    &[inter, hidden],
+                )?;
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.block_sparse_moe.experts.0.w3.weight"),
+                    &[inter, hidden],
+                )?;
+                dense(
+                    &mut tensors,
+                    &format!("{prefix}.block_sparse_moe.experts.0.w2.weight"),
+                    &[hidden, inter],
+                )?;
+                tensors.insert(
+                    format!("{prefix}.mlp.gate_proj.weight"),
+                    tensors[&format!("{prefix}.block_sparse_moe.experts.0.w1.weight")].clone(),
+                );
+                tensors.insert(
+                    format!("{prefix}.mlp.up_proj.weight"),
+                    tensors[&format!("{prefix}.block_sparse_moe.experts.0.w3.weight")].clone(),
+                );
+                tensors.insert(
+                    format!("{prefix}.mlp.down_proj.weight"),
+                    tensors[&format!("{prefix}.block_sparse_moe.experts.0.w2.weight")].clone(),
+                );
+                for expert_id in 1..*num_experts {
+                    dense(
+                        &mut tensors,
+                        &format!("{prefix}.block_sparse_moe.experts.{expert_id}.w1.weight"),
+                        &[inter, hidden],
+                    )?;
+                    dense(
+                        &mut tensors,
+                        &format!("{prefix}.block_sparse_moe.experts.{expert_id}.w3.weight"),
+                        &[inter, hidden],
+                    )?;
+                    dense(
+                        &mut tensors,
+                        &format!("{prefix}.block_sparse_moe.experts.{expert_id}.w2.weight"),
+                        &[hidden, inter],
+                    )?;
+                }
+            }
+        }
+    }
+    norm(&mut tensors, "model.norm.weight")?;
+    dense(
+        &mut tensors,
+        "lm_head.weight",
+        &[FIXTURE_VOCAB_SIZE, hidden],
+    )?;
+    Ok(tensors)
+}
+
 /// Write a complete, deterministic tiny **Llama GGUF** checkpoint (`model.gguf` +
 /// `tokenizer.json` + the broker's `.tachyon-model.json` sidecar) so tests
 /// exercise the real candle-transformers quantized Llama forward. Tensors are
@@ -2260,6 +2652,13 @@ mod tests {
 
     #[cfg(test)]
     fn write_fixture_dir(tag: &str) -> PathBuf {
+        write_fixture_dir_with(tag, write_tachyon_tiny_fixture)
+    }
+
+    fn write_fixture_dir_with(
+        tag: &str,
+        writer: impl FnOnce(&Path) -> anyhow::Result<()>,
+    ) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock should be after the epoch")
@@ -2268,7 +2667,7 @@ mod tests {
             "tachyon-llama-{tag}-{}-{nanos}",
             std::process::id()
         ));
-        write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
+        writer(&dir).expect("fixture should be written");
         dir
     }
 
@@ -2387,8 +2786,11 @@ mod tests {
     }
 
     #[test]
-    fn expert_parallel_strategy_is_rejected_until_a_moe_loader_exists() {
-        let dir = write_fixture_dir("ep-dispatch");
+    fn expert_parallel_strategy_rejects_a_non_mixtral_checkpoint() {
+        // A dense Llama checkpoint declares `model_type: "llama"`, which the
+        // Mixtral-only expert-parallel loader must reject rather than
+        // silently treating as a dense single-expert MoE model.
+        let dir = write_fixture_dir("ep-dispatch-non-mixtral");
         let strategy = HardwareStrategy {
             distribution_mode: GpuDistribution::ExpertParallelism,
             device_ids: vec![0, 1],
@@ -2402,10 +2804,86 @@ mod tests {
             &strategy,
             &two_device_topology(),
         )
-        .expect_err("expert-parallel must be rejected: no MoE checkpoint loader yet");
+        .expect_err("expert-parallel must reject a non-Mixtral checkpoint");
         match error {
             CandleLlmError::UnsupportedModel { detail, .. } => {
-                assert!(detail.contains("MoE"), "unexpected detail: {detail}");
+                assert!(detail.contains("Mixtral"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expert_parallel_strategy_dispatches_and_decodes_a_mixtral_checkpoint() {
+        let dir = write_fixture_dir_with("ep-dispatch", write_tachyon_tiny_mixtral_mixed_fixture);
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::ExpertParallelism,
+            device_ids: vec![0, 1],
+            expert_device_map: vec![(0, 0), (1, 1)],
+            ..Default::default()
+        };
+        let expert = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect("expert-parallel load")
+        .expect("supported model");
+
+        assert!(matches!(
+            &*expert.inner,
+            LoadedModel::Parallel(ParallelModel::Expert { .. })
+        ));
+
+        // Expert parallelism carries a KV cache, so full generation works
+        // exactly like the tensor- and pipeline-parallel paths.
+        let generated = expert
+            .generate(&[&b"hello"[..]])
+            .expect("expert-parallel generation should run the decode loop");
+        assert!(!generated.is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expert_parallel_strategy_rejects_top_k_routing_above_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-mixtral-topk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        write_tachyon_tiny_mixtral_fixture(&dir).expect("fixture should be written");
+        // Patch `num_experts_per_tok` to 2, which this runtime does not
+        // support (only top-1 routing is implemented).
+        let config_path = dir.join(CONFIG_JSON);
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).expect("config should read"))
+                .expect("config should parse");
+        config["num_experts_per_tok"] = serde_json::json!(2);
+        fs::write(&config_path, config.to_string()).expect("config should write");
+
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::ExpertParallelism,
+            device_ids: vec![0, 1],
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect_err("top-2 routing must be rejected: only top-1 is implemented");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(detail.contains("top-1"), "unexpected detail: {detail}");
             }
             other => panic!("expected UnsupportedModel, got {other:?}"),
         }

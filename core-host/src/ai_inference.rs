@@ -2,6 +2,8 @@
 mod candle_llm_runtime;
 #[path = "ai_inference/candle_onnx_backend.rs"]
 mod candle_onnx_backend;
+#[path = "ai_inference/expert_parallel_llama.rs"]
+pub(crate) mod expert_parallel_llama;
 #[path = "ai_inference/modelopt_nvfp4.rs"]
 mod modelopt_nvfp4;
 #[path = "ai_inference/parallel.rs"]

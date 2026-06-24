@@ -853,6 +853,23 @@ impl ExpertPlacementPlan {
     pub(crate) fn device_index_for(&self, expert_id: u32) -> Option<usize> {
         self.expert_device_index.get(&expert_id).copied()
     }
+
+    /// Builds a plan from an explicit expert id -> device-ids index map (e.g.
+    /// `hardware_strategy.expert_device_map`), falling back to
+    /// `round_robin` for any expert id the map omits, so a deployment can pin
+    /// a subset of experts without having to enumerate all of them.
+    pub(crate) fn from_explicit_map_or_round_robin(
+        expert_device_map: &[(u32, u32)],
+        expert_count: u32,
+        device_count: usize,
+    ) -> Self {
+        let mut plan = Self::round_robin(expert_count, device_count);
+        for &(expert_id, device_index) in expert_device_map {
+            plan.expert_device_index
+                .insert(expert_id, device_index as usize);
+        }
+        plan
+    }
 }
 
 /// A single token's top-k expert selection, as produced by the model's gate
@@ -953,12 +970,10 @@ impl ExpertMlp {
 /// `forward` performs genuine gate-then-route dispatch — every token is
 /// gathered into a per-expert batch and only that expert's MLP runs over
 /// only its assigned tokens, rather than every expert running over every
-/// token (dense replication). This is the building block that, once a live
-/// MoE checkpoint loader exists in `candle_llm_runtime.rs`, would replace
-/// `TensorParallelMlp` for MoE layers; today nothing in this codebase loads
-/// an MoE checkpoint, so the dense path (`TensorParallelMlp`,
-/// `TensorParallelBlock`) remains the only one ever exercised at runtime —
-/// see Task 6's notes in `tasks.md`.
+/// token (dense replication). This is the building block
+/// [`super::expert_parallel_llama::ExpertParallelLlama`] uses for each
+/// MoE-classified layer of a loaded Mixtral-style checkpoint, alongside
+/// `TensorParallelMlp` for that checkpoint's dense-classified layers.
 pub(crate) struct ExpertParallelMlp {
     gate: Tensor,
     experts: Vec<ExpertMlp>,
@@ -1347,6 +1362,24 @@ mod tests {
         assert_eq!(plan.device_index_for(1), Some(1));
         assert_eq!(plan.device_index_for(2), Some(0));
         assert_eq!(plan.device_index_for(3), Some(1));
+    }
+
+    #[test]
+    fn explicit_map_overrides_are_applied_on_top_of_round_robin() {
+        let plan = ExpertPlacementPlan::from_explicit_map_or_round_robin(&[(2, 1)], 4, 2);
+        // Expert 2 is pinned to device 1 by the explicit map, overriding what
+        // round-robin would have assigned it (device 0).
+        assert_eq!(plan.device_index_for(2), Some(1));
+        // Every other expert keeps its round-robin placement.
+        assert_eq!(plan.device_index_for(0), Some(0));
+        assert_eq!(plan.device_index_for(1), Some(1));
+        assert_eq!(plan.device_index_for(3), Some(1));
+    }
+
+    #[test]
+    fn explicit_map_falls_back_to_round_robin_for_omitted_experts() {
+        let plan = ExpertPlacementPlan::from_explicit_map_or_round_robin(&[], 4, 2);
+        assert_eq!(plan, ExpertPlacementPlan::round_robin(4, 2));
     }
 
     #[test]

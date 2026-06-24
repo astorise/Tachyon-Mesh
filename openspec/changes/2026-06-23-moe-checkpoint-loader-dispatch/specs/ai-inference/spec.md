@@ -41,10 +41,22 @@ For checkpoints declaring expert tensors (e.g. Mixtral-style `model_type: mixtra
 `detect_expert_count`, `ExpertPlacementPlan`, `ExpertMlp`, and `ExpertParallelMlp`
 (`core-host/src/ai_inference/parallel.rs`) are pre-existing, numerically verified
 primitives unchanged by this work. This change adds the previously-missing caller:
-MoE config parsing branching ahead of the Llama-only `load_llama_config`, per-layer
-dense/MoE detection, an `ExpertParallelLlama` model wrapper, and a real
+MoE config parsing (`load_mixtral_config`, a `RawMixtralConfig`/`MixtralConfigJson`
+pair) branching ahead of the Llama-only `load_llama_config`, per-layer dense/MoE
+detection via a new `ExpertParallelLlama` model wrapper
+(`core-host/src/ai_inference/expert_parallel_llama.rs`), and a real
 `GpuDistribution::ExpertParallelism` dispatch arm in `candle_llm_runtime.rs`,
 replacing the previous unconditional `CandleLlmError::UnsupportedModel` rejection.
-Top-k routing greater than one and combining expert-parallelism with tensor- or
-pipeline-parallelism in the same deployment remain out of scope and are tracked as
-follow-ups.
+`ExpertParallelLlama::forward` takes its `TensorParallelCache` as an external
+`&mut` parameter rather than as an owned field (the same revision
+`pipeline-parallel-decode-kv-cache` made to its own design for the same reason:
+the loaded model is shared behind `Arc<LoadedModel>` across concurrent requests,
+so a cache owned by the model would let concurrent requests corrupt each other's
+KV state). `ParallelModel::Expert` reuses the same `decode_loop` driver and
+single-cache decode pattern as `ParallelModel::Tensor`, since expert-parallel
+attention is dense and replicated identically. Verified by per-layer MoE/dense
+dispatch tests, a dense-reference equivalence test (single-expert top-1 routing
+is numerically identical to the dense path), a multi-token decode test, and the
+full `ai_inference::` suite (104 tests, 0 regressions). Top-k routing greater
+than one and combining expert-parallelism with tensor- or pipeline-parallelism
+in the same deployment remain out of scope and are tracked as follow-ups.
