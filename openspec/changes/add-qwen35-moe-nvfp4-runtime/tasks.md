@@ -60,7 +60,7 @@
 - [x] 8.2 Add an opt-in deterministic prompt test that produces non-mock text through buffered and streaming runtime paths
 - [x] 8.3 Measure host memory, accelerator memory, first-token latency, decode latency, and expert paging for each supported memory profile
 - [x] 8.4 Require native production capabilities when fallback execution would exceed configured memory limits and verify the resulting diagnostic
-- [ ] 8.5 Bind the qualified model to the deployed OpenAI route and smoke-test `https://ai.tachyon-mesh.wsl/v1/chat/completions`
+- [x] 8.5 Bind the qualified model to the deployed OpenAI route and smoke-test `https://ai.tachyon-mesh.wsl/v1/chat/completions`
 
 ## 9. Documentation and Release Guardrails
 
