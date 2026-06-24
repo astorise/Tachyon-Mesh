@@ -50,3 +50,58 @@ The platform's NPU/TPU/GPU capability detection and dispatch/fallback behavior S
 - **THEN** capability discovery detects it
 - **AND** a model declared with `tpu` affinity executes via the Edge TPU backend
 - **AND** evidence confirms the Edge TPU, not CPU/GPU, performed the inference
+
+## Implementation status as of this change
+
+Only the first MODIFIED requirement ("dispatched according to declared affinity" /
+honest-unavailable-reporting) is implemented, and only at the host-level model-load
+boundary, not the two ADDED requirements (real OpenVINO/Edge TPU execution, physical
+hardware validation):
+
+- **`core-host/src/ai_inference/accelerator_backend.rs`** (new module) implements
+  `probe(AcceleratorKind) -> AcceleratorAvailability`: `Cpu` is always available;
+  `Gpu` is probed for real via `parallel::discover_cluster_topology` (existing CUDA
+  device enumeration); `Npu`/`Tpu` always report `Unavailable { reason:
+  "no_backend_wired" }`, since no vendor SDK backend is wired into the host. This
+  satisfies "only report an accelerator class as available when a real execution
+  backend ... has been successfully initialized" for `Npu`/`Tpu` (trivially — they
+  are never claimed available) and for `Gpu` (genuinely probed, not assumed).
+- **`AiInferenceRuntime::load_component_model`** (`core-host/src/ai_inference.rs`)
+  calls `accelerator_backend::probe` and rejects the load with a typed error when,
+  and only when, the requested accelerator is `Npu` or `Tpu` and unavailable. `Cpu`/
+  `Gpu` dispatch in this function is unchanged from before this change — this was a
+  deliberate scope decision to avoid altering already-tested GPU/CPU behavior (see
+  `tasks.md` Task 1/4 notes).
+  - This is the load-time gate, not full fallback routing: `resolve_with_fallback`
+    exists and is unit-tested, but is not yet wired into the live WIT-facing
+    `load_accelerator_model`/`compute_accelerator_prompt` dispatch path in
+    `component_hosts.rs`. A target that declares `npu` affinity today gets a clear
+    rejection at model-load time, not yet an automatic redirect to a fallback
+    accelerator end-to-end through the guest-visible API.
+  - `AiInferenceRuntime::supports_accelerator` (the pre-existing scheduling-lane/
+    QoS-queue-sizing concept, unrelated to real hardware presence) is deliberately
+    left unchanged: it still reports `true` for all four `AcceleratorKind` values,
+    since per-class request-queue provisioning is a different question from "is
+    there a real backend," and an existing test
+    (`component_accelerator_runtime_rejects_mismatched_devices`) already asserts
+    that lane-availability semantics for `Gpu`/`Npu`/`Tpu` in CPU-only CI.
+
+The two **ADDED** requirements above — real OpenVINO NPU execution, real Edge TPU
+execution via `libedgetpu`, and physical hardware validation on a CPU+NPU+GPU
+machine and a Coral USB TPU — are **not implemented** by this change. They require
+vendor SDK dependencies (OpenVINO, `libedgetpu`) and physical test hardware that are
+not available in this sandboxed environment. `accelerator_backend.rs`'s module doc
+comment and `tasks.md` Tasks 2/3/5/7 record this explicitly as deferred follow-up
+work, rather than the gap being silently merged as spec text with no implementation
+(the failure mode this change exists to avoid repeating, per
+`2026-06-19-constrained-decoding-activation`'s precedent for an honest "implemented
+vs. not" accounting).
+
+Verified by 3 new unit tests in `accelerator_backend.rs` covering `probe` status
+transitions, 3 new unit tests covering `resolve_with_fallback` (including an
+injected-probe test demonstrating the fallback logic is independent of real
+hardware), 1 new integration test in `ai_inference.rs`
+(`load_component_model_honestly_rejects_npu_and_tpu_as_unavailable`), and the full
+`core-host --features ai-inference` suite (121 tests, 0 regressions), plus a clean
+`cargo clippy --features ai-inference --all-targets -- -D warnings -D
+clippy::unwrap_used`.

@@ -1,3 +1,5 @@
+#[path = "ai_inference/accelerator_backend.rs"]
+mod accelerator_backend;
 #[path = "ai_inference/candle_llm_runtime.rs"]
 mod candle_llm_runtime;
 #[path = "ai_inference/candle_onnx_backend.rs"]
@@ -449,6 +451,28 @@ impl AiInferenceRuntime {
                 "{} accelerator is unavailable on this host",
                 accelerator.as_str()
             ));
+        }
+        // `supports_accelerator` only answers "is this a valid scheduling
+        // lane" (true for every `AcceleratorKind`, including `Npu`/`Tpu`, by
+        // design — see its doc comment). Whether a class can actually
+        // execute real work is a separate, execution-backed question. This
+        // change scopes the answer to `Npu`/`Tpu` only (GPU/CPU dispatch via
+        // candle is unchanged and out of scope — see this change's
+        // proposal): no NPU/TPU vendor SDK backend is wired into this host
+        // yet, so guests dispatching through the `npu`/`tpu` WIT interfaces
+        // must see an honest "unavailable" here rather than a label that
+        // silently routes to nothing. See `accelerator_backend` and
+        // `openspec/changes/2026-06-19-npu-tpu-real-device-execution`.
+        if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
+            let availability = accelerator_backend::probe(accelerator);
+            if let accelerator_backend::AvailabilityStatus::Unavailable { reason } =
+                availability.status
+            {
+                return Err(format!(
+                    "{} accelerator is unavailable on this host: {reason}",
+                    accelerator.as_str()
+                ));
+            }
         }
 
         self.ensure_model_loaded(alias)?;
@@ -2404,6 +2428,65 @@ mod tests {
             runtime
                 .compute_component_prompt("llama3", "hello")
                 .expect("component compute should succeed"),
+            MOCK_INFERENCE_RESPONSE
+        );
+    }
+
+    #[test]
+    fn load_component_model_honestly_rejects_npu_and_tpu_as_unavailable() {
+        // `supports_accelerator` reports `Npu`/`Tpu` as a valid scheduling
+        // lane (it is, for QoS/batching purposes), but no real NPU/TPU
+        // backend is wired into this host, so the guest-facing
+        // `load_component_model` dispatch boundary must say so explicitly
+        // rather than let a label that cannot execute appear to succeed.
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![
+            IntegrityModelBinding {
+                alias: "npu-whisper".to_owned(),
+                path: "mock:npu-whisper".to_owned(),
+                device: ModelDevice::Npu,
+                qos: RouteQos::RealTime,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            },
+            IntegrityModelBinding {
+                alias: "tpu-embed".to_owned(),
+                path: "mock:tpu-embed".to_owned(),
+                device: ModelDevice::Tpu,
+                qos: RouteQos::Batch,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            },
+        ];
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime should build");
+
+        let npu_error = runtime
+            .load_component_model("npu-whisper", AcceleratorKind::Npu)
+            .expect_err("npu dispatch should be rejected: no backend is wired");
+        assert!(
+            npu_error.contains("no_backend_wired"),
+            "expected a no_backend_wired reason, got: {npu_error}"
+        );
+
+        let tpu_error = runtime
+            .load_component_model("tpu-embed", AcceleratorKind::Tpu)
+            .expect_err("tpu dispatch should be rejected: no backend is wired");
+        assert!(
+            tpu_error.contains("no_backend_wired"),
+            "expected a no_backend_wired reason, got: {tpu_error}"
+        );
+
+        // The pre-existing internal mock-compute path (bypassing the
+        // guest-facing dispatch boundary above) is unaffected: it exercises
+        // the runtime's own batching/QoS plumbing, not a real accelerator.
+        assert_eq!(
+            runtime
+                .compute_component_prompt("npu-whisper", "ping")
+                .expect("internal mock compute should still succeed"),
             MOCK_INFERENCE_RESPONSE
         );
     }
