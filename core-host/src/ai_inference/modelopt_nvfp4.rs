@@ -5,9 +5,10 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 #[cfg(feature = "nvfp4-cuda")]
@@ -130,7 +131,10 @@ pub(crate) enum Nvfp4ExecutionPlan {
 pub(crate) struct ModelOptNvfp4Directory {
     alias: String,
     root: PathBuf,
+    config_json: Option<Value>,
+    hf_quant_json: Option<Value>,
     shard_index: SafetensorsShardIndex,
+    header_cache: Arc<Mutex<BTreeMap<PathBuf, SafetensorsHeader>>>,
     quantization: ModelOptNvfp4QuantizationLayout,
 }
 
@@ -192,7 +196,10 @@ impl ModelOptNvfp4Directory {
         Ok(Some(Self {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
+            config_json,
+            hf_quant_json,
             shard_index,
+            header_cache: Arc::new(Mutex::new(BTreeMap::new())),
             quantization,
         }))
     }
@@ -209,9 +216,20 @@ impl ModelOptNvfp4Directory {
         &self.quantization
     }
 
+    pub(crate) fn config_json(&self) -> Option<&Value> {
+        self.config_json.as_ref()
+    }
+
+    pub(crate) fn hf_quant_json(&self) -> Option<&Value> {
+        self.hf_quant_json.as_ref()
+    }
+
+    pub(crate) fn contains_tensor(&self, tensor_name: &str) -> bool {
+        self.shard_index.contains_tensor(tensor_name)
+    }
+
     /// Every tensor name the checkpoint declares, across all shards. Callers
-    /// building a dense in-memory model (the NVFP4 fallback execution path)
-    /// walk this to classify and materialize each parameter in turn.
+    /// building a runtime walk this to classify and materialize parameters.
     pub(crate) fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.shard_index.tensor_names()
     }
@@ -227,13 +245,23 @@ impl ModelOptNvfp4Directory {
                 tensor: tensor_name.to_owned(),
             }
         })?;
-        let header = SafetensorsHeader::read(&location.shard_path)?;
-        let info = header.tensor(tensor_name).ok_or_else(|| {
-            ModelOptNvfp4LoadError::TensorNotFoundInShard {
-                alias: self.alias.clone(),
-                tensor: tensor_name.to_owned(),
-                shard: location.shard_path.clone(),
+        let info = {
+            let mut cache = self
+                .header_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("safetensors header cache lock is poisoned"))?;
+            if !cache.contains_key(&location.shard_path) {
+                let header = SafetensorsHeader::read(&location.shard_path)?;
+                cache.insert(location.shard_path.clone(), header);
             }
+            cache
+                .get(&location.shard_path)
+                .and_then(|header| header.tensor(tensor_name))
+        };
+        let info = info.ok_or_else(|| ModelOptNvfp4LoadError::TensorNotFoundInShard {
+            alias: self.alias.clone(),
+            tensor: tensor_name.to_owned(),
+            shard: location.shard_path.clone(),
         })?;
         Ok(SafetensorsTensorRef {
             name: tensor_name.to_owned(),
@@ -547,6 +575,10 @@ impl SafetensorsShardIndex {
             .any(|tensor| tensor.ends_with(suffix))
     }
 
+    pub(crate) fn contains_tensor(&self, tensor_name: &str) -> bool {
+        self.weight_map.contains_key(tensor_name)
+    }
+
     pub(crate) fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.weight_map.keys().map(String::as_str)
     }
@@ -605,6 +637,141 @@ pub(crate) struct SafetensorsTensorRef {
     pub(crate) name: String,
     pub(crate) shard_path: PathBuf,
     pub(crate) info: SafetensorsTensorInfo,
+}
+
+impl SafetensorsTensorRef {
+    pub(crate) fn read_bytes(&self) -> Result<Vec<u8>> {
+        let mut file = File::open(&self.shard_path).with_context(|| {
+            format!(
+                "failed to open safetensors shard `{}`",
+                self.shard_path.display()
+            )
+        })?;
+        let mut prefix = [0u8; 8];
+        file.read_exact(&mut prefix)?;
+        let header_len = u64::from_le_bytes(prefix);
+        let data_start = 8u64
+            .checked_add(header_len)
+            .context("safetensors data offset overflow")?;
+        let start = data_start
+            .checked_add(u64::try_from(self.info.data_offsets.0)?)
+            .context("safetensors tensor start offset overflow")?;
+        let len = self
+            .info
+            .data_offsets
+            .1
+            .checked_sub(self.info.data_offsets.0)
+            .context("invalid safetensors tensor offsets")?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0u8; len];
+        file.read_exact(&mut bytes).with_context(|| {
+            format!(
+                "failed to read tensor `{}` from `{}`",
+                self.name,
+                self.shard_path.display()
+            )
+        })?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn read_f32(&self) -> Result<Vec<f32>> {
+        let bytes = self.read_bytes()?;
+        let expected = elem_count(&self.info.shape);
+        let values: Vec<f32> = match self.info.dtype {
+            SafetensorsDType::F8E4M3 => bytes.into_iter().map(e4m3_to_f32).collect(),
+            SafetensorsDType::BF16 => bytes
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    f32::from_bits(u32::from(bits) << 16)
+                })
+                .collect(),
+            SafetensorsDType::F16 => bytes
+                .chunks_exact(2)
+                .map(|chunk| f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect(),
+            SafetensorsDType::F32 => bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect(),
+            dtype => bail!(
+                "tensor `{}` cannot be decoded as f32 from dtype {dtype:?}",
+                self.name
+            ),
+        };
+        if values.len() != expected {
+            bail!(
+                "tensor `{}` decoded {} values, expected {expected}",
+                self.name,
+                values.len()
+            );
+        }
+        Ok(values)
+    }
+
+    pub(crate) fn read_f32_slice(
+        &self,
+        element_start: usize,
+        element_len: usize,
+    ) -> Result<Vec<f32>> {
+        let element_size = match self.info.dtype {
+            SafetensorsDType::F8E4M3 => 1usize,
+            SafetensorsDType::BF16 | SafetensorsDType::F16 => 2,
+            SafetensorsDType::F32 => 4,
+            dtype => bail!(
+                "tensor `{}` cannot be sliced as f32 from dtype {dtype:?}",
+                self.name
+            ),
+        };
+        let total = elem_count(&self.info.shape);
+        let element_end = element_start
+            .checked_add(element_len)
+            .context("tensor slice range overflow")?;
+        if element_end > total {
+            bail!(
+                "tensor `{}` slice [{element_start}..{element_end}] exceeds {total} elements",
+                self.name
+            );
+        }
+        let byte_start = element_start
+            .checked_mul(element_size)
+            .context("tensor slice byte offset overflow")?;
+        let byte_len = element_len
+            .checked_mul(element_size)
+            .context("tensor slice byte length overflow")?;
+        let mut file = File::open(&self.shard_path)?;
+        let mut prefix = [0u8; 8];
+        file.read_exact(&mut prefix)?;
+        let data_start = 8u64
+            .checked_add(u64::from_le_bytes(prefix))
+            .context("safetensors data offset overflow")?;
+        let tensor_start = data_start
+            .checked_add(u64::try_from(self.info.data_offsets.0)?)
+            .and_then(|offset| offset.checked_add(u64::try_from(byte_start).ok()?))
+            .context("tensor slice start offset overflow")?;
+        file.seek(SeekFrom::Start(tensor_start))?;
+        let mut bytes = vec![0u8; byte_len];
+        file.read_exact(&mut bytes)?;
+        let values = match self.info.dtype {
+            SafetensorsDType::F8E4M3 => bytes.into_iter().map(e4m3_to_f32).collect(),
+            SafetensorsDType::BF16 => bytes
+                .chunks_exact(2)
+                .map(|chunk| {
+                    f32::from_bits(u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16)
+                })
+                .collect(),
+            SafetensorsDType::F16 => bytes
+                .chunks_exact(2)
+                .map(|chunk| f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect(),
+            SafetensorsDType::F32 => bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect(),
+            _ => unreachable!(),
+        };
+        Ok(values)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -764,56 +931,6 @@ impl SafetensorsHeader {
     }
 }
 
-impl SafetensorsTensorRef {
-    /// Reads this tensor's raw little-endian bytes straight from its shard
-    /// file. Used by the dense (fallback) NVFP4 execution path to materialize
-    /// an in-memory model: the packed FP4 weight, its FP8 block scales, and
-    /// the F32 tensor scale are each read this way before dequantization, and
-    /// passthrough (unquantized) tensors are read this way to feed
-    /// `Tensor::from_raw_buffer` directly.
-    pub(crate) fn read_bytes(&self) -> Result<Vec<u8>> {
-        let mut file = File::open(&self.shard_path).with_context(|| {
-            format!(
-                "failed to open safetensors shard `{}`",
-                self.shard_path.display()
-            )
-        })?;
-        let mut prefix = [0u8; 8];
-        file.read_exact(&mut prefix).with_context(|| {
-            format!(
-                "failed to read safetensors header prefix from `{}`",
-                self.shard_path.display()
-            )
-        })?;
-        let header_len = u64::from_le_bytes(prefix) as usize;
-        let (start, end) = self.info.data_offsets;
-        let data_start = 8usize
-            .checked_add(header_len)
-            .and_then(|base| base.checked_add(start))
-            .ok_or_else(|| ModelOptNvfp4LoadError::UnsupportedQuantization {
-                alias: self.name.clone(),
-                detail: "tensor data offset overflows usize".to_owned(),
-            })?;
-        file.seek(SeekFrom::Start(data_start as u64))
-            .with_context(|| {
-                format!(
-                    "failed to seek to tensor `{}` data in `{}`",
-                    self.name,
-                    self.shard_path.display()
-                )
-            })?;
-        let mut buf = vec![0u8; end.saturating_sub(start)];
-        file.read_exact(&mut buf).with_context(|| {
-            format!(
-                "failed to read tensor `{}` data from `{}`",
-                self.name,
-                self.shard_path.display()
-            )
-        })?;
-        Ok(buf)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackedFp4TensorRef {
     pub(crate) tensor: SafetensorsTensorRef,
@@ -874,6 +991,208 @@ pub(crate) enum ModelOptLinearTensors {
     Nvfp4(Nvfp4LinearTensors),
     Fp8(Fp8LinearTensors),
     Passthrough(PassthroughTensorRef),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedLinear {
+    Dense {
+        rows: usize,
+        cols: usize,
+        weight: Vec<f32>,
+    },
+    Fp8 {
+        rows: usize,
+        cols: usize,
+        weight: Vec<u8>,
+        scale: f32,
+    },
+    Nvfp4 {
+        rows: usize,
+        cols: usize,
+        packed: Vec<u8>,
+        scales: Vec<u8>,
+        tensor_scale: f32,
+    },
+}
+
+impl PreparedLinear {
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        match self {
+            Self::Dense { weight, .. } => (weight.len() as u64).saturating_mul(4),
+            Self::Fp8 { weight, .. } => weight.len() as u64,
+            Self::Nvfp4 { packed, scales, .. } => {
+                (packed.len() as u64).saturating_add(scales.len() as u64)
+            }
+        }
+    }
+
+    pub(crate) fn matvec(&self, input: &[f32]) -> Result<Vec<f32>> {
+        let (rows, cols) = match self {
+            Self::Dense { rows, cols, .. }
+            | Self::Fp8 { rows, cols, .. }
+            | Self::Nvfp4 { rows, cols, .. } => (*rows, *cols),
+        };
+        if input.len() != cols {
+            bail!("linear input has {} values, expected {cols}", input.len());
+        }
+        let mut output = vec![0.0f32; rows];
+        match self {
+            Self::Dense { weight, .. } => {
+                for (row, output_value) in output.iter_mut().enumerate() {
+                    *output_value = weight[row * cols..(row + 1) * cols]
+                        .iter()
+                        .zip(input)
+                        .map(|(weight, input)| weight * input)
+                        .sum();
+                }
+            }
+            Self::Fp8 { weight, scale, .. } => {
+                for (row, output_value) in output.iter_mut().enumerate() {
+                    *output_value = weight[row * cols..(row + 1) * cols]
+                        .iter()
+                        .zip(input)
+                        .map(|(weight, input)| e4m3_to_f32(*weight) * scale * input)
+                        .sum();
+                }
+            }
+            Self::Nvfp4 {
+                packed,
+                scales,
+                tensor_scale,
+                ..
+            } => {
+                let packed_cols = cols / 2;
+                let scale_cols = cols / NVFP4_BLOCK_SIZE;
+                for row in 0..rows {
+                    let mut sum = 0.0;
+                    for block in 0..scale_cols {
+                        let scale = e4m3_to_f32(scales[row * scale_cols + block]) * tensor_scale;
+                        let packed_offset = row * packed_cols + block * (NVFP4_BLOCK_SIZE / 2);
+                        let input_offset = block * NVFP4_BLOCK_SIZE;
+                        for byte_index in 0..NVFP4_BLOCK_SIZE / 2 {
+                            let byte = packed[packed_offset + byte_index];
+                            let value_index = input_offset + byte_index * 2;
+                            sum += E2M1_LUT[(byte >> 4) as usize] * scale * input[value_index];
+                            sum +=
+                                E2M1_LUT[(byte & 0x0f) as usize] * scale * input[value_index + 1];
+                        }
+                    }
+                    output[row] = sum;
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
+impl ModelOptLinearTensors {
+    pub(crate) fn logical_shape(&self) -> Result<(usize, usize)> {
+        let shape = match self {
+            Self::Nvfp4(linear) => {
+                let shape = &linear.packed_weight.tensor.info.shape;
+                vec![shape[0], shape[1] * 2]
+            }
+            Self::Fp8(linear) => linear.weight.info.shape.clone(),
+            Self::Passthrough(linear) => linear.tensor.info.shape.clone(),
+        };
+        if shape.len() != 2 {
+            bail!("linear weight must be rank 2, got {shape:?}");
+        }
+        Ok((shape[0], shape[1]))
+    }
+
+    pub(crate) fn dequantize_f32(&self, max_dense_bytes: Option<u64>) -> Result<Vec<f32>> {
+        let (rows, cols) = self.logical_shape()?;
+        let bytes = u64::try_from(rows)?
+            .saturating_mul(u64::try_from(cols)?)
+            .saturating_mul(4);
+        if max_dense_bytes.is_some_and(|limit| bytes > limit) {
+            bail!(
+                "linear fallback needs {bytes} dense bytes for [{rows}, {cols}], exceeding limit {}",
+                max_dense_bytes.unwrap_or_default()
+            );
+        }
+        match self {
+            Self::Passthrough(linear) => linear.tensor.read_f32(),
+            Self::Fp8(linear) => {
+                let scale = read_scalar_f32(&linear.weight_scale.tensor)?;
+                Ok(linear
+                    .weight
+                    .read_f32()?
+                    .into_iter()
+                    .map(|value| value * scale)
+                    .collect())
+            }
+            Self::Nvfp4(linear) => {
+                let packed = linear.packed_weight.tensor.read_bytes()?;
+                let block_scales = linear.block_scales.tensor.read_bytes()?;
+                let tensor_scale = read_scalar_f32(&linear.tensor_scale.tensor)?;
+                let Nvfp4DenseValues::F32(values) = dequantize_nvfp4_e4m3(
+                    &packed,
+                    &block_scales,
+                    tensor_scale,
+                    rows,
+                    cols,
+                    Nvfp4OutputDType::F32,
+                )?
+                else {
+                    unreachable!("F32 output was requested")
+                };
+                Ok(values)
+            }
+        }
+    }
+
+    pub(crate) fn matvec_f32(
+        &self,
+        input: &[f32],
+        max_dense_bytes: Option<u64>,
+    ) -> Result<Vec<f32>> {
+        let (_, cols) = self.logical_shape()?;
+        if input.len() != cols {
+            bail!("linear input has {} values, expected {cols}", input.len());
+        }
+        self.prepare(max_dense_bytes)?.matvec(input)
+    }
+
+    pub(crate) fn prepare(&self, max_dense_bytes: Option<u64>) -> Result<PreparedLinear> {
+        let (rows, cols) = self.logical_shape()?;
+        match self {
+            Self::Nvfp4(linear) => {
+                let packed = linear.packed_weight.tensor.read_bytes()?;
+                let scales = linear.block_scales.tensor.read_bytes()?;
+                let tensor_scale = read_scalar_f32(&linear.tensor_scale.tensor)?;
+                Ok(PreparedLinear::Nvfp4 {
+                    rows,
+                    cols,
+                    packed,
+                    scales,
+                    tensor_scale,
+                })
+            }
+            Self::Fp8(linear) => {
+                let weight = linear.weight.read_bytes()?;
+                let scale = read_scalar_f32(&linear.weight_scale.tensor)?;
+                Ok(PreparedLinear::Fp8 {
+                    rows,
+                    cols,
+                    weight,
+                    scale,
+                })
+            }
+            Self::Passthrough(linear) => {
+                let weight = linear.tensor.read_f32()?;
+                let dense_bytes = (weight.len() as u64).saturating_mul(4);
+                if max_dense_bytes.is_some_and(|limit| dense_bytes > limit) {
+                    bail!(
+                        "linear fallback needs {dense_bytes} dense bytes, exceeding limit {}",
+                        max_dense_bytes.unwrap_or_default()
+                    );
+                }
+                Ok(PreparedLinear::Dense { rows, cols, weight })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1265,6 +1584,39 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
     let lsb = (bits >> 16) & 1;
     let rounded = bits.wrapping_add(0x7fff + lsb);
     (rounded >> 16) as u16
+}
+
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = (bits >> 10) & 0x1f;
+    let fraction = bits & 0x03ff;
+    let value = match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let mut fraction = u32::from(fraction);
+            let mut exponent = 113u32;
+            while fraction & 0x0400 == 0 {
+                fraction <<= 1;
+                exponent -= 1;
+            }
+            sign | (exponent << 23) | ((fraction & 0x03ff) << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (u32::from(fraction) << 13),
+        _ => sign | (u32::from(exponent + 112) << 23) | (u32::from(fraction) << 13),
+    };
+    f32::from_bits(value)
+}
+
+fn read_scalar_f32(tensor: &SafetensorsTensorRef) -> Result<f32> {
+    let values = tensor.read_f32()?;
+    if values.len() != 1 {
+        bail!(
+            "tensor `{}` must contain one scalar, got {} values",
+            tensor.name,
+            values.len()
+        );
+    }
+    Ok(values[0])
 }
 
 #[cfg(test)]
@@ -1692,6 +2044,68 @@ mod tests {
             .expect_err("invalid K should fail");
 
         assert!(error.to_string().contains("multiple of block size"));
+    }
+
+    #[test]
+    fn quantized_linear_fallback_matvec_is_bounded() {
+        let root = temp_model_dir("modelopt-linear-matvec");
+        write_minimal_modelopt_nvfp4_dir(&root);
+        let model = ModelOptNvfp4Directory::try_load("nvfp4", &root)
+            .expect("loader should not error")
+            .expect("directory should be detected");
+        let linear = model
+            .modelopt_linear(TEST_LINEAR)
+            .expect("linear should load");
+
+        let output = linear
+            .matvec_f32(&[1.0; 16], Some(1024))
+            .expect("bounded fallback should run");
+        assert_eq!(output, vec![0.0]);
+
+        let bounded = linear
+            .matvec_f32(&[1.0; 16], Some(1))
+            .expect("packed matvec must not allocate a dense weight window");
+        assert_eq!(bounded, vec![0.0]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn f16_conversion_handles_normal_subnormal_and_infinity() {
+        assert_eq!(f16_bits_to_f32(0x3c00), 1.0);
+        assert!(f16_bits_to_f32(0x0001) > 0.0);
+        assert!(f16_bits_to_f32(0x7c00).is_infinite());
+    }
+
+    #[test]
+    fn mixed_dense_fp8_nvfp4_graph_matches_expected_output() {
+        let mut dense_weight = vec![0.0; 16 * 16];
+        let mut fp8_weight = vec![0u8; 16 * 16];
+        for index in 0..16 {
+            dense_weight[index * 16 + index] = 1.0;
+            fp8_weight[index * 16 + index] = 0x38;
+        }
+        let dense = PreparedLinear::Dense {
+            rows: 16,
+            cols: 16,
+            weight: dense_weight,
+        };
+        let fp8 = PreparedLinear::Fp8 {
+            rows: 16,
+            cols: 16,
+            weight: fp8_weight,
+            scale: 1.0,
+        };
+        let nvfp4 = PreparedLinear::Nvfp4 {
+            rows: 1,
+            cols: 16,
+            packed: vec![0x22; 8],
+            scales: vec![0x38],
+            tensor_scale: 1.0,
+        };
+        let dense_output = dense.matvec(&[1.0; 16]).expect("dense");
+        let fp8_output = fp8.matvec(&dense_output).expect("fp8");
+        let output = nvfp4.matvec(&fp8_output).expect("nvfp4");
+        assert_eq!(output, vec![16.0]);
     }
 
     #[test]

@@ -1,6 +1,8 @@
-# ModelOpt/NVFP4 Inference Primitives
+# ModelOpt/NVFP4 Inference
 
-Tachyon supports ModelOpt/NVFP4 as quantized tensor primitives, not as a complete causal-LLM runtime.
+Tachyon supports ModelOpt/NVFP4 tensor primitives and a versioned Qwen 3.5 MoE
+text runtime. NVFP4 is a weight encoding, not a generic architecture marker:
+unknown architectures fail closed.
 
 ## Supported Layout
 
@@ -18,7 +20,11 @@ Packed FP4 bytes must not be interpreted as `f32`.
 
 ## Fallback Dequantization
 
-The pure Rust fallback converts packed FP4 plus FP8 E4M3 scales into BF16 or F32 dense tensors. It validates NVFP4 block size, packed shape, scale shape, nibble order, tensor scale, and fallback memory limits.
+The pure Rust fallback can convert packed FP4 plus FP8 E4M3 scales into BF16 or
+F32 dense tensors. Quantized matvec execution consumes packed FP8 or NVFP4
+weights directly, keeping fallback memory bounded to the active operator. It
+validates block size, packed shape, scale shape, nibble order, tensor scale, and
+fallback memory limits.
 
 Fallback can be estimated for eager full-model dequantization or for a layer window. If estimated host RAM or accelerator memory exceeds configured limits, the runtime rejects fallback instead of silently loading an unsafe dense tensor set.
 
@@ -54,6 +60,13 @@ cargo test -p core-host --features "ai-inference nvfp4-cuda" modelopt_nvfp4
 
 The native source provides CUDA entrypoints for NVFP4 dequantization and an initial linear matmul kernel that consumes ModelOpt packed FP4 weights and FP8 E4M3 scales. CUTLASS headers are required to compile the native kernels so future block-scaled Tensor Core kernels can use the same ABI boundary.
 
-## Current Runtime Boundary
+## Architecture Runtime
 
-Detected ModelOpt/NVFP4 directories are registered as typed component sets and do not fall through to `MOCK_LLM_RESPONSE`. Inference for such aliases returns an explicit unsupported-execution error until a concrete architecture runtime or native kernel backend is configured.
+Detected ModelOpt/NVFP4 directories are registered as typed component sets and
+never fall through to `MOCK_LLM_RESPONSE`. Checkpoints matching
+`qwen3.5-moe-text-modelopt-0.44-v1` execute through the hybrid Qwen 3.5 runtime.
+Other architectures return an actionable compatibility error.
+
+The Qwen runtime pages only the current layer, selected routed experts, shared
+expert, and required attention state. See
+[`ai/qwen35-moe-nvfp4-reference.md`](ai/qwen35-moe-nvfp4-reference.md).

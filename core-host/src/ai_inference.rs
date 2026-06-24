@@ -1,5 +1,7 @@
 #[path = "ai_inference/accelerator_backend.rs"]
 mod accelerator_backend;
+#[path = "ai_inference/architecture_registry.rs"]
+mod architecture_registry;
 #[path = "ai_inference/candle_llm_runtime.rs"]
 mod candle_llm_runtime;
 #[path = "ai_inference/candle_onnx_backend.rs"]
@@ -12,6 +14,8 @@ mod modelopt_nvfp4;
 pub(crate) mod parallel;
 #[path = "ai_inference/pipeline_parallel_llama.rs"]
 pub(crate) mod pipeline_parallel_llama;
+#[path = "ai_inference/qwen35_moe_runtime.rs"]
+mod qwen35_moe_runtime;
 #[path = "ai_inference/samplers.rs"]
 mod samplers;
 #[path = "ai_inference/tensor_parallel_llama.rs"]
@@ -19,7 +23,7 @@ pub(crate) mod tensor_parallel_llama;
 #[path = "ai_inference/vram_manager.rs"]
 pub(crate) mod vram_manager;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{
     bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
     Tensor as CandleTensor,
@@ -944,6 +948,7 @@ enum CandleBackendModelKind {
     /// Native FP4-kernel execution without eager dequantization remains a
     /// documented follow-up.
     ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
+    Qwen35Moe(Box<qwen35_moe_runtime::Qwen35MoeRuntime>),
 }
 
 impl CandleBackendModel {
@@ -981,9 +986,36 @@ impl CandleBackendModel {
                 &binding.alias,
                 &binding.path,
             )? {
-                Some(directory) => CandleBackendModelKind::ModelOptNvfp4(Box::new(
-                    candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4(&directory)?,
-                )),
+                Some(model) => {
+                    static DESCRIPTORS: [&dyn architecture_registry::ArchitectureDescriptor; 1] =
+                        [&qwen35_moe_runtime::QWEN35_MOE_DESCRIPTOR];
+                    let registry =
+                        architecture_registry::ArchitectureRegistry::new(&DESCRIPTORS);
+                    match registry.resolve(&model)? {
+                        Some(architecture)
+                            if architecture.kind
+                                == architecture_registry::ArchitectureKind::Qwen35MoeText =>
+                        {
+                            CandleBackendModelKind::Qwen35Moe(Box::new(
+                                qwen35_moe_runtime::Qwen35MoeRuntime::from_model(
+                                    &binding.alias,
+                                    &binding.path,
+                                    binding.device.as_str(),
+                                    model,
+                                )?,
+                            ))
+                        }
+                        Some(architecture) => {
+                            return Err(anyhow!(
+                                "unsupported registered ModelOpt/NVFP4 architecture {:?}",
+                                architecture.kind
+                            ));
+                        }
+                        None => CandleBackendModelKind::ModelOptNvfp4(Box::new(
+                            candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4(&model)?,
+                        )),
+                    }
+                }
                 None => match candle_llm_runtime::CandleLlmRuntime::try_load(
                     &binding.alias,
                     &binding.path,
@@ -1031,6 +1063,28 @@ impl BackendModel for CandleBackendModel {
 
     fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>> {
         match &self.kind {
+            CandleBackendModelKind::Qwen35Moe(runtime) => {
+                if inputs
+                    .iter()
+                    .any(|input| !matches!(input.ty, TensorType::U8))
+                {
+                    return Err(anyhow!(
+                        "Qwen 3.5 MoE model `{}` only accepts U8 prompt tensors",
+                        self.source.alias
+                    ));
+                }
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                return runtime.generate(&prompts).map_err(|error| {
+                    anyhow!(
+                        "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
+                        self.source.alias,
+                        runtime.root().display()
+                    )
+                });
+            }
             CandleBackendModelKind::ModelOptNvfp4(runtime)
             | CandleBackendModelKind::TextGeneration(runtime) => {
                 if inputs
@@ -1083,40 +1137,61 @@ impl BackendModel for CandleBackendModel {
         inputs: &[SharedInputTensor],
         on_token: &mut dyn FnMut(&str),
     ) -> Result<()> {
-        // Only the text-generation backend decodes incrementally; everything
-        // else (mock, NVFP4) uses the trait's buffered emit-once fallback.
-        let CandleBackendModelKind::TextGeneration(runtime) = &self.kind else {
-            let output = self.execute(inputs)?;
-            let text = String::from_utf8(output)
-                .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
-            if !text.is_empty() {
-                on_token(&text);
+        match &self.kind {
+            CandleBackendModelKind::ModelOptNvfp4(runtime)
+            | CandleBackendModelKind::TextGeneration(runtime) => {
+                validate_u8_prompts(&self.source.alias, inputs)?;
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                runtime
+                    .generate_streaming(&prompts, on_token)
+                    .map_err(|error| {
+                        anyhow!(
+                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                            self.source.alias,
+                            runtime.root().display()
+                        )
+                    })
             }
-            return Ok(());
-        };
-        if inputs
-            .iter()
-            .any(|input| !matches!(input.ty, TensorType::U8))
-        {
-            return Err(anyhow!(
-                "Candle LLM model `{}` only accepts U8 prompt tensors",
-                self.source.alias
-            ));
+            CandleBackendModelKind::Qwen35Moe(runtime) => {
+                validate_u8_prompts(&self.source.alias, inputs)?;
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                runtime
+                    .generate_streaming(&prompts, on_token)
+                    .map_err(|error| {
+                        anyhow!(
+                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
+                            self.source.alias,
+                            runtime.root().display()
+                        )
+                    })
+            }
+            CandleBackendModelKind::Mock => {
+                let output = self.execute(inputs)?;
+                let text = String::from_utf8(output)
+                    .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
+                if !text.is_empty() {
+                    on_token(&text);
+                }
+                Ok(())
+            }
         }
-        let prompts = inputs
-            .iter()
-            .map(|input| input.data.as_ref())
-            .collect::<Vec<_>>();
-        runtime
-            .generate_streaming(&prompts, on_token)
-            .map_err(|error| {
-                anyhow!(
-                    "Candle LLM model `{}` loaded from `{}` failed: {error}",
-                    self.source.alias,
-                    runtime.root().display()
-                )
-            })
     }
+}
+
+fn validate_u8_prompts(alias: &str, inputs: &[SharedInputTensor]) -> Result<()> {
+    if inputs
+        .iter()
+        .any(|input| !matches!(input.ty, TensorType::U8))
+    {
+        bail!("text-generation model `{alias}` only accepts U8 prompt tensors");
+    }
+    Ok(())
 }
 
 struct CandleModel {

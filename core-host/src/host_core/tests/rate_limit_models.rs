@@ -167,6 +167,59 @@ fn validate_integrity_config_normalizes_model_bindings() {
 }
 
 #[test]
+fn validate_integrity_config_preserves_dynamic_model_bindings_without_paths() {
+    let mut config = IntegrityConfig::default_sealed();
+    let mut route = IntegrityRoute::user("/v1/chat/completions");
+    route.models = vec![IntegrityModelBinding {
+        alias: " qwen-dynamic ".to_owned(),
+        path: String::new(),
+        device: ModelDevice::Cpu,
+        qos: RouteQos::Standard,
+        dynamic: true,
+        hardware_strategy: Default::default(),
+    }];
+    config.routes = vec![route];
+
+    let config = validate_integrity_config(config).expect("dynamic model bindings should validate");
+    let route = config
+        .sealed_route("/v1/chat/completions")
+        .expect("OpenAI chat route should stay available");
+
+    assert_eq!(
+        route.models,
+        vec![IntegrityModelBinding {
+            alias: "qwen-dynamic".to_owned(),
+            path: String::new(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: true,
+            hardware_strategy: Default::default(),
+        }]
+    );
+}
+
+#[test]
+fn validate_integrity_config_rejects_static_model_bindings_without_paths() {
+    let mut config = IntegrityConfig::default_sealed();
+    let mut route = IntegrityRoute::user("/v1/chat/completions");
+    route.models = vec![IntegrityModelBinding {
+        alias: "qwen-static".to_owned(),
+        path: String::new(),
+        device: ModelDevice::Cpu,
+        qos: RouteQos::Standard,
+        dynamic: false,
+        hardware_strategy: Default::default(),
+    }];
+    config.routes = vec![route];
+
+    let error = validate_integrity_config(config)
+        .expect_err("static model bindings without paths must be rejected");
+    assert!(error
+        .to_string()
+        .contains("must include a non-empty `path`"));
+}
+
+#[test]
 fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
     let mut first = IntegrityRoute::user("/api/guest-ai");
     first.models = vec![IntegrityModelBinding {

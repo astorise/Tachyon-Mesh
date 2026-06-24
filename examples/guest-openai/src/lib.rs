@@ -228,7 +228,16 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
         return Err("chat completion request must include at least one message".to_owned());
     }
 
-    let model_id = match bindings::tachyon::accelerator::cpu::load_model(&request.model) {
+    let models = list_models()?;
+    let Some(alias) = resolve_model_alias(&request.model, &models) else {
+        return Ok(openai_error_payload(
+            404,
+            format!("model `{}` is unavailable", request.model),
+            "model_not_found",
+        ));
+    };
+
+    let model_id = match bindings::tachyon::accelerator::cpu::load_model(alias) {
         Ok(model_id) => model_id,
         Err(error) => {
             return Ok(openai_error_payload(
@@ -244,6 +253,15 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     } else {
         handle_chat_completions_buffered(request, model_id)
     }
+}
+
+fn resolve_model_alias<'a>(requested: &str, models: &'a [ModelInfo]) -> Option<&'a str> {
+    models
+        .iter()
+        .find(|model| {
+            model.alias == requested || format!("{}/{}", model.engine, model.alias) == requested
+        })
+        .map(|model| model.alias.as_str())
 }
 
 fn handle_chat_completions_buffered(
@@ -492,6 +510,26 @@ mod tests {
         // validation, before any host accelerator import is invoked.
         let result = route_request("POST", ROUTE_CHAT_COMPLETIONS, b"{}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolves_openai_model_id_to_registry_alias() {
+        let models = vec![ModelInfo {
+            alias: "nvidia--Qwen3.6-35B-A3B-NVFP4".to_owned(),
+            engine: "safetensors".to_owned(),
+            vram_required_mb: 0,
+            status: "available".to_owned(),
+        }];
+
+        assert_eq!(
+            resolve_model_alias("safetensors/nvidia--Qwen3.6-35B-A3B-NVFP4", &models),
+            Some("nvidia--Qwen3.6-35B-A3B-NVFP4")
+        );
+        assert_eq!(
+            resolve_model_alias("nvidia--Qwen3.6-35B-A3B-NVFP4", &models),
+            Some("nvidia--Qwen3.6-35B-A3B-NVFP4")
+        );
+        assert_eq!(resolve_model_alias("unknown", &models), None);
     }
 
     #[test]

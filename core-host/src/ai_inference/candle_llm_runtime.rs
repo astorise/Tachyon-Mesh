@@ -298,9 +298,9 @@ struct SafetensorsIndex {
 /// Rendered into a prompt by the model's own chat template at parse time.
 /// `Serialize` so it can be handed to the Jinja chat-template context.
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
-struct ChatTurn {
-    role: String,
-    content: String,
+pub(crate) struct ChatTurn {
+    pub(crate) role: String,
+    pub(crate) content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1618,7 +1618,7 @@ fn render_generic_chat(messages: &[ChatTurn]) -> String {
 /// A checkpoint's chat template, extracted once from `tokenizer_config.json`.
 /// Rendering uses minijinja with the Python-compatibility method set so real
 /// Hugging Face instruct templates (which call `.strip()`, `.split()`, …) work.
-struct ChatTemplate {
+pub(crate) struct ChatTemplate {
     source: String,
     bos_token: String,
     eos_token: String,
@@ -1686,7 +1686,7 @@ impl ChatTemplateField {
 impl ChatTemplate {
     /// Load the model's chat template from `tokenizer_config.json`, or `None`
     /// when the file or the `chat_template` field is absent.
-    fn load(alias: &str, root: &Path) -> Result<Option<Self>, CandleLlmError> {
+    pub(crate) fn load(alias: &str, root: &Path) -> Result<Option<Self>, CandleLlmError> {
         let path = root.join(TOKENIZER_CONFIG_JSON);
         if !path.exists() {
             return Ok(None);
@@ -1725,7 +1725,7 @@ impl ChatTemplate {
 
     /// Render `messages` through the Jinja template with `add_generation_prompt`
     /// set, so the prompt ends ready for the assistant to continue.
-    fn render(&self, messages: &[ChatTurn]) -> Result<String, String> {
+    pub(crate) fn render(&self, messages: &[ChatTurn]) -> Result<String, String> {
         let mut env = minijinja::Environment::new();
         // Real HF templates call `raise_exception(...)` to reject malformed
         // conversations (e.g. a system turn where the model forbids one).
