@@ -229,12 +229,16 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     }
 
     let models = list_models()?;
-    let Some(alias) = resolve_model_alias(&request.model, &models) else {
-        return Ok(openai_error_payload(
-            404,
-            format!("model `{}` is unavailable", request.model),
-            "model_not_found",
-        ));
+    let alias = match resolve_model_alias(&request.model, &models) {
+        Some(alias) => alias,
+        None if !request.model.contains('/') => request.model.as_str(),
+        None => {
+            return Ok(openai_error_payload(
+                404,
+                format!("model `{}` is unavailable", request.model),
+                "model_not_found",
+            ));
+        }
     };
 
     let model_id = match bindings::tachyon::accelerator::cpu::load_model(alias) {
