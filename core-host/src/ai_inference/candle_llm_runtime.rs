@@ -17,6 +17,7 @@ use tokenizers::Tokenizer;
 use crate::{GpuDistribution, HardwareStrategy};
 
 use super::expert_parallel_llama::ExpertParallelLlama;
+use super::modelopt_nvfp4;
 use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
@@ -518,6 +519,141 @@ impl CandleLlmRuntime {
             },
             limits,
         ))
+    }
+
+    /// Build a runnable dense Llama model from an already-detected
+    /// ModelOpt/NVFP4 checkpoint: every NVFP4-quantized linear is dequantized
+    /// to F32 at load time (the documented fallback execution path — native
+    /// FP4-kernel execution without eager dequantization remains a follow-up,
+    /// see the `gpu-accelerated-inference-execution` change), passthrough
+    /// tensors (norms, embeddings, anything not quantized) are read as-is,
+    /// and the resulting in-memory tensor map feeds the same already-tested
+    /// `Llama::load` engine `load_safetensors` uses. This makes NVFP4
+    /// checkpoints genuinely executable instead of unconditionally rejected.
+    pub(crate) fn try_load_modelopt_nvfp4(
+        directory: &modelopt_nvfp4::ModelOptNvfp4Directory,
+    ) -> Result<Self, CandleLlmError> {
+        let alias = directory.alias();
+        let root = directory.root();
+
+        let raw_config = fs::read(root.join(CONFIG_JSON)).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        let probe: ModelTypeProbe = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        if probe.model_type != LLAMA_MODEL_TYPE {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "NVFP4 execution currently supports Llama-family checkpoints only (`model_type` = `{LLAMA_MODEL_TYPE}`), got `{}`",
+                    probe.model_type
+                ),
+            });
+        }
+        let llama_config: LlamaConfig = serde_json::from_slice(&raw_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: CONFIG_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        let config = llama_config.into_config(false);
+        let limits = GenerationLimits::with_context(config.max_position_embeddings);
+        let eos_tokens = eos_token_ids(&config);
+
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        for name in directory.tensor_names() {
+            if name.ends_with(".weight_scale")
+                || name.ends_with(".weight_scale_2")
+                || name.ends_with(".input_scale")
+            {
+                continue;
+            }
+            let Some(base_name) = name.strip_suffix(".weight") else {
+                let info = directory.tensor_info(name).map_err(invalid_nvfp4(alias, root))?;
+                let tensor = raw_tensor_from_ref(&info, &device).map_err(invalid_nvfp4(alias, root))?;
+                tensors.insert(name.to_owned(), tensor);
+                continue;
+            };
+            let tensor = match directory
+                .modelopt_linear(base_name)
+                .map_err(invalid_nvfp4(alias, root))?
+            {
+                modelopt_nvfp4::ModelOptLinearTensors::Nvfp4(linear) => {
+                    dense_tensor_from_nvfp4(&linear, &device).map_err(invalid_nvfp4(alias, root))?
+                }
+                modelopt_nvfp4::ModelOptLinearTensors::Fp8(fp8) => {
+                    return Err(CandleLlmError::UnsupportedModel {
+                        alias: alias.to_owned(),
+                        path: root.to_path_buf(),
+                        detail: format!(
+                            "NVFP4 execution does not yet support the mixed FP8 linear `{}`",
+                            fp8.base_name
+                        ),
+                    });
+                }
+                modelopt_nvfp4::ModelOptLinearTensors::Passthrough(passthrough) => {
+                    raw_tensor_from_ref(&passthrough.tensor, &device)
+                        .map_err(invalid_nvfp4(alias, root))?
+                }
+            };
+            tensors.insert(name.to_owned(), tensor);
+        }
+
+        let var_builder = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let model = Llama::load(var_builder, &config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            }
+        })?;
+        let inner = LoadedModel::Safetensors {
+            model,
+            config,
+            eos_tokens,
+        };
+
+        if !root.join(TOKENIZER_JSON).exists() {
+            return Err(CandleLlmError::MissingFile {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                file: TOKENIZER_JSON,
+            });
+        }
+        let tokenizer = Tokenizer::from_file(root.join(TOKENIZER_JSON)).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: TOKENIZER_JSON,
+                detail: error.to_string(),
+            }
+        })?;
+        let chat_template = ChatTemplate::load(alias, root)?.map(Arc::new);
+
+        Ok(Self {
+            alias: alias.to_owned(),
+            root: root.to_path_buf(),
+            tokenizer,
+            inner: Arc::new(inner),
+            limits,
+            chat_template,
+        })
     }
 
     /// Load a single GGUF Llama file. The architecture and hyper-parameters come
@@ -1696,6 +1832,98 @@ fn resolve_devices(device_ids: &[u32]) -> Vec<Device> {
         .collect()
 }
 
+/// Wraps an `anyhow::Error` from the format-agnostic `modelopt_nvfp4` module
+/// (which knows nothing about Candle) into the typed `CandleLlmError` this
+/// module's callers expect.
+fn invalid_nvfp4<'a>(
+    alias: &'a str,
+    root: &'a Path,
+) -> impl Fn(anyhow::Error) -> CandleLlmError + 'a {
+    move |error| CandleLlmError::InvalidComponent {
+        alias: alias.to_owned(),
+        path: root.to_path_buf(),
+        component: MODEL_SAFETENSORS,
+        detail: error.to_string(),
+    }
+}
+
+/// Dequantizes one NVFP4 linear's packed weight into a dense F32 `Tensor`:
+/// the fallback (non-native-kernel) NVFP4 execution path. Reads the packed
+/// nibbles, FP8 block scales, and F32 tensor scale straight from the shard
+/// file and reuses the already-tested `dequantize_nvfp4_e4m3`.
+fn dense_tensor_from_nvfp4(
+    linear: &modelopt_nvfp4::Nvfp4LinearTensors,
+    device: &Device,
+) -> anyhow::Result<Tensor> {
+    let packed = linear.packed_weight.tensor.read_bytes()?;
+    let block_scales = linear.block_scales.tensor.read_bytes()?;
+    let tensor_scale_bytes = linear.tensor_scale.tensor.read_bytes()?;
+    let tensor_scale_bytes: [u8; 4] = tensor_scale_bytes.get(..4).ok_or_else(|| {
+        anyhow::anyhow!(
+            "NVFP4 tensor scale for `{}` is shorter than 4 bytes",
+            linear.base_name
+        )
+    })?.try_into().expect("length checked above");
+    let tensor_scale = f32::from_le_bytes(tensor_scale_bytes);
+    let n_rows = linear.packed_weight.tensor.info.shape[0];
+    let n_cols = linear
+        .packed_weight
+        .tensor
+        .info
+        .shape
+        .get(1)
+        .copied()
+        .unwrap_or_default()
+        * 2;
+    let dense = modelopt_nvfp4::dequantize_nvfp4_e4m3(
+        &packed,
+        &block_scales,
+        tensor_scale,
+        n_rows,
+        n_cols,
+        modelopt_nvfp4::Nvfp4OutputDType::F32,
+    )?;
+    let values = match dense {
+        modelopt_nvfp4::Nvfp4DenseValues::F32(values) => values,
+        modelopt_nvfp4::Nvfp4DenseValues::BF16(_) => {
+            anyhow::bail!("internal error: requested F32 NVFP4 dequantization but got BF16")
+        }
+    };
+    Ok(Tensor::from_vec(values, (n_rows, n_cols), device)?)
+}
+
+/// Reads an unquantized (passthrough) tensor straight from its shard, for
+/// the parameters an NVFP4 checkpoint does not quantize (norms, embeddings,
+/// any linear ModelOpt left in full precision).
+fn raw_tensor_from_ref(
+    reference: &modelopt_nvfp4::SafetensorsTensorRef,
+    device: &Device,
+) -> anyhow::Result<Tensor> {
+    let bytes = reference.read_bytes()?;
+    let dtype = candle_dtype_for(reference.info.dtype)?;
+    Ok(Tensor::from_raw_buffer(
+        &bytes,
+        dtype,
+        &reference.info.shape,
+        device,
+    )?)
+}
+
+fn candle_dtype_for(dtype: modelopt_nvfp4::SafetensorsDType) -> anyhow::Result<DType> {
+    use modelopt_nvfp4::SafetensorsDType;
+    Ok(match dtype {
+        SafetensorsDType::U8 => DType::U8,
+        SafetensorsDType::U32 => DType::U32,
+        SafetensorsDType::F16 => DType::F16,
+        SafetensorsDType::BF16 => DType::BF16,
+        SafetensorsDType::F32 => DType::F32,
+        SafetensorsDType::F8E4M3 => DType::F8E4M3,
+        SafetensorsDType::Other => {
+            anyhow::bail!("unsupported safetensors dtype for a passthrough NVFP4 tensor")
+        }
+    })
+}
+
 /// Resolve the safetensors shard paths for a model directory: the HF index when
 /// the checkpoint is sharded, otherwise the single `model.safetensors`.
 fn safetensors_paths(alias: &str, root: &Path) -> Result<Vec<PathBuf>, CandleLlmError> {
@@ -2308,6 +2536,160 @@ mod tests {
             "different prompts must flow through attention to different logits"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn modelopt_nvfp4_dequantized_forward_matches_a_dense_reference() {
+        // Quantizes only `down_proj.weight` (the one square-free linear in the
+        // fixture, [hidden, inter] = [8, 16], so its 16-wide row satisfies
+        // NVFP4's block-size-16 constraint with exactly one scale per row) using
+        // values drawn from NVFP4's own E2M1 levels with unit scales, so
+        // dequantization reproduces the dense reference's weights exactly
+        // rather than merely approximately.
+        const E2M1_LUT: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let hidden = FIXTURE_HIDDEN_SIZE;
+        let inter = FIXTURE_INTERMEDIATE_SIZE;
+        let down_values: Vec<f32> = (0..hidden)
+            .flat_map(|row| (0..inter).map(move |col| E2M1_LUT[(row + col) % 16]))
+            .collect();
+
+        let mut weights = fixture_weights().expect("fixture weights");
+        for layer in 0..FIXTURE_NUM_LAYERS {
+            weights.insert(
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                Tensor::from_vec(down_values.clone(), (hidden, inter), &Device::Cpu)
+                    .expect("down_proj override"),
+            );
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dense_dir = std::env::temp_dir().join(format!(
+            "tachyon-nvfp4-dense-ref-{}-{nanos}",
+            std::process::id()
+        ));
+        let nvfp4_dir = std::env::temp_dir().join(format!(
+            "tachyon-nvfp4-quant-{}-{nanos}",
+            std::process::id()
+        ));
+
+        fn write_config_and_tokenizer(root: &Path) {
+            fs::create_dir_all(root).expect("dir");
+            fs::write(
+                root.join(CONFIG_JSON),
+                serde_json::json!({
+                    "model_type": LLAMA_MODEL_TYPE,
+                    "architectures": ["LlamaForCausalLM"],
+                    "hidden_size": FIXTURE_HIDDEN_SIZE,
+                    "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+                    "vocab_size": FIXTURE_VOCAB_SIZE,
+                    "num_hidden_layers": FIXTURE_NUM_LAYERS,
+                    "num_attention_heads": FIXTURE_NUM_HEADS,
+                    "num_key_value_heads": FIXTURE_NUM_HEADS,
+                    "rms_norm_eps": 1e-5,
+                    "rope_theta": 10000.0,
+                    "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+                    "tie_word_embeddings": false,
+                    "bos_token_id": 1,
+                    "eos_token_id": null
+                })
+                .to_string(),
+            )
+            .expect("config");
+            fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON).expect("tokenizer");
+        }
+
+        // Dense reference: plain safetensors, the already-tested load path.
+        write_config_and_tokenizer(&dense_dir);
+        candle_core::safetensors::save(&weights, dense_dir.join(MODEL_SAFETENSORS))
+            .expect("dense reference weights should save");
+
+        // NVFP4 fixture: every tensor passthrough-F32 except each layer's
+        // `down_proj.weight`, which is packed/scaled so it dequantizes back to
+        // exactly `down_values`.
+        write_config_and_tokenizer(&nvfp4_dir);
+        let mut shard_entries: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> = Vec::new();
+        for (name, tensor) in &weights {
+            if name.ends_with(".mlp.down_proj.weight") {
+                continue;
+            }
+            let shape = tensor.dims().to_vec();
+            let values = tensor
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1::<f32>()
+                .expect("f32 values");
+            let bytes = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<u8>>();
+            shard_entries.push((name.clone(), "F32", shape, bytes));
+        }
+        for layer in 0..FIXTURE_NUM_LAYERS {
+            let base = format!("model.layers.{layer}.mlp.down_proj");
+            let pack_cols = inter / 2;
+            let mut packed = vec![0u8; hidden * pack_cols];
+            for row in 0..hidden {
+                for byte_idx in 0..pack_cols {
+                    let hi = (row + 2 * byte_idx) % 16;
+                    let lo = (row + 2 * byte_idx + 1) % 16;
+                    packed[row * pack_cols + byte_idx] = ((hi as u8) << 4) | (lo as u8);
+                }
+            }
+            shard_entries.push((format!("{base}.weight"), "U8", vec![hidden, pack_cols], packed));
+            shard_entries.push((
+                format!("{base}.weight_scale"),
+                "F8_E4M3",
+                vec![hidden, inter / 16],
+                vec![0x38u8; hidden * (inter / 16)],
+            ));
+            shard_entries.push((
+                format!("{base}.weight_scale_2"),
+                "F32",
+                vec![1],
+                1.0f32.to_le_bytes().to_vec(),
+            ));
+        }
+        let shard_name = "model-00001-of-00001.safetensors";
+        let entries: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = shard_entries
+            .iter()
+            .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+            .collect();
+        modelopt_nvfp4::tests_support::write_safetensors_shard(&nvfp4_dir.join(shard_name), entries);
+        let tensor_names: Vec<&str> = shard_entries.iter().map(|(name, ..)| name.as_str()).collect();
+        modelopt_nvfp4::tests_support::write_index(&nvfp4_dir, shard_name, &tensor_names);
+
+        let dense_runtime =
+            CandleLlmRuntime::try_load("dense-ref", &dense_dir, "cpu", &HardwareStrategy::default())
+                .expect("dense reference should load")
+                .expect("dense reference is a supported llama model");
+        let directory = modelopt_nvfp4::ModelOptNvfp4Directory::try_load("nvfp4", &nvfp4_dir)
+            .expect("nvfp4 detection should not error")
+            .expect("nvfp4 directory should be detected");
+        let nvfp4_runtime = CandleLlmRuntime::try_load_modelopt_nvfp4(&directory)
+            .expect("nvfp4 checkpoint should load via the dequantized fallback path");
+
+        let dense_logits = dense_runtime.debug_last_logits("hello");
+        let nvfp4_logits = nvfp4_runtime.debug_last_logits("hello");
+        assert_eq!(dense_logits.len(), nvfp4_logits.len());
+        for (dense, nvfp4) in dense_logits.iter().zip(nvfp4_logits.iter()) {
+            assert!(
+                (dense - nvfp4).abs() < 1e-3,
+                "dense {dense} vs nvfp4 {nvfp4} should match within tolerance"
+            );
+        }
+
+        let generated = nvfp4_runtime
+            .generate(&[&b"hello"[..]])
+            .expect("nvfp4 checkpoint should run a real decode loop");
+        assert!(!generated.is_empty(), "decode output must not be empty");
+
+        let _ = fs::remove_dir_all(dense_dir);
+        let _ = fs::remove_dir_all(nvfp4_dir);
     }
 
     #[test]

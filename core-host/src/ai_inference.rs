@@ -912,7 +912,12 @@ struct CandleBackendModel {
 enum CandleBackendModelKind {
     Mock,
     TextGeneration(Box<candle_llm_runtime::CandleLlmRuntime>),
-    ModelOptNvfp4(modelopt_nvfp4::ModelOptNvfp4Directory),
+    /// A ModelOpt/NVFP4 checkpoint, dequantized to a dense F32 model at load
+    /// time (the fallback NVFP4 execution path: see
+    /// `candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4`).
+    /// Native FP4-kernel execution without eager dequantization remains a
+    /// documented follow-up.
+    ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
 }
 
 impl CandleBackendModel {
@@ -950,7 +955,9 @@ impl CandleBackendModel {
                 &binding.alias,
                 &binding.path,
             )? {
-                Some(model) => CandleBackendModelKind::ModelOptNvfp4(model),
+                Some(directory) => CandleBackendModelKind::ModelOptNvfp4(Box::new(
+                    candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4(&directory)?,
+                )),
                 None => match candle_llm_runtime::CandleLlmRuntime::try_load(
                     &binding.alias,
                     &binding.path,
@@ -998,14 +1005,8 @@ impl BackendModel for CandleBackendModel {
 
     fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>> {
         match &self.kind {
-            CandleBackendModelKind::ModelOptNvfp4(model) => {
-                return Err(anyhow!(
-                    "ModelOpt/NVFP4 model `{}` was loaded from `{}` but this backend only has NVFP4 detection/dequant support; native kernels or architecture execution are not configured yet",
-                    model.alias(),
-                    model.root().display()
-                ));
-            }
-            CandleBackendModelKind::TextGeneration(runtime) => {
+            CandleBackendModelKind::ModelOptNvfp4(runtime)
+            | CandleBackendModelKind::TextGeneration(runtime) => {
                 if inputs
                     .iter()
                     .any(|input| !matches!(input.ty, TensorType::U8))

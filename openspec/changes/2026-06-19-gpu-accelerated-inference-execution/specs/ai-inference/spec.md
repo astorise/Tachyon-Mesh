@@ -42,3 +42,30 @@ The runtime SHALL record, for every inference call, which device class actually 
 - **WHEN** an operator inspects telemetry for an inference call against a model binding that declares a GPU device
 - **THEN** the telemetry indicates the actual device class that executed the call
 - **AND** a CPU fallback is distinguishable from genuine GPU execution without reading source code
+
+## Implementation status as of this change
+
+ONNX GPU execution (the "MODIFIED" requirement above) was already real before this
+change started: an unrelated prior commit (`3c56ec0`, #193) wired
+`candle_onnx_backend.rs`'s `ExecutionTarget::Gpu` to a real CUDA `Device` and
+`candle_onnx::simple_eval` via the forked candle's CUDA ONNX op support. The
+per-operator allow-list (`OnnxOpSupport`) and `executed_on: gpu`/`executed_on:
+cpu` telemetry the scenarios above describe were **not** built — the fork's
+CUDA ONNX coverage made a manual allow-list unnecessary for the ops exercised
+so far, and there is no per-inference-call device telemetry field anywhere in
+`compute-observability` yet to populate. The "ADDED Requirement" (observable
+`executed_on` per call) is therefore still unimplemented and tracked as a
+follow-up rather than delivered here.
+
+What this change actually delivers is the NVFP4 (ModelOpt) side: ModelOpt/
+NVFP4 Llama checkpoints, previously detected and load-time-validated but
+unconditionally rejected at execution time, now run via a real dequantize-to-
+dense-F32-then-execute fallback (`CandleLlmRuntime::try_load_modelopt_nvfp4`
+in `candle_llm_runtime.rs`, dispatched from `CandleBackendModel::load`/
+`execute` in `ai_inference.rs`). Native FP4-kernel matmul without eager
+dequantization (eliminating the dequantization memory/time overhead) remains
+out of scope and is tracked as a follow-up, as is combining NVFP4 with
+tensor/pipeline/expert parallelism in the same deployment. Verified by a new
+load-and-forward equivalence test
+(`modelopt_nvfp4_dequantized_forward_matches_a_dense_reference`) and the full
+`ai_inference::` suite (105 tests, 0 regressions).
