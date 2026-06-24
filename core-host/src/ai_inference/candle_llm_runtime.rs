@@ -550,14 +550,13 @@ impl CandleLlmRuntime {
         let alias = directory.alias();
         let root = directory.root();
 
-        let raw_config = fs::read(root.join(CONFIG_JSON)).map_err(|error| {
-            CandleLlmError::InvalidComponent {
+        let raw_config =
+            fs::read(root.join(CONFIG_JSON)).map_err(|error| CandleLlmError::InvalidComponent {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
                 component: CONFIG_JSON,
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         let probe: ModelTypeProbe = serde_json::from_slice(&raw_config).map_err(|error| {
             CandleLlmError::InvalidComponent {
                 alias: alias.to_owned(),
@@ -598,8 +597,11 @@ impl CandleLlmRuntime {
                 continue;
             }
             let Some(base_name) = name.strip_suffix(".weight") else {
-                let info = directory.tensor_info(name).map_err(invalid_nvfp4(alias, root))?;
-                let tensor = raw_tensor_from_ref(&info, &device).map_err(invalid_nvfp4(alias, root))?;
+                let info = directory
+                    .tensor_info(name)
+                    .map_err(invalid_nvfp4(alias, root))?;
+                let tensor =
+                    raw_tensor_from_ref(&info, &device).map_err(invalid_nvfp4(alias, root))?;
                 tensors.insert(name.to_owned(), tensor);
                 continue;
             };
@@ -1251,10 +1253,9 @@ impl CandleLlmRuntime {
             index_pos += context.len();
             if let Some(fsm) = fsm_processor.as_mut() {
                 if !eos_tokens.contains(&next) {
-                    let text = self
-                        .tokenizer
-                        .decode(&[next], false)
-                        .map_err(|error| self.execution_error(format!("failed to decode token: {error}")))?;
+                    let text = self.tokenizer.decode(&[next], false).map_err(|error| {
+                        self.execution_error(format!("failed to decode token: {error}"))
+                    })?;
                     fsm.commit(&text);
                 }
             }
@@ -1304,8 +1305,9 @@ impl CandleLlmRuntime {
                 *value = f32::NEG_INFINITY;
             }
         }
-        Tensor::from_vec(values, row.shape(), row.device())
-            .map_err(|error| self.execution_error(format!("failed to build masked logits: {error}")))
+        Tensor::from_vec(values, row.shape(), row.device()).map_err(|error| {
+            self.execution_error(format!("failed to build masked logits: {error}"))
+        })
     }
 
     /// Decode the full generated token sequence to UTF-8 text (special tokens
@@ -1928,12 +1930,16 @@ fn dense_tensor_from_nvfp4(
     let packed = linear.packed_weight.tensor.read_bytes()?;
     let block_scales = linear.block_scales.tensor.read_bytes()?;
     let tensor_scale_bytes = linear.tensor_scale.tensor.read_bytes()?;
-    let tensor_scale_bytes: [u8; 4] = tensor_scale_bytes.get(..4).ok_or_else(|| {
-        anyhow::anyhow!(
-            "NVFP4 tensor scale for `{}` is shorter than 4 bytes",
-            linear.base_name
-        )
-    })?.try_into().expect("length checked above");
+    let tensor_scale_bytes: [u8; 4] = tensor_scale_bytes
+        .get(..4)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "NVFP4 tensor scale for `{}` is shorter than 4 bytes",
+                linear.base_name
+            )
+        })?
+        .try_into()
+        .expect("length checked above");
     let tensor_scale = f32::from_le_bytes(tensor_scale_bytes);
     let n_rows = linear.packed_weight.tensor.info.shape[0];
     let n_cols = linear
@@ -2795,7 +2801,12 @@ mod tests {
                     packed[row * pack_cols + byte_idx] = ((hi as u8) << 4) | (lo as u8);
                 }
             }
-            shard_entries.push((format!("{base}.weight"), "U8", vec![hidden, pack_cols], packed));
+            shard_entries.push((
+                format!("{base}.weight"),
+                "U8",
+                vec![hidden, pack_cols],
+                packed,
+            ));
             shard_entries.push((
                 format!("{base}.weight_scale"),
                 "F8_E4M3",
@@ -2812,16 +2823,28 @@ mod tests {
         let shard_name = "model-00001-of-00001.safetensors";
         let entries: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = shard_entries
             .iter()
-            .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+            .map(|(name, dtype, shape, bytes)| {
+                (name.as_str(), *dtype, shape.clone(), bytes.clone())
+            })
             .collect();
-        modelopt_nvfp4::tests_support::write_safetensors_shard(&nvfp4_dir.join(shard_name), entries);
-        let tensor_names: Vec<&str> = shard_entries.iter().map(|(name, ..)| name.as_str()).collect();
+        modelopt_nvfp4::tests_support::write_safetensors_shard(
+            &nvfp4_dir.join(shard_name),
+            entries,
+        );
+        let tensor_names: Vec<&str> = shard_entries
+            .iter()
+            .map(|(name, ..)| name.as_str())
+            .collect();
         modelopt_nvfp4::tests_support::write_index(&nvfp4_dir, shard_name, &tensor_names);
 
-        let dense_runtime =
-            CandleLlmRuntime::try_load("dense-ref", &dense_dir, "cpu", &HardwareStrategy::default())
-                .expect("dense reference should load")
-                .expect("dense reference is a supported llama model");
+        let dense_runtime = CandleLlmRuntime::try_load(
+            "dense-ref",
+            &dense_dir,
+            "cpu",
+            &HardwareStrategy::default(),
+        )
+        .expect("dense reference should load")
+        .expect("dense reference is a supported llama model");
         let directory = modelopt_nvfp4::ModelOptNvfp4Directory::try_load("nvfp4", &nvfp4_dir)
             .expect("nvfp4 detection should not error")
             .expect("nvfp4 directory should be detected");

@@ -60,9 +60,17 @@ pub(crate) enum FsmState {
     /// Matching the literal text of `properties[idx]`'s `"name":` prefix (or
     /// the closing `}` when `idx == properties.len()`); `matched` counts how
     /// many bytes of that literal have been consumed so far.
-    ObjKey { idx: usize, matched: usize },
-    ObjValue { idx: usize, value: ValueState },
-    ObjAfterValue { idx: usize },
+    ObjKey {
+        idx: usize,
+        matched: usize,
+    },
+    ObjValue {
+        idx: usize,
+        value: ValueState,
+    },
+    ObjAfterValue {
+        idx: usize,
+    },
     ScalarValue(ValueState),
     Done,
 }
@@ -75,7 +83,9 @@ pub(crate) enum ValueState {
     /// immediately after an unconsumed `\`, so the following character is
     /// treated as the escaped payload rather than a possible closing `"` or
     /// a fresh `\`.
-    String { escaped: bool },
+    String {
+        escaped: bool,
+    },
     Number(NumberPhase),
     /// Matching a fixed literal (`true`/`false`) or one alternative of an
     /// `enum`. `consumed` is the exact text matched so far; a candidate is
@@ -83,7 +93,9 @@ pub(crate) enum ValueState {
     /// later step can never "switch" to an alternative whose earlier prefix
     /// was never actually emitted (e.g. matching `"a"` of `"ab"` and then
     /// jumping to `"ca"` because both have `a` at the next offset).
-    Literal { consumed: String },
+    Literal {
+        consumed: String,
+    },
 }
 
 /// Sub-states of a JSON number's grammar (`-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`),
@@ -275,10 +287,9 @@ impl CompiledFsm {
             GrammarRoot::Scalar(_) => None,
         };
         match state {
-            FsmState::ObjBeforeOpen => (ch == '{').then_some(FsmState::ObjKey {
-                idx: 0,
-                matched: 0,
-            }),
+            FsmState::ObjBeforeOpen => {
+                (ch == '{').then_some(FsmState::ObjKey { idx: 0, matched: 0 })
+            }
             FsmState::ObjKey { idx, matched } => {
                 let properties = properties?;
                 let literal = if *idx == properties.len() {
@@ -311,7 +322,10 @@ impl CompiledFsm {
             FsmState::ObjValue { idx, value } => {
                 let node = self.node_for_idx(*idx)?;
                 match step_value(value, node, ch) {
-                    StepOutcome::Consumed(next) => Some(FsmState::ObjValue { idx: *idx, value: next }),
+                    StepOutcome::Consumed(next) => Some(FsmState::ObjValue {
+                        idx: *idx,
+                        value: next,
+                    }),
                     StepOutcome::ConsumedComplete => Some(FsmState::ObjAfterValue { idx: *idx }),
                     StepOutcome::Terminate => self.step(&FsmState::ObjAfterValue { idx: *idx }, ch),
                     StepOutcome::Invalid => None,
@@ -367,22 +381,25 @@ pub(crate) enum SchemaCompileError {
 /// Compile a JSON Schema string into a [`CompiledFsm`]. See the module-level
 /// scope note for exactly what is and isn't supported.
 pub(crate) fn compile_schema(schema: &str) -> Result<CompiledFsm, SchemaCompileError> {
-    let value: serde_json::Value =
-        serde_json::from_str(schema).map_err(|error| SchemaCompileError::InvalidJson(error.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(schema)
+        .map_err(|error| SchemaCompileError::InvalidJson(error.to_string()))?;
     let root = compile_root(&value)?;
     Ok(CompiledFsm { root })
 }
 
 fn compile_root(value: &serde_json::Value) -> Result<GrammarRoot, SchemaCompileError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| SchemaCompileError::Unsupported("schema must be a JSON object".to_owned()))?;
+    let object = value.as_object().ok_or_else(|| {
+        SchemaCompileError::Unsupported("schema must be a JSON object".to_owned())
+    })?;
     let schema_type = object.get("type").and_then(serde_json::Value::as_str);
-    if schema_type == Some("object") || (schema_type.is_none() && object.contains_key("properties")) {
+    if schema_type == Some("object") || (schema_type.is_none() && object.contains_key("properties"))
+    {
         let properties_value = object
             .get("properties")
             .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| SchemaCompileError::Unsupported("object schema requires `properties`".to_owned()))?;
+            .ok_or_else(|| {
+                SchemaCompileError::Unsupported("object schema requires `properties`".to_owned())
+            })?;
         let mut properties = Vec::with_capacity(properties_value.len());
         for (name, node_value) in properties_value {
             let node = compile_scalar_node(node_value)?;
@@ -399,9 +416,9 @@ fn compile_root(value: &serde_json::Value) -> Result<GrammarRoot, SchemaCompileE
 }
 
 fn compile_scalar_node(value: &serde_json::Value) -> Result<SchemaNode, SchemaCompileError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| SchemaCompileError::Unsupported("property schema must be a JSON object".to_owned()))?;
+    let object = value.as_object().ok_or_else(|| {
+        SchemaCompileError::Unsupported("property schema must be a JSON object".to_owned())
+    })?;
     if let Some(enum_values) = object.get("enum").and_then(serde_json::Value::as_array) {
         let alternatives = enum_values
             .iter()
@@ -445,7 +462,8 @@ pub(crate) struct FsmCache {
 
 impl FsmCache {
     pub(crate) fn new(capacity: usize) -> Self {
-        let capacity = std::num::NonZeroUsize::new(capacity.max(1)).expect("capacity is at least 1");
+        let capacity =
+            std::num::NonZeroUsize::new(capacity.max(1)).expect("capacity is at least 1");
         Self {
             cache: Mutex::new(LruCache::new(capacity)),
         }
@@ -457,7 +475,10 @@ impl FsmCache {
         schema: &str,
     ) -> Result<Arc<CompiledFsm>, SchemaCompileError> {
         let key: [u8; 32] = Sha256::digest(schema.as_bytes()).into();
-        let mut cache = self.cache.lock().expect("fsm cache mutex is never poisoned");
+        let mut cache = self
+            .cache
+            .lock()
+            .expect("fsm cache mutex is never poisoned");
         if let Some(existing) = cache.get(&key) {
             return Ok(Arc::clone(existing));
         }
@@ -600,12 +621,15 @@ mod tests {
 
     #[test]
     fn logit_processor_allows_only_grammar_consistent_tokens() {
-        let fsm = Arc::new(fsm_for(r#"{"type":"object","properties":{"ok":{"type":"boolean"}}}"#));
+        let fsm = Arc::new(fsm_for(
+            r#"{"type":"object","properties":{"ok":{"type":"boolean"}}}"#,
+        ));
         let processor = FsmLogitProcessor::new(fsm);
         // A tiny synthetic vocabulary: id 0 is the correct next fragment,
         // id 1 is grammar-violating, id 2 decodes to an empty string.
         let vocab = ["{\"ok\":t", "xyz", ""];
-        let allowed = processor.allowed_token_ids(vocab.len(), &[], |id| vocab[id as usize].to_owned());
+        let allowed =
+            processor.allowed_token_ids(vocab.len(), &[], |id| vocab[id as usize].to_owned());
         assert_eq!(allowed, vec![0]);
     }
 

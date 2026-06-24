@@ -64,10 +64,7 @@ pub(crate) fn probe(backend: AcceleratorKind) -> AcceleratorAvailability {
             reason: NO_BACKEND_WIRED,
         },
     };
-    AcceleratorAvailability {
-        backend,
-        status,
-    }
+    AcceleratorAvailability { backend, status }
 }
 
 /// Resolves which accelerator class a dispatch should actually target: the
@@ -93,7 +90,10 @@ mod tests {
 
     #[test]
     fn cpu_is_always_available() {
-        assert_eq!(probe(AcceleratorKind::Cpu).status, AvailabilityStatus::Available);
+        assert_eq!(
+            probe(AcceleratorKind::Cpu).status,
+            AvailabilityStatus::Available
+        );
     }
 
     #[test]
@@ -146,7 +146,8 @@ mod tests {
             backend,
             status: AvailabilityStatus::Available,
         };
-        let resolved = resolve_with_fallback(AcceleratorKind::Npu, AcceleratorKind::Cpu, always_available);
+        let resolved =
+            resolve_with_fallback(AcceleratorKind::Npu, AcceleratorKind::Cpu, always_available);
         assert_eq!(resolved, AcceleratorKind::Npu);
     }
 }
