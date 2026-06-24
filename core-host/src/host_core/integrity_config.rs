@@ -1630,7 +1630,7 @@ pub(crate) fn normalize_route_models(
             )
         })?;
         let path = model.path.trim();
-        if path.is_empty() {
+        if path.is_empty() && !model.dynamic {
             return Err(anyhow!(
                 "Integrity Validation Failed: route `{route_path}` model `{alias}` must include a non-empty `path`"
             ));
@@ -1643,8 +1643,8 @@ pub(crate) fn normalize_route_models(
                 path: path.to_owned(),
                 device: model.device,
                 qos: model.qos,
-                dynamic: false,
-                hardware_strategy: Default::default(),
+                dynamic: model.dynamic,
+                hardware_strategy: model.hardware_strategy,
             });
     }
 

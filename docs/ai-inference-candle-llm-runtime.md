@@ -69,5 +69,7 @@ with an actionable error. They do not fall back to `MOCK_LLM_RESPONSE`.
 ## NVFP4 Boundary
 
 ModelOpt/NVFP4 remains a separate loader and kernel capability. A detected
-NVFP4 directory is classified as non-mock and still returns the existing
-unsupported-execution error until a complete architecture runtime is wired.
+directory is never interpreted as Llama merely because it contains
+safetensors. The registered Qwen 3.5 MoE compatibility profile executes through
+its dedicated hybrid runtime; unmatched architectures return an explicit
+unsupported-architecture error.
