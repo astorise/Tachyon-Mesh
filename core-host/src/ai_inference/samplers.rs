@@ -71,14 +71,53 @@ pub(crate) enum FsmState {
 pub(crate) enum ValueState {
     /// Before the value's opening `"` has been consumed.
     StringOpen,
-    /// Inside the string body, after the opening `"`.
-    String,
-    Number {
-        has_digit: bool,
-    },
+    /// Inside the string body, after the opening `"`. `escaped` is `true`
+    /// immediately after an unconsumed `\`, so the following character is
+    /// treated as the escaped payload rather than a possible closing `"` or
+    /// a fresh `\`.
+    String { escaped: bool },
+    Number(NumberPhase),
     /// Matching a fixed literal (`true`/`false`) or one alternative of an
-    /// `enum`; `matched` counts bytes consumed so far.
-    Literal { text: String, matched: usize },
+    /// `enum`. `consumed` is the exact text matched so far; a candidate is
+    /// only eligible to continue matching if it starts with `consumed`, so a
+    /// later step can never "switch" to an alternative whose earlier prefix
+    /// was never actually emitted (e.g. matching `"a"` of `"ab"` and then
+    /// jumping to `"ca"` because both have `a` at the next offset).
+    Literal { consumed: String },
+}
+
+/// Sub-states of a JSON number's grammar (`-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`),
+/// tracked explicitly so malformed sequences like `1+`, `1..2`, or `1e}` are
+/// rejected rather than accepted by a single permissive `has_digit` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumberPhase {
+    /// Nothing consumed yet; `-` or a digit may follow.
+    Start,
+    /// Leading `-` consumed; a digit is required next.
+    Negative,
+    /// At least one integer digit consumed; complete, and `.`/`e`/`E`/more
+    /// digits may follow.
+    IntDigits,
+    /// `.` just consumed; a fraction digit is required next.
+    FracFirst,
+    /// At least one fraction digit consumed; complete, and `e`/`E`/more
+    /// digits may follow.
+    FracDigits,
+    /// `e`/`E` just consumed; a sign or digit is required next.
+    ExpFirst,
+    /// Exponent sign just consumed; a digit is required next.
+    ExpSign,
+    /// At least one exponent digit consumed; complete, more digits may follow.
+    ExpDigits,
+}
+
+impl NumberPhase {
+    fn is_complete(self) -> bool {
+        matches!(
+            self,
+            NumberPhase::IntDigits | NumberPhase::FracDigits | NumberPhase::ExpDigits
+        )
+    }
 }
 
 enum StepOutcome {
@@ -94,14 +133,9 @@ enum StepOutcome {
 fn start_value_state(node: &SchemaNode) -> ValueState {
     match node {
         SchemaNode::String => ValueState::StringOpen,
-        SchemaNode::Number => ValueState::Number { has_digit: false },
-        SchemaNode::Boolean => ValueState::Literal {
-            text: "true".to_owned(),
-            matched: 0,
-        },
-        SchemaNode::Enum(alternatives) => ValueState::Literal {
-            text: alternatives.first().cloned().unwrap_or_default(),
-            matched: 0,
+        SchemaNode::Number => ValueState::Number(NumberPhase::Start),
+        SchemaNode::Boolean | SchemaNode::Enum(_) => ValueState::Literal {
+            consumed: String::new(),
         },
     }
 }
@@ -122,57 +156,87 @@ fn step_value(state: &ValueState, node: &SchemaNode, ch: char) -> StepOutcome {
     match state {
         ValueState::StringOpen => {
             if ch == '"' {
-                StepOutcome::Consumed(ValueState::String)
+                StepOutcome::Consumed(ValueState::String { escaped: false })
             } else {
                 StepOutcome::Invalid
             }
         }
-        ValueState::String => {
+        ValueState::String { escaped: true } => {
+            // The previous character was an unconsumed `\`; this character is
+            // its escaped payload, not a candidate closing `"` or a fresh `\`.
+            if ch.is_control() {
+                StepOutcome::Invalid
+            } else {
+                StepOutcome::Consumed(ValueState::String { escaped: false })
+            }
+        }
+        ValueState::String { escaped: false } => {
             if ch == '"' {
                 StepOutcome::ConsumedComplete
-            } else if ch == '\\' || !ch.is_control() {
-                StepOutcome::Consumed(ValueState::String)
+            } else if ch == '\\' {
+                StepOutcome::Consumed(ValueState::String { escaped: true })
+            } else if !ch.is_control() {
+                StepOutcome::Consumed(ValueState::String { escaped: false })
             } else {
                 StepOutcome::Invalid
             }
         }
-        ValueState::Number { has_digit } => {
-            if ch.is_ascii_digit()
-                || ((ch == '-' || ch == '.' || ch == 'e' || ch == 'E' || ch == '+') && *has_digit)
-            {
-                StepOutcome::Consumed(ValueState::Number { has_digit: true })
-            } else if ch == '-' && !*has_digit {
-                StepOutcome::Consumed(ValueState::Number { has_digit: false })
-            } else if *has_digit {
-                StepOutcome::Terminate
-            } else {
-                StepOutcome::Invalid
-            }
-        }
-        ValueState::Literal { matched, .. } => {
-            // Try every alternative literal that still matches the bytes
-            // consumed so far, given the next character.
-            let mut candidates: Vec<String> = value_alternatives(node);
-            if candidates.is_empty() {
-                candidates.push(match node {
-                    SchemaNode::Boolean => "true".to_owned(),
-                    _ => String::new(),
-                });
-            }
-            for candidate in candidates {
-                let bytes: Vec<char> = candidate.chars().collect();
-                if *matched < bytes.len() && bytes[*matched] == ch {
-                    if matched + 1 == bytes.len() {
-                        return StepOutcome::ConsumedComplete;
-                    }
-                    return StepOutcome::Consumed(ValueState::Literal {
-                        text: candidate,
-                        matched: matched + 1,
-                    });
+        ValueState::Number(phase) => step_number(*phase, ch),
+        ValueState::Literal { consumed } => {
+            // Try every alternative literal that starts with the text
+            // already consumed (so a candidate can never be switched to once
+            // its earlier prefix diverges from what was actually emitted),
+            // given the next character.
+            let consumed_len = consumed.chars().count();
+            for candidate in value_alternatives(node) {
+                if !candidate.starts_with(consumed.as_str()) {
+                    continue;
                 }
+                let Some(next_ch) = candidate.chars().nth(consumed_len) else {
+                    continue;
+                };
+                if next_ch != ch {
+                    continue;
+                }
+                let candidate_len = candidate.chars().count();
+                if consumed_len + 1 == candidate_len {
+                    return StepOutcome::ConsumedComplete;
+                }
+                let mut next_consumed = consumed.clone();
+                next_consumed.push(ch);
+                return StepOutcome::Consumed(ValueState::Literal {
+                    consumed: next_consumed,
+                });
             }
             StepOutcome::Invalid
         }
+    }
+}
+
+/// Steps a JSON number grammar (`-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`) by one
+/// character. `Terminate` is returned once a complete phase (`IntDigits`,
+/// `FracDigits`, `ExpDigits`) sees a character that doesn't extend it, so the
+/// caller can reprocess that character against the surrounding grammar
+/// instead of treating the number as having accepted it.
+fn step_number(phase: NumberPhase, ch: char) -> StepOutcome {
+    use NumberPhase::*;
+    let digit = ch.is_ascii_digit();
+    match phase {
+        Start if ch == '-' => StepOutcome::Consumed(ValueState::Number(Negative)),
+        Start if digit => StepOutcome::Consumed(ValueState::Number(IntDigits)),
+        Negative if digit => StepOutcome::Consumed(ValueState::Number(IntDigits)),
+        IntDigits if digit => StepOutcome::Consumed(ValueState::Number(IntDigits)),
+        IntDigits if ch == '.' => StepOutcome::Consumed(ValueState::Number(FracFirst)),
+        IntDigits if ch == 'e' || ch == 'E' => StepOutcome::Consumed(ValueState::Number(ExpFirst)),
+        FracFirst if digit => StepOutcome::Consumed(ValueState::Number(FracDigits)),
+        FracDigits if digit => StepOutcome::Consumed(ValueState::Number(FracDigits)),
+        FracDigits if ch == 'e' || ch == 'E' => StepOutcome::Consumed(ValueState::Number(ExpFirst)),
+        ExpFirst if ch == '+' || ch == '-' => StepOutcome::Consumed(ValueState::Number(ExpSign)),
+        ExpFirst if digit => StepOutcome::Consumed(ValueState::Number(ExpDigits)),
+        ExpSign if digit => StepOutcome::Consumed(ValueState::Number(ExpDigits)),
+        ExpDigits if digit => StepOutcome::Consumed(ValueState::Number(ExpDigits)),
+        phase if phase.is_complete() => StepOutcome::Terminate,
+        _ => StepOutcome::Invalid,
     }
 }
 
@@ -193,7 +257,7 @@ impl CompiledFsm {
     pub(crate) fn is_complete(&self, state: &FsmState) -> bool {
         match state {
             FsmState::Done => true,
-            FsmState::ScalarValue(ValueState::Number { has_digit }) => *has_digit,
+            FsmState::ScalarValue(ValueState::Number(phase)) => phase.is_complete(),
             _ => false,
         }
     }
@@ -552,5 +616,47 @@ mod tests {
         assert!(!processor.is_complete());
         processor.commit("\"hi\"");
         assert!(processor.is_complete());
+    }
+
+    #[test]
+    fn enum_matching_cannot_switch_to_an_alternative_whose_prefix_diverged() {
+        // Regression test: "ab" and "ca" only share a character at offset 1,
+        // not a common prefix. A byte-offset-only matcher could accept "aa"
+        // by matching `a` from "ab" then `a` from "ca". The fix tracks the
+        // exact consumed prefix and rejects candidates that no longer match it.
+        let fsm = fsm_for(r#"{"type":"object","properties":{"v":{"enum":["ab","ca"]}}}"#);
+        assert!(run(&fsm, r#"{"v":"ab"}"#).is_some());
+        assert!(run(&fsm, r#"{"v":"ca"}"#).is_some());
+        assert!(run(&fsm, r#"{"v":"aa"}"#).is_none());
+        assert!(run(&fsm, r#"{"v":"cb"}"#).is_none());
+    }
+
+    #[test]
+    fn malformed_numbers_are_rejected() {
+        let fsm = fsm_for(r#"{"type":"number"}"#);
+        let complete = |text: &str| run(&fsm, text).is_some_and(|s| fsm.is_complete(&s));
+        assert!(complete("1.5e-3"));
+        assert!(complete("-0"));
+        assert!(run(&fsm, "1+").is_none());
+        assert!(run(&fsm, "1..2").is_none());
+        assert!(run(&fsm, "1e}").is_none());
+        // "1e" is a valid prefix (more exponent input may follow) but is not
+        // itself grammar-complete, so generation cannot stop here.
+        assert!(!complete("1e"));
+        // "-" alone is a valid prefix (a digit must follow) but not complete.
+        assert!(!complete("-"));
+        assert!(run(&fsm, ".5").is_none());
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_close_the_string_but_an_unescaped_one_does() {
+        let fsm = fsm_for(r#"{"type":"string"}"#);
+        // A literal backslash-quote inside the string body is an escape
+        // sequence, not the closing delimiter, so the string continues.
+        let mid_string = run(&fsm, r#""a\""#).expect("escaped quote stays inside the string");
+        assert!(!fsm.is_complete(&mid_string));
+        // The real closing quote completes the string.
+        let complete = run(&fsm, r#""a\"b""#).expect("closing quote completes the string");
+        assert!(fsm.is_complete(&complete));
     }
 }
