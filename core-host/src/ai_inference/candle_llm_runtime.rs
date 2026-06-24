@@ -20,6 +20,7 @@ use super::expert_parallel_llama::ExpertParallelLlama;
 use super::modelopt_nvfp4;
 use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
+use super::samplers::{FsmCache, FsmLogitProcessor};
 use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
 use parallel_topology::{
     validate_parallel_topology, ClusterTopology, ParallelExecutionPlan, ParallelStrategy,
@@ -268,6 +269,10 @@ pub(crate) struct CandleLlmRuntime {
     /// `None` when the checkpoint ships no template (the runtime then falls back
     /// to a generic chat rendering). Shared behind `Arc` so clones stay cheap.
     chat_template: Option<Arc<ChatTemplate>>,
+    /// Compiled JSON-Schema grammars for constrained decoding, keyed by the
+    /// schema's SHA-256 hash. Shared behind `Arc` so clones (and concurrent
+    /// requests) reuse the same cache instead of recompiling per-request.
+    fsm_cache: Arc<FsmCache>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,6 +320,11 @@ struct GenerationRequest {
     /// text, and the matched sequence (and anything after it) is trimmed.
     #[serde(default)]
     stop: Option<Vec<String>>,
+    /// Optional JSON Schema (source text) constraining generated output to a
+    /// grammar compiled from the schema. See `samplers::compile_schema` for
+    /// the supported subset.
+    #[serde(default)]
+    json_schema: Option<String>,
 }
 
 /// Token-selection policy resolved from a request's `temperature`/`top_p`/`seed`.
@@ -346,6 +356,9 @@ struct ParsedGenerationRequest {
     max_new_tokens: usize,
     sampling: SamplingPolicy,
     stop: Vec<String>,
+    /// Compiled grammar for constrained decoding, when the request supplied
+    /// `json_schema`.
+    fsm: Option<Arc<super::samplers::CompiledFsm>>,
 }
 
 impl CandleLlmRuntime {
@@ -442,6 +455,7 @@ impl CandleLlmRuntime {
             inner: Arc::new(inner),
             limits,
             chat_template,
+            fsm_cache: Arc::new(FsmCache::default()),
         }))
     }
 
@@ -653,6 +667,7 @@ impl CandleLlmRuntime {
             inner: Arc::new(inner),
             limits,
             chat_template,
+            fsm_cache: Arc::new(FsmCache::default()),
         })
     }
 
@@ -1188,6 +1203,11 @@ impl CandleLlmRuntime {
     ) -> Result<(), CandleLlmError> {
         let device = input_device;
         let mut processor = request.sampling.processor();
+        let mut fsm_processor = request
+            .fsm
+            .as_ref()
+            .map(|fsm| FsmLogitProcessor::new(Arc::clone(fsm)));
+        let vocab_size = self.tokenizer.get_vocab_size(true);
         let mut tokens = prompt_ids.to_vec();
         let mut generated = Vec::with_capacity(request.max_new_tokens);
         // Hold back this many trailing bytes so a stop sequence split across the
@@ -1221,10 +1241,23 @@ impl CandleLlmRuntime {
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
             })?;
+            let row = match &fsm_processor {
+                Some(fsm) => self.mask_row_for_fsm(&row, fsm, vocab_size, eos_tokens)?,
+                None => row,
+            };
             let next = processor.sample(&row).map_err(|error| {
                 self.execution_error(format!("failed to sample next token: {error}"))
             })?;
             index_pos += context.len();
+            if let Some(fsm) = fsm_processor.as_mut() {
+                if !eos_tokens.contains(&next) {
+                    let text = self
+                        .tokenizer
+                        .decode(&[next], false)
+                        .map_err(|error| self.execution_error(format!("failed to decode token: {error}")))?;
+                    fsm.commit(&text);
+                }
+            }
             tokens.push(next);
             generated.push(next);
 
@@ -1247,6 +1280,32 @@ impl CandleLlmRuntime {
         let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
         emit_delta(on_token, &text, &mut emitted, end);
         Ok(())
+    }
+
+    /// Mask every vocabulary logit the grammar would reject for the next
+    /// token to `-inf`, given `fsm`'s current state, leaving everything else
+    /// untouched. Returns a new tensor; `row` itself is not mutated.
+    fn mask_row_for_fsm(
+        &self,
+        row: &Tensor,
+        fsm: &FsmLogitProcessor,
+        vocab_size: usize,
+        eos_tokens: &[u32],
+    ) -> Result<Tensor, CandleLlmError> {
+        let allowed = fsm.allowed_token_ids(vocab_size, eos_tokens, |id| {
+            self.tokenizer.decode(&[id], false).unwrap_or_default()
+        });
+        let allowed: std::collections::HashSet<u32> = allowed.into_iter().collect();
+        let mut values = row
+            .to_vec1::<f32>()
+            .map_err(|error| self.execution_error(format!("failed to read logits: {error}")))?;
+        for (id, value) in values.iter_mut().enumerate() {
+            if !allowed.contains(&(id as u32)) {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+        Tensor::from_vec(values, row.shape(), row.device())
+            .map_err(|error| self.execution_error(format!("failed to build masked logits: {error}")))
     }
 
     /// Decode the full generated token sequence to UTF-8 text (special tokens
@@ -1416,6 +1475,15 @@ impl CandleLlmRuntime {
                     })
                 }
             };
+            let fsm = match request.json_schema {
+                Some(schema) => Some(self.fsm_cache.get_or_compile(&schema).map_err(|error| {
+                    CandleLlmError::InvalidRequest {
+                        alias: self.alias.clone(),
+                        detail: format!("invalid `json_schema`: {error}"),
+                    }
+                })?),
+                None => None,
+            };
             ParsedGenerationRequest {
                 prompt,
                 max_new_tokens: request
@@ -1423,6 +1491,7 @@ impl CandleLlmRuntime {
                     .unwrap_or(self.limits.default_max_new_tokens),
                 sampling: resolve_sampling(request.temperature, request.top_p, request.seed),
                 stop: sanitize_stop(request.stop),
+                fsm,
             }
         } else {
             ParsedGenerationRequest {
@@ -1430,6 +1499,7 @@ impl CandleLlmRuntime {
                 max_new_tokens: self.limits.default_max_new_tokens,
                 sampling: resolve_sampling(None, None, None),
                 stop: Vec::new(),
+                fsm: None,
             }
         };
 
@@ -2509,6 +2579,47 @@ mod tests {
         (runtime, dir)
     }
 
+    /// Same fixture as [`load_fixture`], but with a custom 4-token vocabulary
+    /// whose token id 1 decodes to the exact JSON text `tachyon`. Used to
+    /// exercise constrained decoding without needing a real tokenizer that
+    /// can spell out JSON punctuation one character at a time.
+    fn load_fixture_with_vocab(tag: &str, vocab: &str) -> (CandleLlmRuntime, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-llama-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
+        fs::write(
+            dir.join(TOKENIZER_JSON),
+            format!(
+                r#"{{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {{"type": "Whitespace"}},
+  "post_processor": null,
+  "decoder": null,
+  "model": {{
+    "type": "WordLevel",
+    "vocab": {vocab},
+    "unk_token": "<unk>"
+  }}
+}}"#
+            ),
+        )
+        .expect("custom tokenizer should write");
+        let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
+            .expect("fixture should load without error")
+            .expect("fixture is a supported Llama model");
+        (runtime, dir)
+    }
+
     #[test]
     fn generate_runs_a_real_llama_forward_and_is_not_a_mock() {
         let (runtime, dir) = load_fixture("real-forward");
@@ -2521,6 +2632,50 @@ mod tests {
             "a real forward pass must emit at least one decoded token"
         );
         assert_ne!(text, "MOCK_LLM_RESPONSE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn json_schema_constrained_generation_only_ever_emits_grammar_valid_text() {
+        // Token id 2 decodes to the exact, grammar-complete JSON text
+        // `{"ok":true}`; ids 0/1/3 decode to grammar-violating text. With the
+        // schema's FSM masking every non-matching id to `-inf`, sampling must
+        // pick id 2 regardless of the (untrained, deterministic-fill) model's
+        // raw logits.
+        let (runtime, dir) = load_fixture_with_vocab(
+            "constrained",
+            r#"{"<unk>": 0, "x": 1, "{\"ok\":true}": 2, "mesh": 3}"#,
+        );
+        let request = serde_json::json!({
+            "prompt": "hello",
+            "max_new_tokens": 1,
+            "json_schema": r#"{"type":"object","properties":{"ok":{"type":"boolean"}}}"#,
+        })
+        .to_string();
+        let bytes = runtime
+            .generate(&[request.as_bytes()])
+            .expect("constrained generation should run");
+        let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
+        assert_eq!(text, r#"{"ok":true}"#);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("output must be valid JSON");
+        assert_eq!(parsed["ok"], serde_json::Value::Bool(true));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_json_schema_is_rejected_before_generation() {
+        let (runtime, dir) = load_fixture("invalid-schema");
+        let request = serde_json::json!({
+            "prompt": "hello",
+            "json_schema": "{not valid json",
+        })
+        .to_string();
+        let error = runtime
+            .generate(&[request.as_bytes()])
+            .expect_err("malformed schema must be rejected");
+        assert!(matches!(error, CandleLlmError::InvalidRequest { .. }));
         let _ = fs::remove_dir_all(dir);
     }
 

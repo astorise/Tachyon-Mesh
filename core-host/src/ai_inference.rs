@@ -10,6 +10,8 @@ mod modelopt_nvfp4;
 pub(crate) mod parallel;
 #[path = "ai_inference/pipeline_parallel_llama.rs"]
 pub(crate) mod pipeline_parallel_llama;
+#[path = "ai_inference/samplers.rs"]
+mod samplers;
 #[path = "ai_inference/tensor_parallel_llama.rs"]
 pub(crate) mod tensor_parallel_llama;
 #[path = "ai_inference/vram_manager.rs"]

@@ -213,6 +213,17 @@ jobs:
       - name: Check ai-inference host build
         run: cargo check -p core-host --features ai-inference
 
+      - name: Verify constrained decoding is implemented, not just specified
+        # openspec/specs/core-host/spec.md requires native constrained decoding
+        # behind ai-inference. The previous attempt at this (archived change
+        # 2026-05-16-ai-constrained-decoding) merged the spec text with 0 lines
+        # of matching code. Guard against that drift recurring: the FSM/logit
+        # masking engine must exist in core-host/src, and the WIT contract must
+        # expose `sample-constrained`.
+        run: |
+          grep -rq "FsmLogitProcessor" core-host/src
+          grep -q "sample-constrained" wit/ai/inference.wit
+
       - name: Test real Candle LLM fixture
         run: cargo test -p core-host --features ai-inference --bin core-host real_candle_llm_runtime
 

@@ -82,6 +82,13 @@ interface layer-execution {
 
     /// Safely cleans up the tensor representation on the host side.
     drop-tensor: func(handle: tensor-handle);
+
+    /// Samples a single token from `logits`, masking out any token whose
+    /// emission would violate `json-schema` (when present) given the FSM
+    /// state accumulated from prior calls in the same generation. Returns
+    /// the sampled vocabulary id. When `json-schema` is `none`, sampling is
+    /// unconstrained (existing behaviour).
+    sample-constrained: func(logits: tensor-handle, json-schema: option<string>) -> result<u32, string>;
 }
 
 /// Declarative multi-GPU/multi-node execution planning for a single model

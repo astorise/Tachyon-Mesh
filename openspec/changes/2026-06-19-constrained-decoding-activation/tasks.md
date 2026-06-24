@@ -1,24 +1,32 @@
 # Implementation Tasks
 
-- [ ] **Task 1: WIT contract (actually implement, not just spec)**
-  - Add `sample-constrained` to `wit/ai/inference.wit`'s `layer-execution` interface as already documented in `openspec/specs/core-host/spec.md`.
-  - Regenerate host bindings.
+- [x] **Task 1: WIT contract (actually implement, not just spec)**
+  - Added `sample-constrained: func(logits: tensor-handle, json-schema: option<string>) -> result<u32, string>` to `wit/ai/inference.wit`'s `layer-execution` interface.
+  - "Regenerate host bindings" does not apply: this WIT file's interfaces are not wired into any `wasmtime::component::bindgen!` call in `core-host/src/main.rs` (verified by inspection during this change) — it is a documentation/contract-parity artifact, not bindgen-generated code, consistent with the rest of `layer-execution`.
 
-- [ ] **Task 2: Conditional dependencies**
-  - Add `llm-samplers` and `lru` to `core-host/Cargo.toml` as optional dependencies linked to the `ai-inference` feature.
+- [x] **Task 2: Conditional dependencies** — done differently than literally specified, see note
+  - `llm-samplers` was deliberately **not** added. It is a generic sampling-algorithm crate (top-k/top-p/etc.), not a JSON-Schema/grammar compiler, and the project's existing `candle_transformers::generation::LogitsProcessor`/`Sampling` (already a dependency) already covers the actual token-sampling step this change needs.
+  - `lru` was already declared as an optional dependency gated into the `ai-inference` feature list in `core-host/Cargo.toml` (added by an earlier, unrelated change) — no Cargo.toml edit was needed for it.
+  - `sha2` (for the cache key) was already a required top-level dependency. `serde_json` and `tokenizers` (for schema parsing and token-text decoding) were already available under `ai-inference`.
+  - Net result: zero `Cargo.toml` changes for this task; everything needed was already present.
 
-- [ ] **Task 3: FSM compilation and caching**
-  - Create `core-host/src/ai_inference/samplers.rs` (guarded by `#[cfg(feature = "ai-inference")]`).
-  - Implement the thread-safe SHA-256-keyed LRU cache for compiled FSM graphs.
+- [x] **Task 3: FSM compilation and caching**
+  - Created `core-host/src/ai_inference/samplers.rs` (compiled only under `#[cfg(feature = "ai-inference")]` via the module's `#[path = ...]` declaration in `ai_inference.rs`, which is itself feature-gated).
+  - Implemented `FsmCache`: a `Mutex<LruCache<[u8; 32], Arc<CompiledFsm>>>` keyed by SHA-256 of the schema string, via `get_or_compile`.
+  - Scope of `compile_schema`, narrower than "any JSON Schema": supports flat top-level `object` schemas with scalar/string-enum properties (`string`, `number`/`integer`, `boolean`, string-only `enum`), or a top-level scalar schema. No nesting, arrays, `$ref`, `oneOf`/`anyOf`, or non-string enum literals — these are rejected at compile time with a typed `SchemaCompileError::Unsupported`, not silently mishandled. Compact-JSON-only output. Object property emission order is **alphabetical**, not declaration order, because `serde_json::Map` is backed by a `BTreeMap` in this project (the `preserve_order` Cargo feature is not enabled) — documented in the module doc comment and enforced by a dedicated test.
 
-- [ ] **Task 4: Logit masking integration**
-  - Implement `FsmLogitProcessor`: mask disallowed logits to `-inf` based on FSM state, sample, advance FSM state.
-  - Wire it into the existing generation loop (buffered and streaming paths from `ai-inference`'s "runtime streams decoded fragments incrementally" requirement) so constrained sampling works for both.
+- [x] **Task 4: Logit masking integration**
+  - Implemented `FsmLogitProcessor` (`samplers.rs`): `allowed_token_ids` scans the full vocabulary and decodes+checks each id against the FSM's current state (documented in code as a known performance cost / follow-up optimization — not a precomputed token-trie in this first pass); `commit` advances FSM state after a token is actually emitted.
+  - Wired into `CandleLlmRuntime::decode_loop` (`candle_llm_runtime.rs`) — the single shared autoregressive decode driver used by all topologies (dense safetensors, GGUF, tensor/pipeline/expert-parallel), so constrained sampling works uniformly across all of them without topology-specific code. Per-step logits are masked via a new `mask_row_for_fsm` helper before `LogitsProcessor::sample`, and the FSM state is advanced via `commit` after each sampled token is decoded.
+  - `GenerationRequest` gained an optional `json_schema: Option<String>` field; `parse_request` compiles/looks up the FSM via `CandleLlmRuntime`'s new `fsm_cache: Arc<FsmCache>` field, surfacing `SchemaCompileError` as a typed `CandleLlmError::InvalidRequest`.
+  - The streaming path was not separately wired: it already calls the same `decode_loop`, so it inherits constrained sampling for free — no separate code path exists to duplicate this in.
 
-- [ ] **Task 5: CI drift guard**
-  - Add the build+grep verification step from `design.md` so a future archive of a spec delta without matching code fails CI.
+- [x] **Task 5: CI drift guard** — implemented with a corrected check, not the literal grep from `design.md`
+  - `design.md`'s proposed check (`grep -q "sample_constrained\|sample-constrained" core-host/src -r`) does not match what was actually built: there is no Rust symbol literally named `sample_constrained` in `core-host/src` — `sample-constrained` only exists as the WIT function name in `wit/ai/inference.wit`. Grepping for it in `core-host/src` would never have caught the original gap (spec merged, code absent) either, since the spec text itself doesn't live in `core-host/src`.
+  - Added a corrected step to `.github/workflows/ci.yml` (after "Check ai-inference host build"): asserts `FsmLogitProcessor` exists in `core-host/src` (the real masking engine) **and** `sample-constrained` exists in `wit/ai/inference.wit` (the real contract surface) — matching the two places this capability actually lives.
 
-- [ ] **Task 6: Tests**
-  - Unit test: a JSON-Schema-constrained generation never produces a token violating the schema's FSM.
-  - Unit test: repeated requests with the same schema hit the LRU cache (no recompilation).
-  - Regression test: default build (`ai-inference` off) does not link `llm-samplers`/`lru`.
+- [x] **Task 6: Tests**
+  - Unit tests in `samplers.rs` (7): exact-shape acceptance + alphabetical-order enforcement + extra-key rejection + whitespace rejection for a flat object schema; string-enum restriction; scalar number schema; compile-time rejection of nested objects; LRU cache reuse (`Arc::ptr_eq`); logit-processor allow-list correctness against a synthetic vocabulary; logit-processor `commit` advancing to completion.
+  - Integration tests in `candle_llm_runtime.rs` (2): `json_schema_constrained_generation_only_ever_emits_grammar_valid_text` (a fixture whose vocab includes the literal token text `{"ok":true}` deterministically generates exactly that text under the matching schema, and the result parses as valid JSON); `invalid_json_schema_is_rejected_before_generation` (a malformed `json_schema` causes `generate()` to return `CandleLlmError::InvalidRequest` before any generation is attempted).
+  - "Regression test: default build (`ai-inference` off) does not link `llm-samplers`/`lru`" does not apply as literally written since `llm-samplers` was never added (Task 2) and `lru` was already gated behind `ai-inference` by a prior change, predating this one — the existing default-feature build (which excludes `ai-inference`) already excludes `lru`'s code paths, unchanged by this work.
+  - Full regression: `cargo test -p core-host --features ai-inference ai_inference::` — 114/114 passed, 0 regressions. `cargo clippy -p core-host --features ai-inference --all-targets -- -D warnings -D clippy::unwrap_used` — clean.
