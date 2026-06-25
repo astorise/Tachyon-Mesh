@@ -50,18 +50,20 @@ The runtime SHALL provide deterministic fallback dequantization from packed NVFP
 - **AND** no partial dense tensor is returned
 
 ### Requirement: Native FP4 acceleration MUST be capability-gated
-The runtime SHALL only select native NVFP4 dequant/matmul kernels when the accelerator backend reports compatible hardware, driver/runtime support, and kernel availability.
 
-#### Scenario: Compatible backend selects native FP4
-- **WHEN** the selected accelerator reports native FP4 capability
-- **AND** required NVFP4 kernels are compiled and available
-- **THEN** the runtime may execute packed FP4 weights without eager BF16/F32 dequantization
+The runtime SHALL execute packed NVFP4 weights through native kernels only when compatible hardware, drivers, and compiled kernels are available; otherwise it SHALL use the bounded fallback or reject execution.
 
-#### Scenario: Unsupported accelerator falls back or rejects
-- **WHEN** the selected accelerator lacks native NVFP4 support
-- **AND** fallback dequantization is allowed within configured memory limits
-- **THEN** the runtime uses the BF16/F32 fallback path
-- **AND** if fallback exceeds configured limits, startup or inference fails with an unsupported-accelerator error
+#### Scenario: Native kernels are available
+
+- **WHEN** a compatible CUDA backend and native NVFP4 kernels are available
+- **THEN** inference executes without eager full-model dense dequantization
+- **AND** output is validated against the fallback reference
+
+#### Scenario: Native kernels are unavailable
+
+- **WHEN** native execution is unavailable
+- **THEN** the runtime uses the bounded fallback only when configured memory limits permit it
+- **AND** otherwise returns a typed unsupported-execution error
 
 ### Requirement: CUDA/CUTLASS NVFP4 backend MUST be feature-gated
 The runtime SHALL expose a concrete CUDA/CUTLASS native backend only when the `nvfp4-cuda` feature is enabled and the build has CUDA/CUTLASS inputs.
@@ -134,4 +136,13 @@ requirements.
 
 - **WHEN** the accelerator reports all required native capabilities
 - **THEN** packed FP8/NVFP4 weights execute without full eager dense conversion
+
+### Requirement: NVFP4 execution path MUST be observable
+
+The runtime SHALL record whether each NVFP4 request used native FP4, dense GPU fallback, CPU fallback, or failed before execution.
+
+#### Scenario: Operator inspects an NVFP4 request
+
+- **WHEN** an operator reads inference telemetry
+- **THEN** the actual execution path is present without requiring source inspection
 

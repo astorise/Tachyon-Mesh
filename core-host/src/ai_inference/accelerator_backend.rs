@@ -5,14 +5,9 @@
 //! `AiInferenceRuntime::supports_accelerator`/`AcceleratorKind::ALL`, used to
 //! size per-class request queues and unchanged by this module).
 //!
-//! Today there is no NPU runtime (e.g. OpenVINO) or TPU runtime (e.g.
-//! `libedgetpu`/Coral Edge TPU) wired into this host at all — `Npu`/`Tpu`
-//! always report `Unavailable { reason: NO_BACKEND_WIRED }`. Wiring a real
-//! vendor SDK backend for either class, and the physical hardware validation
-//! that would accompany it (a Coral USB TPU, an NPU-equipped machine), is out
-//! of scope for this change: it requires vendor SDK dependencies and physical
-//! test hardware that are not available in this environment. See
-//! `openspec/changes/2026-06-19-npu-tpu-real-device-execution`.
+//! NPU and TPU availability is delegated to optional OpenVINO and Edge TPU
+//! runners. A runner is available only after its probe confirms the expected
+//! physical device; otherwise dispatch can explicitly fall back to CPU.
 //!
 //! `Gpu` is probed for real via `parallel::discover_cluster_topology`, which
 //! enumerates real CUDA ordinals on `candle-cuda` builds (and reports only
@@ -23,7 +18,6 @@ use super::AcceleratorKind;
 
 /// Why an accelerator class is unavailable. Stable, machine-checkable reason
 /// strings (not free text) so callers can branch on the cause.
-pub(crate) const NO_BACKEND_WIRED: &str = "no_backend_wired";
 pub(crate) const DEVICE_NOT_DETECTED: &str = "device_not_detected";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,8 +40,8 @@ impl AcceleratorAvailability {
 
 /// Probes whether `backend` has a real, initialized execution path on this
 /// host. `Cpu` is always available (the host itself). `Gpu` reflects real
-/// CUDA device enumeration. `Npu`/`Tpu` are always `Unavailable`: no vendor
-/// SDK backend exists yet (see module docs).
+/// CUDA device enumeration. `Npu`/`Tpu` reflect the corresponding optional
+/// vendor runner probe.
 pub(crate) fn probe(backend: AcceleratorKind) -> AcceleratorAvailability {
     let status = match backend {
         AcceleratorKind::Cpu => AvailabilityStatus::Available,
@@ -60,9 +54,15 @@ pub(crate) fn probe(backend: AcceleratorKind) -> AcceleratorAvailability {
                 }
             }
         }
-        AcceleratorKind::Npu | AcceleratorKind::Tpu => AvailabilityStatus::Unavailable {
-            reason: NO_BACKEND_WIRED,
-        },
+        AcceleratorKind::Npu | AcceleratorKind::Tpu => {
+            if super::vendor_accelerator::is_available(backend) {
+                AvailabilityStatus::Available
+            } else {
+                AvailabilityStatus::Unavailable {
+                    reason: DEVICE_NOT_DETECTED,
+                }
+            }
+        }
     };
     AcceleratorAvailability { backend, status }
 }
@@ -97,14 +97,14 @@ mod tests {
     }
 
     #[test]
-    fn npu_and_tpu_report_unavailable_with_no_backend_wired() {
+    fn npu_and_tpu_report_unavailable_without_initialized_vendor_runner() {
         for kind in [AcceleratorKind::Npu, AcceleratorKind::Tpu] {
             let availability = probe(kind);
             assert_eq!(availability.backend, kind);
             assert_eq!(
                 availability.status,
                 AvailabilityStatus::Unavailable {
-                    reason: NO_BACKEND_WIRED
+                    reason: DEVICE_NOT_DETECTED
                 }
             );
             assert!(!availability.is_available());

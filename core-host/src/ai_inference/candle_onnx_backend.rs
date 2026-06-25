@@ -113,7 +113,27 @@ impl BackendExecutionContext for CandleOnnxContext {
             }
         }
         self.outputs = candle_onnx::simple_eval(&self.model, self.inputs.clone(), &self.device)
-            .map_err(|e| BackendError::BackendAccess(wasmtime::Error::msg(e.to_string())))?;
+            .map_err(|e| {
+                super::record_execution(
+                    "wasi-nn-onnx",
+                    if self.device.is_cuda() {
+                        "gpu_onnx"
+                    } else {
+                        "cpu"
+                    },
+                    false,
+                );
+                BackendError::BackendAccess(wasmtime::Error::msg(e.to_string()))
+            })?;
+        super::record_execution(
+            "wasi-nn-onnx",
+            if self.device.is_cuda() {
+                "gpu_onnx"
+            } else {
+                "cpu"
+            },
+            true,
+        );
         Ok(None)
     }
 }

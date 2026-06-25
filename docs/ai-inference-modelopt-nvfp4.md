@@ -28,6 +28,12 @@ fallback memory limits.
 
 Fallback can be estimated for eager full-model dequantization or for a layer window. If estimated host RAM or accelerator memory exceeds configured limits, the runtime rejects fallback instead of silently loading an unsafe dense tensor set.
 
+Production limits are configured in bytes:
+
+- `TACHYON_NVFP4_MAX_HOST_RAM_BYTES`
+- `TACHYON_NVFP4_MAX_ACCELERATOR_BYTES`
+- `TACHYON_NVFP4_NATIVE_REQUIRED=1` to reject fallback
+
 ## Native Kernel Requirements
 
 Native NVFP4 execution is capability-gated. A backend must report:
@@ -59,6 +65,12 @@ cargo test -p core-host --features "ai-inference nvfp4-cuda" modelopt_nvfp4
 ```
 
 The native source provides CUDA entrypoints for NVFP4 dequantization and an initial linear matmul kernel that consumes ModelOpt packed FP4 weights and FP8 E4M3 scales. CUTLASS headers are required to compile the native kernels so future block-scaled Tensor Core kernels can use the same ABI boundary.
+
+The Qwen runtime selects the native packed path once per loaded model. Each
+request records `executed_on` as one of `gpu_native_fp4`, `gpu_fallback`, or
+`cpu_fallback`. WASI-NN ONNX execution records `gpu_onnx` or `cpu`. The bounded
+in-process telemetry log is available through
+`ai_inference::inference_execution_telemetry()` for admin/metrics consumers.
 
 ## Architecture Runtime
 

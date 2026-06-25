@@ -20,6 +20,8 @@ mod qwen35_moe_runtime;
 mod samplers;
 #[path = "ai_inference/tensor_parallel_llama.rs"]
 pub(crate) mod tensor_parallel_llama;
+#[path = "ai_inference/vendor_accelerator.rs"]
+mod vendor_accelerator;
 #[path = "ai_inference/vram_manager.rs"]
 pub(crate) mod vram_manager;
 
@@ -28,8 +30,6 @@ use candle_core::{
     bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
     Tensor as CandleTensor,
 };
-#[cfg(test)]
-use std::sync::Mutex;
 use std::{
     any::Any,
     cmp::Ordering as CmpOrdering,
@@ -38,7 +38,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, RwLock,
+        mpsc, Arc, Mutex, OnceLock, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -61,6 +61,36 @@ const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(25);
 const ACCELERATOR_QUEUE_CAPACITY: usize = 256;
 const ACCELERATOR_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InferenceExecutionTelemetry {
+    pub(crate) alias: String,
+    pub(crate) executed_on: String,
+    pub(crate) succeeded: bool,
+}
+
+static INFERENCE_TELEMETRY: OnceLock<Mutex<Vec<InferenceExecutionTelemetry>>> = OnceLock::new();
+
+fn record_execution(alias: impl Into<String>, executed_on: impl Into<String>, succeeded: bool) {
+    let records = INFERENCE_TELEMETRY.get_or_init(|| Mutex::new(Vec::new()));
+    let mut records = records.lock().expect("inference telemetry lock poisoned");
+    records.push(InferenceExecutionTelemetry {
+        alias: alias.into(),
+        executed_on: executed_on.into(),
+        succeeded,
+    });
+    if records.len() > 1024 {
+        records.remove(0);
+    }
+}
+
+pub(crate) fn inference_execution_telemetry() -> Vec<InferenceExecutionTelemetry> {
+    INFERENCE_TELEMETRY
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("inference telemetry lock poisoned")
+        .clone()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum AcceleratorKind {
@@ -456,39 +486,29 @@ impl AiInferenceRuntime {
                 accelerator.as_str()
             ));
         }
-        // `supports_accelerator` only answers "is this a valid scheduling
-        // lane" (true for every `AcceleratorKind`, including `Npu`/`Tpu`, by
-        // design — see its doc comment). Whether a class can actually
-        // execute real work is a separate, execution-backed question. This
-        // change scopes the answer to `Npu`/`Tpu` only (GPU/CPU dispatch via
-        // candle is unchanged and out of scope — see this change's
-        // proposal): no NPU/TPU vendor SDK backend is wired into this host
-        // yet, so guests dispatching through the `npu`/`tpu` WIT interfaces
-        // must see an honest "unavailable" here rather than a label that
-        // silently routes to nothing. See `accelerator_backend` and
-        // `openspec/changes/2026-06-19-npu-tpu-real-device-execution`.
-        if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
-            let availability = accelerator_backend::probe(accelerator);
-            if let accelerator_backend::AvailabilityStatus::Unavailable { reason } =
-                availability.status
-            {
-                return Err(format!(
-                    "{} accelerator is unavailable on this host: {reason}",
-                    accelerator.as_str()
-                ));
-            }
-        }
-
+        // NPU/TPU requests may fall back to the CPU lane when their optional
+        // vendor runner is unavailable. CPU/GPU requests keep strict device
+        // matching semantics.
         self.ensure_model_loaded(alias)?;
         let models = self.models.read().expect("model registry lock poisoned");
         let model = models
             .get(alias)
             .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
-        if model.accelerator != accelerator {
+        let resolved = if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
+            accelerator_backend::resolve_with_fallback(
+                accelerator,
+                AcceleratorKind::Cpu,
+                accelerator_backend::probe,
+            )
+        } else {
+            accelerator
+        };
+        if model.accelerator != resolved {
             return Err(format!(
-                "model alias `{alias}` requires `{}` but `{}` was requested",
+                "model alias `{alias}` requires `{}` but `{}` resolved to `{}`",
                 model.accelerator.as_str(),
-                accelerator.as_str()
+                accelerator.as_str(),
+                resolved.as_str()
             ));
         }
         Ok(())
@@ -949,6 +969,7 @@ enum CandleBackendModelKind {
     /// documented follow-up.
     ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
     Qwen35Moe(Box<qwen35_moe_runtime::Qwen35MoeRuntime>),
+    Vendor(vendor_accelerator::VendorAcceleratorRuntime),
 }
 
 impl CandleBackendModel {
@@ -981,6 +1002,20 @@ impl CandleBackendModel {
         }
         let kind = if is_explicit_mock_binding(binding) {
             CandleBackendModelKind::Mock
+        } else if matches!(
+            binding.device,
+            crate::ModelDevice::Npu | crate::ModelDevice::Tpu
+        ) {
+            let accelerator = AcceleratorKind::from_model_device(&binding.device);
+            CandleBackendModelKind::Vendor(
+                vendor_accelerator::VendorAcceleratorRuntime::try_load(accelerator, &binding.path)?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "{} vendor backend is unavailable; configure its SDK runner",
+                            accelerator.as_str()
+                        )
+                    })?,
+            )
         } else {
             match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(
                 &binding.alias,
@@ -1011,9 +1046,25 @@ impl CandleBackendModel {
                                 architecture.kind
                             ));
                         }
-                        None => CandleBackendModelKind::ModelOptNvfp4(Box::new(
-                            candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4(&model)?,
-                        )),
+                        None => {
+                            model.ensure_fallback_memory_within_limits(
+                                modelopt_nvfp4::Nvfp4OutputDType::F32,
+                                modelopt_nvfp4::Nvfp4FallbackScope::Eager,
+                                modelopt_nvfp4::Nvfp4FallbackMemoryLimits {
+                                    max_host_ram_bytes: env_u64(
+                                        "TACHYON_NVFP4_MAX_HOST_RAM_BYTES",
+                                    ),
+                                    max_accelerator_bytes: env_u64(
+                                        "TACHYON_NVFP4_MAX_ACCELERATOR_BYTES",
+                                    ),
+                                },
+                            )?;
+                            CandleBackendModelKind::ModelOptNvfp4(Box::new(
+                                candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4(
+                                    &model,
+                                )?,
+                            ))
+                        }
                     }
                 }
                 None => match candle_llm_runtime::CandleLlmRuntime::try_load(
@@ -1047,6 +1098,12 @@ impl CandleBackendModel {
     }
 }
 
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
 impl BackendModel for CandleBackendModel {
     fn residency(&self) -> AcceleratorMemoryResidency {
         match self.source.accelerator {
@@ -1077,13 +1134,15 @@ impl BackendModel for CandleBackendModel {
                     .iter()
                     .map(|input| input.data.as_ref())
                     .collect::<Vec<_>>();
-                return runtime.generate(&prompts).map_err(|error| {
+                let result = runtime.generate(&prompts).map_err(|error| {
                     anyhow!(
                         "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
                         self.source.alias,
                         runtime.root().display()
                     )
                 });
+                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
+                return result;
             }
             CandleBackendModelKind::ModelOptNvfp4(runtime)
             | CandleBackendModelKind::TextGeneration(runtime) => {
@@ -1100,13 +1159,35 @@ impl BackendModel for CandleBackendModel {
                     .iter()
                     .map(|input| input.data.as_ref())
                     .collect::<Vec<_>>();
-                return runtime.generate(&prompts).map_err(|error| {
+                let result = runtime.generate(&prompts).map_err(|error| {
                     anyhow!(
                         "Candle LLM model `{}` loaded from `{}` failed: {error}",
                         self.source.alias,
                         runtime.root().display()
                     )
                 });
+                let executed_on = match (&self.kind, self.source.accelerator) {
+                    (CandleBackendModelKind::ModelOptNvfp4(_), AcceleratorKind::Gpu) => {
+                        "gpu_fallback"
+                    }
+                    (CandleBackendModelKind::ModelOptNvfp4(_), _) => "cpu_fallback",
+                    (_, AcceleratorKind::Gpu) => "gpu",
+                    _ => "cpu",
+                };
+                record_execution(&self.source.alias, executed_on, result.is_ok());
+                return result;
+            }
+            CandleBackendModelKind::Vendor(runtime) => {
+                let input = inputs
+                    .first()
+                    .ok_or_else(|| anyhow!("vendor backend requires one input tensor"))?;
+                let result = runtime.execute(input.data.as_ref());
+                record_execution(
+                    &self.source.alias,
+                    self.source.accelerator.as_str(),
+                    result.is_ok(),
+                );
+                return result;
             }
             CandleBackendModelKind::Mock => {}
         }
@@ -1129,6 +1210,7 @@ impl BackendModel for CandleBackendModel {
             CandleTensor::zeros((batch_size, longest_prompt), DType::F32, &Device::Cpu)
                 .context("failed to prepare candle mock batch")?;
         let _resident_weights = self.source.model_size_bytes;
+        record_execution(&self.source.alias, self.source.accelerator.as_str(), true);
         Ok(b"MOCK_LLM_RESPONSE".to_vec())
     }
 
@@ -1172,12 +1254,25 @@ impl BackendModel for CandleBackendModel {
                     })
             }
             CandleBackendModelKind::Mock => {
-                let output = self.execute(inputs)?;
+                let output = self.execute(inputs);
+                record_execution(
+                    &self.source.alias,
+                    self.source.accelerator.as_str(),
+                    output.is_ok(),
+                );
+                let output = output?;
                 let text = String::from_utf8(output)
                     .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
                 if !text.is_empty() {
                     on_token(&text);
                 }
+                Ok(())
+            }
+            CandleBackendModelKind::Vendor(_) => {
+                let output = self.execute(inputs)?;
+                let text = String::from_utf8(output)
+                    .map_err(|error| anyhow!("vendor output was not UTF-8: {error}"))?;
+                on_token(&text);
                 Ok(())
             }
         }
@@ -2498,7 +2593,7 @@ mod tests {
             .is_err());
         assert!(runtime
             .load_component_model("tiny", AcceleratorKind::Tpu)
-            .is_err());
+            .is_ok());
         assert_eq!(
             runtime
                 .compute_component_prompt("llama3", "hello")
@@ -2508,12 +2603,11 @@ mod tests {
     }
 
     #[test]
-    fn load_component_model_honestly_rejects_npu_and_tpu_as_unavailable() {
+    fn load_component_model_honestly_resolves_npu_and_tpu_fallbacks() {
         // `supports_accelerator` reports `Npu`/`Tpu` as a valid scheduling
-        // lane (it is, for QoS/batching purposes), but no real NPU/TPU
-        // backend is wired into this host, so the guest-facing
-        // `load_component_model` dispatch boundary must say so explicitly
-        // rather than let a label that cannot execute appear to succeed.
+        // lane (it is, for QoS/batching purposes), but without an initialized
+        // vendor runner the request resolves to CPU. A model pinned to the
+        // unavailable vendor device must not silently execute elsewhere.
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![
             IntegrityModelBinding {
@@ -2542,18 +2636,12 @@ mod tests {
         let npu_error = runtime
             .load_component_model("npu-whisper", AcceleratorKind::Npu)
             .expect_err("npu dispatch should be rejected: no backend is wired");
-        assert!(
-            npu_error.contains("no_backend_wired"),
-            "expected a no_backend_wired reason, got: {npu_error}"
-        );
+        assert!(npu_error.contains("resolved to `cpu`"), "{npu_error}");
 
         let tpu_error = runtime
             .load_component_model("tpu-embed", AcceleratorKind::Tpu)
             .expect_err("tpu dispatch should be rejected: no backend is wired");
-        assert!(
-            tpu_error.contains("no_backend_wired"),
-            "expected a no_backend_wired reason, got: {tpu_error}"
-        );
+        assert!(tpu_error.contains("resolved to `cpu`"), "{tpu_error}");
 
         // The pre-existing internal mock-compute path (bypassing the
         // guest-facing dispatch boundary above) is unaffected: it exercises
@@ -2918,5 +3006,18 @@ mod tests {
     #[test]
     fn memory_profile_default_is_performance() {
         assert_eq!(MemoryProfile::default(), MemoryProfile::Performance);
+    }
+
+    #[test]
+    fn per_request_execution_telemetry_records_selected_target() {
+        let runtime = AiInferenceRuntime::from_config(&config_with_model("telemetry-model"))
+            .expect("runtime");
+        runtime
+            .compute_component_prompt("telemetry-model", "hello")
+            .expect("compute");
+        let records = inference_execution_telemetry();
+        assert!(records.iter().any(|record| {
+            record.alias == "telemetry-model" && record.executed_on == "cpu" && record.succeeded
+        }));
     }
 }
