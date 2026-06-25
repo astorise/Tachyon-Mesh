@@ -1,7 +1,0 @@
-- [x] Integrate the OpenVINO SDK and initialize a real NPU device.
-- [x] Integrate `libedgetpu` and initialize a Coral USB TPU.
-- [x] Wire fallback selection through the live WIT-facing load and compute path.
-- [x] Add SDK-optional unit and integration tests.
-- [ ] Run and record CPU+GPU+NPU hardware validation.
-- [ ] Run and record Coral USB TPU validation.
-- [x] Document supported vendors, formats, op sets, and fallback behavior.
