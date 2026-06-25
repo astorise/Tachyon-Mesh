@@ -8,8 +8,16 @@ use std::{
 use candle_core::{quantized::gguf_file, safetensors::MmapedSafetensors, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::models::deepseek2::{
+    DeepSeekV2 as DeepSeekModel, DeepSeekV2Config as DeepSeekConfig,
+};
+use candle_transformers::models::gemma2::{Config as Gemma2Config, Model as Gemma2Model};
+use candle_transformers::models::gemma3::{Config as Gemma3Config, Model as Gemma3Model};
 use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig, LlamaEosToks};
+use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
 use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlama;
+use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
+use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
 use serde::Deserialize;
 use thiserror::Error;
 use tokenizers::Tokenizer;
@@ -130,14 +138,175 @@ pub(crate) enum ModelFormat {
     Gguf,
 }
 
+/// Normalized text architecture selected exclusively from checkpoint metadata.
+/// A family being recognized does not imply every format or execution mode is
+/// implemented; [`ArchitectureCapabilities`] keeps those claims explicit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelArchitecture {
+    Llama,
+    Mixtral,
+    Qwen2,
+    Qwen3,
+    Gemma2,
+    Gemma3,
+    Phi3,
+    Phi4,
+    DeepSeekV2,
+    DeepSeekV3,
+    DeepSeekR1,
+    Qwen35Moe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArchitectureCapabilities {
+    safetensors: bool,
+    gguf: bool,
+    single: bool,
+    tensor_parallel: bool,
+    pipeline_parallel: bool,
+    expert_parallel: bool,
+    specialized_runtime: bool,
+}
+
+impl ModelArchitecture {
+    fn from_hf_model_type(model_type: &str) -> Option<Self> {
+        match model_type {
+            LLAMA_MODEL_TYPE => Some(Self::Llama),
+            MIXTRAL_MODEL_TYPE => Some(Self::Mixtral),
+            "qwen2" => Some(Self::Qwen2),
+            "qwen3" => Some(Self::Qwen3),
+            "gemma2" => Some(Self::Gemma2),
+            "gemma3" | "gemma3_text" => Some(Self::Gemma3),
+            "phi3" => Some(Self::Phi3),
+            "phi4" => Some(Self::Phi4),
+            "deepseek_v2" => Some(Self::DeepSeekV2),
+            "deepseek_v3" => Some(Self::DeepSeekV3),
+            "deepseek_r1" => Some(Self::DeepSeekR1),
+            "qwen3_5_moe" | "qwen3_5_moe_text" => Some(Self::Qwen35Moe),
+            _ => None,
+        }
+    }
+
+    fn from_gguf_architecture(architecture: &str) -> Option<Self> {
+        match architecture {
+            GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
+            "qwen2" => Some(Self::Qwen2),
+            "qwen3" => Some(Self::Qwen3),
+            "gemma2" => Some(Self::Gemma2),
+            "gemma3" => Some(Self::Gemma3),
+            "phi3" => Some(Self::Phi3),
+            "phi4" => Some(Self::Phi4),
+            "deepseek2" => Some(Self::DeepSeekV2),
+            "deepseek3" => Some(Self::DeepSeekV3),
+            _ => None,
+        }
+    }
+
+    fn capabilities(self) -> ArchitectureCapabilities {
+        match self {
+            Self::Llama => ArchitectureCapabilities {
+                safetensors: true,
+                gguf: true,
+                single: true,
+                tensor_parallel: true,
+                pipeline_parallel: true,
+                expert_parallel: false,
+                specialized_runtime: false,
+            },
+            Self::Mixtral => ArchitectureCapabilities {
+                safetensors: true,
+                gguf: false,
+                single: false,
+                tensor_parallel: false,
+                pipeline_parallel: false,
+                expert_parallel: true,
+                specialized_runtime: false,
+            },
+            Self::Qwen35Moe => ArchitectureCapabilities {
+                safetensors: true,
+                gguf: false,
+                single: false,
+                tensor_parallel: false,
+                pipeline_parallel: false,
+                expert_parallel: false,
+                specialized_runtime: true,
+            },
+            Self::Qwen2 | Self::Qwen3 => ArchitectureCapabilities {
+                safetensors: true,
+                gguf: false,
+                single: true,
+                tensor_parallel: false,
+                pipeline_parallel: false,
+                expert_parallel: false,
+                specialized_runtime: false,
+            },
+            Self::Gemma2 | Self::Gemma3 => ArchitectureCapabilities {
+                safetensors: true,
+                gguf: false,
+                single: true,
+                tensor_parallel: false,
+                pipeline_parallel: false,
+                expert_parallel: false,
+                specialized_runtime: false,
+            },
+            Self::Phi3 | Self::Phi4 | Self::DeepSeekV2 | Self::DeepSeekV3 | Self::DeepSeekR1 => {
+                ArchitectureCapabilities {
+                    safetensors: true,
+                    gguf: false,
+                    single: true,
+                    tensor_parallel: false,
+                    pipeline_parallel: false,
+                    expert_parallel: false,
+                    specialized_runtime: false,
+                }
+            }
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Llama => "llama",
+            Self::Mixtral => "mixtral",
+            Self::Qwen2 => "qwen2",
+            Self::Qwen3 => "qwen3",
+            Self::Gemma2 => "gemma2",
+            Self::Gemma3 => "gemma3",
+            Self::Phi3 => "phi3",
+            Self::Phi4 => "phi4",
+            Self::DeepSeekV2 => "deepseek-v2",
+            Self::DeepSeekV3 => "deepseek-v3",
+            Self::DeepSeekR1 => "deepseek-r1",
+            Self::Qwen35Moe => "qwen3.5-moe",
+        }
+    }
+
+    fn supports_format(self, format: ModelFormat) -> bool {
+        let capabilities = self.capabilities();
+        match format {
+            ModelFormat::Safetensors => capabilities.safetensors,
+            ModelFormat::Gguf => capabilities.gguf,
+        }
+    }
+
+    fn supports_strategy(self, strategy: &HardwareStrategy) -> bool {
+        let capabilities = self.capabilities();
+        match strategy.distribution_mode {
+            GpuDistribution::Single => capabilities.single,
+            GpuDistribution::TensorParallelism => capabilities.tensor_parallel,
+            GpuDistribution::PipelineParallelism => capabilities.pipeline_parallel,
+            GpuDistribution::ExpertParallelism => capabilities.expert_parallel,
+        }
+    }
+}
+
 /// A loaded, ready-to-run Llama-family model. Weights are mmapped (safetensors)
 /// or read (GGUF) from the model directory — never copied into the Tachyon
 /// artifact. Shared behind an `Arc` so the runtime stays cheap to clone.
 enum LoadedModel {
-    /// Full-precision safetensors Llama with an external, per-request KV cache.
+    /// Full-precision safetensors model behind a family-neutral dispatch
+    /// boundary. Each family owns its Candle-specific cache semantics here.
     Safetensors {
-        model: Llama,
-        config: Config,
+        backend: SingleDeviceBackend,
         eos_tokens: Vec<u32>,
     },
     /// Quantised GGUF Llama. `forward` takes `&mut self` (the KV cache lives
@@ -154,6 +323,191 @@ enum LoadedModel {
     /// `tensor_parallel_llama`/`pipeline_parallel_llama`; this variant is the
     /// runtime dispatch that finally selects them.
     Parallel(ParallelModel),
+}
+
+/// Family-neutral boundary for single-device safetensors execution. New
+/// architectures are added here without leaking their Candle model/cache types
+/// into request parsing, sampling, stop handling, or streaming.
+enum SingleDeviceBackend {
+    Llama { model: Llama, config: Config },
+    Qwen2(Mutex<Qwen2Model>),
+    Qwen3(Mutex<Qwen3Model>),
+    Gemma2(Mutex<Gemma2Model>),
+    Gemma3(Mutex<Gemma3Model>),
+    Phi3(Mutex<Phi3Model>),
+    DeepSeek(Mutex<DeepSeekModel>),
+}
+
+impl SingleDeviceBackend {
+    fn decode(
+        &self,
+        runtime: &CandleLlmRuntime,
+        prompt_ids: &[u32],
+        request: &ParsedGenerationRequest,
+        eos_tokens: &[u32],
+        device: &Device,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), CandleLlmError> {
+        match self {
+            Self::Llama { model, config } => {
+                let mut cache = Cache::new(true, DType::F32, config, device).map_err(|error| {
+                    runtime.execution_error(format!("failed to build KV cache: {error}"))
+                })?;
+                runtime.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    device,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos, &mut cache),
+                )
+            }
+            Self::Qwen2(model) => {
+                let mut model = model.lock().map_err(|_| {
+                    runtime.execution_error("Qwen2 model mutex was poisoned".to_owned())
+                })?;
+                model.clear_kv_cache();
+                runtime.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    device,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
+                )
+            }
+            Self::Qwen3(model) => {
+                let mut model = model.lock().map_err(|_| {
+                    runtime.execution_error("Qwen3 model mutex was poisoned".to_owned())
+                })?;
+                model.clear_kv_cache();
+                runtime.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    device,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
+                )
+            }
+            Self::Gemma2(model) => {
+                let mut model = model.lock().map_err(|_| {
+                    runtime.execution_error("Gemma2 model mutex was poisoned".to_owned())
+                })?;
+                model.clear_kv_cache();
+                runtime.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    device,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
+                )
+            }
+            Self::Gemma3(model) => {
+                let mut model = model.lock().map_err(|_| {
+                    runtime.execution_error("Gemma3 model mutex was poisoned".to_owned())
+                })?;
+                model.clear_kv_cache();
+                runtime.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    device,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
+                )
+            }
+            Self::Phi3(model) => {
+                let mut model = model.lock().map_err(|_| {
+                    runtime.execution_error("Phi model mutex was poisoned".to_owned())
+                })?;
+                model.clear_kv_cache();
+                runtime.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    device,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
+                )
+            }
+            Self::DeepSeek(model) => {
+                let mut model = model.lock().map_err(|_| {
+                    runtime.execution_error("DeepSeek model mutex was poisoned".to_owned())
+                })?;
+                model.clear_kv_cache();
+                runtime.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    device,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos),
+                )
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn debug_last_logits(&self, input: &Tensor, device: &Device) -> Tensor {
+        match self {
+            Self::Llama { model, config } => {
+                let mut cache =
+                    Cache::new(true, DType::F32, config, device).expect("cache should build");
+                model
+                    .forward(input, 0, &mut cache)
+                    .expect("forward pass should run")
+            }
+            Self::Qwen2(model) => {
+                let mut model = model.lock().expect("Qwen2 mutex should not be poisoned");
+                model.clear_kv_cache();
+                model
+                    .forward(input, 0)
+                    .and_then(|logits| logits.squeeze(1))
+                    .expect("Qwen2 forward pass should run")
+            }
+            Self::Qwen3(model) => {
+                let mut model = model.lock().expect("Qwen3 mutex should not be poisoned");
+                model.clear_kv_cache();
+                model
+                    .forward(input, 0)
+                    .and_then(|logits| logits.squeeze(1))
+                    .expect("Qwen3 forward pass should run")
+            }
+            Self::Gemma2(model) => {
+                let mut model = model.lock().expect("Gemma2 mutex should not be poisoned");
+                model.clear_kv_cache();
+                model
+                    .forward(input, 0)
+                    .and_then(|logits| logits.squeeze(1))
+                    .expect("Gemma2 forward pass should run")
+            }
+            Self::Gemma3(model) => {
+                let mut model = model.lock().expect("Gemma3 mutex should not be poisoned");
+                model.clear_kv_cache();
+                model
+                    .forward(input, 0)
+                    .and_then(|logits| logits.squeeze(1))
+                    .expect("Gemma3 forward pass should run")
+            }
+            Self::Phi3(model) => {
+                let mut model = model.lock().expect("Phi mutex should not be poisoned");
+                model.clear_kv_cache();
+                model
+                    .forward(input, 0)
+                    .and_then(|logits| logits.squeeze(1))
+                    .expect("Phi forward pass should run")
+            }
+            Self::DeepSeek(model) => {
+                let mut model = model.lock().expect("DeepSeek mutex should not be poisoned");
+                model.clear_kv_cache();
+                model
+                    .forward(input, 0)
+                    .expect("DeepSeek forward pass should run")
+            }
+        }
+    }
 }
 
 /// The concrete parallel engine behind a [`LoadedModel::Parallel`]. Tensor,
@@ -279,6 +633,29 @@ pub(crate) struct CandleLlmRuntime {
 struct ModelTypeProbe {
     #[serde(default)]
     model_type: String,
+    #[serde(default)]
+    text_config: Option<Box<ModelTypeProbe>>,
+    #[serde(default)]
+    vision_config: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum TokenIdField {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GenerationMetadataProbe {
+    #[serde(default)]
+    eos_token_id: Option<TokenIdField>,
+    #[serde(default = "default_max_position_embeddings")]
+    max_position_embeddings: usize,
+}
+
+fn default_max_position_embeddings() -> usize {
+    DEFAULT_MAX_PROMPT_TOKENS
 }
 
 /// Parsed `.tachyon-model.json` sidecar. Only the declared format is consumed;
@@ -399,6 +776,47 @@ impl CandleLlmRuntime {
         let Some(format) = resolve_model_format(alias, root)? else {
             return Ok(None);
         };
+        let architecture = inspect_model_architecture(alias, root, format)?;
+        if architecture.capabilities().specialized_runtime {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "architecture `{}` is handled by its specialized runtime, not the generic Candle loader",
+                    architecture.display_name()
+                ),
+            });
+        }
+        if !architecture.supports_format(format) {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "recognized architecture `{}` has no verified {} loader",
+                    architecture.display_name(),
+                    format.display_name()
+                ),
+            });
+        }
+        if !architecture.supports_strategy(strategy) {
+            let detail = if strategy.distribution_mode == GpuDistribution::ExpertParallelism
+                && architecture == ModelArchitecture::Llama
+            {
+                "expert-parallel execution requires a Mixtral-family checkpoint; got `llama`"
+                    .to_owned()
+            } else {
+                format!(
+                    "architecture `{}` does not support `{}` execution",
+                    architecture.display_name(),
+                    distribution_mode_name(strategy.distribution_mode)
+                )
+            };
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail,
+            });
+        }
 
         // The single-device path remains CPU-only in this runtime (GPU
         // execution of the dense path is the separate
@@ -459,9 +877,8 @@ impl CandleLlmRuntime {
         }))
     }
 
-    /// Load a Hugging Face safetensors Llama directory: `config.json` (validated
-    /// as `model_type = "llama"`) plus single-file or sharded safetensors,
-    /// mmapped so the weights stay on disk.
+    /// Load a registered Hugging Face safetensors architecture from
+    /// `config.json` plus single-file or sharded weights.
     fn load_safetensors(
         alias: &str,
         root: &Path,
@@ -473,37 +890,8 @@ impl CandleLlmRuntime {
                 component: CONFIG_JSON,
                 detail: error.to_string(),
             })?;
-        let probe: ModelTypeProbe = serde_json::from_slice(&raw_config).map_err(|error| {
-            CandleLlmError::InvalidComponent {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                component: CONFIG_JSON,
-                detail: error.to_string(),
-            }
-        })?;
-        if probe.model_type != LLAMA_MODEL_TYPE {
-            return Err(CandleLlmError::UnsupportedModel {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                detail: format!(
-                    "expected a Llama-family checkpoint (`model_type` = `{LLAMA_MODEL_TYPE}`), got `{}`",
-                    probe.model_type
-                ),
-            });
-        }
-
-        let llama_config: LlamaConfig = serde_json::from_slice(&raw_config).map_err(|error| {
-            CandleLlmError::InvalidComponent {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                component: CONFIG_JSON,
-                detail: error.to_string(),
-            }
-        })?;
-        let config = llama_config.into_config(false);
-        let limits = GenerationLimits::with_context(config.max_position_embeddings);
-        let eos_tokens = eos_token_ids(&config);
-
+        let architecture = inspect_hf_architecture(alias, root, &raw_config)?;
+        let eos_tokens = generation_eos_token_ids(alias, root, &raw_config)?;
         let weight_paths = safetensors_paths(alias, root)?;
         let device = Device::Cpu;
         // SAFETY: the model files live in the (uploaded) model directory and are
@@ -516,19 +904,161 @@ impl CandleLlmRuntime {
                     component: MODEL_SAFETENSORS,
                     detail: error.to_string(),
                 })?;
-        let model = Llama::load(var_builder, &config).map_err(|error| {
-            CandleLlmError::InvalidComponent {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                component: MODEL_SAFETENSORS,
-                detail: error.to_string(),
+        let invalid_weights = |error: candle_core::Error| CandleLlmError::InvalidComponent {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            component: MODEL_SAFETENSORS,
+            detail: error.to_string(),
+        };
+        let (backend, limits, eos_tokens) = match architecture {
+            ModelArchitecture::Llama => {
+                let llama_config: LlamaConfig =
+                    serde_json::from_slice(&raw_config).map_err(|error| {
+                        CandleLlmError::InvalidComponent {
+                            alias: alias.to_owned(),
+                            path: root.to_path_buf(),
+                            component: CONFIG_JSON,
+                            detail: error.to_string(),
+                        }
+                    })?;
+                let config = llama_config.into_config(false);
+                let limits = GenerationLimits::with_context(config.max_position_embeddings);
+                let eos_tokens = eos_token_ids(&config);
+                let model = Llama::load(var_builder, &config).map_err(invalid_weights)?;
+                (
+                    SingleDeviceBackend::Llama { model, config },
+                    limits,
+                    eos_tokens,
+                )
             }
-        })?;
+            ModelArchitecture::Qwen2 => {
+                let config: Qwen2Config = serde_json::from_slice(&raw_config).map_err(|error| {
+                    CandleLlmError::InvalidComponent {
+                        alias: alias.to_owned(),
+                        path: root.to_path_buf(),
+                        component: CONFIG_JSON,
+                        detail: error.to_string(),
+                    }
+                })?;
+                let limits = GenerationLimits::with_context(config.max_position_embeddings);
+                let model = Qwen2Model::new(&config, var_builder).map_err(invalid_weights)?;
+                (
+                    SingleDeviceBackend::Qwen2(Mutex::new(model)),
+                    limits,
+                    eos_tokens,
+                )
+            }
+            ModelArchitecture::Qwen3 => {
+                let config: Qwen3Config = serde_json::from_slice(&raw_config).map_err(|error| {
+                    CandleLlmError::InvalidComponent {
+                        alias: alias.to_owned(),
+                        path: root.to_path_buf(),
+                        component: CONFIG_JSON,
+                        detail: error.to_string(),
+                    }
+                })?;
+                let limits = GenerationLimits::with_context(config.max_position_embeddings);
+                let model = Qwen3Model::new(&config, var_builder).map_err(invalid_weights)?;
+                (
+                    SingleDeviceBackend::Qwen3(Mutex::new(model)),
+                    limits,
+                    eos_tokens,
+                )
+            }
+            ModelArchitecture::Gemma2 => {
+                let config: Gemma2Config =
+                    serde_json::from_slice(&raw_config).map_err(|error| {
+                        CandleLlmError::InvalidComponent {
+                            alias: alias.to_owned(),
+                            path: root.to_path_buf(),
+                            component: CONFIG_JSON,
+                            detail: error.to_string(),
+                        }
+                    })?;
+                let limits = GenerationLimits::with_context(config.max_position_embeddings);
+                let model =
+                    Gemma2Model::new(false, &config, var_builder).map_err(invalid_weights)?;
+                (
+                    SingleDeviceBackend::Gemma2(Mutex::new(model)),
+                    limits,
+                    eos_tokens,
+                )
+            }
+            ModelArchitecture::Gemma3 => {
+                let config: Gemma3Config =
+                    serde_json::from_slice(&raw_config).map_err(|error| {
+                        CandleLlmError::InvalidComponent {
+                            alias: alias.to_owned(),
+                            path: root.to_path_buf(),
+                            component: CONFIG_JSON,
+                            detail: error.to_string(),
+                        }
+                    })?;
+                let limits = GenerationLimits::with_context(config.max_position_embeddings);
+                let model =
+                    Gemma3Model::new(false, &config, var_builder).map_err(invalid_weights)?;
+                (
+                    SingleDeviceBackend::Gemma3(Mutex::new(model)),
+                    limits,
+                    eos_tokens,
+                )
+            }
+            ModelArchitecture::Phi3 | ModelArchitecture::Phi4 => {
+                let config: Phi3Config = serde_json::from_slice(&raw_config).map_err(|error| {
+                    CandleLlmError::InvalidComponent {
+                        alias: alias.to_owned(),
+                        path: root.to_path_buf(),
+                        component: CONFIG_JSON,
+                        detail: error.to_string(),
+                    }
+                })?;
+                let limits = GenerationLimits::with_context(config.max_position_embeddings);
+                let model = Phi3Model::new(&config, var_builder).map_err(invalid_weights)?;
+                (
+                    SingleDeviceBackend::Phi3(Mutex::new(model)),
+                    limits,
+                    eos_tokens,
+                )
+            }
+            ModelArchitecture::DeepSeekV2
+            | ModelArchitecture::DeepSeekV3
+            | ModelArchitecture::DeepSeekR1 => {
+                let config: DeepSeekConfig =
+                    serde_json::from_slice(&raw_config).map_err(|error| {
+                        CandleLlmError::InvalidComponent {
+                            alias: alias.to_owned(),
+                            path: root.to_path_buf(),
+                            component: CONFIG_JSON,
+                            detail: error.to_string(),
+                        }
+                    })?;
+                let limits = GenerationLimits::with_context(generation_context_limit(
+                    alias,
+                    root,
+                    &raw_config,
+                )?);
+                let model = DeepSeekModel::new(&config, var_builder).map_err(invalid_weights)?;
+                (
+                    SingleDeviceBackend::DeepSeek(Mutex::new(model)),
+                    limits,
+                    eos_tokens,
+                )
+            }
+            other => {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail: format!(
+                        "recognized architecture `{}` has no generic safetensors backend",
+                        other.display_name()
+                    ),
+                });
+            }
+        };
 
         Ok((
             LoadedModel::Safetensors {
-                model,
-                config,
+                backend,
                 eos_tokens,
             },
             limits,
@@ -640,8 +1170,7 @@ impl CandleLlmRuntime {
             }
         })?;
         let inner = LoadedModel::Safetensors {
-            model,
-            config,
+            backend: SingleDeviceBackend::Llama { model, config },
             eos_tokens,
         };
 
@@ -1074,22 +1603,9 @@ impl CandleLlmRuntime {
         let device = Device::Cpu;
         match &*self.inner {
             LoadedModel::Safetensors {
-                model,
-                config,
+                backend,
                 eos_tokens,
-            } => {
-                let mut cache = Cache::new(true, DType::F32, config, &device).map_err(|error| {
-                    self.execution_error(format!("failed to build KV cache: {error}"))
-                })?;
-                self.decode_loop(
-                    prompt_ids,
-                    request,
-                    eos_tokens,
-                    &device,
-                    on_token,
-                    |input, index_pos| model.forward(input, index_pos, &mut cache),
-                )
-            }
+            } => backend.decode(self, prompt_ids, request, eos_tokens, &device, on_token),
             LoadedModel::Gguf { model, eos_tokens } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
@@ -1370,13 +1886,7 @@ impl CandleLlmRuntime {
             .and_then(|tensor| tensor.unsqueeze(0))
             .expect("input tensor should build");
         let logits = match &*self.inner {
-            LoadedModel::Safetensors { model, config, .. } => {
-                let mut cache =
-                    Cache::new(true, DType::F32, config, &device).expect("cache should build");
-                model
-                    .forward(&input, 0, &mut cache)
-                    .expect("forward pass should run")
-            }
+            LoadedModel::Safetensors { backend, .. } => backend.debug_last_logits(&input, &device),
             LoadedModel::Gguf { model, .. } => {
                 let mut guard = model.lock().expect("gguf mutex should not be poisoned");
                 guard.forward(&input, 0).expect("forward pass should run")
@@ -1800,6 +2310,151 @@ fn resolve_model_format(alias: &str, root: &Path) -> Result<Option<ModelFormat>,
     }
 }
 
+impl ModelFormat {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Safetensors => "safetensors",
+            Self::Gguf => "GGUF",
+        }
+    }
+}
+
+fn distribution_mode_name(mode: GpuDistribution) -> &'static str {
+    match mode {
+        GpuDistribution::Single => "single",
+        GpuDistribution::TensorParallelism => "tensor_parallelism",
+        GpuDistribution::PipelineParallelism => "pipeline_parallelism",
+        GpuDistribution::ExpertParallelism => "expert_parallelism",
+    }
+}
+
+fn inspect_model_architecture(
+    alias: &str,
+    root: &Path,
+    format: ModelFormat,
+) -> Result<ModelArchitecture, CandleLlmError> {
+    match format {
+        ModelFormat::Safetensors => {
+            let raw = fs::read(root.join(CONFIG_JSON)).map_err(|error| {
+                CandleLlmError::InvalidComponent {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    component: CONFIG_JSON,
+                    detail: error.to_string(),
+                }
+            })?;
+            inspect_hf_architecture(alias, root, &raw)
+        }
+        ModelFormat::Gguf => {
+            let gguf_path = gguf_file_path(alias, root)?;
+            let mut reader =
+                fs::File::open(&gguf_path).map_err(|error| CandleLlmError::InvalidComponent {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    component: GGUF_COMPONENT,
+                    detail: error.to_string(),
+                })?;
+            let content = gguf_file::Content::read(&mut reader).map_err(|error| {
+                CandleLlmError::InvalidComponent {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    component: GGUF_COMPONENT,
+                    detail: error.to_string(),
+                }
+            })?;
+            let declared = content
+                .metadata
+                .get("general.architecture")
+                .and_then(|value| value.to_string().ok())
+                .cloned()
+                .unwrap_or_default();
+            ModelArchitecture::from_gguf_architecture(&declared).ok_or_else(|| {
+                CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail: format!(
+                        "unrecognized GGUF `general.architecture` `{declared}`; the model alias and directory name are not used for architecture selection"
+                    ),
+                }
+            })
+        }
+    }
+}
+
+fn inspect_hf_architecture(
+    alias: &str,
+    root: &Path,
+    raw_config: &[u8],
+) -> Result<ModelArchitecture, CandleLlmError> {
+    let probe: ModelTypeProbe =
+        serde_json::from_slice(raw_config).map_err(|error| CandleLlmError::InvalidComponent {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            component: CONFIG_JSON,
+            detail: error.to_string(),
+        })?;
+    let declared = if probe.model_type.is_empty() {
+        probe
+            .text_config
+            .as_deref()
+            .map(|text| text.model_type.as_str())
+            .unwrap_or_default()
+    } else {
+        probe.model_type.as_str()
+    };
+    let architecture = ModelArchitecture::from_hf_model_type(declared).ok_or_else(|| {
+        CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: format!(
+                "unrecognized Hugging Face `model_type` `{declared}`; supported generic families include `{LLAMA_MODEL_TYPE}`, `qwen2`, `qwen3`, and `gemma2`; the model alias and directory name are not used for architecture selection"
+            ),
+        }
+    })?;
+    if architecture == ModelArchitecture::Gemma3 && probe.vision_config.is_some() {
+        return Err(CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: "Gemma3 multimodal checkpoints with a `vision_config` are not supported by the text-only backend".to_owned(),
+        });
+    }
+    Ok(architecture)
+}
+
+fn generation_eos_token_ids(
+    alias: &str,
+    root: &Path,
+    raw_config: &[u8],
+) -> Result<Vec<u32>, CandleLlmError> {
+    let probe: GenerationMetadataProbe =
+        serde_json::from_slice(raw_config).map_err(|error| CandleLlmError::InvalidComponent {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            component: CONFIG_JSON,
+            detail: error.to_string(),
+        })?;
+    Ok(match probe.eos_token_id {
+        Some(TokenIdField::One(id)) => vec![id],
+        Some(TokenIdField::Many(ids)) => ids,
+        None => Vec::new(),
+    })
+}
+
+fn generation_context_limit(
+    alias: &str,
+    root: &Path,
+    raw_config: &[u8],
+) -> Result<usize, CandleLlmError> {
+    let probe: GenerationMetadataProbe =
+        serde_json::from_slice(raw_config).map_err(|error| CandleLlmError::InvalidComponent {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            component: CONFIG_JSON,
+            detail: error.to_string(),
+        })?;
+    Ok(probe.max_position_embeddings)
+}
+
 /// Locate the single `*.gguf` file in a model directory, if any.
 fn find_gguf_file(root: &Path) -> Option<PathBuf> {
     let entries = fs::read_dir(root).ok()?;
@@ -2176,6 +2831,325 @@ fn fixture_weights() -> anyhow::Result<HashMap<String, Tensor>> {
         &[FIXTURE_VOCAB_SIZE, hidden],
     )?;
     Ok(tensors)
+}
+
+#[cfg(test)]
+fn write_tachyon_tiny_qwen_fixture(
+    root: &Path,
+    architecture: ModelArchitecture,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(root)?;
+    let (model_type, architecture_name, mut config) = match architecture {
+        ModelArchitecture::Qwen2 => (
+            "qwen2",
+            "Qwen2ForCausalLM",
+            serde_json::json!({
+                "model_type": "qwen2",
+                "vocab_size": FIXTURE_VOCAB_SIZE,
+                "hidden_size": FIXTURE_HIDDEN_SIZE,
+                "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+                "num_hidden_layers": FIXTURE_NUM_LAYERS,
+                "num_attention_heads": FIXTURE_NUM_HEADS,
+                "num_key_value_heads": FIXTURE_NUM_HEADS,
+                "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+                "sliding_window": FIXTURE_MAX_POSITION_EMBEDDINGS,
+                "max_window_layers": FIXTURE_NUM_LAYERS,
+                "tie_word_embeddings": false,
+                "rope_theta": 10000.0,
+                "rms_norm_eps": 1e-5,
+                "use_sliding_window": false,
+                "hidden_act": "silu",
+                "eos_token_id": null
+            }),
+        ),
+        ModelArchitecture::Qwen3 => (
+            "qwen3",
+            "Qwen3ForCausalLM",
+            serde_json::json!({
+                "model_type": "qwen3",
+                "vocab_size": FIXTURE_VOCAB_SIZE,
+                "hidden_size": FIXTURE_HIDDEN_SIZE,
+                "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+                "num_hidden_layers": FIXTURE_NUM_LAYERS,
+                "num_attention_heads": FIXTURE_NUM_HEADS,
+                "head_dim": FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS,
+                "attention_bias": false,
+                "num_key_value_heads": FIXTURE_NUM_HEADS,
+                "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+                "sliding_window": null,
+                "max_window_layers": FIXTURE_NUM_LAYERS,
+                "tie_word_embeddings": false,
+                "rope_theta": 10000.0,
+                "rms_norm_eps": 1e-5,
+                "use_sliding_window": false,
+                "hidden_act": "silu",
+                "eos_token_id": null
+            }),
+        ),
+        _ => anyhow::bail!("tiny Qwen fixture requires Qwen2 or Qwen3"),
+    };
+    config["model_type"] = serde_json::Value::String(model_type.to_owned());
+    config["architectures"] = serde_json::json!([architecture_name]);
+    fs::write(root.join(CONFIG_JSON), config.to_string())?;
+    fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON)?;
+
+    let mut tensors = fixture_weights()?;
+    if architecture == ModelArchitecture::Qwen2 {
+        let head_dim = FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS;
+        let q = FIXTURE_NUM_HEADS * head_dim;
+        let kv = FIXTURE_NUM_HEADS * head_dim;
+        for layer in 0..FIXTURE_NUM_LAYERS {
+            let prefix = format!("model.layers.{layer}.self_attn");
+            tensors.insert(
+                format!("{prefix}.q_proj.bias"),
+                Tensor::zeros(q, DType::F32, &Device::Cpu)?,
+            );
+            tensors.insert(
+                format!("{prefix}.k_proj.bias"),
+                Tensor::zeros(kv, DType::F32, &Device::Cpu)?,
+            );
+            tensors.insert(
+                format!("{prefix}.v_proj.bias"),
+                Tensor::zeros(kv, DType::F32, &Device::Cpu)?,
+            );
+        }
+    } else {
+        let head_dim = FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS;
+        for layer in 0..FIXTURE_NUM_LAYERS {
+            let prefix = format!("model.layers.{layer}.self_attn");
+            tensors.insert(
+                format!("{prefix}.q_norm.weight"),
+                Tensor::ones(head_dim, DType::F32, &Device::Cpu)?,
+            );
+            tensors.insert(
+                format!("{prefix}.k_norm.weight"),
+                Tensor::ones(head_dim, DType::F32, &Device::Cpu)?,
+            );
+        }
+    }
+    candle_core::safetensors::save(&tensors, root.join(MODEL_SAFETENSORS))?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_tachyon_tiny_gemma_fixture(
+    root: &Path,
+    architecture: ModelArchitecture,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(root)?;
+    let config = match architecture {
+        ModelArchitecture::Gemma2 => serde_json::json!({
+            "model_type": "gemma2",
+            "architectures": ["Gemma2ForCausalLM"],
+            "attention_bias": false,
+            "head_dim": FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS,
+            "hidden_activation": "gelu",
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "final_logit_softcapping": null,
+            "attn_logit_softcapping": null,
+            "query_pre_attn_scalar": FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS,
+            "sliding_window": null,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "eos_token_id": null
+        }),
+        ModelArchitecture::Gemma3 => serde_json::json!({
+            "model_type": "gemma3_text",
+            "architectures": ["Gemma3ForCausalLM"],
+            "attention_bias": false,
+            "head_dim": FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS,
+            "hidden_activation": "gelu",
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "rope_local_base_freq": 10000.0,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "final_logit_softcapping": null,
+            "attn_logit_softcapping": null,
+            "query_pre_attn_scalar": FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS,
+            "sliding_window": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "sliding_window_pattern": 2,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "eos_token_id": null
+        }),
+        _ => anyhow::bail!("tiny Gemma fixture requires Gemma2 or Gemma3"),
+    };
+    fs::write(root.join(CONFIG_JSON), config.to_string())?;
+    fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON)?;
+    let mut tensors = fixture_weights()?;
+    let head_dim = FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS;
+    for layer in 0..FIXTURE_NUM_LAYERS {
+        let prefix = format!("model.layers.{layer}");
+        for norm_name in [
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
+        ] {
+            tensors.insert(
+                format!("{prefix}.{norm_name}"),
+                Tensor::zeros(FIXTURE_HIDDEN_SIZE, DType::F32, &Device::Cpu)?,
+            );
+        }
+        if architecture == ModelArchitecture::Gemma3 {
+            tensors.insert(
+                format!("{prefix}.self_attn.q_norm.weight"),
+                Tensor::zeros(head_dim, DType::F32, &Device::Cpu)?,
+            );
+            tensors.insert(
+                format!("{prefix}.self_attn.k_norm.weight"),
+                Tensor::zeros(head_dim, DType::F32, &Device::Cpu)?,
+            );
+        }
+    }
+    // Gemma ties the LM head to the embedding table.
+    tensors.remove("lm_head.weight");
+    candle_core::safetensors::save(&tensors, root.join(MODEL_SAFETENSORS))?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_tachyon_tiny_phi_fixture(
+    root: &Path,
+    architecture: ModelArchitecture,
+) -> anyhow::Result<()> {
+    let model_type = match architecture {
+        ModelArchitecture::Phi3 => "phi3",
+        ModelArchitecture::Phi4 => "phi4",
+        _ => anyhow::bail!("tiny Phi fixture requires Phi3 or Phi4"),
+    };
+    fs::create_dir_all(root)?;
+    fs::write(
+        root.join(CONFIG_JSON),
+        serde_json::json!({
+            "model_type": model_type,
+            "architectures": ["Phi3ForCausalLM"],
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "hidden_act": "silu",
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "bos_token_id": 1,
+            "eos_token_id": null,
+            "rope_scaling": null,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "original_max_position_embeddings": null,
+            "partial_rotary_factor": null,
+            "tie_word_embeddings": false
+        })
+        .to_string(),
+    )?;
+    fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON)?;
+    let mut tensors = fixture_weights()?;
+    for layer in 0..FIXTURE_NUM_LAYERS {
+        let prefix = format!("model.layers.{layer}");
+        let q = tensors
+            .remove(&format!("{prefix}.self_attn.q_proj.weight"))
+            .expect("fixture q weight");
+        let k = tensors
+            .remove(&format!("{prefix}.self_attn.k_proj.weight"))
+            .expect("fixture k weight");
+        let v = tensors
+            .remove(&format!("{prefix}.self_attn.v_proj.weight"))
+            .expect("fixture v weight");
+        tensors.insert(
+            format!("{prefix}.self_attn.qkv_proj.weight"),
+            Tensor::cat(&[&q, &k, &v], 0)?,
+        );
+        let gate = tensors
+            .remove(&format!("{prefix}.mlp.gate_proj.weight"))
+            .expect("fixture gate weight");
+        let up = tensors
+            .remove(&format!("{prefix}.mlp.up_proj.weight"))
+            .expect("fixture up weight");
+        tensors.insert(
+            format!("{prefix}.mlp.gate_up_proj.weight"),
+            Tensor::cat(&[&gate, &up], 0)?,
+        );
+    }
+    candle_core::safetensors::save(&tensors, root.join(MODEL_SAFETENSORS))?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_tachyon_tiny_deepseek_fixture(
+    root: &Path,
+    architecture: ModelArchitecture,
+) -> anyhow::Result<()> {
+    let model_type = match architecture {
+        ModelArchitecture::DeepSeekV2 => "deepseek_v2",
+        ModelArchitecture::DeepSeekV3 => "deepseek_v3",
+        ModelArchitecture::DeepSeekR1 => "deepseek_r1",
+        _ => anyhow::bail!("tiny DeepSeek fixture requires a DeepSeek architecture"),
+    };
+    fs::create_dir_all(root)?;
+    fs::write(
+        root.join(CONFIG_JSON),
+        serde_json::json!({
+            "model_type": model_type,
+            "architectures": ["DeepseekV2ForCausalLM"],
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "moe_intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "num_hidden_layers": 0,
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "n_shared_experts": null,
+            "n_routed_experts": null,
+            "num_experts_per_tok": null,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": false,
+            "rope_theta": 10000.0,
+            "rope_scaling": null,
+            "attention_bias": false,
+            "q_lora_rank": null,
+            "qk_rope_head_dim": 2,
+            "kv_lora_rank": 2,
+            "v_head_dim": 2,
+            "qk_nope_head_dim": 2,
+            "n_group": 1,
+            "topk_group": 1,
+            "eos_token_id": null
+        })
+        .to_string(),
+    )?;
+    fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON)?;
+    let mut tensors = HashMap::new();
+    tensors.insert(
+        "model.embed_tokens.weight".to_owned(),
+        Tensor::from_vec(
+            deterministic_fill(71, FIXTURE_VOCAB_SIZE * FIXTURE_HIDDEN_SIZE),
+            (FIXTURE_VOCAB_SIZE, FIXTURE_HIDDEN_SIZE),
+            &Device::Cpu,
+        )?,
+    );
+    tensors.insert(
+        "model.norm.weight".to_owned(),
+        Tensor::ones(FIXTURE_HIDDEN_SIZE, DType::F32, &Device::Cpu)?,
+    );
+    tensors.insert(
+        "lm_head.weight".to_owned(),
+        Tensor::from_vec(
+            deterministic_fill(72, FIXTURE_VOCAB_SIZE * FIXTURE_HIDDEN_SIZE),
+            (FIXTURE_VOCAB_SIZE, FIXTURE_HIDDEN_SIZE),
+            &Device::Cpu,
+        )?,
+    );
+    candle_core::safetensors::save(&tensors, root.join(MODEL_SAFETENSORS))?;
+    Ok(())
 }
 
 /// Deterministic small weights in roughly `[-0.4, 0.4)`, distinct per element and
@@ -2568,6 +3542,370 @@ pub(crate) fn write_tachyon_tiny_gguf_fixture(root: &Path) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn architecture_registry_normalizes_supported_hf_aliases() {
+        assert_eq!(
+            ModelArchitecture::from_hf_model_type("qwen2"),
+            Some(ModelArchitecture::Qwen2)
+        );
+        assert_eq!(
+            ModelArchitecture::from_hf_model_type("qwen3"),
+            Some(ModelArchitecture::Qwen3)
+        );
+        assert_eq!(
+            ModelArchitecture::from_hf_model_type("gemma3_text"),
+            Some(ModelArchitecture::Gemma3)
+        );
+        assert_eq!(
+            ModelArchitecture::from_hf_model_type("deepseek_r1"),
+            Some(ModelArchitecture::DeepSeekR1)
+        );
+        assert_eq!(ModelArchitecture::from_hf_model_type("gpt2"), None);
+    }
+
+    #[test]
+    fn architecture_registry_keeps_format_support_explicit() {
+        assert!(ModelArchitecture::Llama.supports_format(ModelFormat::Safetensors));
+        assert!(ModelArchitecture::Llama.supports_format(ModelFormat::Gguf));
+        assert!(ModelArchitecture::Qwen3.supports_format(ModelFormat::Safetensors));
+        assert!(!ModelArchitecture::Gemma3.supports_format(ModelFormat::Gguf));
+        assert!(ModelArchitecture::Gemma3.supports_format(ModelFormat::Safetensors));
+    }
+
+    #[test]
+    fn architecture_registry_rejects_unregistered_parallel_modes() {
+        let tensor = HardwareStrategy {
+            distribution_mode: GpuDistribution::TensorParallelism,
+            ..HardwareStrategy::default()
+        };
+        let expert = HardwareStrategy {
+            distribution_mode: GpuDistribution::ExpertParallelism,
+            ..HardwareStrategy::default()
+        };
+        assert!(ModelArchitecture::Llama.supports_strategy(&tensor));
+        assert!(!ModelArchitecture::Qwen3.supports_strategy(&tensor));
+        assert!(ModelArchitecture::Mixtral.supports_strategy(&expert));
+        assert!(!ModelArchitecture::Llama.supports_strategy(&expert));
+    }
+
+    fn load_qwen_fixture(
+        tag: &str,
+        architecture: ModelArchitecture,
+    ) -> (CandleLlmRuntime, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-{}-{tag}-{}-{nanos}",
+            architecture.display_name(),
+            std::process::id()
+        ));
+        write_tachyon_tiny_qwen_fixture(&dir, architecture)
+            .expect("Qwen fixture should be written");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny-qwen", &dir, "cpu", &HardwareStrategy::default())
+                .expect("Qwen fixture should load without error")
+                .expect("Qwen fixture should select the native Candle runtime");
+        (runtime, dir)
+    }
+
+    #[test]
+    fn qwen2_and_qwen3_generate_and_reset_their_internal_cache() {
+        for architecture in [ModelArchitecture::Qwen2, ModelArchitecture::Qwen3] {
+            let (runtime, dir) = load_qwen_fixture("generation", architecture);
+            let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
+            let first = runtime.generate(&[request]).expect("first generation");
+            let second = runtime.generate(&[request]).expect("second generation");
+            assert_eq!(
+                first,
+                second,
+                "{} must reset its internal KV cache between requests",
+                architecture.display_name()
+            );
+            assert_ne!(first, b"MOCK_LLM_RESPONSE");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn qwen2_and_qwen3_streaming_matches_buffered_generation() {
+        for architecture in [ModelArchitecture::Qwen2, ModelArchitecture::Qwen3] {
+            let (runtime, dir) = load_qwen_fixture("streaming", architecture);
+            let request: &[u8] = br#"{"prompt":"hello","max_new_tokens":4}"#;
+            let buffered =
+                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let mut streamed = String::new();
+            runtime
+                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .expect("streamed");
+            assert_eq!(streamed, buffered);
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn qwen2_and_qwen3_logits_match_direct_candle_models_and_enforce_limits() {
+        for architecture in [ModelArchitecture::Qwen2, ModelArchitecture::Qwen3] {
+            let (runtime, dir) = load_qwen_fixture("reference", architecture);
+            let runtime_logits = runtime.debug_last_logits("hello mesh");
+            let ids = runtime
+                .encode_ids("hello mesh")
+                .expect("prompt should encode");
+            let input = Tensor::new(ids.as_slice(), &Device::Cpu)
+                .and_then(|tensor| tensor.unsqueeze(0))
+                .expect("input should build");
+            let raw_config = fs::read(dir.join(CONFIG_JSON)).expect("config should read");
+            let paths = vec![dir.join(MODEL_SAFETENSORS)];
+            // SAFETY: the fixture remains immutable for the lifetime of the
+            // direct reference model.
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&paths, DType::F32, &Device::Cpu)
+                    .expect("fixture weights should map")
+            };
+            let reference = match architecture {
+                ModelArchitecture::Qwen2 => {
+                    let config: Qwen2Config =
+                        serde_json::from_slice(&raw_config).expect("Qwen2 config");
+                    let mut model = Qwen2Model::new(&config, vb).expect("Qwen2 reference");
+                    model
+                        .forward(&input, 0)
+                        .and_then(|logits| logits.squeeze(1))
+                        .and_then(|logits| logits.squeeze(0))
+                        .and_then(|logits| logits.to_vec1::<f32>())
+                        .expect("Qwen2 reference logits")
+                }
+                ModelArchitecture::Qwen3 => {
+                    let config: Qwen3Config =
+                        serde_json::from_slice(&raw_config).expect("Qwen3 config");
+                    let mut model = Qwen3Model::new(&config, vb).expect("Qwen3 reference");
+                    model
+                        .forward(&input, 0)
+                        .and_then(|logits| logits.squeeze(1))
+                        .and_then(|logits| logits.squeeze(0))
+                        .and_then(|logits| logits.to_vec1::<f32>())
+                        .expect("Qwen3 reference logits")
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(runtime_logits, reference);
+
+            let request = format!(
+                r#"{{"prompt":"hello","max_new_tokens":{}}}"#,
+                HOST_MAX_NEW_TOKENS + 1
+            );
+            let error = runtime
+                .generate(&[request.as_bytes()])
+                .expect_err("host generation limit must apply to Qwen");
+            assert!(matches!(error, CandleLlmError::InvalidRequest { .. }));
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    fn load_gemma_fixture(
+        tag: &str,
+        architecture: ModelArchitecture,
+    ) -> (CandleLlmRuntime, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-{}-{tag}-{}-{nanos}",
+            architecture.display_name(),
+            std::process::id()
+        ));
+        write_tachyon_tiny_gemma_fixture(&dir, architecture)
+            .expect("Gemma fixture should be written");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny-gemma", &dir, "cpu", &HardwareStrategy::default())
+                .expect("Gemma fixture should load without error")
+                .expect("Gemma fixture should select the native Candle runtime");
+        (runtime, dir)
+    }
+
+    #[test]
+    fn gemma2_and_gemma3_generate_with_streaming_parity_and_cache_reset() {
+        for architecture in [ModelArchitecture::Gemma2, ModelArchitecture::Gemma3] {
+            let (runtime, dir) = load_gemma_fixture("generation", architecture);
+            let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
+            let first =
+                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let second =
+                String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+            assert_eq!(first, second, "internal KV cache must reset");
+            let mut streamed = String::new();
+            runtime
+                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .expect("streamed");
+            assert_eq!(streamed, first);
+            assert_ne!(first.as_bytes(), b"MOCK_LLM_RESPONSE");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn gemma2_and_gemma3_logits_match_direct_candle_models_and_enforce_limits() {
+        for architecture in [ModelArchitecture::Gemma2, ModelArchitecture::Gemma3] {
+            let (runtime, dir) = load_gemma_fixture("reference", architecture);
+            let runtime_logits = runtime.debug_last_logits("hello mesh");
+            let ids = runtime
+                .encode_ids("hello mesh")
+                .expect("prompt should encode");
+            let input = Tensor::new(ids.as_slice(), &Device::Cpu)
+                .and_then(|tensor| tensor.unsqueeze(0))
+                .expect("input should build");
+            let raw_config = fs::read(dir.join(CONFIG_JSON)).expect("config should read");
+            let paths = vec![dir.join(MODEL_SAFETENSORS)];
+            // SAFETY: the fixture remains immutable for the lifetime of the
+            // direct reference model.
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&paths, DType::F32, &Device::Cpu)
+                    .expect("fixture weights should map")
+            };
+            let reference = match architecture {
+                ModelArchitecture::Gemma2 => {
+                    let config: Gemma2Config =
+                        serde_json::from_slice(&raw_config).expect("Gemma2 config");
+                    let mut model = Gemma2Model::new(false, &config, vb).expect("Gemma2 reference");
+                    model
+                        .forward(&input, 0)
+                        .and_then(|logits| logits.squeeze(1))
+                        .and_then(|logits| logits.squeeze(0))
+                        .and_then(|logits| logits.to_vec1::<f32>())
+                        .expect("Gemma2 reference logits")
+                }
+                ModelArchitecture::Gemma3 => {
+                    let config: Gemma3Config =
+                        serde_json::from_slice(&raw_config).expect("Gemma3 config");
+                    let mut model = Gemma3Model::new(false, &config, vb).expect("Gemma3 reference");
+                    model
+                        .forward(&input, 0)
+                        .and_then(|logits| logits.squeeze(1))
+                        .and_then(|logits| logits.squeeze(0))
+                        .and_then(|logits| logits.to_vec1::<f32>())
+                        .expect("Gemma3 reference logits")
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(runtime_logits, reference);
+
+            let request = format!(
+                r#"{{"prompt":"hello","max_new_tokens":{}}}"#,
+                HOST_MAX_NEW_TOKENS + 1
+            );
+            let error = runtime
+                .generate(&[request.as_bytes()])
+                .expect_err("host generation limit must apply to Gemma");
+            assert!(matches!(error, CandleLlmError::InvalidRequest { .. }));
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn gemma3_multimodal_config_is_rejected_before_weight_loading() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-gemma3-multimodal-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            dir.join(CONFIG_JSON),
+            serde_json::json!({
+                "model_type": "gemma3",
+                "text_config": {"model_type": "gemma3_text"},
+                "vision_config": {"model_type": "siglip"}
+            })
+            .to_string(),
+        )
+        .expect("config");
+        let error = inspect_model_architecture("gemma-mm", &dir, ModelFormat::Safetensors)
+            .expect_err("multimodal Gemma3 must be refused");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(detail.contains("multimodal"));
+                assert!(detail.contains("vision_config"));
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn load_family_fixture(
+        tag: &str,
+        architecture: ModelArchitecture,
+        writer: impl FnOnce(&Path, ModelArchitecture) -> anyhow::Result<()>,
+    ) -> (CandleLlmRuntime, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-{}-{tag}-{}-{nanos}",
+            architecture.display_name(),
+            std::process::id()
+        ));
+        writer(&dir, architecture).expect("family fixture should be written");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny-family", &dir, "cpu", &HardwareStrategy::default())
+                .expect("family fixture should load without error")
+                .expect("family fixture should select the native Candle runtime");
+        (runtime, dir)
+    }
+
+    #[test]
+    fn phi3_and_compatible_phi4_configs_generate_and_stream() {
+        for architecture in [ModelArchitecture::Phi3, ModelArchitecture::Phi4] {
+            let (runtime, dir) =
+                load_family_fixture("generation", architecture, write_tachyon_tiny_phi_fixture);
+            let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
+            let buffered =
+                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let repeat =
+                String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+            assert_eq!(buffered, repeat);
+            let mut streamed = String::new();
+            runtime
+                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .expect("streamed");
+            assert_eq!(streamed, buffered);
+            assert_ne!(buffered.as_bytes(), b"MOCK_LLM_RESPONSE");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn deepseek_v2_v3_and_r1_compatible_configs_generate_and_stream() {
+        for architecture in [
+            ModelArchitecture::DeepSeekV2,
+            ModelArchitecture::DeepSeekV3,
+            ModelArchitecture::DeepSeekR1,
+        ] {
+            let (runtime, dir) = load_family_fixture(
+                "generation",
+                architecture,
+                write_tachyon_tiny_deepseek_fixture,
+            );
+            let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
+            let buffered =
+                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let repeat =
+                String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+            assert_eq!(buffered, repeat);
+            let mut streamed = String::new();
+            runtime
+                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .expect("streamed");
+            assert_eq!(streamed, buffered);
+            assert_ne!(buffered.as_bytes(), b"MOCK_LLM_RESPONSE");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
 
     fn load_fixture(tag: &str) -> (CandleLlmRuntime, PathBuf) {
         let nanos = std::time::SystemTime::now()
