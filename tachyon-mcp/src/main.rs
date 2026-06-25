@@ -1001,7 +1001,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_upload_model",
-                    "description": "Upload a local AI model to the cluster via the model broker. Point `path` at a complete model directory (weights plus tokenizer.json, and config.json for safetensors) or a single self-contained file on the MCP host machine. The directory is tar+gzip compressed on the fly during upload — no pre-built archive needed — and verified by hash on commit. On success the model is registered automatically and appears in the model list (/v1/models); the alias is derived from the directory/file name.",
+                    "description": "Upload a local AI model to the cluster via the model broker. Point `path` at a complete model directory (weights plus tokenizer.json, and config.json for safetensors) or a single self-contained file on the MCP host machine. The directory is tar+gzip compressed on the fly during upload — no pre-built archive needed — and verified by hash on commit. On success the model is registered automatically and appears in the model list (/ai/v1/models); the alias is derived from the directory/file name.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["path"],
@@ -1194,7 +1194,7 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                     {
                         "type": "text",
                         "text": format!(
-                            "Uploaded model from `{path}`. The broker is unpacking and registering it; it will appear in the model list (/v1/models).\n\nServer model path: {model_path}"
+                            "Uploaded model from `{path}`. The broker is unpacking and registering it; it will appear in the model list (/ai/v1/models).\n\nServer model path: {model_path}"
                         )
                     }
                 ]

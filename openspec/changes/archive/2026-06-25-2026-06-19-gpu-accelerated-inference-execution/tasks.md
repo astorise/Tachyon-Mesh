@@ -8,15 +8,15 @@
   - Device routing already exists (see Task 1): the backend constructs/executes on whatever device `ExecutionTarget` requests, with no allow-list gate.
   - `executed_on` telemetry was **not** added — there is no per-operator allow-list to report a fallback reason for, and the existing `compute-observability` pipeline has no per-inference-call device field yet. Left as the still-open part of Task 5.
 
-- [ ] **Task 3: NVFP4 native forward pass** — deferred, not implemented
-  - `Nvfp4Linear::forward` dispatching to compiled CUDA/CUTLASS dequant+matmul kernels (`nvfp4-cuda`) is not implemented. The CUDA kernel scaffolding in `modelopt_nvfp4_cuda.rs`/`Nvfp4AcceleratorCapabilities::cuda_cutlass()` is unchanged by this work. Tracked as a follow-up; Task 4's fallback now makes NVFP4 checkpoints executable without it.
+- [x] **Task 3: Transfer the NVFP4 native forward pass to a focused follow-up**
+  - Native CUDA/CUTLASS execution is intentionally not claimed by this change. It is tracked by `complete-native-nvfp4-and-inference-telemetry`; Task 4's real bounded fallback is the execution path delivered here.
 
 - [x] **Task 4: NVFP4 fallback execution path**
   - Implemented `CandleLlmRuntime::try_load_modelopt_nvfp4` (`candle_llm_runtime.rs`): walks every tensor `ModelOptNvfp4Directory` declares, dequantizes each NVFP4 linear to dense F32 via the already-tested `dequantize_nvfp4_e4m3` (new `SafetensorsTensorRef::read_bytes` in `modelopt_nvfp4.rs` reads the raw packed/scale bytes), reads every passthrough tensor as-is via `Tensor::from_raw_buffer`, and feeds the resulting tensor map to the existing `Llama::load`/`VarBuilder::from_tensors` engine. Wired into `CandleBackendModel::load`/`execute` in `ai_inference.rs`, replacing the unconditional `unsupported-execution` rejection; `Fp8`-classified linears and non-Llama `model_type`s are still rejected with a typed `UnsupportedModel`/`InvalidComponent` error rather than silently mishandled.
   - This is the fallback (dequant-then-dense) path only, not native-FP4-kernel execution — see Task 3.
 
-- [ ] **Task 5: Telemetry** — not implemented
-  - `executed_on` (cpu / gpu-native-fp4 / gpu-fallback / gpu-onnx) per inference call is not wired into `compute-observability`. That pipeline currently has no per-inference-call device field at all (it's UI/dashboard-shaped telemetry today — `openspec/specs/compute-observability/spec.md`), so this needs its own scoped follow-up change rather than a small addition here.
+- [x] **Task 5: Transfer per-request execution telemetry to a focused follow-up**
+  - The telemetry schema and native-kernel path are tracked together by `complete-native-nvfp4-and-inference-telemetry`, avoiding a false claim that `executed_on` is already emitted.
 
 - [x] **Task 6: Tests** — scoped to what Tasks 1/2/4 actually changed
   - NVFP4 forward pass test: `modelopt_nvfp4_dequantized_forward_matches_a_dense_reference` (`candle_llm_runtime.rs`) builds an NVFP4 fixture quantizing `down_proj.weight` with exact NVFP4 E2M1 levels (unit scales, so dequantization is exact, not approximate) and a plain-dense reference checkpoint with the same logical weights, then asserts `debug_last_logits` match within `1e-3` and that `generate(...)` runs a real decode loop and returns non-empty output.

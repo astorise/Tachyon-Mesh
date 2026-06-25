@@ -34,7 +34,7 @@ type UploadPreview = {
  * step-up command, so MFA is enforced by the privileged-command wrapper — this
  * panel never calls the Tauri command directly. Progress is reported through
  * the `upload_progress` event emitted by the command. On success the model is
- * registered automatically (broker → guest-openai) and appears in `/v1/models`.
+ * registered automatically (broker → guest-openai) and appears in `/ai/v1/models`.
  */
 export class TachyonModelUploadPanel extends TachyonConfigDashboard {
   private state: UploadState = "idle";
@@ -192,7 +192,7 @@ export class TachyonModelUploadPanel extends TachyonConfigDashboard {
     this.resultMessage = t("ai.upload.success").replace("{asset}", assetRef);
     this.render();
     this.bindEvents();
-    // Notify the parent AI panel so it re-fetches `/v1/models` and the freshly
+    // Notify the parent AI panel so it re-fetches `/ai/v1/models` and the freshly
     // uploaded model shows up without requiring a manual refresh. `composed` lets
     // the event escape this panel's shadow root and reach the parent's host.
     this.dispatchEvent(

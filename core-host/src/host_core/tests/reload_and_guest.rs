@@ -560,7 +560,7 @@ fn execute_guest_persists_volume_data_for_component_guest() {
 #[cfg(feature = "ai-inference")]
 #[tokio::test]
 async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
-    let mut route = IntegrityRoute::user("/v1/chat/completions");
+    let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.models = vec![IntegrityModelBinding {
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
@@ -599,7 +599,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         let ai_runtime_c = Arc::clone(&ai_runtime);
         let req = GuestRequest::new(
             "POST",
-            "/v1/chat/completions",
+            "/ai/v1/chat/completions",
             Bytes::from(serde_json::to_vec(&body_json).expect("encode")),
         );
         let (htx, hrx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();

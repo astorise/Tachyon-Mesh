@@ -332,6 +332,16 @@ jobs:
       - name: Run CUDA NCCL all-reduce proof
         run: cargo test -p core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
 
+      - name: Fetch CUTLASS headers
+        run: git clone --depth 1 --branch v4.3.5 https://github.com/NVIDIA/cutlass.git .ci-cutlass
+
+      - name: Run native NVFP4 parity and telemetry proof
+        env:
+          TACHYON_NVFP4_CUDA_SMOKE: "1"
+          TACHYON_NVFP4_NATIVE_REQUIRED: "1"
+          TACHYON_CUTLASS_INCLUDE_DIR: ${{ github.workspace }}/.ci-cutlass/include
+        run: cargo test -p core-host --features "candle-cuda nvfp4-cuda" nvfp4_cuda -- --nocapture
+
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos
   # integration test — plus doc tests.

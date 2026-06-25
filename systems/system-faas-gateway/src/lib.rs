@@ -94,7 +94,7 @@ fn route_baas_request(
             kind: GatewayTargetKind::MaterializedView,
         };
     }
-    // `/v1/*` (the OpenAI-compatible surface) are sealed user routes served by
+    // `/ai/v1/*` (the OpenAI-compatible surface) are sealed user routes served by
     // the `guest-openai` example FaaS; the gateway forwards them as ordinary
     // OLTP traffic rather than rewriting to a system adapter route.
     GatewayTarget {
@@ -255,18 +255,18 @@ mod tests {
     }
 
     #[test]
-    fn v1_models_passes_through_as_oltp() {
-        // `/v1/*` are sealed user routes (guest-openai); the gateway forwards
+    fn ai_v1_models_passes_through_as_oltp() {
+        // `/ai/v1/*` are sealed user routes (guest-openai); the gateway forwards
         // them unchanged rather than rewriting to a system adapter.
-        let target = route_baas_request("/v1/models", &[], b"");
+        let target = route_baas_request("/ai/v1/models", &[], b"");
         assert_eq!(target.kind, GatewayTargetKind::Oltp);
-        assert_eq!(target.route, "/v1/models");
+        assert_eq!(target.route, "/ai/v1/models");
     }
 
     #[test]
-    fn v1_chat_completions_passes_through_as_oltp() {
-        let target = route_baas_request("/v1/chat/completions", &[], b"{}");
+    fn ai_v1_chat_completions_passes_through_as_oltp() {
+        let target = route_baas_request("/ai/v1/chat/completions", &[], b"{}");
         assert_eq!(target.kind, GatewayTargetKind::Oltp);
-        assert_eq!(target.route, "/v1/chat/completions");
+        assert_eq!(target.route, "/ai/v1/chat/completions");
     }
 }

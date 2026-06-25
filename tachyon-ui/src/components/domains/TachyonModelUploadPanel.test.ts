@@ -76,7 +76,7 @@ describe("TachyonModelUploadPanel", () => {
 
     const result = panel.shadowRoot?.querySelector("[data-upload-result]");
     expect(result?.textContent).toContain("gguf/llama");
-    expect(result?.textContent).toContain("/v1/models");
+    expect(result?.textContent).toContain("/ai/v1/models");
   });
 
   it("renders live progress from upload_progress events", async () => {

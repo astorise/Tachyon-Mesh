@@ -218,3 +218,60 @@ extern "C" int tachyon_nvfp4_cutlass_linear_f32(TachyonNvfp4LinearF32Params para
   nvfp4_linear_f32_kernel<<<launch_size(total), 256, 0, params.stream>>>(params);
   return cudaGetLastError();
 }
+
+extern "C" int tachyon_nvfp4_cutlass_linear_f32_host(
+    const float* input,
+    const uint8_t* packed_weight,
+    const uint8_t* weight_scale_e4m3,
+    float tensor_scale,
+    float* output,
+    int64_t m,
+    int64_t n,
+    int64_t k) {
+  if (validate_nvfp4_shape(n, k) != cudaSuccess || input == nullptr ||
+      packed_weight == nullptr || weight_scale_e4m3 == nullptr || output == nullptr ||
+      m <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  float* device_input = nullptr;
+  uint8_t* device_weight = nullptr;
+  uint8_t* device_scales = nullptr;
+  float* device_output = nullptr;
+  const size_t input_bytes = static_cast<size_t>(m * k) * sizeof(float);
+  const size_t weight_bytes = static_cast<size_t>(n * (k / 2));
+  const size_t scale_bytes = static_cast<size_t>(n * (k / kNvfp4BlockSize));
+  const size_t output_bytes = static_cast<size_t>(m * n) * sizeof(float);
+
+  cudaError_t status = cudaMalloc(&device_input, input_bytes);
+  if (status != cudaSuccess) goto cleanup;
+  status = cudaMalloc(&device_weight, weight_bytes);
+  if (status != cudaSuccess) goto cleanup;
+  status = cudaMalloc(&device_scales, scale_bytes);
+  if (status != cudaSuccess) goto cleanup;
+  status = cudaMalloc(&device_output, output_bytes);
+  if (status != cudaSuccess) goto cleanup;
+  status = cudaMemcpy(device_input, input, input_bytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) goto cleanup;
+  status = cudaMemcpy(device_weight, packed_weight, weight_bytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) goto cleanup;
+  status = cudaMemcpy(device_scales, weight_scale_e4m3, scale_bytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) goto cleanup;
+
+  {
+    TachyonNvfp4LinearF32Params params{
+        device_input, device_weight, device_scales, tensor_scale, device_output,
+        m, n, k, nullptr};
+    nvfp4_linear_f32_kernel<<<launch_size(m * n), 256>>>(params);
+  }
+  status = cudaGetLastError();
+  if (status != cudaSuccess) goto cleanup;
+  status = cudaMemcpy(output, device_output, output_bytes, cudaMemcpyDeviceToHost);
+
+cleanup:
+  cudaFree(device_output);
+  cudaFree(device_scales);
+  cudaFree(device_weight);
+  cudaFree(device_input);
+  return status;
+}

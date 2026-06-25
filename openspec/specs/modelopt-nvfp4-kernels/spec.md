@@ -50,18 +50,20 @@ The runtime SHALL provide deterministic fallback dequantization from packed NVFP
 - **AND** no partial dense tensor is returned
 
 ### Requirement: Native FP4 acceleration MUST be capability-gated
-The runtime SHALL only select native NVFP4 dequant/matmul kernels when the accelerator backend reports compatible hardware, driver/runtime support, and kernel availability.
 
-#### Scenario: Compatible backend selects native FP4
-- **WHEN** the selected accelerator reports native FP4 capability
-- **AND** required NVFP4 kernels are compiled and available
-- **THEN** the runtime may execute packed FP4 weights without eager BF16/F32 dequantization
+The runtime SHALL execute packed NVFP4 weights through native kernels only when compatible hardware, drivers, and compiled kernels are available; otherwise it SHALL use the bounded fallback or reject execution.
 
-#### Scenario: Unsupported accelerator falls back or rejects
-- **WHEN** the selected accelerator lacks native NVFP4 support
-- **AND** fallback dequantization is allowed within configured memory limits
-- **THEN** the runtime uses the BF16/F32 fallback path
-- **AND** if fallback exceeds configured limits, startup or inference fails with an unsupported-accelerator error
+#### Scenario: Native kernels are available
+
+- **WHEN** a compatible CUDA backend and native NVFP4 kernels are available
+- **THEN** inference executes without eager full-model dense dequantization
+- **AND** output is validated against the fallback reference
+
+#### Scenario: Native kernels are unavailable
+
+- **WHEN** native execution is unavailable
+- **THEN** the runtime uses the bounded fallback only when configured memory limits permit it
+- **AND** otherwise returns a typed unsupported-execution error
 
 ### Requirement: CUDA/CUTLASS NVFP4 backend MUST be feature-gated
 The runtime SHALL expose a concrete CUDA/CUTLASS native backend only when the `nvfp4-cuda` feature is enabled and the build has CUDA/CUTLASS inputs.
@@ -80,3 +82,67 @@ The runtime SHALL expose a concrete CUDA/CUTLASS native backend only when the `n
 - **WHEN** `nvfp4-cuda` is enabled with CUDA toolkit and CUTLASS include paths
 - **THEN** the build compiles the native NVFP4 CUDA source
 - **AND** runtime capability checks can report compiled dequant and matmul kernels
+
+### Requirement: Mixed FP8 and NVFP4 operators MUST compose in one forward graph
+
+The ModelOpt runtime SHALL execute a single architecture graph containing dense
+BF16/F16 tensors, FP8 projections, and W4A16 NVFP4 projections according to the
+checkpoint's quantized-layer metadata.
+
+#### Scenario: Operator selects declared quantization
+
+- **WHEN** quantization metadata assigns FP8, W4A16 NVFP4, or dense storage to an
+  operator
+- **THEN** the runtime dispatches that operator through the matching typed
+  implementation
+
+#### Scenario: Unknown mixed-precision assignment is rejected
+
+- **WHEN** quantization metadata assigns an unsupported algorithm to a required
+  operator
+- **THEN** loading fails with the operator name and quantization algorithm
+
+### Requirement: NVFP4 sparse experts MUST avoid full-model densification
+
+The runtime SHALL execute selected NVFP4 experts without eagerly dequantizing
+all experts or all layers into dense accelerator tensors.
+
+#### Scenario: Only active experts are materialized
+
+- **WHEN** sparse routing selects a subset of experts
+- **THEN** only those experts and shared experts are transferred, dequantized,
+  or executed for that token batch
+
+#### Scenario: Fallback is memory bounded
+
+- **WHEN** native NVFP4 expert kernels are unavailable
+- **THEN** fallback dequantization is limited to the active expert/layer window
+- **AND** execution is rejected when configured host or accelerator memory
+  limits would be exceeded
+
+### Requirement: Native mixed-precision execution MUST remain capability-gated
+
+Production-sized compatible checkpoints SHALL use native FP8/NVFP4 kernels only
+when hardware, runtime, and compiled-kernel capabilities satisfy the operator
+requirements.
+
+#### Scenario: Production checkpoint lacks required native capability
+
+- **WHEN** a checkpoint exceeds the configured fallback memory threshold
+- **AND** required native FP8 or NVFP4 kernels are unavailable
+- **THEN** the runtime rejects execution with the missing capabilities
+
+#### Scenario: Compatible native backend executes packed weights
+
+- **WHEN** the accelerator reports all required native capabilities
+- **THEN** packed FP8/NVFP4 weights execute without full eager dense conversion
+
+### Requirement: NVFP4 execution path MUST be observable
+
+The runtime SHALL record whether each NVFP4 request used native FP4, dense GPU fallback, CPU fallback, or failed before execution.
+
+#### Scenario: Operator inspects an NVFP4 request
+
+- **WHEN** an operator reads inference telemetry
+- **THEN** the actual execution path is present without requiring source inspection
+

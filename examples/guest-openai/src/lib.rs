@@ -6,7 +6,7 @@
 //! Its `openai-faas-guest` world imports `kv-partition` (the shared
 //! `ai-models-registry` table is read and written directly — no separate
 //! registry FaaS and no outbound mesh hop) and `tachyon:accelerator/cpu`, so
-//! `/v1/chat/completions` runs real inference on the host CPU accelerator.
+//! `/ai/v1/chat/completions` runs real inference on the host CPU accelerator.
 //!
 //! The registry is read fresh from `kv-partition` on every request (no in-guest
 //! cache), so a model registered on any instance — e.g. via the
@@ -40,8 +40,8 @@ const MODELS_TABLE: &str = "ai-models-registry";
 const ROUTE_REGISTER: &str = "/internal/guest-openai/register";
 const ROUTE_DEREGISTER_PREFIX: &str = "/internal/guest-openai/deregister/";
 // OpenAI-compatible endpoints (client-facing).
-const ROUTE_MODELS: &str = "/v1/models";
-const ROUTE_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+const ROUTE_MODELS: &str = "/ai/v1/models";
+const ROUTE_CHAT_COMPLETIONS: &str = "/ai/v1/chat/completions";
 
 /// Generation defaults when the request omits them. The host clamps these to its
 /// own hard caps (`HOST_MAX_NEW_TOKENS`, context window).
@@ -216,7 +216,7 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
     ))
 }
 
-/// Run `/v1/chat/completions` against the host CPU accelerator.
+/// Run `/ai/v1/chat/completions` against the host CPU accelerator.
 /// Routes to the streaming SSE path when `stream: true`, buffered otherwise.
 fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let request: ChatCompletionRequest = serde_json::from_slice(body)
@@ -295,7 +295,7 @@ fn handle_chat_completions_buffered(
         .map_err(|e| format!("failed to encode chat completion response: {e}"))
 }
 
-/// Stream `/v1/chat/completions` as Server-Sent Events. Each decoded token
+/// Stream `/ai/v1/chat/completions` as Server-Sent Events. Each decoded token
 /// fragment becomes a `chat.completion.chunk` frame; the stream is terminated
 /// by `data: [DONE]`. The host `streaming-response` resource is used to flush
 /// status + headers first, then each SSE frame as it is produced.
@@ -430,7 +430,7 @@ fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, S
 }
 
 /// Read the registry fresh from kv-partition and reshape into the OpenAI
-/// `/v1/models` response. No caching — a newly registered model is visible on
+/// `/ai/v1/models` response. No caching — a newly registered model is visible on
 /// the next call from any instance.
 fn handle_list_models() -> Result<(u16, Vec<u8>), String> {
     let data = list_models()?
@@ -603,6 +603,15 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_slice(&body).expect("serialized error should parse");
         assert!(parsed["error"]["message"].is_string());
+    }
+
+    #[test]
+    fn former_v1_routes_are_not_exposed() {
+        for (method, path) in [("GET", "/v1/models"), ("POST", "/v1/chat/completions")] {
+            let (status, _) = route_request(method, path, b"{}")
+                .expect("obsolete route should return a response");
+            assert_eq!(status, 404, "{method} {path} must remain absent");
+        }
     }
 
     #[test]

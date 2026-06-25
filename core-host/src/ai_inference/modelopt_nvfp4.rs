@@ -1083,6 +1083,36 @@ impl PreparedLinear {
         }
         Ok(output)
     }
+
+    pub(crate) fn matvec_native_nvfp4(&self, input: &[f32]) -> Result<Vec<f32>> {
+        match self {
+            Self::Nvfp4 {
+                rows,
+                cols,
+                packed,
+                scales,
+                tensor_scale,
+            } => {
+                #[cfg(feature = "nvfp4-cuda")]
+                {
+                    return cuda::Nvfp4CudaBackend::linear_f32_host(
+                        input,
+                        packed,
+                        scales,
+                        *tensor_scale,
+                        *rows,
+                        *cols,
+                    );
+                }
+                #[cfg(not(feature = "nvfp4-cuda"))]
+                {
+                    let _ = (rows, cols, packed, scales, tensor_scale, input);
+                    bail!("native NVFP4 execution requires the `nvfp4-cuda` feature")
+                }
+            }
+            _ => self.matvec(input),
+        }
+    }
 }
 
 impl ModelOptLinearTensors {
@@ -2106,6 +2136,29 @@ mod tests {
         let fp8_output = fp8.matvec(&dense_output).expect("fp8");
         let output = nvfp4.matvec(&fp8_output).expect("nvfp4");
         assert_eq!(output, vec![16.0]);
+    }
+
+    #[cfg(feature = "nvfp4-cuda")]
+    #[test]
+    fn nvfp4_cuda_host_linear_matches_fallback() {
+        if std::env::var("TACHYON_NVFP4_CUDA_SMOKE").as_deref() != Ok("1") {
+            return;
+        }
+        let linear = PreparedLinear::Nvfp4 {
+            rows: 2,
+            cols: 16,
+            packed: vec![0x22; 16],
+            scales: vec![0x38; 2],
+            tensor_scale: 1.0,
+        };
+        let input = vec![1.0f32; 16];
+        let fallback = linear.matvec(&input).expect("fallback");
+        let native = linear
+            .matvec_native_nvfp4(&input)
+            .expect("native CUDA linear");
+        for (actual, expected) in native.iter().zip(fallback) {
+            assert!((actual - expected).abs() < 1e-4);
+        }
     }
 
     #[test]

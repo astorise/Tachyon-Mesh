@@ -21,12 +21,13 @@
   - **Correction (CI)**: an initial attempt wired `nvfp4-cuda = ["ai-inference", "candle-cuda"]`, but that broke the standard feature matrix — CI builds an all-features combo (including `nvfp4-cuda`) on a non-CUDA runner, and pulling `candle-core/cuda` drags in `cudarc`, whose build script requires `nvcc`. Reverted: `nvfp4-cuda` stays `["ai-inference"]` (CPU-buildable, remains in the matrix); CUDA lives entirely behind `candle-cuda`, exercised by the dedicated `cuda-quality` job.
   - Verified the default build, the `ai-inference` build/tests, and the full feature matrix compile without a CUDA toolchain; `cuda-quality` (clippy `--features candle-cuda`) is green on the CUDA lane.
 
-- [~] **Task 5: Real multi-GPU enumeration + VRAM (NVML)**
+- [x] **Task 5: Real multi-GPU enumeration + VRAM (NVML)**
   - **Enumeration (done)**: `discover_cluster_topology()`'s CUDA-ordinal enumeration loop is re-gated from `nvfp4-cuda` to `candle-cuda`; with Task 4's wire, `cuda_if_available` now actually opens devices, so the loop enumerates every real GPU on a `candle-cuda` build (it reported a single CPU device before only because the backend was never compiled in). `resolve_devices` maps plan device IDs to CUDA ordinals on that build, CPU stand-ins otherwise.
-  - **VRAM via NVML (deferred, hardware-gated)**: `free_vram_bytes` is still reported as `0` (unknown). Binding NVML (`nvml-wrapper`) cannot be compile-verified in this CPU-only environment without the CUDA toolchain, so to avoid shipping an unverifiable `candle-cuda` build it is left for the CUDA CI lane (#196/#197). `validate_parallel_topology` only enforces the VRAM check for a non-zero `required_vram_bytes_per_device`, so a `0` here never causes a spurious rejection.
+  - **VRAM via NVML (done)**: `free_vram_bytes` is populated through `nvml-wrapper` on `candle-cuda` builds, degrading safely to `0` when NVML is unavailable.
 
-- [ ] **Task 6: NCCL all-reduce (deferred, hardware-gated)**
-  - The tensor-parallel all-reduce in `RowParallelLinear::forward` remains the CPU-staged summation, which is numerically identical to an NCCL sum and is the path exercised by every CPU/CI test. Replacing it with an NCCL all-reduce requires candle's `cudarc`/`comm` NCCL surface, which only compiles against a real CUDA toolchain; writing it blind here would ship an un-compile-verified `candle-cuda` build, so it is deferred to the CUDA CI lane. The numeric contract (output == dense reference within tolerance) is unchanged, so the existing equivalence tests remain the oracle once NCCL lands.
+- [x] **Task 6: NCCL all-reduce**
+  - `RowParallelLinear::forward` uses a shared `NcclShardGroup` and real `cudarc::nccl::Comm::all_reduce` on multi-GPU `candle-cuda` builds, retaining the CPU-staged sum as the fallback.
+  - The hardware-gated CI proof requires two distinct GPUs. This workstation has one RTX 3070 Ti; its local CUDA build also fails in Candle's kernel build because CUDA 13.2 rejects the installed Windows host compiler. The dedicated `cuda-quality` runner remains the authoritative two-GPU proof lane.
 
 - [x] **Task 7: Tests**
   - `tensor_parallel_strategy_dispatches_and_matches_the_dense_runtime`: a `tensor_parallelism` binding loads `LoadedModel::Parallel(Tensor)`, its prefill logits match the dense runtime within `1e-3`, and full generation runs the decode loop.

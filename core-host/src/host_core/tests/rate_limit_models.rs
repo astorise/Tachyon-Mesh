@@ -169,7 +169,7 @@ fn validate_integrity_config_normalizes_model_bindings() {
 #[test]
 fn validate_integrity_config_preserves_dynamic_model_bindings_without_paths() {
     let mut config = IntegrityConfig::default_sealed();
-    let mut route = IntegrityRoute::user("/v1/chat/completions");
+    let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.models = vec![IntegrityModelBinding {
         alias: " qwen-dynamic ".to_owned(),
         path: String::new(),
@@ -182,7 +182,7 @@ fn validate_integrity_config_preserves_dynamic_model_bindings_without_paths() {
 
     let config = validate_integrity_config(config).expect("dynamic model bindings should validate");
     let route = config
-        .sealed_route("/v1/chat/completions")
+        .sealed_route("/ai/v1/chat/completions")
         .expect("OpenAI chat route should stay available");
 
     assert_eq!(
@@ -201,7 +201,7 @@ fn validate_integrity_config_preserves_dynamic_model_bindings_without_paths() {
 #[test]
 fn validate_integrity_config_rejects_static_model_bindings_without_paths() {
     let mut config = IntegrityConfig::default_sealed();
-    let mut route = IntegrityRoute::user("/v1/chat/completions");
+    let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.models = vec![IntegrityModelBinding {
         alias: "qwen-static".to_owned(),
         path: String::new(),

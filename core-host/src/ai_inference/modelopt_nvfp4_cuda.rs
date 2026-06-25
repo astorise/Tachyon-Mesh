@@ -43,6 +43,16 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> c_int;
     fn tachyon_nvfp4_cutlass_linear_f32(params: Nvfp4CudaLinearF32Params) -> c_int;
+    fn tachyon_nvfp4_cutlass_linear_f32_host(
+        input: *const f32,
+        packed_weight: *const u8,
+        weight_scale_e4m3: *const u8,
+        tensor_scale: f32,
+        output: *mut f32,
+        m: i64,
+        n: i64,
+        k: i64,
+    ) -> c_int;
 }
 
 pub(crate) struct Nvfp4CudaBackend;
@@ -137,6 +147,54 @@ impl Nvfp4CudaBackend {
 
     #[cfg(not(tachyon_nvfp4_cuda_compiled))]
     pub(crate) unsafe fn launch_linear_f32(_params: Nvfp4CudaLinearF32Params) -> Result<()> {
+        Err(anyhow!(
+            "NVFP4 CUDA backend was enabled but native CUDA/CUTLASS kernels were not compiled"
+        ))
+    }
+
+    #[cfg(tachyon_nvfp4_cuda_compiled)]
+    pub(crate) fn linear_f32_host(
+        input: &[f32],
+        packed_weight: &[u8],
+        weight_scale_e4m3: &[u8],
+        tensor_scale: f32,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>> {
+        if input.len() != cols {
+            return Err(anyhow!(
+                "NVFP4 input has {} values, expected {cols}",
+                input.len()
+            ));
+        }
+        let mut output = vec![0.0f32; rows];
+        cuda_status(
+            unsafe {
+                tachyon_nvfp4_cutlass_linear_f32_host(
+                    input.as_ptr(),
+                    packed_weight.as_ptr(),
+                    weight_scale_e4m3.as_ptr(),
+                    tensor_scale,
+                    output.as_mut_ptr(),
+                    1,
+                    i64::try_from(rows)?,
+                    i64::try_from(cols)?,
+                )
+            },
+            "execute host-backed NVFP4 CUDA/CUTLASS linear",
+        )?;
+        Ok(output)
+    }
+
+    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
+    pub(crate) fn linear_f32_host(
+        _input: &[f32],
+        _packed_weight: &[u8],
+        _weight_scale_e4m3: &[u8],
+        _tensor_scale: f32,
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<Vec<f32>> {
         Err(anyhow!(
             "NVFP4 CUDA backend was enabled but native CUDA/CUTLASS kernels were not compiled"
         ))

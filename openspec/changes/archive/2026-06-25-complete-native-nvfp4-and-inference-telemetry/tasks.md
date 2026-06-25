@@ -1,0 +1,5 @@
+- [x] Implement native packed NVFP4 CUDA/CUTLASS forward execution.
+- [x] Enforce configured fallback memory budgets in the production load path.
+- [x] Add per-request `executed_on` telemetry for CPU, GPU ONNX, GPU native FP4, and GPU fallback.
+- [x] Add CUDA-runner parity and telemetry tests.
+- [x] Update the NVFP4 operator runbook.

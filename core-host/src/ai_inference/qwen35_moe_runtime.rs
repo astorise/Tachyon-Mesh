@@ -15,7 +15,9 @@ use super::{
     architecture_registry::{ArchitectureDescriptor, ArchitectureKind, ArchitectureMatch},
     candle_llm_runtime::{ChatTemplate, ChatTurn, HOST_MAX_NEW_TOKENS},
     modelopt_nvfp4::{
-        ModelOptLinearTensors, ModelOptNvfp4Directory, PreparedLinear, SafetensorsDType,
+        ModelOptLinearTensors, ModelOptNvfp4Directory, Nvfp4AcceleratorCapabilities,
+        Nvfp4ExecutionPlan, Nvfp4FallbackMemoryLimits, Nvfp4FallbackScope,
+        Nvfp4KernelSelectionMode, Nvfp4OutputDType, PreparedLinear, SafetensorsDType,
         NVFP4_BLOCK_SIZE,
     },
 };
@@ -370,6 +372,8 @@ pub(crate) struct Qwen35MoeRuntime {
     tokenizer: Tokenizer,
     chat_template: Option<ChatTemplate>,
     max_dense_operator_bytes: u64,
+    execution_plan: Nvfp4ExecutionPlan,
+    executed_on: &'static str,
     working_set: Mutex<LinearWorkingSet>,
 }
 
@@ -504,6 +508,32 @@ impl Qwen35MoeRuntime {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(1024 * 1024 * 1024);
+        let fallback_limits = Nvfp4FallbackMemoryLimits {
+            max_host_ram_bytes: env_u64("TACHYON_NVFP4_MAX_HOST_RAM_BYTES"),
+            max_accelerator_bytes: env_u64("TACHYON_NVFP4_MAX_ACCELERATOR_BYTES"),
+        };
+        let mode = if std::env::var("TACHYON_NVFP4_NATIVE_REQUIRED").as_deref() == Ok("1") {
+            Nvfp4KernelSelectionMode::NativeRequired
+        } else {
+            Nvfp4KernelSelectionMode::NativePreferred
+        };
+        let capabilities = if requested_device == "gpu" {
+            Nvfp4AcceleratorCapabilities::cuda_cutlass()
+        } else {
+            Nvfp4AcceleratorCapabilities::fallback_only()
+        };
+        let execution_plan = model.select_execution_plan(
+            &capabilities,
+            Nvfp4OutputDType::F32,
+            Nvfp4FallbackScope::LayerWindow(1),
+            fallback_limits,
+            mode,
+        )?;
+        let executed_on = match (&execution_plan, requested_device) {
+            (Nvfp4ExecutionPlan::Native { .. }, _) => "gpu_native_fp4",
+            (Nvfp4ExecutionPlan::Fallback(_), "gpu") => "gpu_fallback",
+            (Nvfp4ExecutionPlan::Fallback(_), _) => "cpu_fallback",
+        };
         Ok(Self {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
@@ -512,12 +542,18 @@ impl Qwen35MoeRuntime {
             tokenizer,
             chat_template,
             max_dense_operator_bytes,
+            execution_plan,
+            executed_on,
             working_set: Mutex::new(LinearWorkingSet::new(working_set_bytes)),
         })
     }
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn executed_on(&self) -> &'static str {
+        self.executed_on
     }
 
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>> {
@@ -821,10 +857,18 @@ impl Qwen35MoeRuntime {
                 prepared
             }
         };
-        prepared
-            .matvec(input)
-            .with_context(|| format!("Qwen operator `{base}` failed"))
+        match &self.execution_plan {
+            Nvfp4ExecutionPlan::Native { .. } => prepared.matvec_native_nvfp4(input),
+            Nvfp4ExecutionPlan::Fallback(_) => prepared.matvec(input),
+        }
+        .with_context(|| format!("Qwen operator `{base}` failed"))
     }
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
 }
 
 #[derive(Debug)]

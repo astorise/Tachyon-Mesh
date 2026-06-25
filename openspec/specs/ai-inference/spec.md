@@ -114,15 +114,29 @@ The orchestration configuration SHALL allow operators to define a `tensor_parall
 - **AND** rejects startup with a typed configuration error if the requested GPU topology is unavailable.
 
 ### Requirement: AI inference bindings MUST classify ModelOpt/NVFP4 directories without mock execution
-The AI inference runtime SHALL load supported ModelOpt/NVFP4 model bindings as typed component sets and SHALL NOT return mock inference output for those aliases.
 
-#### Scenario: Detected NVFP4 alias refuses execution until backend is configured
+The AI inference runtime SHALL load supported ModelOpt/NVFP4 model bindings as
+typed component sets and SHALL NOT return mock inference output for those
+aliases. When a registered architecture backend matches the checkpoint, the
+runtime SHALL execute real inference; otherwise it SHALL return an actionable
+unsupported-architecture error.
+
+#### Scenario: Detected NVFP4 alias executes with a supported architecture
+
 - **WHEN** a preloaded model alias is classified as ModelOpt/NVFP4
-- **AND** a guest or host caller submits an inference request for that alias
-- **THEN** the runtime returns an actionable unsupported-execution error
+- **AND** a registered architecture backend validates its metadata and tensors
+- **THEN** inference executes through that architecture backend
+- **AND** the response is not `MOCK_LLM_RESPONSE`
+
+#### Scenario: Detected NVFP4 alias refuses an unsupported architecture
+
+- **WHEN** a preloaded model alias is classified as ModelOpt/NVFP4
+- **AND** no registered architecture backend accepts it
+- **THEN** the runtime returns an actionable unsupported-architecture error
 - **AND** the response is not `MOCK_LLM_RESPONSE`
 
 #### Scenario: Existing ONNX guest path remains available
+
 - **WHEN** a legacy guest loads an ONNX model through WASI-NN
 - **THEN** the host continues to use the candle-onnx backend
 - **AND** ModelOpt/NVFP4 loading does not change the ONNX graph encoding contract
@@ -193,17 +207,31 @@ The Candle LLM runtime SHALL enforce prompt length, max-new-token, batch size, a
 - **AND** the behavior is reported in the response or error path
 
 ### Requirement: Existing ONNX and NVFP4 boundaries MUST remain unchanged
-Adding a real Candle LLM runtime SHALL NOT change legacy Candle ONNX/WASI-NN graph loading or the ModelOpt/NVFP4 unsupported-execution boundary.
+
+Adding a new ModelOpt/NVFP4 architecture runtime SHALL NOT change legacy Candle
+ONNX/WASI-NN graph loading. NVFP4 checkpoints SHALL execute only when an
+explicit architecture backend validates their metadata and tensor contract;
+all other NVFP4 checkpoints SHALL preserve the non-mock unsupported boundary.
 
 #### Scenario: Legacy ONNX guest still uses candle-onnx
+
 - **WHEN** a legacy guest loads an ONNX model through WASI-NN
 - **THEN** the host continues to use the candle-onnx backend
-- **AND** Candle LLM binding classification does not change the ONNX graph encoding contract
+- **AND** architecture backend selection does not change the ONNX graph
+  encoding contract
 
-#### Scenario: ModelOpt/NVFP4 alias remains non-mock and unsupported for text generation
+#### Scenario: Supported ModelOpt/NVFP4 alias generates text
+
+- **WHEN** a preloaded ModelOpt/NVFP4 alias matches a registered text-generation
+  architecture backend
+- **THEN** buffered and streaming inference execute real model generation
+- **AND** the response is not `MOCK_LLM_RESPONSE`
+
+#### Scenario: Unsupported ModelOpt/NVFP4 alias remains non-mock
+
 - **WHEN** a preloaded model alias is classified as ModelOpt/NVFP4
-- **AND** no complete architecture execution runtime is configured for that alias
-- **THEN** inference returns the existing actionable unsupported-execution error
+- **AND** no architecture backend is configured for that alias
+- **THEN** inference returns an actionable unsupported-execution error
 - **AND** the response is not `MOCK_LLM_RESPONSE`
 
 ### Requirement: Real Candle LLM validation MUST run without network downloads
@@ -284,6 +312,7 @@ excluding) the earliest match. An empty or oversized stop entry SHALL be ignored
 - **THEN** the runtime filters and caps the list before decoding
 
 ### Requirement: The runtime streams decoded fragments incrementally
+
 The runtime SHALL provide a streaming generation path that emits each newly
 decoded text fragment as it is produced, such that the concatenation of all
 fragments equals the buffered generation output for the same request. While
@@ -291,14 +320,23 @@ streaming with stop sequences, the runtime SHALL hold back the trailing text
 that could begin a stop match until a further token confirms it is safe to emit.
 
 #### Scenario: Streamed fragments reconstruct the buffered output
+
 - **WHEN** the same request is run buffered and streamed
 - **THEN** the streamed path emits one or more fragments
 - **AND** their concatenation equals the buffered output byte-for-byte
 
-#### Scenario: Non-text backends fall back to a single fragment
+#### Scenario: Non-generative backends fall back to a single fragment
+
 - **WHEN** a streaming request targets a backend that cannot decode
-  incrementally (mock or NVFP4)
+  incrementally, such as an explicit mock backend
 - **THEN** the runtime emits the entire output as one fragment
+
+#### Scenario: Supported NVFP4 architecture streams tokens
+
+- **WHEN** a streaming request targets a ModelOpt/NVFP4 checkpoint with a
+  registered autoregressive architecture backend
+- **THEN** decoded text fragments are emitted incrementally as tokens are
+  generated
 
 ### Requirement: The accelerator exposes a streaming compute primitive
 The `tachyon:accelerator/cpu` interface SHALL provide a `compute-stream`
@@ -318,4 +356,249 @@ are unaffected.
 - **WHEN** a guest calls `compute-stream` for a handle it does not hold, or for
   an alias not sealed for its route
 - **THEN** the host rejects the call with an error, exactly as `compute` does
+
+### Requirement: The runtime MUST execute tensor-parallel inference across multiple GPUs
+When a model deployment is configured with `hardware_strategy.distribution_mode: tensor_parallelism` and `multi_gpu: true`, the inference runtime SHALL shard transformer layer weights across the configured GPU set and SHALL synchronize partial results between shards on every layer that requires it using a real collective-communication primitive on CUDA hardware, falling back to a host-staged reduction only when no CUDA backend with multiple participating GPUs is available.
+
+#### Scenario: A model exceeding single-GPU VRAM is sharded across GPUs
+- **GIVEN** a model deployment configured with `distribution_mode: tensor_parallelism` and a GPU set whose combined VRAM, but not any single member's VRAM, can hold the model
+- **WHEN** the model broker loads the model
+- **THEN** the runtime partitions attention and MLP weights across the configured GPUs
+- **AND** synchronizes partial activations across shards via an all-reduce/all-gather step per transformer block
+- **AND** produces output numerically equivalent (within floating-point tolerance) to a single-GPU reference run of the same model on hardware where that reference fits
+
+#### Scenario: Single-GPU deployments are unaffected
+- **WHEN** a model deployment is configured with `distribution_mode: single` or `multi_gpu: false`
+- **THEN** the runtime executes the existing single-device path unchanged
+- **AND** no tensor-parallel synchronization code path is invoked
+
+#### Scenario: A real NCCL collective performs the all-reduce on CUDA hardware
+- **GIVEN** the runtime is built with the `candle-cuda` feature and a tensor-parallel shard group spans 2 or more CUDA devices
+- **WHEN** `RowParallelLinear::forward` synchronizes partial outputs across the shard group
+- **THEN** the runtime issues a real NCCL `AllReduce` collective across the participating devices' communicators
+- **AND** the reduced result matches the existing host-staged-sum reference within `1e-4` tolerance
+
+#### Scenario: The host-staged fallback remains correct when no multi-GPU CUDA group is available
+- **GIVEN** the runtime is built without the `candle-cuda` feature, or a shard group has fewer than 2 CUDA devices, or the shard group runs on `Device::Cpu`
+- **WHEN** `RowParallelLinear::forward` synchronizes partial outputs
+- **THEN** the runtime performs the existing host-staged manual sum across devices
+- **AND** the result is unchanged from the pre-existing behavior, with no regression in any CPU-only test
+
+### Requirement: The runtime MUST execute pipeline-parallel inference across multiple nodes
+When a model deployment is configured with `hardware_strategy.distribution_mode: pipeline_parallelism`, the runtime SHALL assign contiguous layer ranges to distinct nodes/GPUs, SHALL stream activations between pipeline stages over a point-to-point transport implementing `StageTransport`, and SHALL support full autoregressive generation (prefill followed by an arbitrary number of decode steps), not prefill alone.
+
+#### Scenario: Layers are split across pipeline stages
+- **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` across N nodes
+- **WHEN** the model broker loads the model
+- **THEN** each node is assigned a contiguous, non-overlapping range of layers
+- **AND** each node executes its layer range with a real transformer-block forward pass
+
+#### Scenario: A pipeline-parallel deployment generates more than one token
+- **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` and successfully loaded
+- **WHEN** a generation request is submitted with `max_tokens > 1`
+- **THEN** the runtime completes an initial prefill pass across all stages
+- **AND** completes a decode pass for each subsequent token, each stage reusing a persistent per-stage KV cache rather than rebuilding it from scratch
+- **AND** the final output is numerically equivalent (within floating-point tolerance) to a dense single-device reference run of the same model and prompt for the same number of tokens
+
+#### Scenario: Pipeline depth bounds in-flight micro-batches
+- **GIVEN** a pipeline-parallel deployment with a configured pipeline depth
+- **WHEN** multiple inference requests are in flight concurrently
+- **THEN** the scheduler admits at most the configured number of micro-batches into the pipeline at once
+- **AND** additional requests queue rather than unboundedly growing per-stage memory usage
+
+### Requirement: The runtime MUST execute expert-parallel inference for Mixture-of-Experts checkpoints
+For checkpoints declaring expert tensors (e.g. Mixtral-style `model_type: mixtral` checkpoints), the runtime SHALL load the checkpoint, partition experts across the configured GPU/node set, and SHALL route each token only to the device(s) hosting its selected expert, rather than rejecting expert-parallel deployments outright or replicating all experts on every device.
+
+#### Scenario: An MoE checkpoint is loaded and partitioned across devices
+- **GIVEN** a model deployment configured with `distribution_mode: expert_parallelism` and a checkpoint whose `config.json` declares `model_type: mixtral`
+- **WHEN** the model broker loads the model
+- **THEN** the runtime parses the checkpoint's MoE-specific config fields (`num_local_experts`, `num_experts_per_tok`)
+- **AND** partitions experts across the configured device set per the deployment's `hardware_strategy.expert_device_map`, falling back to an even round-robin placement for any expert the map does not explicitly pin
+- **AND** does not load a full replica of every expert onto every device
+
+#### Scenario: Mixed dense and MoE layers in the same checkpoint load correctly
+- **GIVEN** a checkpoint where some transformer layers declare expert tensors and others do not
+- **WHEN** the model broker loads the model
+- **THEN** layers without expert tensors execute the existing dense MLP path unchanged
+- **AND** layers with expert tensors execute the expert-parallel routed path
+- **AND** both layer kinds share the same attention and KV-cache machinery within one forward pass
+
+#### Scenario: Tokens are routed only to their selected expert's device
+- **WHEN** the gate layer selects the top-1 expert for a token
+- **THEN** the runtime forwards that token's hidden state only to the device hosting the selected expert
+- **AND** non-MoE checkpoints continue to execute the existing dense path unchanged
+
+#### Scenario: An MoE deployment generates more than one token
+- **GIVEN** a successfully loaded expert-parallel deployment
+- **WHEN** a generation request is submitted with `max_tokens > 1`
+- **THEN** the runtime completes an initial prefill pass followed by per-token decode steps
+- **AND** the KV cache persists correctly across decode steps for both dense and MoE layers
+
+#### Scenario: Top-k greater than one is rejected at load time
+- **GIVEN** a checkpoint whose config declares `num_experts_per_tok > 1`
+- **WHEN** the model broker attempts to load it under `distribution_mode: expert_parallelism`
+- **THEN** the runtime rejects the deployment with a typed `UnsupportedModel` error
+- **AND** does not silently truncate routing to top-1
+
+### Requirement: Parallel execution plans MUST be validated against discovered hardware topology before deployment
+The runtime SHALL reject, with a typed topology error, any `tensor_parallelism`, `pipeline_parallelism`, or `expert_parallelism` deployment whose GPU/node count, interconnect class, or per-shard VRAM requirement cannot be satisfied by the cluster's discovered hardware topology. On CUDA builds, per-device free VRAM SHALL be sourced from real NVML telemetry rather than a hardcoded placeholder value, so the VRAM check can actually reject an oversized deployment in production.
+
+#### Scenario: Insufficient GPU count is rejected at deploy time
+- **WHEN** a deployment requests `tensor_parallelism` across more GPUs than are available on the target node
+- **THEN** `apply-model-deployment` fails with a typed `InsufficientDeviceCount` error
+- **AND** no partial model load is attempted
+
+#### Scenario: Incompatible interconnect is rejected at deploy time
+- **WHEN** a deployment requests `tensor_parallelism` across GPUs that lack the required high-bandwidth interconnect
+- **THEN** `apply-model-deployment` fails with a typed `IncompatibleInterconnect` error
+
+#### Scenario: Per-shard VRAM overrun is rejected at deploy time using real telemetry
+- **GIVEN** the runtime is built with the `candle-cuda` feature and NVML successfully reports each CUDA device's free VRAM
+- **WHEN** a deployment's computed per-shard VRAM requirement exceeds any target GPU's NVML-reported free VRAM
+- **THEN** `apply-model-deployment` fails with a typed `VramPerShardExceeded` error
+- **AND** the runtime does not silently downgrade to a single-GPU execution plan
+
+#### Scenario: VRAM telemetry degrades gracefully when NVML is unavailable
+- **GIVEN** NVML initialization fails (no NVIDIA driver, insufficient permissions, or a non-NVIDIA host) or the `candle-cuda` feature is not compiled in
+- **WHEN** the runtime discovers cluster topology
+- **THEN** every device reports `free_vram_bytes: 0` ("unknown"), matching the existing pre-NVML behavior
+- **AND** `validate_parallel_topology` never rejects a deployment on VRAM grounds for a device reporting `0`
+
+### Requirement: CUDA CI MUST prove multi-GPU collective execution, not just compilation
+The `cuda-quality` CI job (or an equivalent job on the same GPU-equipped self-hosted runner) SHALL execute a test that exercises a real NCCL all-reduce on real CUDA hardware and asserts its numeric result against a known-correct reference, in addition to the existing `cargo check`/`cargo clippy --features candle-cuda` compilation/lint steps.
+
+#### Scenario: GPU CI runs and passes a real NCCL all-reduce test
+- **GIVEN** the `cuda-quality` job runs on the `arc-gpu-runners` self-hosted runner with a real GPU detected via `nvidia-smi`
+- **WHEN** the job executes its test step
+- **THEN** a test exercising `ncclAllReduce` across multiple ranks runs to completion
+- **AND** its result matches the existing CPU-staged-sum reference within `1e-4` tolerance
+- **AND** the job's overall conclusion is `success` only if that test passes, not merely if `cargo clippy` finds no lint errors
+
+#### Scenario: The NCCL test runs correctly on a single-physical-GPU runner
+- **GIVEN** the runner exposes exactly one physical CUDA device (the verified case for the current `arc-gpu-runners` configuration)
+- **WHEN** the NCCL all-reduce test runs
+- **THEN** it uses multiple NCCL ranks on that single device (loopback communicator initialization) rather than requiring a second physical GPU
+- **AND** the test is skipped, not failed, on a `candle-cuda` build executed on a host reporting zero CUDA devices
+
+### Requirement: The `nvfp4-cuda` and `candle-cuda` Cargo features MUST be documented as independent
+Inline documentation describing the relationship between the `nvfp4-cuda` and `candle-cuda` Cargo features SHALL accurately reflect that they are separate, sibling features — enabling one does not enable the other — matching `core-host/Cargo.toml`'s actual feature graph.
+
+#### Scenario: The topology-discovery comment accurately describes feature independence
+- **GIVEN** a reader inspects the comment above `discover_cluster_topology`'s CUDA-enumeration loop in `core-host/src/ai_inference/parallel.rs`
+- **WHEN** they read the comment to understand what enables multi-GPU enumeration
+- **THEN** the comment states that the `candle-cuda` feature, not `nvfp4-cuda`, is required
+- **AND** the comment does not claim `nvfp4-cuda` pulls in or implies `candle-cuda`
+
+### Requirement: Route-scoped dynamic model bindings
+
+The integrity manifest SHALL support dynamic model bindings whose model content
+is resolved from the managed broker model directory at runtime. A dynamic
+binding SHALL authorize only the route that declares it and SHALL NOT require a
+static model path.
+
+#### Scenario: Dynamic binding omits static path
+
+- **WHEN** integrity configuration normalization receives a model binding with
+  `dynamic: true` and an empty path
+- **THEN** normalization SHALL preserve the dynamic flag and accept the binding
+
+#### Scenario: Static binding still requires path
+
+- **WHEN** integrity configuration normalization receives a static model
+  binding with an empty path
+- **THEN** normalization SHALL reject the binding
+
+#### Scenario: Dynamic authorization remains route-scoped
+
+- **GIVEN** a dynamic alias is bound to the OpenAI chat route
+- **WHEN** another route attempts to load the same alias without declaring it
+- **THEN** the host SHALL reject that route's request as not sealed
+
+### Requirement: A model deployment's `hardware_strategy` MUST select the parallel execution engine at load time
+When a model deployment declares `hardware_strategy.distribution_mode` other than `single`, the runtime SHALL carry that strategy from configuration into model loading and SHALL construct the corresponding parallel engine (tensor-, pipeline-, or expert-parallel) instead of the dense single-device path. A `single` (or absent) strategy SHALL load the existing single-device path with no behavioural change.
+
+#### Scenario: A tensor-parallel deployment is dispatched to the tensor-parallel engine
+- **GIVEN** a model binding whose `hardware_strategy.distribution_mode` is `tensor_parallelism` with two device IDs
+- **WHEN** the runtime loads the model
+- **THEN** the binding's strategy is threaded into `try_load`
+- **AND** the model is loaded as a tensor-parallel engine across the configured devices
+- **AND** generation produces output numerically equivalent (within floating-point tolerance) to the dense single-device path on the same checkpoint
+
+#### Scenario: A pipeline-parallel deployment is dispatched to the pipeline engine
+- **GIVEN** a model binding whose `distribution_mode` is `pipeline_parallelism` with contiguous `stage_layer_ranges`
+- **WHEN** the runtime loads the model
+- **THEN** the model is loaded as a pipeline-parallel engine with the configured stage ranges
+- **AND** a prefill request returns prompt logits equivalent to the dense reference
+- **AND** a token-streaming (decode) request returns a typed "decode not yet supported for pipeline parallelism" error rather than incorrect output
+
+#### Scenario: An expert-parallel deployment is validated but refused until a MoE loader exists
+- **GIVEN** a model binding whose `distribution_mode` is `expert_parallelism`
+- **WHEN** the runtime loads the model
+- **THEN** the plan is validated against the discovered hardware topology
+- **AND** the load returns a typed error indicating that a full MoE checkpoint loader is not yet implemented (only the numerically-verified per-expert `ExpertParallelMlp` primitive exists), rather than constructing a non-existent full MoE model or silently downgrading to the dense path
+
+#### Scenario: Single-device deployments are byte-for-byte unaffected
+- **WHEN** a model binding declares `distribution_mode: single` or carries no `hardware_strategy`
+- **THEN** the existing `Safetensors`/`Gguf` single-device load path executes unchanged
+- **AND** no parallel dispatch, topology discovery, or strategy plumbing is invoked
+
+### Requirement: The runtime MUST validate a parallel plan against discovered hardware before loading weights
+Before constructing any parallel engine, the runtime SHALL validate the requested plan against the cluster's discovered hardware topology (device count, interconnect class, per-shard VRAM) and SHALL abort the load with a typed topology error — loading no weights — when the plan cannot be satisfied. This hardware-aware check is in addition to the structural plan validation already performed by the config API.
+
+#### Scenario: A plan requesting more devices than exist is rejected before any load
+- **GIVEN** a binding requesting a parallel plan across more devices than `discover_cluster_topology()` reports
+- **WHEN** the runtime attempts to load the model
+- **THEN** `try_load` fails with a typed topology error mapped from `TopologyError::InsufficientDeviceCount`
+- **AND** no model weights are allocated
+
+### Requirement: GPU execution MUST be served when the candle CUDA backend is compiled in, and refused with a typed error otherwise
+The runtime SHALL accept a GPU `device` request only on a build where the candle CUDA backend is compiled in. On a build without the CUDA backend, a GPU request SHALL continue to return the existing typed unsupported-execution error, and parallel engines SHALL run on CPU device stand-ins.
+
+#### Scenario: GPU request on a CUDA-less build is refused unchanged
+- **GIVEN** a build without the `candle-cuda` feature
+- **WHEN** a binding requests a non-`cpu` device on the `single` path
+- **THEN** `try_load` returns the existing `UnsupportedModel` error verbatim ("the Candle LLM runtime supports `cpu` execution only")
+
+#### Scenario: Multi-GPU topology is enumerated on a CUDA build
+- **GIVEN** a build with the `candle-cuda` feature on a host with more than one CUDA device
+- **WHEN** `discover_cluster_topology()` runs
+- **THEN** it enumerates every available CUDA device (the enumeration loop is live once the candle CUDA backend is compiled in)
+- **AND** per-device free-VRAM telemetry (NVML) and the NCCL all-reduce are validated on the CUDA CI lane as hardware-gated follow-ups (see `tasks.md` Tasks 5–6); the CPU-staged summation remains the numerically-equivalent reduction on every non-CUDA build
+
+### Requirement: Native Candle inference MUST dispatch supported non-Llama architectures
+
+The native Candle text-generation path SHALL dispatch supported non-Llama
+safetensors and GGUF checkpoints through registered architecture-specific
+backends while preserving the existing sealed-alias authorization, request
+schema, scheduler, sampling, constrained decoding, stop, buffered, and streaming
+behavior. Existing Llama, Mixtral, Qwen 3.5 MoE, ModelOpt/NVFP4, ONNX, and mock
+backend boundaries SHALL remain unchanged.
+
+#### Scenario: Supported non-Llama alias uses native Candle execution
+
+- **WHEN** a route-authorized model alias resolves to a checkpoint whose
+  architecture and format have a registered backend
+- **THEN** the native Candle runtime executes that backend
+- **AND** the response is not `MOCK_LLM_RESPONSE`
+
+#### Scenario: Unsupported architecture remains actionable and non-mock
+
+- **WHEN** a route-authorized alias resolves to an architecture or format
+  combination without a registered backend
+- **THEN** the runtime returns an actionable typed unsupported-model error
+- **AND** does not return mock inference output
+
+#### Scenario: Existing Llama behavior is unchanged
+
+- **WHEN** a Llama safetensors or supported Llama GGUF checkpoint is loaded
+- **THEN** its existing single-device generation path and outputs remain
+  compatible with the pre-registry behavior
+
+#### Scenario: Existing specialized runtimes remain independently dispatched
+
+- **WHEN** a checkpoint matches the Qwen 3.5 MoE ModelOpt/NVFP4 contract, the
+  Mixtral expert-parallel contract, or the legacy ONNX contract
+- **THEN** the existing specialized dispatcher handles it
+- **AND** the generic architecture registry does not reinterpret it as a dense
+  Qwen, Gemma, Phi, or DeepSeek checkpoint
 

@@ -1,0 +1,43 @@
+name: Hardware Accelerator Acceptance
+
+on:
+  workflow_dispatch:
+
+jobs:
+  openvino-npu:
+    runs-on: [self-hosted, tachyon-openvino-npu]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require OpenVINO NPU runner and model
+        shell: bash
+        run: |
+          : "${TACHYON_OPENVINO_RUNNER:?missing TACHYON_OPENVINO_RUNNER}"
+          : "${TACHYON_OPENVINO_ACCEPTANCE_MODEL:?missing TACHYON_OPENVINO_ACCEPTANCE_MODEL}"
+          "$TACHYON_OPENVINO_RUNNER" --probe | tee openvino-probe.txt
+          grep -q OPENVINO_NPU openvino-probe.txt
+          "$TACHYON_OPENVINO_RUNNER" --model "$TACHYON_OPENVINO_ACCEPTANCE_MODEL" --input-hex 00 | tee openvino-output.txt
+          test -s openvino-output.txt
+      - name: Validate host integration
+        env:
+          TACHYON_HARDWARE_ACCEPTANCE: "1"
+        run: cargo test -p core-host --features ai-inference vendor_accelerator -- --nocapture
+
+  coral-edgetpu:
+    runs-on: [self-hosted, tachyon-coral-edgetpu]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require Edge TPU runner and compiled model
+        shell: bash
+        run: |
+          : "${TACHYON_EDGETPU_RUNNER:?missing TACHYON_EDGETPU_RUNNER}"
+          : "${TACHYON_EDGETPU_ACCEPTANCE_MODEL:?missing TACHYON_EDGETPU_ACCEPTANCE_MODEL}"
+          "$TACHYON_EDGETPU_RUNNER" --probe | tee edgetpu-probe.txt
+          grep -q EDGE_TPU edgetpu-probe.txt
+          "$TACHYON_EDGETPU_RUNNER" --model "$TACHYON_EDGETPU_ACCEPTANCE_MODEL" --input-hex 00 | tee edgetpu-output.txt
+          test -s edgetpu-output.txt
+      - name: Validate host integration
+        env:
+          TACHYON_HARDWARE_ACCEPTANCE: "1"
+        run: cargo test -p core-host --features ai-inference vendor_accelerator -- --nocapture

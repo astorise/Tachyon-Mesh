@@ -5,7 +5,12 @@ TBD - created by archiving change faas-openai-user-example. Update Purpose after
 ## Requirements
 ### Requirement: User-space OpenAI-compatible FaaS
 
-The OpenAI-compatible HTTP surface SHALL be provided by a single **user-role** FaaS (`guest-openai`) built against the `faas-guest` WIT world. It SHALL expose `GET /v1/models` and `POST /v1/chat/completions`, and it SHALL NOT be a system FaaS injected by a compile-time feature flag.
+The OpenAI-compatible HTTP surface SHALL be provided by a single **user-role**
+FaaS (`guest-openai`) built against the `faas-guest` WIT world. It SHALL expose
+`GET /v1/models` and `POST /v1/chat/completions`, and it SHALL NOT be a system
+FaaS injected by a compile-time feature flag. A dynamic model advertised by the
+registry SHALL be usable by the chat route when that alias is included in the
+route's sealed dynamic model bindings.
 
 #### Scenario: Model listing returns OpenAI-compatible shape
 
@@ -16,12 +21,19 @@ The OpenAI-compatible HTTP surface SHALL be provided by a single **user-role** F
 
 #### Scenario: Chat completions runs real inference
 
-- **GIVEN** a sealed model alias the route is allowed to use
+- **GIVEN** a sealed static or dynamic model alias the route is allowed to use
 - **WHEN** a client requests `POST /v1/chat/completions` naming that model
-- **THEN** `guest-openai` loads the model on the CPU accelerator, hands the
-  structured conversation and sampling parameters to the host, and returns an
-  OpenAI-shaped `chat.completion` whose assistant message carries the generated
-  text
+- **THEN** `guest-openai` loads the model on the requested accelerator, hands
+  the structured conversation and sampling parameters to the host, and returns
+  an OpenAI-shaped `chat.completion`
+
+#### Scenario: Listed dynamic model is authorized for chat
+
+- **GIVEN** a dynamic model is registered and listed by `/v1/models`
+- **AND** the `/v1/chat/completions` route contains a sealed dynamic binding for
+  its alias
+- **WHEN** a client requests a chat completion with that alias
+- **THEN** the request SHALL pass route model authorization
 
 #### Scenario: Unknown model returns 404
 
@@ -33,7 +45,8 @@ The OpenAI-compatible HTTP surface SHALL be provided by a single **user-role** F
 
 - **GIVEN** a node whose sealed manifest declares the `guest-openai` user routes
 - **WHEN** the topology graph is built from that manifest
-- **THEN** `guest-openai` appears as a user route regardless of whether the binary was compiled with `ai-inference`
+- **THEN** `guest-openai` appears as a user route regardless of whether the
+  binary was compiled with `ai-inference`
 
 ### Requirement: Registry ownership via kv-partition
 
@@ -58,13 +71,13 @@ The OpenAI-compatible HTTP surface SHALL be provided by a single **user-role** F
 #### Scenario: Newly registered model is visible immediately
 
 - **GIVEN** a model is registered
-- **WHEN** `GET /v1/models` is served by the same instance immediately afterward
+- **WHEN** `GET /ai/v1/models` is served by the same instance immediately afterward
 - **THEN** the response includes the newly registered model
 
 #### Scenario: Visibility across instances
 
 - **GIVEN** a model is registered on instance A
-- **WHEN** `GET /v1/models` is served by a different instance B
+- **WHEN** `GET /ai/v1/models` is served by a different instance B
 - **THEN** the response includes the model registered on A
 
 ### Requirement: Scope-gated registry table access
@@ -85,13 +98,13 @@ The `guest-openai` route SHALL declare deployment scopes that grant `kv` access 
 
 ### Requirement: Upload notification persists to the shared registry
 
-`system-faas-model-broker` SHALL notify `guest-openai` over HTTP when a newly uploaded model becomes available, targeting the register endpoint, so the model is recorded in the shared `ai-models-registry` table and becomes listable.
+`system-faas-model-broker` SHALL notify `guest-openai` over HTTP when a newly uploaded model becomes available, targeting the internal register endpoint, so the model is recorded in the shared `ai-models-registry` table and becomes listable.
 
 #### Scenario: Broker upload makes a model listable
 
 - **WHEN** `model-broker` completes a model upload and notifies `guest-openai`'s register endpoint
 - **THEN** the model is written to `ai-models-registry`
-- **AND** a subsequent `GET /v1/models` includes that model
+- **AND** a subsequent `GET /ai/v1/models` includes that model
 
 ### Requirement: Chat completion sampling parameters
 
