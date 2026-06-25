@@ -2,7 +2,7 @@ package tachyon:openai@1.1.0;
 
 /// guest-openai's world. It keeps the mesh surface it already used — the
 /// `kv-partition` model registry and the `handler` HTTP export — and adds the
-/// CPU accelerator import so `/v1/chat/completions` can run real inference on
+/// CPU accelerator import so `/ai/v1/chat/completions` can run real inference on
 /// uploaded models (the host satisfies `tachyon:accelerator/cpu` on ai-inference
 /// builds). Defining this in guest-openai's own package keeps the shared
 /// `tachyon:mesh` `tachyon.wit` single-file and self-contained for every other

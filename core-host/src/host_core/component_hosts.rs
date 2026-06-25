@@ -2483,7 +2483,7 @@ impl background_component_bindings::tachyon::mesh::routing_control::Host for Com
 // Must match the casing `guest-openai` uses to read the `ai-models-registry`
 // table (`#[serde(rename_all = "camelCase")]`); otherwise its `list_models`
 // drops the row on a deserialize miss and the model never appears in
-// `GET /v1/models`. See the matching note on `RegistryModelInfo` in
+// `GET /ai/v1/models`. See the matching note on `RegistryModelInfo` in
 // `system_storage.rs`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -2829,7 +2829,7 @@ pub fn recommend_concurrency_policy(
 }
 
 pub async fn list_available_ai_models() -> Result<Vec<AvailableAiModel>> {
-    let response: OpenAiModelListResponse = get_admin_json("/v1/models").await?;
+    let response: OpenAiModelListResponse = get_admin_json("/ai/v1/models").await?;
     Ok(response
         .data
         .into_iter()

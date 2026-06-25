@@ -217,8 +217,8 @@ fn guest_openai_example_routes_validate_with_kv_scope() {
     };
     let mut config = IntegrityConfig::default_sealed();
     config.routes = vec![
-        make("/v1/models", "openai-models"),
-        make("/v1/chat/completions", "openai-chat"),
+        make("/ai/v1/models", "openai-models"),
+        make("/ai/v1/chat/completions", "openai-chat"),
         make("/internal/guest-openai/register", "openai-registry"),
     ];
 
@@ -226,10 +226,12 @@ fn guest_openai_example_routes_validate_with_kv_scope() {
         .expect("guest-openai example routes with a kv scope must validate");
 
     let models = config
-        .sealed_route("/v1/models")
-        .expect("/v1/models should remain sealed");
+        .sealed_route("/ai/v1/models")
+        .expect("/ai/v1/models should remain sealed");
     assert_eq!(models.role, RouteRole::User);
     assert_eq!(models.name, "openai-models");
+    assert!(config.sealed_route("/v1/models").is_none());
+    assert!(config.sealed_route("/v1/chat/completions").is_none());
     assert!(
         config
             .sealed_route("/internal/guest-openai/register")
@@ -936,13 +938,13 @@ fn validate_route_asset_availability_rejects_missing_blob() {
     let digest = "0".repeat(64);
     let asset_uri = format!("tachyon://sha256:{digest}");
     let mut config = IntegrityConfig::default_sealed();
-    config.routes = vec![asset_uri_route("/v1/models", &asset_uri)];
+    config.routes = vec![asset_uri_route("/api/assets", &asset_uri)];
 
     let error = validate_route_asset_availability(&config, &manifest_path)
         .expect_err("a route pointing at a missing asset blob must be rejected at seal time");
 
     let message = error.to_string();
-    assert!(message.contains("/v1/models"), "message: {message}");
+    assert!(message.contains("/api/assets"), "message: {message}");
     assert!(
         message.contains("not present in the registry"),
         "message: {message}"
@@ -962,7 +964,7 @@ fn validate_route_asset_availability_accepts_present_blob() {
 
     let asset_uri = format!("tachyon://sha256:{digest}");
     let mut config = IntegrityConfig::default_sealed();
-    config.routes = vec![asset_uri_route("/v1/models", &asset_uri)];
+    config.routes = vec![asset_uri_route("/api/assets", &asset_uri)];
 
     validate_route_asset_availability(&config, &manifest_path)
         .expect("a route whose asset blob exists must pass seal-time validation");

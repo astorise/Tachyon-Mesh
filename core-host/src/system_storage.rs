@@ -306,7 +306,7 @@ fn invoke_storage_component(
 // broker writes the same table directly on upload, so it MUST use the identical
 // casing — otherwise `guest-openai`'s `list_models` fails to deserialize the
 // row (missing required `vramRequiredMb`) and silently drops it, so uploaded
-// models never surface in `GET /v1/models`.
+// models never surface in `GET /ai/v1/models`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegistryModelInfo<'a> {
@@ -544,7 +544,7 @@ mod registry_casing_tests {
     /// "camelCase")]` and a *required* `vram_required_mb`. If the host writer
     /// drifts back to snake_case, deserialization fails here exactly as it does
     /// in `guest-openai::list_models` (which silently `filter_map(...ok())`s the
-    /// miss), making uploaded models invisible in `GET /v1/models`.
+    /// miss), making uploaded models invisible in `GET /ai/v1/models`.
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     #[allow(dead_code)]
