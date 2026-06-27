@@ -311,7 +311,10 @@ jobs:
           nvidia-smi
           nvcc --version
 
+      # Native NVFP4 requires a runner GPU/toolchain that can execute the FP4
+      # kernels. Keep this proof opt-in until such a runner is available.
       - name: Configure NVFP4 CUDA architecture
+        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
         run: |
           compute_capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '[:space:].')"
           if [ -z "$compute_capability" ]; then
@@ -344,9 +347,11 @@ jobs:
         run: cargo test -p core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
 
       - name: Fetch CUTLASS headers
+        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
         run: git clone --depth 1 --branch v4.3.5 https://github.com/NVIDIA/cutlass.git .ci-cutlass
 
       - name: Run native NVFP4 parity and telemetry proof
+        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
         env:
           TACHYON_NVFP4_CUDA_SMOKE: "1"
           TACHYON_NVFP4_NATIVE_REQUIRED: "1"
