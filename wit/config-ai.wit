@@ -55,6 +55,10 @@ interface config-ai {
         /// Bounded number of micro-batches kept in flight across pipeline
         /// stages. Ignored outside `pipeline-parallelism`.
         pipeline-depth: u32,
+        /// Request block-paged KV-cache attention. Tachyon accepts this
+        /// declarative knob only when its runtime has wired Candle's paged
+        /// flash-attn API to a block allocator and per-sequence block table.
+        paged-attention: bool,
     }
 
     record lora-adapter {

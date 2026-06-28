@@ -73,3 +73,24 @@ directory is never interpreted as Llama merely because it contains
 safetensors. The registered Qwen 3.5 MoE compatibility profile executes through
 its dedicated hybrid runtime; unmatched architectures return an explicit
 unsupported-architecture error.
+
+## PagedAttention Status
+
+The pinned `astorise/candle` fork includes Candle's paged flash-attn API
+(`flash_attn_varlen_paged_windowed`), but Tachyon does not yet own the required
+runtime state for it: a CUDA KV block pool, per-sequence block tables, and
+block-granular allocation/free during continuous batching.
+
+Model bindings can declare the future mode with:
+
+```json
+{
+  "hardware_strategy": {
+    "paged_attention": true
+  }
+}
+```
+
+Until the block allocator and block-table path are wired, the Candle LLM runtime
+rejects that setting with a typed unsupported-model error instead of silently
+falling back to the contiguous per-request KV cache.

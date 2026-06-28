@@ -425,6 +425,12 @@ pub(crate) struct HardwareStrategy {
     /// Ignored outside `pipeline_parallelism`.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub(crate) pipeline_depth: u32,
+    /// Request block-paged KV cache attention instead of the contiguous
+    /// per-request KV cache. This is serialized only when explicitly enabled;
+    /// the runtime rejects it until the Candle paged flash-attn path is wired
+    /// through Tachyon's block allocator and block table.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) paged_attention: bool,
 }
 
 impl HardwareStrategy {
@@ -438,11 +444,16 @@ impl HardwareStrategy {
             && self.stage_layer_ranges.is_empty()
             && self.expert_device_map.is_empty()
             && self.pipeline_depth == 0
+            && !self.paged_attention
     }
 }
 
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -1204,11 +1215,32 @@ mod hardware_strategy_tests {
                 distribution_mode: GpuDistribution::TensorParallelism,
                 device_ids: vec![0, 1],
                 pipeline_depth: 0,
+                paged_attention: false,
                 ..Default::default()
             },
         };
         let json = serde_json::to_string(&binding).expect("serialize");
         assert!(json.contains("tensor_parallelism"));
+        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, binding);
+        assert!(!restored.hardware_strategy.is_single());
+    }
+
+    #[test]
+    fn paged_attention_strategy_round_trips_and_is_not_single() {
+        let binding = IntegrityModelBinding {
+            alias: "m".to_owned(),
+            path: "/models/m".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: HardwareStrategy {
+                paged_attention: true,
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&binding).expect("serialize");
+        assert!(json.contains("paged_attention"));
         let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, binding);
         assert!(!restored.hardware_strategy.is_single());

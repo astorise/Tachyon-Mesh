@@ -817,6 +817,15 @@ impl CandleLlmRuntime {
                 detail,
             });
         }
+        if strategy.paged_attention {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail:
+                    "paged_attention requires Tachyon's block allocator and per-sequence block table to be wired to candle_flash_attn::flash_attn_varlen_paged_windowed"
+                        .to_owned(),
+            });
+        }
 
         // The single-device path remains CPU-only in this runtime (GPU
         // execution of the dense path is the separate
@@ -4834,6 +4843,27 @@ mod tests {
             CandleLlmError::UnsupportedModel { detail, .. } => {
                 assert!(
                     detail.contains("cpu` execution only"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn paged_attention_strategy_is_rejected_until_block_tables_are_wired() {
+        let dir = write_fixture_dir("paged-attn-reject");
+        let strategy = HardwareStrategy {
+            paged_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &strategy)
+            .expect_err("paged attention must not silently use the contiguous KV cache");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("flash_attn_varlen_paged_windowed"),
                     "unexpected detail: {detail}"
                 );
             }

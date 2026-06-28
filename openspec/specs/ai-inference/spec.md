@@ -565,6 +565,21 @@ When a model deployment declares `hardware_strategy.distribution_mode` other tha
 - **THEN** the existing `Safetensors`/`Gguf` single-device load path executes unchanged
 - **AND** no parallel dispatch, topology discovery, or strategy plumbing is invoked
 
+### Requirement: PagedAttention MUST require an explicit block-table runtime path
+When a model deployment sets `hardware_strategy.paged_attention: true`, the runtime SHALL NOT silently fall back to the existing contiguous per-request KV cache. Tachyon SHALL enable this mode only after its core-host runtime owns a block allocator, a per-sequence block table, and a Candle paged flash-attn call using `flash_attn_varlen_paged_windowed` or a compatible successor API.
+
+#### Scenario: PagedAttention request is rejected before Tachyon block tables are wired
+- **GIVEN** a model binding sets `hardware_strategy.paged_attention: true`
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming the missing block allocator and block-table integration
+- **AND** the runtime does not execute the contiguous KV-cache path as a fallback
+
+#### Scenario: PagedAttention can be enabled only after block-paged KV integration
+- **GIVEN** the runtime has a CUDA block pool, per-sequence block tables, context lengths, and a paged K/V tensor layout compatible with Candle's paged flash-attn API
+- **WHEN** a deployment enables `hardware_strategy.paged_attention`
+- **THEN** decode uses the block-paged attention path
+- **AND** sequence admission and eviction operate at block granularity rather than reallocating a contiguous KV cache per request
+
 ### Requirement: The runtime MUST validate a parallel plan against discovered hardware before loading weights
 Before constructing any parallel engine, the runtime SHALL validate the requested plan against the cluster's discovered hardware topology (device count, interconnect class, per-shard VRAM) and SHALL abort the load with a typed topology error — loading no weights — when the plan cannot be satisfied. This hardware-aware check is in addition to the structural plan validation already performed by the config API.
 
