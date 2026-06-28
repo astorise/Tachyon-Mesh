@@ -33,7 +33,7 @@ pkcs8 = { version = "0.10", default-features = false, features = [
     "alloc",
     "pem",
 ] }
-const-oid = { version = "0.9", default-features = false, features = ["db"] }
+const-oid = { version = "0.10", default-features = false, features = ["db"] }
 # Fresh leaf-key entropy. getrandom 0.2 uses the WASI backend on
 # wasm32-wasip2, so no `js` feature is needed.
 getrandom = "0.4"

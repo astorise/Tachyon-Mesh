@@ -8202,7 +8202,7 @@ dependencies = [
 name = "system-faas-cert-manager"
 version = "1.0.0"
 dependencies = [
- "const-oid 0.9.6",
+ "const-oid 0.10.2",
  "der",
  "ed25519-dalek",
  "getrandom 0.4.3",
