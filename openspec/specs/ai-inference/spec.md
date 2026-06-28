@@ -48,13 +48,19 @@ target devices so the host can preload model bindings before serving inference.
 - **THEN** the host loads that model binding into its runtime configuration for startup initialization
 
 ### Requirement: Inference requests are continuously batched by the host
-The host SHALL run a batching scheduler that groups compatible inference requests within a short
-time window and executes them as a single Candle-backed forward pass.
+The host SHALL run a continuous batching scheduler that admits compatible inference sequences into
+an active set, advances each sequence through explicit `prefill` and `decode` phases, and chooses
+the next compatible step without waiting for a fixed time window.
 
-#### Scenario: Multiple inference requests arrive together
-- **WHEN** several inference requests are queued within the batching window
-- **THEN** the scheduler pads and batches them into a single model execution
+#### Scenario: Compatible inference requests are active together
+- **WHEN** several compatible inference requests are active on the same accelerator
+- **THEN** the scheduler groups their next matching phase into a shared prefill or decode step
 - **AND** routes each generated response back to the correct caller
+
+#### Scenario: New work is admitted while decode is in flight
+- **WHEN** a new higher-QoS inference request arrives while another sequence is already active
+- **THEN** the scheduler may admit the new request into the active set before the existing sequence completes
+- **AND** the next eligible step is selected by QoS and compatibility rather than by the original arrival batch
 
 ### Requirement: WASI-NN calls are bridged through the batching scheduler
 The Wasmtime host SHALL intercept `wasi-nn` compute calls, enqueue them with response channels,

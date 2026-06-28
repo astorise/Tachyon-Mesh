@@ -30,6 +30,8 @@ use candle_core::{
     bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
     Tensor as CandleTensor,
 };
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     any::Any,
     cmp::Ordering as CmpOrdering,
@@ -41,7 +43,6 @@ use std::{
         mpsc, Arc, Mutex, OnceLock, RwLock,
     },
     thread,
-    time::{Duration, Instant},
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use wasmtime_wasi_nn::{
@@ -57,9 +58,7 @@ use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
 
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 const DEFAULT_BATCH_SIZE: usize = 32;
-const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(25);
 const ACCELERATOR_QUEUE_CAPACITY: usize = 256;
-const ACCELERATOR_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,6 +285,9 @@ pub(crate) struct SchedulerSnapshot {
     pub(crate) batches_processed: usize,
     pub(crate) requests_processed: usize,
     pub(crate) max_batch_size: usize,
+    pub(crate) prefill_steps_processed: usize,
+    pub(crate) decode_steps_processed: usize,
+    pub(crate) max_active_sequences: usize,
     pub(crate) queued_requests: usize,
     pub(crate) realtime_queued: usize,
     pub(crate) standard_queued: usize,
@@ -307,11 +309,7 @@ impl AiInferenceRuntime {
             .map(|accelerator| {
                 (
                     accelerator,
-                    AcceleratorScheduler::new(
-                        accelerator,
-                        DEFAULT_BATCH_SIZE,
-                        DEFAULT_BATCH_WINDOW,
-                    ),
+                    AcceleratorScheduler::new(accelerator, DEFAULT_BATCH_SIZE),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -619,7 +617,7 @@ struct AcceleratorScheduler {
 }
 
 impl AcceleratorScheduler {
-    fn new(accelerator: AcceleratorKind, batch_size: usize, batch_window: Duration) -> Self {
+    fn new(accelerator: AcceleratorKind, max_active_sequences: usize) -> Self {
         let (sender, receiver) = tokio_mpsc::channel(ACCELERATOR_QUEUE_CAPACITY);
         let metrics = Arc::new(SchedulerMetrics::default());
         let worker_metrics = Arc::clone(&metrics);
@@ -627,13 +625,7 @@ impl AcceleratorScheduler {
         thread::Builder::new()
             .name(format!("tachyon-{}-dispatcher", accelerator.as_str()))
             .spawn(move || {
-                run_scheduler(
-                    accelerator,
-                    receiver,
-                    worker_metrics,
-                    batch_size,
-                    batch_window,
-                )
+                run_scheduler(accelerator, receiver, worker_metrics, max_active_sequences)
             })
             .expect("AI inference scheduler thread should start");
 
@@ -687,6 +679,9 @@ impl AcceleratorScheduler {
             batches_processed: self.metrics.batches_processed.load(Ordering::Relaxed),
             requests_processed: self.metrics.requests_processed.load(Ordering::Relaxed),
             max_batch_size: self.metrics.max_batch_size.load(Ordering::Relaxed),
+            prefill_steps_processed: self.metrics.prefill_steps_processed.load(Ordering::Relaxed),
+            decode_steps_processed: self.metrics.decode_steps_processed.load(Ordering::Relaxed),
+            max_active_sequences: self.metrics.max_active_sequences.load(Ordering::Relaxed),
             queued_requests: self.metrics.queued_requests.load(Ordering::Relaxed),
             realtime_queued: self.metrics.realtime_queued.load(Ordering::Relaxed),
             standard_queued: self.metrics.standard_queued.load(Ordering::Relaxed),
@@ -723,6 +718,9 @@ struct SchedulerMetrics {
     batches_processed: AtomicUsize,
     requests_processed: AtomicUsize,
     max_batch_size: AtomicUsize,
+    prefill_steps_processed: AtomicUsize,
+    decode_steps_processed: AtomicUsize,
+    max_active_sequences: AtomicUsize,
     queued_requests: AtomicUsize,
     realtime_queued: AtomicUsize,
     standard_queued: AtomicUsize,
@@ -741,7 +739,26 @@ impl SchedulerMetrics {
         queue_counter(self, qos).fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn record_batch(&self, batch: &[InferenceJob]) {
+    fn record_active_sequences(&self, active_sequences: usize) {
+        self.max_active_sequences
+            .fetch_max(active_sequences, Ordering::Relaxed);
+    }
+
+    fn record_prefill_step(&self, batch: &[InferenceJob]) {
+        self.prefill_steps_processed.fetch_add(1, Ordering::Relaxed);
+        self.max_batch_size
+            .fetch_max(batch.len(), Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(first) = batch.first() {
+            self.completed_aliases
+                .lock()
+                .expect("scheduler completion log should not be poisoned")
+                .push(format!("{}:prefill", first.alias));
+        }
+    }
+
+    fn record_decode_step(&self, batch: &[InferenceJob]) {
+        self.decode_steps_processed.fetch_add(1, Ordering::Relaxed);
         self.batches_processed.fetch_add(1, Ordering::Relaxed);
         self.requests_processed
             .fetch_add(batch.len(), Ordering::Relaxed);
@@ -752,7 +769,7 @@ impl SchedulerMetrics {
             self.completed_aliases
                 .lock()
                 .expect("scheduler completion log should not be poisoned")
-                .push(first.alias.clone());
+                .push(format!("{}:decode", first.alias));
         }
     }
 }
@@ -765,6 +782,7 @@ fn queue_counter(metrics: &SchedulerMetrics, qos: RouteQos) -> &AtomicUsize {
     }
 }
 
+#[derive(Clone)]
 struct InferenceJob {
     alias: String,
     adapter_id: Option<String>,
@@ -795,6 +813,55 @@ impl PrioritizedInferenceJob {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InferenceSequencePhase {
+    Prefill,
+    Decode,
+}
+
+struct ActiveInferenceSequence {
+    qos_score: u16,
+    sequence: usize,
+    phase: InferenceSequencePhase,
+    job: InferenceJob,
+}
+
+impl From<PrioritizedInferenceJob> for ActiveInferenceSequence {
+    fn from(job: PrioritizedInferenceJob) -> Self {
+        Self {
+            qos_score: job.qos_score,
+            sequence: job.sequence,
+            phase: InferenceSequencePhase::Prefill,
+            job: job.job,
+        }
+    }
+}
+
+impl ActiveInferenceSequence {
+    fn batch_key(&self) -> InferenceBatchKey {
+        InferenceBatchKey {
+            alias: self.job.alias.clone(),
+            adapter_id: self.job.adapter_id.clone(),
+        }
+    }
+
+    fn priority_cmp(&self, other: &Self) -> CmpOrdering {
+        self.qos_score
+            .cmp(&other.qos_score)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+
+    fn is_compatible_with(
+        &self,
+        batch_key: &InferenceBatchKey,
+        phase: InferenceSequencePhase,
+    ) -> bool {
+        self.phase == phase
+            && self.job.alias == batch_key.alias
+            && self.job.adapter_id == batch_key.adapter_id
+    }
+}
+
 impl PartialEq for PrioritizedInferenceJob {
     fn eq(&self, other: &Self) -> bool {
         self.qos_score == other.qos_score && self.sequence == other.sequence
@@ -821,56 +888,41 @@ fn run_scheduler(
     accelerator: AcceleratorKind,
     mut receiver: tokio_mpsc::Receiver<PrioritizedInferenceJob>,
     metrics: Arc<SchedulerMetrics>,
-    batch_size: usize,
-    batch_window: Duration,
+    max_active_sequences: usize,
 ) {
     let mut queued = BinaryHeap::new();
+    let mut active = Vec::new();
 
     loop {
-        let first = match wait_for_next_job(&mut queued, &mut receiver) {
-            Some(job) => job,
-            None => return,
-        };
-        let batch_key = InferenceBatchKey {
-            alias: first.alias.clone(),
-            adapter_id: first.adapter_id.clone(),
-        };
-        let mut batch = vec![first];
-        let deadline = Instant::now() + batch_window;
+        drain_ready_jobs(&mut receiver, &mut queued);
+        admit_sequences(&mut queued, &mut active, max_active_sequences, &metrics);
 
-        while batch.len() < batch_size {
-            drain_ready_jobs(&mut receiver, &mut queued);
-            let Some(job) = try_take_compatible_job(&mut queued, &batch_key) else {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                thread::sleep(ACCELERATOR_QUEUE_POLL_INTERVAL);
-                continue;
+        if active.is_empty() {
+            let Some(job) = receiver.blocking_recv() else {
+                return;
             };
-            batch.push(job);
+            queued.push(job);
+            continue;
         }
 
-        let results = process_batch(accelerator, &batch);
-        metrics.record_batch(&batch);
-        for (job, result) in batch.into_iter().zip(results) {
-            metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-            metrics.record_dequeue(job.qos);
-            let _ = job.response_tx.send(result);
-        }
+        run_continuous_step(accelerator, &mut active, &metrics);
         age_waiting_jobs(&mut queued);
     }
 }
 
-fn wait_for_next_job(
+fn admit_sequences(
     queued: &mut BinaryHeap<PrioritizedInferenceJob>,
-    receiver: &mut tokio_mpsc::Receiver<PrioritizedInferenceJob>,
-) -> Option<InferenceJob> {
-    drain_ready_jobs(receiver, queued);
-    if let Some(job) = queued.pop() {
-        return Some(job.job);
+    active: &mut Vec<ActiveInferenceSequence>,
+    max_active_sequences: usize,
+    metrics: &SchedulerMetrics,
+) {
+    while active.len() < max_active_sequences {
+        let Some(job) = queued.pop() else {
+            break;
+        };
+        active.push(job.into());
+        metrics.record_active_sequences(active.len());
     }
-
-    receiver.blocking_recv().map(|job| job.job)
 }
 
 fn drain_ready_jobs(
@@ -882,31 +934,67 @@ fn drain_ready_jobs(
     }
 }
 
-fn try_take_compatible_job(
-    queued: &mut BinaryHeap<PrioritizedInferenceJob>,
-    batch_key: &InferenceBatchKey,
-) -> Option<InferenceJob> {
-    let mut deferred = Vec::new();
-    let mut selected = None;
-
-    while let Some(job) = queued.pop() {
-        if job.job.alias == batch_key.alias && job.job.adapter_id == batch_key.adapter_id {
-            selected = Some(job.job);
-            break;
-        }
-        deferred.push(job);
-    }
-
-    for job in deferred {
-        queued.push(job);
-    }
-
-    selected
-}
-
 struct InferenceBatchKey {
     alias: String,
     adapter_id: Option<String>,
+}
+
+fn run_continuous_step(
+    accelerator: AcceleratorKind,
+    active: &mut Vec<ActiveInferenceSequence>,
+    metrics: &SchedulerMetrics,
+) {
+    if let Some(indices) = select_active_batch(active, InferenceSequencePhase::Prefill) {
+        let prefill_batch = indices
+            .iter()
+            .map(|index| active[*index].job.clone())
+            .collect::<Vec<_>>();
+        metrics.record_prefill_step(&prefill_batch);
+        for index in indices {
+            active[index].phase = InferenceSequencePhase::Decode;
+        }
+        return;
+    }
+
+    let Some(indices) = select_active_batch(active, InferenceSequencePhase::Decode) else {
+        return;
+    };
+    let mut decode_batch = Vec::with_capacity(indices.len());
+    for index in indices.iter().rev() {
+        decode_batch.push(active.swap_remove(*index).job);
+    }
+    decode_batch.reverse();
+
+    let results = process_batch(accelerator, &decode_batch);
+    metrics.record_decode_step(&decode_batch);
+    for (job, result) in decode_batch.into_iter().zip(results) {
+        metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+        metrics.record_dequeue(job.qos);
+        let _ = job.response_tx.send(result);
+    }
+}
+
+fn select_active_batch(
+    active: &[ActiveInferenceSequence],
+    phase: InferenceSequencePhase,
+) -> Option<Vec<usize>> {
+    let (_, first) = active
+        .iter()
+        .enumerate()
+        .filter(|(_, sequence)| sequence.phase == phase)
+        .max_by(|(_, left), (_, right)| left.priority_cmp(right))?;
+    let batch_key = first.batch_key();
+    let mut indices = active
+        .iter()
+        .enumerate()
+        .filter_map(|(index, sequence)| {
+            sequence
+                .is_compatible_with(&batch_key, phase)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    Some(indices)
 }
 
 fn age_waiting_jobs(queued: &mut BinaryHeap<PrioritizedInferenceJob>) {
@@ -2471,15 +2559,15 @@ mod tests {
 
         let snapshot = runtime.scheduler_snapshot(AcceleratorKind::Cpu);
         assert_eq!(snapshot.requests_processed, 8);
-        assert_eq!(snapshot.batches_processed, 1);
-        assert_eq!(snapshot.max_batch_size, 8);
+        assert!(snapshot.prefill_steps_processed >= 1);
+        assert!(snapshot.decode_steps_processed >= 1);
+        assert_eq!(snapshot.batches_processed, snapshot.decode_steps_processed);
+        assert!(snapshot.max_batch_size >= 1);
         assert_eq!(snapshot.queued_requests, 0);
     }
 
     #[test]
     fn realtime_qos_preempts_batch_backlog_on_gpu_scheduler() {
-        let scheduler =
-            AcceleratorScheduler::new(AcceleratorKind::Gpu, 1, Duration::from_millis(0));
         let batch_model = Arc::new(
             CandleModel::load_mock(&IntegrityModelBinding {
                 alias: "gpu-batch".to_owned(),
@@ -2505,69 +2593,86 @@ mod tests {
             .with_mock_latency(Duration::from_millis(20)),
         );
 
-        let mut receivers = Vec::new();
-        for _ in 0..6 {
-            receivers.push(
-                scheduler
-                    .enqueue(
-                        Arc::clone(&batch_model),
-                        None,
-                        SharedInputTensor {
-                            dimensions: vec![1],
-                            ty: TensorType::U8,
-                            data: Arc::from(b"batch".as_slice()),
-                        },
-                    )
-                    .expect("batch request should queue"),
-            );
-        }
-        let started_at = Instant::now();
-        while scheduler.snapshot().completed_aliases.is_empty() {
-            assert!(
-                started_at.elapsed() < Duration::from_secs(1),
-                "scheduler should start the first batch before the realtime request"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-        let realtime_rx = scheduler
-            .enqueue(
-                Arc::clone(&realtime_model),
-                None,
-                SharedInputTensor {
+        let metrics = SchedulerMetrics::default();
+        metrics.queued_requests.store(2, Ordering::Relaxed);
+        metrics.record_enqueue(RouteQos::Batch);
+        metrics.record_enqueue(RouteQos::RealTime);
+        let mut queued = BinaryHeap::new();
+        let (batch_tx, batch_rx) = mpsc::channel();
+        let (realtime_tx, realtime_rx) = mpsc::channel();
+        let mut active = vec![ActiveInferenceSequence {
+            qos_score: RouteQos::Batch.score(),
+            sequence: 0,
+            phase: InferenceSequencePhase::Decode,
+            job: InferenceJob {
+                alias: batch_model.alias.clone(),
+                adapter_id: None,
+                model: Arc::clone(&batch_model),
+                qos: batch_model.qos,
+                input: SharedInputTensor {
+                    dimensions: vec![1],
+                    ty: TensorType::U8,
+                    data: Arc::from(b"batch".as_slice()),
+                },
+                response_tx: batch_tx,
+            },
+        }];
+        queued.push(PrioritizedInferenceJob::new(
+            RouteQos::RealTime.score(),
+            1,
+            InferenceJob {
+                alias: realtime_model.alias.clone(),
+                adapter_id: None,
+                model: Arc::clone(&realtime_model),
+                qos: realtime_model.qos,
+                input: SharedInputTensor {
                     dimensions: vec![1],
                     ty: TensorType::U8,
                     data: Arc::from(b"realtime".as_slice()),
                 },
-            )
-            .expect("realtime request should queue");
+                response_tx: realtime_tx,
+            },
+        ));
 
-        for receiver in receivers {
-            let _ = receiver
-                .recv()
-                .expect("batch response should arrive")
-                .expect("batch inference should succeed");
-        }
+        admit_sequences(&mut queued, &mut active, 2, &metrics);
+        run_continuous_step(AcceleratorKind::Gpu, &mut active, &metrics);
+        run_continuous_step(AcceleratorKind::Gpu, &mut active, &metrics);
+
         let _ = realtime_rx
             .recv()
             .expect("realtime response should arrive")
             .expect("realtime inference should succeed");
-
-        let snapshot = scheduler.snapshot();
         assert!(
-            snapshot.completed_aliases.len() >= 2,
-            "scheduler should have processed at least two batches"
+            batch_rx.try_recv().is_err(),
+            "active batch decode should not complete before inserted realtime decode"
         );
-        assert_eq!(snapshot.completed_aliases[0], "gpu-batch");
-        let realtime_position = snapshot
+        run_continuous_step(AcceleratorKind::Gpu, &mut active, &metrics);
+        let _ = batch_rx
+            .recv()
+            .expect("batch response should arrive")
+            .expect("batch inference should succeed");
+
+        let completed_aliases = metrics
             .completed_aliases
+            .lock()
+            .expect("scheduler completion log should not be poisoned")
+            .clone();
+        let realtime_prefill_position = completed_aliases
             .iter()
-            .position(|alias| alias == "gpu-bot")
-            .expect("realtime request should complete");
+            .position(|alias| alias == "gpu-bot:prefill")
+            .expect("realtime prefill should complete");
+        let realtime_decode_position = completed_aliases
+            .iter()
+            .position(|alias| alias == "gpu-bot:decode")
+            .expect("realtime decode should complete");
+        let batch_decode_position = completed_aliases
+            .iter()
+            .position(|alias| alias == "gpu-batch:decode")
+            .expect("batch decode should complete");
+        assert!(realtime_prefill_position < realtime_decode_position);
         assert!(
-            snapshot.completed_aliases[(realtime_position + 1)..]
-                .iter()
-                .any(|alias| alias == "gpu-batch"),
-            "realtime request should run before the batch backlog is fully drained"
+            realtime_decode_position < batch_decode_position,
+            "realtime decode should be inserted ahead of an active batch decode"
         );
     }
 

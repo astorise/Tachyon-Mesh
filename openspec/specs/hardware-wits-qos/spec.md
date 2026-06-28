@@ -19,5 +19,5 @@ The platform SHALL expose hardware-specific accelerator capabilities through exp
 
 #### Scenario: Realtime inference preempts batch backlog on the same accelerator
 - **WHEN** realtime and batch jobs compete for the same accelerator queue
-- **THEN** the scheduler chooses the higher QoS request for the next batch
+- **THEN** the scheduler chooses the higher QoS request for the next compatible prefill or decode step
 - **AND** waiting work is aged so lower-priority jobs eventually execute
