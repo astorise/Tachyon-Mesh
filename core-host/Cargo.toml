@@ -48,7 +48,7 @@ secrets-vault = []
 websockets = ["axum/ws", "dep:futures-util"]
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow = "1"
 async-trait = "0.1"
 arc-swap = "1.7"
