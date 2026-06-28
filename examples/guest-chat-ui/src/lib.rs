@@ -1,3 +1,4 @@
+#[cfg(target_arch = "wasm32")]
 mod bindings {
     use super::Component;
 
@@ -9,14 +10,20 @@ mod bindings {
     export!(Component);
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 const INDEX_HTML: &str = include_str!("../assets/index.html");
+#[cfg(any(test, target_arch = "wasm32"))]
 const CHAT_COMPONENT_JS: &str = include_str!("../assets/tachyon-chat-assistant.js");
+#[cfg(any(test, target_arch = "wasm32"))]
 const STYLES_CSS: &str = include_str!("../assets/styles.css");
+#[cfg(target_arch = "wasm32")]
 const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
+#[cfg(target_arch = "wasm32")]
 struct Component;
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(any(test, target_arch = "wasm32"))]
 struct StaticResponse {
     status: u16,
     content_type: &'static str,
@@ -24,6 +31,7 @@ struct StaticResponse {
     etag: &'static str,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl bindings::exports::tachyon::mesh::handler::Guest for Component {
     fn handle_request(
         req: bindings::exports::tachyon::mesh::handler::Request,
@@ -42,12 +50,14 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
     }
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 struct StaticRequest<'a> {
     method: &'a str,
     uri: &'a str,
     headers: Vec<(&'a str, &'a str)>,
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 fn route_request(request: &StaticRequest<'_>) -> StaticResponse {
     if !request.method.eq_ignore_ascii_case("GET") && !request.method.eq_ignore_ascii_case("HEAD") {
         return static_response(
@@ -95,6 +105,7 @@ fn route_request(request: &StaticRequest<'_>) -> StaticResponse {
     }
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 fn static_response(
     status: u16,
     content_type: &'static str,
@@ -109,6 +120,7 @@ fn static_response(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn to_guest_response(
     response: StaticResponse,
 ) -> bindings::exports::tachyon::mesh::handler::Response {
@@ -129,16 +141,19 @@ fn to_guest_response(
     }
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 fn route_path(uri: &str) -> &str {
     uri.split_once('?').map(|(path, _)| path).unwrap_or(uri)
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 fn request_etag_matches(headers: &[(&str, &str)], expected: &str) -> bool {
     headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("if-none-match") && etag_list_matches(value, expected)
     })
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 fn etag_list_matches(value: &str, expected: &str) -> bool {
     value
         .split(',')
