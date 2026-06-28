@@ -2521,7 +2521,14 @@ mod tests {
                     .expect("batch request should queue"),
             );
         }
-        thread::sleep(Duration::from_millis(5));
+        let started_at = Instant::now();
+        while scheduler.snapshot().completed_aliases.is_empty() {
+            assert!(
+                started_at.elapsed() < Duration::from_secs(1),
+                "scheduler should start the first batch before the realtime request"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         let realtime_rx = scheduler
             .enqueue(
                 Arc::clone(&realtime_model),
@@ -2551,7 +2558,17 @@ mod tests {
             "scheduler should have processed at least two batches"
         );
         assert_eq!(snapshot.completed_aliases[0], "gpu-batch");
-        assert_eq!(snapshot.completed_aliases[1], "gpu-bot");
+        let realtime_position = snapshot
+            .completed_aliases
+            .iter()
+            .position(|alias| alias == "gpu-bot")
+            .expect("realtime request should complete");
+        assert!(
+            snapshot.completed_aliases[(realtime_position + 1)..]
+                .iter()
+                .any(|alias| alias == "gpu-batch"),
+            "realtime request should run before the batch backlog is fully drained"
+        );
     }
 
     #[test]

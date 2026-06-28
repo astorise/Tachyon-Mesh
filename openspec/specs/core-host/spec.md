@@ -151,6 +151,11 @@ The `core-host` crate SHALL keep tokenizer and Candle text-generation dependenci
 - **THEN** the Candle LLM runtime module, tokenizer support, and selected Candle text-generation dependency are compiled
 - **AND** existing ONNX/WASI-NN AI inference support remains available
 
+#### Scenario: AI inference build consumes the downstream Candle quantization fork
+- **WHEN** a developer builds `core-host` with `--features ai-inference`
+- **THEN** `candle-core`, `candle-nn`, `candle-onnx`, and `candle-transformers` resolve from the pinned `astorise/candle` fork revision that carries GPTQ/Marlin, AWQ, and block-wise FP8 weight-quantization kernels proposed upstream in `huggingface/candle#3650`
+- **AND** the default `core-host` build remains free of those optional Candle dependencies
+
 #### Scenario: AI guest runs without ai-inference feature
 - **WHEN** `core-host` is built without `--features ai-inference`
 - **AND** an AI guest or route requires a model binding

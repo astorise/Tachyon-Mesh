@@ -20,8 +20,10 @@ directory name.
 
 Recognized but unsupported combinations fail before weight loading with a typed
 error naming the architecture, format, or execution mode. Gemma3 text requires
-the pinned Candle fork revision `9181a226`, which makes transposed K/V tensors
-contiguous before appending them to the KV cache.
+the pinned Candle fork revision `2ba71712`, which makes transposed K/V tensors
+contiguous before appending them to the KV cache and carries the downstream
+weight-quantization kernel work from `astorise/candle` for GPTQ/Marlin, AWQ,
+and block-wise FP8 proposed upstream in `huggingface/candle#3650`.
 
 Phi4 and DeepSeek V3/R1 are accepted only when their configuration deserializes
 against the pinned Phi3 or DeepSeek V2 Candle contracts respectively. Semantic

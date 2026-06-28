@@ -76,6 +76,23 @@ The repository SHALL build the `guest-ai` artifact in CI and validate that the o
 - **AND** it runs `cargo check -p core-host --features ai-inference`
 - **AND** it still builds the default `core-host` release artifact without the feature
 
+### Requirement: Downstream Candle quantization kernels MUST be consumed through the pinned fork
+The AI inference build SHALL consume Candle from the pinned `astorise/candle`
+revision that includes the downstream GPTQ/Marlin, AWQ, and block-wise FP8
+weight-quantization kernel work proposed upstream in `huggingface/candle#3650`.
+This integration SHALL be represented as dependency selection in Tachyon rather
+than by duplicating those Candle kernels in `core-host`.
+
+#### Scenario: AI inference resolves the forked Candle crates
+- **WHEN** the optional AI inference dependency graph is resolved
+- **THEN** `candle-core`, `candle-nn`, `candle-onnx`, and `candle-transformers` come from `https://github.com/astorise/candle`
+- **AND** Cargo.lock pins them to a single fork revision containing the downstream quantization work
+
+#### Scenario: Default builds do not link Candle quantization code
+- **WHEN** `core-host` is built without `--features ai-inference`
+- **THEN** the optional Candle crates remain unlinked
+- **AND** the default host build does not acquire the fork's quantization kernels
+
 ### Requirement: Wasm guests may request a LoRA adapter for an inference call
 The Mesh SHALL extend the `wit/ai` Wasm Component Model definitions so that an inference call accepts an optional `adapter_id` parameter, allowing a guest to request that a tenant-specific LoRA adapter be applied to the shared foundation model for that single call.
 
