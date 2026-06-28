@@ -565,6 +565,22 @@ When a model deployment declares `hardware_strategy.distribution_mode` other tha
 - **THEN** the existing `Safetensors`/`Gguf` single-device load path executes unchanged
 - **AND** no parallel dispatch, topology discovery, or strategy plumbing is invoked
 
+### Requirement: Llama safetensors generation SHOULD reuse cached KV prefixes
+For the single-device Llama safetensors backend, the runtime SHOULD keep a bounded in-memory prefix cache keyed by token blocks so repeated prompts with a shared prefix can resume prefill from the longest cached block boundary instead of recomputing the full prompt. Cache lookup SHALL verify the stored token sequence before reuse, and generation output SHALL remain identical to the uncached decode path.
+
+#### Scenario: A repeated Llama prefix is reused without changing generation
+- **GIVEN** a loaded Llama safetensors model has already generated from a prompt long enough to populate at least one prefix block
+- **WHEN** a later request for the same model starts with that cached token prefix
+- **THEN** the runtime restores the cached KV state and last prefill logits for the longest matching block-aligned prefix
+- **AND** it only pre-fills the uncached suffix before entering the autoregressive decode loop
+- **AND** buffered and streaming generation produce the same decoded text they would have produced without the prefix cache
+
+#### Scenario: Prefix caching remains independent from PagedAttention
+- **GIVEN** a deployment does not enable `hardware_strategy.paged_attention`
+- **WHEN** Llama safetensors prefix caching is active
+- **THEN** the runtime still uses the existing contiguous KV cache representation
+- **AND** PagedAttention remains rejected until block tables and paged flash-attention are wired explicitly
+
 ### Requirement: PagedAttention MUST require an explicit block-table runtime path
 When a model deployment sets `hardware_strategy.paged_attention: true`, the runtime SHALL NOT silently fall back to the existing contiguous per-request KV cache. Tachyon SHALL enable this mode only after its core-host runtime owns a block allocator, a per-sequence block table, and a Candle paged flash-attn call using `flash_attn_varlen_paged_windowed` or a compatible successor API.
 

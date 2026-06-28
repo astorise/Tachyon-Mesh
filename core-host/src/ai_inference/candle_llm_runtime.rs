@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -100,6 +101,8 @@ const MAX_STOP_SEQUENCE_BYTES: usize = 256;
 pub(crate) const DEFAULT_MAX_PROMPT_BYTES: usize = 16_384;
 const DEFAULT_MAX_PROMPT_TOKENS: usize = 4_096;
 const DEFAULT_MAX_BATCH_SIZE: usize = 32;
+const PREFIX_CACHE_BLOCK_TOKENS: usize = 16;
+const PREFIX_CACHE_MAX_ENTRIES: usize = 128;
 
 #[derive(Debug, Error)]
 pub(crate) enum CandleLlmError {
@@ -353,7 +356,11 @@ impl SingleDeviceBackend {
                 let mut cache = Cache::new(true, DType::F32, config, device).map_err(|error| {
                     runtime.execution_error(format!("failed to build KV cache: {error}"))
                 })?;
-                runtime.decode_loop(
+                let (logits, index_pos) = runtime
+                    .llama_prefill_with_prefix_cache(model, prompt_ids, &mut cache, device)?;
+                runtime.decode_loop_from_logits(
+                    logits,
+                    index_pos,
                     prompt_ids,
                     request,
                     eos_tokens,
@@ -603,6 +610,97 @@ impl GenerationLimits {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PrefixCacheKey {
+    token_len: usize,
+    token_hash: u64,
+}
+
+#[derive(Clone)]
+struct PrefixCacheEntry {
+    tokens: Arc<[u32]>,
+    cache: Cache,
+    logits: Tensor,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct PrefixCache {
+    entries: HashMap<PrefixCacheKey, PrefixCacheEntry>,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl PrefixCache {
+    fn longest_match(&mut self, prompt_ids: &[u32]) -> Option<PrefixCacheEntry> {
+        let mut len = prompt_ids.len() - (prompt_ids.len() % PREFIX_CACHE_BLOCK_TOKENS);
+        while len >= PREFIX_CACHE_BLOCK_TOKENS {
+            let key = prefix_cache_key(&prompt_ids[..len]);
+            if let Some(entry) = self.entries.get_mut(&key) {
+                if entry.tokens.as_ref() == &prompt_ids[..len] {
+                    self.clock = self.clock.saturating_add(1);
+                    entry.last_used = self.clock;
+                    self.hits = self.hits.saturating_add(1);
+                    return Some(entry.clone());
+                }
+            }
+            len = len.saturating_sub(PREFIX_CACHE_BLOCK_TOKENS);
+        }
+        self.misses = self.misses.saturating_add(1);
+        None
+    }
+
+    fn insert(&mut self, prompt_ids: &[u32], cache: Cache, logits: Tensor) {
+        if prompt_ids.len() < PREFIX_CACHE_BLOCK_TOKENS
+            || prompt_ids.len() % PREFIX_CACHE_BLOCK_TOKENS != 0
+        {
+            return;
+        }
+        self.clock = self.clock.saturating_add(1);
+        let key = prefix_cache_key(prompt_ids);
+        self.entries.insert(
+            key,
+            PrefixCacheEntry {
+                tokens: Arc::from(prompt_ids),
+                cache,
+                logits,
+                last_used: self.clock,
+            },
+        );
+        if self.entries.len() > PREFIX_CACHE_MAX_ENTRIES {
+            if let Some(evict) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            {
+                self.entries.remove(&evict);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn token_lengths(&self) -> Vec<usize> {
+        let mut lengths = self
+            .entries
+            .values()
+            .map(|entry| entry.tokens.len())
+            .collect::<Vec<_>>();
+        lengths.sort_unstable();
+        lengths
+    }
+}
+
+fn prefix_cache_key(prompt_ids: &[u32]) -> PrefixCacheKey {
+    let mut hasher = DefaultHasher::new();
+    prompt_ids.hash(&mut hasher);
+    PrefixCacheKey {
+        token_len: prompt_ids.len(),
+        token_hash: hasher.finish(),
+    }
+}
+
 impl std::fmt::Debug for CandleLlmRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CandleLlmRuntime")
@@ -627,6 +725,10 @@ pub(crate) struct CandleLlmRuntime {
     /// schema's SHA-256 hash. Shared behind `Arc` so clones (and concurrent
     /// requests) reuse the same cache instead of recompiling per-request.
     fsm_cache: Arc<FsmCache>,
+    /// Block-addressed KV prefix cache for the upstream Llama safetensors
+    /// backend. Other families keep their current per-request cache behavior
+    /// until their Candle cache types expose a cloneable external cache.
+    prefix_cache: Arc<Mutex<PrefixCache>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -883,6 +985,7 @@ impl CandleLlmRuntime {
             limits,
             chat_template,
             fsm_cache: Arc::new(FsmCache::default()),
+            prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
         }))
     }
 
@@ -1208,6 +1311,7 @@ impl CandleLlmRuntime {
             limits,
             chat_template,
             fsm_cache: Arc::new(FsmCache::default()),
+            prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
         })
     }
 
@@ -1729,13 +1833,47 @@ impl CandleLlmRuntime {
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(), CandleLlmError> {
         let device = input_device;
+        if prompt_ids.len() > self.limits.max_position_embeddings {
+            return Ok(());
+        }
+        let input = Tensor::new(prompt_ids, device)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .map_err(|error| {
+                self.execution_error(format!("failed to build input tensor: {error}"))
+            })?;
+        let logits = forward(&input, 0).map_err(|error| {
+            self.execution_error(format!("transformer forward pass failed: {error}"))
+        })?;
+        self.decode_loop_from_logits(
+            logits,
+            prompt_ids.len(),
+            prompt_ids,
+            request,
+            eos_tokens,
+            device,
+            on_token,
+            forward,
+        )
+    }
+
+    fn decode_loop_from_logits(
+        &self,
+        mut logits: Tensor,
+        mut index_pos: usize,
+        _prompt_ids: &[u32],
+        request: &ParsedGenerationRequest,
+        eos_tokens: &[u32],
+        input_device: &Device,
+        on_token: &mut dyn FnMut(&str),
+        mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
+    ) -> Result<(), CandleLlmError> {
+        let device = input_device;
         let mut processor = request.sampling.processor();
         let mut fsm_processor = request
             .fsm
             .as_ref()
             .map(|fsm| FsmLogitProcessor::new(Arc::clone(fsm)));
         let vocab_size = self.tokenizer.get_vocab_size(true);
-        let mut tokens = prompt_ids.to_vec();
         let mut generated = Vec::with_capacity(request.max_new_tokens);
         // Hold back this many trailing bytes so a stop sequence split across the
         // last token(s) is never partially emitted before it is matched.
@@ -1747,24 +1885,7 @@ impl CandleLlmRuntime {
             .unwrap_or(0)
             .saturating_sub(1);
         let mut emitted = 0usize;
-        let mut index_pos = 0usize;
         for step in 0..request.max_new_tokens {
-            let context: &[u32] = if step == 0 {
-                &tokens
-            } else {
-                &tokens[tokens.len() - 1..]
-            };
-            if index_pos + context.len() > self.limits.max_position_embeddings {
-                break;
-            }
-            let input = Tensor::new(context, device)
-                .and_then(|tensor| tensor.unsqueeze(0))
-                .map_err(|error| {
-                    self.execution_error(format!("failed to build input tensor: {error}"))
-                })?;
-            let logits = forward(&input, index_pos).map_err(|error| {
-                self.execution_error(format!("transformer forward pass failed: {error}"))
-            })?;
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
             })?;
@@ -1775,7 +1896,6 @@ impl CandleLlmRuntime {
             let next = processor.sample(&row).map_err(|error| {
                 self.execution_error(format!("failed to sample next token: {error}"))
             })?;
-            index_pos += context.len();
             if let Some(fsm) = fsm_processor.as_mut() {
                 if !eos_tokens.contains(&next) {
                     let text = self.tokenizer.decode(&[next], false).map_err(|error| {
@@ -1784,7 +1904,6 @@ impl CandleLlmRuntime {
                     fsm.commit(&text);
                 }
             }
-            tokens.push(next);
             generated.push(next);
 
             let text = self.decode_generated(&generated)?;
@@ -1800,12 +1919,80 @@ impl CandleLlmRuntime {
             // No stop yet: emit everything except the held-back tail.
             let safe = floor_char_boundary(&text, text.len().saturating_sub(hold));
             emit_delta(on_token, &text, &mut emitted, safe);
+
+            if step + 1 == request.max_new_tokens {
+                break;
+            }
+            if index_pos + 1 > self.limits.max_position_embeddings {
+                break;
+            }
+            let input = Tensor::new(&[next], device)
+                .and_then(|tensor| tensor.unsqueeze(0))
+                .map_err(|error| {
+                    self.execution_error(format!("failed to build input tensor: {error}"))
+                })?;
+            logits = forward(&input, index_pos).map_err(|error| {
+                self.execution_error(format!("transformer forward pass failed: {error}"))
+            })?;
+            index_pos += 1;
         }
         // Token budget exhausted: flush the held-back tail, trimming any stop.
         let text = self.decode_generated(&generated)?;
         let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
         emit_delta(on_token, &text, &mut emitted, end);
         Ok(())
+    }
+
+    fn llama_prefill_with_prefix_cache(
+        &self,
+        model: &Llama,
+        prompt_ids: &[u32],
+        cache: &mut Cache,
+        device: &Device,
+    ) -> Result<(Tensor, usize), CandleLlmError> {
+        let mut index_pos = 0usize;
+        let mut logits = None;
+        if let Some(entry) = self
+            .prefix_cache
+            .lock()
+            .map_err(|_| self.execution_error("prefix cache mutex was poisoned".to_owned()))?
+            .longest_match(prompt_ids)
+        {
+            *cache = entry.cache;
+            index_pos = entry.tokens.len();
+            logits = Some(entry.logits);
+        }
+
+        while index_pos < prompt_ids.len() {
+            let remaining = prompt_ids.len() - index_pos;
+            let chunk_len = remaining.min(PREFIX_CACHE_BLOCK_TOKENS);
+            if index_pos + chunk_len > self.limits.max_position_embeddings {
+                break;
+            }
+            let chunk = &prompt_ids[index_pos..index_pos + chunk_len];
+            let input = Tensor::new(chunk, device)
+                .and_then(|tensor| tensor.unsqueeze(0))
+                .map_err(|error| {
+                    self.execution_error(format!("failed to build input tensor: {error}"))
+                })?;
+            let next_logits = model.forward(&input, index_pos, cache).map_err(|error| {
+                self.execution_error(format!("transformer forward pass failed: {error}"))
+            })?;
+            index_pos += chunk_len;
+            if index_pos % PREFIX_CACHE_BLOCK_TOKENS == 0 {
+                self.prefix_cache
+                    .lock()
+                    .map_err(|_| {
+                        self.execution_error("prefix cache mutex was poisoned".to_owned())
+                    })?
+                    .insert(&prompt_ids[..index_pos], cache.clone(), next_logits.clone());
+            }
+            logits = Some(next_logits);
+        }
+
+        logits
+            .ok_or_else(|| self.execution_error("prompt produced no prefill logits".to_owned()))
+            .map(|logits| (logits, index_pos))
     }
 
     /// Mask every vocabulary logit the grammar would reject for the next
@@ -1959,6 +2146,22 @@ impl CandleLlmRuntime {
     #[cfg(test)]
     pub(crate) fn debug_parallel_prefill_logits(&self, prompt: &str) -> Vec<f32> {
         self.debug_last_logits(prompt)
+    }
+
+    #[cfg(test)]
+    fn debug_prefix_cache_token_lengths(&self) -> Vec<usize> {
+        self.prefix_cache
+            .lock()
+            .expect("prefix cache should not be poisoned")
+            .token_lengths()
+    }
+
+    #[cfg(test)]
+    fn debug_prefix_cache_hits(&self) -> u64 {
+        self.prefix_cache
+            .lock()
+            .expect("prefix cache should not be poisoned")
+            .hits
     }
 
     fn parse_request(&self, data: &[u8]) -> Result<ParsedGenerationRequest, CandleLlmError> {
@@ -3985,6 +4188,59 @@ mod tests {
             "a real forward pass must emit at least one decoded token"
         );
         assert_ne!(text, "MOCK_LLM_RESPONSE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn llama_generation_populates_block_prefix_cache() {
+        let (runtime, dir) = load_fixture("prefix-cache-fill");
+        let prompt = std::iter::repeat("hello")
+            .take(PREFIX_CACHE_BLOCK_TOKENS * 2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let request = serde_json::json!({
+            "prompt": prompt,
+            "max_new_tokens": 1,
+        })
+        .to_string();
+
+        runtime
+            .generate(&[request.as_bytes()])
+            .expect("generation should fill prefix cache");
+
+        assert_eq!(
+            runtime.debug_prefix_cache_token_lengths(),
+            vec![PREFIX_CACHE_BLOCK_TOKENS, PREFIX_CACHE_BLOCK_TOKENS * 2]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn llama_generation_reuses_cached_prefix_without_changing_output() {
+        let (runtime, dir) = load_fixture("prefix-cache-hit");
+        let prompt = std::iter::repeat("hello")
+            .take(PREFIX_CACHE_BLOCK_TOKENS + 4)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let request = serde_json::json!({
+            "prompt": prompt,
+            "max_new_tokens": 2,
+        })
+        .to_string();
+
+        let first = runtime
+            .generate(&[request.as_bytes()])
+            .expect("first generation should run");
+        let hits_before = runtime.debug_prefix_cache_hits();
+        let second = runtime
+            .generate(&[request.as_bytes()])
+            .expect("second generation should reuse prefix cache");
+
+        assert_eq!(first, second);
+        assert!(
+            runtime.debug_prefix_cache_hits() > hits_before,
+            "second generation should hit the block prefix cache"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
