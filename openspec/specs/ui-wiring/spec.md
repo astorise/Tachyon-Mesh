@@ -17,6 +17,23 @@ The Tachyon web component registry SHALL map `topology` and `registry` routes to
 - **THEN** the registry returns `tachyon-supply-chain-panel`
 - **AND** the route label remains `Asset Registry`
 
+### Requirement: Shell exposes optional chat micro-frontend
+The Tachyon web component registry SHALL map `chat` to `tachyon-chat-panel`.
+The chat panel SHALL attempt to load `/chat/tachyon-chat-assistant.js`
+dynamically from the static FaaS endpoint and render the remote
+`<tachyon-chat-assistant>` element when available. If the script cannot be
+loaded, the shell SHALL keep rendering without throwing and SHALL show a
+non-blocking unavailable state.
+
+#### Scenario: Chat route resolves through registry
+- **WHEN** the shell asks `ComponentRegistry` to resolve `chat`
+- **THEN** the registry returns `tachyon-chat-panel`
+
+#### Scenario: Missing static FaaS does not break the shell
+- **WHEN** `<tachyon-chat-panel>` cannot import `/chat/tachyon-chat-assistant.js`
+- **THEN** it renders a fallback unavailable state
+- **AND** the rest of Tachyon-UI remains interactive
+
 ### Requirement: Overview dashboard uses live mesh graph telemetry
 The `<tachyon-overview-panel>` dashboard SHALL fetch telemetry from the Tauri `get_mesh_graph` command and update its counters asynchronously before animating them.
 

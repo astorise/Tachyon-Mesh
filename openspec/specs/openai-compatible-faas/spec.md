@@ -1,39 +1,47 @@
 # openai-compatible-faas Specification
 
 ## Purpose
-TBD - created by archiving change faas-openai-user-example. Update Purpose after archive.
+Define the user-space OpenAI-compatible FaaS surface, its model registry
+ownership, streaming behavior, and the decoupled static chat UI example that
+dogfoods Tachyon FaaS for browser delivery.
 ## Requirements
 ### Requirement: User-space OpenAI-compatible FaaS
 
 The OpenAI-compatible HTTP surface SHALL be provided by a single **user-role**
 FaaS (`guest-openai`) built against the `faas-guest` WIT world. It SHALL expose
-`GET /v1/models` and `POST /v1/chat/completions`, and it SHALL NOT be a system
-FaaS injected by a compile-time feature flag. A dynamic model advertised by the
-registry SHALL be usable by the chat route when that alias is included in the
-route's sealed dynamic model bindings.
+`GET /ai/v1/models` and `POST /ai/v1/chat/completions`, and it SHALL NOT expose
+the former public `/v1/models` or `/v1/chat/completions` routes. It SHALL NOT be
+a system FaaS injected by a compile-time feature flag. A dynamic model
+advertised by the registry SHALL be usable by the chat route when that alias is
+included in the route's sealed dynamic model bindings.
 
 #### Scenario: Model listing returns OpenAI-compatible shape
 
 - **GIVEN** the registry contains at least one available model
-- **WHEN** a client requests `GET /v1/models`
+- **WHEN** a client requests `GET /ai/v1/models`
 - **THEN** `guest-openai` returns a JSON body with `object: "list"` and a `data` array
 - **AND** each item includes an `id`, `object: "model"`, and `owned_by: "tachyon-mesh"`
 
 #### Scenario: Chat completions runs real inference
 
 - **GIVEN** a sealed static or dynamic model alias the route is allowed to use
-- **WHEN** a client requests `POST /v1/chat/completions` naming that model
+- **WHEN** a client requests `POST /ai/v1/chat/completions` naming that model
 - **THEN** `guest-openai` loads the model on the requested accelerator, hands
   the structured conversation and sampling parameters to the host, and returns
   an OpenAI-shaped `chat.completion`
 
 #### Scenario: Listed dynamic model is authorized for chat
 
-- **GIVEN** a dynamic model is registered and listed by `/v1/models`
-- **AND** the `/v1/chat/completions` route contains a sealed dynamic binding for
+- **GIVEN** a dynamic model is registered and listed by `/ai/v1/models`
+- **AND** the `/ai/v1/chat/completions` route contains a sealed dynamic binding for
   its alias
 - **WHEN** a client requests a chat completion with that alias
 - **THEN** the request SHALL pass route model authorization
+
+#### Scenario: Former public routes are absent
+
+- **WHEN** a client requests `GET /v1/models` or `POST /v1/chat/completions`
+- **THEN** the node returns `404` because those routes are not sealed
 
 #### Scenario: Unknown model returns 404
 
@@ -163,4 +171,37 @@ transport.
 
 - **WHEN** a chat completion request omits `stream` or sets it to `false`
 - **THEN** `guest-openai` returns a single buffered `chat.completion` JSON body
+
+### Requirement: Static chat UI FaaS example
+
+The repository SHALL provide a `guest-chat-ui` user-role FaaS example that
+serves a browser chat UI as static assets under `/chat`. The example SHALL be
+implemented as a framework-free Web Component (`<tachyon-chat-assistant>`) with
+Shadow DOM encapsulation. The component SHALL call the browser-visible
+OpenAI-compatible gateway directly, using `GET /ai/v1/models` for model
+discovery when available and streamed `POST /ai/v1/chat/completions` requests
+for assistant responses.
+
+#### Scenario: Static FaaS serves chat assets
+
+- **WHEN** a browser requests `/chat`
+- **THEN** `guest-chat-ui` returns an HTML shell that loads
+  `/chat/tachyon-chat-assistant.js`
+- **AND** the JavaScript asset defines `<tachyon-chat-assistant>`
+- **AND** successful static asset responses include cache headers and ETags
+
+#### Scenario: Web Component streams directly from the gateway
+
+- **WHEN** the user sends a message through `<tachyon-chat-assistant>`
+- **THEN** the component sends a streamed OpenAI-compatible request directly to
+  `/ai/v1/chat/completions`
+- **AND** it consumes `data:` Server-Sent Event frames until `[DONE]`
+
+#### Scenario: Standalone topology includes the complete chat stack
+
+- **WHEN** an operator deploys the `guest-chat-ui` example manifest
+- **THEN** the topology includes the static `/chat` route, the
+  `/ai/v1/models` route, the `/ai/v1/chat/completions` route, and the internal
+  `guest-openai` registration route backed by the shared `ai-models-registry`
+  table
 

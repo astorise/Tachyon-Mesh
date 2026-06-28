@@ -1,0 +1,54 @@
+{
+  "routes": [
+    {
+      "path": "/chat",
+      "role": "user",
+      "name": "chat-ui-static",
+      "targets": [{ "module": "guest-chat-ui", "weight": 100 }],
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "0.1.0",
+      "scopes": {},
+      "dependencies": {}
+    },
+    {
+      "path": "/ai/v1/models",
+      "role": "user",
+      "name": "openai-models",
+      "targets": [{ "module": "guest-openai", "weight": 100 }],
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "1.0.0",
+      "scopes": { "kv": ["ai-models-registry"] },
+      "dependencies": {}
+    },
+    {
+      "path": "/ai/v1/chat/completions",
+      "role": "user",
+      "name": "openai-chat",
+      "targets": [{ "module": "guest-openai", "weight": 100 }],
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "1.0.0",
+      "scopes": { "kv": ["ai-models-registry"] },
+      "models": [
+        {
+          "alias": "nvidia--Qwen3.6-35B-A3B-NVFP4",
+          "dynamic": true
+        }
+      ],
+      "dependencies": {}
+    },
+    {
+      "path": "/internal/guest-openai/register",
+      "role": "user",
+      "name": "openai-registry",
+      "targets": [{ "module": "guest-openai", "weight": 100 }],
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "1.0.0",
+      "scopes": { "kv": ["ai-models-registry"] },
+      "dependencies": {}
+    }
+  ]
+}

@@ -3902,6 +3902,13 @@ name = "guest-call-legacy"
 version = "1.0.0"
 
 [[package]]
+name = "guest-chat-ui"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "guest-example"
 version = "1.0.0"
 dependencies = [

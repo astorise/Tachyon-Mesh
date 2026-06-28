@@ -16,6 +16,7 @@ const routes: ComponentRoute[] = [
   { route: "routing", label: "Routing", tagName: "tachyon-routing-panel", requires: "hasRouting" },
   { route: "resilience", label: "Resilience", tagName: "tachyon-resilience-panel", requires: "hasResilience" },
   { route: "ai", label: "AI Orchestration", tagName: "tachyon-ai-panel", requires: "hasAi" },
+  { route: "chat", label: "Chat", tagName: "tachyon-chat-panel" },
   { route: "hardware", label: "Hardware", tagName: "tachyon-hardware-panel", requires: "hasEnrolledNodes" },
   { route: "nodes", label: "Nodes", tagName: "tachyon-nodes-panel", requires: "hasEnrolledNodes" },
   { route: "systems", label: "Systems", tagName: "tachyon-systems-panel", requires: "hasEnrolledNodes" },

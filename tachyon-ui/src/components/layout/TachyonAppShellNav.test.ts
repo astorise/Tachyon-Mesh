@@ -36,6 +36,11 @@ describe("TachyonAppShellNav — cluster feature filtering", () => {
     expect(navRoutes(mountNav())).toContain("overview");
   });
 
+  it("always renders chat regardless of cluster features", () => {
+    vi.mocked(isFeatureAvailable).mockReturnValue(false);
+    expect(navRoutes(mountNav())).toContain("chat");
+  });
+
   it("always renders dashboard regardless of cluster features", () => {
     vi.mocked(isFeatureAvailable).mockReturnValue(false);
     expect(navRoutes(mountNav())).toContain("dashboard");
