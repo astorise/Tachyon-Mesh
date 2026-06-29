@@ -342,6 +342,13 @@ enum SingleDeviceBackend {
     DeepSeek(Mutex<DeepSeekModel>),
 }
 
+struct DecodeLoopContext<'a> {
+    request: &'a ParsedGenerationRequest,
+    eos_tokens: &'a [u32],
+    input_device: &'a Device,
+    on_token: &'a mut dyn FnMut(&str),
+}
+
 impl SingleDeviceBackend {
     fn decode(
         &self,
@@ -363,10 +370,12 @@ impl SingleDeviceBackend {
                     logits,
                     index_pos,
                     prompt_ids,
-                    request,
-                    eos_tokens,
-                    device,
-                    on_token,
+                    DecodeLoopContext {
+                        request,
+                        eos_tokens,
+                        input_device: device,
+                        on_token,
+                    },
                     |input, index_pos| model.forward(input, index_pos, &mut cache),
                 )
             }
@@ -676,7 +685,7 @@ impl PrefixCache {
 
     fn insert(&mut self, prompt_ids: &[u32], cache: Cache, logits: Tensor) {
         if prompt_ids.len() < PREFIX_CACHE_BLOCK_TOKENS
-            || prompt_ids.len() % PREFIX_CACHE_BLOCK_TOKENS != 0
+            || !prompt_ids.len().is_multiple_of(PREFIX_CACHE_BLOCK_TOKENS)
         {
             return;
         }
@@ -1862,7 +1871,16 @@ impl CandleLlmRuntime {
         }
         let (logits, index_pos) = self.run_prefill_chunks(prompt_ids, device, &mut forward)?;
         self.decode_loop_from_logits(
-            logits, index_pos, prompt_ids, request, eos_tokens, device, on_token, forward,
+            logits,
+            index_pos,
+            prompt_ids,
+            DecodeLoopContext {
+                request,
+                eos_tokens,
+                input_device,
+                on_token,
+            },
+            forward,
         )
     }
 
@@ -1900,13 +1918,15 @@ impl CandleLlmRuntime {
         mut logits: Tensor,
         mut index_pos: usize,
         _prompt_ids: &[u32],
-        request: &ParsedGenerationRequest,
-        eos_tokens: &[u32],
-        input_device: &Device,
-        on_token: &mut dyn FnMut(&str),
+        context: DecodeLoopContext<'_>,
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(), CandleLlmError> {
-        let device = input_device;
+        let DecodeLoopContext {
+            request,
+            eos_tokens,
+            input_device: device,
+            on_token,
+        } = context;
         let mut processor = request.sampling.processor();
         let mut fsm_processor = request
             .fsm
@@ -2018,7 +2038,7 @@ impl CandleLlmRuntime {
                 self.execution_error(format!("transformer forward pass failed: {error}"))
             })?;
             index_pos += chunk_len;
-            if index_pos % PREFIX_CACHE_BLOCK_TOKENS == 0 {
+            if index_pos.is_multiple_of(PREFIX_CACHE_BLOCK_TOKENS) {
                 self.prefix_cache
                     .lock()
                     .map_err(|_| {
@@ -4244,8 +4264,7 @@ mod tests {
             ..HardwareStrategy::default()
         };
         let (runtime, dir) = load_fixture_with_strategy("prefix-cache-fill", &strategy);
-        let prompt = std::iter::repeat("hello")
-            .take(PREFIX_CACHE_BLOCK_TOKENS * 2)
+        let prompt = std::iter::repeat_n("hello", PREFIX_CACHE_BLOCK_TOKENS * 2)
             .collect::<Vec<_>>()
             .join(" ");
         let request = serde_json::json!({
@@ -4272,8 +4291,7 @@ mod tests {
             ..HardwareStrategy::default()
         };
         let (runtime, dir) = load_fixture_with_strategy("prefix-cache-hit", &strategy);
-        let prompt = std::iter::repeat("hello")
-            .take(PREFIX_CACHE_BLOCK_TOKENS + 4)
+        let prompt = std::iter::repeat_n("hello", PREFIX_CACHE_BLOCK_TOKENS + 4)
             .collect::<Vec<_>>()
             .join(" ");
         let request = serde_json::json!({

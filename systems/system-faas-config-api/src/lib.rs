@@ -750,6 +750,8 @@ mod tests {
             stage_layer_ranges,
             expert_device_map,
             pipeline_depth,
+            paged_attention: false,
+            prefill_chunk_tokens: None,
         }
     }
 
