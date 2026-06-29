@@ -25,7 +25,7 @@ der = { version = "0.7", default-features = false, features = [
     "pem",
     "flagset",
 ] }
-spki = { version = "0.7", default-features = false, features = ["alloc"] }
+spki = { version = "0.8", default-features = false, features = ["alloc"] }
 # PKCS#8 PEM export of the P-256 leaf private key (`EncodePrivateKey`). Already
 # in the tree via ed25519-dalek / p256; named directly so both key types share
 # one trait import. `alloc` + `pem` enable `to_pkcs8_pem`.
