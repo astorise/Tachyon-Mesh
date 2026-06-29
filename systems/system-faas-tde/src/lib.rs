@@ -59,15 +59,17 @@ fn transform(
 
 pub fn encrypt_chunk(data: &[u8], nonce: u64) -> Result<Vec<u8>, String> {
     let nonce = nonce_bytes(nonce);
+    let nonce = Nonce::try_from(nonce.as_slice()).map_err(|_| "invalid TDE nonce".to_owned())?;
     cipher()?
-        .encrypt(Nonce::from_slice(&nonce), data)
+        .encrypt(&nonce, data)
         .map_err(|_| "failed to encrypt TDE chunk with AES-256-GCM".to_owned())
 }
 
 pub fn decrypt_chunk(data: &[u8], nonce: u64) -> Result<Vec<u8>, String> {
     let nonce = nonce_bytes(nonce);
+    let nonce = Nonce::try_from(nonce.as_slice()).map_err(|_| "invalid TDE nonce".to_owned())?;
     cipher()?
-        .decrypt(Nonce::from_slice(&nonce), data)
+        .decrypt(&nonce, data)
         .map_err(|_| "failed to decrypt TDE chunk or authenticate ciphertext".to_owned())
 }
 
