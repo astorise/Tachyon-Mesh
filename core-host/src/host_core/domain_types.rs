@@ -431,6 +431,11 @@ pub(crate) struct HardwareStrategy {
     /// through Tachyon's block allocator and block table.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) paged_attention: bool,
+    /// Optional prefill chunk size in tokens. `None` uses the runtime default
+    /// (8K tokens), `Some(0)` disables chunking and processes the prompt in a
+    /// single prefill forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prefill_chunk_tokens: Option<u32>,
 }
 
 impl HardwareStrategy {
@@ -445,6 +450,7 @@ impl HardwareStrategy {
             && self.expert_device_map.is_empty()
             && self.pipeline_depth == 0
             && !self.paged_attention
+            && self.prefill_chunk_tokens.is_none()
     }
 }
 
@@ -1241,6 +1247,26 @@ mod hardware_strategy_tests {
         };
         let json = serde_json::to_string(&binding).expect("serialize");
         assert!(json.contains("paged_attention"));
+        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, binding);
+        assert!(!restored.hardware_strategy.is_single());
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_round_trips_and_is_not_single() {
+        let binding = IntegrityModelBinding {
+            alias: "m".to_owned(),
+            path: "/models/m".to_owned(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: HardwareStrategy {
+                prefill_chunk_tokens: Some(4096),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&binding).expect("serialize");
+        assert!(json.contains("prefill_chunk_tokens"));
         let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, binding);
         assert!(!restored.hardware_strategy.is_single());

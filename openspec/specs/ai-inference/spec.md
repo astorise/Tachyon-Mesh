@@ -62,6 +62,23 @@ the next compatible step without waiting for a fixed time window.
 - **THEN** the scheduler may admit the new request into the active set before the existing sequence completes
 - **AND** the next eligible step is selected by QoS and compatibility rather than by the original arrival batch
 
+### Requirement: Candle LLM prefill is chunked and configurable
+The Candle LLM runtime SHALL split prompt prefill into bounded token chunks before entering
+autoregressive decode. The default chunk size SHALL be 8192 tokens, model bindings MAY configure
+`hardware_strategy.prefill_chunk_tokens`, and setting it to `0` SHALL disable chunking for that
+binding.
+
+#### Scenario: Long prompt prefill advances in chunks
+- **GIVEN** a loaded Candle text-generation model with `prefill_chunk_tokens` set to `4096`
+- **WHEN** a request prompt tokenizes to more than 4096 tokens
+- **THEN** the runtime performs multiple prefill forwards with increasing `index_pos`
+- **AND** decode starts from the logits of the final prefill chunk
+
+#### Scenario: Chunking can be disabled
+- **GIVEN** a model binding sets `hardware_strategy.prefill_chunk_tokens` to `0`
+- **WHEN** the runtime processes a prompt within the model context window
+- **THEN** prefill is executed as a single forward pass before decode
+
 ### Requirement: WASI-NN calls are bridged through the batching scheduler
 The Wasmtime host SHALL intercept `wasi-nn` compute calls, enqueue them with response channels,
 and resume the guest only after the scheduler returns inference output.

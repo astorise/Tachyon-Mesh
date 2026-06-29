@@ -101,6 +101,7 @@ const MAX_STOP_SEQUENCE_BYTES: usize = 256;
 pub(crate) const DEFAULT_MAX_PROMPT_BYTES: usize = 16_384;
 const DEFAULT_MAX_PROMPT_TOKENS: usize = 4_096;
 const DEFAULT_MAX_BATCH_SIZE: usize = 32;
+const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 8_192;
 const PREFIX_CACHE_BLOCK_TOKENS: usize = 16;
 const PREFIX_CACHE_MAX_ENTRIES: usize = 128;
 
@@ -596,6 +597,9 @@ struct GenerationLimits {
     max_prompt_tokens: usize,
     max_batch_size: usize,
     max_position_embeddings: usize,
+    /// `None` disables chunking; `Some(n)` bounds each prefill forward to at
+    /// most `n` tokens. The default is `Some(8192)` to match candle-vllm.
+    prefill_chunk_tokens: Option<usize>,
 }
 
 impl GenerationLimits {
@@ -606,7 +610,26 @@ impl GenerationLimits {
             max_prompt_tokens: DEFAULT_MAX_PROMPT_TOKENS,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_position_embeddings,
+            prefill_chunk_tokens: Some(DEFAULT_PREFILL_CHUNK_TOKENS),
         }
+    }
+
+    fn with_prefill_chunk_tokens(mut self, configured: Option<u32>) -> Self {
+        if let Some(tokens) = configured {
+            self.prefill_chunk_tokens = match usize::try_from(tokens) {
+                Ok(0) => None,
+                Ok(value) => Some(value),
+                Err(_) => Some(DEFAULT_PREFILL_CHUNK_TOKENS),
+            };
+        }
+        self
+    }
+
+    fn next_prefill_chunk_len(&self, remaining: usize) -> usize {
+        self.prefill_chunk_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| remaining.min(tokens))
+            .unwrap_or(remaining)
     }
 }
 
@@ -935,7 +958,7 @@ impl CandleLlmRuntime {
         // `single` deployment still returns the existing typed error. A
         // non-`single` strategy resolves its devices from the validated plan
         // instead, so it does not go through this check.
-        if strategy.is_single() && requested_device != "cpu" {
+        if strategy.distribution_mode == GpuDistribution::Single && requested_device != "cpu" {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
@@ -968,7 +991,7 @@ impl CandleLlmRuntime {
         // `messages` requests render exactly as the checkpoint expects.
         let chat_template = ChatTemplate::load(alias, root)?.map(Arc::new);
 
-        let (inner, limits) = if strategy.is_single() {
+        let (inner, limits) = if strategy.distribution_mode == GpuDistribution::Single {
             match format {
                 ModelFormat::Safetensors => Self::load_safetensors(alias, root)?,
                 ModelFormat::Gguf => Self::load_gguf(alias, root)?,
@@ -976,6 +999,7 @@ impl CandleLlmRuntime {
         } else {
             Self::load_parallel(alias, root, format, strategy, topology)?
         };
+        let limits = limits.with_prefill_chunk_tokens(strategy.prefill_chunk_tokens);
 
         Ok(Some(Self {
             alias: alias.to_owned(),
@@ -1836,24 +1860,39 @@ impl CandleLlmRuntime {
         if prompt_ids.len() > self.limits.max_position_embeddings {
             return Ok(());
         }
-        let input = Tensor::new(prompt_ids, device)
-            .and_then(|tensor| tensor.unsqueeze(0))
-            .map_err(|error| {
-                self.execution_error(format!("failed to build input tensor: {error}"))
-            })?;
-        let logits = forward(&input, 0).map_err(|error| {
-            self.execution_error(format!("transformer forward pass failed: {error}"))
-        })?;
+        let (logits, index_pos) = self.run_prefill_chunks(prompt_ids, device, &mut forward)?;
         self.decode_loop_from_logits(
-            logits,
-            prompt_ids.len(),
-            prompt_ids,
-            request,
-            eos_tokens,
-            device,
-            on_token,
-            forward,
+            logits, index_pos, prompt_ids, request, eos_tokens, device, on_token, forward,
         )
+    }
+
+    fn run_prefill_chunks(
+        &self,
+        prompt_ids: &[u32],
+        device: &Device,
+        forward: &mut impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
+    ) -> Result<(Tensor, usize), CandleLlmError> {
+        let mut index_pos = 0usize;
+        let mut logits = None;
+        while index_pos < prompt_ids.len() {
+            let remaining = prompt_ids.len() - index_pos;
+            let chunk_len = self.limits.next_prefill_chunk_len(remaining);
+            let chunk = &prompt_ids[index_pos..index_pos + chunk_len];
+            let input = Tensor::new(chunk, device)
+                .and_then(|tensor| tensor.unsqueeze(0))
+                .map_err(|error| {
+                    self.execution_error(format!("failed to build input tensor: {error}"))
+                })?;
+            let next_logits = forward(&input, index_pos).map_err(|error| {
+                self.execution_error(format!("transformer forward pass failed: {error}"))
+            })?;
+            index_pos += chunk_len;
+            logits = Some(next_logits);
+        }
+
+        logits
+            .ok_or_else(|| self.execution_error("prompt produced no prefill logits".to_owned()))
+            .map(|logits| (logits, index_pos))
     }
 
     fn decode_loop_from_logits(
@@ -1965,7 +2004,7 @@ impl CandleLlmRuntime {
 
         while index_pos < prompt_ids.len() {
             let remaining = prompt_ids.len() - index_pos;
-            let chunk_len = remaining.min(PREFIX_CACHE_BLOCK_TOKENS);
+            let chunk_len = self.limits.next_prefill_chunk_len(remaining);
             if index_pos + chunk_len > self.limits.max_position_embeddings {
                 break;
             }
@@ -4120,6 +4159,13 @@ mod tests {
     }
 
     fn load_fixture(tag: &str) -> (CandleLlmRuntime, PathBuf) {
+        load_fixture_with_strategy(tag, &HardwareStrategy::default())
+    }
+
+    fn load_fixture_with_strategy(
+        tag: &str,
+        strategy: &HardwareStrategy,
+    ) -> (CandleLlmRuntime, PathBuf) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock should be after the epoch")
@@ -4129,7 +4175,7 @@ mod tests {
             std::process::id()
         ));
         write_tachyon_tiny_fixture(&dir).expect("fixture should be written");
-        let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &HardwareStrategy::default())
+        let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cpu", strategy)
             .expect("fixture should load without error")
             .expect("fixture is a supported Llama model");
         (runtime, dir)
@@ -4193,7 +4239,11 @@ mod tests {
 
     #[test]
     fn llama_generation_populates_block_prefix_cache() {
-        let (runtime, dir) = load_fixture("prefix-cache-fill");
+        let strategy = HardwareStrategy {
+            prefill_chunk_tokens: Some(PREFIX_CACHE_BLOCK_TOKENS as u32),
+            ..HardwareStrategy::default()
+        };
+        let (runtime, dir) = load_fixture_with_strategy("prefix-cache-fill", &strategy);
         let prompt = std::iter::repeat("hello")
             .take(PREFIX_CACHE_BLOCK_TOKENS * 2)
             .collect::<Vec<_>>()
@@ -4217,7 +4267,11 @@ mod tests {
 
     #[test]
     fn llama_generation_reuses_cached_prefix_without_changing_output() {
-        let (runtime, dir) = load_fixture("prefix-cache-hit");
+        let strategy = HardwareStrategy {
+            prefill_chunk_tokens: Some(PREFIX_CACHE_BLOCK_TOKENS as u32),
+            ..HardwareStrategy::default()
+        };
+        let (runtime, dir) = load_fixture_with_strategy("prefix-cache-hit", &strategy);
         let prompt = std::iter::repeat("hello")
             .take(PREFIX_CACHE_BLOCK_TOKENS + 4)
             .collect::<Vec<_>>()
@@ -4242,6 +4296,24 @@ mod tests {
             "second generation should hit the block prefix cache"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prefill_chunk_limits_default_to_8k_and_can_be_disabled() {
+        let default_limits = GenerationLimits::with_context(DEFAULT_MAX_PROMPT_TOKENS);
+        assert_eq!(
+            default_limits.next_prefill_chunk_len(DEFAULT_PREFILL_CHUNK_TOKENS + 1),
+            DEFAULT_PREFILL_CHUNK_TOKENS
+        );
+
+        let disabled = default_limits.with_prefill_chunk_tokens(Some(0));
+        assert_eq!(
+            disabled.next_prefill_chunk_len(DEFAULT_PREFILL_CHUNK_TOKENS + 1),
+            DEFAULT_PREFILL_CHUNK_TOKENS + 1
+        );
+
+        let configured = default_limits.with_prefill_chunk_tokens(Some(128));
+        assert_eq!(configured.next_prefill_chunk_len(1024), 128);
     }
 
     #[test]
