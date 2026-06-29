@@ -86,6 +86,7 @@ const GGUF_LLAMA_ARCHITECTURE: &str = "llama";
 /// Error component label for GGUF load failures.
 const GGUF_COMPONENT: &str = "model.gguf";
 const DEFAULT_MAX_NEW_TOKENS: usize = 64;
+pub(crate) const DEFAULT_SPECULATIVE_DRAFT_TOKENS: usize = 4;
 /// Hard upper bound on `max_new_tokens` for any single request, regardless of
 /// what the caller asks for. Protects the host from unbounded decode loops.
 pub(crate) const HOST_MAX_NEW_TOKENS: usize = 256;
@@ -466,8 +467,7 @@ impl SingleDeviceBackend {
         }
     }
 
-    #[cfg(test)]
-    fn debug_last_logits(&self, input: &Tensor, device: &Device) -> Tensor {
+    fn last_logits(&self, input: &Tensor, device: &Device) -> Tensor {
         match self {
             Self::Llama { model, config } => {
                 let mut cache =
@@ -588,7 +588,6 @@ fn pipeline_stage_transports(
 /// prefill-equivalence test/debug path; the production decode path instead
 /// calls [`PipelineParallelLlama::forward_at`] directly so it can reuse the
 /// same per-stage caches across multiple decode steps.
-#[cfg(test)]
 fn pipeline_prefill_forward(
     model: &PipelineParallelLlama,
     input: &Tensor,
@@ -848,6 +847,10 @@ struct SamplingPolicy {
 }
 
 impl SamplingPolicy {
+    fn is_greedy(&self) -> bool {
+        self.temperature.is_none()
+    }
+
     fn processor(&self) -> LogitsProcessor {
         match self.temperature {
             // Greedy: deterministic argmax, independent of the seed.
@@ -1681,6 +1684,19 @@ impl CandleLlmRuntime {
         Ok(out.into_bytes())
     }
 
+    pub(crate) fn generate_speculative(
+        &self,
+        prompts: &[&[u8]],
+        draft: &Self,
+        draft_tokens: usize,
+    ) -> Result<Vec<u8>, CandleLlmError> {
+        let mut out = String::new();
+        self.generate_speculative_streaming(prompts, draft, draft_tokens, &mut |delta| {
+            out.push_str(delta)
+        })?;
+        Ok(out.into_bytes())
+    }
+
     /// Streaming generation: identical decoding to [`generate`], but each newly
     /// decoded, stop-trimmed text fragment is handed to `on_token` as it is
     /// produced. The concatenation of every `on_token` fragment equals the
@@ -1730,8 +1746,221 @@ impl CandleLlmRuntime {
         self.decode(&prompt_ids, request, on_token)
     }
 
+    pub(crate) fn generate_speculative_streaming(
+        &self,
+        prompts: &[&[u8]],
+        draft: &Self,
+        draft_tokens: usize,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), CandleLlmError> {
+        if prompts.len() != 1 || !self.has_compatible_tokenizer(draft) {
+            return self.generate_streaming(prompts, on_token);
+        }
+        let request = self.parse_request(prompts[0])?;
+        if !request.sampling.is_greedy() || request.fsm.is_some() {
+            return self.generate_streaming(prompts, on_token);
+        }
+        let prompt_ids = self.encode_ids(&request.prompt)?;
+        if prompt_ids.is_empty() {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: "prompt produced no tokens to condition on".to_owned(),
+            });
+        }
+
+        let draft_tokens = draft_tokens.max(1);
+        let mut context_ids = prompt_ids.clone();
+        let mut generated = Vec::with_capacity(request.max_new_tokens);
+        let hold = request
+            .stop
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let mut emitted = 0usize;
+
+        while generated.len() < request.max_new_tokens
+            && context_ids.len() < self.limits.max_position_embeddings
+        {
+            let remaining = request.max_new_tokens - generated.len();
+            let proposed = draft.greedy_token_ids_from_context(
+                &context_ids,
+                &request,
+                draft_tokens.min(remaining),
+            )?;
+            if proposed.is_empty() {
+                break;
+            }
+
+            for proposed_token in proposed {
+                let Some(target_token) = self.greedy_next_token_id(&context_ids, &request)? else {
+                    return Ok(());
+                };
+                context_ids.push(target_token);
+                generated.push(target_token);
+
+                let text = self.decode_generated(&generated)?;
+                if let Some(stop_at) = find_earliest_stop(&text, &request.stop) {
+                    emit_delta(on_token, &text, &mut emitted, stop_at);
+                    return Ok(());
+                }
+                if self.is_eos_token(target_token) {
+                    emit_delta(on_token, &text, &mut emitted, text.len());
+                    return Ok(());
+                }
+                let safe = floor_char_boundary(&text, text.len().saturating_sub(hold));
+                emit_delta(on_token, &text, &mut emitted, safe);
+
+                if target_token != proposed_token
+                    || generated.len() == request.max_new_tokens
+                    || context_ids.len() >= self.limits.max_position_embeddings
+                {
+                    break;
+                }
+            }
+        }
+
+        let text = self.decode_generated(&generated)?;
+        let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
+        emit_delta(on_token, &text, &mut emitted, end);
+        Ok(())
+    }
+
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn has_compatible_tokenizer(&self, draft: &Self) -> bool {
+        self.tokenizer.get_vocab(true) == draft.tokenizer.get_vocab(true)
+    }
+
+    fn is_eos_token(&self, token: u32) -> bool {
+        match &*self.inner {
+            LoadedModel::Safetensors { eos_tokens, .. } | LoadedModel::Gguf { eos_tokens, .. } => {
+                eos_tokens.contains(&token)
+            }
+            LoadedModel::Parallel(parallel) => match parallel {
+                ParallelModel::Tensor { eos_tokens, .. }
+                | ParallelModel::Pipeline { eos_tokens, .. }
+                | ParallelModel::Expert { eos_tokens, .. } => eos_tokens.contains(&token),
+            },
+        }
+    }
+
+    fn greedy_token_ids_from_context(
+        &self,
+        context_ids: &[u32],
+        request: &ParsedGenerationRequest,
+        max_tokens: usize,
+    ) -> Result<Vec<u32>, CandleLlmError> {
+        let mut context = context_ids.to_vec();
+        let mut tokens = Vec::with_capacity(max_tokens);
+        for _ in 0..max_tokens {
+            let Some(next) = self.greedy_next_token_id(&context, request)? else {
+                break;
+            };
+            context.push(next);
+            tokens.push(next);
+            if self.is_eos_token(next) {
+                break;
+            }
+        }
+        Ok(tokens)
+    }
+
+    fn greedy_next_token_id(
+        &self,
+        context_ids: &[u32],
+        request: &ParsedGenerationRequest,
+    ) -> Result<Option<u32>, CandleLlmError> {
+        if context_ids.is_empty() || context_ids.len() > self.limits.max_position_embeddings {
+            return Ok(None);
+        }
+        let logits = self.last_logits_for_ids(context_ids)?;
+        let row = logits
+            .squeeze(0)
+            .map_err(|error| self.execution_error(format!("failed to reshape logits: {error}")))?;
+        let mut processor = request.sampling.processor();
+        processor
+            .sample(&row)
+            .map(Some)
+            .map_err(|error| self.execution_error(format!("failed to sample next token: {error}")))
+    }
+
+    fn last_logits_for_ids(&self, ids: &[u32]) -> Result<Tensor, CandleLlmError> {
+        let device = Device::Cpu;
+        let input = Tensor::new(ids, &device)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .map_err(|error| {
+                self.execution_error(format!("failed to build input tensor: {error}"))
+            })?;
+        match &*self.inner {
+            LoadedModel::Safetensors { backend, .. } => Ok(backend.last_logits(&input, &device)),
+            LoadedModel::Gguf { model, .. } => {
+                let mut guard = model.lock().map_err(|_| {
+                    self.execution_error("GGUF model mutex was poisoned".to_owned())
+                })?;
+                guard.forward(&input, 0).map_err(|error| {
+                    self.execution_error(format!("transformer forward pass failed: {error}"))
+                })
+            }
+            LoadedModel::Parallel(parallel) => match parallel {
+                ParallelModel::Tensor {
+                    model,
+                    config,
+                    devices,
+                    ..
+                } => {
+                    let primary = &devices[0];
+                    let input = input.to_device(primary).map_err(|error| {
+                        self.execution_error(format!("failed to move input to device: {error}"))
+                    })?;
+                    let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
+                        .map_err(|error| {
+                            self.execution_error(format!(
+                                "failed to build tensor-parallel KV cache: {error}"
+                            ))
+                        })?;
+                    model.forward(&input, 0, &mut cache).map_err(|error| {
+                        self.execution_error(format!("transformer forward pass failed: {error}"))
+                    })
+                }
+                ParallelModel::Pipeline { model, .. } => {
+                    let stage0_device = model
+                        .stages
+                        .first()
+                        .map(|stage| stage.device().clone())
+                        .unwrap_or(Device::Cpu);
+                    let input = input.to_device(&stage0_device).map_err(|error| {
+                        self.execution_error(format!("failed to move input to device: {error}"))
+                    })?;
+                    pipeline_prefill_forward(model, &input).map_err(|error| {
+                        self.execution_error(format!("transformer forward pass failed: {error}"))
+                    })
+                }
+                ParallelModel::Expert {
+                    model,
+                    config,
+                    devices,
+                    ..
+                } => {
+                    let primary = &devices[0];
+                    let input = input.to_device(primary).map_err(|error| {
+                        self.execution_error(format!("failed to move input to device: {error}"))
+                    })?;
+                    let mut cache = TensorParallelCache::new(true, DType::F32, config, primary)
+                        .map_err(|error| {
+                            self.execution_error(format!(
+                                "failed to build expert-parallel KV cache: {error}"
+                            ))
+                        })?;
+                    model.forward(&input, 0, &mut cache).map_err(|error| {
+                        self.execution_error(format!("transformer forward pass failed: {error}"))
+                    })
+                }
+            },
+        }
     }
 
     /// Autoregressive decode through the real Llama forward, with a fresh KV
@@ -2142,7 +2371,7 @@ impl CandleLlmRuntime {
             .and_then(|tensor| tensor.unsqueeze(0))
             .expect("input tensor should build");
         let logits = match &*self.inner {
-            LoadedModel::Safetensors { backend, .. } => backend.debug_last_logits(&input, &device),
+            LoadedModel::Safetensors { backend, .. } => backend.last_logits(&input, &device),
             LoadedModel::Gguf { model, .. } => {
                 let mut guard = model.lock().expect("gguf mutex should not be poisoned");
                 guard.forward(&input, 0).expect("forward pass should run")
@@ -4759,6 +4988,31 @@ mod tests {
             "the concatenation of streamed deltas must equal the buffered output"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn speculative_decoding_with_identical_draft_matches_greedy_decode() {
+        let (target, target_dir) = load_fixture("spec-target");
+        let (draft, draft_dir) = load_fixture("spec-draft");
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
+        let greedy = target.generate(&[request]).expect("greedy generation");
+        let speculative = target
+            .generate_speculative(&[request], &draft, 3)
+            .expect("speculative generation");
+        assert_eq!(
+            speculative, greedy,
+            "draft/verify must preserve target greedy output"
+        );
+
+        let mut streamed = String::new();
+        target
+            .generate_speculative_streaming(&[request], &draft, 3, &mut |delta| {
+                streamed.push_str(delta)
+            })
+            .expect("speculative streaming");
+        assert_eq!(streamed.into_bytes(), greedy);
+        let _ = fs::remove_dir_all(target_dir);
+        let _ = fs::remove_dir_all(draft_dir);
     }
 
     #[test]

@@ -436,6 +436,15 @@ pub(crate) struct HardwareStrategy {
     /// single prefill forward.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) prefill_chunk_tokens: Option<u32>,
+    /// Optional local draft model directory used for speculative decoding.
+    /// When set, the Candle backend loads this smaller model beside the target
+    /// model and uses it only for greedy propose/verify decoding.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) speculative_draft_model_path: String,
+    /// Number of draft tokens proposed before target verification. `0` uses the
+    /// runtime default.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub(crate) speculative_draft_tokens: u32,
 }
 
 impl HardwareStrategy {
@@ -451,6 +460,8 @@ impl HardwareStrategy {
             && self.pipeline_depth == 0
             && !self.paged_attention
             && self.prefill_chunk_tokens.is_none()
+            && self.speculative_draft_model_path.is_empty()
+            && self.speculative_draft_tokens == 0
     }
 }
 
@@ -1267,6 +1278,28 @@ mod hardware_strategy_tests {
         };
         let json = serde_json::to_string(&binding).expect("serialize");
         assert!(json.contains("prefill_chunk_tokens"));
+        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, binding);
+        assert!(!restored.hardware_strategy.is_single());
+    }
+
+    #[test]
+    fn speculative_draft_strategy_round_trips_and_is_not_single() {
+        let binding = IntegrityModelBinding {
+            alias: "m".to_owned(),
+            path: "/models/m".to_owned(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: HardwareStrategy {
+                speculative_draft_model_path: "/models/m-draft".to_owned(),
+                speculative_draft_tokens: 6,
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&binding).expect("serialize");
+        assert!(json.contains("speculative_draft_model_path"));
+        assert!(json.contains("speculative_draft_tokens"));
         let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, binding);
         assert!(!restored.hardware_strategy.is_single());

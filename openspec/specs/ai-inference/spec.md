@@ -636,6 +636,32 @@ The runtime SHALL accept a GPU `device` request only on a build where the candle
 - **THEN** it enumerates every available CUDA device (the enumeration loop is live once the candle CUDA backend is compiled in)
 - **AND** per-device free-VRAM telemetry (NVML) and the NCCL all-reduce are validated on the CUDA CI lane as hardware-gated follow-ups (see `tasks.md` Tasks 5–6); the CPU-staged summation remains the numerically-equivalent reduction on every non-CUDA build
 
+### Requirement: Candle LLM generation MAY use speculative draft/verify decoding
+
+The Candle LLM runtime SHALL allow a model binding to declare a local draft
+model through `hardware_strategy.speculative_draft_model_path`. When present,
+the host SHALL load the draft model beside the target model and use it for
+greedy speculative decoding: the draft proposes up to
+`hardware_strategy.speculative_draft_tokens` tokens, and the target model
+verifies each proposed token before it is emitted. The runtime SHALL preserve
+the target model's greedy output exactly, and SHALL fall back to the existing
+target-only decode path for unsupported speculative modes.
+
+#### Scenario: Identical draft preserves target output
+
+- **GIVEN** a Candle text-generation binding with a compatible draft model
+- **WHEN** a greedy generation request is submitted
+- **THEN** the draft proposes a bounded token window
+- **AND** the target verifies every proposed token
+- **AND** buffered and streaming output match the target-only greedy decode
+
+#### Scenario: Unsupported speculative request falls back safely
+
+- **WHEN** a request uses sampling, constrained decoding, batching that is not
+  a single prompt, or a tokenizer-incompatible draft model
+- **THEN** the runtime uses the existing target-only decode path
+- **AND** does not accept draft tokens without target verification
+
 ### Requirement: Native Candle inference MUST dispatch supported non-Llama architectures
 
 The native Candle text-generation path SHALL dispatch supported non-Llama

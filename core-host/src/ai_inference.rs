@@ -1049,7 +1049,10 @@ struct CandleBackendModel {
 
 enum CandleBackendModelKind {
     Mock,
-    TextGeneration(Box<candle_llm_runtime::CandleLlmRuntime>),
+    TextGeneration {
+        target: Box<candle_llm_runtime::CandleLlmRuntime>,
+        speculative: Option<SpeculativeDraftRuntime>,
+    },
     /// A ModelOpt/NVFP4 checkpoint, dequantized to a dense F32 model at load
     /// time (the fallback NVFP4 execution path: see
     /// `candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4`).
@@ -1058,6 +1061,11 @@ enum CandleBackendModelKind {
     ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
     Qwen35Moe(Box<qwen35_moe_runtime::Qwen35MoeRuntime>),
     Vendor(vendor_accelerator::VendorAcceleratorRuntime),
+}
+
+struct SpeculativeDraftRuntime {
+    draft: Box<candle_llm_runtime::CandleLlmRuntime>,
+    draft_tokens: usize,
 }
 
 impl CandleBackendModel {
@@ -1161,7 +1169,19 @@ impl CandleBackendModel {
                     binding.device.as_str(),
                     &binding.hardware_strategy,
                 )? {
-                    Some(model) => CandleBackendModelKind::TextGeneration(Box::new(model)),
+                    Some(model) => {
+                        let speculative =
+                            load_speculative_draft_runtime(binding)?.map(|(draft, draft_tokens)| {
+                                SpeculativeDraftRuntime {
+                                    draft: Box::new(draft),
+                                    draft_tokens,
+                                }
+                            });
+                        CandleBackendModelKind::TextGeneration {
+                            target: Box::new(model),
+                            speculative,
+                        }
+                    }
                     None => {
                         return Err(anyhow!(
                             "unsupported AI model binding `{}` at `{}`: expected explicit mock path `mock:<name>`, supported Candle LLM directory, ONNX guest-loaded graph, or ModelOpt/NVFP4 directory",
@@ -1184,6 +1204,39 @@ impl CandleBackendModel {
             kind,
         })
     }
+}
+
+fn load_speculative_draft_runtime(
+    binding: &IntegrityModelBinding,
+) -> Result<Option<(candle_llm_runtime::CandleLlmRuntime, usize)>> {
+    let draft_path = binding
+        .hardware_strategy
+        .speculative_draft_model_path
+        .trim();
+    if draft_path.is_empty() {
+        return Ok(None);
+    }
+    let mut draft_strategy = binding.hardware_strategy.clone();
+    draft_strategy.speculative_draft_model_path.clear();
+    draft_strategy.speculative_draft_tokens = 0;
+    let draft = candle_llm_runtime::CandleLlmRuntime::try_load(
+        &format!("{}:draft", binding.alias),
+        draft_path,
+        binding.device.as_str(),
+        &draft_strategy,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "speculative draft model for `{}` at `{}` is not a supported Candle LLM directory",
+            binding.alias,
+            draft_path
+        )
+    })?;
+    let draft_tokens = usize::try_from(binding.hardware_strategy.speculative_draft_tokens)
+        .ok()
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(candle_llm_runtime::DEFAULT_SPECULATIVE_DRAFT_TOKENS);
+    Ok(Some((draft, draft_tokens)))
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -1232,8 +1285,7 @@ impl BackendModel for CandleBackendModel {
                 record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
                 return result;
             }
-            CandleBackendModelKind::ModelOptNvfp4(runtime)
-            | CandleBackendModelKind::TextGeneration(runtime) => {
+            CandleBackendModelKind::ModelOptNvfp4(runtime) => {
                 if inputs
                     .iter()
                     .any(|input| !matches!(input.ty, TensorType::U8))
@@ -1261,6 +1313,46 @@ impl BackendModel for CandleBackendModel {
                     (CandleBackendModelKind::ModelOptNvfp4(_), _) => "cpu_fallback",
                     (_, AcceleratorKind::Gpu) => "gpu",
                     _ => "cpu",
+                };
+                record_execution(&self.source.alias, executed_on, result.is_ok());
+                return result;
+            }
+            CandleBackendModelKind::TextGeneration {
+                target,
+                speculative,
+            } => {
+                if inputs
+                    .iter()
+                    .any(|input| !matches!(input.ty, TensorType::U8))
+                {
+                    return Err(anyhow!(
+                        "Candle LLM model `{}` only accepts U8 prompt tensors",
+                        self.source.alias
+                    ));
+                }
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                let result = match speculative {
+                    Some(speculative) => target.generate_speculative(
+                        &prompts,
+                        &speculative.draft,
+                        speculative.draft_tokens,
+                    ),
+                    None => target.generate(&prompts),
+                }
+                .map_err(|error| {
+                    anyhow!(
+                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                        self.source.alias,
+                        target.root().display()
+                    )
+                });
+                let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
+                    "gpu"
+                } else {
+                    "cpu"
                 };
                 record_execution(&self.source.alias, executed_on, result.is_ok());
                 return result;
@@ -1308,8 +1400,7 @@ impl BackendModel for CandleBackendModel {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<()> {
         match &self.kind {
-            CandleBackendModelKind::ModelOptNvfp4(runtime)
-            | CandleBackendModelKind::TextGeneration(runtime) => {
+            CandleBackendModelKind::ModelOptNvfp4(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
                 let prompts = inputs
                     .iter()
@@ -1324,6 +1415,32 @@ impl BackendModel for CandleBackendModel {
                             runtime.root().display()
                         )
                     })
+            }
+            CandleBackendModelKind::TextGeneration {
+                target,
+                speculative,
+            } => {
+                validate_u8_prompts(&self.source.alias, inputs)?;
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                match speculative {
+                    Some(speculative) => target.generate_speculative_streaming(
+                        &prompts,
+                        &speculative.draft,
+                        speculative.draft_tokens,
+                        on_token,
+                    ),
+                    None => target.generate_streaming(&prompts, on_token),
+                }
+                .map_err(|error| {
+                    anyhow!(
+                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                        self.source.alias,
+                        target.root().display()
+                    )
+                })
             }
             CandleBackendModelKind::Qwen35Moe(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
