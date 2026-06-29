@@ -1073,8 +1073,9 @@ pub(crate) fn encrypt_tde_file_body(plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let mut nonce = [0_u8; 12];
     nonce[4..].copy_from_slice(&rand::rng().random::<u64>().to_be_bytes());
+    let nonce = Nonce::try_from(nonce.as_slice()).map_err(|_| anyhow!("invalid TDE nonce"))?;
     let ciphertext = tde_cipher()?
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|_| anyhow!("failed to encrypt TDE file body"))?;
     let mut out = Vec::with_capacity(TDE_FILE_MAGIC.len() + nonce.len() + ciphertext.len());
     out.extend_from_slice(TDE_FILE_MAGIC);
@@ -1091,8 +1092,9 @@ pub(crate) fn decrypt_tde_file_body(body: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("TDE file body is missing nonce"));
     }
     let (nonce, ciphertext) = rest.split_at(12);
+    let nonce = Nonce::try_from(nonce).map_err(|_| anyhow!("invalid TDE nonce"))?;
     tde_cipher()?
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| anyhow!("failed to decrypt TDE file body"))
 }
 
