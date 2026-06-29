@@ -1913,6 +1913,7 @@ impl CandleLlmRuntime {
             .map(|logits| (logits, index_pos))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_loop_from_logits(
         &self,
         mut logits: Tensor,
