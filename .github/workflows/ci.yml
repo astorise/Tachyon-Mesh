@@ -148,8 +148,11 @@ jobs:
       - name: Run cargo audit
         # RUSTSEC-2023-0071 (rsa Marvin attack) targets RSA private-key
         # decryption timing; we only verify JWT signatures with public keys
-        # (no private-key ops), so it does not apply. See deny.toml for detail.
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        # (no private-key ops), so it does not apply. RUSTSEC-2024-0429 is in
+        # glib's VariantStrIter; glib is present through the desktop/Tauri GTK
+        # dependency tree, not the headless runtime path. See deny.toml for
+        # the broader advisory policy.
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0429
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
