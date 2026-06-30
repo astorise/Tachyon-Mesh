@@ -55,6 +55,14 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     #[serde(default)]
+    tools: Vec<serde_json::Value>,
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_call_parser: Option<ToolCallParser>,
+    #[serde(default)]
+    extra_body: Option<ExtraBody>,
+    #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f32>,
@@ -71,7 +79,67 @@ struct ChatCompletionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<ToolCall>,
+}
+
+#[cfg(test)]
+impl ChatMessage {
+    fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolCallParser {
+    Json,
+    Qwen,
+    QwenCoder,
+    Mistral,
+}
+
+impl ToolCallParser {
+    fn as_str(self) -> &'static str {
+        match self {
+            ToolCallParser::Json => "json",
+            ToolCallParser::Qwen => "qwen",
+            ToolCallParser::QwenCoder => "qwen_coder",
+            ToolCallParser::Mistral => "mistral",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExtraBody {
+    #[serde(default)]
+    tool_call_parser: Option<ToolCallParser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug)]
+struct ParsedAssistantOutput {
     content: String,
+    tool_calls: Vec<ToolCall>,
 }
 
 /// OpenAI's `stop` is either a single string or an array of strings. Normalised
@@ -275,6 +343,12 @@ fn handle_chat_completions_buffered(
     let generation = build_generation_request(&request)?;
     let output = bindings::tachyon::accelerator::cpu::compute(model_id, &generation)
         .map_err(|e| format!("inference failed for model `{}`: {e}", request.model))?;
+    let parsed = parse_assistant_output(&request, &output);
+    let finish_reason = if parsed.tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
 
     let response = ChatCompletionResponse {
         id: "chatcmpl-tachyon",
@@ -285,9 +359,14 @@ fn handle_chat_completions_buffered(
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_owned(),
-                content: output,
+                content: if parsed.content.is_empty() {
+                    None
+                } else {
+                    Some(parsed.content)
+                },
+                tool_calls: parsed.tool_calls,
             },
-            finish_reason: "stop",
+            finish_reason,
         }],
     };
     serde_json::to_vec(&response)
@@ -404,6 +483,184 @@ fn write_sse_chunk<T: serde::Serialize>(
         .map_err(|e| format!("failed to write SSE frame: {e}"))
 }
 
+fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> ParsedAssistantOutput {
+    let Some(parser) = request.resolved_tool_call_parser() else {
+        return ParsedAssistantOutput {
+            content: output.to_owned(),
+            tool_calls: Vec::new(),
+        };
+    };
+
+    match parser {
+        ToolCallParser::Json => parse_json_tool_calls(output),
+        ToolCallParser::Qwen | ToolCallParser::QwenCoder => parse_tagged_tool_calls(
+            output,
+            &[
+                ("<tool_call>", "</tool_call>"),
+                ("<tool_calls>", "</tool_calls>"),
+            ],
+        ),
+        ToolCallParser::Mistral => parse_mistral_tool_calls(output),
+    }
+    .unwrap_or_else(|| ParsedAssistantOutput {
+        content: output.to_owned(),
+        tool_calls: Vec::new(),
+    })
+}
+
+impl ChatCompletionRequest {
+    fn resolved_tool_call_parser(&self) -> Option<ToolCallParser> {
+        self.tool_call_parser
+            .or_else(|| {
+                self.extra_body
+                    .as_ref()
+                    .and_then(|body| body.tool_call_parser)
+            })
+            .or_else(|| parser_from_model(&self.model))
+            .filter(|_| !self.tools.is_empty() || self.tool_choice.is_some())
+    }
+}
+
+fn parser_from_model(model: &str) -> Option<ToolCallParser> {
+    let normalized = model.to_ascii_lowercase();
+    if normalized.contains("qwen") && normalized.contains("coder") {
+        Some(ToolCallParser::QwenCoder)
+    } else if normalized.contains("qwen") {
+        Some(ToolCallParser::Qwen)
+    } else if normalized.contains("mistral") {
+        Some(ToolCallParser::Mistral)
+    } else {
+        None
+    }
+}
+
+fn parse_json_tool_calls(output: &str) -> Option<ParsedAssistantOutput> {
+    let trimmed = strip_markdown_json_fence(output.trim());
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    tool_calls_from_value(&value, 0).map(|tool_calls| ParsedAssistantOutput {
+        content: value
+            .get("content")
+            .and_then(|content| content.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        tool_calls,
+    })
+}
+
+fn parse_tagged_tool_calls(
+    output: &str,
+    tag_pairs: &[(&str, &str)],
+) -> Option<ParsedAssistantOutput> {
+    let mut tool_calls = Vec::new();
+    let mut content = output.to_owned();
+
+    for (start_tag, end_tag) in tag_pairs {
+        while let Some(start) = content.find(start_tag) {
+            let after_start = start + start_tag.len();
+            let Some(relative_end) = content[after_start..].find(end_tag) else {
+                break;
+            };
+            let end = after_start + relative_end;
+            let payload = content[after_start..end].trim();
+            if let Some(mut parsed) = parse_tool_call_payload(payload, tool_calls.len()) {
+                tool_calls.append(&mut parsed);
+            }
+            content.replace_range(start..end + end_tag.len(), "");
+        }
+    }
+
+    if tool_calls.is_empty() {
+        None
+    } else {
+        Some(ParsedAssistantOutput {
+            content: content.trim().to_owned(),
+            tool_calls,
+        })
+    }
+}
+
+fn parse_mistral_tool_calls(output: &str) -> Option<ParsedAssistantOutput> {
+    let marker = "[TOOL_CALLS]";
+    let start = output.find(marker)?;
+    let content = output[..start].trim().to_owned();
+    let payload = output[start + marker.len()..].trim();
+    parse_tool_call_payload(payload, 0).map(|tool_calls| ParsedAssistantOutput {
+        content,
+        tool_calls,
+    })
+}
+
+fn parse_tool_call_payload(payload: &str, start_index: usize) -> Option<Vec<ToolCall>> {
+    let value: serde_json::Value = serde_json::from_str(strip_markdown_json_fence(payload)).ok()?;
+    tool_calls_from_value(&value, start_index)
+}
+
+fn tool_calls_from_value(value: &serde_json::Value, start_index: usize) -> Option<Vec<ToolCall>> {
+    let items = if let Some(items) = value.get("tool_calls").and_then(|v| v.as_array()) {
+        items
+    } else if let Some(items) = value.as_array() {
+        items
+    } else {
+        return tool_call_from_value(value, start_index).map(|tool_call| vec![tool_call]);
+    };
+
+    let tool_calls: Vec<ToolCall> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| tool_call_from_value(item, start_index + index))
+        .collect();
+    (!tool_calls.is_empty()).then_some(tool_calls)
+}
+
+fn tool_call_from_value(value: &serde_json::Value, index: usize) -> Option<ToolCall> {
+    let function = value.get("function").unwrap_or(value);
+    let name = function
+        .get("name")
+        .or_else(|| value.get("name"))
+        .and_then(|v| v.as_str())?
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let arguments = function
+        .get("arguments")
+        .or_else(|| value.get("arguments"))
+        .map(canonical_arguments)
+        .unwrap_or_else(|| "{}".to_owned());
+    let id = value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("call_tachyon_{index}"));
+
+    Some(ToolCall {
+        id,
+        kind: "function".to_owned(),
+        function: ToolCallFunction {
+            name: name.to_owned(),
+            arguments,
+        },
+    })
+}
+
+fn canonical_arguments(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned()),
+    }
+}
+
+fn strip_markdown_json_fence(value: &str) -> &str {
+    let trimmed = value.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let rest = rest.strip_prefix("json").unwrap_or(rest).trim_start();
+    rest.strip_suffix("```").map(str::trim).unwrap_or(trimmed)
+}
+
 /// Encode the host generation request: the structured chat turns (the host
 /// renders the model's own chat template) plus the resolved sampling
 /// parameters. Defaults are applied here so the host always receives concrete
@@ -425,6 +682,18 @@ fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, S
     }
     if let Some(stop) = request.stop.clone() {
         object.insert("stop".to_owned(), serde_json::json!(stop.into_vec()));
+    }
+    if !request.tools.is_empty() {
+        object.insert("tools".to_owned(), serde_json::json!(request.tools));
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        object.insert("tool_choice".to_owned(), tool_choice.clone());
+    }
+    if let Some(parser) = request.resolved_tool_call_parser() {
+        object.insert(
+            "tool_call_parser".to_owned(),
+            serde_json::json!(parser.as_str()),
+        );
     }
     serde_json::to_string(&payload).map_err(|e| format!("failed to encode generation request: {e}"))
 }
@@ -543,15 +812,13 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "m".to_owned(),
             messages: vec![
-                ChatMessage {
-                    role: "system".to_owned(),
-                    content: "be terse".to_owned(),
-                },
-                ChatMessage {
-                    role: "user".to_owned(),
-                    content: "hello".to_owned(),
-                },
+                ChatMessage::text("system", "be terse"),
+                ChatMessage::text("user", "hello"),
             ],
+            tools: Vec::new(),
+            tool_choice: None,
+            tool_call_parser: None,
+            extra_body: None,
             max_tokens: None,
             temperature: None,
             top_p: None,
@@ -575,10 +842,11 @@ mod tests {
     fn build_generation_request_forwards_sampling_params_and_normalizes_stop() {
         let request = ChatCompletionRequest {
             model: "m".to_owned(),
-            messages: vec![ChatMessage {
-                role: "user".to_owned(),
-                content: "hi".to_owned(),
-            }],
+            messages: vec![ChatMessage::text("user", "hi")],
+            tools: Vec::new(),
+            tool_choice: None,
+            tool_call_parser: None,
+            extra_body: None,
             max_tokens: Some(32),
             temperature: Some(0.7),
             top_p: Some(0.9),
@@ -593,6 +861,93 @@ mod tests {
         assert_eq!(payload["seed"], 7);
         // A scalar `stop` is normalised to a single-element array for the host.
         assert_eq!(payload["stop"], serde_json::json!(["\n\n"]));
+    }
+
+    #[test]
+    fn build_generation_request_forwards_tools_and_parser() {
+        let request = ChatCompletionRequest {
+            model: "qwen-coder".to_owned(),
+            messages: vec![ChatMessage::text("user", "weather?")],
+            tools: vec![serde_json::json!({
+                "type": "function",
+                "function": { "name": "get_weather" }
+            })],
+            tool_choice: Some(serde_json::json!("auto")),
+            tool_call_parser: None,
+            extra_body: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: None,
+            stream: None,
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                .expect("valid json");
+
+        assert_eq!(payload["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(payload["tool_choice"], "auto");
+        assert_eq!(payload["tool_call_parser"], "qwen_coder");
+    }
+
+    #[test]
+    fn json_parser_extracts_openai_tool_calls() {
+        let output = r#"{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":{"query":"tachyon"}}}]}"#;
+        let parsed = parse_json_tool_calls(output).expect("tool call should parse");
+
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+        assert_eq!(parsed.tool_calls[0].function.name, "lookup");
+        assert_eq!(
+            parsed.tool_calls[0].function.arguments,
+            r#"{"query":"tachyon"}"#
+        );
+    }
+
+    #[test]
+    fn qwen_parser_extracts_tagged_tool_call_and_preserves_text() {
+        let output =
+            "Let me check.\n<tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"mesh\"}}</tool_call>";
+        let parsed = parse_tagged_tool_calls(output, &[("<tool_call>", "</tool_call>")])
+            .expect("tagged tool call should parse");
+
+        assert_eq!(parsed.content, "Let me check.");
+        assert_eq!(parsed.tool_calls[0].function.name, "search");
+        assert_eq!(parsed.tool_calls[0].id, "call_tachyon_0");
+    }
+
+    #[test]
+    fn mistral_parser_extracts_tool_calls_marker() {
+        let output =
+            "Checking\n[TOOL_CALLS] [{\"name\":\"fetch\",\"arguments\":\"{\\\"id\\\":7}\"}]";
+        let parsed = parse_mistral_tool_calls(output).expect("mistral tool calls should parse");
+
+        assert_eq!(parsed.content, "Checking");
+        assert_eq!(parsed.tool_calls[0].function.name, "fetch");
+        assert_eq!(parsed.tool_calls[0].function.arguments, "{\"id\":7}");
+    }
+
+    #[test]
+    fn parser_is_inactive_without_tools_or_tool_choice() {
+        let request = ChatCompletionRequest {
+            model: "qwen".to_owned(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            tools: Vec::new(),
+            tool_choice: None,
+            tool_call_parser: None,
+            extra_body: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: None,
+            stream: None,
+        };
+        let parsed = parse_assistant_output(&request, r#"{"name":"search","arguments":{}}"#);
+
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.content, r#"{"name":"search","arguments":{}}"#);
     }
 
     #[test]

@@ -141,6 +141,46 @@ string SHALL be normalised to a list.
 - **THEN** `guest-openai` omits it from the host generation request so the host
   default applies
 
+### Requirement: Chat completion tool calling post-processing
+
+`guest-openai` SHALL support OpenAI-compatible tool calling for buffered chat
+completion responses as user-space post-processing of generated assistant text.
+When a request provides `tools` or `tool_choice`, it SHALL select a configurable
+tool-call parser from `tool_call_parser`, `extra_body.tool_call_parser`, or a
+model-name heuristic for `qwen_coder`, `qwen`, and `mistral`. Supported parser
+names SHALL include `json`, `qwen_coder`, `qwen`, and `mistral`. Parsed calls
+SHALL be returned as `message.tool_calls` entries with `type: "function"`,
+canonical string `function.arguments`, and `finish_reason: "tool_calls"`.
+Unparseable model output SHALL fall back to normal assistant `content` with no
+tool calls. This parsing SHALL remain outside the host decode loop.
+
+#### Scenario: Tools and parser reach the generation request
+
+- **WHEN** a buffered chat completion request includes `tools` and a tool-call
+  parser is explicitly or implicitly selected
+- **THEN** `guest-openai` forwards `tools`, `tool_choice`, and
+  `tool_call_parser` in the structured host generation request
+
+#### Scenario: JSON parser emits OpenAI tool calls
+
+- **WHEN** generated assistant text is JSON containing `tool_calls`
+- **THEN** `guest-openai` converts each call into an OpenAI-compatible
+  `message.tool_calls` item
+- **AND** sets the choice `finish_reason` to `tool_calls`
+
+#### Scenario: Qwen and Mistral parser formats are supported
+
+- **WHEN** generated assistant text contains Qwen `<tool_call>` tags or a
+  Mistral `[TOOL_CALLS]` payload
+- **THEN** `guest-openai` extracts the function name and arguments into
+  OpenAI-compatible tool calls
+
+#### Scenario: Tool parsing is inactive without tool intent
+
+- **WHEN** a chat completion request omits both `tools` and `tool_choice`
+- **THEN** generated text that resembles a tool-call payload is returned as
+  normal assistant `content`
+
 ### Requirement: Streaming chat completions
 
 When a chat completion request sets `stream: true`, `guest-openai` SHALL respond
