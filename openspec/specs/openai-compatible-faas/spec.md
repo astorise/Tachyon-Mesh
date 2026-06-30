@@ -9,10 +9,11 @@ dogfoods Tachyon FaaS for browser delivery.
 
 The OpenAI-compatible HTTP surface SHALL be provided by a single **user-role**
 FaaS (`guest-openai`) built against the `faas-guest` WIT world. It SHALL expose
-`GET /ai/v1/models` and `POST /ai/v1/chat/completions`, and it SHALL NOT expose
-the former public `/v1/models` or `/v1/chat/completions` routes. It SHALL NOT be
-a system FaaS injected by a compile-time feature flag. A dynamic model
-advertised by the registry SHALL be usable by the chat route when that alias is
+`GET /ai/v1/models`, `POST /ai/v1/chat/completions`, and
+`POST /ai/v1/embeddings`, and it SHALL NOT expose the former public `/v1/models`,
+`/v1/chat/completions`, or `/v1/embeddings` routes. It SHALL NOT be a system FaaS
+injected by a compile-time feature flag. A dynamic model advertised by the
+registry SHALL be usable by the chat and embeddings routes when that alias is
 included in the route's sealed dynamic model bindings.
 
 #### Scenario: Model listing returns OpenAI-compatible shape
@@ -30,6 +31,18 @@ included in the route's sealed dynamic model bindings.
   the structured conversation and sampling parameters to the host, and returns
   an OpenAI-shaped `chat.completion`
 
+#### Scenario: Embeddings returns OpenAI-compatible vectors
+
+- **GIVEN** a sealed static or dynamic model alias the route is allowed to use
+- **AND** that alias resolves to an ONNX embedding model directory containing
+  `tokenizer.json` and a model file such as `model.onnx`
+- **WHEN** a client requests `POST /ai/v1/embeddings` naming that model with a
+  single string or list of strings
+- **THEN** `guest-openai` loads the model on the CPU accelerator, calls the host
+  Candle ONNX embeddings primitive once per input, applies masked pooling and
+  L2 normalization, and returns an OpenAI-shaped `list` of `embedding` objects
+  preserving input order
+
 #### Scenario: Listed dynamic model is authorized for chat
 
 - **GIVEN** a dynamic model is registered and listed by `/ai/v1/models`
@@ -40,7 +53,8 @@ included in the route's sealed dynamic model bindings.
 
 #### Scenario: Former public routes are absent
 
-- **WHEN** a client requests `GET /v1/models` or `POST /v1/chat/completions`
+- **WHEN** a client requests `GET /v1/models`, `POST /v1/chat/completions`, or
+  `POST /v1/embeddings`
 - **THEN** the node returns `404` because those routes are not sealed
 
 #### Scenario: Unknown model returns 404
@@ -242,6 +256,6 @@ for assistant responses.
 - **WHEN** an operator deploys the `guest-chat-ui` example manifest
 - **THEN** the topology includes the static `/chat` route, the
   `/ai/v1/models` route, the `/ai/v1/chat/completions` route, and the internal
-  `guest-openai` registration route backed by the shared `ai-models-registry`
-  table
+  `/ai/v1/embeddings` route, and the internal `guest-openai` registration route
+  backed by the shared `ai-models-registry` table
 

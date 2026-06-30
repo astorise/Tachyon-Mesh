@@ -125,6 +125,23 @@
       "dependencies": {}
     },
     {
+      "path": "/ai/v1/embeddings",
+      "role": "user",
+      "name": "openai-embeddings",
+      "targets": [{ "module": "guest-openai", "weight": 100 }],
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "1.0.0",
+      "scopes": { "kv": ["ai-models-registry"] },
+      "models": [
+        {
+          "alias": "nvidia--Qwen3.6-35B-A3B-NVFP4",
+          "dynamic": true
+        }
+      ],
+      "dependencies": {}
+    },
+    {
       "path": "/internal/guest-openai/register",
       "role": "user",
       "name": "openai-registry",

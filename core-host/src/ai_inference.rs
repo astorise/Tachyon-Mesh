@@ -2,6 +2,8 @@
 mod accelerator_backend;
 #[path = "ai_inference/architecture_registry.rs"]
 mod architecture_registry;
+#[path = "ai_inference/candle_embedding_runtime.rs"]
+mod candle_embedding_runtime;
 #[path = "ai_inference/candle_llm_runtime.rs"]
 mod candle_llm_runtime;
 #[path = "ai_inference/candle_onnx_backend.rs"]
@@ -275,6 +277,11 @@ trait BackendModel: Send + Sync {
             on_token(&text);
         }
         Ok(())
+    }
+
+    fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
+        let _ = input;
+        bail!("this backend does not expose dense text embeddings")
     }
 }
 
@@ -570,6 +577,36 @@ impl AiInferenceRuntime {
             )
             .map_err(|error| error.to_string())?;
         String::from_utf8(output).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn embed_component_input(
+        &self,
+        alias: &str,
+        input: &str,
+    ) -> Result<Vec<f32>, String> {
+        self.ensure_model_loaded(alias)?;
+        let model = {
+            let models = self.models.read().expect("model registry lock poisoned");
+            models
+                .get(alias)
+                .cloned()
+                .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
+        };
+        if self.scheduler_for(model.accelerator).is_none() {
+            return Err(format!(
+                "{} accelerator is unavailable on this host",
+                model.accelerator.as_str()
+            ));
+        }
+        let tensor = SharedInputTensor {
+            dimensions: vec![input.len() as u32],
+            ty: TensorType::U8,
+            data: Arc::from(input.as_bytes()),
+        };
+        model
+            .backend_model
+            .embed_text(&tensor)
+            .map_err(|error| error.to_string())
     }
 
     /// Stream a prompt's decoded output, invoking `on_token` for each text
@@ -1108,6 +1145,7 @@ enum CandleBackendModelKind {
     /// Native FP4-kernel execution without eager dequantization remains a
     /// documented follow-up.
     ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
+    TextEmbedding(Box<candle_embedding_runtime::CandleEmbeddingRuntime>),
     Qwen35Moe(Box<qwen35_moe_runtime::Qwen35MoeRuntime>),
     Vendor(vendor_accelerator::VendorAcceleratorRuntime),
 }
@@ -1162,15 +1200,11 @@ impl CandleBackendModel {
                     })?,
             )
         } else {
-            match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(
-                &binding.alias,
-                &binding.path,
-            )? {
+            match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(&binding.alias, &binding.path)? {
                 Some(model) => {
                     static DESCRIPTORS: [&dyn architecture_registry::ArchitectureDescriptor; 1] =
                         [&qwen35_moe_runtime::QWEN35_MOE_DESCRIPTOR];
-                    let registry =
-                        architecture_registry::ArchitectureRegistry::new(&DESCRIPTORS);
+                    let registry = architecture_registry::ArchitectureRegistry::new(&DESCRIPTORS);
                     match registry.resolve(&model)? {
                         Some(architecture)
                             if architecture.kind
@@ -1196,9 +1230,7 @@ impl CandleBackendModel {
                                 modelopt_nvfp4::Nvfp4OutputDType::F32,
                                 modelopt_nvfp4::Nvfp4FallbackScope::Eager,
                                 modelopt_nvfp4::Nvfp4FallbackMemoryLimits {
-                                    max_host_ram_bytes: env_u64(
-                                        "TACHYON_NVFP4_MAX_HOST_RAM_BYTES",
-                                    ),
+                                    max_host_ram_bytes: env_u64("TACHYON_NVFP4_MAX_HOST_RAM_BYTES"),
                                     max_accelerator_bytes: env_u64(
                                         "TACHYON_NVFP4_MAX_ACCELERATOR_BYTES",
                                     ),
@@ -1212,33 +1244,40 @@ impl CandleBackendModel {
                         }
                     }
                 }
-                None => match candle_llm_runtime::CandleLlmRuntime::try_load(
-                    &binding.alias,
-                    &binding.path,
-                    binding.device.as_str(),
-                    &binding.hardware_strategy,
-                )? {
-                    Some(model) => {
-                        let speculative =
-                            load_speculative_draft_runtime(binding)?.map(|(draft, draft_tokens)| {
-                                SpeculativeDraftRuntime {
-                                    draft: Box::new(draft),
-                                    draft_tokens,
+                None => {
+                    match candle_embedding_runtime::CandleEmbeddingRuntime::try_load(
+                        &binding.alias,
+                        &binding.path,
+                    )? {
+                        Some(model) => CandleBackendModelKind::TextEmbedding(Box::new(model)),
+                        None => match candle_llm_runtime::CandleLlmRuntime::try_load(
+                            &binding.alias,
+                            &binding.path,
+                            binding.device.as_str(),
+                            &binding.hardware_strategy,
+                        )? {
+                            Some(model) => {
+                                let speculative = load_speculative_draft_runtime(binding)?.map(
+                                    |(draft, draft_tokens)| SpeculativeDraftRuntime {
+                                        draft: Box::new(draft),
+                                        draft_tokens,
+                                    },
+                                );
+                                CandleBackendModelKind::TextGeneration {
+                                    target: Box::new(model),
+                                    speculative,
                                 }
-                            });
-                        CandleBackendModelKind::TextGeneration {
-                            target: Box::new(model),
-                            speculative,
-                        }
+                            }
+                            None => {
+                                return Err(anyhow!(
+                                    "unsupported AI model binding `{}` at `{}`: expected explicit mock path `mock:<name>`, supported Candle LLM directory, ONNX embedding directory, ONNX guest-loaded graph, or ModelOpt/NVFP4 directory",
+                                    binding.alias,
+                                    binding.path
+                                ))
+                            }
+                        },
                     }
-                    None => {
-                        return Err(anyhow!(
-                            "unsupported AI model binding `{}` at `{}`: expected explicit mock path `mock:<name>`, supported Candle LLM directory, ONNX guest-loaded graph, or ModelOpt/NVFP4 directory",
-                            binding.alias,
-                            binding.path
-                        ))
-                    }
-                },
+                }
             }
         };
         Ok(Self {
@@ -1418,6 +1457,12 @@ impl BackendModel for CandleBackendModel {
                 );
                 return result;
             }
+            CandleBackendModelKind::TextEmbedding(_) => {
+                bail!(
+                    "embedding model `{}` does not support text generation",
+                    self.source.alias
+                );
+            }
             CandleBackendModelKind::Mock => {}
         }
         if inputs.is_empty() {
@@ -1471,6 +1516,58 @@ impl BackendModel for CandleBackendModel {
             CandleBackendModelKind::Qwen35Moe(_) | CandleBackendModelKind::Vendor(_) => bail!(
                 "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
                 adapter.id,
+                self.source.alias
+            ),
+            CandleBackendModelKind::TextEmbedding(_) => bail!(
+                "LoRA adapter `{}` was resolved for embedding model `{}`, but embeddings do not support adapter injection",
+                adapter.id,
+                self.source.alias
+            ),
+        }
+    }
+
+    fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
+        if !matches!(input.ty, TensorType::U8) {
+            bail!(
+                "embedding model `{}` only accepts U8 text tensors",
+                self.source.alias
+            );
+        }
+
+        match &self.kind {
+            CandleBackendModelKind::Mock => {
+                record_execution(&self.source.alias, self.source.accelerator.as_str(), true);
+                Ok(deterministic_mock_embedding(input.data.as_ref()))
+            }
+            CandleBackendModelKind::TextGeneration { .. }
+            | CandleBackendModelKind::ModelOptNvfp4(_)
+            | CandleBackendModelKind::Qwen35Moe(_) => bail!(
+                "model `{}` is a generation runtime and does not expose hidden-state pooling yet",
+                self.source.alias
+            ),
+            CandleBackendModelKind::TextEmbedding(runtime) => {
+                let input = std::str::from_utf8(input.data.as_ref()).map_err(|error| {
+                    anyhow!(
+                        "embedding input for model `{}` was not UTF-8: {error}",
+                        self.source.alias
+                    )
+                })?;
+                let result = runtime.embed(input).map_err(|error| {
+                    anyhow!(
+                        "embedding model `{}` loaded from `{}` failed: {error}",
+                        self.source.alias,
+                        runtime.root().display()
+                    )
+                });
+                record_execution(
+                    &self.source.alias,
+                    self.source.accelerator.as_str(),
+                    result.is_ok(),
+                );
+                result
+            }
+            CandleBackendModelKind::Vendor(_) => bail!(
+                "vendor backend for model `{}` does not expose dense text embeddings",
                 self.source.alias
             ),
         }
@@ -1540,6 +1637,12 @@ impl BackendModel for CandleBackendModel {
                         )
                     })
             }
+            CandleBackendModelKind::TextEmbedding(_) => {
+                bail!(
+                    "embedding model `{}` does not support text generation",
+                    self.source.alias
+                )
+            }
             CandleBackendModelKind::Mock => {
                 let output = self.execute(inputs);
                 record_execution(
@@ -1564,6 +1667,27 @@ impl BackendModel for CandleBackendModel {
             }
         }
     }
+}
+
+fn deterministic_mock_embedding(input: &[u8]) -> Vec<f32> {
+    const DIM: usize = 8;
+    let mut values = vec![0.0; DIM];
+    for (index, byte) in input.iter().enumerate() {
+        let slot = index % DIM;
+        values[slot] += (*byte as f32 + 1.0) / 256.0;
+    }
+    normalize_f32(values)
+}
+
+fn normalize_f32(mut values: Vec<f32>) -> Vec<f32> {
+    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return values;
+    }
+    for value in &mut values {
+        *value /= norm;
+    }
+    values
 }
 
 fn validate_u8_prompts(alias: &str, inputs: &[SharedInputTensor]) -> Result<()> {

@@ -269,4 +269,11 @@ mod tests {
         assert_eq!(target.kind, GatewayTargetKind::Oltp);
         assert_eq!(target.route, "/ai/v1/chat/completions");
     }
+
+    #[test]
+    fn ai_v1_embeddings_passes_through_as_oltp() {
+        let target = route_baas_request("/ai/v1/embeddings", &[], b"{}");
+        assert_eq!(target.kind, GatewayTargetKind::Oltp);
+        assert_eq!(target.route, "/ai/v1/embeddings");
+    }
 }

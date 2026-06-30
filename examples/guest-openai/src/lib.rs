@@ -42,6 +42,7 @@ const ROUTE_DEREGISTER_PREFIX: &str = "/internal/guest-openai/deregister/";
 // OpenAI-compatible endpoints (client-facing).
 const ROUTE_MODELS: &str = "/ai/v1/models";
 const ROUTE_CHAT_COMPLETIONS: &str = "/ai/v1/chat/completions";
+const ROUTE_EMBEDDINGS: &str = "/ai/v1/embeddings";
 
 /// Generation defaults when the request omits them. The host clamps these to its
 /// own hard caps (`HOST_MAX_NEW_TOKENS`, context window).
@@ -74,6 +75,28 @@ struct ChatCompletionRequest {
     stop: Option<StopField>,
     #[serde(default)]
     stream: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingsRequest {
+    model: String,
+    input: EmbeddingsInput,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum EmbeddingsInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl EmbeddingsInput {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +248,20 @@ struct OpenAiModelList {
 }
 
 #[derive(Debug, Serialize)]
+struct EmbeddingsResponse {
+    object: &'static str,
+    data: Vec<EmbeddingData>,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingData {
+    object: &'static str,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Debug, Serialize)]
 struct OpenAiError {
     error: OpenAiErrorBody,
 }
@@ -277,11 +314,71 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         return handle_chat_completions(body);
     }
 
+    if method.eq_ignore_ascii_case("POST") && path == ROUTE_EMBEDDINGS {
+        return handle_embeddings(body);
+    }
+
     Ok(openai_error_payload(
         404,
         format!("route `{method} {path}` not found"),
         "invalid_request_error",
     ))
+}
+
+fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let request: EmbeddingsRequest =
+        serde_json::from_slice(body).map_err(|e| format!("invalid embeddings request: {e}"))?;
+    if request.model.trim().is_empty() {
+        return Err("embeddings request must name a model".to_owned());
+    }
+    let inputs = request.input.into_vec();
+    if inputs.is_empty() || inputs.iter().any(|input| input.trim().is_empty()) {
+        return Err("embeddings request must include at least one non-empty input".to_owned());
+    }
+
+    let models = list_models()?;
+    let alias = match resolve_model_alias(&request.model, &models) {
+        Some(alias) => alias,
+        None if !request.model.contains('/') => request.model.as_str(),
+        None => {
+            return Ok(openai_error_payload(
+                404,
+                format!("model `{}` is unavailable", request.model),
+                "model_not_found",
+            ));
+        }
+    };
+
+    let model_id = match bindings::tachyon::accelerator::cpu::load_model(alias) {
+        Ok(model_id) => model_id,
+        Err(error) => {
+            return Ok(openai_error_payload(
+                404,
+                format!("model `{}` is unavailable: {error}", request.model),
+                "model_not_found",
+            ))
+        }
+    };
+
+    let mut data = Vec::with_capacity(inputs.len());
+    for (index, input) in inputs.into_iter().enumerate() {
+        let embedding = bindings::tachyon::accelerator::cpu::embed(model_id, &input)
+            .map_err(|e| format!("embedding failed for model `{}`: {e}", request.model))?;
+        data.push(EmbeddingData {
+            object: "embedding",
+            embedding,
+            index,
+        });
+    }
+
+    let response = EmbeddingsResponse {
+        object: "list",
+        data,
+        model: request.model,
+    };
+    serde_json::to_vec(&response)
+        .map(|body| (200, body))
+        .map_err(|e| format!("failed to encode embeddings response: {e}"))
 }
 
 /// Run `/ai/v1/chat/completions` against the host CPU accelerator.
@@ -962,11 +1059,30 @@ mod tests {
 
     #[test]
     fn former_v1_routes_are_not_exposed() {
-        for (method, path) in [("GET", "/v1/models"), ("POST", "/v1/chat/completions")] {
+        for (method, path) in [
+            ("GET", "/v1/models"),
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/embeddings"),
+        ] {
             let (status, _) = route_request(method, path, b"{}")
                 .expect("obsolete route should return a response");
             assert_eq!(status, 404, "{method} {path} must remain absent");
         }
+    }
+
+    #[test]
+    fn embeddings_input_accepts_single_string_and_array() {
+        let one: EmbeddingsRequest =
+            serde_json::from_slice(br#"{"model":"m","input":"hello"}"#).expect("valid request");
+        let many: EmbeddingsRequest =
+            serde_json::from_slice(br#"{"model":"m","input":["hello","world"]}"#)
+                .expect("valid request");
+
+        assert_eq!(one.input.into_vec(), vec!["hello".to_owned()]);
+        assert_eq!(
+            many.input.into_vec(),
+            vec!["hello".to_owned(), "world".to_owned()]
+        );
     }
 
     #[test]

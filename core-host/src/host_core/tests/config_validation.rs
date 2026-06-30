@@ -219,6 +219,7 @@ fn guest_openai_example_routes_validate_with_kv_scope() {
     config.routes = vec![
         make("/ai/v1/models", "openai-models"),
         make("/ai/v1/chat/completions", "openai-chat"),
+        make("/ai/v1/embeddings", "openai-embeddings"),
         make("/internal/guest-openai/register", "openai-registry"),
     ];
 
@@ -230,8 +231,10 @@ fn guest_openai_example_routes_validate_with_kv_scope() {
         .expect("/ai/v1/models should remain sealed");
     assert_eq!(models.role, RouteRole::User);
     assert_eq!(models.name, "openai-models");
+    assert!(config.sealed_route("/ai/v1/embeddings").is_some());
     assert!(config.sealed_route("/v1/models").is_none());
     assert!(config.sealed_route("/v1/chat/completions").is_none());
+    assert!(config.sealed_route("/v1/embeddings").is_none());
     assert!(
         config
             .sealed_route("/internal/guest-openai/register")

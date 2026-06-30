@@ -339,6 +339,30 @@ impl ComponentHostState {
             )
     }
 
+    #[cfg(feature = "ai-inference")]
+    pub(crate) fn embed_accelerator_input(
+        &self,
+        expected_accelerator: ai_inference::AcceleratorKind,
+        model_id: u32,
+        input: String,
+    ) -> std::result::Result<Vec<f32>, String> {
+        let loaded = self
+            .accelerator_models
+            .get(&model_id)
+            .ok_or_else(|| format!("accelerator model handle `{model_id}` is unknown"))?;
+        if loaded.accelerator != expected_accelerator {
+            return Err(format!(
+                "accelerator model handle `{model_id}` was loaded for `{}` not `{}`",
+                loaded.accelerator.as_str(),
+                expected_accelerator.as_str()
+            ));
+        }
+        self.ai_runtime
+            .as_ref()
+            .ok_or_else(|| "AI inference runtime is unavailable for this component".to_owned())?
+            .embed_component_input(&loaded.alias, &input)
+    }
+
     /// Begin a streaming generation: resolve the model handle (the same scope
     /// and accelerator checks as `compute_accelerator_prompt`), then run the
     /// decode on a dedicated thread that pushes each decoded text fragment into
@@ -1923,6 +1947,10 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
+    }
+
+    fn embed(&mut self, model_id: u32, input: String) -> std::result::Result<Vec<f32>, String> {
+        self.embed_accelerator_input(ai_inference::AcceleratorKind::Cpu, model_id, input)
     }
 
     fn compute_stream(

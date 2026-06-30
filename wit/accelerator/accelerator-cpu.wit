@@ -12,6 +12,9 @@ interface cpu {
 
     load-model: func(name: string) -> result<u32, string>;
     compute: func(model-id: u32, prompt: string) -> result<string, string>;
+    /// Compute a dense L2-normalized embedding for one input string with a
+    /// model previously loaded by `load-model`.
+    embed: func(model-id: u32, input: string) -> result<list<f32>, string>;
     /// Begin a streaming generation for a previously loaded model. The returned
     /// `token-stream` yields decoded text fragments as the host produces them,
     /// giving the caller real time-to-first-token instead of a buffered result.

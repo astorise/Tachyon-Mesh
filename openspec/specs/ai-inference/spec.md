@@ -562,6 +562,32 @@ static model path.
 - **WHEN** another route attempts to load the same alias without declaring it
 - **THEN** the host SHALL reject that route's request as not sealed
 
+### Requirement: ONNX embedding models SHALL produce pooled dense vectors
+
+The CPU accelerator's `embed` primitive SHALL execute route-authorized ONNX
+embedding model directories with the pure-Rust Candle ONNX backend, tokenize
+text with the directory's `tokenizer.json`, and return a dense f32 embedding.
+Direct `[1, hidden]` outputs SHALL be returned as the embedding vector.
+Sequence outputs shaped
+`[1, seq, hidden]` SHALL be pooled with the attention mask using mean pooling by
+default, or CLS pooling when model metadata declares `pooling: "cls"`. Returned
+embeddings SHALL be L2-normalized by default.
+
+#### Scenario: ONNX embedding directory is loaded for embed requests
+
+- **GIVEN** a sealed model binding points to a directory containing
+  `tokenizer.json` and an ONNX file such as `model.onnx`
+- **WHEN** a guest loads that alias on the CPU accelerator and calls `embed`
+- **THEN** the host tokenizes the input, runs the ONNX graph through Candle,
+  pools the selected output tensor, and returns a dense f32 vector
+
+#### Scenario: Generation models are not misused as embedding models
+
+- **GIVEN** a sealed model binding resolves to a text-generation runtime
+- **WHEN** a guest calls `embed` for that model handle
+- **THEN** the host returns a typed error instead of fabricating an embedding
+  from generated text
+
 ### Requirement: A model deployment's `hardware_strategy` MUST select the parallel execution engine at load time
 When a model deployment declares `hardware_strategy.distribution_mode` other than `single`, the runtime SHALL carry that strategy from configuration into model loading and SHALL construct the corresponding parallel engine (tensor-, pipeline-, or expert-parallel) instead of the dense single-device path. A `single` (or absent) strategy SHALL load the existing single-device path with no behavioural change.
 
