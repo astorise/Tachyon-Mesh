@@ -13,8 +13,8 @@ NOT determine architecture compatibility.
 
 #### Scenario: Hugging Face architecture selects a registered backend
 
-- **WHEN** a safetensors checkpoint declares a supported Qwen, Gemma, Phi, or
-  DeepSeek text `model_type`
+- **WHEN** a safetensors checkpoint declares a supported Qwen, Qwen3-MoE,
+  Gemma, Phi, or DeepSeek V2 text `model_type`
 - **THEN** the runtime selects the corresponding registered family backend
 - **AND** validates the family config before loading weights
 
@@ -32,12 +32,13 @@ NOT determine architecture compatibility.
   `deepseek` but its embedded architecture metadata is unsupported
 - **THEN** the runtime rejects the checkpoint based on the embedded metadata
 
-### Requirement: Qwen and Gemma dense checkpoints MUST execute native generation
+### Requirement: Qwen and Gemma checkpoints MUST execute native generation
 
 The runtime SHALL support single-device native text generation for verified
-Qwen2/Qwen3 dense and Gemma2/Gemma3 safetensors checkpoints using their
-family-specific Candle models. Supported backends SHALL produce logits and
-generated text through the same request contract as the existing Llama backend.
+Qwen2/Qwen3 dense, Qwen3-MoE, and Gemma2/Gemma3 safetensors checkpoints using
+their family-specific Candle models. Supported backends SHALL produce logits
+and generated text through the same request contract as the existing Llama
+backend.
 
 #### Scenario: Qwen dense checkpoint generates multiple tokens
 
@@ -45,6 +46,14 @@ generated text through the same request contract as the existing Llama backend.
 - **AND** a generation request asks for more than one token
 - **THEN** the runtime performs prefill and autoregressive decode with persistent
   family-appropriate cache state
+- **AND** returns non-mock generated text
+
+#### Scenario: Qwen3-MoE checkpoint generates through Candle's MoE backend
+
+- **WHEN** a valid Qwen3-MoE safetensors checkpoint is loaded
+- **AND** a generation request asks for more than one token
+- **THEN** the runtime uses `candle_transformers::models::qwen3_moe`
+- **AND** resets MoE cache state between requests
 - **AND** returns non-mock generated text
 
 #### Scenario: Gemma checkpoint generates multiple tokens
@@ -126,6 +135,13 @@ small local fixtures without downloading external checkpoints.
   implementation
 - **THEN** the runtime reports it as a recognized unsupported variant
 - **AND** documentation does not list it as executable
+
+#### Scenario: DeepSeek V3 and R1 do not reuse the V2 backend
+
+- **WHEN** a checkpoint declares `deepseek_v3` or `deepseek_r1`
+- **AND** the pinned Candle fork does not expose a dedicated V3/R1 backend
+- **THEN** the runtime rejects the checkpoint before weight loading
+- **AND** does not deserialize or execute it through the DeepSeek V2 backend
 
 ### Requirement: Vision-language checkpoints MUST fail closed until a VLM pipeline exists
 

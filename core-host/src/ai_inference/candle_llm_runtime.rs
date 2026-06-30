@@ -19,6 +19,9 @@ use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model
 use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlama;
 use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
 use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
+use candle_transformers::models::qwen3_moe::{
+    Config as Qwen3MoeConfig, ModelForCausalLM as Qwen3MoeModel,
+};
 use serde::Deserialize;
 use thiserror::Error;
 use tokenizers::Tokenizer;
@@ -187,7 +190,9 @@ impl ModelArchitecture {
             "deepseek_v2" => Some(Self::DeepSeekV2),
             "deepseek_v3" => Some(Self::DeepSeekV3),
             "deepseek_r1" => Some(Self::DeepSeekR1),
-            "qwen3_5_moe" | "qwen3_5_moe_text" => Some(Self::Qwen35Moe),
+            "qwen3_moe" | "qwen3_moe_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
+                Some(Self::Qwen35Moe)
+            }
             _ => None,
         }
     }
@@ -230,11 +235,11 @@ impl ModelArchitecture {
             Self::Qwen35Moe => ArchitectureCapabilities {
                 safetensors: true,
                 gguf: false,
-                single: false,
+                single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
                 expert_parallel: false,
-                specialized_runtime: true,
+                specialized_runtime: false,
             },
             Self::Qwen2 | Self::Qwen3 => ArchitectureCapabilities {
                 safetensors: true,
@@ -254,17 +259,24 @@ impl ModelArchitecture {
                 expert_parallel: false,
                 specialized_runtime: false,
             },
-            Self::Phi3 | Self::Phi4 | Self::DeepSeekV2 | Self::DeepSeekV3 | Self::DeepSeekR1 => {
-                ArchitectureCapabilities {
-                    safetensors: true,
-                    gguf: false,
-                    single: true,
-                    tensor_parallel: false,
-                    pipeline_parallel: false,
-                    expert_parallel: false,
-                    specialized_runtime: false,
-                }
-            }
+            Self::Phi3 | Self::Phi4 | Self::DeepSeekV2 => ArchitectureCapabilities {
+                safetensors: true,
+                gguf: false,
+                single: true,
+                tensor_parallel: false,
+                pipeline_parallel: false,
+                expert_parallel: false,
+                specialized_runtime: false,
+            },
+            Self::DeepSeekV3 | Self::DeepSeekR1 => ArchitectureCapabilities {
+                safetensors: false,
+                gguf: false,
+                single: false,
+                tensor_parallel: false,
+                pipeline_parallel: false,
+                expert_parallel: false,
+                specialized_runtime: false,
+            },
         }
     }
 
@@ -281,7 +293,7 @@ impl ModelArchitecture {
             Self::DeepSeekV2 => "deepseek-v2",
             Self::DeepSeekV3 => "deepseek-v3",
             Self::DeepSeekR1 => "deepseek-r1",
-            Self::Qwen35Moe => "qwen3.5-moe",
+            Self::Qwen35Moe => "qwen3-moe",
         }
     }
 
@@ -344,6 +356,7 @@ enum SingleDeviceBackend {
     Llama { model: Llama, config: Config },
     Qwen2(Mutex<Qwen2Model>),
     Qwen3(Mutex<Qwen3Model>),
+    Qwen3Moe(Mutex<Qwen3MoeModel>),
     Gemma2(Mutex<Gemma2Model>),
     Gemma3(Mutex<Gemma3Model>),
     Phi3(Mutex<Phi3Model>),
@@ -404,6 +417,20 @@ impl SingleDeviceBackend {
             Self::Qwen3(model) => {
                 let mut model = model.lock().map_err(|_| {
                     runtime.execution_error("Qwen3 model mutex was poisoned".to_owned())
+                })?;
+                model.clear_kv_cache();
+                runtime.decode_loop(
+                    prompt_ids,
+                    request,
+                    eos_tokens,
+                    device,
+                    on_token,
+                    |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
+                )
+            }
+            Self::Qwen3Moe(model) => {
+                let mut model = model.lock().map_err(|_| {
+                    runtime.execution_error("Qwen3-MoE model mutex was poisoned".to_owned())
                 })?;
                 model.clear_kv_cache();
                 runtime.decode_loop(
@@ -498,6 +525,16 @@ impl SingleDeviceBackend {
                     .forward(input, 0)
                     .and_then(|logits| logits.squeeze(1))
                     .expect("Qwen3 forward pass should run")
+            }
+            Self::Qwen3Moe(model) => {
+                let mut model = model
+                    .lock()
+                    .expect("Qwen3-MoE mutex should not be poisoned");
+                model.clear_kv_cache();
+                model
+                    .forward(input, 0)
+                    .and_then(|logits| logits.squeeze(1))
+                    .expect("Qwen3-MoE forward pass should run")
             }
             Self::Gemma2(model) => {
                 let mut model = model.lock().expect("Gemma2 mutex should not be poisoned");
@@ -1120,6 +1157,24 @@ impl CandleLlmRuntime {
                     eos_tokens,
                 )
             }
+            ModelArchitecture::Qwen35Moe => {
+                let config: Qwen3MoeConfig =
+                    serde_json::from_slice(&raw_config).map_err(|error| {
+                        CandleLlmError::InvalidComponent {
+                            alias: alias.to_owned(),
+                            path: root.to_path_buf(),
+                            component: CONFIG_JSON,
+                            detail: error.to_string(),
+                        }
+                    })?;
+                let limits = GenerationLimits::with_context(config.max_position_embeddings);
+                let model = Qwen3MoeModel::new(&config, var_builder).map_err(invalid_weights)?;
+                (
+                    SingleDeviceBackend::Qwen3Moe(Mutex::new(model)),
+                    limits,
+                    eos_tokens,
+                )
+            }
             ModelArchitecture::Gemma2 => {
                 let config: Gemma2Config =
                     serde_json::from_slice(&raw_config).map_err(|error| {
@@ -1175,9 +1230,7 @@ impl CandleLlmRuntime {
                     eos_tokens,
                 )
             }
-            ModelArchitecture::DeepSeekV2
-            | ModelArchitecture::DeepSeekV3
-            | ModelArchitecture::DeepSeekR1 => {
+            ModelArchitecture::DeepSeekV2 => {
                 let config: DeepSeekConfig =
                     serde_json::from_slice(&raw_config).map_err(|error| {
                         CandleLlmError::InvalidComponent {
@@ -3396,7 +3449,36 @@ fn write_tachyon_tiny_qwen_fixture(
                 "eos_token_id": null
             }),
         ),
-        _ => anyhow::bail!("tiny Qwen fixture requires Qwen2 or Qwen3"),
+        ModelArchitecture::Qwen35Moe => (
+            "qwen3_moe",
+            "Qwen3MoeForCausalLM",
+            serde_json::json!({
+                "model_type": "qwen3_moe",
+                "vocab_size": FIXTURE_VOCAB_SIZE,
+                "hidden_size": FIXTURE_HIDDEN_SIZE,
+                "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+                "num_hidden_layers": FIXTURE_NUM_LAYERS,
+                "num_attention_heads": FIXTURE_NUM_HEADS,
+                "head_dim": FIXTURE_HIDDEN_SIZE / FIXTURE_NUM_HEADS,
+                "attention_bias": false,
+                "num_key_value_heads": FIXTURE_NUM_HEADS,
+                "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+                "sliding_window": null,
+                "max_window_layers": FIXTURE_NUM_LAYERS,
+                "tie_word_embeddings": false,
+                "rope_theta": 10000.0,
+                "rms_norm_eps": 1e-5,
+                "use_sliding_window": false,
+                "hidden_act": "silu",
+                "decoder_sparse_step": 1,
+                "moe_intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+                "num_experts_per_tok": 1,
+                "num_experts": 2,
+                "norm_topk_prob": true,
+                "eos_token_id": null
+            }),
+        ),
+        _ => anyhow::bail!("tiny Qwen fixture requires Qwen2, Qwen3, or Qwen3-MoE"),
     };
     config["model_type"] = serde_json::Value::String(model_type.to_owned());
     config["architectures"] = serde_json::json!([architecture_name]);
@@ -3435,6 +3517,41 @@ fn write_tachyon_tiny_qwen_fixture(
                 format!("{prefix}.k_norm.weight"),
                 Tensor::ones(head_dim, DType::F32, &Device::Cpu)?,
             );
+        }
+        if architecture == ModelArchitecture::Qwen35Moe {
+            for layer in 0..FIXTURE_NUM_LAYERS {
+                let prefix = format!("model.layers.{layer}.mlp");
+                tensors.insert(
+                    format!("{prefix}.gate.weight"),
+                    Tensor::zeros((2, FIXTURE_HIDDEN_SIZE), DType::F32, &Device::Cpu)?,
+                );
+                for expert in 0..2 {
+                    tensors.insert(
+                        format!("{prefix}.experts.{expert}.gate_proj.weight"),
+                        Tensor::ones(
+                            (FIXTURE_INTERMEDIATE_SIZE, FIXTURE_HIDDEN_SIZE),
+                            DType::F32,
+                            &Device::Cpu,
+                        )?,
+                    );
+                    tensors.insert(
+                        format!("{prefix}.experts.{expert}.up_proj.weight"),
+                        Tensor::ones(
+                            (FIXTURE_INTERMEDIATE_SIZE, FIXTURE_HIDDEN_SIZE),
+                            DType::F32,
+                            &Device::Cpu,
+                        )?,
+                    );
+                    tensors.insert(
+                        format!("{prefix}.experts.{expert}.down_proj.weight"),
+                        Tensor::ones(
+                            (FIXTURE_HIDDEN_SIZE, FIXTURE_INTERMEDIATE_SIZE),
+                            DType::F32,
+                            &Device::Cpu,
+                        )?,
+                    );
+                }
+            }
         }
     }
     candle_core::safetensors::save(&tensors, root.join(MODEL_SAFETENSORS))?;
@@ -4064,6 +4181,10 @@ mod tests {
             Some(ModelArchitecture::Qwen3)
         );
         assert_eq!(
+            ModelArchitecture::from_hf_model_type("qwen3_moe"),
+            Some(ModelArchitecture::Qwen35Moe)
+        );
+        assert_eq!(
             ModelArchitecture::from_hf_model_type("gemma3_text"),
             Some(ModelArchitecture::Gemma3)
         );
@@ -4092,6 +4213,8 @@ mod tests {
         assert!(ModelArchitecture::Llama.supports_format(ModelFormat::Safetensors));
         assert!(ModelArchitecture::Llama.supports_format(ModelFormat::Gguf));
         assert!(ModelArchitecture::Qwen3.supports_format(ModelFormat::Safetensors));
+        assert!(ModelArchitecture::Qwen35Moe.supports_format(ModelFormat::Safetensors));
+        assert!(!ModelArchitecture::DeepSeekV3.supports_format(ModelFormat::Safetensors));
         assert!(!ModelArchitecture::Gemma3.supports_format(ModelFormat::Gguf));
         assert!(ModelArchitecture::Gemma3.supports_format(ModelFormat::Safetensors));
     }
@@ -4135,8 +4258,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen2_and_qwen3_generate_and_reset_their_internal_cache() {
-        for architecture in [ModelArchitecture::Qwen2, ModelArchitecture::Qwen3] {
+    fn qwen2_qwen3_and_qwen3_moe_generate_and_reset_their_internal_cache() {
+        for architecture in [
+            ModelArchitecture::Qwen2,
+            ModelArchitecture::Qwen3,
+            ModelArchitecture::Qwen35Moe,
+        ] {
             let (runtime, dir) = load_qwen_fixture("generation", architecture);
             let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
             let first = runtime.generate(&[request]).expect("first generation");
@@ -4153,8 +4280,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen2_and_qwen3_streaming_matches_buffered_generation() {
-        for architecture in [ModelArchitecture::Qwen2, ModelArchitecture::Qwen3] {
+    fn qwen2_qwen3_and_qwen3_moe_streaming_matches_buffered_generation() {
+        for architecture in [
+            ModelArchitecture::Qwen2,
+            ModelArchitecture::Qwen3,
+            ModelArchitecture::Qwen35Moe,
+        ] {
             let (runtime, dir) = load_qwen_fixture("streaming", architecture);
             let request: &[u8] = br#"{"prompt":"hello","max_new_tokens":4}"#;
             let buffered =
@@ -4169,8 +4300,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen2_and_qwen3_logits_match_direct_candle_models_and_enforce_limits() {
-        for architecture in [ModelArchitecture::Qwen2, ModelArchitecture::Qwen3] {
+    fn qwen2_qwen3_and_qwen3_moe_logits_match_direct_candle_models_and_enforce_limits() {
+        for architecture in [
+            ModelArchitecture::Qwen2,
+            ModelArchitecture::Qwen3,
+            ModelArchitecture::Qwen35Moe,
+        ] {
             let (runtime, dir) = load_qwen_fixture("reference", architecture);
             let runtime_logits = runtime.debug_last_logits("hello mesh");
             let ids = runtime
@@ -4209,6 +4344,17 @@ mod tests {
                         .and_then(|logits| logits.squeeze(0))
                         .and_then(|logits| logits.to_vec1::<f32>())
                         .expect("Qwen3 reference logits")
+                }
+                ModelArchitecture::Qwen35Moe => {
+                    let config: Qwen3MoeConfig =
+                        serde_json::from_slice(&raw_config).expect("Qwen3-MoE config");
+                    let mut model = Qwen3MoeModel::new(&config, vb).expect("Qwen3-MoE reference");
+                    model
+                        .forward(&input, 0)
+                        .and_then(|logits| logits.squeeze(1))
+                        .and_then(|logits| logits.squeeze(0))
+                        .and_then(|logits| logits.to_vec1::<f32>())
+                        .expect("Qwen3-MoE reference logits")
                 }
                 _ => unreachable!(),
             };
@@ -4436,29 +4582,55 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v2_v3_and_r1_compatible_configs_generate_and_stream() {
-        for architecture in [
+    fn deepseek_v2_compatible_config_generates_and_streams() {
+        let (runtime, dir) = load_family_fixture(
+            "generation",
             ModelArchitecture::DeepSeekV2,
-            ModelArchitecture::DeepSeekV3,
-            ModelArchitecture::DeepSeekR1,
-        ] {
-            let (runtime, dir) = load_family_fixture(
-                "generation",
-                architecture,
-                write_tachyon_tiny_deepseek_fixture,
-            );
-            let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
-            let buffered =
-                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
-            let repeat =
-                String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
-            assert_eq!(buffered, repeat);
-            let mut streamed = String::new();
-            runtime
-                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
-                .expect("streamed");
-            assert_eq!(streamed, buffered);
-            assert_ne!(buffered.as_bytes(), b"MOCK_LLM_RESPONSE");
+            write_tachyon_tiny_deepseek_fixture,
+        );
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
+        let buffered =
+            String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+        let repeat =
+            String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+        assert_eq!(buffered, repeat);
+        let mut streamed = String::new();
+        runtime
+            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .expect("streamed");
+        assert_eq!(streamed, buffered);
+        assert_ne!(buffered.as_bytes(), b"MOCK_LLM_RESPONSE");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deepseek_v3_and_r1_fail_closed_until_candle_exposes_dedicated_backends() {
+        for architecture in [ModelArchitecture::DeepSeekV3, ModelArchitecture::DeepSeekR1] {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "tachyon-{}-unsupported-{}-{nanos}",
+                architecture.display_name(),
+                std::process::id()
+            ));
+            write_tachyon_tiny_deepseek_fixture(&dir, architecture)
+                .expect("DeepSeek fixture should be written");
+            fs::write(dir.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON).expect("tokenizer");
+            let error = CandleLlmRuntime::try_load(
+                "tiny-deepseek",
+                &dir,
+                "cpu",
+                &HardwareStrategy::default(),
+            )
+            .expect_err("DeepSeek V3/R1 must not be loaded by the V2 backend");
+            match error {
+                CandleLlmError::UnsupportedModel { detail, .. } => {
+                    assert!(detail.contains("no verified safetensors loader"));
+                }
+                other => panic!("expected UnsupportedModel, got {other:?}"),
+            }
             let _ = fs::remove_dir_all(dir);
         }
     }
