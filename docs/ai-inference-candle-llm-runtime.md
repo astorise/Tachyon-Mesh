@@ -94,3 +94,22 @@ Model bindings can declare the future mode with:
 Until the block allocator and block-table path are wired, the Candle LLM runtime
 rejects that setting with a typed unsupported-model error instead of silently
 falling back to the contiguous per-request KV cache.
+
+## Speculative Decoding Status
+
+Model bindings can opt into greedy draft/verify decoding with a local draft
+model directory:
+
+```json
+{
+  "hardware_strategy": {
+    "speculative_draft_model_path": "/models/tiny-draft",
+    "speculative_draft_tokens": 4
+  }
+}
+```
+
+The draft model proposes a bounded token window and the target model verifies
+each token before emission. This first path is exact for greedy single-prompt
+generation; sampling, constrained decoding, tokenizer-incompatible drafts, and
+multi-prompt batches fall back to the existing target-only decode path.

@@ -37,7 +37,7 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BinaryHeap, HashMap},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc, Mutex, OnceLock, RwLock,
@@ -60,6 +60,8 @@ const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 const DEFAULT_BATCH_SIZE: usize = 32;
 const ACCELERATOR_QUEUE_CAPACITY: usize = 256;
 const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
+const MODEL_BROKER_ADAPTERS_DIR: &str = "adapters";
+const SAFETENSORS_EXTENSION: &str = "safetensors";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InferenceExecutionTelemetry {
@@ -244,6 +246,16 @@ trait BackendModel: Send + Sync {
     fn residency(&self) -> AcceleratorMemoryResidency;
     fn as_any(&self) -> &dyn Any;
     fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>>;
+    fn execute_with_adapter(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapter_id: &str,
+    ) -> Result<Vec<u8>> {
+        let _ = inputs;
+        bail!(
+            "LoRA adapter `{adapter_id}` was resolved, but this backend does not support adapter injection"
+        )
+    }
 
     /// Stream decoded text fragments through `on_token` as they are produced.
     /// The default implementation runs `execute` and emits the entire output as
@@ -527,13 +539,10 @@ impl AiInferenceRuntime {
         prompt: &str,
         adapter_id: Option<&str>,
     ) -> Result<String, String> {
-        if let Some(id) = adapter_id {
-            if id.contains("..") || id.starts_with('/') || id.starts_with('\\') {
-                return Err(format!(
-                    "adapter id `{id}` is not a valid identifier: must not contain path traversal sequences"
-                ));
-            }
-        }
+        let adapter_id = adapter_id
+            .map(resolve_lora_adapter_path)
+            .transpose()?
+            .map(|adapter| adapter.id);
         self.ensure_model_loaded(alias)?;
         // Clone the `Arc` out and drop the read lock before inference so a slow
         // forward pass never blocks lazy registration of other models.
@@ -554,7 +563,7 @@ impl AiInferenceRuntime {
             })?
             .infer(
                 Arc::clone(&model),
-                adapter_id.map(str::to_owned),
+                adapter_id,
                 SharedInputTensor {
                     dimensions: vec![prompt.len() as u32],
                     ty: TensorType::U8,
@@ -608,6 +617,48 @@ impl AiInferenceRuntime {
     fn scheduler_for(&self, accelerator: AcceleratorKind) -> Option<AcceleratorScheduler> {
         self.schedulers.get(&accelerator).cloned()
     }
+}
+
+struct ResolvedLoraAdapter {
+    id: String,
+    #[allow(dead_code)]
+    path: PathBuf,
+}
+
+fn resolve_lora_adapter_path(adapter_id: &str) -> Result<ResolvedLoraAdapter, String> {
+    validate_lora_adapter_id(adapter_id)?;
+    let broker_root = std::env::var(MODEL_BROKER_DIR_ENV).map_err(|_| {
+        format!(
+            "adapter id `{adapter_id}` was requested but `{MODEL_BROKER_DIR_ENV}` is not configured"
+        )
+    })?;
+    let path = Path::new(&broker_root)
+        .join(MODEL_BROKER_ADAPTERS_DIR)
+        .join(format!("{adapter_id}.{SAFETENSORS_EXTENSION}"));
+    if !path.is_file() {
+        return Err(format!(
+            "adapter id `{adapter_id}` is not available at `{}`",
+            path.display()
+        ));
+    }
+    Ok(ResolvedLoraAdapter {
+        id: adapter_id.to_owned(),
+        path,
+    })
+}
+
+fn validate_lora_adapter_id(adapter_id: &str) -> Result<(), String> {
+    if adapter_id.is_empty()
+        || adapter_id.contains("..")
+        || adapter_id.contains('/')
+        || adapter_id.contains('\\')
+        || adapter_id.ends_with(&format!(".{SAFETENSORS_EXTENSION}"))
+    {
+        return Err(format!(
+            "adapter id `{adapter_id}` is not a valid identifier: use the adapter name without path separators, traversal, or extension"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1049,7 +1100,10 @@ struct CandleBackendModel {
 
 enum CandleBackendModelKind {
     Mock,
-    TextGeneration(Box<candle_llm_runtime::CandleLlmRuntime>),
+    TextGeneration {
+        target: Box<candle_llm_runtime::CandleLlmRuntime>,
+        speculative: Option<SpeculativeDraftRuntime>,
+    },
     /// A ModelOpt/NVFP4 checkpoint, dequantized to a dense F32 model at load
     /// time (the fallback NVFP4 execution path: see
     /// `candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4`).
@@ -1058,6 +1112,11 @@ enum CandleBackendModelKind {
     ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
     Qwen35Moe(Box<qwen35_moe_runtime::Qwen35MoeRuntime>),
     Vendor(vendor_accelerator::VendorAcceleratorRuntime),
+}
+
+struct SpeculativeDraftRuntime {
+    draft: Box<candle_llm_runtime::CandleLlmRuntime>,
+    draft_tokens: usize,
 }
 
 impl CandleBackendModel {
@@ -1161,7 +1220,19 @@ impl CandleBackendModel {
                     binding.device.as_str(),
                     &binding.hardware_strategy,
                 )? {
-                    Some(model) => CandleBackendModelKind::TextGeneration(Box::new(model)),
+                    Some(model) => {
+                        let speculative =
+                            load_speculative_draft_runtime(binding)?.map(|(draft, draft_tokens)| {
+                                SpeculativeDraftRuntime {
+                                    draft: Box::new(draft),
+                                    draft_tokens,
+                                }
+                            });
+                        CandleBackendModelKind::TextGeneration {
+                            target: Box::new(model),
+                            speculative,
+                        }
+                    }
                     None => {
                         return Err(anyhow!(
                             "unsupported AI model binding `{}` at `{}`: expected explicit mock path `mock:<name>`, supported Candle LLM directory, ONNX guest-loaded graph, or ModelOpt/NVFP4 directory",
@@ -1184,6 +1255,39 @@ impl CandleBackendModel {
             kind,
         })
     }
+}
+
+fn load_speculative_draft_runtime(
+    binding: &IntegrityModelBinding,
+) -> Result<Option<(candle_llm_runtime::CandleLlmRuntime, usize)>> {
+    let draft_path = binding
+        .hardware_strategy
+        .speculative_draft_model_path
+        .trim();
+    if draft_path.is_empty() {
+        return Ok(None);
+    }
+    let mut draft_strategy = binding.hardware_strategy.clone();
+    draft_strategy.speculative_draft_model_path.clear();
+    draft_strategy.speculative_draft_tokens = 0;
+    let draft = candle_llm_runtime::CandleLlmRuntime::try_load(
+        &format!("{}:draft", binding.alias),
+        draft_path,
+        binding.device.as_str(),
+        &draft_strategy,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "speculative draft model for `{}` at `{}` is not a supported Candle LLM directory",
+            binding.alias,
+            draft_path
+        )
+    })?;
+    let draft_tokens = usize::try_from(binding.hardware_strategy.speculative_draft_tokens)
+        .ok()
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(candle_llm_runtime::DEFAULT_SPECULATIVE_DRAFT_TOKENS);
+    Ok(Some((draft, draft_tokens)))
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -1232,8 +1336,7 @@ impl BackendModel for CandleBackendModel {
                 record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
                 return result;
             }
-            CandleBackendModelKind::ModelOptNvfp4(runtime)
-            | CandleBackendModelKind::TextGeneration(runtime) => {
+            CandleBackendModelKind::ModelOptNvfp4(runtime) => {
                 if inputs
                     .iter()
                     .any(|input| !matches!(input.ty, TensorType::U8))
@@ -1261,6 +1364,46 @@ impl BackendModel for CandleBackendModel {
                     (CandleBackendModelKind::ModelOptNvfp4(_), _) => "cpu_fallback",
                     (_, AcceleratorKind::Gpu) => "gpu",
                     _ => "cpu",
+                };
+                record_execution(&self.source.alias, executed_on, result.is_ok());
+                return result;
+            }
+            CandleBackendModelKind::TextGeneration {
+                target,
+                speculative,
+            } => {
+                if inputs
+                    .iter()
+                    .any(|input| !matches!(input.ty, TensorType::U8))
+                {
+                    return Err(anyhow!(
+                        "Candle LLM model `{}` only accepts U8 prompt tensors",
+                        self.source.alias
+                    ));
+                }
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                let result = match speculative {
+                    Some(speculative) => target.generate_speculative(
+                        &prompts,
+                        &speculative.draft,
+                        speculative.draft_tokens,
+                    ),
+                    None => target.generate(&prompts),
+                }
+                .map_err(|error| {
+                    anyhow!(
+                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                        self.source.alias,
+                        target.root().display()
+                    )
+                });
+                let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
+                    "gpu"
+                } else {
+                    "cpu"
                 };
                 record_execution(&self.source.alias, executed_on, result.is_ok());
                 return result;
@@ -1302,14 +1445,27 @@ impl BackendModel for CandleBackendModel {
         Ok(b"MOCK_LLM_RESPONSE".to_vec())
     }
 
+    fn execute_with_adapter(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapter_id: &str,
+    ) -> Result<Vec<u8>> {
+        match &self.kind {
+            CandleBackendModelKind::Mock => self.execute(inputs),
+            _ => bail!(
+                "LoRA adapter `{adapter_id}` was resolved for model `{}`, but Tachyon has not wired candle-nn LoraLinear into this backend's transformer graph yet",
+                self.source.alias
+            ),
+        }
+    }
+
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
         on_token: &mut dyn FnMut(&str),
     ) -> Result<()> {
         match &self.kind {
-            CandleBackendModelKind::ModelOptNvfp4(runtime)
-            | CandleBackendModelKind::TextGeneration(runtime) => {
+            CandleBackendModelKind::ModelOptNvfp4(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
                 let prompts = inputs
                     .iter()
@@ -1324,6 +1480,32 @@ impl BackendModel for CandleBackendModel {
                             runtime.root().display()
                         )
                     })
+            }
+            CandleBackendModelKind::TextGeneration {
+                target,
+                speculative,
+            } => {
+                validate_u8_prompts(&self.source.alias, inputs)?;
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                match speculative {
+                    Some(speculative) => target.generate_speculative_streaming(
+                        &prompts,
+                        &speculative.draft,
+                        speculative.draft_tokens,
+                        on_token,
+                    ),
+                    None => target.generate_streaming(&prompts, on_token),
+                }
+                .map_err(|error| {
+                    anyhow!(
+                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                        self.source.alias,
+                        target.root().display()
+                    )
+                })
             }
             CandleBackendModelKind::Qwen35Moe(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
@@ -1427,8 +1609,10 @@ impl CandleModel {
         inputs: &[SharedInputTensor],
         adapter_id: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let _ = adapter_id; // LoRA adapters are a future enhancement
-        self.backend_model.execute(inputs)
+        match adapter_id {
+            Some(adapter_id) => self.backend_model.execute_with_adapter(inputs, adapter_id),
+            None => self.backend_model.execute(inputs),
+        }
     }
 }
 
@@ -2219,6 +2403,39 @@ mod tests {
     }
 
     #[test]
+    fn real_candle_llm_runtime_rejects_resolved_lora_until_graph_injection_is_wired() {
+        let model_dir = unique_candle_llm_dir("real-lora-reject");
+        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
+            .expect("fixture should be written");
+        let adapter_root = std::env::temp_dir().join(format!(
+            "tachyon-real-lora-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be valid")
+                .as_nanos()
+        ));
+        let adapter_dir = adapter_root.join("adapters");
+        fs::create_dir_all(&adapter_dir).expect("adapter dir should be created");
+        fs::write(adapter_dir.join("tenant-a.safetensors"), b"mock-lora")
+            .expect("adapter should be written");
+        std::env::set_var(MODEL_BROKER_DIR_ENV, &adapter_root);
+
+        let runtime =
+            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
+                .expect("runtime should load real Candle LLM fixture");
+        let error = runtime
+            .compute_component_prompt_with_adapter("tiny", "hello", Some("tenant-a"))
+            .expect_err("real backend must not silently ignore a resolved adapter");
+
+        assert!(error.contains("tenant-a"));
+        assert!(error.contains("LoraLinear"));
+        assert!(error.contains("transformer graph"));
+        std::env::remove_var(MODEL_BROKER_DIR_ENV);
+        let _ = fs::remove_dir_all(adapter_root);
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
     fn streamed_prompt_matches_the_buffered_output() {
         let model_dir = unique_candle_llm_dir("stream-vs-buffered");
         candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
@@ -2812,12 +3029,56 @@ mod tests {
                 .expect("adapter-backed inference should succeed"),
             MOCK_INFERENCE_RESPONSE
         );
+        let missing = runtime
+            .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-b"))
+            .expect_err("missing adapter must fail before inference");
+        assert!(missing.contains("tenant-b"));
+        assert!(missing.contains("adapters"));
         assert!(runtime
             .compute_component_prompt_with_adapter("llama3", "hello", Some("../bad"))
             .is_err());
 
         std::env::remove_var(MODEL_BROKER_DIR_ENV);
         let _ = fs::remove_dir_all(adapter_root);
+    }
+
+    #[test]
+    fn candle_lora_linear_from_pinned_fork_applies_active_adapter() {
+        use candle_core::{DType, Device, Tensor};
+        use candle_nn::{linear_no_bias, lora::LoraLinear, Module, VarBuilder, VarMap};
+
+        let device = Device::Cpu;
+        let mut base_vars = VarMap::new();
+        let base_vb = VarBuilder::from_varmap(&base_vars, DType::F32, &device);
+        let base = linear_no_bias(3, 2, base_vb.pp("q_proj")).expect("base linear");
+        base_vars
+            .set_one(
+                "q_proj.weight",
+                Tensor::new(&[[1f32, 0., 0.], [0., 1., 0.]], &device).expect("base weight"),
+            )
+            .expect("set base weight");
+
+        let mut adapter_vars = VarMap::new();
+        let adapter_vb = VarBuilder::from_varmap(&adapter_vars, DType::F32, &device);
+        let lora = LoraLinear::from_peft(base, adapter_vb.pp("q_proj"), 2, 4.0)
+            .expect("LoRA adapter should load through candle-nn");
+        adapter_vars
+            .set_one(
+                "q_proj.lora_A.weight",
+                Tensor::new(&[[1f32, 0., 0.], [0., 1., 0.]], &device).expect("lora A"),
+            )
+            .expect("set lora A");
+        adapter_vars
+            .set_one(
+                "q_proj.lora_B.weight",
+                Tensor::new(&[[1f32, 0.], [0., 1.]], &device).expect("lora B"),
+            )
+            .expect("set lora B");
+
+        let output = lora
+            .forward(&Tensor::new(&[[1f32, 2., 3.]], &device).expect("input"))
+            .expect("LoRA forward");
+        assert_eq!(output.to_vec2::<f32>().expect("output"), vec![vec![3., 6.]]);
     }
 
     #[test]

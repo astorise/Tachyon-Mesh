@@ -62,6 +62,14 @@ interface config-ai {
         /// Optional prefill chunk size in tokens. Absent uses Tachyon's
         /// default (8192 tokens), `some(0)` disables chunked prefill.
         prefill-chunk-tokens: option<u32>,
+        /// Optional local model directory for speculative decoding. When set,
+        /// core-host loads this draft model beside the target model and uses a
+        /// greedy propose/verify loop; unsupported request modes fall back to
+        /// the target-only decode path.
+        speculative-draft-model-path: string,
+        /// Maximum draft tokens proposed before target verification. `0` uses
+        /// the runtime default.
+        speculative-draft-tokens: u32,
     }
 
     record lora-adapter {

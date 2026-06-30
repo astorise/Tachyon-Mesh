@@ -126,3 +126,26 @@ small local fixtures without downloading external checkpoints.
   implementation
 - **THEN** the runtime reports it as a recognized unsupported variant
 - **AND** documentation does not list it as executable
+
+### Requirement: Vision-language checkpoints MUST fail closed until a VLM pipeline exists
+
+The Candle text-generation runtime SHALL NOT treat multimodal vision-language
+checkpoints as text-only Qwen or Gemma models. Until Tachyon owns image
+preprocessing, a vision encoder, multimodal projection, embedding fusion, and an
+image-bearing request tensor contract, VLM checkpoints SHALL fail before weight
+loading with an actionable unsupported-model error.
+
+#### Scenario: Qwen-VL checkpoint is rejected before weight loading
+
+- **WHEN** a safetensors checkpoint declares a Qwen-VL `model_type`, such as
+  `qwen_vl`, `qwen2_vl`, `qwen2_5_vl`, or `qwen3_vl`
+- **THEN** the runtime rejects the binding as unsupported multimodal execution
+- **AND** the error names the missing vision encoder and image request tensor
+  path
+
+#### Scenario: Vision config prevents text-only dispatch
+
+- **WHEN** a checkpoint carries `vision_config` metadata even though its
+  `text_config` maps to a supported text family
+- **THEN** the runtime rejects the binding before loading weights
+- **AND** it does not silently route the checkpoint through the text-only backend
