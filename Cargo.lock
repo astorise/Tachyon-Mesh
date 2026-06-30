@@ -729,7 +729,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?rev=2ba7171233842ebc52dce3ee73d168c5e948d80d#2ba7171233842ebc52dce3ee73d168c5e948d80d"
+source = "git+https://github.com/astorise/candle?rev=653ccb7735ba0f4642213b9dbcc22c4cc911f26f#653ccb7735ba0f4642213b9dbcc22c4cc911f26f"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -757,7 +757,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?rev=2ba7171233842ebc52dce3ee73d168c5e948d80d#2ba7171233842ebc52dce3ee73d168c5e948d80d"
+source = "git+https://github.com/astorise/candle?rev=653ccb7735ba0f4642213b9dbcc22c4cc911f26f#653ccb7735ba0f4642213b9dbcc22c4cc911f26f"
 dependencies = [
  "cudaforge",
 ]
@@ -765,7 +765,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?rev=2ba7171233842ebc52dce3ee73d168c5e948d80d#2ba7171233842ebc52dce3ee73d168c5e948d80d"
+source = "git+https://github.com/astorise/candle?rev=653ccb7735ba0f4642213b9dbcc22c4cc911f26f#653ccb7735ba0f4642213b9dbcc22c4cc911f26f"
 dependencies = [
  "candle-core",
  "half",
@@ -780,7 +780,7 @@ dependencies = [
 [[package]]
 name = "candle-onnx"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?rev=2ba7171233842ebc52dce3ee73d168c5e948d80d#2ba7171233842ebc52dce3ee73d168c5e948d80d"
+source = "git+https://github.com/astorise/candle?rev=653ccb7735ba0f4642213b9dbcc22c4cc911f26f#653ccb7735ba0f4642213b9dbcc22c4cc911f26f"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -791,7 +791,7 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?rev=2ba7171233842ebc52dce3ee73d168c5e948d80d#2ba7171233842ebc52dce3ee73d168c5e948d80d"
+source = "git+https://github.com/astorise/candle?rev=653ccb7735ba0f4642213b9dbcc22c4cc911f26f#653ccb7735ba0f4642213b9dbcc22c4cc911f26f"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -809,7 +809,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?rev=2ba7171233842ebc52dce3ee73d168c5e948d80d#2ba7171233842ebc52dce3ee73d168c5e948d80d"
+source = "git+https://github.com/astorise/candle?rev=653ccb7735ba0f4642213b9dbcc22c4cc911f26f#653ccb7735ba0f4642213b9dbcc22c4cc911f26f"
 dependencies = [
  "ug",
  "ug-cuda",
