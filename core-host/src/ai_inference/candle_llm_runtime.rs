@@ -33,7 +33,9 @@ use super::modelopt_nvfp4;
 use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::samplers::{FsmCache, FsmLogitProcessor};
-use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
+use super::tensor_parallel_llama::{
+    LoraAdapterTensors, LoraLlama, TensorParallelCache, TensorParallelLlama,
+};
 use parallel_topology::{
     validate_parallel_topology, ClusterTopology, ParallelExecutionPlan, ParallelStrategy,
 };
@@ -1742,6 +1744,119 @@ impl CandleLlmRuntime {
         let mut out = String::new();
         self.generate_streaming(prompts, &mut |delta| out.push_str(delta))?;
         Ok(out.into_bytes())
+    }
+
+    pub(crate) fn generate_with_adapter(
+        &self,
+        prompts: &[&[u8]],
+        adapter_path: &Path,
+    ) -> Result<Vec<u8>, CandleLlmError> {
+        let mut out = String::new();
+        self.generate_with_adapter_streaming(prompts, adapter_path, &mut |delta| {
+            out.push_str(delta)
+        })?;
+        Ok(out.into_bytes())
+    }
+
+    fn generate_with_adapter_streaming(
+        &self,
+        prompts: &[&[u8]],
+        adapter_path: &Path,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), CandleLlmError> {
+        if prompts.is_empty() {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: "at least one U8 prompt tensor is required".to_owned(),
+            });
+        }
+        if prompts.len() > self.limits.max_batch_size {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "batch size {} exceeds max batch size {}",
+                    prompts.len(),
+                    self.limits.max_batch_size
+                ),
+            });
+        }
+        let parsed = prompts
+            .iter()
+            .map(|prompt| self.parse_request(prompt))
+            .collect::<Result<Vec<_>, _>>()?;
+        let request = parsed
+            .first()
+            .ok_or_else(|| CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: "at least one U8 prompt tensor is required".to_owned(),
+            })?;
+        let prompt_ids = self.encode_ids(&request.prompt)?;
+        if prompt_ids.is_empty() {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: "prompt produced no tokens to condition on".to_owned(),
+            });
+        }
+
+        let LoadedModel::Safetensors {
+            backend,
+            eos_tokens,
+        } = &*self.inner
+        else {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: self.alias.clone(),
+                path: self.root.clone(),
+                detail:
+                    "LoRA adapters are currently supported for safetensors Llama checkpoints only"
+                        .to_owned(),
+            });
+        };
+        let SingleDeviceBackend::Llama { config, .. } = backend else {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: self.alias.clone(),
+                path: self.root.clone(),
+                detail: "LoRA adapters are currently supported for Llama-family checkpoints only"
+                    .to_owned(),
+            });
+        };
+
+        let device = Device::Cpu;
+        let adapter = LoraAdapterTensors::load(adapter_path, &device).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: self.alias.clone(),
+                path: adapter_path.to_path_buf(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            }
+        })?;
+        let weight_paths = safetensors_paths(&self.alias, &self.root)?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &device) }
+            .map_err(|error| CandleLlmError::InvalidComponent {
+                alias: self.alias.clone(),
+                path: self.root.clone(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            })?;
+        let model = LoraLlama::load(vb, config, &adapter).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: self.alias.clone(),
+                path: adapter_path.to_path_buf(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            }
+        })?;
+        let mut cache =
+            TensorParallelCache::new(true, DType::F32, config, &device).map_err(|error| {
+                self.execution_error(format!("failed to build LoRA KV cache: {error}"))
+            })?;
+        self.decode_loop(
+            &prompt_ids,
+            request,
+            eos_tokens,
+            &device,
+            on_token,
+            |input, index_pos| model.forward(input, index_pos, &mut cache),
+        )
     }
 
     pub(crate) fn generate_speculative(

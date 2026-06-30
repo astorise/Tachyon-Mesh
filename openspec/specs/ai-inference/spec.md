@@ -122,9 +122,17 @@ The Mesh SHALL extend the `wit/ai` Wasm Component Model definitions so that an i
 #### Scenario: Guest requests an adapter that is locally available
 - **WHEN** a Wasm guest invokes the inference interface with an `adapter_id`
 - **AND** the corresponding `.safetensors` adapter exists in `system-faas-model-broker`
-- **THEN** the host loads the adapter weights and applies them to the foundation model's execution graph
+- **AND** the selected backend is a Llama-family safetensors checkpoint
+- **AND** the adapter uses PEFT LoRA tensor names ending in `lora_A.weight` and `lora_B.weight`
+- **THEN** the host loads the adapter weights through `candle-nn::LoraLinear` and applies them to matching attention/MLP projections in the foundation model's execution graph
 - **AND** the inference output reflects the adapter's behaviour
 - **AND** guests that omit `adapter_id` continue to run against the unmodified foundation model
+
+#### Scenario: Guest requests an adapter for an unsupported backend
+- **WHEN** a Wasm guest invokes the inference interface with an `adapter_id`
+- **AND** the selected backend is GGUF, a non-Llama architecture, Qwen 3.5 MoE, or a vendor accelerator backend
+- **THEN** the host rejects the call with a typed unsupported-adapter error
+- **AND** the host does not silently ignore the requested adapter
 
 ### Requirement: Candle engine hot-swaps adapter weights and bounds context-switching overhead
 The `wasi-nn-candle` execution engine SHALL dynamically inject and remove `.safetensors` adapter matrices during inference and SHALL bound the rate of adapter context-switching so that the cost of switching between adapters cannot dominate end-to-end latency.

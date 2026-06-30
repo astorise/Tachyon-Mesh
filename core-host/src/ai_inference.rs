@@ -249,11 +249,12 @@ trait BackendModel: Send + Sync {
     fn execute_with_adapter(
         &self,
         inputs: &[SharedInputTensor],
-        adapter_id: &str,
+        adapter: &ResolvedLoraAdapter,
     ) -> Result<Vec<u8>> {
         let _ = inputs;
         bail!(
-            "LoRA adapter `{adapter_id}` was resolved, but this backend does not support adapter injection"
+            "LoRA adapter `{}` was resolved, but this backend does not support adapter injection",
+            adapter.id
         )
     }
 
@@ -539,10 +540,7 @@ impl AiInferenceRuntime {
         prompt: &str,
         adapter_id: Option<&str>,
     ) -> Result<String, String> {
-        let adapter_id = adapter_id
-            .map(resolve_lora_adapter_path)
-            .transpose()?
-            .map(|adapter| adapter.id);
+        let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
         self.ensure_model_loaded(alias)?;
         // Clone the `Arc` out and drop the read lock before inference so a slow
         // forward pass never blocks lazy registration of other models.
@@ -563,7 +561,7 @@ impl AiInferenceRuntime {
             })?
             .infer(
                 Arc::clone(&model),
-                adapter_id,
+                adapter,
                 SharedInputTensor {
                     dimensions: vec![prompt.len() as u32],
                     ty: TensorType::U8,
@@ -619,9 +617,9 @@ impl AiInferenceRuntime {
     }
 }
 
+#[derive(Clone)]
 struct ResolvedLoraAdapter {
     id: String,
-    #[allow(dead_code)]
     path: PathBuf,
 }
 
@@ -686,10 +684,10 @@ impl AcceleratorScheduler {
     fn infer(
         &self,
         model: Arc<CandleModel>,
-        adapter_id: Option<String>,
+        adapter: Option<ResolvedLoraAdapter>,
         input: SharedInputTensor,
     ) -> Result<Vec<u8>, anyhow::Error> {
-        let response_rx = self.enqueue(model, adapter_id, input)?;
+        let response_rx = self.enqueue(model, adapter, input)?;
         response_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("AI inference response channel closed unexpectedly"))?
@@ -698,7 +696,7 @@ impl AcceleratorScheduler {
     fn enqueue(
         &self,
         model: Arc<CandleModel>,
-        adapter_id: Option<String>,
+        adapter: Option<ResolvedLoraAdapter>,
         input: SharedInputTensor,
     ) -> Result<mpsc::Receiver<Result<Vec<u8>, anyhow::Error>>, anyhow::Error> {
         let (response_tx, response_rx) = mpsc::channel();
@@ -711,7 +709,7 @@ impl AcceleratorScheduler {
             sequence,
             InferenceJob {
                 alias: model.alias.clone(),
-                adapter_id,
+                adapter,
                 model,
                 qos,
                 input,
@@ -836,7 +834,7 @@ fn queue_counter(metrics: &SchedulerMetrics, qos: RouteQos) -> &AtomicUsize {
 #[derive(Clone)]
 struct InferenceJob {
     alias: String,
-    adapter_id: Option<String>,
+    adapter: Option<ResolvedLoraAdapter>,
     model: Arc<CandleModel>,
     qos: RouteQos,
     input: SharedInputTensor,
@@ -892,7 +890,7 @@ impl ActiveInferenceSequence {
     fn batch_key(&self) -> InferenceBatchKey {
         InferenceBatchKey {
             alias: self.job.alias.clone(),
-            adapter_id: self.job.adapter_id.clone(),
+            adapter_id: self.job.adapter.as_ref().map(|adapter| adapter.id.clone()),
         }
     }
 
@@ -909,7 +907,7 @@ impl ActiveInferenceSequence {
     ) -> bool {
         self.phase == phase
             && self.job.alias == batch_key.alias
-            && self.job.adapter_id == batch_key.adapter_id
+            && self.job.adapter.as_ref().map(|adapter| &adapter.id) == batch_key.adapter_id.as_ref()
     }
 }
 
@@ -1066,7 +1064,7 @@ fn process_batch(
     batch: &[InferenceJob],
 ) -> Vec<Result<Vec<u8>, anyhow::Error>> {
     let model = Arc::clone(&batch[0].model);
-    let adapter_id = batch[0].adapter_id.as_deref();
+    let adapter = batch[0].adapter.as_ref();
     #[cfg(test)]
     if model.mock_latency > Duration::ZERO {
         thread::sleep(model.mock_latency);
@@ -1075,7 +1073,7 @@ fn process_batch(
         .iter()
         .map(|job| job.input.clone())
         .collect::<Vec<_>>();
-    match model.run_mock_batch(&inputs, adapter_id) {
+    match model.run_mock_batch(&inputs, adapter) {
         Ok(output) => batch.iter().map(|_| Ok(output.clone())).collect(),
         Err(error) => {
             let message = format!(
@@ -1448,12 +1446,31 @@ impl BackendModel for CandleBackendModel {
     fn execute_with_adapter(
         &self,
         inputs: &[SharedInputTensor],
-        adapter_id: &str,
+        adapter: &ResolvedLoraAdapter,
     ) -> Result<Vec<u8>> {
         match &self.kind {
             CandleBackendModelKind::Mock => self.execute(inputs),
-            _ => bail!(
-                "LoRA adapter `{adapter_id}` was resolved for model `{}`, but Tachyon has not wired candle-nn LoraLinear into this backend's transformer graph yet",
+            CandleBackendModelKind::TextGeneration { target, .. }
+            | CandleBackendModelKind::ModelOptNvfp4(target) => {
+                validate_u8_prompts(&self.source.alias, inputs)?;
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                target
+                    .generate_with_adapter(&prompts, &adapter.path)
+                    .map_err(|error| {
+                        anyhow!(
+                            "Candle LLM model `{}` failed with LoRA adapter `{}` at `{}`: {error}",
+                            self.source.alias,
+                            adapter.id,
+                            adapter.path.display()
+                        )
+                    })
+            }
+            CandleBackendModelKind::Qwen35Moe(_) | CandleBackendModelKind::Vendor(_) => bail!(
+                "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
+                adapter.id,
                 self.source.alias
             ),
         }
@@ -1607,10 +1624,10 @@ impl CandleModel {
     fn run_mock_batch(
         &self,
         inputs: &[SharedInputTensor],
-        adapter_id: Option<&str>,
+        adapter: Option<&ResolvedLoraAdapter>,
     ) -> Result<Vec<u8>> {
-        match adapter_id {
-            Some(adapter_id) => self.backend_model.execute_with_adapter(inputs, adapter_id),
+        match adapter {
+            Some(adapter) => self.backend_model.execute_with_adapter(inputs, adapter),
             None => self.backend_model.execute(inputs),
         }
     }
@@ -2403,8 +2420,8 @@ mod tests {
     }
 
     #[test]
-    fn real_candle_llm_runtime_rejects_resolved_lora_until_graph_injection_is_wired() {
-        let model_dir = unique_candle_llm_dir("real-lora-reject");
+    fn real_candle_llm_runtime_applies_resolved_lora_adapter() {
+        let model_dir = unique_candle_llm_dir("real-lora-apply");
         candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
             .expect("fixture should be written");
         let adapter_root = std::env::temp_dir().join(format!(
@@ -2416,20 +2433,19 @@ mod tests {
         ));
         let adapter_dir = adapter_root.join("adapters");
         fs::create_dir_all(&adapter_dir).expect("adapter dir should be created");
-        fs::write(adapter_dir.join("tenant-a.safetensors"), b"mock-lora")
+        write_tiny_lora_adapter(&adapter_dir.join("tenant-a.safetensors"), 0.25)
             .expect("adapter should be written");
         std::env::set_var(MODEL_BROKER_DIR_ENV, &adapter_root);
 
         let runtime =
             AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
                 .expect("runtime should load real Candle LLM fixture");
-        let error = runtime
+        let output = runtime
             .compute_component_prompt_with_adapter("tiny", "hello", Some("tenant-a"))
-            .expect_err("real backend must not silently ignore a resolved adapter");
+            .expect("real backend should apply the resolved adapter");
 
-        assert!(error.contains("tenant-a"));
-        assert!(error.contains("LoraLinear"));
-        assert!(error.contains("transformer graph"));
+        assert!(!output.is_empty());
+        assert_ne!(output, MOCK_INFERENCE_RESPONSE);
         std::env::remove_var(MODEL_BROKER_DIR_ENV);
         let _ = fs::remove_dir_all(adapter_root);
         let _ = fs::remove_dir_all(model_dir);
@@ -2823,7 +2839,7 @@ mod tests {
             phase: InferenceSequencePhase::Decode,
             job: InferenceJob {
                 alias: batch_model.alias.clone(),
-                adapter_id: None,
+                adapter: None,
                 model: Arc::clone(&batch_model),
                 qos: batch_model.qos,
                 input: SharedInputTensor {
@@ -2839,7 +2855,7 @@ mod tests {
             1,
             InferenceJob {
                 alias: realtime_model.alias.clone(),
-                adapter_id: None,
+                adapter: None,
                 model: Arc::clone(&realtime_model),
                 qos: realtime_model.qos,
                 input: SharedInputTensor {
@@ -3319,6 +3335,22 @@ mod tests {
                 .expect("time should be valid")
                 .as_nanos()
         ))
+    }
+
+    fn write_tiny_lora_adapter(path: &std::path::Path, value: f32) -> anyhow::Result<()> {
+        let rank = 2usize;
+        let hidden = candle_llm_runtime::FIXTURE_HIDDEN_SIZE;
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.lora_A.weight".to_owned(),
+            CandleTensor::from_vec(vec![value; rank * hidden], (rank, hidden), &Device::Cpu)?,
+        );
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.lora_B.weight".to_owned(),
+            CandleTensor::from_vec(vec![value; hidden * rank], (hidden, rank), &Device::Cpu)?,
+        );
+        candle_core::safetensors::save(&tensors, path)?;
+        Ok(())
     }
 
     #[test]

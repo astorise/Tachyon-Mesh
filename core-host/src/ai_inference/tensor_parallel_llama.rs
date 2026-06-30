@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::f32::consts::PI;
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
-use candle_nn::{Module, VarBuilder};
+use candle_nn::{linear_no_bias as candle_linear_no_bias, Linear as CandleLinear};
+use candle_nn::{LoraLinear, Module, VarBuilder};
 use candle_transformers::models::llama::{Config, Llama3RopeConfig, Llama3RopeType};
 use candle_transformers::models::with_tracing::{
     linear_no_bias as linear, Embedding, Linear, RmsNorm,
@@ -28,6 +29,82 @@ use candle_transformers::utils::{build_causal_mask, repeat_kv};
 #[cfg(feature = "candle-cuda")]
 use super::parallel::NcclShardGroup;
 use super::parallel::{split_for_row_parallel, ColumnParallelLinear, RowParallelLinear};
+
+pub(crate) struct LoraAdapterTensors {
+    tensors: HashMap<String, Tensor>,
+    alpha: f64,
+}
+
+impl LoraAdapterTensors {
+    pub(crate) fn load(path: &std::path::Path, device: &Device) -> CandleResult<Self> {
+        let tensors = candle_core::safetensors::load(path, device)?;
+        Ok(Self {
+            tensors,
+            alpha: 0.0,
+        })
+    }
+
+    fn pair_for(&self, prefix: &str) -> Option<(Tensor, Tensor, usize, f64)> {
+        let a_suffix = format!("{prefix}.lora_A.weight");
+        let b_suffix = format!("{prefix}.lora_B.weight");
+        let a = self
+            .tensors
+            .iter()
+            .find(|(name, _)| *name == &a_suffix || name.ends_with(&format!(".{a_suffix}")))
+            .map(|(_, tensor)| tensor.clone())?;
+        let b = self
+            .tensors
+            .iter()
+            .find(|(name, _)| *name == &b_suffix || name.ends_with(&format!(".{b_suffix}")))
+            .map(|(_, tensor)| tensor.clone())?;
+        let rank = a.dim(0).ok()?;
+        let alpha = if self.alpha > 0.0 {
+            self.alpha
+        } else {
+            rank as f64
+        };
+        Some((a, b, rank, alpha))
+    }
+}
+
+enum AdapterLinear {
+    Base(CandleLinear),
+    Lora(LoraLinear),
+}
+
+impl AdapterLinear {
+    fn load(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+        adapter: &LoraAdapterTensors,
+        prefix: &str,
+    ) -> CandleResult<Self> {
+        let base = candle_linear_no_bias(in_dim, out_dim, vb)?;
+        let Some((lora_a, lora_b, rank, alpha)) = adapter.pair_for(prefix) else {
+            return Ok(Self::Base(base));
+        };
+        let tensors = HashMap::from([
+            ("lora_A.weight".to_owned(), lora_a),
+            ("lora_B.weight".to_owned(), lora_b),
+        ]);
+        let device = base.weight().device().clone();
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let mut lora = LoraLinear::new(base);
+        lora.load_adapter("active", vb, rank, alpha)?;
+        lora.set_active_adapter(Some("active"))?;
+        Ok(Self::Lora(lora))
+    }
+}
+
+impl Module for AdapterLinear {
+    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Base(linear) => linear.forward(xs),
+            Self::Lora(linear) => linear.forward(xs),
+        }
+    }
+}
 
 /// External KV cache + precomputed rotary tables for [`TensorParallelLlama`].
 /// Functionally identical to `candle_transformers::models::llama::Cache`,
@@ -400,6 +477,292 @@ impl TensorParallelLlama {
                 let block = block.with_nccl_group(nccl_group.clone());
                 Ok(block)
             })
+            .collect::<CandleResult<Vec<_>>>()?;
+        Ok(Self {
+            wte,
+            blocks,
+            ln_f,
+            lm_head,
+        })
+    }
+
+    pub(crate) fn forward(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        cache: &mut TensorParallelCache,
+    ) -> CandleResult<Tensor> {
+        let (_b_sz, seq_len) = x.dims2()?;
+        let mut x = self.wte.forward(x)?;
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            x = block.forward(&x, index_pos, block_idx, cache)?;
+        }
+        let x = self.ln_f.forward(&x)?;
+        let x = x.i((.., seq_len - 1, ..))?.contiguous()?;
+        self.lm_head.forward(&x)?.to_dtype(DType::F32)
+    }
+}
+
+struct LoraAttention {
+    q_proj: AdapterLinear,
+    k_proj: AdapterLinear,
+    v_proj: AdapterLinear,
+    o_proj: AdapterLinear,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    max_position_embeddings: usize,
+}
+
+impl LoraAttention {
+    fn load(
+        vb: VarBuilder,
+        cfg: &Config,
+        adapter: &LoraAdapterTensors,
+        prefix: &str,
+    ) -> CandleResult<Self> {
+        let size_in = cfg.hidden_size;
+        let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
+        let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
+        Ok(Self {
+            q_proj: AdapterLinear::load(
+                size_in,
+                size_q,
+                vb.pp("q_proj"),
+                adapter,
+                &format!("{prefix}.q_proj"),
+            )?,
+            k_proj: AdapterLinear::load(
+                size_in,
+                size_kv,
+                vb.pp("k_proj"),
+                adapter,
+                &format!("{prefix}.k_proj"),
+            )?,
+            v_proj: AdapterLinear::load(
+                size_in,
+                size_kv,
+                vb.pp("v_proj"),
+                adapter,
+                &format!("{prefix}.v_proj"),
+            )?,
+            o_proj: AdapterLinear::load(
+                size_q,
+                size_in,
+                vb.pp("o_proj"),
+                adapter,
+                &format!("{prefix}.o_proj"),
+            )?,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            max_position_embeddings: cfg.max_position_embeddings,
+        })
+    }
+
+    fn apply_rotary_emb(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        cache: &TensorParallelCache,
+    ) -> CandleResult<Tensor> {
+        let (_b_sz, _, seq_len, _hidden_size) = x.dims4()?;
+        let cos = cache.cos.narrow(0, index_pos, seq_len)?;
+        let sin = cache.sin.narrow(0, index_pos, seq_len)?;
+        candle_nn::rotary_emb::rope(x, &cos, &sin)
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut TensorParallelCache,
+    ) -> CandleResult<Tensor> {
+        let (b_sz, seq_len, hidden_size) = x.dims3()?;
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        let q = q
+            .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = k
+            .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let mut v = v
+            .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        let q = self.apply_rotary_emb(&q, index_pos, cache)?;
+        let mut k = self.apply_rotary_emb(&k, index_pos, cache)?;
+
+        if cache.use_kv_cache {
+            if let Some((cache_k, cache_v)) = &cache.kvs[block_idx] {
+                k = Tensor::cat(&[cache_k, &k], 2)?.contiguous()?;
+                v = Tensor::cat(&[cache_v, &v], 2)?.contiguous()?;
+                let k_seq_len = k.dims()[1];
+                if k_seq_len > self.max_position_embeddings {
+                    k = k
+                        .narrow(
+                            D::Minus1,
+                            k_seq_len - self.max_position_embeddings,
+                            self.max_position_embeddings,
+                        )?
+                        .contiguous()?
+                }
+                let v_seq_len = v.dims()[1];
+                if v_seq_len > 2 * self.max_position_embeddings {
+                    v = v
+                        .narrow(
+                            D::Minus1,
+                            v_seq_len - self.max_position_embeddings,
+                            self.max_position_embeddings,
+                        )?
+                        .contiguous()?
+                }
+            }
+            cache.kvs[block_idx] = Some((k.clone(), v.clone()))
+        }
+
+        let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
+        let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
+
+        let in_dtype = q.dtype();
+        let q = q.to_dtype(DType::F32)?;
+        let k = k.to_dtype(DType::F32)?;
+        let v = v.to_dtype(DType::F32)?;
+        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+        let att = if seq_len == 1 {
+            att
+        } else {
+            let mask = cache.mask(seq_len, index_pos)?.broadcast_as(att.shape())?;
+            masked_fill(&att, &mask, f32::NEG_INFINITY)?
+        };
+        let att = candle_nn::ops::softmax_last_dim(&att)?;
+        let y = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
+        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
+        self.o_proj.forward(&y)
+    }
+}
+
+struct LoraMlp {
+    gate: AdapterLinear,
+    up: AdapterLinear,
+    down: AdapterLinear,
+}
+
+impl LoraMlp {
+    fn load(
+        vb: VarBuilder,
+        cfg: &Config,
+        adapter: &LoraAdapterTensors,
+        prefix: &str,
+    ) -> CandleResult<Self> {
+        Ok(Self {
+            gate: AdapterLinear::load(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                vb.pp("gate_proj"),
+                adapter,
+                &format!("{prefix}.gate_proj"),
+            )?,
+            up: AdapterLinear::load(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                vb.pp("up_proj"),
+                adapter,
+                &format!("{prefix}.up_proj"),
+            )?,
+            down: AdapterLinear::load(
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                vb.pp("down_proj"),
+                adapter,
+                &format!("{prefix}.down_proj"),
+            )?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let lhs = candle_nn::ops::silu(&self.gate.forward(x)?)?;
+        let rhs = self.up.forward(x)?;
+        self.down.forward(&(lhs * rhs)?)
+    }
+}
+
+struct LoraBlock {
+    rms_1: RmsNorm,
+    attn: LoraAttention,
+    rms_2: RmsNorm,
+    mlp: LoraMlp,
+}
+
+impl LoraBlock {
+    fn load(
+        vb: VarBuilder,
+        cfg: &Config,
+        adapter: &LoraAdapterTensors,
+        layer_idx: usize,
+    ) -> CandleResult<Self> {
+        let layer_prefix = format!("model.layers.{layer_idx}");
+        Ok(Self {
+            attn: LoraAttention::load(
+                vb.pp("self_attn"),
+                cfg,
+                adapter,
+                &format!("{layer_prefix}.self_attn"),
+            )?,
+            mlp: LoraMlp::load(vb.pp("mlp"), cfg, adapter, &format!("{layer_prefix}.mlp"))?,
+            rms_1: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
+            rms_2: RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_attention_layernorm"),
+            )?,
+        })
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut TensorParallelCache,
+    ) -> CandleResult<Tensor> {
+        let residual = x;
+        let x = self.rms_1.forward(x)?;
+        let x = (self.attn.forward(&x, index_pos, block_idx, cache)? + residual)?;
+        let residual = &x;
+        let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
+        Ok(x)
+    }
+}
+
+pub(crate) struct LoraLlama {
+    wte: Embedding,
+    blocks: Vec<LoraBlock>,
+    ln_f: RmsNorm,
+    lm_head: Linear,
+}
+
+impl LoraLlama {
+    pub(crate) fn load(
+        vb: VarBuilder,
+        cfg: &Config,
+        adapter: &LoraAdapterTensors,
+    ) -> CandleResult<Self> {
+        let wte = Embedding::new(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        let lm_head = if cfg.tie_word_embeddings {
+            Linear::from_weights(wte.embeddings().clone(), None)
+        } else {
+            linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        };
+        let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        let blocks = (0..cfg.num_hidden_layers)
+            .map(|i| LoraBlock::load(vb.pp(format!("model.layers.{i}")), cfg, adapter, i))
             .collect::<CandleResult<Vec<_>>>()?;
         Ok(Self {
             wte,
