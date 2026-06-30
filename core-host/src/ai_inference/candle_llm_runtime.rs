@@ -304,6 +304,13 @@ impl ModelArchitecture {
     }
 }
 
+fn is_multimodal_hf_model_type(model_type: &str) -> bool {
+    matches!(
+        model_type,
+        "qwen_vl" | "qwen2_vl" | "qwen2_5_vl" | "qwen3_vl" | "gemma3_vl" | "gemma3_vision"
+    )
+}
+
 /// A loaded, ready-to-run Llama-family model. Weights are mmapped (safetensors)
 /// or read (GGUF) from the model directory — never copied into the Tachyon
 /// artifact. Shared behind an `Arc` so the runtime stays cheap to clone.
@@ -2903,6 +2910,15 @@ fn inspect_hf_architecture(
     } else {
         probe.model_type.as_str()
     };
+    if is_multimodal_hf_model_type(declared) || probe.vision_config.is_some() {
+        return Err(CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: format!(
+                "multimodal vision-language checkpoints (`model_type` = `{declared}`, optional `vision_config`) are not supported by the text-only Candle backend; Tachyon currently has no image preprocessing, vision encoder, multimodal projector, or image request tensor path"
+            ),
+        });
+    }
     let architecture = ModelArchitecture::from_hf_model_type(declared).ok_or_else(|| {
         CandleLlmError::UnsupportedModel {
             alias: alias.to_owned(),
@@ -2912,13 +2928,6 @@ fn inspect_hf_architecture(
             ),
         }
     })?;
-    if architecture == ModelArchitecture::Gemma3 && probe.vision_config.is_some() {
-        return Err(CandleLlmError::UnsupportedModel {
-            alias: alias.to_owned(),
-            path: root.to_path_buf(),
-            detail: "Gemma3 multimodal checkpoints with a `vision_config` are not supported by the text-only backend".to_owned(),
-        });
-    }
     Ok(architecture)
 }
 
@@ -4066,6 +4075,19 @@ mod tests {
     }
 
     #[test]
+    fn architecture_registry_recognizes_multimodal_hf_aliases_as_unsupported() {
+        for model_type in ["qwen_vl", "qwen2_vl", "qwen2_5_vl", "qwen3_vl"] {
+            assert!(
+                is_multimodal_hf_model_type(model_type),
+                "{model_type} must stay out of the text-only architecture registry"
+            );
+            assert_eq!(ModelArchitecture::from_hf_model_type(model_type), None);
+        }
+        assert!(!is_multimodal_hf_model_type("gemma3"));
+        assert!(is_multimodal_hf_model_type("gemma3_vl"));
+    }
+
+    #[test]
     fn architecture_registry_keeps_format_support_explicit() {
         assert!(ModelArchitecture::Llama.supports_format(ModelFormat::Safetensors));
         assert!(ModelArchitecture::Llama.supports_format(ModelFormat::Gguf));
@@ -4331,6 +4353,39 @@ mod tests {
             CandleLlmError::UnsupportedModel { detail, .. } => {
                 assert!(detail.contains("multimodal"));
                 assert!(detail.contains("vision_config"));
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn qwen_vl_config_is_rejected_before_weight_loading() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("tachyon-qwen-vl-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            dir.join(CONFIG_JSON),
+            serde_json::json!({
+                "model_type": "qwen2_5_vl",
+                "text_config": {"model_type": "qwen2"},
+                "vision_config": {"model_type": "qwen2_5_vl_vision"}
+            })
+            .to_string(),
+        )
+        .expect("config");
+        let error = inspect_model_architecture("qwen-vl", &dir, ModelFormat::Safetensors)
+            .expect_err("multimodal Qwen-VL must be refused");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(detail.contains("multimodal"));
+                assert!(detail.contains("qwen2_5_vl"));
+                assert!(detail.contains("vision encoder"));
+                assert!(detail.contains("image request tensor"));
             }
             other => panic!("expected UnsupportedModel, got {other:?}"),
         }
