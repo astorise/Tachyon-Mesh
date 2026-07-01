@@ -254,98 +254,7 @@ pub(crate) async fn admin_metrics_handler(
 /// format accepted by `POST /admin/manifest`. LLM agents and MCP clients can
 /// fetch this schema to validate manifest payloads before submission.
 pub(crate) async fn admin_manifest_schema_handler() -> axum::Json<serde_json::Value> {
-    axum::Json(json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "IntegrityConfig",
-        "description": "Tachyon Mesh sealed manifest configuration accepted by POST /admin/manifest.",
-        "type": "object",
-        "required": ["hostAddress", "maxStdoutBytes", "guestFuelBudget", "guestMemoryLimitBytes", "resourceLimitResponse", "routes"],
-        "properties": {
-            "hostAddress":               { "type": "string", "description": "Bind address for the core-host HTTP server (e.g. 0.0.0.0:8080)." },
-            "advertiseIp":               { "type": ["string", "null"] },
-            "tlsAddress":                { "type": ["string", "null"] },
-            "maxStdoutBytes":            { "type": "integer", "minimum": 1 },
-            "guestFuelBudget":           { "type": "integer", "minimum": 1, "description": "Wasmtime fuel budget per guest invocation." },
-            "guestMemoryLimitBytes":     { "type": "integer", "minimum": 1 },
-            "resourceLimitResponse":     { "type": "string" },
-            "telemetrySampleRate":       { "type": "number", "minimum": 0, "maximum": 1 },
-            "configVersion":             { "type": "integer", "minimum": 0 },
-            "enrollmentEndpoint":        { "type": ["string", "null"] },
-            "cloudSyncEndpoint":         { "type": ["string", "null"] },
-            "instancePoolMaxMemoryBytes":{ "type": ["integer", "null"] },
-            "trustedSigners":            { "type": "array", "items": { "type": "string" } },
-            "routes": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["path", "version"],
-                    "properties": {
-                        "path":               { "type": "string", "description": "HTTP path prefix for this route (e.g. /api/my-function)." },
-                        "role":               { "type": "string", "enum": ["user", "system"] },
-                        "name":               { "type": "string" },
-                        "version":            { "type": "string", "description": "SemVer version string." },
-                        "dependencies":       { "type": "object", "additionalProperties": { "type": "string" } },
-                        "requiresCredentials":{ "type": "array", "items": { "type": "string" } },
-                        "middleware":         { "type": ["string", "null"] },
-                        "env":               { "type": "object", "additionalProperties": { "type": "string" } },
-                        "allowedSecrets":     { "type": "array", "items": { "type": "string" } },
-                        "minInstances":       { "type": "integer", "minimum": 0 },
-                        "maxConcurrency":     { "type": "integer", "minimum": 1 },
-                        "scopes": {
-                            "type": ["object", "string", "null"],
-                            "description": "Per-deployment WIT import scopes. Use `\"allow-all\"` to grant everything (default when omitted) or an object with category keys (`secrets`, `kv`, `bridge`, `vector`, `training`, `routing`, `http`, `outbox`, `storage`, `graph`) mapping to glob pattern arrays."
-                        },
-                        "syncToCloud":        { "type": "boolean" },
-                        "requiresTee":        { "type": "boolean" },
-                        "allowOverflow":      { "type": "boolean" },
-                        "shadowTarget":       { "type": ["string", "null"] },
-                        "adapterId":          { "type": ["string", "null"] },
-                        "resiliency": {
-                            "type": ["object", "null"],
-                            "properties": {
-                                "timeoutMs":   { "type": ["integer", "null"] },
-                                "retryPolicy": {
-                                    "type": ["object", "null"],
-                                    "properties": {
-                                        "maxRetries": { "type": "integer", "minimum": 0 },
-                                        "retryOn":    { "type": "array", "items": { "type": "integer" } }
-                                    }
-                                }
-                            }
-                        },
-                        "resourcePolicy": {
-                            "type": ["object", "null"],
-                            "properties": {
-                                "minRamGb":          { "type": ["integer", "null"], "description": "Minimum host RAM required in GiB." },
-                                "minRamMb":          { "type": ["integer", "null"], "description": "Minimum host RAM required in MiB (takes precedence over minRamGb when both are set)." },
-                                "minVramMb":         { "type": ["integer", "null"], "description": "Minimum GPU VRAM required in MiB. Alias for vram_mb." },
-                                "vramMb":            { "type": ["integer", "null"], "description": "GPU VRAM reservation for the FaaS workload in MiB. The scheduler will only place the function on nodes where free VRAM ≥ vramMb." },
-                                "gpuAffinity":       { "type": ["string", "null"], "description": "Optional GPU device affinity selector (e.g. 'cuda:0', 'hip:1', or a model substring like 'RTX 4090'). When set, the scheduler restricts placement to matching GPUs." },
-                                "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"], "description": "How the host handles admission when the resource constraints cannot be met." }
-                            }
-                        },
-                        "canary": {
-                            "type": ["object", "null"],
-                            "properties": {
-                                "nextVersion":  { "type": "string" },
-                                "stepWeight":   { "type": "integer", "minimum": 1, "maximum": 100 },
-                                "intervalSecs": { "type": "integer", "minimum": 1 },
-                                "maxErrorRate": { "type": "number", "minimum": 0, "maximum": 1 }
-                            },
-                            "required": ["nextVersion", "maxErrorRate"]
-                        }
-                    }
-                }
-            },
-            "requireScopes": {
-                "type": "boolean",
-                "description": "When true, manifests whose `scopes` block is absent or resolves to `allow-all` are rejected at submission. Default false — migrate routes to explicit scopes first."
-            },
-            "batchTargets": { "type": "array", "items": { "type": "object" } },
-            "resources":    { "type": "object" },
-            "kvCaches":     { "type": "array", "items": { "type": "object" } }
-        }
-    }))
+    axum::Json(integrity_config_schema())
 }
 
 /// Serves the OpenAPI 3.1 JSON document generated from the compile-time `ApiDoc`.
@@ -360,63 +269,86 @@ pub(crate) async fn admin_openapi_schema_handler() -> impl IntoResponse {
 
 /// Serves a JSON Schema describing the `integrity.lock` file format.
 pub(crate) async fn admin_integrity_lock_schema_handler() -> impl IntoResponse {
-    let schema = json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "IntegrityLock",
-        "description": "Tachyon Mesh sealed integrity lock file (`integrity.lock`). Produced by `POST /admin/manifest` and validated before every WASM guest invocation.",
-        "type": "object",
-        "required": ["configVersion", "hostAddress", "routes"],
-        "properties": {
-            "configVersion":          { "type": "integer", "minimum": 0, "description": "Monotonically increasing version counter incremented on each successful seal." },
-            "hostAddress":            { "type": "string", "description": "Bind address of the core-host HTTP server." },
-            "advertiseIp":            { "type": ["string", "null"] },
-            "tlsAddress":             { "type": ["string", "null"] },
-            "maxStdoutBytes":         { "type": "integer", "minimum": 1 },
-            "guestFuelBudget":        { "type": "integer", "minimum": 1 },
-            "guestMemoryLimitBytes":  { "type": "integer", "minimum": 1 },
-            "resourceLimitResponse":  { "type": "string" },
-            "telemetrySampleRate":    { "type": "number", "minimum": 0, "maximum": 1 },
-            "enrollmentEndpoint":     { "type": ["string", "null"] },
-            "routes": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["path", "version"],
-                    "properties": {
-                        "path":     { "type": "string" },
-                        "version":  { "type": "string" },
-                        "name":     { "type": "string" },
-                        "role":     { "type": "string", "enum": ["user", "system"] },
-                        "resourcePolicy": {
-                            "type": ["object", "null"],
-                            "properties": {
-                                "minRamMb":    { "type": ["integer", "null"] },
-                                "minVramMb":   { "type": ["integer", "null"] },
-                                "vramMb":      { "type": ["integer", "null"], "description": "GPU VRAM reservation in MiB." },
-                                "gpuAffinity": { "type": ["string", "null"], "description": "GPU device affinity selector." },
-                                "admissionStrategy": { "type": "string", "enum": ["fail_fast", "mesh_retry"] }
-                            }
-                        },
-                        "canary": {
-                            "type": ["object", "null"],
-                            "properties": {
-                                "nextVersion":  { "type": "string" },
-                                "stepWeight":   { "type": "integer", "minimum": 1, "maximum": 100 },
-                                "intervalSecs": { "type": "integer", "minimum": 1 },
-                                "maxErrorRate": { "type": "number", "minimum": 0, "maximum": 1 }
-                            }
-                        }
-                    }
-                }
-            },
-            "resources": { "type": "object", "additionalProperties": { "type": "object" } }
-        }
-    });
+    let schema = integrity_manifest_schema();
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         schema.to_string(),
     )
+}
+
+fn integrity_config_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(IntegrityConfig))
+        .expect("IntegrityConfig JSON Schema should serialize")
+}
+
+fn integrity_manifest_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(IntegrityManifest))
+        .expect("IntegrityManifest JSON Schema should serialize")
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_schema_uses_integrity_config_field_names() {
+        let schema = integrity_config_schema();
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema root should expose properties");
+
+        assert!(properties.contains_key("host_address"));
+        assert!(properties.contains_key("max_stdout_bytes"));
+        assert!(properties.contains_key("layer4"));
+        assert!(properties.contains_key("enrollment"));
+        assert!(properties.contains_key("tee_backend"));
+        assert!(properties.contains_key("asset_versions"));
+        assert!(!properties.contains_key("hostAddress"));
+        assert!(!properties.contains_key("maxStdoutBytes"));
+    }
+
+    #[test]
+    fn manifest_schema_covers_route_nested_config() {
+        let schema = integrity_config_schema();
+        let text = schema.to_string();
+
+        for field in [
+            "\"targets\"",
+            "\"models\"",
+            "\"hardware_strategy\"",
+            "\"distribution_mode\"",
+            "\"paged_attention\"",
+            "\"cuda_graph_decode\"",
+            "\"flashinfer_attention\"",
+            "\"prefill_chunk_tokens\"",
+            "\"speculative_draft_model_path\"",
+            "\"volumes\"",
+            "\"domains\"",
+            "\"runtime\"",
+            "\"concurrency\"",
+            "\"distributed_rate_limit\"",
+            "\"metrics\"",
+        ] {
+            assert!(text.contains(field), "schema should include {field}");
+        }
+    }
+
+    #[test]
+    fn integrity_lock_schema_uses_signed_manifest_field_names() {
+        let schema = integrity_manifest_schema();
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema root should expose properties");
+
+        assert!(properties.contains_key("config_payload"));
+        assert!(properties.contains_key("public_key"));
+        assert!(properties.contains_key("signature"));
+        assert!(!properties.contains_key("configPayload"));
+        assert!(!properties.contains_key("hostAddress"));
+    }
 }
 
 /// Serves the Swagger UI HTML pointing at `/admin/schema/openapi.json`.

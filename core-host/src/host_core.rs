@@ -68,10 +68,11 @@ pub(crate) use hyper_util::{
 };
 pub(crate) use rand::RngExt;
 pub(crate) use reqwest::Client;
+pub(crate) use schemars::JsonSchema;
 pub(crate) use semver::{Version, VersionReq};
 pub(crate) use serde::Deserialize;
 pub(crate) use serde::Serialize;
-pub(crate) use serde_json::{json, Map, Value};
+pub(crate) use serde_json::{Map, Value};
 pub(crate) use sha2::{Digest, Sha256};
 #[cfg(unix)]
 pub(crate) use std::os::unix::fs::PermissionsExt;

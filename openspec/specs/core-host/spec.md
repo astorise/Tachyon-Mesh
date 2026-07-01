@@ -4,31 +4,31 @@
 Core Tachyon Mesh host runtime — manifest schema exposure, routing, and admin API surface.
 ## Requirements
 ### Requirement: Manifest schema generation MUST be supported
-The core-host SHALL add the `schemars` crate to `core-host/Cargo.toml`, derive `JsonSchema` on `Manifest` and all its composite types (`FunctionManifest`, `ResourceLimit`, etc.), expose `GET /admin/schema/manifest`, and actively route `POST /admin/manifest/dryrun` to the `system-faas-config-api` component rather than evaluating dry runs natively by the host.
+The core-host SHALL add the `schemars` crate to `core-host/Cargo.toml`, derive `JsonSchema` on `IntegrityConfig` and every composite type reachable from it, and expose `GET /admin/schema/manifest` from `schemars::schema_for!(IntegrityConfig)`. The generated schema SHALL use the same serde field names accepted by `POST /admin/manifest`, including snake_case fields such as `host_address`, `max_stdout_bytes`, `resource_policy`, and `requires_tee`.
 
 ```rust
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug)]
-pub struct Manifest {
-    pub api_version: String,
-    pub kind: String,
-    pub metadata: Metadata,
-    pub spec: ManifestSpec,
+pub struct IntegrityConfig {
+    pub host_address: String,
+    pub max_stdout_bytes: usize,
+    pub routes: Vec<IntegrityRoute>,
 }
 ```
 
 ```rust
 // In router definition
-let schema = schemars::schema_for!(Manifest);
+let schema = schemars::schema_for!(IntegrityConfig);
 serde_json::to_string(&schema)
 ```
 
-#### Scenario: Manifest schema and dry-run routes are available
+#### Scenario: Manifest schema matches accepted manifest payloads
 - **WHEN** an operator requests `GET /admin/schema/manifest`
-- **THEN** core-host returns the generated manifest JSON Schema
-- **AND** requests to `POST /admin/manifest/dryrun` are routed to `system-faas-config-api`
+- **THEN** core-host returns the generated `IntegrityConfig` JSON Schema
+- **AND** the schema exposes snake_case properties matching serde deserialization
+- **AND** it includes nested route configuration such as `targets`, `models`, `hardware_strategy`, `volumes`, `runtime`, `concurrency`, `distributed_rate_limit`, and `canary.metrics`
 
 ### Requirement: The host provides an incremental body-flush streaming transport
 
@@ -100,11 +100,12 @@ The `ApiDoc` struct SHALL declare `#[utoipa::path]` stubs for all admin routes i
 - **THEN** it contains at least 35 operations covering the core admin API surface
 
 ### Requirement: `GET /admin/schema/integrity-lock` MUST return a JSON Schema for the lock file
-A new endpoint `GET /admin/schema/integrity-lock` SHALL return a JSON Schema (Draft-07) document describing the `integrity.lock` file format including route entries, `resourcePolicy` (with `vramMb`, `gpuAffinity`), and canary config sub-schemas.
+A new endpoint `GET /admin/schema/integrity-lock` SHALL return a JSON Schema document generated from the signed `IntegrityManifest` wrapper used on disk by `integrity.lock`. The schema SHALL expose `config_payload`, `public_key`, and `signature` at the top level. The runtime manifest payload schema remains available separately through `GET /admin/schema/manifest`.
 
 #### Scenario: Agent fetches integrity lock schema
 - **WHEN** an agent calls `GET /admin/schema/integrity-lock`
-- **THEN** the response is JSON with `$schema`, `title: "IntegrityLock"`, and a `routes` array property
+- **THEN** the response is JSON with top-level `config_payload`, `public_key`, and `signature` properties
+- **AND** it does not document camelCase runtime fields such as `hostAddress`
 
 ### Requirement: core-host MUST expose a zero-copy layer-wise inference WIT contract
 The project SHALL define `wit/ai/inference.wit` in the existing `tachyon:mesh@1.1.0` WIT package and SHALL expose a `layer-execution` interface with opaque `tensor-handle` values so Wasm guests can sequence model layers without copying intermediate tensors through linear memory.

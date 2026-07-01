@@ -601,20 +601,22 @@ impl hyper::body::Body for GuestStreamingBody {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RouteRole {
     User,
     System,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct HeaderMatch {
     pub(crate) name: String,
     pub(crate) value: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct RetryPolicy {
     #[serde(default)]
     pub(crate) max_retries: u32,
@@ -622,7 +624,7 @@ pub(crate) struct RetryPolicy {
     pub(crate) retry_on: Vec<u16>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct ResiliencyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeout_ms: Option<u64>,
@@ -630,7 +632,7 @@ pub(crate) struct ResiliencyConfig {
     pub(crate) retry_policy: Option<RetryPolicy>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum FaaSRuntime {
     Wasm {
@@ -654,7 +656,7 @@ pub(crate) fn default_microvm_memory_mb() -> u32 {
     256
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct RouteTarget {
     pub(crate) module: String,
     #[serde(default)]

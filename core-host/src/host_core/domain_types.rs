@@ -120,7 +120,7 @@ pub(crate) static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInfere
 
 // ── Canary deployment types ───────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg(feature = "experimental")]
 pub(crate) enum DeploymentStrategy {
@@ -129,7 +129,7 @@ pub(crate) enum DeploymentStrategy {
     Canary,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct CanaryConfig {
     /// Module name of the next version to roll traffic to.
     pub(crate) next_version: String,
@@ -145,7 +145,7 @@ pub(crate) struct CanaryConfig {
     pub(crate) metrics: Vec<CanaryMetricThreshold>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct CanaryMetricThreshold {
     pub(crate) name: String,
     pub(crate) threshold: String,
@@ -272,7 +272,7 @@ pub(crate) struct RouteVolumeLeaseGuard {
 }
 
 #[cfg_attr(not(any(unix, test)), allow(dead_code))]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct IntegrityManifest {
     pub(crate) config_payload: String,
     pub(crate) public_key: String,
@@ -317,7 +317,7 @@ pub(crate) struct AsyncLogEntry {
     pub(crate) structured_fields: Option<Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum VolumeType {
     Host,
@@ -331,13 +331,15 @@ impl VolumeType {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum VolumeEvictionPolicy {
     Hibernate,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
+)]
 pub(crate) enum RouteQos {
     #[serde(rename = "RealTime", alias = "realtime", alias = "real-time")]
     RealTime,
@@ -363,7 +365,9 @@ pub(crate) fn is_default_route_qos(qos: &RouteQos) -> bool {
     *qos == RouteQos::Standard
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(
+    Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ModelDevice {
     #[default]
@@ -391,7 +395,9 @@ impl ModelDevice {
 /// Mirrors `gpu-distribution` in `wit/config-ai.wit`; the variant selected by
 /// a deployment's `hardware-strategy` is what the runtime reads to pick a
 /// tensor/pipeline/expert-parallel engine over the dense single-device path.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GpuDistribution {
     #[default]
@@ -406,7 +412,9 @@ pub(crate) enum GpuDistribution {
 /// with empty placement lists) preserves the pre-existing single-device load
 /// path byte-for-byte and is skipped during serialization, so configs that
 /// predate this field round-trip unchanged.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(
+    Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
+)]
 pub(crate) struct HardwareStrategy {
     #[serde(default)]
     pub(crate) distribution_mode: GpuDistribution,
@@ -485,7 +493,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct IntegrityLayer4Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) tcp: Vec<IntegrityTcpBinding>,
@@ -493,19 +501,19 @@ pub(crate) struct IntegrityLayer4Config {
     pub(crate) udp: Vec<IntegrityUdpBinding>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct IntegrityTcpBinding {
     pub(crate) port: u16,
     pub(crate) target: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct IntegrityUdpBinding {
     pub(crate) port: u16,
     pub(crate) target: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct IntegrityRoute {
     pub(crate) path: String,
     pub(crate) role: RouteRole,
@@ -616,7 +624,7 @@ impl Default for IntegrityRoute {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct ConcurrencyPolicy {
     #[serde(default)]
     pub(crate) mode: ConcurrencyMode,
@@ -638,7 +646,7 @@ impl ConcurrencyPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ConcurrencyMode {
     #[default]
@@ -655,7 +663,7 @@ pub(crate) enum ConcurrencyMode {
     MeshLeaderStrict,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ConflictPolicy {
     #[default]
@@ -664,7 +672,7 @@ pub(crate) enum ConflictPolicy {
     Drop,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AdmissionStrategy {
     #[default]
@@ -672,7 +680,7 @@ pub(crate) enum AdmissionStrategy {
     MeshRetry,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct ResourcePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) min_ram_gb: Option<u64>,
@@ -694,7 +702,7 @@ pub(crate) fn is_default_admission_strategy(strategy: &AdmissionStrategy) -> boo
     *strategy == AdmissionStrategy::FailFast
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct DistributedRateLimitConfig {
     /// Request count permitted across the entire mesh within `window_seconds`.
     pub(crate) threshold: u32,
@@ -704,7 +712,7 @@ pub(crate) struct DistributedRateLimitConfig {
     pub(crate) scope: DistributedRateLimitScope,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DistributedRateLimitScope {
     #[default]
@@ -721,7 +729,7 @@ pub(crate) fn default_dist_rate_limit_window() -> u32 {
     60
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct IntegrityBatchTarget {
     pub(crate) name: String,
     pub(crate) module: String,
@@ -731,7 +739,7 @@ pub(crate) struct IntegrityBatchTarget {
     pub(crate) volumes: Vec<IntegrityVolume>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) struct IntegrityModelBinding {
     pub(crate) alias: String,
     /// Filesystem path to the model. Required for static bindings; ignored for
@@ -759,7 +767,7 @@ pub(crate) struct IntegrityModelBinding {
     pub(crate) hardware_strategy: HardwareStrategy,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct IntegrityVolume {
     #[serde(
         rename = "type",
@@ -813,7 +821,7 @@ impl Default for IntegrityVolume {
 /// Accepts either the legacy bare cron string or the structured object form,
 /// preserving backward compatibility with sealed manifests written before
 /// the concurrency-policies change introduced coordination/write_isolation fields.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub(crate) enum BackupSchedule {
     Cron(String),
@@ -843,7 +851,7 @@ impl BackupSchedule {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct BackupScheduleDetailed {
     pub(crate) cron: String,
     #[serde(default)]
@@ -852,7 +860,7 @@ pub(crate) struct BackupScheduleDetailed {
     pub(crate) write_isolation: WriteIsolation,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BackupCoordination {
     #[default]
@@ -861,7 +869,7 @@ pub(crate) enum BackupCoordination {
     ManualOnly,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WriteIsolation {
     #[default]
@@ -870,7 +878,7 @@ pub(crate) enum WriteIsolation {
     CopyOnWrite,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct VolumeConsistency {
     #[serde(default)]
     pub(crate) read_mode: ReadMode,
@@ -884,7 +892,7 @@ impl VolumeConsistency {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReadMode {
     #[default]
@@ -892,7 +900,7 @@ pub(crate) enum ReadMode {
     Live,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WriteMode {
     #[default]
@@ -902,7 +910,7 @@ pub(crate) enum WriteMode {
     None,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum IntegrityResource {
     Internal {
@@ -919,7 +927,7 @@ pub(crate) enum IntegrityResource {
 
 // ── KV-cache configuration ────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum KvCacheEvictionPolicy {
     #[default]
@@ -932,7 +940,7 @@ pub(crate) enum KvCacheEvictionPolicy {
 /// Writes are only accepted on nodes where `model_ref` is currently hot;
 /// the `model_ref` is used as the first segment of every storage key so
 /// entries from different models are physically isolated in the ReDB table.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct IntegrityKvCacheConfig {
     /// Logical name for this cache (used in admin APIs and metrics).
     pub(crate) name: String,
@@ -959,7 +967,7 @@ fn default_true() -> bool {
 /// Enrollment strategy for new nodes. `Pin` (default) is the existing
 /// operator-PIN device flow; `ZeroTouch` enables machine-identity (OIDC/JWT)
 /// auto-approval; `Both` tries machine identity first and falls back to PIN.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum EnrollmentMode {
     #[default]
@@ -970,7 +978,7 @@ pub(crate) enum EnrollmentMode {
 
 /// Optional enrollment configuration. Absent / all-default means PIN-only,
 /// identical to the pre-existing behavior.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 pub(crate) struct EnrollmentConfig {
     #[serde(default)]
     pub(crate) mode: EnrollmentMode,
@@ -1000,7 +1008,7 @@ impl EnrollmentConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct IntegrityConfig {
     pub(crate) host_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1108,7 +1116,7 @@ pub(crate) fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum TeeBackendConfig {
     /// In-process hardened wasmtime backend with mlocked memory and a self-attested
