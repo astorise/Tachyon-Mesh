@@ -18,6 +18,8 @@ use candle_core::{op::BackpropOp, CudaStorage, Storage};
 use candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear};
+#[cfg(all(feature = "candle-cuda", target_os = "linux"))]
+use std::os::raw::c_int;
 #[cfg(feature = "candle-cuda")]
 use std::sync::OnceLock;
 
@@ -245,6 +247,84 @@ impl NcclShardGroup {
         })
     }
 
+    /// Builds communicators with `ncclCommInitRank` after exchanging one
+    /// NCCL unique id over TCP. This is the multi-process/multi-node path:
+    /// rank 0 binds `bootstrap.master_addr`, sends the generated id to each
+    /// remote process, and every process initializes its local CUDA devices
+    /// as a contiguous global rank range starting at
+    /// `bootstrap.rank_offset`.
+    ///
+    /// The caller owns orchestration: every process must use the same
+    /// `world_size`, non-overlapping rank ranges, and the master must set
+    /// `peer_count` to the number of remote processes that will connect.
+    /// Returning `None` preserves the existing host-staged fallback behavior
+    /// for callers that attach the group opportunistically.
+    pub(crate) fn try_new_networked(
+        devices: &[Device],
+        bootstrap: &NcclTcpBootstrap,
+    ) -> Option<Self> {
+        let mut streams = Vec::with_capacity(devices.len());
+        for device in devices {
+            match device {
+                Device::Cuda(cuda_device) => streams.push(cuda_device.cuda_stream()),
+                _ => return None,
+            }
+        }
+        if streams.is_empty()
+            || bootstrap.world_size < 2
+            || bootstrap.rank_offset + streams.len() > bootstrap.world_size
+        {
+            return None;
+        }
+
+        let id = match bootstrap.obtain_id() {
+            Ok(id) => id,
+            Err(err) => {
+                eprintln!("NcclShardGroup: TCP NCCL bootstrap failed: {err}");
+                return None;
+            }
+        };
+
+        if let Err(err) = cudarc::nccl::group_start() {
+            eprintln!("NcclShardGroup: networked group_start failed: {:?}", err.0);
+            return None;
+        }
+        let mut comms = Vec::with_capacity(streams.len());
+        for (local_rank, stream) in streams.into_iter().enumerate() {
+            let rank = bootstrap.rank_offset + local_rank;
+            match cudarc::nccl::Comm::from_rank(stream, rank, bootstrap.world_size, id) {
+                Ok(comm) => comms.push(comm),
+                Err(err) => {
+                    eprintln!(
+                        "NcclShardGroup: networked Comm::from_rank(rank={rank}, world_size={}) failed: {:?}",
+                        bootstrap.world_size, err.0
+                    );
+                    break;
+                }
+            }
+        }
+        if let Err(err) = cudarc::nccl::group_end() {
+            eprintln!(
+                "NcclShardGroup: networked group_end failed (deferred init error): {:?}",
+                err.0
+            );
+            return None;
+        }
+        if comms.len() != devices.len() {
+            eprintln!(
+                "NcclShardGroup: only {}/{} local networked ranks initialized",
+                comms.len(),
+                devices.len()
+            );
+            return None;
+        }
+
+        Some(Self {
+            comms,
+            lock: std::sync::Mutex::new(()),
+        })
+    }
+
     /// Sums `partials[i]` (resident on the i-th participating CUDA device,
     /// must be contiguous `DType::F32`) across every communicator via a real
     /// NCCL `AllReduce`, then moves the reduced tensor onto `reduce_device`.
@@ -331,6 +411,190 @@ impl NcclShardGroup {
             candle_core::Error::Msg("NCCL all-reduce requires at least one shard".into())
         })?;
         result.to_device(reduce_device)
+    }
+}
+
+const NCCL_UNIQUE_ID_LEN: usize = 128;
+
+#[cfg(feature = "candle-cuda")]
+fn nccl_id_to_bytes(id: &cudarc::nccl::Id) -> [u8; NCCL_UNIQUE_ID_LEN] {
+    let mut bytes = [0u8; NCCL_UNIQUE_ID_LEN];
+    for (dst, src) in bytes.iter_mut().zip(id.internal().iter()) {
+        *dst = *src as u8;
+    }
+    bytes
+}
+
+#[cfg(feature = "candle-cuda")]
+fn nccl_id_from_bytes(bytes: [u8; NCCL_UNIQUE_ID_LEN]) -> cudarc::nccl::Id {
+    let mut internal = [0 as std::os::raw::c_char; NCCL_UNIQUE_ID_LEN];
+    for (dst, src) in internal.iter_mut().zip(bytes.iter()) {
+        *dst = *src as std::os::raw::c_char;
+    }
+    cudarc::nccl::Id::uninit(internal)
+}
+
+fn broadcast_nccl_rendezvous_bytes(
+    listener: &std::net::TcpListener,
+    bytes: &[u8; NCCL_UNIQUE_ID_LEN],
+    peer_count: usize,
+) -> std::io::Result<()> {
+    for _ in 0..peer_count {
+        let (mut stream, _) = listener.accept()?;
+        write_frame(&mut stream, bytes)?;
+    }
+    Ok(())
+}
+
+fn fetch_nccl_rendezvous_bytes(
+    master_addr: std::net::SocketAddr,
+) -> std::io::Result<[u8; NCCL_UNIQUE_ID_LEN]> {
+    let mut stream = std::net::TcpStream::connect(master_addr)?;
+    let frame = read_frame(&mut stream)?;
+    frame
+        .try_into()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid NCCL id size"))
+}
+
+/// TCP rendezvous settings for inter-process NCCL initialization.
+#[cfg(feature = "candle-cuda")]
+#[derive(Clone, Debug)]
+pub(crate) struct NcclTcpBootstrap {
+    pub(crate) role: NcclTcpBootstrapRole,
+    pub(crate) rank_offset: usize,
+    pub(crate) world_size: usize,
+}
+
+#[cfg(feature = "candle-cuda")]
+#[derive(Clone, Debug)]
+pub(crate) enum NcclTcpBootstrapRole {
+    Master {
+        bind_addr: std::net::SocketAddr,
+        peer_count: usize,
+    },
+    Worker {
+        master_addr: std::net::SocketAddr,
+    },
+}
+
+#[cfg(feature = "candle-cuda")]
+impl NcclTcpBootstrap {
+    pub(crate) fn master(
+        bind_addr: std::net::SocketAddr,
+        rank_offset: usize,
+        world_size: usize,
+        peer_count: usize,
+    ) -> Self {
+        Self {
+            role: NcclTcpBootstrapRole::Master {
+                bind_addr,
+                peer_count,
+            },
+            rank_offset,
+            world_size,
+        }
+    }
+
+    pub(crate) fn worker(
+        master_addr: std::net::SocketAddr,
+        rank_offset: usize,
+        world_size: usize,
+    ) -> Self {
+        Self {
+            role: NcclTcpBootstrapRole::Worker { master_addr },
+            rank_offset,
+            world_size,
+        }
+    }
+
+    fn obtain_id(&self) -> std::io::Result<cudarc::nccl::Id> {
+        match self.role {
+            NcclTcpBootstrapRole::Master {
+                bind_addr,
+                peer_count,
+            } => {
+                let id = cudarc::nccl::Id::new().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}"))
+                })?;
+                let listener = std::net::TcpListener::bind(bind_addr)?;
+                let bytes = nccl_id_to_bytes(&id);
+                broadcast_nccl_rendezvous_bytes(&listener, &bytes, peer_count)?;
+                Ok(id)
+            }
+            NcclTcpBootstrapRole::Worker { master_addr } => {
+                fetch_nccl_rendezvous_bytes(master_addr).map(nccl_id_from_bytes)
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "candle-cuda", target_os = "linux"))]
+#[repr(C)]
+struct CpuSet {
+    bits: [usize; 16],
+}
+
+#[cfg(all(feature = "candle-cuda", target_os = "linux"))]
+extern "C" {
+    fn sched_setaffinity(pid: c_int, cpusetsize: usize, mask: *const CpuSet) -> c_int;
+}
+
+#[cfg(all(feature = "candle-cuda", target_os = "linux"))]
+fn parse_linux_cpu_list(list: &str) -> CandleResult<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+        if let Some((start, end)) = part.split_once('-') {
+            let start: usize = start.parse().map_err(|_| {
+                candle_core::Error::Msg(format!("invalid NUMA CPU list entry: {part}"))
+            })?;
+            let end: usize = end.parse().map_err(|_| {
+                candle_core::Error::Msg(format!("invalid NUMA CPU list entry: {part}"))
+            })?;
+            if start > end {
+                candle_core::bail!("invalid NUMA CPU range: {part}");
+            }
+            cpus.extend(start..=end);
+        } else {
+            cpus.push(part.parse().map_err(|_| {
+                candle_core::Error::Msg(format!("invalid NUMA CPU list entry: {part}"))
+            })?);
+        }
+    }
+    Ok(cpus)
+}
+
+/// Pins the current process to CPUs local to `node_id` using Linux sysfs'
+/// `/sys/devices/system/node/nodeN/cpulist`. Call this before initializing
+/// CUDA/NCCL workers for a node-local rank group so host-side NCCL progress
+/// threads and staging work stay close to the target NUMA domain.
+#[cfg(all(feature = "candle-cuda", target_os = "linux"))]
+pub(crate) fn bind_current_process_to_numa_node(node_id: u32) -> CandleResult<()> {
+    let path = format!("/sys/devices/system/node/node{node_id}/cpulist");
+    let cpulist = std::fs::read_to_string(&path).map_err(|e| {
+        candle_core::Error::Msg(format!("failed to read NUMA CPU list {path}: {e}"))
+    })?;
+    let cpus = parse_linux_cpu_list(&cpulist)?;
+    if cpus.is_empty() {
+        candle_core::bail!("NUMA node {node_id} has an empty CPU list");
+    }
+
+    let mut set = CpuSet { bits: [0; 16] };
+    for cpu in cpus {
+        let word = cpu / usize::BITS as usize;
+        let bit = cpu % usize::BITS as usize;
+        if word < set.bits.len() {
+            set.bits[word] |= 1usize << bit;
+        }
+    }
+
+    let rc = unsafe { sched_setaffinity(0, std::mem::size_of::<CpuSet>(), &set) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(candle_core::Error::Msg(format!(
+            "sched_setaffinity failed for NUMA node {node_id}: {}",
+            std::io::Error::last_os_error()
+        )))
     }
 }
 
@@ -1351,6 +1615,27 @@ mod tests {
 
         let response: Vec<f32> = response.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(response, vec![2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn nccl_tcp_rendezvous_broadcasts_unique_id_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut expected = [0u8; NCCL_UNIQUE_ID_LEN];
+        for (i, byte) in expected.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+
+        let server = std::thread::spawn(move || {
+            broadcast_nccl_rendezvous_bytes(&listener, &expected, 2).unwrap();
+            expected
+        });
+
+        let first = fetch_nccl_rendezvous_bytes(addr).unwrap();
+        let second = fetch_nccl_rendezvous_bytes(addr).unwrap();
+        let expected = server.join().unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
     }
 
     // --- Expert parallelism ---------------------------------------------------

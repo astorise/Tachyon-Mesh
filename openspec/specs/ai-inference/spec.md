@@ -426,6 +426,20 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 - **THEN** the runtime issues a real NCCL `AllReduce` collective across the participating devices' communicators
 - **AND** the reduced result matches the existing host-staged-sum reference within `1e-4` tolerance
 
+#### Scenario: Inter-node tensor parallelism bootstraps NCCL over TCP
+- **GIVEN** the runtime is built with the `candle-cuda` feature and a tensor-parallel shard group spans more than one host process
+- **WHEN** rank 0 starts an NCCL TCP bootstrap rendezvous
+- **THEN** it generates one NCCL unique id and broadcasts the 128-byte rendezvous payload to each remote process over TCP
+- **AND** every process initializes its local CUDA devices with `ncclCommInitRank` using non-overlapping global ranks and the shared world size
+- **AND** CPU-only builds can still validate the TCP framing without linking CUDA or NCCL
+
+#### Scenario: A CUDA worker may be pinned to a NUMA node before NCCL initialization
+- **GIVEN** the runtime is built with the `candle-cuda` feature on Linux
+- **WHEN** a worker requests binding to NUMA node N before initializing its CUDA/NCCL rank group
+- **THEN** the runtime reads `/sys/devices/system/node/nodeN/cpulist`
+- **AND** applies the parsed CPU affinity to the current process with `sched_setaffinity`
+- **AND** reports a typed error if the NUMA node cannot be read or has no CPUs
+
 #### Scenario: The host-staged fallback remains correct when no multi-GPU CUDA group is available
 - **GIVEN** the runtime is built without the `candle-cuda` feature, or a shard group has fewer than 2 CUDA devices, or the shard group runs on `Device::Cpu`
 - **WHEN** `RowParallelLinear::forward` synchronizes partial outputs
