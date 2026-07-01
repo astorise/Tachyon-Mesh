@@ -513,9 +513,8 @@ impl NcclTcpBootstrap {
                 bind_addr,
                 peer_count,
             } => {
-                let id = cudarc::nccl::Id::new().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}"))
-                })?;
+                let id =
+                    cudarc::nccl::Id::new().map_err(|e| std::io::Error::other(format!("{e:?}")))?;
                 let listener = std::net::TcpListener::bind(bind_addr)?;
                 let bytes = nccl_id_to_bytes(&id);
                 broadcast_nccl_rendezvous_bytes(&listener, &bytes, peer_count)?;

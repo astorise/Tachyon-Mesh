@@ -751,6 +751,8 @@ mod tests {
             expert_device_map,
             pipeline_depth,
             paged_attention: false,
+            cuda_graph_decode: false,
+            flashinfer_attention: false,
             prefill_chunk_tokens: None,
             speculative_draft_model_path: String::new(),
             speculative_draft_tokens: 0,

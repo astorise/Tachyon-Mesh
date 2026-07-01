@@ -34,17 +34,12 @@ struct EmbeddingModelMeta {
     max_length: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PoolingMode {
+    #[default]
     Mean,
     Cls,
-}
-
-impl Default for PoolingMode {
-    fn default() -> Self {
-        Self::Mean
-    }
 }
 
 pub(crate) struct CandleEmbeddingRuntime {
