@@ -1009,6 +1009,24 @@ impl CandleLlmRuntime {
                         .to_owned(),
             });
         }
+        if strategy.cuda_graph_decode {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail:
+                    "cuda_graph_decode requires Tachyon's steady-state GPU decode loop to capture fixed-shape operations through candle_core::CudaGraph"
+                        .to_owned(),
+            });
+        }
+        if strategy.flashinfer_attention {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail:
+                    "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention"
+                        .to_owned(),
+            });
+        }
 
         // The single-device path remains CPU-only in this runtime (GPU
         // execution of the dense path is the separate
@@ -5813,5 +5831,61 @@ mod tests {
             other => panic!("expected UnsupportedModel, got {other:?}"),
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cuda_graph_decode_strategy_is_rejected_until_gpu_decode_is_wired() {
+        let dir = write_fixture_dir("cuda-graph-reject");
+        let strategy = HardwareStrategy {
+            cuda_graph_decode: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &strategy)
+            .expect_err("CUDA Graph decode must not silently use the uncaptured decode loop");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("candle_core::CudaGraph"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn flashinfer_attention_strategy_is_rejected_until_decode_attention_is_wired() {
+        let dir = write_fixture_dir("flashinfer-reject");
+        let strategy = HardwareStrategy {
+            flashinfer_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cpu", &strategy)
+            .expect_err("FlashInfer attention must not silently use the default attention path");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("candle-flashinfer-kernels::flashinfer_decode_attention"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "candle-flashinfer")]
+    #[test]
+    fn flashinfer_kernel_dependency_runs_reference_decode_attention() {
+        use candle_flashinfer_kernels::flashinfer_decode_attention;
+
+        let device = Device::Cpu;
+        let q = Tensor::from_vec(vec![1f32, 0.5], (1, 1, 2), &device).expect("q");
+        let k = Tensor::from_vec(vec![1f32, 0.0, 0.0, 1.0], (1, 1, 2, 2), &device).expect("k");
+        let v = Tensor::from_vec(vec![2f32, 4.0, 6.0, 8.0], (1, 1, 2, 2), &device).expect("v");
+        let out = flashinfer_decode_attention(&q, &k, &v, 1.0)
+            .expect("FlashInfer-style reference kernel should run");
+        assert_eq!(out.dims(), &[1, 1, 2]);
     }
 }

@@ -95,6 +95,31 @@ Until the block allocator and block-table path are wired, the Candle LLM runtime
 rejects that setting with a typed unsupported-model error instead of silently
 falling back to the contiguous per-request KV cache.
 
+## CUDA Graphs and FlashInfer Status
+
+The pinned `astorise/candle` fork also includes the downstream APIs proposed in
+`huggingface/candle#3651`: `candle_core::CudaGraph` for capture/replay and the
+optional `candle-flashinfer-kernels` crate for FlashInfer-style decode
+attention.
+
+Model bindings can declare the future modes with:
+
+```json
+{
+  "hardware_strategy": {
+    "cuda_graph_decode": true,
+    "flashinfer_attention": true
+  }
+}
+```
+
+Tachyon rejects both settings today. CUDA Graph replay requires a steady-state
+GPU decode loop with fixed shapes and stable device buffers; FlashInfer requires
+the decode-attention call site to pass single-token Q/K/V tensors to
+`candle-flashinfer-kernels::flashinfer_decode_attention`. Until those runtime
+paths are wired, the host fails closed instead of using the uncaptured/default
+attention path.
+
 ## Speculative Decoding Status
 
 Model bindings can opt into greedy draft/verify decoding with a local draft

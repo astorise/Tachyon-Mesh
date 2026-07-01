@@ -647,6 +647,35 @@ When a model deployment sets `hardware_strategy.paged_attention: true`, the runt
 - **THEN** decode uses the block-paged attention path
 - **AND** sequence admission and eviction operate at block granularity rather than reallocating a contiguous KV cache per request
 
+### Requirement: CUDA Graph and FlashInfer decode acceleration MUST be explicit and fail-closed
+The AI inference build SHALL consume the pinned `astorise/candle` fork revision
+that exposes `candle_core::CudaGraph` and the optional
+`candle-flashinfer-kernels` crate for the downstream work proposed in
+`huggingface/candle#3651`. Model deployments MAY declare
+`hardware_strategy.cuda_graph_decode` and
+`hardware_strategy.flashinfer_attention`, but the runtime SHALL reject those
+settings until Tachyon's GPU decode loop has fixed-shape buffers and an
+attention call site wired to those Candle APIs.
+
+#### Scenario: CUDA Graph decode request is rejected before capture is wired
+- **GIVEN** a model binding sets `hardware_strategy.cuda_graph_decode: true`
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming
+  `candle_core::CudaGraph`
+- **AND** the runtime does not silently execute the uncaptured decode loop
+
+#### Scenario: FlashInfer attention request is rejected before attention dispatch is wired
+- **GIVEN** a model binding sets `hardware_strategy.flashinfer_attention: true`
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming
+  `candle-flashinfer-kernels::flashinfer_decode_attention`
+- **AND** the runtime does not silently use the default attention path
+
+#### Scenario: FlashInfer remains an optional dependency
+- **WHEN** `core-host` is built without the `candle-flashinfer` feature
+- **THEN** the FlashInfer-style Candle crate remains unlinked
+- **AND** default and CPU-only AI inference builds are unchanged
+
 ### Requirement: The runtime MUST validate a parallel plan against discovered hardware before loading weights
 Before constructing any parallel engine, the runtime SHALL validate the requested plan against the cluster's discovered hardware topology (device count, interconnect class, per-shard VRAM) and SHALL abort the load with a typed topology error — loading no weights — when the plan cannot be satisfied. This hardware-aware check is in addition to the structural plan validation already performed by the config API.
 

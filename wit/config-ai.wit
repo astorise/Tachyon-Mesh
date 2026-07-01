@@ -59,6 +59,14 @@ interface config-ai {
         /// declarative knob only when its runtime has wired Candle's paged
         /// flash-attn API to a block allocator and per-sequence block table.
         paged-attention: bool,
+        /// Request CUDA Graph capture/replay for the steady-state decode step.
+        /// Tachyon rejects this until its GPU decode loop has fixed shapes,
+        /// stable device buffers, and a direct `candle-core` CudaGraph path.
+        cuda-graph-decode: bool,
+        /// Request the optional Candle FlashInfer-style decode-attention
+        /// backend. Tachyon rejects this until the model decode path is wired
+        /// to `candle-flashinfer-kernels`.
+        flashinfer-attention: bool,
         /// Optional prefill chunk size in tokens. Absent uses Tachyon's
         /// default (8192 tokens), `some(0)` disables chunked prefill.
         prefill-chunk-tokens: option<u32>,

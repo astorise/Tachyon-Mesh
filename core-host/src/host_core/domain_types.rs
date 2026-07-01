@@ -431,6 +431,16 @@ pub(crate) struct HardwareStrategy {
     /// through Tachyon's block allocator and block table.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) paged_attention: bool,
+    /// Request CUDA Graph capture/replay for the steady-state decode step.
+    /// This requires the forked Candle `CudaGraph` API plus a GPU decode loop
+    /// with fixed tensor shapes and stable device buffers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) cuda_graph_decode: bool,
+    /// Request the forked Candle FlashInfer-style decode-attention backend.
+    /// This is rejected until Tachyon's model decode path can pass single-token
+    /// Q/K/V tensors to `candle-flashinfer-kernels`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) flashinfer_attention: bool,
     /// Optional prefill chunk size in tokens. `None` uses the runtime default
     /// (8K tokens), `Some(0)` disables chunking and processes the prompt in a
     /// single prefill forward.
@@ -459,6 +469,8 @@ impl HardwareStrategy {
             && self.expert_device_map.is_empty()
             && self.pipeline_depth == 0
             && !self.paged_attention
+            && !self.cuda_graph_decode
+            && !self.flashinfer_attention
             && self.prefill_chunk_tokens.is_none()
             && self.speculative_draft_model_path.is_empty()
             && self.speculative_draft_tokens == 0
@@ -1233,6 +1245,8 @@ mod hardware_strategy_tests {
                 device_ids: vec![0, 1],
                 pipeline_depth: 0,
                 paged_attention: false,
+                cuda_graph_decode: false,
+                flashinfer_attention: false,
                 ..Default::default()
             },
         };
@@ -1258,6 +1272,46 @@ mod hardware_strategy_tests {
         };
         let json = serde_json::to_string(&binding).expect("serialize");
         assert!(json.contains("paged_attention"));
+        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, binding);
+        assert!(!restored.hardware_strategy.is_single());
+    }
+
+    #[test]
+    fn cuda_graph_decode_strategy_round_trips_and_is_not_single() {
+        let binding = IntegrityModelBinding {
+            alias: "m".to_owned(),
+            path: "/models/m".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: HardwareStrategy {
+                cuda_graph_decode: true,
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&binding).expect("serialize");
+        assert!(json.contains("cuda_graph_decode"));
+        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, binding);
+        assert!(!restored.hardware_strategy.is_single());
+    }
+
+    #[test]
+    fn flashinfer_attention_strategy_round_trips_and_is_not_single() {
+        let binding = IntegrityModelBinding {
+            alias: "m".to_owned(),
+            path: "/models/m".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: HardwareStrategy {
+                flashinfer_attention: true,
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&binding).expect("serialize");
+        assert!(json.contains("flashinfer_attention"));
         let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, binding);
         assert!(!restored.hardware_strategy.is_single());
