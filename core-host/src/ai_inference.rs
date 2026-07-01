@@ -1503,7 +1503,7 @@ impl BackendModel for CandleBackendModel {
                     .map(|input| input.data.as_ref())
                     .collect::<Vec<_>>();
                 target
-                    .generate_with_adapter(&prompts, &adapter.path)
+                    .generate_with_adapter(&prompts, &adapter.id, &adapter.path)
                     .map_err(|error| {
                         anyhow!(
                             "Candle LLM model `{}` failed with LoRA adapter `{}` at `{}`: {error}",
@@ -2479,6 +2479,14 @@ impl SemanticContextFlattener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_broker_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static MODEL_BROKER_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        MODEL_BROKER_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("model broker env lock should not be poisoned")
+    }
     use crate::{IntegrityConfig, IntegrityRoute, ModelDevice};
     // `fs` and `PathBuf` were used by the deleted `turboquant_ffi_match` test. The
     // replacement test builds its input in-memory so neither is needed any more.
@@ -2545,6 +2553,7 @@ mod tests {
 
     #[test]
     fn real_candle_llm_runtime_applies_resolved_lora_adapter() {
+        let _env_guard = model_broker_env_guard();
         let model_dir = unique_candle_llm_dir("real-lora-apply");
         candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
             .expect("fixture should be written");
@@ -2564,12 +2573,56 @@ mod tests {
         let runtime =
             AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
                 .expect("runtime should load real Candle LLM fixture");
+        let base_before = runtime
+            .compute_component_prompt("tiny", "hello")
+            .expect("base model generation before adapter");
         let output = runtime
             .compute_component_prompt_with_adapter("tiny", "hello", Some("tenant-a"))
             .expect("real backend should apply the resolved adapter");
+        let base_after = runtime
+            .compute_component_prompt_with_adapter("tiny", "hello", None)
+            .expect("base model generation after adapter");
 
         assert!(!output.is_empty());
         assert_ne!(output, MOCK_INFERENCE_RESPONSE);
+        assert_eq!(
+            base_before, base_after,
+            "omitting adapter_id must keep the base model path unchanged"
+        );
+        std::env::remove_var(MODEL_BROKER_DIR_ENV);
+        let _ = fs::remove_dir_all(adapter_root);
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn real_candle_lora_adapter_rejects_unsupported_gguf_backend() {
+        let _env_guard = model_broker_env_guard();
+        let model_dir = unique_candle_llm_dir("lora-gguf-reject");
+        candle_llm_runtime::write_tachyon_tiny_gguf_fixture(&model_dir)
+            .expect("gguf fixture should be written");
+        let adapter_root = std::env::temp_dir().join(format!(
+            "tachyon-real-lora-gguf-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be valid")
+                .as_nanos()
+        ));
+        let adapter_dir = adapter_root.join("adapters");
+        fs::create_dir_all(&adapter_dir).expect("adapter dir should be created");
+        write_tiny_lora_adapter(&adapter_dir.join("tenant-a.safetensors"), 0.25)
+            .expect("adapter should be written");
+        std::env::set_var(MODEL_BROKER_DIR_ENV, &adapter_root);
+
+        let runtime = AiInferenceRuntime::from_config(&config_with_real_candle_model(
+            "tiny-gguf",
+            &model_dir,
+        ))
+        .expect("runtime should load real GGUF fixture");
+        let error = runtime
+            .compute_component_prompt_with_adapter("tiny-gguf", "hello", Some("tenant-a"))
+            .expect_err("GGUF must reject LoRA injection explicitly");
+
+        assert!(error.contains("safetensors Llama checkpoints only"));
         std::env::remove_var(MODEL_BROKER_DIR_ENV);
         let _ = fs::remove_dir_all(adapter_root);
         let _ = fs::remove_dir_all(model_dir);
@@ -3135,6 +3188,7 @@ mod tests {
 
     #[test]
     fn component_accelerator_runtime_loads_lora_adapter_for_single_call() {
+        let _env_guard = model_broker_env_guard();
         let adapter_root = std::env::temp_dir().join(format!(
             "tachyon-lora-{}",
             std::time::SystemTime::now()
@@ -3465,14 +3519,16 @@ mod tests {
         let rank = 2usize;
         let hidden = candle_llm_runtime::FIXTURE_HIDDEN_SIZE;
         let mut tensors = HashMap::new();
-        tensors.insert(
-            "model.layers.0.self_attn.q_proj.lora_A.weight".to_owned(),
-            CandleTensor::from_vec(vec![value; rank * hidden], (rank, hidden), &Device::Cpu)?,
-        );
-        tensors.insert(
-            "model.layers.0.self_attn.q_proj.lora_B.weight".to_owned(),
-            CandleTensor::from_vec(vec![value; hidden * rank], (hidden, rank), &Device::Cpu)?,
-        );
+        for layer in 0..candle_llm_runtime::FIXTURE_NUM_LAYERS {
+            tensors.insert(
+                format!("model.layers.{layer}.self_attn.q_proj.lora_A.weight"),
+                CandleTensor::from_vec(vec![value; rank * hidden], (rank, hidden), &Device::Cpu)?,
+            );
+            tensors.insert(
+                format!("model.layers.{layer}.self_attn.q_proj.lora_B.weight"),
+                CandleTensor::from_vec(vec![value; hidden * rank], (hidden, rank), &Device::Cpu)?,
+            );
+        }
         candle_core::safetensors::save(&tensors, path)?;
         Ok(())
     }

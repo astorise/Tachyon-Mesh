@@ -124,7 +124,7 @@ The Mesh SHALL extend the `wit/ai` Wasm Component Model definitions so that an i
 - **AND** the corresponding `.safetensors` adapter exists in `system-faas-model-broker`
 - **AND** the selected backend is a Llama-family safetensors checkpoint
 - **AND** the adapter uses PEFT LoRA tensor names ending in `lora_A.weight` and `lora_B.weight`
-- **THEN** the host loads the adapter weights through `candle-nn::LoraLinear` and applies them to matching attention/MLP projections in the foundation model's execution graph
+- **THEN** the host loads the adapter weights through Candle's upstream Llama LoRA injection API and applies them to matching attention/MLP projections in the foundation model's execution graph
 - **AND** the inference output reflects the adapter's behaviour
 - **AND** guests that omit `adapter_id` continue to run against the unmodified foundation model
 

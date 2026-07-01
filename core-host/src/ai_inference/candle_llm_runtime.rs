@@ -14,7 +14,9 @@ use candle_transformers::models::deepseek2::{
 };
 use candle_transformers::models::gemma2::{Config as Gemma2Config, Model as Gemma2Model};
 use candle_transformers::models::gemma3::{Config as Gemma3Config, Model as Gemma3Model};
-use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig, LlamaEosToks};
+use candle_transformers::models::llama::{
+    Cache, Config, Llama, LlamaConfig, LlamaEosToks, LlamaLoadConfig, LoraConfig,
+};
 use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
 use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlama;
 use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
@@ -33,9 +35,7 @@ use super::modelopt_nvfp4;
 use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::samplers::{FsmCache, FsmLogitProcessor};
-use super::tensor_parallel_llama::{
-    LoraAdapterTensors, LoraLlama, TensorParallelCache, TensorParallelLlama,
-};
+use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
 use parallel_topology::{
     validate_parallel_topology, ClusterTopology, ParallelExecutionPlan, ParallelStrategy,
 };
@@ -1767,10 +1767,11 @@ impl CandleLlmRuntime {
     pub(crate) fn generate_with_adapter(
         &self,
         prompts: &[&[u8]],
+        adapter_id: &str,
         adapter_path: &Path,
     ) -> Result<Vec<u8>, CandleLlmError> {
         let mut out = String::new();
-        self.generate_with_adapter_streaming(prompts, adapter_path, &mut |delta| {
+        self.generate_with_adapter_streaming(prompts, adapter_id, adapter_path, &mut |delta| {
             out.push_str(delta)
         })?;
         Ok(out.into_bytes())
@@ -1779,6 +1780,7 @@ impl CandleLlmRuntime {
     fn generate_with_adapter_streaming(
         &self,
         prompts: &[&[u8]],
+        adapter_id: &str,
         adapter_path: &Path,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<(), CandleLlmError> {
@@ -1839,14 +1841,30 @@ impl CandleLlmRuntime {
         };
 
         let device = Device::Cpu;
-        let adapter = LoraAdapterTensors::load(adapter_path, &device).map_err(|error| {
-            CandleLlmError::InvalidComponent {
-                alias: self.alias.clone(),
-                path: adapter_path.to_path_buf(),
-                component: MODEL_SAFETENSORS,
-                detail: error.to_string(),
-            }
+        let (lora_config, prefix) =
+            lora_load_config_from_adapter(adapter_path, &device).map_err(|error| {
+                CandleLlmError::InvalidComponent {
+                    alias: self.alias.clone(),
+                    path: adapter_path.to_path_buf(),
+                    component: MODEL_SAFETENSORS,
+                    detail: error.to_string(),
+                }
+            })?;
+        let adapter_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[adapter_path.to_path_buf()], DType::F32, &device)
+        }
+        .map_err(|error| CandleLlmError::InvalidComponent {
+            alias: self.alias.clone(),
+            path: adapter_path.to_path_buf(),
+            component: MODEL_SAFETENSORS,
+            detail: error.to_string(),
         })?;
+        let load_config = LlamaLoadConfig::default().with_lora_adapter_prefixed(
+            adapter_id,
+            adapter_vb,
+            lora_config,
+            prefix,
+        );
         let weight_paths = safetensors_paths(&self.alias, &self.root)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &device) }
             .map_err(|error| CandleLlmError::InvalidComponent {
@@ -1855,7 +1873,7 @@ impl CandleLlmRuntime {
                 component: MODEL_SAFETENSORS,
                 detail: error.to_string(),
             })?;
-        let model = LoraLlama::load(vb, config, &adapter).map_err(|error| {
+        let mut model = Llama::load_with_config(vb, config, load_config).map_err(|error| {
             CandleLlmError::InvalidComponent {
                 alias: self.alias.clone(),
                 path: adapter_path.to_path_buf(),
@@ -1863,10 +1881,17 @@ impl CandleLlmRuntime {
                 detail: error.to_string(),
             }
         })?;
-        let mut cache =
-            TensorParallelCache::new(true, DType::F32, config, &device).map_err(|error| {
-                self.execution_error(format!("failed to build LoRA KV cache: {error}"))
+        model
+            .set_active_adapter(Some(adapter_id))
+            .map_err(|error| CandleLlmError::InvalidComponent {
+                alias: self.alias.clone(),
+                path: adapter_path.to_path_buf(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
             })?;
+        let mut cache = Cache::new(true, DType::F32, config, &device).map_err(|error| {
+            self.execution_error(format!("failed to build LoRA KV cache: {error}"))
+        })?;
         self.decode_loop(
             &prompt_ids,
             request,
@@ -3376,6 +3401,68 @@ fn safetensors_paths(alias: &str, root: &Path) -> Result<Vec<PathBuf>, CandleLlm
     } else {
         Ok(vec![root.join(MODEL_SAFETENSORS)])
     }
+}
+
+fn lora_load_config_from_adapter(
+    adapter_path: &Path,
+    device: &Device,
+) -> candle_core::Result<(LoraConfig, &'static str)> {
+    let tensors = candle_core::safetensors::load(adapter_path, device)?;
+    let mut rank = None;
+    let mut target_modules = Vec::new();
+    let mut has_peft_prefix = false;
+
+    for (name, tensor) in tensors.iter() {
+        let Some(module_path) = name.strip_suffix(".lora_A.weight") else {
+            continue;
+        };
+        if module_path.starts_with("base_model.model.") {
+            has_peft_prefix = true;
+        }
+        let Some(module) = module_path.rsplit('.').next() else {
+            continue;
+        };
+        if !matches!(
+            module,
+            "q_proj" | "k_proj" | "v_proj" | "o_proj" | "gate_proj" | "up_proj" | "down_proj"
+        ) {
+            continue;
+        }
+
+        let adapter_rank = tensor.dim(0)?;
+        match rank {
+            Some(existing) if existing != adapter_rank => candle_core::bail!(
+                "LoRA adapter mixes ranks {existing} and {adapter_rank}; one rank per adapter is supported"
+            ),
+            None => rank = Some(adapter_rank),
+            _ => {}
+        }
+        if !target_modules.iter().any(|target| target == module) {
+            target_modules.push(module.to_owned());
+        }
+    }
+
+    let Some(rank) = rank else {
+        candle_core::bail!(
+            "LoRA adapter contains no supported `*.lora_A.weight` projection tensors"
+        );
+    };
+    if target_modules.is_empty() {
+        candle_core::bail!("LoRA adapter targets no supported Llama projection modules");
+    }
+
+    Ok((
+        LoraConfig {
+            rank,
+            alpha: rank as f64,
+            target_modules,
+        },
+        if has_peft_prefix {
+            "base_model.model"
+        } else {
+            ""
+        },
+    ))
 }
 
 #[cfg(test)]
