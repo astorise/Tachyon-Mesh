@@ -142,7 +142,7 @@ Configuration panels that affect `core-host` runtime behavior SHALL read the act
 - **AND** the applied manifest is visible to `core-host`
 
 #### Scenario: Operator edits remaining IntegrityConfig controls
-- **WHEN** the operator edits enrollment policy, TEE backend, layer4 bindings, scope enforcement, trusted signers, telemetry sample rate, instance-pool memory, cloud sync endpoint, batch targets, or advanced route volume policy
+- **WHEN** the operator edits enrollment policy, TEE backend, layer4 bindings, scope enforcement, trusted signers, telemetry sample rate, instance-pool memory, cloud sync endpoint, batch targets, advanced route volume policy, route policy fields, or route model policy fields
 - **THEN** Tachyon Studio reads the active manifest with `get_manifest_config`
 - **AND** writes the corresponding snake_case `IntegrityConfig` field
 - **AND** applies the signed full manifest with `apply_manifest_config`
@@ -169,6 +169,12 @@ Configuration panels that affect `core-host` runtime behavior SHALL read the act
 - **WHEN** the operator edits a route volume from the expanded Routing view
 - **THEN** Tachyon Studio can write `type`, `encrypted`, `ttl_seconds`, `idle_timeout`, `eviction_policy`, `backup_schedule`, and `consistency`
 - **AND** the update is scoped to the matching `routes[].volumes[]` entry
+
+#### Scenario: Operator configures advanced route policy
+- **WHEN** the operator edits route policy fields from the expanded Routing view
+- **THEN** Tachyon Studio can write `routes[].concurrency`, `routes[].distributed_rate_limit`, `routes[].resource_policy`, `routes[].adapter_id`, and `routes[].shadow_target`
+- **AND** model policy edits are scoped to the matching `routes[].models[]` entry
+- **AND** validation failures from manifest apply are returned to the panel feedback area
 
 #### Scenario: Legacy domain payload command is not exposed
 - **WHEN** a configuration panel would need to change runtime behavior

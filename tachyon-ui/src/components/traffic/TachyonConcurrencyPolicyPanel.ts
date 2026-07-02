@@ -1,5 +1,10 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import {
+  listManifestRoutes,
+  writeRouteConcurrencyPolicy,
+  type ManifestRouteOption,
+} from "../../controllers/manifestConfigController";
 import "../base/TachyonRiskBadge";
 
 type Recommendation = {
@@ -107,6 +112,7 @@ function deriveRisk(sel: Selection): { level: "low" | "medium" | "high"; tooltip
 
 export class TachyonConcurrencyPolicyPanel extends TachyonConfigDashboard {
   private routePath = "";
+  private routes: ManifestRouteOption[] = [];
   private selection: Selection = {
     concurrency: "unrestricted",
     onConflict: "queue",
@@ -126,6 +132,21 @@ export class TachyonConcurrencyPolicyPanel extends TachyonConfigDashboard {
 
   connectedCallback(): void {
     this.routePath = this.getAttribute("route-path") ?? "";
+    this.render();
+    this.bindEvents();
+    void this.loadRoutes();
+  }
+
+  private async loadRoutes(): Promise<void> {
+    try {
+      this.routes = await listManifestRoutes();
+      if (!this.routePath) {
+        this.routePath = this.routes[0]?.path ?? "";
+      }
+    } catch (error) {
+      this.feedback = error instanceof Error ? error.message : String(error);
+      this.routes = [];
+    }
     this.render();
     this.bindEvents();
   }
@@ -157,6 +178,12 @@ export class TachyonConcurrencyPolicyPanel extends TachyonConfigDashboard {
           </div>` : ""}
 
         <div class="grid grid-cols-2 gap-3 text-xs">
+          <label class="flex flex-col gap-1 md:col-span-2">
+            <span class="text-slate-500 uppercase tracking-widest">Manifest route</span>
+            <select id="sel-route-path" class="rounded border border-slate-600 bg-slate-900 px-2 py-1 text-slate-200">
+              ${this.renderRouteOptions()}
+            </select>
+          </label>
           <label class="flex flex-col gap-1">
             <span class="text-slate-500 uppercase tracking-widest">Concurrency mode</span>
             <select id="sel-concurrency" class="rounded border border-slate-600 bg-slate-900 px-2 py-1 text-slate-200">
@@ -200,9 +227,29 @@ export class TachyonConcurrencyPolicyPanel extends TachyonConfigDashboard {
           ${this.recommendation ? this.renderRecommendation(this.recommendation) : ""}
         </details>
 
+        <button id="btn-apply-route" ${this.routePath ? "" : "disabled"}
+          class="rounded border border-emerald-700/60 bg-emerald-800/30 px-3 py-2 text-xs font-semibold text-emerald-200 hover:bg-emerald-800/40 disabled:cursor-not-allowed disabled:opacity-50">
+          Apply to route
+        </button>
+
         ${this.feedback ? `<p class="text-xs text-slate-400 font-mono">${this.escHtml(this.feedback)}</p>` : ""}
       </section>
     `);
+  }
+
+  private renderRouteOptions(): string {
+    if (this.routes.length === 0 && this.routePath) {
+      return `<option value="${this.escAttr(this.routePath)}">${this.escHtml(this.routePath)}</option>`;
+    }
+    if (this.routes.length === 0) {
+      return `<option value="">No manifest routes</option>`;
+    }
+    return this.routes
+      .map((route) => {
+        const label = [route.path, route.name, route.version].filter(Boolean).join(" - ");
+        return `<option value="${this.escAttr(route.path)}"${route.path === this.routePath ? " selected" : ""}>${this.escHtml(label)}</option>`;
+      })
+      .join("");
   }
 
   private renderRecommendation(r: Recommendation): string {
@@ -229,6 +276,11 @@ export class TachyonConcurrencyPolicyPanel extends TachyonConfigDashboard {
   }
 
   private bindEvents(): void {
+    this.root.getElementById("sel-route-path")?.addEventListener("change", (e) => {
+      this.routePath = (e.target as HTMLSelectElement).value;
+      this.render();
+      this.bindEvents();
+    });
     this.root.getElementById("sel-concurrency")?.addEventListener("change", (e) => {
       this.selection.concurrency = (e.target as HTMLSelectElement).value;
       this.render();
@@ -266,6 +318,9 @@ export class TachyonConcurrencyPolicyPanel extends TachyonConfigDashboard {
       this.render();
       this.bindEvents();
     });
+    this.root.getElementById("btn-apply-route")?.addEventListener("click", () => {
+      void this.applyToRoute();
+    });
   }
 
   private async fetchRecommendation(): Promise<void> {
@@ -277,6 +332,33 @@ export class TachyonConcurrencyPolicyPanel extends TachyonConfigDashboard {
         writesSharedState,
       });
       this.feedback = "";
+    } catch (error) {
+      this.feedback = error instanceof Error ? error.message : String(error);
+    }
+    this.render();
+    this.bindEvents();
+  }
+
+  private async applyToRoute(): Promise<void> {
+    if (!this.routePath) {
+      this.feedback = "No manifest route is available for concurrency policy.";
+      this.render();
+      this.bindEvents();
+      return;
+    }
+    try {
+      const response = await writeRouteConcurrencyPolicy(
+        this.routePath,
+        {
+          mode: this.selection.concurrency,
+          on_conflict: this.selection.onConflict,
+        },
+        {
+          read_mode: this.selection.readMode as "snapshot" | "live",
+          write_mode: this.selection.writeMode as "last_write_wins" | "optimistic_etag" | "pessimistic_lock" | "none",
+        },
+      );
+      this.feedback = response.message;
     } catch (error) {
       this.feedback = error instanceof Error ? error.message : String(error);
     }

@@ -63,6 +63,28 @@ The Tachyon-UI SHALL provide a Concurrency Policy panel in the route detail view
 - **THEN** the option element carries a `data-sim-scenario="<scenario-id>"` attribute
 - **AND** a future JS simulation script can attach to those attributes without modifying the panel
 
+### Requirement: Route detail view applies manifest-backed route policies
+The Tachyon-UI SHALL provide route detail controls that write supported `IntegrityRoute` policy fields to the active manifest instead of only updating local simulator state.
+
+#### Scenario: Operator applies a concurrency recommendation to a route
+- **WHEN** an operator selects a manifest route in the Concurrency Policy panel
+- **AND** clicks "Apply to route"
+- **THEN** Tachyon-UI writes `routes[].concurrency.mode` and `routes[].concurrency.on_conflict` for that route
+- **AND** when the route has volumes, it applies the selected `volumes[].consistency.read_mode` and `volumes[].consistency.write_mode`
+- **AND** the update is submitted through `apply_manifest_config`
+
+#### Scenario: Operator edits advanced route policy fields
+- **WHEN** an operator expands a route in the Routing panel and saves the Route policies form
+- **THEN** Tachyon-UI can write `routes[].distributed_rate_limit`, `routes[].resource_policy`, `routes[].adapter_id`, and `routes[].shadow_target`
+- **AND** empty optional values remove only the corresponding manifest field
+- **AND** unrelated route fields are preserved
+
+#### Scenario: Operator edits model policy fields on a route
+- **WHEN** an operator saves a model policy row for a route-bound model
+- **THEN** Tachyon-UI mutates only the matching `routes[].models[]` entry
+- **AND** it can write `qos`, `min_instances`, `max_concurrency`, `env`, and `domains`
+- **AND** it leaves other model bindings on the route unchanged
+
 ### Requirement: Route detail view includes a Scopes panel alongside Volumes and Concurrency panels
 The route detail view SHALL render a Scopes panel (implemented by `tachyon-ui-scope-editor`) as a peer panel alongside the existing Volumes and Concurrency Policy panels.
 

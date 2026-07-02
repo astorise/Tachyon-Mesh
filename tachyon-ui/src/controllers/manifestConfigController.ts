@@ -12,6 +12,11 @@ type ManifestRoute = {
   version?: string;
   canary?: CanaryConfig | null;
   resiliency?: RouteResiliencyConfig | null;
+  concurrency?: RouteConcurrencyConfig | null;
+  distributed_rate_limit?: DistributedRateLimitConfig | null;
+  resource_policy?: ResourcePolicyConfig | null;
+  adapter_id?: string;
+  shadow_target?: string;
   requires_tee?: boolean;
   volumes?: ManifestVolume[];
   models?: ManifestModelBinding[];
@@ -107,8 +112,35 @@ export type RouteResiliencyConfig = {
   };
 };
 
+export type RouteConcurrencyConfig = {
+  mode: string;
+  on_conflict: string;
+  lock_ttl_ms?: number;
+};
+
+export type DistributedRateLimitConfig = {
+  threshold?: number;
+  window_seconds?: number;
+  scope?: string;
+};
+
+export type ResourcePolicyConfig = {
+  vram_mb?: number;
+  gpu_affinity?: string;
+  admission_strategy?: string;
+};
+
 export type ManifestRouteResiliency = ManifestRouteOption & {
   resiliency: RouteResiliencyConfig | null;
+};
+
+export type ManifestRoutePolicy = ManifestRouteOption & {
+  concurrency: RouteConcurrencyConfig | null;
+  distributedRateLimit: DistributedRateLimitConfig | null;
+  resourcePolicy: ResourcePolicyConfig | null;
+  adapterId: string;
+  shadowTarget: string;
+  models: ManifestModelPolicyBinding[];
 };
 
 export type GpuDistribution =
@@ -135,8 +167,23 @@ export type ManifestModelBinding = {
   alias?: string;
   path?: string;
   device?: string;
+  qos?: string;
+  min_instances?: number;
+  max_concurrency?: number;
+  env?: Record<string, string>;
+  domains?: string[];
   hardware_strategy?: Partial<HardwareStrategy>;
   [key: string]: unknown;
+};
+
+export type ManifestModelPolicyBinding = {
+  alias: string;
+  path: string;
+  qos: string;
+  minInstances: number | null;
+  maxConcurrency: number | null;
+  env: Record<string, string>;
+  domains: string[];
 };
 
 export type ManifestModelHardwareBinding = {
@@ -183,6 +230,22 @@ export async function listRouteResiliencyPolicies(): Promise<ManifestRouteResili
   }));
 }
 
+export async function listRoutePolicies(): Promise<ManifestRoutePolicy[]> {
+  const config = await readManifestConfig();
+  return (config.routes ?? []).map((route) => ({
+    path: route.path,
+    name: route.name ?? "",
+    version: route.version ?? "",
+    requiresTee: route.requires_tee === true,
+    concurrency: normalizeRouteConcurrency(route.concurrency),
+    distributedRateLimit: normalizeDistributedRateLimit(route.distributed_rate_limit),
+    resourcePolicy: normalizeResourcePolicy(route.resource_policy),
+    adapterId: typeof route.adapter_id === "string" ? route.adapter_id : "",
+    shadowTarget: typeof route.shadow_target === "string" ? route.shadow_target : "",
+    models: (route.models ?? []).map(normalizeModelPolicyBinding),
+  }));
+}
+
 export async function writeRouteResiliency(
   routePath: string,
   resiliency: RouteResiliencyConfig | null,
@@ -205,6 +268,139 @@ export async function writeRouteResiliency(
   return applyManifestConfig({
     ...config,
     routes: [...routes.slice(0, idx), updated, ...routes.slice(idx + 1)],
+  });
+}
+
+export async function writeRouteField(
+  routePath: string,
+  field: "concurrency" | "distributed_rate_limit" | "resource_policy" | "adapter_id" | "shadow_target",
+  value: unknown,
+): Promise<SealApplyOutcome> {
+  const config = await readManifestConfig();
+  const routes = config.routes ?? [];
+  const idx = routes.findIndex((route) => route.path === routePath);
+  if (idx === -1) {
+    throw new Error(`Route '${routePath}' not found in manifest`);
+  }
+
+  const updated = { ...routes[idx] };
+  const normalized = normalizeRouteField(field, value);
+  if (normalized === null || normalized === "" || normalized === undefined) {
+    delete updated[field];
+  } else {
+    (updated as Record<string, unknown>)[field] = normalized;
+  }
+
+  return applyManifestConfig({
+    ...config,
+    routes: [...routes.slice(0, idx), updated, ...routes.slice(idx + 1)],
+  });
+}
+
+export async function writeRoutePolicy(
+  routePath: string,
+  policy: {
+    concurrency?: RouteConcurrencyConfig | null;
+    distributedRateLimit?: DistributedRateLimitConfig | null;
+    resourcePolicy?: ResourcePolicyConfig | null;
+    adapterId?: string;
+    shadowTarget?: string;
+  },
+): Promise<SealApplyOutcome> {
+  const config = await readManifestConfig();
+  const routes = config.routes ?? [];
+  const idx = routes.findIndex((route) => route.path === routePath);
+  if (idx === -1) {
+    throw new Error(`Route '${routePath}' not found in manifest`);
+  }
+
+  const updated = { ...routes[idx] };
+  if (hasOwn(policy, "concurrency")) {
+    setRouteField(updated, "concurrency", normalizeRouteConcurrency(policy.concurrency));
+  }
+  if (hasOwn(policy, "distributedRateLimit")) {
+    setRouteField(updated, "distributed_rate_limit", normalizeDistributedRateLimit(policy.distributedRateLimit));
+  }
+  if (hasOwn(policy, "resourcePolicy")) {
+    setRouteField(updated, "resource_policy", normalizeResourcePolicy(policy.resourcePolicy));
+  }
+  if (hasOwn(policy, "adapterId")) {
+    setRouteField(updated, "adapter_id", normalizeOptionalString(policy.adapterId));
+  }
+  if (hasOwn(policy, "shadowTarget")) {
+    setRouteField(updated, "shadow_target", normalizeOptionalString(policy.shadowTarget));
+  }
+
+  return applyManifestConfig({
+    ...config,
+    routes: [...routes.slice(0, idx), updated, ...routes.slice(idx + 1)],
+  });
+}
+
+export async function writeRouteConcurrencyPolicy(
+  routePath: string,
+  concurrency: RouteConcurrencyConfig,
+  consistency?: ManifestVolume["consistency"] | null,
+): Promise<SealApplyOutcome> {
+  const config = await readManifestConfig();
+  const routes = config.routes ?? [];
+  const idx = routes.findIndex((route) => route.path === routePath);
+  if (idx === -1) {
+    throw new Error(`Route '${routePath}' not found in manifest`);
+  }
+
+  const updated: ManifestRoute = {
+    ...routes[idx],
+    concurrency: normalizeRouteConcurrency(concurrency) ?? undefined,
+  };
+
+  const normalizedConsistency = normalizeVolumeConsistency(consistency);
+  if (normalizedConsistency && (updated.volumes?.length ?? 0) > 0) {
+    updated.volumes = updated.volumes!.map((volume) => ({
+      ...volume,
+      consistency: normalizedConsistency,
+    }));
+  }
+
+  return applyManifestConfig({
+    ...config,
+    routes: [...routes.slice(0, idx), updated, ...routes.slice(idx + 1)],
+  });
+}
+
+export async function writeRouteModelPolicy(
+  routePath: string,
+  modelAlias: string,
+  policy: Pick<ManifestModelPolicyBinding, "qos" | "minInstances" | "maxConcurrency" | "env" | "domains">,
+): Promise<SealApplyOutcome> {
+  const config = await readManifestConfig();
+  const routes = config.routes ?? [];
+  const routeIdx = routes.findIndex((route) => route.path === routePath);
+  if (routeIdx === -1) {
+    throw new Error(`Route '${routePath}' not found in manifest`);
+  }
+  const route = routes[routeIdx];
+  const models = route.models ?? [];
+  const modelIdx = models.findIndex((model) => model.alias === modelAlias);
+  if (modelIdx === -1) {
+    throw new Error(`Model '${modelAlias}' not found on route '${routePath}'`);
+  }
+
+  const updatedModel = { ...models[modelIdx] };
+  setModelField(updatedModel, "qos", normalizeOptionalString(policy.qos));
+  setModelField(updatedModel, "min_instances", normalizeOptionalNumber(policy.minInstances));
+  setModelField(updatedModel, "max_concurrency", normalizeOptionalNumber(policy.maxConcurrency));
+  setModelField(updatedModel, "env", normalizeEnv(policy.env));
+  setModelField(updatedModel, "domains", normalizeStringList(policy.domains));
+
+  const updatedRoute: ManifestRoute = {
+    ...route,
+    models: [...models.slice(0, modelIdx), updatedModel, ...models.slice(modelIdx + 1)],
+  };
+
+  return applyManifestConfig({
+    ...config,
+    routes: [...routes.slice(0, routeIdx), updatedRoute, ...routes.slice(routeIdx + 1)],
   });
 }
 
@@ -634,6 +830,113 @@ function normalizeRouteResiliency(value: unknown): RouteResiliencyConfig | null 
     };
   }
   return normalized.timeout_ms || normalized.retry_policy ? normalized : null;
+}
+
+function normalizeRouteConcurrency(value: unknown): RouteConcurrencyConfig | null {
+  const input = typeof value === "object" && value !== null ? value as Partial<RouteConcurrencyConfig> : {};
+  const mode = normalizeOptionalString(input.mode);
+  if (!mode) return null;
+  const onConflict = normalizeOptionalString(input.on_conflict) || "queue";
+  const lockTtlMs = normalizeOptionalNumber(input.lock_ttl_ms);
+  return {
+    mode,
+    on_conflict: onConflict,
+    ...(lockTtlMs ? { lock_ttl_ms: lockTtlMs } : {}),
+  };
+}
+
+function normalizeDistributedRateLimit(value: unknown): DistributedRateLimitConfig | null {
+  const input = typeof value === "object" && value !== null ? value as Partial<DistributedRateLimitConfig> : {};
+  const threshold = normalizeOptionalNumber(input.threshold);
+  const windowSeconds = normalizeOptionalNumber(input.window_seconds);
+  const scope = normalizeOptionalString(input.scope);
+  const normalized: DistributedRateLimitConfig = {};
+  if (threshold) normalized.threshold = threshold;
+  if (windowSeconds) normalized.window_seconds = windowSeconds;
+  if (scope) normalized.scope = scope;
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+function normalizeResourcePolicy(value: unknown): ResourcePolicyConfig | null {
+  const input = typeof value === "object" && value !== null ? value as Partial<ResourcePolicyConfig> : {};
+  const vramMb = normalizeOptionalNumber(input.vram_mb);
+  const gpuAffinity = normalizeOptionalString(input.gpu_affinity);
+  const admissionStrategy = normalizeOptionalString(input.admission_strategy);
+  const normalized: ResourcePolicyConfig = {};
+  if (vramMb) normalized.vram_mb = vramMb;
+  if (gpuAffinity) normalized.gpu_affinity = gpuAffinity;
+  if (admissionStrategy) normalized.admission_strategy = admissionStrategy;
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+function normalizeModelPolicyBinding(value: ManifestModelBinding): ManifestModelPolicyBinding {
+  return {
+    alias: value.alias ?? "",
+    path: value.path ?? "",
+    qos: typeof value.qos === "string" ? value.qos : "",
+    minInstances: normalizeOptionalNumber(value.min_instances),
+    maxConcurrency: normalizeOptionalNumber(value.max_concurrency),
+    env: normalizeEnv(value.env),
+    domains: normalizeStringList(value.domains),
+  };
+}
+
+function normalizeEnv(value: unknown): Record<string, string> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([key, val]) => [key.trim(), String(val).trim()])
+      .filter(([key, val]) => key.length > 0 && val.length > 0),
+  );
+}
+
+function normalizeRouteField(field: Parameters<typeof writeRouteField>[1], value: unknown): unknown {
+  if (field === "concurrency") return normalizeRouteConcurrency(value);
+  if (field === "distributed_rate_limit") return normalizeDistributedRateLimit(value);
+  if (field === "resource_policy") return normalizeResourcePolicy(value);
+  return normalizeOptionalString(value);
+}
+
+function normalizeVolumeConsistency(value: unknown): ManifestVolume["consistency"] | null {
+  if (typeof value !== "object" || value === null) return null;
+  const input = value as ManifestVolume["consistency"];
+  const readMode = input?.read_mode === "live" ? "live" : "snapshot";
+  const writeMode = ["optimistic_etag", "pessimistic_lock", "none"].includes(input?.write_mode ?? "")
+    ? input?.write_mode
+    : "last_write_wins";
+  return { read_mode: readMode, write_mode: writeMode };
+}
+
+function normalizeOptionalString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function hasOwn<T extends object>(value: T, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function setRouteField<T extends keyof ManifestRoute>(route: ManifestRoute, field: T, value: ManifestRoute[T] | null | undefined): void {
+  if (value === null || value === undefined || value === "" || (Array.isArray(value) && value.length === 0)) {
+    delete route[field];
+  } else {
+    route[field] = value;
+  }
+}
+
+function setModelField<T extends keyof ManifestModelBinding>(model: ManifestModelBinding, field: T, value: ManifestModelBinding[T] | null | undefined): void {
+  if (
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    (Array.isArray(value) && value.length === 0) ||
+    (typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0)
+  ) {
+    delete model[field];
+  } else {
+    model[field] = value;
+  }
 }
 
 function normalizeVolume(volume: ManifestVolume): ManifestVolume {
