@@ -20,3 +20,18 @@ The runtime orchestration SHALL support multiple execution backends (FaaS Wasm, 
 - **WHEN** a client request is routed to this workload
 - **THEN** the `core-host` bypasses the Wasm engine and acts as a high-performance Layer 4/7 reverse proxy forwarding the traffic to the specified endpoint.
 
+### Requirement: Workload canary configuration is manifest-backed
+The Tachyon UI workload panel SHALL configure canary rollouts by mutating the selected route's `canary` field in the active manifest. The panel SHALL NOT stage canary form data under `ui_configurations`.
+
+#### Scenario: Operator configures canary rollout for a selected route
+- **WHEN** the operator selects the Canary deployment strategy
+- **AND** chooses a route from the manifest route selector
+- **AND** enters `next_version`, `step_weight`, `interval_secs`, and `max_error_rate`
+- **THEN** the panel reads the active manifest through `get_manifest_config`
+- **AND** writes those values to the selected route's `routes[].canary`
+- **AND** applies the updated manifest through `apply_manifest_config`
+
+#### Scenario: Workload form does not fake unsupported runtime fields
+- **WHEN** the operator submits Rolling strategy, engine, or secret fields that do not map to a current `IntegrityConfig` field
+- **THEN** the UI displays a handled message explaining that the field is not manifest-backed yet
+- **AND** no `workloads` payload is staged under `ui_configurations`

@@ -1,9 +1,10 @@
 import gsap from "gsap";
 
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "./TachyonModelUploadPanel";
+import { writeAiKvCaches } from "../../controllers/manifestConfigController";
 
 type RuntimeMetrics = {
   source: string;
@@ -193,13 +194,11 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
 
   private async applyConfiguration(): Promise<void> {
     try {
-      const response = await applyAndSeal("config-ai", {
-          lora_mode: this.value("lora-mode", "dynamic"),
-          kv_cache_size: this.numberValue("kv-cache-range", 32),
-          tde_key: this.value("tde-key", ""),
-          model_loading_modes: this.modelLoadModes,
-      });
-      this.showFeedback(response.success ? "success" : "error", response.message);
+      const response = await writeAiKvCaches(this.models.map((model) => model.alias));
+      const message = response.success
+        ? `${response.message} ${t("ai.feedback.manifestOnly")}`
+        : response.message;
+      this.showFeedback(response.success ? "success" : "error", message);
     } catch (error) {
       this.showFeedback("error", error instanceof Error ? error.message : String(error));
     }
@@ -279,20 +278,6 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
     );
   }
 
-  private value(id: string, fallback: string): string {
-    const element = this.root.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
-    const value = element?.value.trim();
-    return value ? value : fallback;
-  }
-
-  private numberValue(id: string, fallback: number): number {
-    const input = this.root.getElementById(id) as HTMLInputElement | null;
-    if (!input) {
-      return fallback;
-    }
-    const value = input.valueAsNumber;
-    return Number.isFinite(value) ? value : fallback;
-  }
 }
 
 customElements.define("tachyon-ai-panel", TachyonAIPanel);

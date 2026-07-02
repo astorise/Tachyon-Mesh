@@ -4,16 +4,18 @@
 Define the Tachyon UI controls and backend validation contract for AI orchestration, accelerator selection, and KV cache configuration.
 ## Requirements
 ### Requirement: AI Orchestration Panel
-The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for configuring LoRA multiplexing, edge KV cache size, and encrypted TDE key material through the shared dashboard base. The AI Orchestration view SHALL also host the `<tachyon-model-upload-panel>` control for uploading model files (see `ai-model-upload-ui`).
+The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for configuring runtime-backed AI manifest fields through the shared dashboard base. The AI Orchestration view SHALL also host the `<tachyon-model-upload-panel>` control for uploading model files (see `ai-model-upload-ui`).
 
 #### Scenario: Operator adjusts KV cache
 - **WHEN** the operator moves the KV cache slider
 - **THEN** the panel updates the visible cache value immediately without a backend round trip
 
-#### Scenario: Operator applies AI configuration
-- **WHEN** the operator submits the AI panel
-- **THEN** the panel sends a `config-ai` payload with `lora_mode`, `kv_cache_size`, and `tde_key` to `apply_configuration`
-- **AND** the panel shows the backend validation result in its feedback zone
+#### Scenario: Operator applies AI KV-cache configuration
+- **WHEN** the operator submits the AI panel with available model aliases
+- **THEN** the panel reads the active manifest through `get_manifest_config`
+- **AND** writes one `kv_caches` entry per available model alias without overwriting unrelated cache entries
+- **AND** applies the updated manifest through `apply_manifest_config`
+- **AND** the panel shows a feedback message explaining that LoRA, TDE, and model loading mode controls are not runtime manifest fields until a matching `IntegrityConfig` field exists
 
 #### Scenario: AI view exposes the model-upload panel
 - **WHEN** the AI Orchestration view is rendered (with `has_ai` true)
@@ -36,6 +38,11 @@ The Tauri backend SHALL validate `config-ai` payloads against a strict Serde con
 #### Scenario: Invalid AI payload
 - **WHEN** the backend receives a `config-ai` payload with unknown fields, an unsupported mode, an empty TDE key, or a KV cache size outside the allowed range
 - **THEN** it returns a failed validation response describing the invalid field
+
+#### Scenario: Validated AI payload is not staged as runtime config
+- **WHEN** the backend receives a valid `config-ai` payload through `apply_configuration`
+- **THEN** it returns a handled failure stating that domain overlays are not runtime manifest fields
+- **AND** it does not persist the payload under `ui_configurations`
 
 ### Requirement: VRAM Priority Tiers
 The AI inference host SHALL assign each safetensors layer residency a VRAM priority of `Active`, `Hot`, or `Volatile`.

@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { applyAndSeal, resilientInvoke } from "../../utils/network";
+import { resilientInvoke } from "../../utils/network";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { setLanguage } from "../../utils/i18n";
 
 vi.mock("../../utils/network", () => ({
-  applyAndSeal: vi.fn(),
   resilientInvoke: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -16,7 +20,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 import "./TachyonAIPanel";
 
 const invokeMock = vi.mocked(resilientInvoke);
-const applyAndSealMock = vi.mocked(applyAndSeal);
+const tauriInvokeMock = vi.mocked(tauriInvoke);
 
 function mountPanel(): HTMLElement {
   const el = document.createElement("tachyon-ai-panel");
@@ -29,11 +33,14 @@ describe("TachyonAIPanel", () => {
     document.body.innerHTML = "";
     setLanguage("en");
     vi.mocked(listen).mockClear();
-    applyAndSealMock.mockResolvedValue({
-      success: true,
-      message: "staged",
-      staged: true,
-      requiresSeal: true,
+    tauriInvokeMock.mockImplementation(async (command: string) => {
+      if (command === "get_manifest_config") {
+        return { routes: [], kv_caches: [] };
+      }
+      if (command === "apply_manifest_config") {
+        return { success: true, message: "applied", configVersion: 2 };
+      }
+      return null;
     });
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "get_metrics") {
@@ -62,7 +69,7 @@ describe("TachyonAIPanel", () => {
     vi.clearAllMocks();
   });
 
-  it("renders available models and includes selected loading modes in config-ai", async () => {
+  it("renders available models and writes kv-caches through the runtime manifest", async () => {
     const panel = mountPanel();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -78,14 +85,17 @@ describe("TachyonAIPanel", () => {
     root?.querySelector("form")?.dispatchEvent(new Event("submit", { cancelable: true }));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(applyAndSealMock).toHaveBeenCalledWith(
-      "config-ai",
-      expect.objectContaining({
-        model_loading_modes: {
-          "llama-3": "layer-batch",
-          qwen: "integrity",
-        },
+    expect(tauriInvokeMock).toHaveBeenCalledWith("apply_manifest_config", {
+      config: expect.objectContaining({
+        kv_caches: [
+          expect.objectContaining({ name: "cache-for-llama-3", model_ref: "llama-3" }),
+          expect.objectContaining({ name: "cache-for-qwen", model_ref: "qwen" }),
+        ],
       }),
+    });
+    expect(tauriInvokeMock).not.toHaveBeenCalledWith(
+      "apply_configuration",
+      expect.objectContaining({ domain: "config-ai" }),
     );
   });
 });

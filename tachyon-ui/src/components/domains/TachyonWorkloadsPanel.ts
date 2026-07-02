@@ -1,8 +1,9 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
-import { applyAndSeal, resilientInvoke } from "../../utils/network";
+import { resilientInvoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import { invoke } from "@tauri-apps/api/core";
+import { listManifestRoutes, writeRouteCanary, type ManifestRouteOption } from "../../controllers/manifestConfigController";
 
 type ImportPackageResult = {
   importedModules: Array<{ name: string; assetUri: string }>;
@@ -22,6 +23,7 @@ type CanaryStatusEntry = {
 
 export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
   private rollouts: CanaryStatusEntry[] = [];
+  private routes: ManifestRouteOption[] = [];
   private importFile: File | null = null;
   private readonly onLanguageChanged = () => { this.render(); this.bindForm(); };
 
@@ -30,6 +32,7 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
     this.render();
     this.bindForm();
     this.animateEntrance();
+    await this.refreshManifestRoutes();
     await this.refreshRollouts();
   }
 
@@ -42,6 +45,16 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
       this.rollouts = await resilientInvoke<CanaryStatusEntry[]>("fetch_canary_status");
     } catch {
       this.rollouts = [];
+    }
+    this.render();
+    this.bindForm();
+  }
+
+  private async refreshManifestRoutes(): Promise<void> {
+    try {
+      this.routes = await listManifestRoutes();
+    } catch {
+      this.routes = [];
     }
     this.render();
     this.bindForm();
@@ -80,6 +93,12 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
 
           <div id="canary-config-fields" class="md:col-span-2 grid grid-cols-1 gap-4 hidden rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 md:grid-cols-2">
             <p class="md:col-span-2 text-[11px] uppercase tracking-widest text-amber-400">${t("workloads.canary.section")}</p>
+
+            <label class="block text-xs uppercase tracking-widest text-slate-400 md:col-span-2">${t("workloads.canary.route")}
+              <select id="canary-route" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-slate-200 outline-none transition-colors focus:border-cyan-400">
+                ${this.renderRouteOptions()}
+              </select>
+            </label>
 
             <label class="block text-xs uppercase tracking-widest text-slate-400">${t("workloads.canary.nextVersion")}
               <input id="canary-next-version" type="text" placeholder="${t("workloads.canary.nextVersionPlaceholder")}" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-slate-200 outline-none transition-colors focus:border-cyan-400">
@@ -143,6 +162,18 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
         <div id="rollouts-list"></div>
       </article>
     `;
+  }
+
+  private renderRouteOptions(): string {
+    if (this.routes.length === 0) {
+      return `<option value="">${t("workloads.canary.noRoutes")}</option>`;
+    }
+    return this.routes
+      .map((route) => {
+        const label = [route.path, route.name, route.version].filter(Boolean).join(" - ");
+        return `<option value="${this.escape(route.path)}">${this.escape(label)}</option>`;
+      })
+      .join("");
   }
 
   private populateRollouts(): void {
@@ -301,23 +332,18 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
 
   private async applyWorkloadContract(): Promise<void> {
     const strategy = this.value("strategy", "rolling");
-    const payload: Record<string, unknown> = {
-      engine: this.value("engine", "wasmtime"),
-      secret_ref: this.value("secret-ref", ""),
-      strategy,
-    };
+    if (strategy !== "canary") {
+      this.showFeedback("error", t("workloads.feedback.manifestOnly"));
+      return;
+    }
 
-    if (strategy === "canary") {
-      payload.canary = {
+    try {
+      const response = await writeRouteCanary(this.value("canary-route", ""), {
         next_version: this.value("canary-next-version", ""),
         step_weight: Number(this.value("canary-step-weight", "10")),
         interval_secs: Number(this.value("canary-interval-secs", "60")),
         max_error_rate: Number(this.value("canary-max-error-rate", "0.05")),
-      };
-    }
-
-    try {
-      const response = await applyAndSeal("workloads", payload);
+      });
       this.showFeedback(response.success ? "success" : "error", response.message);
       if (response.success) {
         await this.refreshRollouts();
@@ -332,6 +358,14 @@ export class TachyonWorkloadsPanel extends TachyonConfigDashboard {
       this.root.getElementById(id) as HTMLInputElement | HTMLSelectElement | null
     )?.value.trim();
     return value ? value : fallback;
+  }
+
+  private escape(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
 }
 

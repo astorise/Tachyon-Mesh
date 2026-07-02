@@ -868,9 +868,8 @@ async fn delete_resource(name: String) -> Result<(), String> {
 async fn apply_configuration(
     domain: String,
     payload: Value,
-    dry_run: Option<bool>,
+    _dry_run: Option<bool>,
 ) -> Result<ApplyConfigurationResponse, String> {
-    let payload_for_staging = payload.clone();
     let response = match domain.as_str() {
         "config-routing" | "routing" => Ok(validate_traffic_config(&payload)),
         "config-resilience" | "resilience" => Ok(validate_resilience_config(&payload)),
@@ -900,30 +899,15 @@ async fn apply_configuration(
         });
     }
 
-    if dry_run.unwrap_or(false) {
-        return Ok(ApplyConfigurationResponse {
-            success: true,
-            message: format!(
-                "{} Dry-run only; no overlay state changed.",
-                response.message
-            ),
-            staged: false,
-            requires_seal: false,
-        });
-    }
-
-    tachyon_client::stage_configuration_overlay(&domain, payload_for_staging)
-        .await
-        .map_err(|error| error.to_string())?;
-
     Ok(ApplyConfigurationResponse {
-        success: true,
+        success: false,
         message: format!(
-            "{} Staged in local overlay; seal is required.",
+            "{} This configuration domain is not written to the runtime manifest; \
+             ui_configurations overlays are ignored by core-host. Use a manifest-backed controller.",
             response.message
         ),
-        staged: true,
-        requires_seal: true,
+        staged: false,
+        requires_seal: false,
     })
 }
 

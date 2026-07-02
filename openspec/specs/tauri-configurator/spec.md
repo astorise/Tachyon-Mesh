@@ -131,14 +131,21 @@ The desktop step-up MFA flow SHALL use a short-lived session token issued by the
 - **THEN** the Tauri backend requests a host step-up session token
 - **AND** the local password profile is not read or replayed
 
-### Requirement: UI configuration apply is atomic
-Configuration panels SHALL use an atomic `applyAndSeal(domain, payload)` flow for validated changes.
+### Requirement: Runtime configuration panels mutate the manifest directly
+Configuration panels that affect `core-host` runtime behavior SHALL read the active manifest with `get_manifest_config`, mutate the corresponding `IntegrityConfig` field, and apply the result with `apply_manifest_config`. They SHALL NOT rely on `ui_configurations` overlays for runtime configuration.
 
-#### Scenario: Operator applies configuration
-- **WHEN** a configuration panel submits a payload
-- **THEN** the frontend performs a dry-run validation
-- **AND** prompts the operator with the pending payload
-- **AND** runs step-up MFA before staging, sealing, and applying the manifest
+#### Scenario: Operator applies a runtime-backed configuration
+- **WHEN** a configuration panel changes a runtime field such as `routes[].canary`, `routes[].scopes`, or `kv_caches`
+- **THEN** the frontend reads the current manifest
+- **AND** mutates only the targeted manifest field
+- **AND** submits the complete updated config via `apply_manifest_config`
+- **AND** the applied manifest is visible to `core-host`
+
+#### Scenario: Legacy domain payload cannot be staged as a fake runtime change
+- **WHEN** a configuration panel submits a validated domain payload through `apply_configuration`
+- **THEN** the Tauri backend returns a handled failure explaining that `ui_configurations` overlays are ignored by `core-host`
+- **AND** no payload is staged into the local configuration overlay
+- **AND** the UI must migrate that panel to a manifest-backed controller before claiming runtime application
 
 ### Requirement: Additional config WIT bindings are wired
 The Tauri backend SHALL generate and reference WIT bindings for routing plus the additional AI, resilience, observability, storage, and fleet configuration contracts.
