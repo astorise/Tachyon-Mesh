@@ -1,5 +1,10 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import {
+  listRouteVolumes,
+  writeRouteVolume,
+  type ManifestVolume,
+} from "../../controllers/manifestConfigController";
 import "./TachyonVolumeBackupsPanel";
 
 type S3VolumeEntry = {
@@ -12,7 +17,7 @@ const S3_URL_RE = /^s3:\/\/[^/]+/;
 
 export class TachyonVolumesPanel extends TachyonConfigDashboard {
   private routePath = "";
-  private volumes: S3VolumeEntry[] = [];
+  private volumes: ManifestVolume[] = [];
   private addingVolume = false;
   private validationError = "";
   private feedback = "";
@@ -39,8 +44,17 @@ export class TachyonVolumesPanel extends TachyonConfigDashboard {
 
   private async load(): Promise<void> {
     await this.withLoadingState(async () => {
-      const raw = await invoke<S3VolumeEntry[]>("list_s3_volumes", { routePath: this.routePath });
-      this.volumes = raw;
+      try {
+        this.volumes = await listRouteVolumes(this.routePath);
+      } catch {
+        const raw = await invoke<S3VolumeEntry[]>("list_s3_volumes", { routePath: this.routePath });
+        this.volumes = raw.map((entry) => ({
+          type: "s3",
+          host_path: entry.s3Url,
+          guest_path: entry.guestPath,
+          readonly: entry.readonly,
+        }));
+      }
       this.render();
       this.bindEvents();
     });
@@ -76,24 +90,94 @@ export class TachyonVolumesPanel extends TachyonConfigDashboard {
     `);
   }
 
-  private renderVolumeCard(v: S3VolumeEntry): string {
+  private renderVolumeCard(v: ManifestVolume): string {
+    const volumeType = v.type ?? "host";
     const mode = v.readonly
       ? `<span class="rounded bg-amber-900/40 px-1.5 py-0.5 text-xs text-amber-300">read-only</span>`
       : `<span class="rounded bg-cyan-900/40 px-1.5 py-0.5 text-xs text-cyan-300">read-write</span>`;
+    const backup = typeof v.backup_schedule === "string"
+      ? { cron: v.backup_schedule, coordination: "per_node", write_isolation: "none" }
+      : v.backup_schedule;
     return `
-      <article class="flex items-start justify-between gap-3 rounded border border-slate-700/80 bg-slate-800/60 px-3 py-2" data-guest-path="${this.escHtml(v.guestPath)}">
+      <article class="space-y-3 rounded border border-slate-700/80 bg-slate-800/60 px-3 py-2" data-guest-path="${this.escHtml(v.guest_path)}">
+        <div class="flex items-start justify-between gap-3">
         <div class="min-w-0 space-y-0.5">
           <div class="flex items-center gap-2">
-            <span class="text-xs text-slate-500 font-mono">S3</span>
+            <span class="text-xs text-slate-500 font-mono">${this.escHtml(volumeType.toUpperCase())}</span>
             ${mode}
+            ${v.encrypted ? `<span class="rounded bg-emerald-900/40 px-1.5 py-0.5 text-xs text-emerald-300">TDE</span>` : ""}
           </div>
-          <p class="font-mono text-xs text-cyan-200 truncate">${this.escHtml(v.s3Url)}</p>
-          <p class="font-mono text-xs text-slate-400">${this.escHtml(v.guestPath)}</p>
+          <p class="font-mono text-xs text-cyan-200 truncate">${this.escHtml(v.host_path)}</p>
+          <p class="font-mono text-xs text-slate-400">${this.escHtml(v.guest_path)}</p>
         </div>
-        <button data-remove-path="${this.escHtml(v.guestPath)}"
+        <button data-remove-path="${this.escHtml(v.guest_path)}"
           class="shrink-0 rounded border border-red-800/60 bg-red-900/20 px-2 py-1 text-xs text-red-400 hover:bg-red-900/40">
           Remove
         </button>
+        </div>
+        <form class="grid gap-2 md:grid-cols-3" data-volume-form="${this.escHtml(v.guest_path)}">
+          <label class="text-xs text-slate-400">Type
+            <select data-field="type" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+              <option value="host"${volumeType === "host" ? " selected" : ""}>host</option>
+              <option value="ram"${volumeType === "ram" ? " selected" : ""}>ram</option>
+              <option value="s3"${volumeType === "s3" ? " selected" : ""}>s3</option>
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Host/S3 path
+            <input data-field="host_path" value="${this.escHtml(v.host_path)}" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 font-mono text-xs text-slate-200">
+          </label>
+          <label class="text-xs text-slate-400">Guest path
+            <input data-field="guest_path" value="${this.escHtml(v.guest_path)}" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 font-mono text-xs text-slate-200">
+          </label>
+          <label class="text-xs text-slate-400">TTL seconds
+            <input data-field="ttl_seconds" type="number" min="0" value="${v.ttl_seconds ?? ""}" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+          </label>
+          <label class="text-xs text-slate-400">Idle timeout
+            <input data-field="idle_timeout" value="${this.escHtml(v.idle_timeout ?? "")}" placeholder="10m" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+          </label>
+          <label class="text-xs text-slate-400">Eviction
+            <select data-field="eviction_policy" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+              <option value="">none</option>
+              <option value="hibernate"${v.eviction_policy === "hibernate" ? " selected" : ""}>hibernate</option>
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Backup cron
+            <input data-field="backup_cron" value="${this.escHtml(backup?.cron ?? "")}" placeholder="0 3 * * *" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 font-mono text-xs text-slate-200">
+          </label>
+          <label class="text-xs text-slate-400">Coordination
+            <select data-field="backup_coordination" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+              ${this.option("per_node", backup?.coordination ?? "per_node")}
+              ${this.option("mesh_leader", backup?.coordination ?? "per_node")}
+              ${this.option("manual_only", backup?.coordination ?? "per_node")}
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Write isolation
+            <select data-field="backup_write_isolation" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+              ${this.option("none", backup?.write_isolation ?? "none")}
+              ${this.option("drain", backup?.write_isolation ?? "none")}
+              ${this.option("copy_on_write", backup?.write_isolation ?? "none")}
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Read mode
+            <select data-field="read_mode" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+              ${this.option("snapshot", v.consistency?.read_mode ?? "snapshot")}
+              ${this.option("live", v.consistency?.read_mode ?? "snapshot")}
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Write mode
+            <select data-field="write_mode" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+              ${this.option("last_write_wins", v.consistency?.write_mode ?? "last_write_wins")}
+              ${this.option("optimistic_etag", v.consistency?.write_mode ?? "last_write_wins")}
+              ${this.option("pessimistic_lock", v.consistency?.write_mode ?? "last_write_wins")}
+              ${this.option("none", v.consistency?.write_mode ?? "last_write_wins")}
+            </select>
+          </label>
+          <label class="flex items-center gap-2 self-end text-xs text-slate-400">
+            <input data-field="encrypted" type="checkbox"${v.encrypted ? " checked" : ""}>
+            encrypted
+          </label>
+          <button type="submit" class="md:col-span-3 rounded border border-cyan-600/60 bg-cyan-700/30 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-700/40">Save volume policy</button>
+        </form>
       </article>`;
   }
 
@@ -175,6 +259,14 @@ export class TachyonVolumesPanel extends TachyonConfigDashboard {
         void this.removeVolume(guestPath);
       });
     });
+    this.root.querySelectorAll<HTMLFormElement>("[data-volume-form]").forEach((form) => {
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const originalGuestPath = form.dataset.volumeForm ?? "";
+        if (!originalGuestPath) return;
+        void this.saveVolume(form, originalGuestPath);
+      });
+    });
   }
 
   private async submitAdd(): Promise<void> {
@@ -225,8 +317,63 @@ export class TachyonVolumesPanel extends TachyonConfigDashboard {
     }
   }
 
+  private async saveVolume(form: HTMLFormElement, originalGuestPath: string): Promise<void> {
+    try {
+      const backupCron = this.field(form, "backup_cron");
+      const ttlSeconds = this.optionalNumber(this.field(form, "ttl_seconds"));
+      const volume: ManifestVolume = {
+        type: this.field(form, "type") as ManifestVolume["type"],
+        host_path: this.field(form, "host_path"),
+        guest_path: this.field(form, "guest_path"),
+        readonly: this.volumes.find((item) => item.guest_path === originalGuestPath)?.readonly ?? false,
+        ttl_seconds: ttlSeconds ?? undefined,
+        idle_timeout: this.field(form, "idle_timeout") || undefined,
+        eviction_policy: this.field(form, "eviction_policy") as ManifestVolume["eviction_policy"] || undefined,
+        encrypted: this.checked(form, "encrypted"),
+        backup_schedule: backupCron
+          ? {
+              cron: backupCron,
+              coordination: this.field(form, "backup_coordination") as "per_node" | "mesh_leader" | "manual_only",
+              write_isolation: this.field(form, "backup_write_isolation") as "none" | "drain" | "copy_on_write",
+            }
+          : undefined,
+        consistency: {
+          read_mode: this.field(form, "read_mode") as "snapshot" | "live",
+          write_mode: this.field(form, "write_mode") as "last_write_wins" | "optimistic_etag" | "pessimistic_lock" | "none",
+        },
+      };
+      const response = await writeRouteVolume(this.routePath, originalGuestPath, volume);
+      this.feedback = response.message;
+      this.feedbackOk = response.success;
+      await this.load();
+    } catch (error) {
+      this.feedback = error instanceof Error ? error.message : String(error);
+      this.feedbackOk = false;
+      this.render();
+      this.bindEvents();
+    }
+  }
+
   private escHtml(str: string): string {
     return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  private option(value: string, selected: string): string {
+    return `<option value="${value}"${value === selected ? " selected" : ""}>${value}</option>`;
+  }
+
+  private field(form: HTMLFormElement, name: string): string {
+    return (form.querySelector(`[data-field="${name}"]`) as HTMLInputElement | HTMLSelectElement | null)?.value.trim() ?? "";
+  }
+
+  private checked(form: HTMLFormElement, name: string): boolean {
+    return (form.querySelector(`[data-field="${name}"]`) as HTMLInputElement | null)?.checked ?? false;
+  }
+
+  private optionalNumber(value: string): number | null {
+    if (!value) return null;
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
   }
 }
 

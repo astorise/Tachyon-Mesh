@@ -141,6 +141,35 @@ Configuration panels that affect `core-host` runtime behavior SHALL read the act
 - **AND** submits the complete updated config via `apply_manifest_config`
 - **AND** the applied manifest is visible to `core-host`
 
+#### Scenario: Operator edits remaining IntegrityConfig controls
+- **WHEN** the operator edits enrollment policy, TEE backend, layer4 bindings, scope enforcement, trusted signers, telemetry sample rate, instance-pool memory, cloud sync endpoint, batch targets, or advanced route volume policy
+- **THEN** Tachyon Studio reads the active manifest with `get_manifest_config`
+- **AND** writes the corresponding snake_case `IntegrityConfig` field
+- **AND** applies the signed full manifest with `apply_manifest_config`
+- **AND** does not stage a `ui_configurations` overlay for those runtime fields
+
+#### Scenario: Operator toggles route TEE execution
+- **WHEN** the operator toggles a route's TEE state from the routing table
+- **THEN** Tachyon Studio mutates only `routes[].requires_tee` for the selected route
+- **AND** keeps `IntegrityConfig.tee_backend` as the global backend selector
+- **AND** applies the full manifest through `apply_manifest_config`
+
+#### Scenario: Operator configures zero-touch enrollment from Nodes
+- **WHEN** the operator sets `enrollment.mode` to `zero-touch` or `both`
+- **THEN** Tachyon Studio requires `enrollment.oidc_issuer`
+- **AND** accepts optional `enrollment.oidc_audience`
+- **AND** validates `enrollment.auto_approve_tags` as `key=value` matchers before applying the manifest
+
+#### Scenario: Operator edits trusted manifest signers from Identity
+- **WHEN** the operator saves trusted signers
+- **THEN** Tachyon Studio writes `trusted_signers` as newline or comma separated 64-character hex Ed25519 public keys
+- **AND** rejects malformed public keys before applying the manifest
+
+#### Scenario: Operator configures advanced volume policy
+- **WHEN** the operator edits a route volume from the expanded Routing view
+- **THEN** Tachyon Studio can write `type`, `encrypted`, `ttl_seconds`, `idle_timeout`, `eviction_policy`, `backup_schedule`, and `consistency`
+- **AND** the update is scoped to the matching `routes[].volumes[]` entry
+
 #### Scenario: Legacy domain payload cannot be staged as a fake runtime change
 - **WHEN** a configuration panel submits a validated domain payload through `apply_configuration`
 - **THEN** the Tauri backend returns a handled failure explaining that `ui_configurations` overlays are ignored by `core-host`

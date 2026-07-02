@@ -1,5 +1,10 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
+import {
+  getEnrollmentConfig,
+  writeEnrollmentConfig,
+  type EnrollmentConfig,
+} from "../../controllers/manifestConfigController";
 
 type GpuStats = {
   id: string;
@@ -36,6 +41,7 @@ export class TachyonNodesPanel extends TachyonConfigDashboard {
   private nodes: EnrolledNode[] = [];
   private summary: ClusterHardwareSummary | null = null;
   private selected: EnrolledNode | null = null;
+  private enrollment: EnrollmentConfig = { mode: "pin", auto_approve_tags: [] };
   private lastRefresh = 0;
 
   connectedCallback(): void {
@@ -55,7 +61,18 @@ export class TachyonNodesPanel extends TachyonConfigDashboard {
       this.selected = nodes.find((node) => node.nodeId === this.selected?.nodeId) ?? null;
       this.render();
       this.bindEvents();
+      void this.refreshEnrollmentConfig();
     });
+  }
+
+  private async refreshEnrollmentConfig(): Promise<void> {
+    try {
+      this.enrollment = await getEnrollmentConfig();
+      this.render();
+      this.bindEvents();
+    } catch {
+      this.enrollment = { mode: "pin", auto_approve_tags: [] };
+    }
   }
 
   private render(): void {
@@ -82,6 +99,7 @@ export class TachyonNodesPanel extends TachyonConfigDashboard {
           ${this.kpi("RAM MiB", summary.totalRamMb)}
           ${this.kpi("GPUs", summary.gpuCount)}
         </div>
+        ${this.enrollmentForm()}
         ${this.nodes.length === 0 ? this.emptyState() : this.table()}
         ${this.selected ? this.details(this.selected) : ""}
       </section>
@@ -102,6 +120,54 @@ export class TachyonNodesPanel extends TachyonConfigDashboard {
         this.bindEvents();
       });
     });
+    this.root.querySelector<HTMLFormElement>("#enrollment-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void this.saveEnrollment();
+    });
+  }
+
+  private enrollmentForm(): string {
+    return `
+      <form id="enrollment-form" class="space-y-4 rounded-lg border border-slate-800 bg-slate-900 p-5">
+        <h3 class="text-sm font-semibold uppercase tracking-widest text-cyan-300">Enrollment policy</h3>
+        <div class="grid gap-4 md:grid-cols-2">
+          <label class="block text-xs uppercase tracking-widest text-cyan-500">Mode
+            <select id="enrollment-mode" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 p-2 text-sm text-slate-200">
+              <option value="pin"${this.enrollment.mode === "pin" ? " selected" : ""}>PIN</option>
+              <option value="zero-touch"${this.enrollment.mode === "zero-touch" ? " selected" : ""}>Zero-touch OIDC</option>
+              <option value="both"${this.enrollment.mode === "both" ? " selected" : ""}>Both</option>
+            </select>
+          </label>
+          <label class="block text-xs uppercase tracking-widest text-cyan-500">OIDC issuer
+            <input id="oidc-issuer" type="url" value="${this.escape(this.enrollment.oidc_issuer ?? "")}" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 p-2 text-sm text-slate-200">
+          </label>
+          <label class="block text-xs uppercase tracking-widest text-cyan-500">OIDC audience
+            <input id="oidc-audience" type="text" value="${this.escape(this.enrollment.oidc_audience ?? "")}" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 p-2 text-sm text-slate-200">
+          </label>
+          <label class="block text-xs uppercase tracking-widest text-cyan-500">Auto-approve tags
+            <input id="auto-approve-tags" type="text" value="${this.escape((this.enrollment.auto_approve_tags ?? []).join(", "))}" placeholder="env=production, sa=tachyon-node" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 p-2 font-mono text-xs text-slate-200">
+          </label>
+        </div>
+        <button type="submit" class="rounded border border-cyan-500/50 bg-cyan-500/10 px-3 py-2 text-xs font-semibold text-cyan-200 hover:bg-cyan-500/20">Save enrollment</button>
+      </form>`;
+  }
+
+  private async saveEnrollment(): Promise<void> {
+    try {
+      const mode = this.input("enrollment-mode") as EnrollmentConfig["mode"];
+      const response = await writeEnrollmentConfig({
+        mode,
+        oidc_issuer: this.input("oidc-issuer") || undefined,
+        oidc_audience: this.input("oidc-audience") || undefined,
+        auto_approve_tags: this.input("auto-approve-tags").split(","),
+      });
+      this.enrollment = await getEnrollmentConfig();
+      this.render();
+      this.bindEvents();
+      this.showFeedback(response.success ? "success" : "error", response.message);
+    } catch (error) {
+      this.showFeedback("error", error instanceof Error ? error.message : String(error));
+    }
   }
 
   private kpi(label: string, value: number): string {
@@ -149,6 +215,10 @@ export class TachyonNodesPanel extends TachyonConfigDashboard {
 
   private escape(value: string): string {
     return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  private input(id: string): string {
+    return (this.root.getElementById(id) as HTMLInputElement | HTMLSelectElement | null)?.value.trim() ?? "";
   }
 }
 
