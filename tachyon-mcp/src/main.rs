@@ -306,6 +306,7 @@ fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<V
         "restore_volume" => &["route_path", "guest_path", "snapshot_id"],
         "recommend_concurrency_policy" => &["pattern"],
         "tachyon_set_route_scopes" => &["route_path", "scopes"],
+        "tachyon_patch_manifest" => &["patch"],
         "tachyon_patch_route" => &["route_path", "patch"],
         "tachyon_lora_training_status" => &["job_id"],
         "tachyon_suggest_scopes" => &["route_path"],
@@ -338,6 +339,7 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         "tachyon_apply_manifest"
         | "tachyon_seal_overlay"
         | "tachyon_set_route_scopes"
+        | "tachyon_patch_manifest"
         | "tachyon_patch_route" => 1,
         "tachyon_import_package" => 3,
         // Model uploads are large and hash-verified — keep the budget tight.
@@ -763,6 +765,25 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                                 "type": "boolean",
                                 "default": false,
                                 "description": "When true, return route_preview and manifest_preview without posting to the node."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_patch_manifest",
+                    "description": "Patch configurable host-level fields in the live manifest. Reads the current manifest, recursively merges the JSON patch object at the manifest root, validates the merged manifest through the node dry-run endpoint, and POSTs it when dry_run=false. Prefer dry_run=true first to preview host-level edits such as enrollment, layer4, tee_backend, trusted_signers, require_scopes, kv_caches, telemetry_sample_rate, instance_pool_max_memory_bytes, cloud_sync_endpoint, or batch_targets. The structural fields routes, config_version, and asset_versions cannot be patched here; use tachyon_patch_route for route changes.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["patch"],
+                        "properties": {
+                            "patch": {
+                                "type": "object",
+                                "description": "Manifest-root fragment to merge, such as {\"enrollment\":{\"mode\":\"both\",\"oidc_issuer\":\"https://issuer.example\"},\"require_scopes\":true}."
+                            },
+                            "dry_run": {
+                                "type": "boolean",
+                                "default": true,
+                                "description": "When true, return manifest_preview without posting to the node. Recommended for first use."
                             }
                         }
                     }
@@ -1198,6 +1219,20 @@ fn validate_route_patch(patch: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_manifest_patch(patch: &Value) -> Result<()> {
+    let object = patch.as_object().ok_or_else(|| {
+        anyhow::anyhow!("patch must be a JSON object containing manifest fields to merge")
+    })?;
+    for field in ["routes", "config_version", "asset_versions"] {
+        if object.contains_key(field) {
+            anyhow::bail!(
+                "patch must not modify structural manifest field `{field}`; use the dedicated route or manifest apply tools"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
     let name = params
         .and_then(|value| value.get("name"))
@@ -1527,6 +1562,46 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 Ok(text_tool_result(&json!({
                     "success": true,
                     "route_path": route_path,
+                    "patch_applied": patch,
+                    "validation": validation_report,
+                    "dry_run": false,
+                }))?)
+            }
+        }
+        "tachyon_patch_manifest" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let patch = arguments.get("patch").cloned().context("missing patch")?;
+            let dry_run = arguments
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            validate_manifest_patch(&patch)?;
+
+            let mut config = tachyon_client::get_manifest_config()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+
+            merge_json_object(&mut config, patch.clone());
+            let validation_report = tachyon_client::dryrun_manifest(config.clone())
+                .await
+                .context("patched manifest failed dry-run validation")?;
+
+            if dry_run {
+                Ok(text_tool_result(&json!({
+                    "dry_run": true,
+                    "patch_applied": patch,
+                    "validation": validation_report,
+                    "manifest_preview": config,
+                }))?)
+            } else {
+                tachyon_client::apply_manifest_config(config)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                Ok(text_tool_result(&json!({
+                    "success": true,
                     "patch_applied": patch,
                     "validation": validation_report,
                     "dry_run": false,
@@ -2141,6 +2216,37 @@ mod tests {
         assert!(validate_route_patch(&json!(["not", "object"])).is_err());
     }
 
+    #[test]
+    fn validate_manifest_patch_rejects_structural_fields() {
+        assert!(validate_manifest_patch(&json!({
+            "enrollment": {"mode": "both"},
+            "require_scopes": true,
+            "kv_caches": [{"model": "llama-3"}],
+        }))
+        .is_ok());
+        assert!(validate_manifest_patch(&json!({"routes": []})).is_err());
+        assert!(validate_manifest_patch(&json!({"config_version": 2})).is_err());
+        assert!(validate_manifest_patch(&json!({"asset_versions": {}})).is_err());
+        assert!(validate_manifest_patch(&json!(["not", "object"])).is_err());
+    }
+
+    #[test]
+    fn patch_manifest_missing_args_and_rate_limit_match_spec() {
+        assert_eq!(
+            missing_required_args("tachyon_patch_manifest", Some(&json!({}))),
+            Some(vec!["patch".to_owned()])
+        );
+        assert!(missing_required_args(
+            "tachyon_patch_manifest",
+            Some(&json!({"patch": {"require_scopes": true}}))
+        )
+        .is_none());
+
+        let spec = rate_limit_spec("tachyon_patch_manifest")
+            .expect("patch_manifest must have a rate limit");
+        assert_eq!(spec.limit, 1);
+    }
+
     #[tokio::test]
     async fn initialize_round_trips_json_rpc() {
         let context = McpContext::new_for_tests(test_state_path("initialize"));
@@ -2317,6 +2423,32 @@ mod tests {
 
         assert!(names.contains(&"tachyon_kv_cache_stats"));
         assert!(names.contains(&"tachyon_kv_cache_flush"));
+    }
+
+    #[tokio::test]
+    async fn tools_list_includes_patch_manifest_tool() {
+        let context = McpContext::new_for_tests(test_state_path("tools-list-patch-manifest"));
+        let response = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            &context,
+        )
+        .await
+        .expect("tools/list should parse")
+        .expect("tools/list returns a response");
+
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools result should be an array");
+        let patch_manifest = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("tachyon_patch_manifest"))
+            .expect("patch_manifest tool should be advertised");
+
+        assert_eq!(patch_manifest["inputSchema"]["required"], json!(["patch"]));
+        assert_eq!(
+            patch_manifest["inputSchema"]["properties"]["dry_run"]["default"],
+            true
+        );
     }
 
     #[test]

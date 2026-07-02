@@ -503,6 +503,7 @@ fn test_tools_list_includes_scope_tools() {
         for expected in &[
             "tachyon_get_scope_denials",
             "tachyon_set_route_scopes",
+            "tachyon_patch_manifest",
             "tachyon_patch_route",
             "tachyon_suggest_scopes",
             "tachyon_lora_training_status",
@@ -649,8 +650,9 @@ fn test_set_route_scopes_missing_args_returns_32602() {
     let _ = child.wait();
 }
 
-/// `tachyon_patch_route` and `tachyon_lora_training_status` missing required
-/// args are rejected before any cluster/network call.
+/// `tachyon_patch_route`, `tachyon_patch_manifest`, and
+/// `tachyon_lora_training_status` missing required args are rejected before any
+/// cluster/network call.
 #[test]
 fn test_route_patch_and_lora_status_missing_args_return_32602() {
     let Some((mut child, mut stdin, mut reader)) =
@@ -667,6 +669,28 @@ fn test_route_patch_and_lora_status_missing_args_return_32602() {
         serde_json::from_str(&raw).expect("patch_route missing patch response is valid JSON");
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 80);
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "missing patch must return -32602; got {resp}"
+    );
+    drop(stdin);
+    let _ = child.wait();
+
+    let Some((mut child, mut stdin, mut reader)) =
+        spawn_offline_mcp_isolated("patch-manifest-missing")
+    else {
+        return;
+    };
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":82,"method":"tools/call","params":{"name":"tachyon_patch_manifest","arguments":{}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("patch_manifest missing patch response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 82);
     assert_eq!(
         resp["error"]["code"].as_i64(),
         Some(-32602),
