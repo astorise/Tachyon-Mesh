@@ -242,7 +242,11 @@ pub(crate) async fn start_mtls_gateway_listener(
         return Ok(None);
     };
     let runtime = state.runtime.load_full();
-    if runtime.config.sealed_route(SYSTEM_GATEWAY_ROUTE).is_none() {
+    if runtime
+        .route_registry
+        .sealed_route(SYSTEM_GATEWAY_ROUTE)
+        .is_none()
+    {
         return Ok(None);
     }
 
@@ -315,7 +319,7 @@ pub(crate) async fn dispatch_mtls_gateway_request(
     request: hyper::Request<hyper::body::Incoming>,
 ) -> Response {
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.sealed_route(SYSTEM_GATEWAY_ROUTE).cloned() else {
+    let Some(route) = runtime.route_registry.sealed_route(SYSTEM_GATEWAY_ROUTE) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "sealed manifest does not define `/system/gateway`",
@@ -355,10 +359,10 @@ pub(crate) async fn dispatch_mtls_gateway_request(
     let gateway_uri = Uri::from_static(SYSTEM_GATEWAY_ROUTE);
     let trailers = GuestHttpFields::new();
     let trace_id = Uuid::new_v4().to_string();
-    match execute_route_with_middleware(
+    match execute_route_arc_with_middleware(
         &state,
         &runtime,
-        &route,
+        route,
         &headers,
         &parts.method,
         &gateway_uri,
@@ -416,9 +420,8 @@ pub(crate) async fn start_udp_layer4_listeners_with_queue_capacity(
                 )
             })?;
         let route = runtime
-            .config
+            .route_registry
             .sealed_route(&resolved.path)
-            .cloned()
             .ok_or_else(|| {
                 anyhow!(
                     "UDP Layer 4 binding target `{}` resolved to a missing route",
@@ -541,9 +544,8 @@ pub(crate) async fn start_tcp_layer4_listeners(
                 )
             })?;
         let route = runtime
-            .config
+            .route_registry
             .sealed_route(&resolved.path)
-            .cloned()
             .ok_or_else(|| {
                 anyhow!(
                     "TCP Layer 4 binding target `{}` resolved to a missing route",
@@ -603,7 +605,7 @@ pub(crate) async fn start_tcp_layer4_listeners(
 
 pub(crate) async fn handle_udp_layer4_datagram(
     state: AppState,
-    route: IntegrityRoute,
+    route: Arc<IntegrityRoute>,
     socket: Arc<tokio::net::UdpSocket>,
     datagram: UdpInboundDatagram,
 ) -> Result<()> {
@@ -644,9 +646,12 @@ pub(crate) async fn handle_udp_layer4_datagram(
     let storage_broker = Arc::clone(&state.storage_broker);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let component_cache = Arc::clone(&runtime.component_cache);
+    let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let linker_cache = Arc::clone(&runtime.linker_cache);
     let request_headers = HeaderMap::new();
-    let route_for_execution = route.clone();
+    let route_for_execution = Arc::clone(&route);
     let route_overrides = Arc::clone(&state.route_overrides);
     let host_load = Arc::clone(&state.host_load);
     let source = datagram.source;
@@ -669,9 +674,13 @@ pub(crate) async fn handle_udp_layer4_datagram(
             propagated_headers: Vec::new(),
             route_overrides,
             host_load,
+            local_mesh_dispatch: None,
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
+            component_cache: Some(component_cache),
+            component_instance_pre_cache: Some(component_instance_pre_cache),
+            legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
             linker_cache: Some(linker_cache),
         };
         execute_udp_layer4_guest(
@@ -736,6 +745,9 @@ pub(crate) async fn handle_websocket_connection(
     let route_overrides = Arc::clone(&state.route_overrides);
     let host_load = Arc::clone(&state.host_load);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let component_cache = Arc::clone(&runtime.component_cache);
+    let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let linker_cache = Arc::clone(&runtime.linker_cache);
     let (incoming_tx, incoming_rx) = std::sync::mpsc::channel::<HostWebSocketFrame>();
     let (outgoing_tx, mut outgoing_rx) =
@@ -800,6 +812,9 @@ pub(crate) async fn handle_websocket_connection(
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
+            component_cache: Some(component_cache),
+            component_instance_pre_cache: Some(component_instance_pre_cache),
+            legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
             linker_cache: Some(linker_cache),
         };
         let _ = result_tx.send(execute_websocket_guest(
@@ -831,7 +846,7 @@ pub(crate) async fn handle_websocket_connection(
 pub(crate) async fn handle_streaming_http_request(
     state: AppState,
     runtime: Arc<RuntimeState>,
-    route: IntegrityRoute,
+    route: Arc<IntegrityRoute>,
     function_name: String,
     request: GuestRequest,
 ) -> std::result::Result<Response, (StatusCode, String)> {
@@ -884,6 +899,9 @@ pub(crate) async fn handle_streaming_http_request(
     let host_load = Arc::clone(&state.host_load);
     let ai_runtime = Arc::clone(&runtime.ai_runtime);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let component_cache = Arc::clone(&runtime.component_cache);
+    let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let linker_cache = Arc::clone(&runtime.linker_cache);
     let async_log_sender = state.async_log_sender.clone();
     let request_headers = request
@@ -919,8 +937,12 @@ pub(crate) async fn handle_streaming_http_request(
                 propagated_headers: Vec::new(),
                 route_overrides,
                 host_load,
+                local_mesh_dispatch: None,
                 ai_runtime,
                 instance_pool: Some(instance_pool),
+                component_cache: Some(component_cache),
+                component_instance_pre_cache: Some(component_instance_pre_cache),
+                legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
                 linker_cache: Some(linker_cache),
             };
             execute_streaming_guest(
@@ -972,7 +994,7 @@ pub(crate) async fn handle_streaming_http_request(
 
 pub(crate) async fn handle_tcp_layer4_connection(
     state: AppState,
-    route: IntegrityRoute,
+    route: Arc<IntegrityRoute>,
     stream: tokio::net::TcpStream,
 ) -> Result<()> {
     let runtime = state.runtime.load_full();
@@ -1068,7 +1090,7 @@ pub(crate) async fn handle_tcp_layer4_connection(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_tls_wrapped_tcp_layer4_connection(
     state: AppState,
-    route: IntegrityRoute,
+    route: Arc<IntegrityRoute>,
     stream: tokio::net::TcpStream,
     function_name: String,
     engine: Engine,
@@ -1189,9 +1211,13 @@ pub(crate) fn execute_tcp_layer4_guest(
         propagated_headers: Vec::new(),
         route_overrides,
         host_load,
+        local_mesh_dispatch: None,
         #[cfg(feature = "ai-inference")]
         ai_runtime,
         instance_pool: None,
+        component_cache: None,
+        component_instance_pre_cache: None,
+        legacy_instance_pre_cache: None,
         linker_cache: None,
     };
     let (module_path, module) = resolve_legacy_guest_module_with_pool(

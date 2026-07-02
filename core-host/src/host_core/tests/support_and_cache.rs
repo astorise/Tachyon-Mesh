@@ -99,6 +99,25 @@ pub(super) fn l7_domain_route_lookup_uses_normalized_domains() {
     assert_eq!(resolved.path, "/api/domain");
 }
 
+#[test]
+pub(super) fn route_registry_indexes_sealed_routes_by_path_and_domain() {
+    let mut route = IntegrityRoute::user("/api/domain");
+    route.domains.push("example.com".to_owned());
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes.push(route);
+
+    let registry = RouteRegistry::build(&config).expect("route registry should build");
+    let by_path = registry
+        .sealed_route("/api/domain/")
+        .expect("normalized path should resolve route");
+    let by_domain = registry
+        .route_for_domain("EXAMPLE.COM.")
+        .expect("normalized domain should resolve route");
+
+    assert!(Arc::ptr_eq(&by_path, &by_domain));
+    assert_eq!(by_path.path, "/api/domain");
+}
+
 pub(super) struct MtlsTestMaterial {
     pub(super) ca_pem: String,
     pub(super) server_cert_pem: String,
@@ -326,6 +345,47 @@ pub(super) fn instance_pool_is_isolated_per_runtime_generation() {
 }
 
 #[test]
+pub(super) fn component_caches_are_isolated_per_runtime_generation() {
+    let r1 = build_test_runtime(IntegrityConfig::default_sealed());
+    let r2 = build_test_runtime(IntegrityConfig::default_sealed());
+    let component_path = std::path::PathBuf::from("/dummy/component.wasm");
+    let component = Arc::new(Component::new(&r1.engine, "(component)").expect("component"));
+    r1.component_cache.insert(
+        component_path.clone(),
+        CachedComponent {
+            component,
+            modified: None,
+            len: 0,
+        },
+    );
+    let linker = ComponentLinker::<ComponentHostState>::new(&r1.engine);
+    let pre = linker
+        .instantiate_pre(&Component::new(&r1.engine, "(component)").expect("component"))
+        .expect("component pre");
+    r1.component_instance_pre_cache.insert(
+        ComponentInstancePreKey {
+            path: component_path,
+            world: "faas",
+            shape: crate::host_core::scoping::ScopeShape::of(
+                &crate::host_core::scoping::DeploymentScopes::allow_all(),
+            ),
+            modified: None,
+            len: 0,
+        },
+        Arc::new(pre),
+    );
+    r1.component_cache.run_pending_tasks();
+    r1.component_instance_pre_cache.run_pending_tasks();
+    assert_eq!(r1.component_cache.entry_count(), 1);
+    assert_eq!(r1.component_instance_pre_cache.entry_count(), 1);
+
+    r2.component_cache.run_pending_tasks();
+    r2.component_instance_pre_cache.run_pending_tasks();
+    assert_eq!(r2.component_cache.entry_count(), 0);
+    assert_eq!(r2.component_instance_pre_cache.entry_count(), 0);
+}
+
+#[test]
 pub(super) fn instance_pool_evicts_idle_entries_for_hibernation() {
     // The production pool sets `time_to_idle = 5 minutes`. Re-build a tiny pool
     // here with a sub-second idle window so the eviction is observable inside
@@ -352,6 +412,38 @@ pub(super) fn instance_pool_evicts_idle_entries_for_hibernation() {
         pool.get(&path).is_none(),
         "idle entry must be evicted past time_to_idle"
     );
+}
+
+#[test]
+pub(super) fn component_cache_hit_skips_invalid_artifact_bytes() {
+    let runtime = build_test_runtime(IntegrityConfig::default_sealed());
+    let dir = test_tempdir();
+    let component_path = dir.path().join("cached-component.wasm");
+    fs::write(&component_path, b"not a wasm component").expect("write invalid component bytes");
+    let cache_key = component_path.canonicalize().expect("canonical path");
+    let metadata = fs::metadata(&component_path).expect("metadata");
+    let component = Arc::new(Component::new(&runtime.engine, "(component)").expect("component"));
+    runtime.component_cache.insert(
+        cache_key,
+        CachedComponent {
+            component: Arc::clone(&component),
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        },
+    );
+
+    let store =
+        store::CoreStore::open(&dir.path().join("component-cache.redb")).expect("open core store");
+    let loaded = load_component_with_pool(
+        &runtime.engine,
+        &component_path,
+        &store,
+        "default",
+        Some(&runtime.component_cache),
+    )
+    .expect("cache hit should return the cached component");
+
+    assert!(Arc::ptr_eq(&component, &loaded));
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::host_core::scoping::ScopeShape;
 
 pub(crate) struct DrainingRuntime {
     pub(crate) runtime: Arc<RuntimeState>,
@@ -119,6 +120,7 @@ pub(crate) struct ComponentHostState {
     pub(crate) host_capabilities: Capabilities,
     pub(crate) host_load: Arc<HostLoadCounters>,
     pub(crate) outbound_http_client: reqwest::blocking::Client,
+    pub(crate) local_mesh_dispatch: Option<LocalMeshDispatchContext>,
     pub(crate) route_path: String,
     pub(crate) route_role: RouteRole,
     #[cfg(feature = "ai-inference")]
@@ -135,6 +137,13 @@ pub(crate) struct ComponentHostState {
     /// `handle-request`. `None` on the buffered path — `get-streaming-response`
     /// returns an error, and the guest falls back to the buffered return value.
     pub(crate) streaming_body: Option<HostStreamingBodySlot>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalMeshDispatchContext {
+    pub(crate) state: crate::state::AppState,
+    pub(crate) runtime: Arc<RuntimeState>,
+    pub(crate) handle: tokio::runtime::Handle,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -170,11 +179,31 @@ pub(crate) struct GuestExecutionContext {
     pub(crate) propagated_headers: Vec<PropagatedHeader>,
     pub(crate) route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
     pub(crate) host_load: Arc<HostLoadCounters>,
+    pub(crate) local_mesh_dispatch: Option<LocalMeshDispatchContext>,
     /// In-memory `Arc<Module>` cache shared with the active runtime. The hot
     /// HTTP / L4 paths consult this before the redb-backed `cwasm_cache` to
     /// avoid the `Module::deserialize` cost on every request. Tests fill in
     /// `None`; production code clones it from `RuntimeState::instance_pool`.
     pub(crate) instance_pool: Option<Arc<moka::sync::Cache<PathBuf, Arc<Module>>>>,
+    /// In-memory `Arc<Component>` cache shared with the active runtime. Entries
+    /// are validated against the artifact's `(mtime, len)` before reuse.
+    pub(crate) component_cache: Option<Arc<moka::sync::Cache<PathBuf, CachedComponent>>>,
+    /// Cache of Wasmtime component `InstancePre` values keyed by artifact,
+    /// WIT world, scope shape, and file metadata. It lets hot requests pay only
+    /// `InstancePre::instantiate(store)` after the first link for a shape.
+    pub(crate) component_instance_pre_cache: Option<
+        Arc<
+            moka::sync::Cache<
+                ComponentInstancePreKey,
+                Arc<ComponentInstancePre<ComponentHostState>>,
+            >,
+        >,
+    >,
+    /// Cache of pre-linked legacy module instances keyed by module path and
+    /// file metadata.
+    pub(crate) legacy_instance_pre_cache: Option<
+        Arc<moka::sync::Cache<LegacyInstancePreKey, Arc<ModuleInstancePre<LegacyHostState>>>>,
+    >,
     /// Shared linker cache from `RuntimeState`. Tests fill in `None` to disable
     /// caching (fresh linker built per instantiation). Production code clones
     /// from `RuntimeState::linker_cache`.
@@ -182,6 +211,29 @@ pub(crate) struct GuestExecutionContext {
         Option<Arc<crate::host_core::scoping::LinkerCache<ComponentLinker<ComponentHostState>>>>,
     #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedComponent {
+    pub(crate) component: Arc<Component>,
+    pub(crate) modified: Option<SystemTime>,
+    pub(crate) len: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ComponentInstancePreKey {
+    pub(crate) path: PathBuf,
+    pub(crate) world: &'static str,
+    pub(crate) shape: ScopeShape,
+    pub(crate) modified: Option<SystemTime>,
+    pub(crate) len: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct LegacyInstancePreKey {
+    pub(crate) path: PathBuf,
+    pub(crate) modified: Option<SystemTime>,
+    pub(crate) len: u64,
 }
 
 pub(crate) static BLOCKING_OUTBOUND_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> =
@@ -369,7 +421,7 @@ pub(crate) struct HostLoadGuard {
 pub(crate) struct RouteInvocation {
     pub(crate) state: AppState,
     pub(crate) runtime: Arc<RuntimeState>,
-    pub(crate) route: IntegrityRoute,
+    pub(crate) route: Arc<IntegrityRoute>,
     pub(crate) headers: HeaderMap,
     pub(crate) method: Method,
     pub(crate) uri: Uri,

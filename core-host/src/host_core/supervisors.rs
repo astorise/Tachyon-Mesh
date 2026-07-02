@@ -491,9 +491,8 @@ pub(crate) fn spawn_buffered_request_replayer(state: AppState) {
                 };
 
                 let Some(route) = runtime
-                    .config
+                    .route_registry
                     .sealed_route(&buffered.request.route_path)
-                    .cloned()
                 else {
                     state.buffered_requests.complete(
                         buffered,
@@ -555,10 +554,18 @@ pub(crate) fn spawn_global_memory_governor(state: AppState) {
     memory_governor::spawn_memory_governor(governor, move |pressure| {
         let active_runtime = runtime.load();
         active_runtime.instance_pool.invalidate_all();
+        active_runtime.component_cache.invalidate_all();
+        active_runtime.component_instance_pre_cache.invalidate_all();
+        active_runtime.legacy_instance_pre_cache.invalidate_all();
         active_runtime.instance_pool.run_pending_tasks();
+        active_runtime.component_cache.run_pending_tasks();
+        active_runtime
+            .component_instance_pre_cache
+            .run_pending_tasks();
+        active_runtime.legacy_instance_pre_cache.run_pending_tasks();
         tracing::warn!(
             ?pressure,
-            "global memory governor evicted warm instance pool entries"
+            "global memory governor evicted warm wasm cache entries"
         );
     });
 }

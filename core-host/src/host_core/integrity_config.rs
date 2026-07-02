@@ -306,6 +306,9 @@ async fn forward_node_registry_faas(
     let route_overrides = Arc::clone(&state.route_overrides);
     let host_load = Arc::clone(&state.host_load);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let component_cache = Arc::clone(&runtime.component_cache);
+    let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let linker_cache = Arc::clone(&runtime.linker_cache);
     #[cfg(feature = "ai-inference")]
     let ai_runtime = Arc::clone(&runtime.ai_runtime);
@@ -331,9 +334,13 @@ async fn forward_node_registry_faas(
                 propagated_headers: Vec::new(),
                 route_overrides,
                 host_load,
+                local_mesh_dispatch: None,
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
                 instance_pool: Some(instance_pool),
+                component_cache: Some(component_cache),
+                component_instance_pre_cache: Some(component_instance_pre_cache),
+                legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
                 linker_cache: Some(linker_cache),
             },
         )

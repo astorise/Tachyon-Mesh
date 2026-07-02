@@ -1102,7 +1102,7 @@ pub(crate) async fn export_metering_batch(
     batch: Vec<String>,
 ) -> std::result::Result<(), String> {
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.sealed_route(SYSTEM_METERING_ROUTE).cloned() else {
+    let Some(route) = runtime.route_registry.sealed_route(SYSTEM_METERING_ROUTE) else {
         return Ok(());
     };
 
@@ -1111,10 +1111,10 @@ pub(crate) async fn export_metering_batch(
     let uri = Uri::from_static(SYSTEM_METERING_ROUTE);
     let body = encode_metering_batch(batch);
     let trailers = Vec::new();
-    let result = execute_route_with_middleware(
+    let result = execute_route_arc_with_middleware(
         state,
         &runtime,
-        &route,
+        route,
         &headers,
         &method,
         &uri,
@@ -1325,7 +1325,7 @@ pub(crate) async fn export_log_batch(
     batch: Vec<AsyncLogEntry>,
 ) -> std::result::Result<(), String> {
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.sealed_route(SYSTEM_LOGGER_ROUTE).cloned() else {
+    let Some(route) = runtime.route_registry.sealed_route(SYSTEM_LOGGER_ROUTE) else {
         return Ok(());
     };
 
@@ -1335,10 +1335,10 @@ pub(crate) async fn export_log_batch(
     let body = serde_json::to_vec(&batch)
         .map_err(|error| format!("failed to serialize log batch: {error}"))?;
     let trailers = Vec::new();
-    let result = execute_route_with_middleware(
+    let result = execute_route_arc_with_middleware(
         state,
         &runtime,
-        &route,
+        route,
         &headers,
         &method,
         &uri,
@@ -1396,10 +1396,10 @@ pub(crate) async fn custom_domain_routing_middleware(
         return next.run(req).await;
     };
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.route_for_domain(&host) else {
+    let Some(route) = runtime.route_registry.route_for_domain(&host) else {
         return next.run(req).await;
     };
-    let path = route_domain_request_path(route, req.uri());
+    let path = route_domain_request_path(&route, req.uri());
     let mut builder = Uri::builder();
     if let Some(scheme) = req.uri().scheme_str() {
         builder = builder.scheme(scheme);
@@ -1629,20 +1629,30 @@ pub(crate) fn requested_model_alias(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    let body_alias = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|payload| payload.as_object().cloned())
-        .and_then(|payload| {
-            ["model", "model_alias", "alias"]
-                .into_iter()
-                .find_map(|key| payload.get(key).and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        });
+    if let Some(alias) = header_alias {
+        return resolve_requested_model_alias(route, Some(alias));
+    }
 
-    header_alias
-        .or(body_alias)
+    let body_alias = if route.models.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|payload| {
+                ["model", "model_alias", "alias"]
+                    .into_iter()
+                    .find_map(|key| payload.get(key).and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+    };
+
+    resolve_requested_model_alias(route, body_alias)
+}
+
+fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) -> Option<String> {
+    alias
         .filter(|alias| {
             route.models.is_empty()
                 || route
@@ -1657,6 +1667,57 @@ pub(crate) fn requested_model_alias(
                 None
             }
         })
+}
+
+#[cfg(test)]
+mod requested_model_alias_tests {
+    use super::*;
+
+    fn model_binding(alias: &str) -> IntegrityModelBinding {
+        IntegrityModelBinding {
+            alias: alias.to_owned(),
+            path: String::new(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: true,
+            hardware_strategy: HardwareStrategy::default(),
+        }
+    }
+
+    #[test]
+    fn skips_body_alias_for_routes_without_model_bindings() {
+        let route = IntegrityRoute::user("/plain");
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(br#"{"model":"llama3"}"#);
+
+        assert_eq!(requested_model_alias(&route, &headers, &body), None);
+    }
+
+    #[test]
+    fn keeps_header_alias_available_for_routes_without_model_bindings() {
+        let route = IntegrityRoute::user("/plain");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tachyon-model", HeaderValue::from_static("llama3"));
+        let body = Bytes::from_static(br#"{"model":"ignored"}"#);
+
+        assert_eq!(
+            requested_model_alias(&route, &headers, &body).as_deref(),
+            Some("llama3")
+        );
+    }
+
+    #[test]
+    fn reads_body_alias_by_reference_for_model_routes() {
+        let mut route = IntegrityRoute::user("/ai");
+        route.models = vec![model_binding("llama3"), model_binding("mistral")];
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(br#"{"model":"mistral","messages":[{"role":"user"}]}"#);
+
+        assert_eq!(
+            requested_model_alias(&route, &headers, &body).as_deref(),
+            Some("mistral")
+        );
+    }
 }
 
 #[cfg(feature = "ai-inference")]
@@ -1747,13 +1808,13 @@ pub(crate) async fn execute_route_override(
         }
     } else {
         let override_path = normalize_route_path(destination);
-        match runtime.config.sealed_route(&override_path).cloned() {
+        match runtime.route_registry.sealed_route(&override_path) {
             Some(override_route) => {
                 let override_headers = clone_headers_with_original_route(headers, route);
-                match execute_route_with_middleware(
+                match execute_route_arc_with_middleware(
                     state,
                     runtime,
-                    &override_route,
+                    override_route,
                     &override_headers,
                     method,
                     uri,
@@ -1848,9 +1909,8 @@ pub(crate) async fn faas_handler(
     );
 
     let (response, fuel_consumed): (Response, Option<u64>) = match runtime
-        .config
+        .route_registry
         .sealed_route(&normalized_path)
-        .cloned()
     {
         None => (
             (
@@ -1961,7 +2021,7 @@ pub(crate) async fn faas_handler(
                                 Ok(upgrade) => {
                                     let upgrade: WebSocketUpgrade = upgrade;
                                     let websocket_state = state.clone();
-                                    let websocket_route = route.clone();
+                                    let websocket_route = route.as_ref().clone();
                                     let websocket_module = selected_target.module.clone();
                                     let websocket_target = selected_target.module.clone();
                                     (
@@ -2022,7 +2082,7 @@ pub(crate) async fn faas_handler(
                                 return match network::handle_streaming_http_request(
                                     state.clone(),
                                     Arc::clone(&runtime),
-                                    route.clone(),
+                                    Arc::clone(&route),
                                     selected_target.module.clone(),
                                     request,
                                 )
@@ -2032,10 +2092,10 @@ pub(crate) async fn faas_handler(
                                     Err((status, message)) => (status, message).into_response(),
                                 };
                             }
-                            match execute_route_with_middleware(
+                            match execute_route_arc_with_middleware(
                                 &state,
                                 &runtime,
-                                &route,
+                                Arc::clone(&route),
                                 &headers,
                                 &method,
                                 &uri,
@@ -2101,7 +2161,7 @@ pub(crate) async fn faas_handler(
                                 return match network::handle_streaming_http_request(
                                     state.clone(),
                                     Arc::clone(&runtime),
-                                    route.clone(),
+                                    Arc::clone(&route),
                                     selected_target.module.clone(),
                                     request,
                                 )
@@ -2111,10 +2171,10 @@ pub(crate) async fn faas_handler(
                                     Err((status, message)) => (status, message).into_response(),
                                 };
                             }
-                            match execute_route_with_middleware(
+                            match execute_route_arc_with_middleware(
                                 &state,
                                 &runtime,
-                                &route,
+                                Arc::clone(&route),
                                 &headers,
                                 &method,
                                 &uri,
@@ -2172,10 +2232,42 @@ pub(crate) async fn execute_route_with_middleware(
     sampled_execution: bool,
     selected_module: Option<&str>,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
+    execute_route_arc_with_middleware(
+        state,
+        runtime,
+        Arc::new(route.clone()),
+        headers,
+        method,
+        uri,
+        body,
+        trailers,
+        hop_limit,
+        trace_id,
+        sampled_execution,
+        selected_module,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_route_arc_with_middleware(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: Arc<IntegrityRoute>,
+    headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    trailers: &GuestHttpFields,
+    hop_limit: HopLimit,
+    trace_id: Option<&str>,
+    sampled_execution: bool,
+    selected_module: Option<&str>,
+) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     let invocation = RouteInvocation {
         state: state.clone(),
         runtime: Arc::clone(runtime),
-        route: route.clone(),
+        route,
         headers: headers.clone(),
         method: method.clone(),
         uri: uri.clone(),
@@ -2213,9 +2305,8 @@ pub(crate) async fn execute_route_with_middleware_inner(
             .resolve_named_route(middleware_name)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
         let middleware_route = runtime
-            .config
+            .route_registry
             .sealed_route(&middleware_resolved.path)
-            .cloned()
             .ok_or_else(|| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2297,9 +2388,8 @@ pub(crate) fn spawn_shadow_traffic_task(
         return;
     }
     let Some(shadow_route) = runtime
-        .config
+        .route_registry
         .sealed_route(SYSTEM_SHADOW_PROXY_ROUTE)
-        .cloned()
     else {
         tracing::warn!(
             route = %route.path,
@@ -2330,10 +2420,10 @@ pub(crate) fn spawn_shadow_traffic_task(
         let headers = HeaderMap::new();
         let method = Method::POST;
         let uri = Uri::from_static(SYSTEM_SHADOW_PROXY_ROUTE);
-        if let Err((status, message)) = execute_route_with_middleware(
+        if let Err((status, message)) = execute_route_arc_with_middleware(
             &state,
             &runtime,
-            &shadow_route,
+            shadow_route,
             &headers,
             &method,
             &uri,
@@ -2871,7 +2961,15 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
     let task_bridge_manager = Arc::clone(&state.bridge_manager);
     let task_async_log_sender = state.async_log_sender.clone();
     let task_instance_pool = Arc::clone(&runtime.instance_pool);
+    let task_component_cache = Arc::clone(&runtime.component_cache);
+    let task_component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let task_legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let task_linker_cache = Arc::clone(&runtime.linker_cache);
+    let task_local_mesh_dispatch = LocalMeshDispatchContext {
+        state: state.clone(),
+        runtime: Arc::clone(runtime),
+        handle: tokio::runtime::Handle::current(),
+    };
     let route_requires_tee = route.requires_tee;
     #[cfg(feature = "ai-inference")]
     let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
@@ -2930,9 +3028,13 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                             propagated_headers: task_propagated_headers,
                             route_overrides: task_route_overrides,
                             host_load: task_host_load,
+                            local_mesh_dispatch: Some(task_local_mesh_dispatch.clone()),
                             #[cfg(feature = "ai-inference")]
                             ai_runtime: task_ai_runtime,
                             instance_pool: None,
+                            component_cache: Some(task_component_cache),
+                            component_instance_pre_cache: Some(task_component_instance_pre_cache),
+                            legacy_instance_pre_cache: Some(task_legacy_instance_pre_cache),
                             linker_cache: Some(task_linker_cache),
                         },
                     )?;
@@ -2989,9 +3091,13 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                     propagated_headers: task_propagated_headers,
                     route_overrides: task_route_overrides,
                     host_load: task_host_load,
+                    local_mesh_dispatch: Some(task_local_mesh_dispatch),
                     #[cfg(feature = "ai-inference")]
                     ai_runtime: task_ai_runtime,
                     instance_pool: Some(task_instance_pool),
+                    component_cache: Some(task_component_cache),
+                    component_instance_pre_cache: Some(task_component_instance_pre_cache),
+                    legacy_instance_pre_cache: Some(task_legacy_instance_pre_cache),
                     linker_cache: Some(task_linker_cache),
                 },
             )
@@ -3030,7 +3136,9 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
         annotate_tee_response(&mut response, backend);
     }
 
-    let response = resolve_mesh_response(
+    let response = resolve_mesh_response_with_local_dispatch(
+        state,
+        runtime,
         &state.http_client,
         &response_config,
         &route_registry,
@@ -3231,7 +3339,85 @@ pub(crate) async fn acquire_route_permit(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) async fn resolve_mesh_response(
+    http_client: &Client,
+    config: &IntegrityConfig,
+    route_registry: &RouteRegistry,
+    caller_route: &IntegrityRoute,
+    host_identity: &HostIdentity,
+    uds_fast_path: &UdsFastPathRegistry,
+    hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
+    response: GuestHttpResponse,
+) -> std::result::Result<GuestHttpResponse, String> {
+    resolve_mesh_response_via_transport(
+        http_client,
+        config,
+        route_registry,
+        caller_route,
+        host_identity,
+        uds_fast_path,
+        hop_limit,
+        propagated_headers,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_mesh_response_with_local_dispatch(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    http_client: &Client,
+    config: &IntegrityConfig,
+    route_registry: &RouteRegistry,
+    caller_route: &IntegrityRoute,
+    host_identity: &HostIdentity,
+    uds_fast_path: &UdsFastPathRegistry,
+    hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
+    response: GuestHttpResponse,
+) -> std::result::Result<GuestHttpResponse, String> {
+    let Some(target) = extract_mesh_fetch_url(&response.body) else {
+        return Ok(response);
+    };
+    let resolved_target = resolve_outbound_http_target(
+        config,
+        route_registry,
+        caller_route,
+        &reqwest::Method::GET,
+        target,
+    )?;
+    if resolved_target.kind.is_internal() {
+        if let Some(response) = try_dispatch_local_mesh_fetch(
+            state,
+            runtime,
+            &resolved_target.url,
+            hop_limit,
+            propagated_headers,
+        )
+        .await?
+        {
+            return Ok(response);
+        }
+    }
+    resolve_mesh_response_via_transport(
+        http_client,
+        config,
+        route_registry,
+        caller_route,
+        host_identity,
+        uds_fast_path,
+        hop_limit,
+        propagated_headers,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_mesh_response_via_transport(
     http_client: &Client,
     config: &IntegrityConfig,
     route_registry: &RouteRegistry,
@@ -3292,6 +3478,125 @@ pub(crate) async fn resolve_mesh_response(
             "mesh fetch to `{url}` returned an error status: {status}"
         ))
     }
+}
+
+pub(crate) async fn try_dispatch_local_mesh_fetch(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    resolved_url: &str,
+    hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
+) -> std::result::Result<Option<GuestHttpResponse>, String> {
+    let headers = propagated_headers_to_header_map(propagated_headers)?;
+    let response = try_dispatch_local_mesh_request(
+        state,
+        runtime,
+        resolved_url,
+        &Method::GET,
+        &headers,
+        Bytes::new(),
+        Vec::new(),
+        hop_limit,
+    )
+    .await?;
+
+    if let Some(response) = response.as_ref() {
+        if response.status != StatusCode::LOOP_DETECTED && !response.status.is_success() {
+            return Err(format!(
+                "in-process mesh fetch to `{resolved_url}` returned an error status: {}",
+                response.status
+            ));
+        }
+    }
+
+    Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn try_dispatch_local_mesh_request(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    resolved_url: &str,
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
+    trailers: GuestHttpFields,
+    hop_limit: HopLimit,
+) -> std::result::Result<Option<GuestHttpResponse>, String> {
+    if hop_limit.0 <= 1 {
+        return Ok(Some(GuestHttpResponse::new(
+            StatusCode::LOOP_DETECTED,
+            "mesh hop limit exhausted",
+        )));
+    }
+    if state.memory_governor.pressure() == memory_governor::MemoryPressure::Critical {
+        return Ok(None);
+    }
+
+    let url = reqwest::Url::parse(resolved_url)
+        .map_err(|error| format!("internal mesh target `{resolved_url}` is invalid: {error}"))?;
+    let normalized_path = normalize_route_path(url.path());
+    let Some(route) = runtime.route_registry.sealed_route(&normalized_path) else {
+        return Ok(None);
+    };
+    let selected_target = select_route_target(&route, &HeaderMap::new()).map_err(|error| {
+        format!(
+            "failed to resolve local mesh target `{}`: {error}",
+            route.path
+        )
+    })?;
+    if !state.host_capabilities.supports(Capabilities::from_mask(
+        selected_target.required_capability_mask,
+    )) {
+        return Ok(None);
+    }
+    let Some(semaphore) = runtime.concurrency_limits.get(&route.path) else {
+        return Ok(None);
+    };
+    if semaphore.semaphore.available_permits() == 0 {
+        return Ok(None);
+    }
+
+    let uri = append_query(&normalized_path, url.query())
+        .parse::<Uri>()
+        .map_err(|error| {
+            format!("failed to build in-process mesh URI for `{resolved_url}`: {error}")
+        })?;
+    let result = Box::pin(execute_route_request(
+        state,
+        runtime,
+        &route,
+        headers,
+        method,
+        &uri,
+        &body,
+        &trailers,
+        HopLimit(hop_limit.decremented()),
+        None,
+        false,
+        Some(selected_target.module.as_str()),
+    ))
+    .await
+    .map_err(|(status, message)| {
+        format!("in-process mesh fetch to `{resolved_url}` failed with {status}: {message}")
+    })?;
+
+    Ok(Some(result.response))
+}
+
+fn propagated_headers_to_header_map(
+    propagated_headers: &[PropagatedHeader],
+) -> std::result::Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    for header in propagated_headers {
+        let name = hyper::header::HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|error| format!("invalid propagated header `{}`: {error}", header.name))?;
+        let value = HeaderValue::from_str(&header.value).map_err(|error| {
+            format!("invalid propagated header `{}` value: {error}", header.name)
+        })?;
+        headers.insert(name, value);
+    }
+    Ok(headers)
 }
 
 pub(crate) fn apply_mesh_fetch_headers(
@@ -3841,6 +4146,16 @@ impl RouteRegistry {
         let mut seen_versions = HashMap::<(String, String), String>::new();
 
         for route in &config.routes {
+            let sealed_route = Arc::new(route.clone());
+            registry
+                .sealed_by_path
+                .insert(route.path.clone(), Arc::clone(&sealed_route));
+            for domain in &route.domains {
+                registry
+                    .sealed_by_domain
+                    .insert(domain.clone(), Arc::clone(&sealed_route));
+            }
+
             let version = Version::parse(route.version.trim()).with_context(|| {
                 format!(
                     "Integrity Validation Failed: route `{}` has invalid semantic version `{}`",
@@ -3925,6 +4240,16 @@ impl RouteRegistry {
         }
 
         Ok(registry)
+    }
+
+    pub(crate) fn sealed_route(&self, path: &str) -> Option<Arc<IntegrityRoute>> {
+        let normalized = normalize_route_path(path);
+        self.sealed_by_path.get(&normalized).cloned()
+    }
+
+    pub(crate) fn route_for_domain(&self, domain: &str) -> Option<Arc<IntegrityRoute>> {
+        let normalized = tls_runtime::normalize_domain(domain).ok()?;
+        self.sealed_by_domain.get(&normalized).cloned()
     }
 
     pub(crate) fn ensure_dependencies_satisfied(

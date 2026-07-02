@@ -1152,6 +1152,8 @@ pub(crate) struct ResolvedRoute {
 pub(crate) struct RouteRegistry {
     pub(crate) by_name: HashMap<String, Vec<ResolvedRoute>>,
     pub(crate) by_path: HashMap<String, ResolvedRoute>,
+    pub(crate) sealed_by_path: HashMap<String, Arc<IntegrityRoute>>,
+    pub(crate) sealed_by_domain: HashMap<String, Arc<IntegrityRoute>>,
 }
 
 #[derive(Clone, Debug, Default)]

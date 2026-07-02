@@ -270,9 +270,13 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         propagated_headers: Vec::new(),
         route_overrides: test_route_overrides(),
         host_load: test_host_load(),
+        local_mesh_dispatch: None,
         #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         instance_pool: None,
+        component_cache: None,
+        component_instance_pre_cache: None,
+        legacy_instance_pre_cache: None,
         linker_cache: None,
     };
 
@@ -304,9 +308,13 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         propagated_headers: Vec::new(),
         route_overrides: test_route_overrides(),
         host_load: test_host_load(),
+        local_mesh_dispatch: None,
         #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         instance_pool: None,
+        component_cache: None,
+        component_instance_pre_cache: None,
+        legacy_instance_pre_cache: None,
         linker_cache: None,
     };
     let sync_start = Instant::now();
@@ -419,6 +427,24 @@ async fn router_returns_service_unavailable_when_route_concurrency_is_exhausted(
             Arc::new(RouteExecutionControl::from_limits(0, 0)),
         )])),
         instance_pool: Arc::new(
+            moka::sync::Cache::builder()
+                .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
+                .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
+                .build(),
+        ),
+        component_cache: Arc::new(
+            moka::sync::Cache::builder()
+                .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
+                .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
+                .build(),
+        ),
+        component_instance_pre_cache: Arc::new(
+            moka::sync::Cache::builder()
+                .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
+                .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
+                .build(),
+        ),
+        legacy_instance_pre_cache: Arc::new(
             moka::sync::Cache::builder()
                 .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
                 .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
@@ -552,9 +578,13 @@ fn system_guest_requires_system_route_role() {
             propagated_headers: Vec::new(),
             route_overrides: test_route_overrides(),
             host_load: test_host_load(),
+            local_mesh_dispatch: None,
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            component_cache: None,
+            component_instance_pre_cache: None,
+            legacy_instance_pre_cache: None,
             linker_cache: None,
         },
     )

@@ -129,7 +129,10 @@ async fn proxy_request_to_component(
     working_dir: fn(&Path) -> PathBuf,
 ) -> Response {
     let manifest_path = state.manifest_path.clone();
-    let engine = state.runtime.load().engine.clone();
+    let runtime = state.runtime.load();
+    let engine = runtime.engine.clone();
+    let component_cache = Arc::clone(&runtime.component_cache);
+    drop(runtime);
     let core_store = state.core_store.clone();
     #[cfg(feature = "s3-persistence")]
     let s3_backend = state.s3_backend.clone();
@@ -157,12 +160,26 @@ async fn proxy_request_to_component(
             s3_backend,
             #[cfg(feature = "s3-persistence")]
             core_store_path,
+            component_cache,
             component_request,
         )
     })
     .await
     {
-        Ok(Ok(response)) => component_response_to_http(response),
+        Ok(Ok(response)) => {
+            if module_name == REGISTRY_MODULE_NAME && response.status.is_success() {
+                let runtime = state.runtime.load();
+                runtime.instance_pool.invalidate_all();
+                runtime.component_cache.invalidate_all();
+                runtime.component_instance_pre_cache.invalidate_all();
+                runtime.legacy_instance_pre_cache.invalidate_all();
+                runtime.instance_pool.run_pending_tasks();
+                runtime.component_cache.run_pending_tasks();
+                runtime.component_instance_pre_cache.run_pending_tasks();
+                runtime.legacy_instance_pre_cache.run_pending_tasks();
+            }
+            component_response_to_http(response)
+        }
         Ok(Err(error)) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -195,6 +212,7 @@ fn invoke_storage_component(
         Arc<crate::persistence::S3PersistenceBackend>,
     >,
     #[cfg(feature = "s3-persistence")] core_store_path: PathBuf,
+    component_cache: Arc<moka::sync::Cache<PathBuf, crate::CachedComponent>>,
     request: ComponentRequest,
 ) -> Result<ComponentResponse> {
     tracing::info!(
@@ -218,14 +236,19 @@ fn invoke_storage_component(
     // Cranelift compile; every later chunk just deserializes the cached
     // precompiled artifact, so per-chunk host overhead stays flat instead of
     // growing with the number of chunks (and thus the model size).
-    let component =
-        crate::load_component_with_core_store(engine, &module_path, &core_store, "default")
-            .map_err(|error| {
-                anyhow!(
-                    "failed to load storage component `{module_name}` from `{}`: {error:#}",
-                    module_path.display()
-                )
-            })?;
+    let component = crate::load_component_with_pool(
+        engine,
+        &module_path,
+        &core_store,
+        "default",
+        Some(&component_cache),
+    )
+    .map_err(|error| {
+        anyhow!(
+            "failed to load storage component `{module_name}` from `{}`: {error:#}",
+            module_path.display()
+        )
+    })?;
 
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
@@ -266,7 +289,7 @@ fn invoke_storage_component(
             core_store_path,
         },
     );
-    let bindings = bindings::SystemFaasGuest::instantiate(&mut store, &component, &linker)
+    let bindings = bindings::SystemFaasGuest::instantiate(&mut store, component.as_ref(), &linker)
         .map_err(|error| anyhow!("failed to instantiate storage component: {error}"))?;
     let response = bindings
         .tachyon_mesh_handler()

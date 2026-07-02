@@ -105,9 +105,9 @@ pub(crate) use tokio::sync::{
 pub(crate) use tokio_rustls::LazyConfigAcceptor;
 pub(crate) use uuid::Uuid;
 pub(crate) use wasmtime::{
-    component::{Component, Linker as ComponentLinker},
-    Config, Engine, Instance, Linker as ModuleLinker, Module, PoolingAllocationConfig,
-    ResourceLimiter, Store, Trap, TypedFunc,
+    component::{Component, InstancePre as ComponentInstancePre, Linker as ComponentLinker},
+    Config, Engine, Instance, InstancePre as ModuleInstancePre, Linker as ModuleLinker, Module,
+    PoolingAllocationConfig, ResourceLimiter, Store, Trap, TypedFunc,
 };
 #[cfg(test)]
 pub(crate) use wasmtime_wasi::cli::OutputFile;
