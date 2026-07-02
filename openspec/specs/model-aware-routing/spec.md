@@ -16,3 +16,17 @@ The router SHALL consider hot-model state as a first-class placement signal so l
 - **WHEN** the router evaluates model-aware overflow candidates for a request that names a specific model alias
 - **THEN** it prefers peers whose advertised hot-model list contains that alias
 - **AND** only forwards to a lower-pressure peer when that peer is also hot for the requested model
+
+### Requirement: Model alias extraction avoids parsing non-AI request bodies
+The host SHALL extract model aliases from request bodies only for routes that declare model bindings. Header-based aliases such as `x-tachyon-model` SHALL remain available for every route, but non-AI routes SHALL NOT parse or clone full JSON request bodies only to evaluate model-aware routing.
+
+#### Scenario: Non-AI route carries a JSON body with a model field
+- **GIVEN** a sealed route without configured `models`
+- **WHEN** the request body contains a JSON `model` field
+- **THEN** the host does not parse the body for model-aware routing
+- **AND** it does not derive a requested model alias from that body field
+
+#### Scenario: AI route selects a model alias from the request body
+- **GIVEN** a sealed route with multiple configured `models`
+- **WHEN** the request body contains a JSON `model`, `model_alias`, or `alias` string
+- **THEN** the host may use that field to select the requested model alias without cloning the full JSON object map

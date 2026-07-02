@@ -1629,20 +1629,30 @@ pub(crate) fn requested_model_alias(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    let body_alias = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|payload| payload.as_object().cloned())
-        .and_then(|payload| {
-            ["model", "model_alias", "alias"]
-                .into_iter()
-                .find_map(|key| payload.get(key).and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        });
+    if let Some(alias) = header_alias {
+        return resolve_requested_model_alias(route, Some(alias));
+    }
 
-    header_alias
-        .or(body_alias)
+    let body_alias = if route.models.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|payload| {
+                ["model", "model_alias", "alias"]
+                    .into_iter()
+                    .find_map(|key| payload.get(key).and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+    };
+
+    resolve_requested_model_alias(route, body_alias)
+}
+
+fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) -> Option<String> {
+    alias
         .filter(|alias| {
             route.models.is_empty()
                 || route
@@ -1657,6 +1667,57 @@ pub(crate) fn requested_model_alias(
                 None
             }
         })
+}
+
+#[cfg(test)]
+mod requested_model_alias_tests {
+    use super::*;
+
+    fn model_binding(alias: &str) -> IntegrityModelBinding {
+        IntegrityModelBinding {
+            alias: alias.to_owned(),
+            path: String::new(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: true,
+            hardware_strategy: HardwareStrategy::default(),
+        }
+    }
+
+    #[test]
+    fn skips_body_alias_for_routes_without_model_bindings() {
+        let route = IntegrityRoute::user("/plain");
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(br#"{"model":"llama3"}"#);
+
+        assert_eq!(requested_model_alias(&route, &headers, &body), None);
+    }
+
+    #[test]
+    fn keeps_header_alias_available_for_routes_without_model_bindings() {
+        let route = IntegrityRoute::user("/plain");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tachyon-model", HeaderValue::from_static("llama3"));
+        let body = Bytes::from_static(br#"{"model":"ignored"}"#);
+
+        assert_eq!(
+            requested_model_alias(&route, &headers, &body).as_deref(),
+            Some("llama3")
+        );
+    }
+
+    #[test]
+    fn reads_body_alias_by_reference_for_model_routes() {
+        let mut route = IntegrityRoute::user("/ai");
+        route.models = vec![model_binding("llama3"), model_binding("mistral")];
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(br#"{"model":"mistral","messages":[{"role":"user"}]}"#);
+
+        assert_eq!(
+            requested_model_alias(&route, &headers, &body).as_deref(),
+            Some("mistral")
+        );
+    }
 }
 
 #[cfg(feature = "ai-inference")]
