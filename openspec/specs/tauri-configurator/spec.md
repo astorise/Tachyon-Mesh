@@ -172,8 +172,8 @@ Configuration panels that affect `core-host` runtime behavior SHALL read the act
 
 #### Scenario: Operator configures advanced route policy
 - **WHEN** the operator edits route policy fields from the expanded Routing view
-- **THEN** Tachyon Studio can write `routes[].concurrency`, `routes[].distributed_rate_limit`, `routes[].resource_policy`, `routes[].adapter_id`, and `routes[].shadow_target`
-- **AND** model policy edits are scoped to the matching `routes[].models[]` entry
+- **THEN** Tachyon Studio can write `routes[].concurrency`, `routes[].distributed_rate_limit`, `routes[].resource_policy`, `routes[].adapter_id`, `routes[].shadow_target`, `routes[].min_instances`, `routes[].max_concurrency`, `routes[].env`, and `routes[].domains`
+- **AND** model policy edits write only model binding fields such as `routes[].models[].qos` to the matching `routes[].models[]` entry
 - **AND** validation failures from manifest apply are returned to the panel feedback area
 
 #### Scenario: Legacy domain payload command is not exposed

@@ -81,8 +81,9 @@ The Tachyon-UI SHALL provide route detail controls that write supported `Integri
 
 #### Scenario: Operator edits model policy fields on a route
 - **WHEN** an operator saves a model policy row for a route-bound model
-- **THEN** Tachyon-UI mutates only the matching `routes[].models[]` entry
-- **AND** it can write `qos`, `min_instances`, `max_concurrency`, `env`, and `domains`
+- **THEN** Tachyon-UI writes the model binding field `routes[].models[].qos` only on the matching model entry
+- **AND** it writes `routes[].min_instances`, `routes[].max_concurrency`, `routes[].env`, and `routes[].domains` on the owning route
+- **AND** the submitted payload does not place route-level fields under `routes[].models[]`
 - **AND** it leaves other model bindings on the route unchanged
 
 ### Requirement: Route detail view includes a Scopes panel alongside Volumes and Concurrency panels

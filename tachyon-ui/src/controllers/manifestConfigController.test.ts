@@ -37,6 +37,10 @@ describe("manifestConfigController route policies", () => {
         path: "/chat",
         name: "chat",
         version: "v1",
+        min_instances: 1,
+        max_concurrency: 8,
+        env: { TENANT: "a" },
+        domains: ["chat"],
         distributed_rate_limit: { threshold: 100, window_seconds: 60, scope: "tenant" },
         resource_policy: { vram_mb: 4096, gpu_affinity: "gpu:0", admission_strategy: "queue" },
         adapter_id: "lora-tenant-a",
@@ -45,10 +49,6 @@ describe("manifestConfigController route policies", () => {
           alias: "qwen",
           path: "/models/qwen",
           qos: "gold",
-          min_instances: 1,
-          max_concurrency: 8,
-          env: { TENANT: "a" },
-          domains: ["chat"],
         }],
       }],
     });
@@ -59,7 +59,14 @@ describe("manifestConfigController route policies", () => {
       resourcePolicy: { vram_mb: 4096, gpu_affinity: "gpu:0", admission_strategy: "queue" },
       adapterId: "lora-tenant-a",
       shadowTarget: "/chat-shadow",
-      models: [{ alias: "qwen", qos: "gold", minInstances: 1, maxConcurrency: 8 }],
+      models: [{
+        alias: "qwen",
+        qos: "gold",
+        minInstances: 1,
+        maxConcurrency: 8,
+        env: { TENANT: "a" },
+        domains: ["chat"],
+      }],
     }]);
   });
 
@@ -118,11 +125,18 @@ describe("manifestConfigController route policies", () => {
     expect((appliedConfig() as { routes: Array<Record<string, unknown>> }).routes[0]).not.toHaveProperty("adapter_id");
   });
 
-  it("writes model qos, scale, env, and domains", async () => {
+  it("writes model qos on models and route scale, env, and domains on the route", async () => {
     mockManifest({
       routes: [{
         path: "/chat",
-        models: [{ alias: "qwen", path: "/models/qwen" }],
+        models: [{
+          alias: "qwen",
+          path: "/models/qwen",
+          min_instances: 1,
+          max_concurrency: 8,
+          env: { TENANT: "old" },
+          domains: ["legacy"],
+        }],
       }],
     });
 
@@ -137,15 +151,21 @@ describe("manifestConfigController route policies", () => {
     expect(appliedConfig()).toMatchObject({
       routes: [{
         path: "/chat",
+        min_instances: 2,
+        max_concurrency: 16,
+        env: { TENANT: "alpha" },
+        domains: ["chat", "rag"],
         models: [{
           alias: "qwen",
           qos: "gold",
-          min_instances: 2,
-          max_concurrency: 16,
-          env: { TENANT: "alpha" },
-          domains: ["chat", "rag"],
         }],
       }],
     });
+    const route = (appliedConfig() as { routes: Array<{ models: Array<Record<string, unknown>> }> }).routes[0];
+    const model = route.models[0];
+    expect(model).not.toHaveProperty("min_instances");
+    expect(model).not.toHaveProperty("max_concurrency");
+    expect(model).not.toHaveProperty("env");
+    expect(model).not.toHaveProperty("domains");
   });
 });
