@@ -30,6 +30,7 @@ const ADMIN_CANARY_PATH: &str = "/admin/canary";
 const ADMIN_LORA_TRAINING_PATH: &str = "/admin/lora/training";
 const ADMIN_SCHEMA_MANIFEST_PATH: &str = "/admin/schema/manifest";
 const ADMIN_KV_PATH: &str = "/admin/kv";
+const ADMIN_KV_CACHE_PATH: &str = "/admin/kv-cache";
 const ADMIN_LOGS_PATH: &str = "/admin/logs";
 const ADMIN_SHADOW_DIFFS_PATH: &str = "/admin/shadow/diffs";
 const ADMIN_CHAOS_SCENARIOS_PATH: &str = "/admin/chaos/scenarios";
@@ -594,6 +595,27 @@ pub struct RuntimeMetrics {
     pub ram_offload_active: bool,
     #[serde(default)]
     pub scope_denial_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvCacheStats {
+    pub model: String,
+    #[serde(alias = "entry_count")]
+    pub entry_count: u64,
+    #[serde(alias = "total_bytes")]
+    pub total_bytes: u64,
+    #[serde(alias = "expired_count")]
+    pub expired_count: u64,
+    #[serde(default, alias = "hit_rate")]
+    pub hit_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvCacheFlushOutcome {
+    pub model: String,
+    pub evicted: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2312,6 +2334,32 @@ pub async fn kv_delete(namespace: &str, key: &str) -> Result<()> {
         anyhow::bail!("kv_delete failed: HTTP {}", response.status());
     }
     Ok(())
+}
+
+/// Return the current LLM inference KV-cache entry and byte counters for a model.
+pub async fn kv_cache_stats(model: &str) -> Result<KvCacheStats> {
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+    let path = format!("{ADMIN_KV_CACHE_PATH}/{model}/stats");
+    get_admin_json(&path).await
+}
+
+/// Flush all LLM inference KV-cache entries for a model.
+pub async fn kv_cache_flush(model: &str) -> Result<KvCacheFlushOutcome> {
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+    let path = format!("{ADMIN_KV_CACHE_PATH}/{model}");
+    let config = require_connection()?;
+    let client = build_http_client(&config)?;
+    let response = client
+        .delete(build_endpoint_url(&config.url, &path)?)
+        .bearer_auth(&config.token)
+        .send()
+        .await
+        .with_context(|| format!("failed to flush Tachyon KV-cache `{model}`"))?;
+    decode_admin_response(response, &path).await
 }
 
 // ── WASM function lifecycle ───────────────────────────────────────────────────
@@ -4715,6 +4763,23 @@ mod tests {
             http_client_cache_key(&base),
             http_client_cache_key(&different_identity)
         );
+    }
+
+    #[test]
+    fn kv_cache_stats_deserializes_core_host_shape() {
+        let stats: KvCacheStats = serde_json::from_value(json!({
+            "model": "llama-3",
+            "entry_count": 4,
+            "total_bytes": 2048,
+            "expired_count": 1
+        }))
+        .expect("core-host stats shape should deserialize");
+
+        assert_eq!(stats.model, "llama-3");
+        assert_eq!(stats.entry_count, 4);
+        assert_eq!(stats.total_bytes, 2048);
+        assert_eq!(stats.expired_count, 1);
+        assert_eq!(stats.hit_rate, None);
     }
 
     #[test]

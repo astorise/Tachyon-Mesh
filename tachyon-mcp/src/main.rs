@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -291,6 +293,7 @@ fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<V
         "tachyon_kv_get" => &["namespace", "key"],
         "tachyon_kv_put" => &["namespace", "key", "value"],
         "tachyon_kv_delete" => &["namespace", "key"],
+        "tachyon_kv_cache_stats" | "tachyon_kv_cache_flush" => &["model"],
         "tachyon_canary_split" => &["route_path", "weight_pct"],
         "tachyon_register_resource" => &["name", "type", "target"],
         "tachyon_dryrun_manifest" => &["manifest"],
@@ -342,7 +345,10 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         "tachyon_deploy_function" | "tachyon_delete_function" => 5,
         "tachyon_register_resource" => 10,
         // KV mutators and log fetches — generous but bounded.
-        "tachyon_kv_put" | "tachyon_kv_delete" | "tachyon_function_logs" => 30,
+        "tachyon_kv_put"
+        | "tachyon_kv_delete"
+        | "tachyon_kv_cache_flush"
+        | "tachyon_function_logs" => 30,
         // Read-only telemetry and scope tools.
         "tachyon_get_metrics"
         | "tachyon_tail_logs"
@@ -362,6 +368,7 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         | "tachyon_list_functions"
         | "tachyon_lora_training_status"
         | "tachyon_kv_get"
+        | "tachyon_kv_cache_stats"
         | "tachyon_dryrun_manifest"
         | "validate_faas_capabilities"
         | "run_chaos_scenario"
@@ -932,6 +939,28 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                         "properties": {
                             "namespace": { "type": "string", "description": "The KV partition namespace." },
                             "key":       { "type": "string", "description": "Key to delete within the namespace." }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_kv_cache_stats",
+                    "description": "Return LLM inference KV-cache counters for a configured model from /admin/kv-cache/{model}/stats.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["model"],
+                        "properties": {
+                            "model": { "type": "string", "description": "Model reference declared in IntegrityConfig.kv_caches[].model_ref." }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_kv_cache_flush",
+                    "description": "Flush all LLM inference KV-cache entries for a configured model via /admin/kv-cache/{model}. Rate-limited mutator.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["model"],
+                        "properties": {
+                            "model": { "type": "string", "description": "Model reference declared in IntegrityConfig.kv_caches[].model_ref." }
                         }
                     }
                 },
@@ -1818,6 +1847,32 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
             )
         }
 
+        // ── LLM KV-cache admin ────────────────────────────────────────────────
+        "tachyon_kv_cache_stats" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let model = arguments
+                .get("model")
+                .and_then(Value::as_str)
+                .context("missing model")?;
+            let stats = tachyon_client::kv_cache_stats(model).await?;
+            Ok(text_tool_result(&stats)?)
+        }
+        "tachyon_kv_cache_flush" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let model = arguments
+                .get("model")
+                .and_then(Value::as_str)
+                .context("missing model")?;
+            let outcome = tachyon_client::kv_cache_flush(model).await?;
+            Ok(text_tool_result(&outcome)?)
+        }
+
         // ── Canary traffic split ──────────────────────────────────────────────
         "tachyon_canary_split" => {
             let arguments = params
@@ -2172,6 +2227,23 @@ mod tests {
     }
 
     #[test]
+    fn kv_cache_tools_require_model_arg() {
+        assert_eq!(
+            missing_required_args("tachyon_kv_cache_stats", Some(&json!({}))),
+            Some(vec!["model".to_owned()])
+        );
+        assert_eq!(
+            missing_required_args("tachyon_kv_cache_flush", Some(&json!({}))),
+            Some(vec!["model".to_owned()])
+        );
+        assert!(missing_required_args(
+            "tachyon_kv_cache_stats",
+            Some(&json!({"model": "llama-3"}))
+        )
+        .is_none());
+    }
+
+    #[test]
     fn scope_tools_rate_limits_match_spec() {
         let spec_set = rate_limit_spec("tachyon_set_route_scopes");
         assert!(
@@ -2211,6 +2283,40 @@ mod tests {
             30,
             "suggest_scopes limit must be 30/min"
         );
+    }
+
+    #[test]
+    fn kv_cache_tool_rate_limits_match_spec() {
+        let stats = rate_limit_spec("tachyon_kv_cache_stats")
+            .expect("kv-cache stats must have a rate limit");
+        assert_eq!(stats.limit, 100);
+
+        let flush = rate_limit_spec("tachyon_kv_cache_flush")
+            .expect("kv-cache flush must have a rate limit");
+        assert_eq!(flush.limit, 30);
+    }
+
+    #[tokio::test]
+    async fn tools_list_includes_kv_cache_admin_tools() {
+        let context = McpContext::new_for_tests(test_state_path("tools-list-kv-cache"));
+        let response = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            &context,
+        )
+        .await
+        .expect("tools/list should parse")
+        .expect("tools/list returns a response");
+
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools result should be an array");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+
+        assert!(names.contains(&"tachyon_kv_cache_stats"));
+        assert!(names.contains(&"tachyon_kv_cache_flush"));
     }
 
     #[test]

@@ -160,6 +160,26 @@ The MCP server SHALL expose tools for deploying and managing WASM functions, rea
 - **WHEN** `tachyon_canary_split` is called with `weight_pct = 0`
 - **THEN** the rollout is aborted and traffic reverts to the stable version
 
+### Requirement: MCP exposes LLM KV-cache administration tools
+The MCP server SHALL expose LLM inference KV-cache administration tools backed by the core-host `/admin/kv-cache/{model}` endpoints, distinct from the KV-Partition V2 tools.
+
+#### Scenario: Agent reads KV-cache stats for a model
+- **WHEN** an MCP client calls `tachyon_kv_cache_stats` with `model: "llama-3"`
+- **THEN** the MCP server calls `tachyon_client::kv_cache_stats("llama-3")`
+- **AND** the client queries `GET /admin/kv-cache/llama-3/stats`
+- **AND** the tool returns `model`, `entryCount`, `totalBytes`, and `expiredCount` in the JSON tool result
+- **AND** `hitRate` is optional when the core-host endpoint does not expose hit/miss counters
+
+#### Scenario: Agent flushes a model KV-cache
+- **WHEN** an MCP client calls `tachyon_kv_cache_flush` with `model: "llama-3"`
+- **THEN** the MCP server calls `tachyon_client::kv_cache_flush("llama-3")`
+- **AND** the client issues `DELETE /admin/kv-cache/llama-3`
+- **AND** the tool returns the model and number of evicted entries
+
+#### Scenario: KV-cache flush is rate-limited as a mutator
+- **WHEN** `tachyon_kv_cache_flush` exhausts its per-minute mutator bucket
+- **THEN** further calls return the structured rate-limit error (`-32002`) with `retry_after_ms`
+
 ### Requirement: tachyon-mcp MUST have a stdio E2E test harness
 A Rust integration test at `tachyon-mcp/tests/mcp_e2e_runner.rs` SHALL spawn the compiled `tachyon-mcp` binary, drive it via stdin/stdout, and assert that: (1) `initialize` returns the correct MCP protocol version; (2) `tools/list` returns a structurally valid JSON-RPC response; (3) with a live cluster, the core tools are present and read-only calls do not return `-32603`.
 
