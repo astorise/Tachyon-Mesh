@@ -83,6 +83,7 @@ impl ComponentHostState {
         storage_broker: Arc<StorageBrokerManager>,
         concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
         propagated_headers: Vec<PropagatedHeader>,
+        local_mesh_dispatch: Option<LocalMeshDispatchContext>,
         s3_preps: &[crate::host_core::volumes::S3VolumePrep],
     ) -> std::result::Result<Self, ExecutionError> {
         let scopes = {
@@ -136,6 +137,7 @@ impl ComponentHostState {
             host_capabilities: Capabilities::detect(),
             host_load: Arc::new(HostLoadCounters::default()),
             outbound_http_client: blocking_outbound_http_client(),
+            local_mesh_dispatch,
             route_path: route.path.clone(),
             route_role: route.role,
             #[cfg(feature = "ai-inference")]
@@ -2603,6 +2605,22 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             &method,
             &url,
         )?;
+        let outbound_headers = filtered_outbound_http_headers(
+            headers,
+            &self.propagated_headers,
+            &resolved_target.kind,
+        );
+        if resolved_target.kind.is_internal() {
+            if let Some(response) = self.try_send_in_process_outbound_request(
+                &resolved_target.url,
+                &method,
+                &outbound_headers,
+                &body,
+            )? {
+                return Ok(response);
+            }
+        }
+
         let url = rewrite_outbound_http_url(&resolved_target.url, &self.runtime_config);
 
         tracing::info!(
@@ -2613,11 +2631,7 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
         );
 
         let (headers, body) = inject_outbound_secrets(
-            filtered_outbound_http_headers(
-                headers,
-                &self.propagated_headers,
-                &resolved_target.kind,
-            ),
+            outbound_headers,
             body,
             outbound_target_host(&url).as_deref(),
         );
@@ -2654,6 +2668,45 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
                 body,
             },
         )
+    }
+}
+
+impl ComponentHostState {
+    fn try_send_in_process_outbound_request(
+        &self,
+        resolved_url: &str,
+        method: &reqwest::Method,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> std::result::Result<
+        Option<background_component_bindings::tachyon::mesh::outbound_http::Response>,
+        String,
+    > {
+        let Some(context) = self.local_mesh_dispatch.as_ref() else {
+            return Ok(None);
+        };
+        let method = Method::from_bytes(method.as_str().as_bytes())
+            .map_err(|error| format!("invalid local outbound HTTP method `{method}`: {error}"))?;
+        let header_map = guest_fields_to_header_map(&headers.to_vec(), "outbound HTTP headers")?;
+        let response = context.handle.block_on(try_dispatch_local_mesh_request(
+            &context.state,
+            &context.runtime,
+            resolved_url,
+            &method,
+            &header_map,
+            Bytes::copy_from_slice(body),
+            Vec::new(),
+            resolve_incoming_hop_limit(&self.request_headers)
+                .unwrap_or(HopLimit(DEFAULT_HOP_LIMIT)),
+        ))?;
+
+        Ok(response.map(|response| {
+            background_component_bindings::tachyon::mesh::outbound_http::Response {
+                status: response.status.as_u16(),
+                headers: response.headers,
+                body: response.body.to_vec(),
+            }
+        }))
     }
 }
 

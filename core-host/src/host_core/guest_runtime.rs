@@ -443,6 +443,7 @@ pub(crate) fn execute_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
+            execution.local_mesh_dispatch.clone(),
             &s3_preps,
         )?,
     );
@@ -588,6 +589,7 @@ pub(crate) fn execute_udp_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
+            None,
             &[],
         )?,
     );
@@ -740,6 +742,7 @@ pub(crate) fn execute_websocket_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
+            None,
             &[],
         )?,
     );
@@ -1033,6 +1036,7 @@ pub(crate) fn execute_streaming_component_guest(
         Arc::clone(&execution.storage_broker),
         Arc::clone(&execution.concurrency_limits),
         execution.propagated_headers.clone(),
+        execution.local_mesh_dispatch.clone(),
         &s3_preps,
     ) {
         Ok(s) => s,
@@ -1271,6 +1275,7 @@ pub(crate) fn execute_system_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
+            execution.local_mesh_dispatch.clone(),
             &[],
         )?,
     );
@@ -1486,6 +1491,7 @@ impl BackgroundTickRunner {
                 storage_broker,
                 concurrency_limits,
                 Vec::new(),
+                None,
                 &[],
             )?,
         );

@@ -657,6 +657,131 @@ async fn resolve_mesh_response_forwards_propagated_cohort_headers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn resolve_mesh_response_attempts_sealed_local_route_in_process() {
+    let mut config = IntegrityConfig::default_sealed();
+    config.host_address = "127.0.0.1:9".to_owned();
+    let config = validate_integrity_config(config).expect("config should validate");
+    let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+    let runtime = state.runtime.load_full();
+    let route_registry = RouteRegistry::build(&config).expect("route registry should build");
+    let caller_route = config
+        .sealed_route(DEFAULT_ROUTE)
+        .expect("default route should remain sealed");
+
+    let error = resolve_mesh_response_with_local_dispatch(
+        &state,
+        &runtime,
+        &Client::new(),
+        &config,
+        &route_registry,
+        caller_route,
+        state.host_identity.as_ref(),
+        &new_uds_fast_path_registry(),
+        HopLimit(DEFAULT_HOP_LIMIT),
+        &[],
+        GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:/api/guest-example"),
+    )
+    .await
+    .expect_err("local mesh fetch should attempt the in-process guest before transport fallback");
+
+    assert!(
+        error.contains("guest artifact not found"),
+        "expected local guest loading failure, got: {error}"
+    );
+    assert!(
+        !error.contains("failed to send") && !error.contains("connection refused"),
+        "local sealed route should not fall through to HTTP transport: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_mesh_dispatch_yields_to_transport_when_route_is_saturated() {
+    let mut route = IntegrityRoute::user(DEFAULT_ROUTE);
+    route.max_concurrency = 1;
+    let config = validate_integrity_config(IntegrityConfig {
+        routes: vec![route],
+        ..IntegrityConfig::default_sealed()
+    })
+    .expect("config should validate");
+    let state = build_test_state(config, telemetry::init_test_telemetry());
+    let runtime = state.runtime.load_full();
+    let semaphore = runtime
+        .concurrency_limits
+        .get(DEFAULT_ROUTE)
+        .expect("default route should have a concurrency limiter");
+    let _permit = semaphore
+        .semaphore
+        .clone()
+        .try_acquire_owned()
+        .expect("test should acquire the only local permit");
+
+    let response = try_dispatch_local_mesh_fetch(
+        &state,
+        &runtime,
+        "http://127.0.0.1:9/api/guest-example",
+        HopLimit(DEFAULT_HOP_LIMIT),
+        &[],
+    )
+    .await
+    .expect("saturated local route should be a transport fallback");
+
+    assert!(response.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbound_http_import_attempts_sealed_local_route_in_process() {
+    let mut config = IntegrityConfig::default_sealed();
+    config.host_address = "127.0.0.1:9".to_owned();
+    let config = validate_integrity_config(config).expect("config should validate");
+    let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+    let runtime = state.runtime.load_full();
+    let caller_route = config
+        .sealed_route(DEFAULT_ROUTE)
+        .expect("default route should remain sealed");
+    let mut host = ComponentHostState::new(
+        caller_route,
+        config.clone(),
+        runtime.config.guest_memory_limit_bytes,
+        state.telemetry.clone(),
+        SecretAccess::default(),
+        HeaderMap::new(),
+        Arc::clone(&state.host_identity),
+        Arc::clone(&state.storage_broker),
+        Arc::clone(&runtime.concurrency_limits),
+        Vec::new(),
+        Some(LocalMeshDispatchContext {
+            state: state.clone(),
+            runtime,
+            handle: tokio::runtime::Handle::current(),
+        }),
+        &[],
+    )
+    .expect("component host state should build");
+
+    let error = tokio::task::spawn_blocking(move || {
+        <ComponentHostState as background_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
+            &mut host,
+            "GET".to_owned(),
+            "http://mesh/api/guest-example".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+    })
+    .await
+    .expect("outbound HTTP import should run on a blocking worker")
+    .expect_err("local outbound HTTP should attempt in-process execution before transport fallback");
+
+    assert!(
+        error.contains("guest artifact not found"),
+        "expected local guest loading failure, got: {error}"
+    );
+    assert!(
+        !error.contains("failed to send") && !error.contains("connection refused"),
+        "local sealed outbound HTTP should not fall through to transport: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn resolve_mesh_response_does_not_leak_identity_headers_to_external_targets() {
     use axum::{extract::State, routing::get, Router};
 

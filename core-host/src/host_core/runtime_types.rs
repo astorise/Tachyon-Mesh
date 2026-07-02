@@ -119,6 +119,7 @@ pub(crate) struct ComponentHostState {
     pub(crate) host_capabilities: Capabilities,
     pub(crate) host_load: Arc<HostLoadCounters>,
     pub(crate) outbound_http_client: reqwest::blocking::Client,
+    pub(crate) local_mesh_dispatch: Option<LocalMeshDispatchContext>,
     pub(crate) route_path: String,
     pub(crate) route_role: RouteRole,
     #[cfg(feature = "ai-inference")]
@@ -135,6 +136,13 @@ pub(crate) struct ComponentHostState {
     /// `handle-request`. `None` on the buffered path — `get-streaming-response`
     /// returns an error, and the guest falls back to the buffered return value.
     pub(crate) streaming_body: Option<HostStreamingBodySlot>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalMeshDispatchContext {
+    pub(crate) state: crate::state::AppState,
+    pub(crate) runtime: Arc<RuntimeState>,
+    pub(crate) handle: tokio::runtime::Handle,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -170,6 +178,7 @@ pub(crate) struct GuestExecutionContext {
     pub(crate) propagated_headers: Vec<PropagatedHeader>,
     pub(crate) route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
     pub(crate) host_load: Arc<HostLoadCounters>,
+    pub(crate) local_mesh_dispatch: Option<LocalMeshDispatchContext>,
     /// In-memory `Arc<Module>` cache shared with the active runtime. The hot
     /// HTTP / L4 paths consult this before the redb-backed `cwasm_cache` to
     /// avoid the `Module::deserialize` cost on every request. Tests fill in

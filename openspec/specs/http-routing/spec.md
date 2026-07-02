@@ -50,7 +50,7 @@ The guest module SHALL read its input from standard input, write its response to
 - **AND** the host returns those bytes as the HTTP response body
 
 ### Requirement: Host can fulfill mesh fetch commands emitted by a guest
-If the captured guest stdout contains a single line beginning with `MESH_FETCH:`, the host SHALL interpret the remainder as an outbound HTTP target, perform the fetch on the guest's behalf, and return the fetched response body to the original client.
+If the captured guest stdout contains a single line beginning with `MESH_FETCH:`, the host SHALL interpret the remainder as an outbound target and return the fetched response body to the original client. Internal targets that resolve to a sealed route in the same host process SHALL be dispatched through the in-process guest execution pipeline before any UDS or TCP transport is attempted. The transport path remains the fallback for external targets, remote targets, critical local memory pressure, or local route saturation.
 
 #### Scenario: Guest asks the host to reach a legacy service
 - **WHEN** the guest stdout is `MESH_FETCH:http://legacy-service:8081/ping`
@@ -60,9 +60,16 @@ If the captured guest stdout contains a single line beginning with `MESH_FETCH:`
 
 #### Scenario: Guest asks the host to recurse through another sealed mesh route
 - **WHEN** the guest stdout is `MESH_FETCH:/api/guest-loop`
-- **THEN** the host resolves the relative route against its own HTTP listener
-- **AND** the host injects the decremented `X-Tachyon-Hop-Limit` header into the outbound request
+- **THEN** the host resolves the relative route against the sealed route registry
+- **AND** the host dispatches the target route in-process when a local concurrency permit is available
+- **AND** the in-process dispatch preserves route target selection, resource admission, concurrency admission, canary routing, cohort propagation, telemetry, and a decremented hop limit
 - **AND** the host returns the downstream response status and body to the original client
+
+#### Scenario: Local route saturation falls back to transport
+- **WHEN** the guest stdout targets a sealed route in the same host process
+- **AND** the target route has no available local concurrency permit or local memory pressure is critical
+- **THEN** the host does not execute the target route in-process
+- **AND** the request falls back to the existing UDS/TCP mesh transport path
 
 ### Requirement: Host enforces a request hop limit for inbound and outbound mesh traffic
 The `core-host` gateway SHALL track a request-scoped hop limit using the `X-Tachyon-Hop-Limit` header so distributed routing loops are rejected before they can exhaust host resources.
@@ -230,6 +237,13 @@ rewrites the target.
 - **AND** `inventory-api` is sealed as an internal resource alias targeting a compatible route
 - **THEN** the host rewrites the request to the local mesh route for that sealed target
 - **AND** it preserves `/items?expand=1`
+
+#### Scenario: WIT outbound HTTP targets a local sealed route
+- **WHEN** a component guest calls `tachyon:mesh/outbound-http.send-request` with an internal mesh URL
+- **AND** the URL resolves to a sealed route in the same host process
+- **THEN** the host dispatches the target route in-process when a local concurrency permit is available
+- **AND** the original method, headers, body, query string, cohort context, route policies, and decremented hop limit are preserved
+- **AND** the host uses UDS/TCP only when the local route is saturated, unavailable, or under critical memory pressure
 
 #### Scenario: External resource alias rewrites to a sealed HTTPS endpoint
 - **WHEN** a guest requests `http://mesh/payment-gateway/charges?expand=1`

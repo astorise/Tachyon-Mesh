@@ -2872,6 +2872,11 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
     let task_async_log_sender = state.async_log_sender.clone();
     let task_instance_pool = Arc::clone(&runtime.instance_pool);
     let task_linker_cache = Arc::clone(&runtime.linker_cache);
+    let task_local_mesh_dispatch = LocalMeshDispatchContext {
+        state: state.clone(),
+        runtime: Arc::clone(runtime),
+        handle: tokio::runtime::Handle::current(),
+    };
     let route_requires_tee = route.requires_tee;
     #[cfg(feature = "ai-inference")]
     let task_ai_runtime = Arc::clone(&runtime.ai_runtime);
@@ -2930,6 +2935,7 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                             propagated_headers: task_propagated_headers,
                             route_overrides: task_route_overrides,
                             host_load: task_host_load,
+                            local_mesh_dispatch: Some(task_local_mesh_dispatch.clone()),
                             #[cfg(feature = "ai-inference")]
                             ai_runtime: task_ai_runtime,
                             instance_pool: None,
@@ -2989,6 +2995,7 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                     propagated_headers: task_propagated_headers,
                     route_overrides: task_route_overrides,
                     host_load: task_host_load,
+                    local_mesh_dispatch: Some(task_local_mesh_dispatch),
                     #[cfg(feature = "ai-inference")]
                     ai_runtime: task_ai_runtime,
                     instance_pool: Some(task_instance_pool),
@@ -3030,7 +3037,9 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
         annotate_tee_response(&mut response, backend);
     }
 
-    let response = resolve_mesh_response(
+    let response = resolve_mesh_response_with_local_dispatch(
+        state,
+        runtime,
         &state.http_client,
         &response_config,
         &route_registry,
@@ -3231,7 +3240,85 @@ pub(crate) async fn acquire_route_permit(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) async fn resolve_mesh_response(
+    http_client: &Client,
+    config: &IntegrityConfig,
+    route_registry: &RouteRegistry,
+    caller_route: &IntegrityRoute,
+    host_identity: &HostIdentity,
+    uds_fast_path: &UdsFastPathRegistry,
+    hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
+    response: GuestHttpResponse,
+) -> std::result::Result<GuestHttpResponse, String> {
+    resolve_mesh_response_via_transport(
+        http_client,
+        config,
+        route_registry,
+        caller_route,
+        host_identity,
+        uds_fast_path,
+        hop_limit,
+        propagated_headers,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_mesh_response_with_local_dispatch(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    http_client: &Client,
+    config: &IntegrityConfig,
+    route_registry: &RouteRegistry,
+    caller_route: &IntegrityRoute,
+    host_identity: &HostIdentity,
+    uds_fast_path: &UdsFastPathRegistry,
+    hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
+    response: GuestHttpResponse,
+) -> std::result::Result<GuestHttpResponse, String> {
+    let Some(target) = extract_mesh_fetch_url(&response.body) else {
+        return Ok(response);
+    };
+    let resolved_target = resolve_outbound_http_target(
+        config,
+        route_registry,
+        caller_route,
+        &reqwest::Method::GET,
+        target,
+    )?;
+    if resolved_target.kind.is_internal() {
+        if let Some(response) = try_dispatch_local_mesh_fetch(
+            state,
+            runtime,
+            &resolved_target.url,
+            hop_limit,
+            propagated_headers,
+        )
+        .await?
+        {
+            return Ok(response);
+        }
+    }
+    resolve_mesh_response_via_transport(
+        http_client,
+        config,
+        route_registry,
+        caller_route,
+        host_identity,
+        uds_fast_path,
+        hop_limit,
+        propagated_headers,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_mesh_response_via_transport(
     http_client: &Client,
     config: &IntegrityConfig,
     route_registry: &RouteRegistry,
@@ -3292,6 +3379,125 @@ pub(crate) async fn resolve_mesh_response(
             "mesh fetch to `{url}` returned an error status: {status}"
         ))
     }
+}
+
+pub(crate) async fn try_dispatch_local_mesh_fetch(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    resolved_url: &str,
+    hop_limit: HopLimit,
+    propagated_headers: &[PropagatedHeader],
+) -> std::result::Result<Option<GuestHttpResponse>, String> {
+    let headers = propagated_headers_to_header_map(propagated_headers)?;
+    let response = try_dispatch_local_mesh_request(
+        state,
+        runtime,
+        resolved_url,
+        &Method::GET,
+        &headers,
+        Bytes::new(),
+        Vec::new(),
+        hop_limit,
+    )
+    .await?;
+
+    if let Some(response) = response.as_ref() {
+        if response.status != StatusCode::LOOP_DETECTED && !response.status.is_success() {
+            return Err(format!(
+                "in-process mesh fetch to `{resolved_url}` returned an error status: {}",
+                response.status
+            ));
+        }
+    }
+
+    Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn try_dispatch_local_mesh_request(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    resolved_url: &str,
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
+    trailers: GuestHttpFields,
+    hop_limit: HopLimit,
+) -> std::result::Result<Option<GuestHttpResponse>, String> {
+    if hop_limit.0 <= 1 {
+        return Ok(Some(GuestHttpResponse::new(
+            StatusCode::LOOP_DETECTED,
+            "mesh hop limit exhausted",
+        )));
+    }
+    if state.memory_governor.pressure() == memory_governor::MemoryPressure::Critical {
+        return Ok(None);
+    }
+
+    let url = reqwest::Url::parse(resolved_url)
+        .map_err(|error| format!("internal mesh target `{resolved_url}` is invalid: {error}"))?;
+    let normalized_path = normalize_route_path(url.path());
+    let Some(route) = runtime.config.sealed_route(&normalized_path).cloned() else {
+        return Ok(None);
+    };
+    let selected_target = select_route_target(&route, &HeaderMap::new()).map_err(|error| {
+        format!(
+            "failed to resolve local mesh target `{}`: {error}",
+            route.path
+        )
+    })?;
+    if !state.host_capabilities.supports(Capabilities::from_mask(
+        selected_target.required_capability_mask,
+    )) {
+        return Ok(None);
+    }
+    let Some(semaphore) = runtime.concurrency_limits.get(&route.path) else {
+        return Ok(None);
+    };
+    if semaphore.semaphore.available_permits() == 0 {
+        return Ok(None);
+    }
+
+    let uri = append_query(&normalized_path, url.query())
+        .parse::<Uri>()
+        .map_err(|error| {
+            format!("failed to build in-process mesh URI for `{resolved_url}`: {error}")
+        })?;
+    let result = Box::pin(execute_route_request(
+        state,
+        runtime,
+        &route,
+        headers,
+        method,
+        &uri,
+        &body,
+        &trailers,
+        HopLimit(hop_limit.decremented()),
+        None,
+        false,
+        Some(selected_target.module.as_str()),
+    ))
+    .await
+    .map_err(|(status, message)| {
+        format!("in-process mesh fetch to `{resolved_url}` failed with {status}: {message}")
+    })?;
+
+    Ok(Some(result.response))
+}
+
+fn propagated_headers_to_header_map(
+    propagated_headers: &[PropagatedHeader],
+) -> std::result::Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    for header in propagated_headers {
+        let name = hyper::header::HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|error| format!("invalid propagated header `{}`: {error}", header.name))?;
+        let value = HeaderValue::from_str(&header.value).map_err(|error| {
+            format!("invalid propagated header `{}` value: {error}", header.name)
+        })?;
+        headers.insert(name, value);
+    }
+    Ok(headers)
 }
 
 pub(crate) fn apply_mesh_fetch_headers(

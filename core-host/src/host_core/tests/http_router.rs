@@ -270,6 +270,7 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         propagated_headers: Vec::new(),
         route_overrides: test_route_overrides(),
         host_load: test_host_load(),
+        local_mesh_dispatch: None,
         #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         instance_pool: None,
@@ -304,6 +305,7 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         propagated_headers: Vec::new(),
         route_overrides: test_route_overrides(),
         host_load: test_host_load(),
+        local_mesh_dispatch: None,
         #[cfg(feature = "ai-inference")]
         ai_runtime: test_ai_runtime(&config),
         instance_pool: None,
@@ -552,6 +554,7 @@ fn system_guest_requires_system_route_role() {
             propagated_headers: Vec::new(),
             route_overrides: test_route_overrides(),
             host_load: test_host_load(),
+            local_mesh_dispatch: None,
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,

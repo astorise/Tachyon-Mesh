@@ -669,6 +669,7 @@ pub(crate) async fn handle_udp_layer4_datagram(
             propagated_headers: Vec::new(),
             route_overrides,
             host_load,
+            local_mesh_dispatch: None,
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
@@ -1189,6 +1190,7 @@ pub(crate) fn execute_tcp_layer4_guest(
         propagated_headers: Vec::new(),
         route_overrides,
         host_load,
+        local_mesh_dispatch: None,
         #[cfg(feature = "ai-inference")]
         ai_runtime,
         instance_pool: None,
