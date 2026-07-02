@@ -99,10 +99,6 @@ describe("TachyonAIPanel", () => {
         ],
       }),
     });
-    expect(tauriInvokeMock).not.toHaveBeenCalledWith(
-      "apply_configuration",
-      expect.objectContaining({ domain: "config-ai" }),
-    );
   });
 
   it("writes hardware_strategy on the selected manifest model binding", async () => {
@@ -163,9 +159,5 @@ describe("TachyonAIPanel", () => {
         ],
       }),
     });
-    expect(tauriInvokeMock).not.toHaveBeenCalledWith(
-      "apply_configuration",
-      expect.objectContaining({ domain: "config-ai" }),
-    );
   });
 });

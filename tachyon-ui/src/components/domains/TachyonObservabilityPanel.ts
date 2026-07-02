@@ -1,6 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import { readScopeMetrics } from "../../controllers/scopesController";
 
@@ -117,39 +117,13 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
           </div>
         </article>
 
-        <article data-stagger-panel class="rounded-lg border border-slate-700 bg-slate-800/40 p-6">
-          <h3 class="mb-4 text-sm font-semibold uppercase tracking-widest text-cyan-300">${t("observability.config.title")}</h3>
-          <form class="space-y-6">
-            <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("observability.config.endpoint")}
-              <input id="otlp-endpoint" type="url" placeholder="https://otel-collector.tachyon.local/v1/traces" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-slate-200 outline-none transition-colors focus:border-cyan-400">
-            </label>
-
-            <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("observability.config.log-level")}
-              <select id="log-level" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-slate-200 outline-none transition-colors focus:border-cyan-400">
-                <option value="debug">Debug</option>
-                <option value="info" selected>Info</option>
-                <option value="warn">Warn</option>
-                <option value="error">Error</option>
-              </select>
-            </label>
-
-            <button class="border border-cyan-500 px-6 py-3 font-bold text-cyan-500 transition-colors hover:bg-cyan-500 hover:text-slate-950">
-              ${t("observability.config.update")}
-            </button>
-          </form>
-        </article>
-
-        <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">${t("observability.feedback.empty")}</div>
+        <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">Observability policy is runtime-derived; no manifest field is edited here.</div>
       </section>
     `);
     this.populateObservability();
   }
 
   private bindEvents(): void {
-    this.root.querySelector("form")?.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void this.applyObservabilityConfig();
-    });
     this.root.getElementById("btn-refresh-observability")?.addEventListener("click", () => {
       void this.refreshTelemetry();
     });
@@ -256,22 +230,6 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
     this.animateEntrance();
   }
 
-  private async applyObservabilityConfig(): Promise<void> {
-    try {
-      const response = await applyAndSeal("observability", {
-          otlp_endpoint: this.value("otlp-endpoint", ""),
-          log_level: this.value("log-level", "info"),
-      });
-      this.showFeedback(response.success ? "success" : "error", response.message);
-    } catch (error) {
-      this.showFeedback("error", error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  private value(id: string, fallback: string): string {
-    const value = (this.root.getElementById(id) as HTMLInputElement | HTMLSelectElement | null)?.value.trim();
-    return value ? value : fallback;
-  }
 }
 
 customElements.define("tachyon-observability-panel", TachyonObservabilityPanel);

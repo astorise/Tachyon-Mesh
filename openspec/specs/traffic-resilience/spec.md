@@ -4,36 +4,36 @@
 TBD - created by archiving change tachyon-ui-traffic-dashboards. Update Purpose after archive.
 ## Requirements
 ### Requirement: Tachyon UI MUST expose a routing panel Web Component
-Tachyon UI SHALL provide a `<tachyon-routing-panel>` Web Component for configuring path-to-workload routing through the shared configuration dashboard foundation.
+Tachyon UI SHALL provide a `<tachyon-routing-panel>` Web Component for previewing sealed routes and editing manifest-backed routing controls.
 
-#### Scenario: Routing panel renders path and target inputs
+#### Scenario: Routing panel renders manifest controls
 - **GIVEN** the App Shell mounts `<tachyon-routing-panel>`
 - **WHEN** the component renders
-- **THEN** it displays an inbound path input
-- **AND** it displays a target workload input
-- **AND** it includes a deploy action and feedback zone.
+- **THEN** it displays sealed route previews from `get_mesh_graph`
+- **AND** it displays manifest-backed controls for layer4 bindings, TEE backend, telemetry sample rate, instance pool memory, cloud sync endpoint, batch targets, and scope enforcement
+- **AND** it includes a feedback zone.
 
-#### Scenario: Routing panel submits through Tauri
-- **GIVEN** the operator enters a path and target workload
-- **WHEN** the deploy action is submitted
-- **THEN** the panel invokes `apply_configuration`
-- **AND** the request uses the `config-routing` domain
-- **AND** successful validation displays success feedback.
+#### Scenario: Routing panel applies through manifest controller
+- **GIVEN** the operator edits routing manifest controls
+- **WHEN** the form is submitted
+- **THEN** the panel mutates the corresponding `IntegrityConfig` fields
+- **AND** applies the updated manifest through `apply_manifest_config`
+- **AND** it does not submit a legacy `config-routing` payload.
 
 ### Requirement: Tachyon UI MUST expose a resilience panel Web Component
-Tachyon UI SHALL provide a `<tachyon-resilience-panel>` Web Component for configuring timeout, retries, and circuit breaker threshold values.
+Tachyon UI SHALL provide a `<tachyon-resilience-panel>` Web Component for configuring route-level timeout and retry values.
 
 #### Scenario: Resilience panel renders policy controls
 - **GIVEN** the App Shell mounts `<tachyon-resilience-panel>`
 - **WHEN** the component renders
-- **THEN** it displays timeout, retry count, and circuit breaker threshold controls
+- **THEN** it displays a route selector, timeout, retry count, and retry status controls
 - **AND** it includes an apply action and feedback zone.
 
-#### Scenario: Resilience panel submits through Tauri
-- **GIVEN** the operator enters resilience policy values
+#### Scenario: Resilience panel applies through manifest controller
+- **GIVEN** the operator enters route resilience policy values
 - **WHEN** the apply action is submitted
-- **THEN** the panel invokes `apply_configuration`
-- **AND** the request uses the `config-resilience` domain
+- **THEN** the panel mutates `routes[].resiliency` on the selected route
+- **AND** applies the updated manifest through `apply_manifest_config`
 - **AND** validation errors are displayed without unmounting the App Shell.
 
 ### Requirement: Traffic dashboards MUST animate successful feedback
@@ -44,4 +44,3 @@ Traffic and resilience dashboard feedback SHALL pulse when a configuration is su
 - **WHEN** it renders success feedback
 - **THEN** `#feedback-zone` receives a GSAP success pulse
 - **AND** the dashboard remains interactive after the animation.
-

@@ -41,27 +41,24 @@ The Tachyon AI panel SHALL expose each route model binding from the active manif
 - **THEN** the AI panel displays the returned rejection message in its feedback area
 
 ### Requirement: Hardware Accelerator Panel
-The Tachyon UI shell SHALL expose a `<tachyon-hardware-panel>` web component for selecting NPU, TPU, or GPU acceleration and enabling eBPF XDP offloading.
+The Tachyon UI shell SHALL expose a `<tachyon-hardware-panel>` web component for live hardware and VRAM visibility. Hardware strategy edits SHALL live in the AI panel on `routes[].models[].hardware_strategy`.
 
-#### Scenario: Operator applies accelerator policy
-- **WHEN** the operator selects an accelerator and toggles XDP offload
-- **THEN** the panel sends those choices as part of a `config-ai` payload for strict backend validation
+#### Scenario: Operator inspects hardware status
+- **WHEN** the Hardware panel loads
+- **THEN** it reads live hardware status and metrics
+- **AND** it does not submit a `config-ai` payload
 
-### Requirement: AI Payload Validation
-The Tauri backend SHALL validate `config-ai` payloads against a strict Serde contract that rejects unknown fields and invalid ranges.
+### Requirement: AI runtime configuration validation follows IntegrityConfig schema
+The Tauri backend SHALL validate AI runtime configuration through the `IntegrityConfig` manifest apply path rather than a separate `config-ai` payload command.
 
-#### Scenario: Valid AI payload
-- **WHEN** the backend receives a `config-ai` payload with a supported LoRA mode, a KV cache size from 8 to 128 GB, and a non-empty TDE key
-- **THEN** it returns a successful validation response
+#### Scenario: Valid AI manifest applies
+- **WHEN** the backend receives an updated manifest containing valid `kv_caches` or model `hardware_strategy` fields
+- **THEN** it validates and applies the manifest through `apply_manifest_config`
 
-#### Scenario: Invalid AI payload
-- **WHEN** the backend receives a `config-ai` payload with unknown fields, an unsupported mode, an empty TDE key, or a KV cache size outside the allowed range
-- **THEN** it returns a failed validation response describing the invalid field
-
-#### Scenario: Validated AI payload is not staged as runtime config
-- **WHEN** the backend receives a valid `config-ai` payload through `apply_configuration`
-- **THEN** it returns a handled failure stating that domain overlays are not runtime manifest fields
-- **AND** it does not persist the payload under `ui_configurations`
+#### Scenario: Legacy AI payload command is absent
+- **WHEN** the frontend applies AI runtime configuration
+- **THEN** it does not call a legacy domain payload command
+- **AND** no AI payload is persisted under `ui_configurations`
 
 ### Requirement: VRAM Priority Tiers
 The AI inference host SHALL assign each safetensors layer residency a VRAM priority of `Active`, `Hot`, or `Volatile`.

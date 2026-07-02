@@ -5,12 +5,12 @@ Expose security identity and RBAC configuration dashboards in the Tachyon web co
 
 ## Requirements
 ### Requirement: Web component shell exposes Identity and Quotas configuration
-The Tachyon web component shell SHALL provide a `<tachyon-identity-panel>` dashboard that extends `TachyonConfigDashboard` and lets an operator submit JWT issuer and distributed CRDT quota configuration through the shared configuration command.
+The Tachyon web component shell SHALL provide a `<tachyon-identity-panel>` dashboard that extends `TachyonConfigDashboard` and lets an operator manage trusted manifest signers through the runtime manifest.
 
-#### Scenario: Operator submits identity configuration
-- **WHEN** the operator enters a JWT issuer URL and CRDT quota value in the Identity & Quotas panel
-- **THEN** the panel invokes `apply_configuration` with the security identity domain
-- **AND** the payload includes the issuer and numeric quota values
+#### Scenario: Operator submits trusted signers
+- **WHEN** the operator enters trusted Ed25519 public keys in the Identity panel
+- **THEN** the panel validates each key as 64-character hex
+- **AND** writes `trusted_signers` through `apply_manifest_config`
 - **AND** the panel renders success or error feedback using `showFeedback`
 
 #### Scenario: Identity panel is reachable from shell navigation
@@ -18,21 +18,15 @@ The Tachyon web component shell SHALL provide a `<tachyon-identity-panel>` dashb
 - **THEN** it includes an Identity & Quotas route
 - **AND** selecting that route mounts `<tachyon-identity-panel>`
 
-### Requirement: Web component shell exposes RBAC policy configuration
-The Tachyon web component shell SHALL provide a `<tachyon-rbac-panel>` dashboard that extends `TachyonConfigDashboard` and lets an operator submit a selected role and structured policy payload through the shared configuration command.
+### Requirement: Web component shell exposes RBAC through Users and Groups
+The Tachyon web component shell SHALL expose RBAC administration through the runtime-backed Users & Groups panel and SHALL NOT route a separate legacy `<tachyon-rbac-panel>` policy form.
 
-#### Scenario: Operator submits RBAC policy
-- **WHEN** the operator selects a role and enters a valid JSON policy document
-- **THEN** the panel invokes `apply_configuration` with the RBAC domain
-- **AND** the payload includes the selected role and parsed policy document
-- **AND** the panel renders success or error feedback using `showFeedback`
+#### Scenario: Operator updates RBAC group
+- **WHEN** the operator edits a group in Users & Groups
+- **THEN** the panel invokes the IAM group admin command
+- **AND** it does not submit a legacy RBAC domain payload
 
-#### Scenario: Invalid RBAC policy is rejected client side
-- **WHEN** the operator submits malformed JSON in the RBAC policy field
-- **THEN** the panel shows an error with `showFeedback`
-- **AND** it does not invoke `apply_configuration`
-
-#### Scenario: RBAC panel is reachable from shell navigation
+#### Scenario: RBAC policy form is not reachable from shell navigation
 - **WHEN** the authenticated shell renders its configuration navigation
-- **THEN** it includes an RBAC route
-- **AND** selecting that route mounts `<tachyon-rbac-panel>`
+- **THEN** it does not include an RBAC route
+- **AND** no `<tachyon-rbac-panel>` is mounted

@@ -97,7 +97,7 @@ describe("TachyonAppShellNav — cluster feature filtering", () => {
   it("shows all gated panels when all features are present", () => {
     vi.mocked(isFeatureAvailable).mockReturnValue(true);
     const routes = navRoutes(mountNav());
-    for (const route of ["ai", "storage", "fleet", "users", "rbac", "topology", "nodes", "supply-chain", "observability"]) {
+    for (const route of ["ai", "storage", "users", "topology", "nodes", "observability"]) {
       expect(routes).toContain(route);
     }
   });

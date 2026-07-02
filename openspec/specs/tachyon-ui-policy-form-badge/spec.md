@@ -1,51 +1,23 @@
 # tachyon-ui-policy-form-badge Specification
 
 ## Purpose
-TBD - created by archiving change tachyon-ui-honest-policy-views. Update Purpose after archive.
+Document the retirement of the former policy-only badge pattern. Runtime-facing
+panels must now either read and write real `IntegrityConfig` fields or be
+removed from shell navigation.
+
 ## Requirements
-### Requirement: Shared Policy Form badge component
+### Requirement: Policy-only badge pattern is retired
+Tachyon-UI SHALL NOT use `<tachyon-policy-form-badge>` to mark panels that write
+configuration without displaying runtime state. Panels affecting `core-host`
+runtime behavior SHALL use manifest-backed controllers, and panels without a
+runtime-backed field SHALL be removed from navigation.
 
-Tachyon-UI SHALL ship a `<tachyon-policy-form-badge>` custom element registered in `tachyon-ui/src/components/base/TachyonPolicyFormBadge.ts`. The element MUST render a single visual chip with the i18n label `policy-form-badge.label` and MUST expose a tooltip whose copy comes from the i18n key `policy-form-badge.tooltip`.
+#### Scenario: Runtime-backed panels do not show a policy-only badge
+- **WHEN** the operator opens Resilience, Identity, Routing, AI, Storage, or Observability
+- **THEN** the panel header does not contain `<tachyon-policy-form-badge>`
+- **AND** any editable runtime field is read from `get_manifest_config` or a live admin API
 
-#### Scenario: Badge renders the i18n label
-
-- **WHEN** a host panel includes `<tachyon-policy-form-badge></tachyon-policy-form-badge>` in its header
-- **THEN** the badge displays the localised text bound to `policy-form-badge.label`
-- **AND** the element renders inside its own Shadow DOM with the shared stylesheet adopted
-
-#### Scenario: Tooltip explains the absence of state
-
-- **WHEN** the operator hovers the badge
-- **THEN** the tooltip shows the localised text bound to `policy-form-badge.tooltip`
-- **AND** the tooltip explicitly states that the host panel writes configuration and does not display the cluster's current state
-
-#### Scenario: Language change re-renders the badge
-
-- **GIVEN** the badge is mounted with the English locale
-- **WHEN** an `i18n:language-changed` event is dispatched on `window`
-- **THEN** the badge re-renders with the newly active locale's `policy-form-badge.label`
-- **AND** the tooltip text re-renders likewise
-
-### Requirement: Badge is applied to every policy-only panel
-
-The following panels SHALL embed `<tachyon-policy-form-badge>` in their header, immediately next to the panel title:
-
-- `<tachyon-resilience-panel>`
-- `<tachyon-identity-panel>` (route `identity-config`)
-- `<tachyon-rbac-panel>`
-- `<tachyon-supply-chain-panel>`
-- `<tachyon-fleet-panel>`
-
-#### Scenario: Every policy panel exposes the badge
-
-- **GIVEN** the application is mounted and authenticated
-- **WHEN** the operator navigates to each of the five routes (`resilience`, `identity-config`, `rbac`, `supply-chain`, `fleet`)
-- **THEN** the corresponding panel's header contains exactly one `<tachyon-policy-form-badge>` element
-- **AND** the badge appears between the panel title and the right-hand side of the header
-
-#### Scenario: Panels that display real state do NOT receive the badge
-
-- **WHEN** the operator navigates to `overview`, `nodes`, `systems`, `topology`, `users`, `workloads`, `observability`, `storage`, or `ai`
-- **THEN** the rendered panel header does NOT contain a `<tachyon-policy-form-badge>` element
-- **AND** the absence of the badge is enforced by an assertion in the panel-level unit tests
-
+#### Scenario: Legacy policy-only panels are not routed
+- **WHEN** the application shell renders navigation
+- **THEN** the former RBAC policy form, Fleet policy form, Supply Chain policy form, and RoutingDashboard legacy form are absent
+- **AND** operators use the runtime-backed Users & Groups, bundle apply, Routing, or manifest-backed Resilience workflows instead

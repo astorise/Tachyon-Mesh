@@ -17,18 +17,19 @@ Tachyon UI SHALL initialize Tauri Stronghold and route remembered credential per
 - **THEN** the UI calls a native credential deletion command
 - **AND** stale browser credential state is not used for password restoration
 
-### Requirement: Validated UI configuration is staged for sealing
-The Tauri `apply_configuration` command SHALL keep existing WIT validation and stage successfully validated payloads into the local overlay.
+### Requirement: Runtime UI configuration uses manifest-backed apply
+Tachyon UI SHALL mutate runtime configuration through manifest-backed commands rather than staging legacy domain payloads.
 
-#### Scenario: Configuration validates successfully
-- **WHEN** a configuration panel submits a valid domain payload
-- **THEN** `apply_configuration` writes the payload to the local overlay
-- **AND** returns `success=true`, `staged=true`, and `requiresSeal=true`
+#### Scenario: Runtime configuration applies successfully
+- **WHEN** a configuration panel submits a runtime-backed change
+- **THEN** the panel reads the current manifest with `get_manifest_config`
+- **AND** submits the updated manifest with `apply_manifest_config`
+- **AND** the change is visible in the applied `IntegrityConfig`
 
-#### Scenario: Configuration validation fails
-- **WHEN** a configuration panel submits an invalid payload
-- **THEN** `apply_configuration` returns `success=false`
-- **AND** it does not mark the payload as staged or requiring seal
+#### Scenario: Legacy domain payload command is unavailable
+- **WHEN** frontend code needs to apply a runtime configuration
+- **THEN** it does not call a Tauri `apply_configuration` command
+- **AND** no runtime payload is staged under `ui_configurations`
 
 ### Requirement: Tauri can seal and apply pending overlays
 Tachyon UI SHALL provide a `seal_and_apply_manifest` command that signs pending overlay state and POSTs the signed manifest to `/admin/manifest`.
@@ -43,11 +44,11 @@ Tachyon UI SHALL provide a `seal_and_apply_manifest` command that signs pending 
 - **WHEN** the host returns a non-success status for `/admin/manifest`
 - **THEN** the command returns an explicit error including the host response
 
-### Requirement: Shell exposes pending Seal & Apply action
-The Tachyon app shell SHALL show a global pending changes button when any configuration payload requires sealing.
+### Requirement: Shell exposes pending Seal & Apply action for overlay resources
+The Tachyon app shell SHALL show a global pending changes button when overlay-backed resources or system route changes require sealing.
 
-#### Scenario: Configuration stage event occurs
-- **WHEN** the frontend receives an `apply_configuration` response with `requiresSeal=true`
+#### Scenario: Overlay stage event occurs
+- **WHEN** the frontend stages an overlay-backed resource or system route change
 - **THEN** the shell renders a visible `Pending Changes: Seal & Apply` action
 
 #### Scenario: Operator applies pending changes

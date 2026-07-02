@@ -11,6 +11,13 @@ The platform SHALL allow routes to declare timeout and retry policies that are o
 - **THEN** it applies the configured middleware chain for that route
 - **AND** avoids introducing resiliency overhead when the feature is disabled
 
+#### Scenario: Tachyon Studio writes route resiliency through the runtime manifest
+- **WHEN** an operator saves timeout and retry settings from the Resilience panel
+- **THEN** Tachyon Studio reads the active manifest with `get_manifest_config`
+- **AND** writes `routes[].resiliency.timeout_ms` and `routes[].resiliency.retry_policy` on the selected route
+- **AND** applies the full manifest with `apply_manifest_config`
+- **AND** no `config-resilience` payload is staged through `ui_configurations`
+
 ### Requirement: Resiliency policies MUST be declarative and schema-driven
 The `system-faas-config-api` SHALL expose a strict `config-resilience.wit` contract to allow Tachyon-UI and MCP clients to safely manipulate retries, timeouts, and fault injections without restarting the data-plane.
 
@@ -28,4 +35,3 @@ When a `shadow_traffic` policy is applied to a route, the runtime SHALL mirror t
 - **WHEN** a client request is served by the primary target
 - **THEN** the runtime sends the mirrored request asynchronously
 - **AND** returns the primary response without waiting for the shadow target.
-

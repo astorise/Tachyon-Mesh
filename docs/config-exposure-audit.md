@@ -12,6 +12,7 @@ through the sealed manifest path. The live schema is available from
 | `enrollment.mode`, `enrollment.oidc_issuer`, `enrollment.oidc_audience`, `enrollment.auto_approve_tags` | Nodes panel, Enrollment policy form |
 | `tee_backend` | Routing panel, Manifest routing controls |
 | `routes[].requires_tee` | Routing route table TEE toggle |
+| `routes[].resiliency.timeout_ms`, `routes[].resiliency.retry_policy` | Resilience panel, per-route resilience policy |
 | `layer4.tcp[]`, `layer4.udp[]` | Routing panel, TCP/UDP binding text areas |
 | `routes[].volumes[].backup_schedule` | Expanded route Volumes panel |
 | `routes[].volumes[].consistency` | Expanded route Volumes panel |

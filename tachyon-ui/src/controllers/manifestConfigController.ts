@@ -11,6 +11,7 @@ type ManifestRoute = {
   name?: string;
   version?: string;
   canary?: CanaryConfig | null;
+  resiliency?: RouteResiliencyConfig | null;
   requires_tee?: boolean;
   volumes?: ManifestVolume[];
   models?: ManifestModelBinding[];
@@ -98,6 +99,18 @@ export type CanaryConfig = {
   max_error_rate: number;
 };
 
+export type RouteResiliencyConfig = {
+  timeout_ms?: number;
+  retry_policy?: {
+    max_retries: number;
+    retry_on: number[];
+  };
+};
+
+export type ManifestRouteResiliency = ManifestRouteOption & {
+  resiliency: RouteResiliencyConfig | null;
+};
+
 export type GpuDistribution =
   | "single"
   | "tensor_parallelism"
@@ -157,6 +170,42 @@ export async function listManifestRoutes(): Promise<ManifestRouteOption[]> {
     version: route.version ?? "",
     requiresTee: route.requires_tee === true,
   }));
+}
+
+export async function listRouteResiliencyPolicies(): Promise<ManifestRouteResiliency[]> {
+  const config = await readManifestConfig();
+  return (config.routes ?? []).map((route) => ({
+    path: route.path,
+    name: route.name ?? "",
+    version: route.version ?? "",
+    requiresTee: route.requires_tee === true,
+    resiliency: normalizeRouteResiliency(route.resiliency),
+  }));
+}
+
+export async function writeRouteResiliency(
+  routePath: string,
+  resiliency: RouteResiliencyConfig | null,
+): Promise<SealApplyOutcome> {
+  const config = await readManifestConfig();
+  const routes = config.routes ?? [];
+  const idx = routes.findIndex((route) => route.path === routePath);
+  if (idx === -1) {
+    throw new Error(`Route '${routePath}' not found in manifest`);
+  }
+
+  const updated = { ...routes[idx] };
+  const normalized = normalizeRouteResiliency(resiliency);
+  if (normalized) {
+    updated.resiliency = normalized;
+  } else {
+    delete updated.resiliency;
+  }
+
+  return applyManifestConfig({
+    ...config,
+    routes: [...routes.slice(0, idx), updated, ...routes.slice(idx + 1)],
+  });
 }
 
 export async function getEnrollmentConfig(): Promise<EnrollmentConfig> {
@@ -566,6 +615,25 @@ function normalizeOptionalNumber(value: unknown): number | null {
 function normalizeStringList(value: unknown): string[] {
   const items = Array.isArray(value) ? value : String(value ?? "").split(/[\n,]/);
   return [...new Set(items.map((item) => String(item).trim()).filter(Boolean))];
+}
+
+function normalizeRouteResiliency(value: unknown): RouteResiliencyConfig | null {
+  const input = typeof value === "object" && value !== null ? value as RouteResiliencyConfig : {};
+  const timeout = normalizeOptionalNumber(input.timeout_ms);
+  const maxRetries = normalizeNonNegativeInteger(input.retry_policy?.max_retries);
+  const retryOn = normalizeNumberList(input.retry_policy?.retry_on)
+    .filter((status) => status >= 100 && status <= 599);
+  const normalized: RouteResiliencyConfig = {};
+  if (timeout && timeout > 0) {
+    normalized.timeout_ms = timeout;
+  }
+  if (maxRetries > 0) {
+    normalized.retry_policy = {
+      max_retries: maxRetries,
+      retry_on: retryOn.length > 0 ? retryOn : [502, 503, 504],
+    };
+  }
+  return normalized.timeout_ms || normalized.retry_policy ? normalized : null;
 }
 
 function normalizeVolume(volume: ManifestVolume): ManifestVolume {

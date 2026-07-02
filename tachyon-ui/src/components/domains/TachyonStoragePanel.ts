@@ -1,6 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
 type MeshResource = {
@@ -21,12 +21,11 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
   private resources: MeshResource[] = [];
   private kvResult: KvResult | null = null;
   private kvBusy = false;
-  private readonly onLanguageChanged = () => { this.render(); this.bindForm(); this.bindKvForm(); };
+  private readonly onLanguageChanged = () => { this.render(); this.bindKvForm(); };
 
   async connectedCallback(): Promise<void> {
     window.addEventListener("i18n:language-changed", this.onLanguageChanged);
     this.render();
-    this.bindForm();
     this.bindKvForm();
     this.animateEntrance();
     try {
@@ -35,19 +34,11 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
       this.resources = [];
     }
     this.render();
-    this.bindForm();
     this.bindKvForm();
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("i18n:language-changed", this.onLanguageChanged);
-  }
-
-  private bindForm(): void {
-    this.root.querySelector("#storage-config-form")?.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void this.applyStorageConfig();
-    });
   }
 
   private bindKvForm(): void {
@@ -94,21 +85,7 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
           <div id="kv-result-zone" class="min-h-[3rem]"></div>
         </article>
 
-        <form id="storage-config-form" class="space-y-6 rounded-lg border border-slate-700 bg-slate-800/40 p-6">
-          <label data-stagger-panel class="block text-xs uppercase tracking-widest text-cyan-500">WASI Volume Mount Path
-            <input id="mount-path" type="text" value="/mnt/data" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-slate-200 outline-none transition-colors focus:border-cyan-400">
-          </label>
-
-          <label data-stagger-panel class="block text-xs uppercase tracking-widest text-cyan-500">S3 Proxy Endpoint
-            <input id="s3-endpoint" type="url" placeholder="https://s3-proxy.tachyon.local" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-slate-200 outline-none transition-colors focus:border-cyan-400">
-          </label>
-
-          <button data-stagger-panel type="submit" class="border border-cyan-500 px-6 py-3 font-bold text-cyan-500 transition-colors hover:bg-cyan-500 hover:text-slate-950">
-            Apply Storage Config
-          </button>
-        </form>
-
-        <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">Awaiting storage configuration.</div>
+        <div id="feedback-zone" data-stagger-panel class="rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">Volumes are configured from expanded route rows in Routing.</div>
       </section>
     `);
     this.populateResourceRows();
@@ -254,25 +231,8 @@ export class TachyonStoragePanel extends TachyonConfigDashboard {
     if (delBtn) delBtn.disabled = busy;
   }
 
-  private async applyStorageConfig(): Promise<void> {
-    try {
-      const response = await applyAndSeal("storage", {
-          mount_path: this.inputValue("mount-path", "/mnt/data"),
-          s3_endpoint: this.inputValue("s3-endpoint", ""),
-      });
-      this.showFeedback(response.success ? "success" : "error", response.message);
-    } catch (error) {
-      this.showFeedback("error", error instanceof Error ? error.message : String(error));
-    }
-  }
-
   private kvInputValue(id: string): string {
     return (this.root.getElementById(id) as HTMLInputElement | null)?.value.trim() ?? "";
-  }
-
-  private inputValue(id: string, fallback: string): string {
-    const value = (this.root.getElementById(id) as HTMLInputElement | null)?.value.trim();
-    return value ? value : fallback;
   }
 }
 

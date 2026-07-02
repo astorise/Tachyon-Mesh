@@ -4,46 +4,33 @@
 Expose storage, fleet, and air-gapped supply-chain configuration dashboards in the Tachyon web component shell.
 ## Requirements
 ### Requirement: Web component shell exposes Storage configuration
-The Tachyon web component shell SHALL provide a `<tachyon-storage-panel>` dashboard that extends `TachyonConfigDashboard` and lets an operator submit WASI volume mount path and S3 proxy endpoint settings through the shared configuration command.
+The Tachyon web component shell SHALL provide a `<tachyon-storage-panel>` dashboard that extends `TachyonConfigDashboard` and surfaces storage resources plus a KV explorer. Route volume configuration SHALL be edited from expanded Routing rows.
 
-#### Scenario: Operator submits storage configuration
-- **WHEN** the operator enters a WASI volume mount path and S3 proxy endpoint
-- **THEN** the panel invokes `apply_configuration` with the storage domain
-- **AND** the payload includes the mount path and endpoint values
-- **AND** the panel renders success or error feedback using `showFeedback`
+#### Scenario: Operator inspects storage resources
+- **WHEN** the Storage panel loads
+- **THEN** it reads resources through `get_resources`
+- **AND** it does not submit a legacy storage domain payload
 
 #### Scenario: Storage panel is reachable from shell navigation
 - **WHEN** the authenticated shell renders its configuration navigation
 - **THEN** it includes a Storage route
 - **AND** selecting that route mounts `<tachyon-storage-panel>`
 
-### Requirement: Web component shell exposes Fleet configuration
-The Tachyon web component shell SHALL provide a `<tachyon-fleet-panel>` dashboard that extends `TachyonConfigDashboard` and lets an operator submit node selector tags and a node profile through the shared configuration command.
+### Requirement: Fleet policy form is retired
+The Tachyon web component shell SHALL NOT expose a `<tachyon-fleet-panel>` policy form until a matching runtime-backed `IntegrityConfig` field or live admin API exists.
 
-#### Scenario: Operator submits fleet selector configuration
-- **WHEN** the operator enters node selector tags and selects a node profile
-- **THEN** the panel invokes `apply_configuration` with the fleet domain
-- **AND** the payload includes selector tags and profile values
-- **AND** the panel renders success or error feedback using `showFeedback`
-
-#### Scenario: Fleet panel is reachable from shell navigation
+#### Scenario: Fleet panel is absent from shell navigation
 - **WHEN** the authenticated shell renders its configuration navigation
-- **THEN** it includes a Fleet route
-- **AND** selecting that route mounts `<tachyon-fleet-panel>`
+- **THEN** it does not include a Fleet route
+- **AND** no `<tachyon-fleet-panel>` is mounted
 
-### Requirement: Web component shell exposes Supply Chain configuration
-The Tachyon web component shell SHALL provide a `<tachyon-supply-chain-panel>` dashboard that extends `TachyonConfigDashboard` and lets an operator submit asset signature key and air-gapped mode settings through the shared configuration command.
+### Requirement: Supply Chain policy form is retired
+The Tachyon web component shell SHALL NOT expose a `<tachyon-supply-chain-panel>` policy form. Supply-chain runtime changes SHALL use the bundle apply and asset registry workflows.
 
-#### Scenario: Operator submits supply chain configuration
-- **WHEN** the operator enters an asset signature key and toggles air-gapped mode
-- **THEN** the panel invokes `apply_configuration` with the supply chain domain
-- **AND** the payload includes the signature key and air-gapped mode flag
-- **AND** the panel renders success or error feedback using `showFeedback`
-
-#### Scenario: Supply chain panel is reachable from shell navigation
+#### Scenario: Supply chain panel is absent from shell navigation
 - **WHEN** the authenticated shell renders its configuration navigation
-- **THEN** it includes a Supply Chain route
-- **AND** selecting that route mounts `<tachyon-supply-chain-panel>`
+- **THEN** it does not include a Supply Chain route
+- **AND** no `<tachyon-supply-chain-panel>` is mounted
 
 ### Requirement: BaaS Query Authorization Cache
 The core host SHALL integrate Biscuit authorization for BaaS query paths and cache sanitized query plus Datalog mutation results to avoid repeated SmolVM round trips for recurring requests.

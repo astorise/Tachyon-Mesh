@@ -85,9 +85,5 @@ describe("TachyonWorkloadsPanel", () => {
         ],
       }),
     });
-    expect(tauriInvokeMock).not.toHaveBeenCalledWith(
-      "apply_configuration",
-      expect.objectContaining({ domain: "workloads" }),
-    );
   });
 });

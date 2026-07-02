@@ -21,12 +21,9 @@ const routes: ComponentRoute[] = [
   { route: "nodes", label: "Nodes", tagName: "tachyon-nodes-panel", requires: "hasEnrolledNodes" },
   { route: "systems", label: "Systems", tagName: "tachyon-systems-panel", requires: "hasEnrolledNodes" },
   { route: "identity-config", label: "Identity & Quotas", tagName: "tachyon-identity-panel", requires: "hasIdentity" },
-  { route: "rbac", label: "RBAC", tagName: "tachyon-rbac-panel", requires: "hasRbac" },
   { route: "workloads", label: "Workloads", tagName: "tachyon-workloads-panel", requires: "hasEnrolledNodes" },
   { route: "observability", label: "Observability", tagName: "tachyon-observability-panel", requires: "hasObservability" },
   { route: "storage", label: "Storage", tagName: "tachyon-storage-panel", requires: "hasStorage" },
-  { route: "fleet", label: "Fleet", tagName: "tachyon-fleet-panel", requires: "hasFleet" },
-  { route: "supply-chain", label: "Supply Chain", tagName: "tachyon-supply-chain-panel", requires: "hasSupplyChain" },
 ];
 
 export function listComponentRoutes(): ComponentRoute[] {

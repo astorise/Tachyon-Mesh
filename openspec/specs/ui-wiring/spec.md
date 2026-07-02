@@ -4,18 +4,26 @@ Define the Tachyon UI shell wiring requirements for route resolution, overview t
 
 ## Requirements
 
-### Requirement: Web component registry includes topology and registry routes
-The Tachyon web component registry SHALL map `topology` and `registry` routes to concrete custom elements so shell navigation resolves without falling back to static or unknown route content.
+### Requirement: Web component registry includes topology route
+The Tachyon web component registry SHALL map `topology` to a concrete custom element so shell navigation resolves without falling back to static or unknown route content.
 
 #### Scenario: Topology route resolves through registry
 - **WHEN** the shell asks `ComponentRegistry` to resolve `topology`
 - **THEN** the registry returns `tachyon-topology-panel`
 - **AND** the route label remains `Mesh Topology`
 
-#### Scenario: Registry route resolves through registry
-- **WHEN** the shell asks `ComponentRegistry` to resolve `registry`
-- **THEN** the registry returns `tachyon-supply-chain-panel`
-- **AND** the route label remains `Asset Registry`
+### Requirement: Web component registry excludes policy-only dead routes
+The Tachyon web component registry SHALL expose only panels backed by runtime manifest fields, live admin APIs, or read-only telemetry. Legacy policy-only routes that previously wrote `ui_configurations` overlays SHALL NOT be reachable from shell navigation.
+
+#### Scenario: Removed policy-only routes are not resolved
+- **WHEN** the shell asks `ComponentRegistry` to resolve `rbac`, `fleet`, or `supply-chain`
+- **THEN** the registry returns no component route
+- **AND** operators use the runtime-backed Users & Groups IAM view or bundle apply workflow instead
+
+#### Scenario: Routing dashboard legacy payload route is not imported
+- **WHEN** the application shell initializes
+- **THEN** it imports `tachyon-routing-panel` for the `routing` route
+- **AND** it does not import or register the legacy `tachyon-routing-dashboard` form
 
 ### Requirement: Shell exposes optional chat micro-frontend
 The Tachyon web component registry SHALL map `chat` to `tachyon-chat-panel`.

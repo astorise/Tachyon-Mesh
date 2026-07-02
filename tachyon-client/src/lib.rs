@@ -1669,44 +1669,6 @@ pub async fn get_staged_config(domain: &str) -> Result<Option<serde_json::Value>
         .map(|entry| entry.payload))
 }
 
-/// Returns the **active** (sealed and applied) payload for a given configuration
-/// domain, sourced from the live node's manifest when connected, or the local
-/// `integrity.lock` file when offline. Returns `None` when the domain has no
-/// active configuration.
-pub async fn get_active_config(domain: &str) -> Result<Option<serde_json::Value>> {
-    let payload_json: serde_json::Value = if current_connection().is_some() {
-        match get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH).await {
-            Ok(config) => config,
-            Err(_) => {
-                let raw = read_lockfile().await.unwrap_or_default();
-                if raw.is_empty() {
-                    return Ok(None);
-                }
-                let manifest: IntegrityManifest =
-                    serde_json::from_str(&raw).context("failed to parse integrity.lock")?;
-                serde_json::from_str(&manifest.config_payload)
-                    .context("failed to parse config_payload")?
-            }
-        }
-    } else {
-        let raw = match read_lockfile().await {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
-        if raw.is_empty() {
-            return Ok(None);
-        }
-        let manifest: IntegrityManifest =
-            serde_json::from_str(&raw).context("failed to parse integrity.lock")?;
-        serde_json::from_str(&manifest.config_payload).context("failed to parse config_payload")?
-    };
-
-    Ok(payload_json
-        .get("ui_configurations")
-        .and_then(|uc| uc.get(domain))
-        .cloned())
-}
-
 pub async fn seal_overlay() -> Result<SealApplyOutcome> {
     let manifest = seal_overlay_manifest().await?;
     write_lockfile(&manifest).await?;
@@ -1942,18 +1904,6 @@ fn apply_overlay_to_config(
             }
             resources.insert(resource.name, serde_json::Value::Object(entry));
         }
-    }
-
-    if !overlay.configurations.is_empty() {
-        let configs: BTreeMap<String, serde_json::Value> = overlay
-            .configurations
-            .into_iter()
-            .map(|entry| (entry.domain, entry.payload))
-            .collect();
-        object.insert(
-            "ui_configurations".to_owned(),
-            serde_json::to_value(configs).context("failed to serialize staged configurations")?,
-        );
     }
 
     // Merge system routes: enabled ones are added/updated; disabled ones are removed.

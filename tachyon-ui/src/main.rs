@@ -5,7 +5,6 @@
 
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,13 +62,6 @@ struct LoginFinalizePayload {
     session_id: String,
     totp_code: String,
     cert: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiResponse {
-    success: bool,
-    message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -210,60 +202,6 @@ fn load_or_create_stronghold_client(
         .or_else(|_| stronghold.load_client(STRONGHOLD_PROFILE_CLIENT))
         .or_else(|_| stronghold.create_client(STRONGHOLD_PROFILE_CLIENT))
         .map_err(|error| format!("failed to open Stronghold auth client: {error}"))
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApplyConfigurationResponse {
-    success: bool,
-    message: String,
-    staged: bool,
-    requires_seal: bool,
-}
-
-#[allow(dead_code)]
-mod wit_contracts {
-    pub mod routing {
-        wit_bindgen::generate!({
-            path: "../wit/config-routing.wit",
-            world: "traffic-management-config",
-        });
-    }
-
-    pub mod resilience {
-        wit_bindgen::generate!({
-            path: "../wit/config-resilience.wit",
-            world: "resilience-chaos-config",
-        });
-    }
-
-    pub mod ai {
-        wit_bindgen::generate!({
-            path: "../wit/config-ai.wit",
-            world: "ai-orchestration-config",
-        });
-    }
-
-    pub mod observability {
-        wit_bindgen::generate!({
-            path: "../wit/config-observability.wit",
-            world: "observability-compute-config",
-        });
-    }
-
-    pub mod storage {
-        wit_bindgen::generate!({
-            path: "../wit/config-storage.wit",
-            world: "storage-state-config",
-        });
-    }
-
-    pub mod fleet {
-        wit_bindgen::generate!({
-            path: "../wit/config-fleet.wit",
-            world: "fleet-profile-config",
-        });
-    }
 }
 
 #[tauri::command]
@@ -821,13 +759,6 @@ async fn get_staged_config(domain: String) -> Result<Option<serde_json::Value>, 
 }
 
 #[tauri::command]
-async fn get_active_config(domain: String) -> Result<Option<serde_json::Value>, String> {
-    tachyon_client::get_active_config(&domain)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 async fn toggle_system_route(slug: String, version: String, enabled: bool) -> Result<(), String> {
     tachyon_client::toggle_system_route(&slug, &version, enabled)
         .await
@@ -862,53 +793,6 @@ async fn delete_resource(name: String) -> Result<(), String> {
     tachyon_client::remove_overlay_resource(&name)
         .await
         .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-async fn apply_configuration(
-    domain: String,
-    payload: Value,
-    _dry_run: Option<bool>,
-) -> Result<ApplyConfigurationResponse, String> {
-    let response = match domain.as_str() {
-        "config-routing" | "routing" => Ok(validate_traffic_config(&payload)),
-        "config-resilience" | "resilience" => Ok(validate_resilience_config(&payload)),
-        "config-ai" | "ai_orchestration" => Ok(validate_ai_config(&payload)),
-        "config-security" | "identity" | "security-identity" => {
-            Ok(validate_security_identity_config(&payload))
-        }
-        "config-rbac" | "rbac" => Ok(validate_rbac_panel_config(&payload)),
-        "config-workloads" | "workloads" => Ok(validate_workloads_panel_config(&payload)),
-        "config-observability" | "observability" => {
-            Ok(validate_observability_panel_config(&payload))
-        }
-        "config-storage" | "storage" => Ok(validate_storage_panel_config(&payload)),
-        "config-fleet" | "fleet" => Ok(validate_fleet_panel_config(&payload)),
-        "config-assets" | "supply_chain" | "supply-chain" => {
-            Ok(validate_supply_chain_panel_config(&payload))
-        }
-        _ => Err(format!("Unknown configuration domain: {domain}")),
-    }?;
-
-    if !response.success {
-        return Ok(ApplyConfigurationResponse {
-            success: false,
-            message: response.message,
-            staged: false,
-            requires_seal: false,
-        });
-    }
-
-    Ok(ApplyConfigurationResponse {
-        success: false,
-        message: format!(
-            "{} This configuration domain is not written to the runtime manifest; \
-             ui_configurations overlays are ignored by core-host. Use a manifest-backed controller.",
-            response.message
-        ),
-        staged: false,
-        requires_seal: false,
-    })
 }
 
 #[tauri::command]
@@ -1080,281 +964,6 @@ async fn write_secure_profile(
     store.insert_record(AUTH_PROFILE_RECORD, bytes)
 }
 
-fn validate_traffic_config(config: &Value) -> ApiResponse {
-    let traffic = match traffic_configuration_from_json(config) {
-        Ok(traffic) => traffic,
-        Err(message) => return failed(&message),
-    };
-    let gateways = traffic.gateways.len();
-    let routes = traffic.routes.len();
-    if gateways == 0 && routes == 0 {
-        return failed("WIT validation failed: gateways or routes are required");
-    }
-    passed(format!(
-        "WIT validation passed: {gateways} gateway(s), {routes} route(s)."
-    ))
-}
-
-fn validate_resilience_config(config: &Value) -> ApiResponse {
-    let _wit_config =
-        wit_contracts::resilience::exports::tachyon::resilience_config::config_resilience::ResilienceConfiguration {
-            policies: Vec::new(),
-        };
-    let policies = array_len(config, &["policies"]);
-    if policies == 0 && !config.is_object() {
-        return failed("Resilience validation failed: payload must be an object");
-    }
-    passed(format!(
-        "Resilience WIT validation passed: {policies} policy item(s)."
-    ))
-}
-
-fn validate_ai_config(config: &Value) -> ApiResponse {
-    let wit_config = wit_contracts::ai::exports::tachyon::ai_config::config_ai::AiConfiguration {
-        deployments: Vec::new(),
-    };
-    if let Some(kv_cache_size) = config.get("kv_cache_size").and_then(Value::as_u64) {
-        if !(8..=128).contains(&kv_cache_size) {
-            return failed("AI WIT validation failed: kv_cache_size must be between 8 and 128 GB");
-        }
-    }
-    let deployments = array_len(config, &["deployments"]).max(wit_config.deployments.len());
-    passed(format!(
-        "AI WIT validation passed: {deployments} deployment(s)."
-    ))
-}
-
-fn validate_security_identity_config(config: &Value) -> ApiResponse {
-    let providers = array_len(config, &["providers"]);
-    let authz = array_len(config, &["authz"]);
-    let rate_limits = array_len(config, &["rate_limits", "rateLimits", "rate-limits"]);
-    if providers == 0 && authz == 0 && rate_limits == 0 && !config.is_object() {
-        return failed("Security WIT validation failed: payload must be an object");
-    }
-    passed(format!(
-        "Security config accepted: providers={providers}, authz={authz}, rate_limits={rate_limits}."
-    ))
-}
-
-fn validate_rbac_panel_config(config: &Value) -> ApiResponse {
-    let roles = array_len(config, &["roles"]);
-    let bindings = array_len(config, &["bindings"]);
-    passed(format!(
-        "RBAC WIT validation passed: roles={roles}, bindings={bindings}."
-    ))
-}
-
-fn validate_workloads_panel_config(config: &Value) -> ApiResponse {
-    let workloads = array_len(config, &["workloads"]);
-    let secrets = array_len(config, &["secrets"]);
-    passed(format!(
-        "Workload WIT validation passed: workloads={workloads}, secret providers={secrets}."
-    ))
-}
-
-fn validate_observability_panel_config(config: &Value) -> ApiResponse {
-    let endpoint = nested_string(config, "telemetry.traces.otlp_endpoint")
-        .or_else(|| nested_string(config, "telemetry.traces.otlp-endpoint"))
-        .or_else(|| config.get("otlp_endpoint").and_then(Value::as_str))
-        .map(str::to_owned);
-    let _wit_config =
-        wit_contracts::observability::exports::tachyon::observability_config::config_observability::OpsConfiguration {
-            telemetry: wit_contracts::observability::exports::tachyon::observability_config::config_observability::TelemetryConfig {
-                logs: wit_contracts::observability::exports::tachyon::observability_config::config_observability::LogPolicy {
-                    global_level: wit_contracts::observability::exports::tachyon::observability_config::config_observability::LogLevel::Info,
-                },
-                traces: wit_contracts::observability::exports::tachyon::observability_config::config_observability::TracePolicy {
-                    otlp_endpoint: endpoint.clone(),
-                    sample_rate: config
-                        .get("sample_rate")
-                        .or_else(|| nested_value(config, "telemetry.traces.sample_rate"))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(1.0),
-                },
-            },
-            quotas: Vec::new(),
-        };
-    if let Some(endpoint) = endpoint.as_deref() {
-        if !endpoint.is_empty()
-            && !endpoint.starts_with("https://")
-            && !endpoint.starts_with("http://")
-        {
-            return failed(
-                "Observability WIT validation failed: otlp_endpoint must use http(s)://",
-            );
-        }
-    }
-    passed("Observability WIT validation passed.")
-}
-
-fn validate_storage_panel_config(config: &Value) -> ApiResponse {
-    let _wit_config =
-        wit_contracts::storage::exports::tachyon::storage_config::config_storage::StorageConfiguration {
-            volumes: Vec::new(),
-            s3_backends: Vec::new(),
-            kv_partitions: Vec::new(),
-        };
-    let volumes = array_len(config, &["volumes"]);
-    let s3 = array_len(config, &["s3_backends", "s3Backends", "s3-backends"]);
-    let kv = array_len(config, &["kv_partitions", "kvPartitions", "kv-partitions"]);
-    passed(format!(
-        "Storage WIT validation passed: volumes={volumes}, s3_backends={s3}, kv_partitions={kv}."
-    ))
-}
-
-fn validate_fleet_panel_config(config: &Value) -> ApiResponse {
-    let wit_config =
-        wit_contracts::fleet::exports::tachyon::fleet_config::config_fleet::FleetConfiguration {
-            profiles: Vec::new(),
-        };
-    let profiles = array_len(config, &["profiles"]).max(wit_config.profiles.len());
-    passed(format!(
-        "Fleet WIT validation passed: {profiles} profile(s)."
-    ))
-}
-
-fn validate_supply_chain_panel_config(config: &Value) -> ApiResponse {
-    let bundles = array_len(config, &["bundles"]);
-    if let Some(signature_key) = config.get("signature_key").and_then(Value::as_str) {
-        if !signature_key.starts_with("sha256:") {
-            return failed(
-                "Supply Chain WIT validation failed: signature_key must start with sha256:",
-            );
-        }
-    }
-    passed(format!(
-        "Supply chain WIT validation passed: {bundles} bundle(s)."
-    ))
-}
-
-fn traffic_configuration_from_json(
-    config: &Value,
-) -> Result<
-    wit_contracts::routing::exports::tachyon::routing::config_routing::TrafficConfiguration,
-    String,
-> {
-    use wit_contracts::routing::exports::tachyon::routing::config_routing::{
-        AccelMode, GatewayConfig, RouteConfig, TrafficConfiguration,
-    };
-
-    let gateway_values = array_values(config, &["gateways", "spec.gateways"]);
-    let route_values = array_values(config, &["routes", "spec.routes"]);
-    let gateways = gateway_values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let name = string_field(value, &["name"], &format!("gateway-{index}"));
-            let protocol = string_field(value, &["proto", "protocol"], "http");
-            let bind_address = string_field(
-                value,
-                &["bind_address", "bindAddress", "bind-address"],
-                "0.0.0.0:80",
-            );
-            Ok(GatewayConfig {
-                name,
-                proto: protocol_from_string(&protocol)?,
-                bind_address,
-                accel: AccelMode::Userspace,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let routes = route_values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let name = string_field(value, &["name"], &format!("route-{index}"));
-            let gateway_refs =
-                string_array_field(value, &["gateway_refs", "gatewayRefs", "gateway-refs"]);
-            Ok(RouteConfig { name, gateway_refs })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    Ok(TrafficConfiguration { gateways, routes })
-}
-
-fn protocol_from_string(
-    value: &str,
-) -> Result<wit_contracts::routing::exports::tachyon::routing::config_routing::Protocol, String> {
-    use wit_contracts::routing::exports::tachyon::routing::config_routing::Protocol;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "tcp" => Ok(Protocol::Tcp),
-        "udp" => Ok(Protocol::Udp),
-        "http" => Ok(Protocol::Http),
-        "https" => Ok(Protocol::Https),
-        "grpc" => Ok(Protocol::Grpc),
-        "uds" => Ok(Protocol::Uds),
-        other => Err(format!(
-            "WIT validation failed: unsupported routing protocol `{other}`"
-        )),
-    }
-}
-
-fn array_len(config: &Value, paths: &[&str]) -> usize {
-    paths
-        .iter()
-        .find_map(|path| {
-            nested_value(config, path)
-                .and_then(Value::as_array)
-                .map(Vec::len)
-        })
-        .unwrap_or(0)
-}
-
-fn array_values<'a>(config: &'a Value, paths: &[&str]) -> Vec<&'a Value> {
-    paths
-        .iter()
-        .find_map(|path| nested_value(config, path).and_then(Value::as_array))
-        .map(|values| values.iter().collect())
-        .unwrap_or_default()
-}
-
-fn string_field(value: &Value, keys: &[&str], fallback: &str) -> String {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback)
-        .to_owned()
-}
-
-fn string_array_field(value: &Value, keys: &[&str]) -> Vec<String> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_array))
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn nested_string<'a>(config: &'a Value, path: &str) -> Option<&'a str> {
-    nested_value(config, path).and_then(Value::as_str)
-}
-
-fn nested_value<'a>(config: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .try_fold(config, |value, segment| value.get(segment))
-}
-
-fn failed(message: &str) -> ApiResponse {
-    ApiResponse {
-        success: false,
-        message: message.to_owned(),
-    }
-}
-
-fn passed(message: impl Into<String>) -> ApiResponse {
-    ApiResponse {
-        success: true,
-        message: message.into(),
-    }
-}
-
 fn stronghold_profile_key(data_dir: &std::path::Path) -> Result<Vec<u8>, String> {
     let key_path = data_dir.join("stronghold-profile.key");
     match std::fs::read(&key_path) {
@@ -1448,13 +1057,11 @@ fn main() {
             get_cluster_features,
             get_cluster_hardware_summary,
             get_staged_config,
-            get_active_config,
             toggle_system_route,
             get_staged_system_routes,
             validate_hardware_policy,
             save_resource,
             delete_resource,
-            apply_configuration,
             seal_and_apply_manifest,
             get_node_public_key,
             bundle_and_apply_manifest,

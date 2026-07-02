@@ -25,7 +25,6 @@ vi.mock("../../stores/clusterFeaturesStore", () => ({
 
 vi.mock("../../utils/network", () => ({
   resilientInvoke: vi.fn().mockResolvedValue(null),
-  applyAndSeal: vi.fn().mockResolvedValue(null),
 }));
 
 import "./TachyonAppShell";
@@ -74,17 +73,6 @@ describe("TachyonAppShell — route guard", () => {
     await activateShell(shell);
 
     window.location.hash = "storage";
-    window.dispatchEvent(new Event("hashchange"));
-
-    expect(window.location.hash).toBe("#overview");
-  });
-
-  it("redirects #fleet to #overview when hasFleet is false", async () => {
-    vi.mocked(isFeatureAvailable).mockReturnValue(false);
-    const shell = mountShell();
-    await activateShell(shell);
-
-    window.location.hash = "fleet";
     window.dispatchEvent(new Event("hashchange"));
 
     expect(window.location.hash).toBe("#overview");

@@ -170,19 +170,19 @@ Configuration panels that affect `core-host` runtime behavior SHALL read the act
 - **THEN** Tachyon Studio can write `type`, `encrypted`, `ttl_seconds`, `idle_timeout`, `eviction_policy`, `backup_schedule`, and `consistency`
 - **AND** the update is scoped to the matching `routes[].volumes[]` entry
 
-#### Scenario: Legacy domain payload cannot be staged as a fake runtime change
-- **WHEN** a configuration panel submits a validated domain payload through `apply_configuration`
-- **THEN** the Tauri backend returns a handled failure explaining that `ui_configurations` overlays are ignored by `core-host`
-- **AND** no payload is staged into the local configuration overlay
-- **AND** the UI must migrate that panel to a manifest-backed controller before claiming runtime application
+#### Scenario: Legacy domain payload command is not exposed
+- **WHEN** a configuration panel would need to change runtime behavior
+- **THEN** the Tauri backend exposes only manifest-backed commands such as `get_manifest_config` and `apply_manifest_config`
+- **AND** it does not expose `apply_configuration` for legacy domain payloads
+- **AND** the sealed manifest payload does not contain a `ui_configurations` block
 
-### Requirement: Additional config WIT bindings are wired
-The Tauri backend SHALL generate and reference WIT bindings for routing plus the additional AI, resilience, observability, storage, and fleet configuration contracts.
+### Requirement: Runtime configuration validation follows IntegrityConfig schema
+The Tauri backend SHALL delegate runtime configuration writes to the manifest apply path instead of maintaining separate WIT validation shims for legacy UI payloads.
 
-#### Scenario: A panel validates a configured domain
-- **WHEN** a supported panel submits a domain payload
-- **THEN** the backend uses generated WIT contract types in the validation path
-- **AND** unsupported domains are rejected explicitly
+#### Scenario: A panel applies runtime configuration
+- **WHEN** a supported panel submits manifest-backed configuration
+- **THEN** the backend applies the full `IntegrityConfig` through `tachyon_client::apply_manifest_config`
+- **AND** unsupported legacy domain payload commands are absent from the IPC command registry
 
 ### Requirement: Strict Content Security Policy
 The Tauri WebView SHALL enforce a strict Content Security Policy that blocks inline scripts and evals while permitting Tauri IPC, local WebSockets, and data URI images.

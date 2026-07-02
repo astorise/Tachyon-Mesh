@@ -1,6 +1,6 @@
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
-import { applyAndSeal, resilientInvoke as invoke } from "../../utils/network";
+import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 
 type GpuStats = {
@@ -60,27 +60,7 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
 
         ${this.renderVramSection()}
 
-        <form class="space-y-6">
-          <div data-stagger-panel class="grid grid-cols-1 gap-6 rounded-lg border border-slate-700 bg-slate-800/40 p-6 md:grid-cols-2">
-            <label class="block text-xs uppercase tracking-widest text-cyan-500">${t("hardware.field.accelerator")}
-              <select id="accelerator" class="mt-1 w-full rounded border border-slate-600 bg-slate-900 p-2 text-sm text-slate-200 outline-none transition-colors focus:border-cyan-400">
-                <option value="npu">${t("hardware.option.npu")}</option>
-                <option value="tpu">${t("hardware.option.tpu")}</option>
-                <option value="gpu">${t("hardware.option.gpu")}</option>
-              </select>
-            </label>
-            <label class="flex min-h-20 items-center justify-between rounded border border-slate-800 bg-slate-900/50 px-4 text-xs uppercase tracking-widest text-cyan-500">
-              <span>${t("hardware.field.ebpf")}</span>
-              <input id="xdp-offload" type="checkbox" checked class="h-5 w-5 accent-cyan-500">
-            </label>
-          </div>
-
-          <button id="apply-hardware" class="bg-cyan-600 px-8 py-3 font-black uppercase tracking-tight text-slate-950 transition-colors hover:bg-cyan-500">
-            ${t("hardware.button")}
-          </button>
-        </form>
-
-        <div id="feedback-zone" data-stagger-panel class="mt-4 rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">${t("hardware.feedback.empty")}</div>
+        <div id="feedback-zone" data-stagger-panel class="mt-4 rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 font-mono text-xs text-slate-400">Model hardware strategy is configured from the AI orchestration panel.</div>
       </section>
     `);
     this.populateGpuBars();
@@ -166,10 +146,6 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
   }
 
   private bindForm(): void {
-    this.root.querySelector("form")?.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void this.applyHardwarePolicy();
-    });
     this.root.getElementById("btn-vram-refresh")?.addEventListener("click", () => {
       void this.refreshVram();
     });
@@ -183,27 +159,6 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
     } catch {
       // Non-fatal — VRAM section just stays stale
     }
-  }
-
-  private async applyHardwarePolicy(): Promise<void> {
-    try {
-      const response = await applyAndSeal("config-ai", {
-          lora_mode: "dynamic",
-          kv_cache_size: 32,
-          tde_key: "hardware-policy-validation",
-          accelerator: this.value("accelerator", "npu"),
-          xdp_offload:
-            (this.root.getElementById("xdp-offload") as HTMLInputElement | null)?.checked ?? true,
-      });
-      this.showFeedback(response.success ? "success" : "error", response.message);
-    } catch (error) {
-      this.showFeedback("error", error instanceof Error ? error.message : String(error));
-    }
-  }
-
-  private value(id: string, fallback: string): string {
-    const value = (this.root.getElementById(id) as HTMLSelectElement | null)?.value.trim();
-    return value ? value : fallback;
   }
 
 }

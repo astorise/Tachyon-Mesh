@@ -5,7 +5,6 @@ import * as scopesController from "../../controllers/scopesController";
 
 vi.mock("../../utils/network", () => ({
   resilientInvoke: vi.fn(),
-  applyAndSeal: vi.fn(),
 }));
 
 vi.mock("../../controllers/scopesController", () => ({
