@@ -52,6 +52,12 @@ The `core-host` runtime SHALL resolve guest artifacts from the workspace or pack
 - **AND** passes the HTTP method, URI, and request body through the typed WIT `request` record
 - **AND** returns the typed WIT `response` status and body to the client
 
+#### Scenario: Host avoids request-body copies before the WIT boundary
+- **WHEN** `core-host` dispatches a buffered `GuestRequest` to a typed component guest
+- **THEN** the component and system-component execution paths borrow the `GuestRequest` instead of cloning the whole request for fallback probing
+- **AND** the request body remains a shared `Bytes` value until the host constructs the typed WIT `request`
+- **AND** the only full request-body copy in the typed guest path is the required `list<u8>` transfer into guest memory
+
 #### Scenario: Host falls back to the legacy WASI pipeline for non-component guests
 - **WHEN** `core-host` resolves a guest artifact that does not decode as a WebAssembly component
 - **THEN** it instantiates the artifact with the existing WASI preview1 module pipeline
