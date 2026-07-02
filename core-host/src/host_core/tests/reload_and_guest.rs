@@ -384,9 +384,7 @@ fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
     assert_eq!(
         response,
         GuestExecutionOutcome {
-            output: GuestExecutionOutput::LegacyStdout(Bytes::from(
-                "MESH_FETCH:http://mesh/legacy-service/ping\n"
-            )),
+            output: GuestExecutionOutput::LegacyStdout(Bytes::from("legacy guest stdout\n")),
             fuel_consumed: None,
         }
     );

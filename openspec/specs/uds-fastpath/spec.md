@@ -27,11 +27,6 @@ The mesh router SHALL inspect the shared discovery directory for a Unix domain s
 ### Requirement: UDS clients are reused per peer socket
 The mesh transport SHALL cache UDS HTTP clients by socket path so repeated calls to the same local peer reuse keep-alive connections instead of constructing a new client and reconnecting for every request.
 
-#### Scenario: Repeated mesh fetches target the same local peer
-- **WHEN** multiple `MESH_FETCH` requests resolve to the same UDS socket
-- **THEN** the host reuses the cached async UDS client for that socket
-- **AND** the request still preserves internal mesh headers such as hop limit and propagated identity headers
-
 #### Scenario: Repeated component outbound HTTP calls target the same local peer
 - **WHEN** a component calls `tachyon:mesh/outbound-http.send-request` repeatedly for an internal target resolved to the same UDS socket
 - **THEN** the host reuses the cached blocking UDS client for that socket

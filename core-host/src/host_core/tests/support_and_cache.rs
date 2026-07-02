@@ -27,9 +27,6 @@ pub(super) use tokio_rustls::{
 };
 pub(super) use tower::util::ServiceExt;
 
-pub(super) type CapturedForwardedHeaders =
-    Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
-
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct TestGrpcHelloRequest {
     #[prost(string, tag = "1")]

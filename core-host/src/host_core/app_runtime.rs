@@ -2830,7 +2830,7 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
     uri: Uri,
     body: Bytes,
     trailers: GuestHttpFields,
-    hop_limit: HopLimit,
+    _hop_limit: HopLimit,
     trace_id: Option<String>,
     sampled_execution: bool,
     selected_module: String,
@@ -2942,7 +2942,6 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                 .map(tee_backend_header_value)
         })
         .flatten();
-    let route_registry = Arc::clone(&runtime.route_registry);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let storage_broker = Arc::clone(&state.storage_broker);
     let telemetry_context = trace_id.as_ref().map(|trace_id| GuestTelemetryContext {
@@ -3136,22 +3135,6 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
         annotate_tee_response(&mut response, backend);
     }
 
-    let response = resolve_mesh_response_with_local_dispatch(
-        state,
-        runtime,
-        &state.http_client,
-        &response_config,
-        &route_registry,
-        route,
-        &state.host_identity,
-        &state.uds_fast_path,
-        hop_limit,
-        &propagated_headers,
-        response,
-    )
-    .await
-    .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
-
     Ok(RouteExecutionResult {
         response,
         fuel_consumed,
@@ -3339,180 +3322,6 @@ pub(crate) async fn acquire_route_permit(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) async fn resolve_mesh_response(
-    http_client: &Client,
-    config: &IntegrityConfig,
-    route_registry: &RouteRegistry,
-    caller_route: &IntegrityRoute,
-    host_identity: &HostIdentity,
-    uds_fast_path: &UdsFastPathRegistry,
-    hop_limit: HopLimit,
-    propagated_headers: &[PropagatedHeader],
-    response: GuestHttpResponse,
-) -> std::result::Result<GuestHttpResponse, String> {
-    resolve_mesh_response_via_transport(
-        http_client,
-        config,
-        route_registry,
-        caller_route,
-        host_identity,
-        uds_fast_path,
-        hop_limit,
-        propagated_headers,
-        response,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn resolve_mesh_response_with_local_dispatch(
-    state: &AppState,
-    runtime: &Arc<RuntimeState>,
-    http_client: &Client,
-    config: &IntegrityConfig,
-    route_registry: &RouteRegistry,
-    caller_route: &IntegrityRoute,
-    host_identity: &HostIdentity,
-    uds_fast_path: &UdsFastPathRegistry,
-    hop_limit: HopLimit,
-    propagated_headers: &[PropagatedHeader],
-    response: GuestHttpResponse,
-) -> std::result::Result<GuestHttpResponse, String> {
-    let Some(target) = extract_mesh_fetch_url(&response.body) else {
-        return Ok(response);
-    };
-    let resolved_target = resolve_outbound_http_target(
-        config,
-        route_registry,
-        caller_route,
-        &reqwest::Method::GET,
-        target,
-    )?;
-    if resolved_target.kind.is_internal() {
-        if let Some(response) = try_dispatch_local_mesh_fetch(
-            state,
-            runtime,
-            &resolved_target.url,
-            hop_limit,
-            propagated_headers,
-        )
-        .await?
-        {
-            return Ok(response);
-        }
-    }
-    resolve_mesh_response_via_transport(
-        http_client,
-        config,
-        route_registry,
-        caller_route,
-        host_identity,
-        uds_fast_path,
-        hop_limit,
-        propagated_headers,
-        response,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn resolve_mesh_response_via_transport(
-    http_client: &Client,
-    config: &IntegrityConfig,
-    route_registry: &RouteRegistry,
-    caller_route: &IntegrityRoute,
-    host_identity: &HostIdentity,
-    uds_fast_path: &UdsFastPathRegistry,
-    hop_limit: HopLimit,
-    propagated_headers: &[PropagatedHeader],
-    response: GuestHttpResponse,
-) -> std::result::Result<GuestHttpResponse, String> {
-    let Some(target) = extract_mesh_fetch_url(&response.body) else {
-        return Ok(response);
-    };
-    let resolved_target = resolve_outbound_http_target(
-        config,
-        route_registry,
-        caller_route,
-        &reqwest::Method::GET,
-        target,
-    )?;
-    let url = rewrite_outbound_http_url(&resolved_target.url, config);
-    let inject_identity = resolved_target.kind.is_internal();
-    let identity_token = if inject_identity {
-        Some(
-            host_identity
-                .sign_route(caller_route)
-                .map_err(|error| format!("failed to sign mesh caller identity: {error:#}"))?,
-        )
-    } else {
-        None
-    };
-    let response = send_mesh_fetch_request(
-        http_client,
-        uds_fast_path,
-        &url,
-        &resolved_target.kind,
-        hop_limit,
-        propagated_headers,
-        identity_token.as_deref(),
-    )
-    .await?;
-
-    let status = response.status();
-    let headers = header_map_to_guest_fields(response.headers());
-    let body = response.bytes().await.map_err(|error| {
-        format!("failed to read mesh fetch response body from `{url}`: {error}")
-    })?;
-
-    if status == StatusCode::LOOP_DETECTED || status.is_success() {
-        Ok(GuestHttpResponse {
-            status,
-            headers,
-            body,
-            trailers: Vec::new(),
-        })
-    } else {
-        Err(format!(
-            "mesh fetch to `{url}` returned an error status: {status}"
-        ))
-    }
-}
-
-pub(crate) async fn try_dispatch_local_mesh_fetch(
-    state: &AppState,
-    runtime: &Arc<RuntimeState>,
-    resolved_url: &str,
-    hop_limit: HopLimit,
-    propagated_headers: &[PropagatedHeader],
-) -> std::result::Result<Option<GuestHttpResponse>, String> {
-    let headers = propagated_headers_to_header_map(propagated_headers)?;
-    let response = try_dispatch_local_mesh_request(
-        state,
-        runtime,
-        resolved_url,
-        &Method::GET,
-        &headers,
-        Bytes::new(),
-        Vec::new(),
-        hop_limit,
-    )
-    .await?;
-
-    if let Some(response) = response.as_ref() {
-        if response.status != StatusCode::LOOP_DETECTED && !response.status.is_success() {
-            return Err(format!(
-                "in-process mesh fetch to `{resolved_url}` returned an error status: {}",
-                response.status
-            ));
-        }
-    }
-
-    Ok(response)
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_dispatch_local_mesh_request(
     state: &AppState,
     runtime: &Arc<RuntimeState>,
@@ -3582,101 +3391,6 @@ pub(crate) async fn try_dispatch_local_mesh_request(
     })?;
 
     Ok(Some(result.response))
-}
-
-fn propagated_headers_to_header_map(
-    propagated_headers: &[PropagatedHeader],
-) -> std::result::Result<HeaderMap, String> {
-    let mut headers = HeaderMap::new();
-    for header in propagated_headers {
-        let name = hyper::header::HeaderName::from_bytes(header.name.as_bytes())
-            .map_err(|error| format!("invalid propagated header `{}`: {error}", header.name))?;
-        let value = HeaderValue::from_str(&header.value).map_err(|error| {
-            format!("invalid propagated header `{}` value: {error}", header.name)
-        })?;
-        headers.insert(name, value);
-    }
-    Ok(headers)
-}
-
-pub(crate) fn apply_mesh_fetch_headers(
-    mut request: reqwest::RequestBuilder,
-    target_kind: &OutboundTargetKind,
-    hop_limit: HopLimit,
-    propagated_headers: &[PropagatedHeader],
-    identity_token: Option<&str>,
-) -> reqwest::RequestBuilder {
-    if !target_kind.is_internal() {
-        return request;
-    }
-
-    request = request.header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
-    for header in propagated_headers
-        .iter()
-        .filter(|header| !header.name.eq_ignore_ascii_case(TACHYON_IDENTITY_HEADER))
-    {
-        request = request.header(&header.name, &header.value);
-    }
-    if let Some(identity_token) = identity_token {
-        request = request.header(TACHYON_IDENTITY_HEADER, format!("Bearer {identity_token}"));
-    }
-
-    request
-}
-
-pub(crate) async fn send_mesh_fetch_request(
-    http_client: &Client,
-    _uds_fast_path: &UdsFastPathRegistry,
-    url: &str,
-    target_kind: &OutboundTargetKind,
-    hop_limit: HopLimit,
-    propagated_headers: &[PropagatedHeader],
-    identity_token: Option<&str>,
-) -> std::result::Result<reqwest::Response, String> {
-    #[cfg(unix)]
-    if let Some(peer) = _uds_fast_path.discover_peer_for_url(url) {
-        let uds_client = _uds_fast_path
-            .async_client_for_peer(&peer)
-            .map_err(|error| error.to_string())?;
-        let request = apply_mesh_fetch_headers(
-            uds_client.get(url),
-            target_kind,
-            hop_limit,
-            propagated_headers,
-            identity_token,
-        );
-        match request.send().await {
-            Ok(response) => return Ok(response),
-            Err(error) => {
-                _uds_fast_path.note_connect_failure(&peer);
-                tracing::debug!(
-                    socket = %peer.socket_path.display(),
-                    url = %url,
-                    "UDS fast-path unavailable, falling back to TCP: {error}"
-                );
-            }
-        }
-    }
-
-    apply_mesh_fetch_headers(
-        http_client.get(url),
-        target_kind,
-        hop_limit,
-        propagated_headers,
-        identity_token,
-    )
-    .send()
-    .await
-    .map_err(|error| format!("mesh fetch to `{url}` failed: {error}"))
-}
-
-pub(crate) fn extract_mesh_fetch_url(stdout: &Bytes) -> Option<&str> {
-    std::str::from_utf8(stdout)
-        .ok()?
-        .trim()
-        .strip_prefix("MESH_FETCH:")
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
 }
 
 pub(crate) fn select_route_module(
