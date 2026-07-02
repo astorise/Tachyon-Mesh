@@ -5,6 +5,7 @@ import {
   writeRouteConcurrencyPolicy,
   writeRouteModelPolicy,
   writeRoutePolicy,
+  writeRouteScalePolicy,
 } from "./manifestConfigController";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -59,13 +60,13 @@ describe("manifestConfigController route policies", () => {
       resourcePolicy: { vram_mb: 4096, gpu_affinity: "gpu:0", admission_strategy: "queue" },
       adapterId: "lora-tenant-a",
       shadowTarget: "/chat-shadow",
+      minInstances: 1,
+      maxConcurrency: 8,
+      env: { TENANT: "a" },
+      domains: ["chat"],
       models: [{
         alias: "qwen",
         qos: "RealTime",
-        minInstances: 1,
-        maxConcurrency: 8,
-        env: { TENANT: "a" },
-        domains: ["chat"],
       }],
     }]);
   });
@@ -125,10 +126,48 @@ describe("manifestConfigController route policies", () => {
     expect((appliedConfig() as { routes: Array<Record<string, unknown>> }).routes[0]).not.toHaveProperty("adapter_id");
   });
 
-  it("writes model qos on models and route scale, env, and domains on the route", async () => {
+  it("writes route scale, env, and domains on the route", async () => {
     mockManifest({
       routes: [{
         path: "/chat",
+        min_instances: 1,
+        max_concurrency: 8,
+        env: { TENANT: "old" },
+        domains: ["legacy"],
+        models: [{ alias: "qwen", path: "/models/qwen" }],
+      }],
+    });
+
+    await writeRouteScalePolicy("/chat", {
+      minInstances: 2,
+      maxConcurrency: 16,
+      env: { TENANT: "alpha" },
+      domains: ["chat", "rag"],
+    });
+
+    expect(appliedConfig()).toMatchObject({
+      routes: [{
+        path: "/chat",
+        min_instances: 2,
+        max_concurrency: 16,
+        env: { TENANT: "alpha" },
+        domains: ["chat", "rag"],
+        models: [{
+          alias: "qwen",
+          path: "/models/qwen",
+        }],
+      }],
+    });
+  });
+
+  it("writes model qos on models and removes stale route-level fields from the model", async () => {
+    mockManifest({
+      routes: [{
+        path: "/chat",
+        min_instances: 2,
+        max_concurrency: 16,
+        env: { TENANT: "alpha" },
+        domains: ["chat", "rag"],
         models: [{
           alias: "qwen",
           path: "/models/qwen",
@@ -140,13 +179,7 @@ describe("manifestConfigController route policies", () => {
       }],
     });
 
-    await writeRouteModelPolicy("/chat", "qwen", {
-      qos: "Batch",
-      minInstances: 2,
-      maxConcurrency: 16,
-      env: { TENANT: "alpha" },
-      domains: ["chat", "rag"],
-    });
+    await writeRouteModelPolicy("/chat", "qwen", { qos: "Batch" });
 
     expect(appliedConfig()).toMatchObject({
       routes: [{
@@ -182,10 +215,6 @@ describe("manifestConfigController route policies", () => {
 
     await expect(writeRouteModelPolicy("/chat", "qwen", {
       qos: "gold",
-      minInstances: null,
-      maxConcurrency: null,
-      env: {},
-      domains: [],
     })).rejects.toThrow("Model QoS 'gold' must be one of RealTime, Standard, or Batch.");
 
     expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "apply_manifest_config")).toBe(false);

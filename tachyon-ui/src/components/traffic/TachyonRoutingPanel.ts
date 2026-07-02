@@ -8,6 +8,7 @@ import {
   writeManifestOperatorConfig,
   writeRouteModelPolicy,
   writeRoutePolicy,
+  writeRouteScalePolicy,
   writeRouteRequiresTee,
   type ManifestModelPolicyBinding,
   type ManifestOperatorConfig,
@@ -236,6 +237,13 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
         if (routePath) void this.applyRoutePolicy(routePath, form);
       });
     });
+    tbody.querySelectorAll<HTMLFormElement>("[data-route-scale-form]").forEach((form) => {
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const routePath = form.dataset.routeScaleForm ?? "";
+        if (routePath) void this.applyRouteScalePolicy(routePath, form);
+      });
+    });
     tbody.querySelectorAll<HTMLFormElement>("[data-model-policy-form]").forEach((form) => {
       form.addEventListener("submit", (event) => {
         event.preventDefault();
@@ -290,28 +298,53 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
           </label>
           <button type="submit" class="md:col-span-4 rounded border border-emerald-700/60 bg-emerald-800/30 px-3 py-1.5 text-xs font-semibold text-emerald-200 hover:bg-emerald-800/40">Save route policy</button>
         </form>
+        ${this.renderRouteScalePolicy(policy)}
         ${this.renderModelPolicies(policy)}
       </section>
     `;
   }
 
+  private renderRouteScalePolicy(policy: ManifestRoutePolicy): string {
+    const env = Object.entries(policy.env).map(([key, value]) => `${key}=${value}`).join("\n");
+    return `
+      <form data-route-scale-form="${this.escape(policy.path)}" class="grid gap-3 rounded border border-slate-700 bg-slate-950/50 p-3 md:grid-cols-4">
+        <div class="md:col-span-4">
+          <h5 class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">${t("routing.routeScale.title")}</h5>
+          <p class="mt-1 font-mono text-[11px] text-slate-500">routes[].min_instances / max_concurrency / domains / env</p>
+        </div>
+        <label class="text-xs text-slate-400">${t("routing.routeScale.minInstances")}
+          <input data-field="min_instances" type="number" min="0" value="${policy.minInstances ?? ""}" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 text-xs text-slate-200">
+        </label>
+        <label class="text-xs text-slate-400">${t("routing.routeScale.maxConcurrency")}
+          <input data-field="max_concurrency" type="number" min="0" value="${policy.maxConcurrency ?? ""}" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 text-xs text-slate-200">
+        </label>
+        <label class="text-xs text-slate-400">${t("routing.routeScale.domains")}
+          <input data-field="domains" value="${this.escape(policy.domains.join(", "))}" placeholder="chat, embeddings" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200">
+        </label>
+        <label class="text-xs text-slate-400">${t("routing.routeScale.env")}
+          <textarea data-field="env" rows="1" placeholder="KEY=value" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200">${this.escape(env)}</textarea>
+        </label>
+        <button type="submit" class="md:col-span-4 rounded border border-cyan-600/60 bg-cyan-700/30 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-700/40">${t("routing.routeScale.save")}</button>
+      </form>
+    `;
+  }
+
   private renderModelPolicies(policy: ManifestRoutePolicy): string {
     if (policy.models.length === 0) {
-      return `<p class="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-500">No models are bound to this route.</p>`;
+      return `<p class="rounded border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-500">${t("routing.modelPolicy.empty")}</p>`;
     }
     return `
       <div class="space-y-2">
-        <h5 class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">Model policies</h5>
+        <h5 class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">${t("routing.modelPolicy.title")}</h5>
         ${policy.models.map((model) => this.renderModelPolicy(policy.path, model)).join("")}
       </div>
     `;
   }
 
   private renderModelPolicy(routePath: string, model: ManifestModelPolicyBinding): string {
-    const env = Object.entries(model.env).map(([key, value]) => `${key}=${value}`).join("\n");
     return `
-      <form data-model-policy-form data-route-path="${this.escape(routePath)}" data-model-alias="${this.escape(model.alias)}" class="grid gap-2 rounded border border-slate-700 bg-slate-800/50 p-3 md:grid-cols-5">
-        <div class="md:col-span-5">
+      <form data-model-policy-form data-route-path="${this.escape(routePath)}" data-model-alias="${this.escape(model.alias)}" class="grid gap-2 rounded border border-slate-700 bg-slate-800/50 p-3 md:grid-cols-[minmax(0,1fr)_14rem_auto]">
+        <div>
           <span class="font-mono text-xs text-cyan-200">${this.escape(model.alias || model.path)}</span>
           ${model.path ? `<span class="ml-2 font-mono text-[10px] text-slate-500">${this.escape(model.path)}</span>` : ""}
         </div>
@@ -323,19 +356,7 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
             ${this.option("Batch", model.qos)}
           </select>
         </label>
-        <label class="text-xs text-slate-400">Min instances
-          <input data-field="min_instances" type="number" min="0" value="${model.minInstances ?? ""}" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 text-xs text-slate-200">
-        </label>
-        <label class="text-xs text-slate-400">Max concurrency
-          <input data-field="max_concurrency" type="number" min="0" value="${model.maxConcurrency ?? ""}" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 text-xs text-slate-200">
-        </label>
-        <label class="text-xs text-slate-400">Domains
-          <input data-field="domains" value="${this.escape(model.domains.join(", "))}" placeholder="chat, embeddings" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200">
-        </label>
-        <label class="text-xs text-slate-400">Env
-          <textarea data-field="env" rows="1" placeholder="KEY=value" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200">${this.escape(env)}</textarea>
-        </label>
-        <button type="submit" class="md:col-span-5 rounded border border-cyan-600/60 bg-cyan-700/30 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-700/40">Save model policy</button>
+        <button type="submit" class="self-end rounded border border-cyan-600/60 bg-cyan-700/30 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-700/40">${t("routing.modelPolicy.save")}</button>
       </form>
     `;
   }
@@ -380,14 +401,26 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
     }
   }
 
-  private async applyModelPolicy(routePath: string, modelAlias: string, form: HTMLFormElement): Promise<void> {
+  private async applyRouteScalePolicy(routePath: string, form: HTMLFormElement): Promise<void> {
     try {
-      const response = await writeRouteModelPolicy(routePath, modelAlias, {
-        qos: this.formValue(form, "qos"),
+      const response = await writeRouteScalePolicy(routePath, {
         minInstances: this.optionalFormNumber(form, "min_instances"),
         maxConcurrency: this.optionalFormNumber(form, "max_concurrency"),
         domains: this.formValue(form, "domains").split(","),
         env: this.parseEnv(this.formValue(form, "env")),
+      });
+      this.routePolicies = await listRoutePolicies();
+      this.showFeedback(response.success ? "success" : "error", response.message);
+      this.populateSnapshotRows();
+    } catch (error) {
+      this.showFeedback("error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async applyModelPolicy(routePath: string, modelAlias: string, form: HTMLFormElement): Promise<void> {
+    try {
+      const response = await writeRouteModelPolicy(routePath, modelAlias, {
+        qos: this.formValue(form, "qos"),
       });
       this.routePolicies = await listRoutePolicies();
       this.showFeedback(response.success ? "success" : "error", response.message);

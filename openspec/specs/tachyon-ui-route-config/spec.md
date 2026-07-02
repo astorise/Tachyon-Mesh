@@ -79,11 +79,16 @@ The Tachyon-UI SHALL provide route detail controls that write supported `Integri
 - **AND** empty optional values remove only the corresponding manifest field
 - **AND** unrelated route fields are preserved
 
-#### Scenario: Operator edits model policy fields on a route
+#### Scenario: Operator edits route scale and runtime fields
+- **WHEN** an operator expands a route in the Routing panel and saves the Route scale & runtime form
+- **THEN** Tachyon-UI writes `routes[].min_instances`, `routes[].max_concurrency`, `routes[].env`, and `routes[].domains` on the owning route
+- **AND** the submitted payload does not place route-level fields under `routes[].models[]`
+- **AND** it leaves all model bindings on the route unchanged
+
+#### Scenario: Operator edits model QoS on a route
 - **WHEN** an operator saves a model policy row for a route-bound model
 - **THEN** Tachyon-UI writes the model binding field `routes[].models[].qos` only on the matching model entry
-- **AND** it writes `routes[].min_instances`, `routes[].max_concurrency`, `routes[].env`, and `routes[].domains` on the owning route
-- **AND** the submitted payload does not place route-level fields under `routes[].models[]`
+- **AND** it leaves `routes[].min_instances`, `routes[].max_concurrency`, `routes[].env`, and `routes[].domains` unchanged on the owning route
 - **AND** it leaves other model bindings on the route unchanged
 
 #### Scenario: Model policy QoS input is constrained to backend-supported classes

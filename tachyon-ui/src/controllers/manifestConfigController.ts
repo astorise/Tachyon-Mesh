@@ -144,6 +144,10 @@ export type ManifestRoutePolicy = ManifestRouteOption & {
   resourcePolicy: ResourcePolicyConfig | null;
   adapterId: string;
   shadowTarget: string;
+  minInstances: number | null;
+  maxConcurrency: number | null;
+  env: Record<string, string>;
+  domains: string[];
   models: ManifestModelPolicyBinding[];
 };
 
@@ -182,10 +186,6 @@ export type ManifestModelPolicyBinding = {
   alias: string;
   path: string;
   qos: string;
-  minInstances: number | null;
-  maxConcurrency: number | null;
-  env: Record<string, string>;
-  domains: string[];
 };
 
 export type ManifestModelHardwareBinding = {
@@ -244,7 +244,11 @@ export async function listRoutePolicies(): Promise<ManifestRoutePolicy[]> {
     resourcePolicy: normalizeResourcePolicy(route.resource_policy),
     adapterId: typeof route.adapter_id === "string" ? route.adapter_id : "",
     shadowTarget: typeof route.shadow_target === "string" ? route.shadow_target : "",
-    models: (route.models ?? []).map((model) => normalizeModelPolicyBinding(model, route)),
+    minInstances: normalizeOptionalNumber(route.min_instances),
+    maxConcurrency: normalizeOptionalNumber(route.max_concurrency),
+    env: normalizeEnv(route.env),
+    domains: normalizeStringList(route.domains),
+    models: (route.models ?? []).map((model) => normalizeModelPolicyBinding(model)),
   }));
 }
 
@@ -339,6 +343,29 @@ export async function writeRoutePolicy(
   });
 }
 
+export async function writeRouteScalePolicy(
+  routePath: string,
+  policy: Pick<ManifestRoutePolicy, "minInstances" | "maxConcurrency" | "env" | "domains">,
+): Promise<SealApplyOutcome> {
+  const config = await readManifestConfig();
+  const routes = config.routes ?? [];
+  const idx = routes.findIndex((route) => route.path === routePath);
+  if (idx === -1) {
+    throw new Error(`Route '${routePath}' not found in manifest`);
+  }
+
+  const updatedRoute: ManifestRoute = { ...routes[idx] };
+  setRouteField(updatedRoute, "min_instances", normalizeOptionalNumber(policy.minInstances));
+  setRouteField(updatedRoute, "max_concurrency", normalizeOptionalNumber(policy.maxConcurrency));
+  setRouteField(updatedRoute, "env", normalizeEnv(policy.env));
+  setRouteField(updatedRoute, "domains", normalizeStringList(policy.domains));
+
+  return applyManifestConfig({
+    ...config,
+    routes: [...routes.slice(0, idx), updatedRoute, ...routes.slice(idx + 1)],
+  });
+}
+
 export async function writeRouteConcurrencyPolicy(
   routePath: string,
   concurrency: RouteConcurrencyConfig,
@@ -373,7 +400,7 @@ export async function writeRouteConcurrencyPolicy(
 export async function writeRouteModelPolicy(
   routePath: string,
   modelAlias: string,
-  policy: Pick<ManifestModelPolicyBinding, "qos" | "minInstances" | "maxConcurrency" | "env" | "domains">,
+  policy: Pick<ManifestModelPolicyBinding, "qos">,
 ): Promise<SealApplyOutcome> {
   const config = await readManifestConfig();
   const routes = config.routes ?? [];
@@ -399,10 +426,6 @@ export async function writeRouteModelPolicy(
     ...route,
     models: [...models.slice(0, modelIdx), updatedModel, ...models.slice(modelIdx + 1)],
   };
-  setRouteField(updatedRoute, "min_instances", normalizeOptionalNumber(policy.minInstances));
-  setRouteField(updatedRoute, "max_concurrency", normalizeOptionalNumber(policy.maxConcurrency));
-  setRouteField(updatedRoute, "env", normalizeEnv(policy.env));
-  setRouteField(updatedRoute, "domains", normalizeStringList(policy.domains));
 
   return applyManifestConfig({
     ...config,
@@ -875,15 +898,11 @@ function normalizeResourcePolicy(value: unknown): ResourcePolicyConfig | null {
   return Object.keys(normalized).length > 0 ? normalized : null;
 }
 
-function normalizeModelPolicyBinding(value: ManifestModelBinding, route: ManifestRoute): ManifestModelPolicyBinding {
+function normalizeModelPolicyBinding(value: ManifestModelBinding): ManifestModelPolicyBinding {
   return {
     alias: value.alias ?? "",
     path: value.path ?? "",
     qos: typeof value.qos === "string" ? value.qos : "",
-    minInstances: normalizeOptionalNumber(route.min_instances),
-    maxConcurrency: normalizeOptionalNumber(route.max_concurrency),
-    env: normalizeEnv(route.env),
-    domains: normalizeStringList(route.domains),
   };
 }
 
