@@ -28,6 +28,15 @@ The core host MUST move concrete runtime, network, identity, telemetry, and stat
 - **THEN** `state`, `identity`, `runtime`, `network`, and `telemetry` modules contain real host logic instead of placeholders
 - **AND** the binary compiles with the entry point importing those module APIs
 
+### Requirement: Admin plane is isolated from the data-plane runtime
+The core host MUST keep administrative HTTP route registration and admin-only handlers in `host_core/admin_plane.rs`, while `host_core/app_runtime.rs` remains focused on runtime composition, request fallback, and data-plane execution.
+
+#### Scenario: Admin routes are registered outside app runtime
+- **WHEN** contributors inspect the core host router
+- **THEN** `/admin/*` route registration lives in `core-host/src/host_core/admin_plane.rs`
+- **AND** `core-host/src/host_core/app_runtime.rs` composes the admin router without owning admin handler implementations
+- **AND** the admin endpoints preserve their existing authentication and enrollment bootstrap behavior
+
 ### Requirement: Production panic removal
 The core host MUST avoid direct `panic!` macros in production source paths.
 

@@ -44,7 +44,7 @@ The CI workflow SHALL run a repository script that verifies Tachyon client admin
 #### Scenario: Client admin endpoint has a host route
 - **GIVEN** `tachyon-client/src/lib.rs` defines an `ADMIN_*_PATH` constant
 - **WHEN** CI runs cross-layer validation
-- **THEN** `scripts/validate_cross_layer.sh` verifies that `core-host/src/host_core/app_runtime.rs` contains the exact route literal or a dynamic route beneath that path
+- **THEN** `scripts/validate_cross_layer.sh` verifies that `core-host/src/host_core/admin_plane.rs` contains the exact route literal or a dynamic route beneath that path
 
 #### Scenario: Client admin endpoint is missing from the host
 - **GIVEN** `tachyon-client/src/lib.rs` defines an `ADMIN_*_PATH` constant with no matching host route

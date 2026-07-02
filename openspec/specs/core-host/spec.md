@@ -87,7 +87,7 @@ The core-host admin API SHALL expose `GET /admin/docs` returning a Swagger UI HT
 - **AND** the HTML references `/admin/schema/openapi.json` as the schema URL
 
 ### Requirement: Cross-layer validation MUST assert OpenAPI contract routes exist
-The `validate_cross_layer.sh` script SHALL assert that the four core OpenAPI contract routes (`/admin/schema/openapi.json`, `/admin/docs`, `/admin/manifest`, `/admin/iam/users`) are registered in `app_runtime.rs`.
+The `validate_cross_layer.sh` script SHALL assert that the four core OpenAPI contract routes (`/admin/schema/openapi.json`, `/admin/docs`, `/admin/manifest`, `/admin/iam/users`) are registered in `admin_plane.rs`.
 
 #### Scenario: Validation fails when a contract route is removed
 - **WHEN** one of the checked routes is removed from the Axum router
