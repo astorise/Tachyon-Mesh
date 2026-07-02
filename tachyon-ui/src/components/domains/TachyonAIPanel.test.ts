@@ -29,13 +29,16 @@ function mountPanel(): HTMLElement {
 }
 
 describe("TachyonAIPanel", () => {
+  let manifestConfig: Record<string, unknown>;
+
   beforeEach(() => {
     document.body.innerHTML = "";
     setLanguage("en");
+    manifestConfig = { routes: [], kv_caches: [] };
     vi.mocked(listen).mockClear();
     tauriInvokeMock.mockImplementation(async (command: string) => {
       if (command === "get_manifest_config") {
-        return { routes: [], kv_caches: [] };
+        return manifestConfig;
       }
       if (command === "apply_manifest_config") {
         return { success: true, message: "applied", configVersion: 2 };
@@ -59,6 +62,9 @@ describe("TachyonAIPanel", () => {
           { id: "gguf/llama-3", alias: "llama-3", engine: "gguf" },
           { id: "safetensors/qwen", alias: "qwen", engine: "safetensors" },
         ];
+      }
+      if (command === "get_cluster_hardware_summary") {
+        return { source: "mock", enrolledCount: 1, onlineCount: 1, staleCount: 0, totalRamMb: 65536, gpuCount: 2 };
       }
       return null;
     });
@@ -90,6 +96,70 @@ describe("TachyonAIPanel", () => {
         kv_caches: [
           expect.objectContaining({ name: "cache-for-llama-3", model_ref: "llama-3" }),
           expect.objectContaining({ name: "cache-for-qwen", model_ref: "qwen" }),
+        ],
+      }),
+    });
+    expect(tauriInvokeMock).not.toHaveBeenCalledWith(
+      "apply_configuration",
+      expect.objectContaining({ domain: "config-ai" }),
+    );
+  });
+
+  it("writes hardware_strategy on the selected manifest model binding", async () => {
+    manifestConfig = {
+      routes: [
+        {
+          path: "/chat",
+          name: "chat",
+          version: "1.0.0",
+          models: [{ alias: "qwen", path: "/models/qwen", device: "cuda" }],
+        },
+      ],
+      kv_caches: [],
+    };
+
+    const panel = mountPanel();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const root = panel.shadowRoot;
+    expect(root?.textContent).toContain("Model Hardware Strategy");
+
+    const distribution = root?.querySelector<HTMLSelectElement>('[data-hw-field="distribution_mode"]');
+    const devices = root?.querySelector<HTMLInputElement>('[data-hw-field="device_ids"]');
+    const paged = root?.querySelector<HTMLInputElement>('[data-hw-field="paged_attention"]');
+    const prefill = root?.querySelector<HTMLInputElement>('[data-hw-field="prefill_chunk_tokens"]');
+    const draftPath = root?.querySelector<HTMLInputElement>('[data-hw-field="speculative_draft_model_path"]');
+    const draftTokens = root?.querySelector<HTMLInputElement>('[data-hw-field="speculative_draft_tokens"]');
+
+    distribution!.value = "tensor_parallelism";
+    devices!.value = "0,1";
+    paged!.checked = true;
+    prefill!.value = "4096";
+    draftPath!.value = "/models/qwen-draft";
+    draftTokens!.value = "6";
+
+    root?.querySelector<HTMLButtonElement>("[data-hardware-save]")?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(tauriInvokeMock).toHaveBeenCalledWith("apply_manifest_config", {
+      config: expect.objectContaining({
+        routes: [
+          expect.objectContaining({
+            path: "/chat",
+            models: [
+              expect.objectContaining({
+                alias: "qwen",
+                hardware_strategy: expect.objectContaining({
+                  distribution_mode: "tensor_parallelism",
+                  device_ids: [0, 1],
+                  paged_attention: true,
+                  prefill_chunk_tokens: 4096,
+                  speculative_draft_model_path: "/models/qwen-draft",
+                  speculative_draft_tokens: 6,
+                }),
+              }),
+            ],
+          }),
         ],
       }),
     });

@@ -4,7 +4,15 @@ import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { resilientInvoke as invoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
 import "./TachyonModelUploadPanel";
-import { writeAiKvCaches } from "../../controllers/manifestConfigController";
+import {
+  type GpuDistribution,
+  type HardwareStrategy,
+  type ManifestModelHardwareBinding,
+  listManifestModelHardwareBindings,
+  normalizeHardwareStrategy,
+  writeAiKvCaches,
+  writeModelHardwareStrategy,
+} from "../../controllers/manifestConfigController";
 
 type RuntimeMetrics = {
   source: string;
@@ -24,9 +32,16 @@ type AvailableAiModel = {
 
 type ModelLoadMode = "integrity" | "layer" | "layer-batch";
 
+type ClusterHardwareSummary = {
+  source: string;
+  gpuCount: number;
+};
+
 export class TachyonAIPanel extends TachyonConfigDashboard {
   private metrics: RuntimeMetrics | null = null;
   private models: AvailableAiModel[] = [];
+  private manifestModelBindings: ManifestModelHardwareBinding[] = [];
+  private hardwareSummary: ClusterHardwareSummary | null = null;
   private modelLoadModes: Record<string, ModelLoadMode> = {};
   private readonly onLanguageChanged = () => { this.render(); this.bindEvents(); };
   // The child `<tachyon-model-upload-panel>` fires this (bubbling/composed) on a
@@ -49,22 +64,35 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
   }
 
   private async refreshAiState(): Promise<void> {
-    const metrics = await invoke<RuntimeMetrics>("get_metrics").catch(() => null);
+    const [metrics, hardwareSummary] = await Promise.all([
+      invoke<RuntimeMetrics>("get_metrics").catch(() => null),
+      invoke<ClusterHardwareSummary>("get_cluster_hardware_summary").catch(() => null),
+    ]);
     // Unlike metrics (best-effort), a failed model-list fetch is surfaced: silently
     // swallowing it (`catch(() => [])`) is exactly what made an uploaded-but-
     // unlistable model look like "nothing happened". Keep the previous list on error.
     let modelsError: string | null = null;
+    let bindingsError: string | null = null;
     try {
       this.models = await invoke<AvailableAiModel[]>("list_available_models");
     } catch (error) {
       modelsError = error instanceof Error ? error.message : String(error);
     }
+    try {
+      this.manifestModelBindings = await listManifestModelHardwareBindings();
+    } catch (error) {
+      bindingsError = error instanceof Error ? error.message : String(error);
+    }
     this.metrics = metrics;
+    this.hardwareSummary = hardwareSummary;
     this.reconcileModelLoadModes();
     this.render();
     this.bindEvents();
     if (modelsError) {
       this.showFeedback("error", t("ai.model.loadError").replace("{message}", modelsError));
+    }
+    if (bindingsError) {
+      this.showFeedback("error", `Failed to load manifest model bindings: ${bindingsError}`);
     }
   }
 
@@ -87,6 +115,8 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
         <tachyon-model-upload-panel data-stagger-panel></tachyon-model-upload-panel>
 
         ${this.renderModelLoadModes()}
+
+        ${this.renderHardwareStrategies()}
 
         <form class="space-y-6">
           <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -190,6 +220,15 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
         }
       });
     });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-hardware-save]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const key = button.dataset.hardwareSave;
+        if (key) {
+          void this.saveHardwareStrategy(key);
+        }
+      });
+    });
   }
 
   private async applyConfiguration(): Promise<void> {
@@ -242,6 +281,176 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
         }
       </section>
     `;
+  }
+
+  private renderHardwareStrategies(): string {
+    const bindings = this.manifestModelBindings;
+    const gpuHint =
+      this.hardwareSummary && this.hardwareSummary.gpuCount > 0
+        ? `Discovered GPUs: ${Array.from({ length: this.hardwareSummary.gpuCount }, (_, idx) => idx).join(", ")}`
+        : "No GPU reported by cluster hardware summary.";
+
+    return `
+      <section data-stagger-panel class="rounded border border-slate-700 bg-slate-800/70 p-5">
+        <div class="mb-4 flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h3 class="text-sm font-bold uppercase tracking-widest text-slate-200">Model Hardware Strategy</h3>
+            <p class="text-[11px] text-slate-500">Manifest-backed routes[].models[].hardware_strategy bindings.</p>
+          </div>
+          <span class="font-mono text-[11px] text-cyan-300">${this.escape(gpuHint)}</span>
+        </div>
+        ${
+          bindings.length === 0
+            ? `<div class="rounded border border-slate-700 bg-slate-900/70 px-3 py-2 text-[11px] text-slate-500">No route model bindings are present in the active manifest.</div>`
+            : `<div class="space-y-4">${bindings.map((binding) => this.renderHardwareStrategyCard(binding)).join("")}</div>`
+        }
+      </section>
+    `;
+  }
+
+  private renderHardwareStrategyCard(binding: ManifestModelHardwareBinding): string {
+    const strategy = binding.hardwareStrategy;
+    const key = this.hardwareBindingKey(binding);
+    const routeLabel = `${binding.routePath}${binding.routeVersion ? ` @ ${binding.routeVersion}` : ""}`;
+    return `
+      <article class="rounded border border-slate-700 bg-slate-900/70 p-4">
+        <div class="mb-4 flex flex-col gap-1 md:flex-row md:items-start md:justify-between">
+          <div>
+            <div class="font-mono text-sm text-slate-100">${this.escape(binding.alias)}</div>
+            <div class="text-[11px] text-slate-500">${this.escape(routeLabel)} · ${this.escape(binding.device)}</div>
+          </div>
+          <button type="button" data-hardware-save="${this.escape(key)}" class="rounded border border-cyan-500/60 bg-cyan-500/10 px-3 py-2 text-xs font-semibold text-cyan-200 hover:bg-cyan-500/20">Save strategy</button>
+        </div>
+        <div class="grid grid-cols-1 gap-3 lg:grid-cols-4">
+          <label class="text-[11px] uppercase tracking-widest text-slate-400">Distribution
+            <select data-hw-key="${this.escape(key)}" data-hw-field="distribution_mode" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-xs text-cyan-300">
+              ${this.renderDistributionOption("single", strategy.distribution_mode)}
+              ${this.renderDistributionOption("tensor_parallelism", strategy.distribution_mode)}
+              ${this.renderDistributionOption("pipeline_parallelism", strategy.distribution_mode)}
+              ${this.renderDistributionOption("expert_parallelism", strategy.distribution_mode)}
+            </select>
+          </label>
+          <label class="text-[11px] uppercase tracking-widest text-slate-400">Device IDs
+            <input data-hw-key="${this.escape(key)}" data-hw-field="device_ids" value="${this.escape(strategy.device_ids.join(","))}" placeholder="0,1" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-200">
+          </label>
+          <label class="text-[11px] uppercase tracking-widest text-slate-400">Pipeline depth
+            <input data-hw-key="${this.escape(key)}" data-hw-field="pipeline_depth" type="number" min="0" value="${strategy.pipeline_depth}" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-200">
+          </label>
+          <label class="text-[11px] uppercase tracking-widest text-slate-400">Prefill chunk tokens
+            <input data-hw-key="${this.escape(key)}" data-hw-field="prefill_chunk_tokens" type="number" min="0" value="${strategy.prefill_chunk_tokens ?? ""}" placeholder="8192" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-200">
+          </label>
+        </div>
+        <div class="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <label class="text-[11px] uppercase tracking-widest text-slate-400">Stage layer ranges
+            <input data-hw-key="${this.escape(key)}" data-hw-field="stage_layer_ranges" value="${this.escape(this.formatPairs(strategy.stage_layer_ranges))}" placeholder="0-15,16-31" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-200">
+          </label>
+          <label class="text-[11px] uppercase tracking-widest text-slate-400">Expert device map
+            <input data-hw-key="${this.escape(key)}" data-hw-field="expert_device_map" value="${this.escape(this.formatPairs(strategy.expert_device_map))}" placeholder="0:0,1:1" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-200">
+          </label>
+        </div>
+        <div class="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-3">
+          ${this.renderHardwareToggle(key, "paged_attention", "Paged attention", strategy.paged_attention)}
+          ${this.renderHardwareToggle(key, "cuda_graph_decode", "CUDA graph decode", strategy.cuda_graph_decode)}
+          ${this.renderHardwareToggle(key, "flashinfer_attention", "FlashInfer attention", strategy.flashinfer_attention)}
+        </div>
+        <div class="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-[1fr_12rem]">
+          <label class="text-[11px] uppercase tracking-widest text-slate-400">Speculative draft model path
+            <input data-hw-key="${this.escape(key)}" data-hw-field="speculative_draft_model_path" value="${this.escape(strategy.speculative_draft_model_path)}" placeholder="/models/draft" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-200">
+          </label>
+          <label class="text-[11px] uppercase tracking-widest text-slate-400">Draft tokens
+            <input data-hw-key="${this.escape(key)}" data-hw-field="speculative_draft_tokens" type="number" min="0" value="${strategy.speculative_draft_tokens}" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-200">
+          </label>
+        </div>
+        <p class="mt-3 text-[11px] text-amber-300/80">Runtime rejections from unsupported Candle paths are returned by manifest apply and shown in the feedback area.</p>
+      </article>
+    `;
+  }
+
+  private renderDistributionOption(value: GpuDistribution, selected: GpuDistribution): string {
+    return `<option value="${value}" ${value === selected ? "selected" : ""}>${value}</option>`;
+  }
+
+  private renderHardwareToggle(key: string, field: keyof HardwareStrategy, label: string, checked: boolean): string {
+    return `
+      <label class="flex items-center justify-between gap-3 rounded border border-slate-700 bg-slate-950 px-3 py-2 text-[11px] uppercase tracking-widest text-slate-400">
+        <span>${this.escape(label)}</span>
+        <input data-hw-key="${this.escape(key)}" data-hw-field="${String(field)}" type="checkbox" ${checked ? "checked" : ""} class="h-4 w-4 accent-cyan-500">
+      </label>
+    `;
+  }
+
+  private async saveHardwareStrategy(key: string): Promise<void> {
+    const binding = this.manifestModelBindings.find((item) => this.hardwareBindingKey(item) === key);
+    if (!binding) {
+      this.showFeedback("error", "Model binding is no longer available in the manifest.");
+      return;
+    }
+    try {
+      const strategy = this.readHardwareStrategyFromForm(key);
+      const response = await writeModelHardwareStrategy(binding.routePath, binding.alias, strategy);
+      this.showFeedback(response.success ? "success" : "error", response.message);
+      this.manifestModelBindings = await listManifestModelHardwareBindings();
+      this.render();
+      this.bindEvents();
+    } catch (error) {
+      this.showFeedback("error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private readHardwareStrategyFromForm(key: string): HardwareStrategy {
+    const controls = Array.from(this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-hw-key]"))
+      .filter((control) => control.dataset.hwKey === key);
+    const valueFor = (field: string): string => controls.find((control) => control.dataset.hwField === field)?.value ?? "";
+    const checkedFor = (field: string): boolean => {
+      const control = controls.find((item) => item.dataset.hwField === field) as HTMLInputElement | undefined;
+      return control?.checked === true;
+    };
+
+    return normalizeHardwareStrategy({
+      distribution_mode: this.normalizeDistribution(valueFor("distribution_mode")),
+      device_ids: this.parseNumberList(valueFor("device_ids")),
+      stage_layer_ranges: this.parsePairs(valueFor("stage_layer_ranges")),
+      expert_device_map: this.parsePairs(valueFor("expert_device_map")),
+      pipeline_depth: this.parseNonNegativeInteger(valueFor("pipeline_depth")),
+      paged_attention: checkedFor("paged_attention"),
+      cuda_graph_decode: checkedFor("cuda_graph_decode"),
+      flashinfer_attention: checkedFor("flashinfer_attention"),
+      prefill_chunk_tokens: valueFor("prefill_chunk_tokens") === "" ? undefined : this.parseNonNegativeInteger(valueFor("prefill_chunk_tokens")),
+      speculative_draft_model_path: valueFor("speculative_draft_model_path").trim(),
+      speculative_draft_tokens: this.parseNonNegativeInteger(valueFor("speculative_draft_tokens")),
+    });
+  }
+
+  private hardwareBindingKey(binding: ManifestModelHardwareBinding): string {
+    return `${binding.routePath}::${binding.alias}`;
+  }
+
+  private normalizeDistribution(value: string): GpuDistribution {
+    return value === "tensor_parallelism" || value === "pipeline_parallelism" || value === "expert_parallelism" ? value : "single";
+  }
+
+  private parseNumberList(value: string): number[] {
+    return value.split(",").map((item) => this.parseNonNegativeInteger(item)).filter((item, index, list) => item > 0 || list.indexOf(item) === index);
+  }
+
+  private parsePairs(value: string): Array<[number, number]> {
+    return value
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((item) => {
+        const [left, right] = item.split(/[:-]/);
+        return [this.parseNonNegativeInteger(left), this.parseNonNegativeInteger(right)] as [number, number];
+      });
+  }
+
+  private formatPairs(pairs: Array<[number, number]>): string {
+    return pairs.map(([left, right]) => `${left}:${right}`).join(",");
+  }
+
+  private parseNonNegativeInteger(value: string): number {
+    const numeric = Number.parseInt(value, 10);
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
   }
 
   private reconcileModelLoadModes(): void {

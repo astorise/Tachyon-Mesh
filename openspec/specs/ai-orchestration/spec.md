@@ -21,6 +21,25 @@ The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for confi
 - **WHEN** the AI Orchestration view is rendered (with `has_ai` true)
 - **THEN** the `<tachyon-model-upload-panel>` control is present for uploading a model file
 
+### Requirement: AI Panel Hardware Strategy Bindings
+The Tachyon AI panel SHALL expose each route model binding from the active manifest and let operators configure the binding's `hardware_strategy` fields without using `ui_configurations` overlays.
+
+#### Scenario: Operator lists manifest model hardware bindings
+- **WHEN** the AI panel loads
+- **THEN** it reads the active manifest through `get_manifest_config`
+- **AND** lists every `routes[].models[]` binding that has an alias
+- **AND** it shows the cluster GPU count from `get_cluster_hardware_summary` as placement context
+
+#### Scenario: Operator applies a model hardware strategy
+- **WHEN** the operator edits a model binding's distribution mode, device IDs, stage ranges, expert map, pipeline depth, paged attention, CUDA graph decode, FlashInfer attention, prefill chunk tokens, or speculative draft settings
+- **THEN** the panel mutates only that binding's `models[].hardware_strategy` field in the active manifest
+- **AND** it applies the updated manifest through `apply_manifest_config`
+- **AND** it does not call `apply_configuration` or persist an AI payload under `ui_configurations`
+
+#### Scenario: Runtime rejects an unsupported hardware strategy
+- **WHEN** `apply_manifest_config` rejects a `hardware_strategy` because the selected Candle runtime path is not available
+- **THEN** the AI panel displays the returned rejection message in its feedback area
+
 ### Requirement: Hardware Accelerator Panel
 The Tachyon UI shell SHALL expose a `<tachyon-hardware-panel>` web component for selecting NPU, TPU, or GPU acceleration and enabling eBPF XDP offloading.
 
