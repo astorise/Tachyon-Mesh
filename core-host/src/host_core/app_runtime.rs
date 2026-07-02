@@ -35,6 +35,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/admin/shadow/diffs", get(admin_shadow_diffs_handler))
         .route("/admin/chaos/scenarios", post(admin_chaos_scenario_handler))
         .route(
+            "/admin/lora/training/{job_id}",
+            get(admin_lora_training_status_handler),
+        )
+        .route(
             "/admin/manifest",
             get(admin_get_manifest_handler).post(admin_manifest_update_handler),
         )
@@ -403,6 +407,76 @@ pub(crate) async fn admin_shadow_diffs_handler() -> axum::Json<Vec<AdminShadowDi
     // telemetry stream. The admin surface is intentionally stable even when no
     // divergence collector has produced recent rows.
     axum::Json(Vec::new())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminLoraTrainingStatus {
+    pub(crate) job_id: String,
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) step: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) adapter_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) async fn admin_lora_training_status_handler(
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Response {
+    let queue = lora_training_queue();
+    let status = queue
+        .statuses
+        .lock()
+        .expect("LoRA training status map should not be poisoned")
+        .get(&job_id)
+        .cloned();
+    let Some(status) = status else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("unknown LoRA training job `{job_id}`"),
+        )
+            .into_response();
+    };
+
+    let body = match status {
+        LoraTrainingJobStatus::Queued => AdminLoraTrainingStatus {
+            job_id,
+            status: "queued".to_owned(),
+            step: None,
+            total: None,
+            adapter_path: None,
+            error: None,
+        },
+        LoraTrainingJobStatus::Running { step, total } => AdminLoraTrainingStatus {
+            job_id,
+            status: "running".to_owned(),
+            step: Some(step),
+            total: Some(total),
+            adapter_path: None,
+            error: None,
+        },
+        LoraTrainingJobStatus::Completed { adapter_path } => AdminLoraTrainingStatus {
+            job_id,
+            status: "completed".to_owned(),
+            step: None,
+            total: None,
+            adapter_path: Some(adapter_path),
+            error: None,
+        },
+        LoraTrainingJobStatus::Failed { message } => AdminLoraTrainingStatus {
+            job_id,
+            status: "failed".to_owned(),
+            step: None,
+            total: None,
+            adapter_path: None,
+            error: Some(message),
+        },
+    };
+    axum::Json(body).into_response()
 }
 
 #[derive(Debug, Serialize)]

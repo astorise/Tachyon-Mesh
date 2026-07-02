@@ -27,6 +27,7 @@ const ADMIN_MANIFEST_BUNDLE_PATH: &str = "/admin/manifest/bundle";
 const ADMIN_MANIFEST_PATH: &str = "/admin/manifest";
 const ADMIN_METRICS_PATH: &str = "/admin/metrics";
 const ADMIN_CANARY_PATH: &str = "/admin/canary";
+const ADMIN_LORA_TRAINING_PATH: &str = "/admin/lora/training";
 const ADMIN_SCHEMA_MANIFEST_PATH: &str = "/admin/schema/manifest";
 const ADMIN_KV_PATH: &str = "/admin/kv";
 const ADMIN_LOGS_PATH: &str = "/admin/logs";
@@ -2181,6 +2182,29 @@ pub async fn fetch_canary_status() -> Result<Vec<CanaryStatusEntry>> {
         return Ok(Vec::new());
     }
     get_admin_json(ADMIN_CANARY_PATH).await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoraTrainingStatus {
+    pub job_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub async fn lora_training_status(job_id: &str) -> Result<LoraTrainingStatus> {
+    if current_connection().is_none() {
+        return Err(anyhow::anyhow!("not connected to a node"));
+    }
+    let path = format!("{ADMIN_LORA_TRAINING_PATH}/{job_id}");
+    get_admin_json(&path).await
 }
 
 /// Fetch the JSON Schema document that describes the `IntegrityConfig` manifest

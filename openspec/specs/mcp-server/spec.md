@@ -274,6 +274,28 @@ The Tachyon MCP server SHALL provide a `recommend_concurrency_policy` tool that 
 - **THEN** the tool returns `consistency.write_mode: "optimistic_etag"` and `coordination.mode: "mesh_leader"`
 - **AND** `risk_level: "medium"` because optimistic conflicts can cause invocation failures
 
+### Requirement: MCP exposes a generic route patch mutator
+The Tachyon MCP server SHALL provide a `tachyon_patch_route` JSON-RPC tool that accepts `route_path`, a JSON object `patch`, and optional `dry_run`, reads the live manifest, recursively merges the patch into the matching `IntegrityRoute`, validates the patched manifest, and applies it through the admin manifest API when `dry_run` is false.
+
+#### Scenario: Route patch applies configurable route fields
+- **WHEN** an AI agent calls `tachyon_patch_route` with `route_path: "/api/billing"` and `patch: {"concurrency":{"mode":"mesh-singleton","on_conflict":"queue"},"adapter_id":"tenant-a"}`
+- **THEN** the MCP server merges those fields into the matching route without replacing unrelated nested fields
+- **AND** validates the patched manifest before applying it
+- **AND** posts the updated manifest through the existing admin manifest path
+
+#### Scenario: Route patch dry-run previews validation and merged route
+- **WHEN** an AI agent calls `tachyon_patch_route` with `dry_run: true`
+- **THEN** the tool returns the merged `route_preview`, `manifest_preview`, and validation report
+- **AND** it does not post the manifest to the node
+
+#### Scenario: Route patch rejects structural route changes
+- **WHEN** a `tachyon_patch_route` call includes `path` or `role` inside `patch`
+- **THEN** the server returns an invalid-params error without applying the manifest
+
+#### Scenario: Route patch is rate-limited as a manifest mutator
+- **WHEN** `tachyon_patch_route` is called more often than its per-minute mutator budget allows
+- **THEN** further calls return the rate-limited error (`-32002`) until the bucket refills
+
 ### Requirement: The MCP server exposes an upload_model tool
 The `tachyon-mcp` binary SHALL register a `tachyon_upload_model` JSON-RPC tool that accepts a required string `path` argument — an absolute local path to a model directory (weights plus `tokenizer.json`, and `config.json` for safetensors) or a single self-contained file on the MCP host — and delegates to `tachyon_client::push_large_model(path)`, returning the resulting server-side model path in the tool result content. The tool's `inputSchema` SHALL declare `required: ["path"]`, the missing-`path` case SHALL be rejected before any cluster call, and the tool SHALL be governed by the same tight per-minute rate-limit budget as other large, hash-verified mutators.
 

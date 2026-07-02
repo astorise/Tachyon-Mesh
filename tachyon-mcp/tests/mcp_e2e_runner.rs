@@ -503,7 +503,9 @@ fn test_tools_list_includes_scope_tools() {
         for expected in &[
             "tachyon_get_scope_denials",
             "tachyon_set_route_scopes",
+            "tachyon_patch_route",
             "tachyon_suggest_scopes",
+            "tachyon_lora_training_status",
         ] {
             assert!(
                 names.contains(expected),
@@ -642,6 +644,55 @@ fn test_set_route_scopes_missing_args_returns_32602() {
         resp["error"]["code"].as_i64(),
         Some(-32602),
         "missing scopes must return -32602; got {resp}"
+    );
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// `tachyon_patch_route` and `tachyon_lora_training_status` missing required
+/// args are rejected before any cluster/network call.
+#[test]
+fn test_route_patch_and_lora_status_missing_args_return_32602() {
+    let Some((mut child, mut stdin, mut reader)) =
+        spawn_offline_mcp_isolated("patch-route-missing")
+    else {
+        return;
+    };
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"tachyon_patch_route","arguments":{"route_path":"/api/fn"}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("patch_route missing patch response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 80);
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "missing patch must return -32602; got {resp}"
+    );
+    drop(stdin);
+    let _ = child.wait();
+
+    let Some((mut child, mut stdin, mut reader)) =
+        spawn_offline_mcp_isolated("lora-status-missing")
+    else {
+        return;
+    };
+    let raw = send_and_recv(
+        &mut stdin,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":81,"method":"tools/call","params":{"name":"tachyon_lora_training_status","arguments":{}}}"#,
+    );
+    let resp: serde_json::Value =
+        serde_json::from_str(&raw).expect("lora status missing job_id response is valid JSON");
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 81);
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "missing job_id must return -32602; got {resp}"
     );
     drop(stdin);
     let _ = child.wait();

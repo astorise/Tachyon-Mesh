@@ -303,6 +303,8 @@ fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<V
         "restore_volume" => &["route_path", "guest_path", "snapshot_id"],
         "recommend_concurrency_policy" => &["pattern"],
         "tachyon_set_route_scopes" => &["route_path", "scopes"],
+        "tachyon_patch_route" => &["route_path", "patch"],
+        "tachyon_lora_training_status" => &["job_id"],
         "tachyon_suggest_scopes" => &["route_path"],
         _ => return None,
     };
@@ -330,7 +332,10 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         // Critical mutators — very tight budget to prevent accidental canary misconfiguration.
         "tachyon_canary_split" => 2,
         // Deployment / deletion mutators — moderate budget.
-        "tachyon_apply_manifest" | "tachyon_seal_overlay" | "tachyon_set_route_scopes" => 1,
+        "tachyon_apply_manifest"
+        | "tachyon_seal_overlay"
+        | "tachyon_set_route_scopes"
+        | "tachyon_patch_route" => 1,
         "tachyon_import_package" => 3,
         // Model uploads are large and hash-verified — keep the budget tight.
         "tachyon_upload_model" => 3,
@@ -355,6 +360,7 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         | "tachyon_hardware_status"
         | "tachyon_list_resources"
         | "tachyon_list_functions"
+        | "tachyon_lora_training_status"
         | "tachyon_kv_get"
         | "tachyon_dryrun_manifest"
         | "validate_faas_capabilities"
@@ -732,6 +738,29 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                     }
                 },
                 {
+                    "name": "tachyon_patch_route",
+                    "description": "Patch any configurable fields on a route in the live manifest. Reads the current manifest, recursively merges the JSON patch object into the target route, validates through the node manifest endpoint when applying, and POSTs the modified manifest. Use dry_run=true to preview the merged route and manifest without applying it. The structural fields path and role cannot be patched.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["route_path", "patch"],
+                        "properties": {
+                            "route_path": {
+                                "type": "string",
+                                "description": "HTTP route path of the target deployment (e.g. '/api/my-fn')."
+                            },
+                            "patch": {
+                                "type": "object",
+                                "description": "Route fragment to merge, such as {\"concurrency\":{\"mode\":\"mesh-singleton\",\"on_conflict\":\"queue\"},\"distributed_rate_limit\":{\"threshold\":100,\"window_seconds\":60,\"scope\":\"tenant\"},\"adapter_id\":\"tenant-a\"}."
+                            },
+                            "dry_run": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "When true, return route_preview and manifest_preview without posting to the node."
+                            }
+                        }
+                    }
+                },
+                {
                     "name": "tachyon_suggest_scopes",
                     "description": "Suggest a starting scopes configuration for a route based on its current state and lifetime denial count. Returns a conservative YAML snippet and rationale. Apply the suggestion with tachyon_set_route_scopes.",
                     "inputSchema": {
@@ -855,6 +884,17 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                         "properties": {
                             "function_name": { "type": "string" },
                             "lines": { "type": "integer", "default": 100, "minimum": 1, "maximum": 1000 }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_lora_training_status",
+                    "description": "Return the current status for a LoRA training job submitted through the tachyon:mesh/training WIT interface.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["job_id"],
+                        "properties": {
+                            "job_id": { "type": "string", "description": "LoRA training job id, e.g. 'lora-abc123'." }
                         }
                     }
                 },
@@ -1097,6 +1137,36 @@ async fn get_hardware_status() -> Result<Value> {
     Ok(json!({
         "content": [{ "type": "text", "text": body }]
     }))
+}
+
+fn merge_json_object(target: &mut Value, patch: Value) {
+    match (target, patch) {
+        (Value::Object(target_map), Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                match target_map.get_mut(&key) {
+                    Some(target_value) => merge_json_object(target_value, patch_value),
+                    None => {
+                        target_map.insert(key, patch_value);
+                    }
+                }
+            }
+        }
+        (target_slot, patch_value) => {
+            *target_slot = patch_value;
+        }
+    }
+}
+
+fn validate_route_patch(patch: &Value) -> Result<()> {
+    let object = patch.as_object().ok_or_else(|| {
+        anyhow::anyhow!("patch must be a JSON object containing route fields to merge")
+    })?;
+    for field in ["path", "role"] {
+        if object.contains_key(field) {
+            anyhow::bail!("patch must not modify structural route field `{field}`");
+        }
+    }
+    Ok(())
 }
 
 async fn handle_tool_call(params: Option<&Value>) -> Result<Value> {
@@ -1358,6 +1428,82 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 }))?)
             }
         }
+        "tachyon_patch_route" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .context("missing route_path")?;
+            let patch = arguments.get("patch").cloned().context("missing patch")?;
+            let dry_run = arguments
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            validate_route_patch(&patch)?;
+
+            let mut config = tachyon_client::get_manifest_config()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+
+            let routes = config
+                .get_mut("routes")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| anyhow::anyhow!("manifest has no routes array"))?;
+
+            let route = routes.iter_mut().find(|r| {
+                r.get("path")
+                    .and_then(Value::as_str)
+                    .map(|p| p == route_path)
+                    .unwrap_or(false)
+            });
+
+            let route = match route {
+                Some(r) => r,
+                None => {
+                    return Ok(json_rpc_error_response(
+                        None,
+                        &JsonRpcError::invalid_params(
+                            "route not found",
+                            json!({
+                                "route_path": route_path,
+                                "detail": "route not found in manifest - use tachyon_list_functions to list available routes"
+                            }),
+                        ),
+                    ));
+                }
+            };
+
+            merge_json_object(route, patch.clone());
+            let route_preview = route.clone();
+            let validation_report = tachyon_client::dryrun_manifest(config.clone())
+                .await
+                .context("patched manifest failed dry-run validation")?;
+
+            if dry_run {
+                Ok(text_tool_result(&json!({
+                    "dry_run": true,
+                    "route_path": route_path,
+                    "patch_applied": patch,
+                    "validation": validation_report,
+                    "route_preview": route_preview,
+                    "manifest_preview": config,
+                }))?)
+            } else {
+                tachyon_client::apply_manifest_config(config)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                Ok(text_tool_result(&json!({
+                    "success": true,
+                    "route_path": route_path,
+                    "patch_applied": patch,
+                    "validation": validation_report,
+                    "dry_run": false,
+                }))?)
+            }
+        }
         "tachyon_suggest_scopes" => {
             let arguments = params
                 .and_then(|v| v.get("arguments"))
@@ -1599,6 +1745,18 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
         }
 
         // ── KV-Partition V2 ───────────────────────────────────────────────────
+        "tachyon_lora_training_status" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let job_id = arguments
+                .get("job_id")
+                .and_then(Value::as_str)
+                .context("missing job_id")?;
+            let status = tachyon_client::lora_training_status(job_id).await?;
+            Ok(text_tool_result(&status)?)
+        }
         "tachyon_kv_get" => {
             let arguments = params
                 .and_then(|v| v.get("arguments"))
@@ -1884,6 +2042,48 @@ mod tests {
             std::process::id(),
             unix_now()
         ))
+    }
+
+    #[test]
+    fn merge_json_object_recursively_updates_nested_route_fields() {
+        let mut route = json!({
+            "path": "/api/fn",
+            "concurrency": {
+                "mode": "unrestricted",
+                "on_conflict": "reject"
+            },
+            "env": {
+                "A": "1"
+            }
+        });
+        merge_json_object(
+            &mut route,
+            json!({
+                "concurrency": {
+                    "mode": "mesh-singleton",
+                    "lock_ttl_ms": 5000
+                },
+                "env": {
+                    "B": "2"
+                },
+                "adapter_id": "tenant-a"
+            }),
+        );
+
+        assert_eq!(route["concurrency"]["mode"], "mesh-singleton");
+        assert_eq!(route["concurrency"]["on_conflict"], "reject");
+        assert_eq!(route["concurrency"]["lock_ttl_ms"], 5000);
+        assert_eq!(route["env"]["A"], "1");
+        assert_eq!(route["env"]["B"], "2");
+        assert_eq!(route["adapter_id"], "tenant-a");
+    }
+
+    #[test]
+    fn validate_route_patch_rejects_structural_fields() {
+        assert!(validate_route_patch(&json!({"concurrency": {"mode": "unrestricted"}})).is_ok());
+        assert!(validate_route_patch(&json!({"path": "/api/other"})).is_err());
+        assert!(validate_route_patch(&json!({"role": "system"})).is_err());
+        assert!(validate_route_patch(&json!(["not", "object"])).is_err());
     }
 
     #[tokio::test]

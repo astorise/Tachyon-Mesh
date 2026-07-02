@@ -22,3 +22,16 @@ The Candle execution engine SHALL fall back to system RAM (CPU/RAM spillover) wh
 - **AND** the resulting `.safetensors` adapter is stored in `system-faas-model-broker`
 - **AND** the job status is reported as `completed` to the originating tenant
 
+### Requirement: Operators can query LoRA training job status
+The host SHALL expose an authenticated admin status endpoint for LoRA training jobs, and Tachyon MCP SHALL expose a `tachyon_lora_training_status` tool that returns the current queue state for a submitted LoRA job id.
+
+#### Scenario: MCP reads a LoRA training job status
+- **GIVEN** a LoRA training job has been submitted through the training WIT interface
+- **WHEN** an operator or AI agent calls `tachyon_lora_training_status` with that `job_id`
+- **THEN** the MCP server queries the node's admin LoRA training status endpoint
+- **AND** returns `queued`, `running`, `completed`, or `failed` with progress or artifact details when available
+
+#### Scenario: Unknown LoRA training job is reported clearly
+- **WHEN** the admin LoRA training status endpoint is queried with an unknown `job_id`
+- **THEN** the host returns a not-found response
+- **AND** the MCP client surfaces the missing job without inventing a queue state
