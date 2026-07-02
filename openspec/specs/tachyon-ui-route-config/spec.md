@@ -86,6 +86,13 @@ The Tachyon-UI SHALL provide route detail controls that write supported `Integri
 - **AND** the submitted payload does not place route-level fields under `routes[].models[]`
 - **AND** it leaves other model bindings on the route unchanged
 
+#### Scenario: Model policy QoS input is constrained to backend-supported classes
+- **WHEN** an operator edits the QoS field in a model policy row
+- **THEN** Tachyon-UI presents a constrained selector with an empty default plus `RealTime`, `Standard`, and `Batch`
+- **AND** the empty default omits `routes[].models[].qos` so the backend default `Standard` applies
+- **AND** the manifest controller rejects any value outside `RealTime`, `Standard`, or `Batch` before calling `apply_manifest_config`
+- **AND** the validation error identifies the model QoS field and accepted values
+
 ### Requirement: Route detail view includes a Scopes panel alongside Volumes and Concurrency panels
 The route detail view SHALL render a Scopes panel (implemented by `tachyon-ui-scope-editor`) as a peer panel alongside the existing Volumes and Concurrency Policy panels.
 

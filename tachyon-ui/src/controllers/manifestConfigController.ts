@@ -171,10 +171,12 @@ export type ManifestModelBinding = {
   alias?: string;
   path?: string;
   device?: string;
-  qos?: string;
+  qos?: RouteQos;
   hardware_strategy?: Partial<HardwareStrategy>;
   [key: string]: unknown;
 };
+
+export type RouteQos = "RealTime" | "Standard" | "Batch";
 
 export type ManifestModelPolicyBinding = {
   alias: string;
@@ -387,7 +389,7 @@ export async function writeRouteModelPolicy(
   }
 
   const updatedModel = { ...models[modelIdx] };
-  setModelField(updatedModel, "qos", normalizeOptionalString(policy.qos));
+  setModelField(updatedModel, "qos", normalizeRouteQos(policy.qos));
   delete updatedModel.min_instances;
   delete updatedModel.max_concurrency;
   delete updatedModel.env;
@@ -901,6 +903,15 @@ function normalizeRouteField(field: Parameters<typeof writeRouteField>[1], value
   if (field === "distributed_rate_limit") return normalizeDistributedRateLimit(value);
   if (field === "resource_policy") return normalizeResourcePolicy(value);
   return normalizeOptionalString(value);
+}
+
+function normalizeRouteQos(value: unknown): RouteQos | null {
+  const qos = normalizeOptionalString(value);
+  if (!qos) return null;
+  if (qos === "RealTime" || qos === "realtime" || qos === "real-time") return "RealTime";
+  if (qos === "Standard" || qos === "standard") return "Standard";
+  if (qos === "Batch" || qos === "batch") return "Batch";
+  throw new Error(`Model QoS '${qos}' must be one of RealTime, Standard, or Batch.`);
 }
 
 function normalizeVolumeConsistency(value: unknown): ManifestVolume["consistency"] | null {

@@ -48,7 +48,7 @@ describe("manifestConfigController route policies", () => {
         models: [{
           alias: "qwen",
           path: "/models/qwen",
-          qos: "gold",
+          qos: "RealTime",
         }],
       }],
     });
@@ -61,7 +61,7 @@ describe("manifestConfigController route policies", () => {
       shadowTarget: "/chat-shadow",
       models: [{
         alias: "qwen",
-        qos: "gold",
+        qos: "RealTime",
         minInstances: 1,
         maxConcurrency: 8,
         env: { TENANT: "a" },
@@ -141,7 +141,7 @@ describe("manifestConfigController route policies", () => {
     });
 
     await writeRouteModelPolicy("/chat", "qwen", {
-      qos: "gold",
+      qos: "Batch",
       minInstances: 2,
       maxConcurrency: 16,
       env: { TENANT: "alpha" },
@@ -157,7 +157,7 @@ describe("manifestConfigController route policies", () => {
         domains: ["chat", "rag"],
         models: [{
           alias: "qwen",
-          qos: "gold",
+          qos: "Batch",
         }],
       }],
     });
@@ -167,5 +167,27 @@ describe("manifestConfigController route policies", () => {
     expect(model).not.toHaveProperty("max_concurrency");
     expect(model).not.toHaveProperty("env");
     expect(model).not.toHaveProperty("domains");
+  });
+
+  it("rejects invalid model qos before applying the manifest", async () => {
+    mockManifest({
+      routes: [{
+        path: "/chat",
+        models: [{
+          alias: "qwen",
+          path: "/models/qwen",
+        }],
+      }],
+    });
+
+    await expect(writeRouteModelPolicy("/chat", "qwen", {
+      qos: "gold",
+      minInstances: null,
+      maxConcurrency: null,
+      env: {},
+      domains: [],
+    })).rejects.toThrow("Model QoS 'gold' must be one of RealTime, Standard, or Batch.");
+
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "apply_manifest_config")).toBe(false);
   });
 });

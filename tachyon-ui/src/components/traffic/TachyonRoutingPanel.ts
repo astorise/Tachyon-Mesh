@@ -316,7 +316,12 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
           ${model.path ? `<span class="ml-2 font-mono text-[10px] text-slate-500">${this.escape(model.path)}</span>` : ""}
         </div>
         <label class="text-xs text-slate-400">QoS
-          <input data-field="qos" value="${this.escape(model.qos)}" placeholder="gold" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-200">
+          <select data-field="qos" aria-label="${t("routing.modelPolicy.qos")}" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 text-xs text-slate-200">
+            <option value=""${model.qos ? "" : " selected"}>${t("routing.modelPolicy.qosDefault")}</option>
+            ${this.option("RealTime", model.qos)}
+            ${this.option("Standard", model.qos)}
+            ${this.option("Batch", model.qos)}
+          </select>
         </label>
         <label class="text-xs text-slate-400">Min instances
           <input data-field="min_instances" type="number" min="0" value="${model.minInstances ?? ""}" class="mt-1 w-full rounded border border-slate-600 bg-slate-950 px-2 py-1 text-xs text-slate-200">
@@ -451,7 +456,7 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
   }
 
   private formValue(form: HTMLFormElement, field: string): string {
-    return (form.querySelector(`[data-field="${field}"]`) as HTMLInputElement | HTMLTextAreaElement | null)?.value.trim() ?? "";
+    return (form.querySelector(`[data-field="${field}"]`) as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null)?.value.trim() ?? "";
   }
 
   private optionalFormNumber(form: HTMLFormElement, field: string): number | null {
@@ -481,6 +486,10 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
 
   private escape(value: string): string {
     return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  private option(value: string, selected: string): string {
+    return `<option value="${value}"${value === selected ? " selected" : ""}>${value}</option>`;
   }
 }
 
