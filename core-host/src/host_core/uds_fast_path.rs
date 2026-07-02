@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(unix)]
+const UDS_PEER_DISCOVERY_TTL: Duration = Duration::from_millis(500);
+
+#[cfg(unix)]
 impl UdsFastPathRegistry {
     #[cfg(test)]
     pub(crate) fn with_discovery_dir(path: PathBuf) -> Self {
@@ -88,6 +91,10 @@ impl UdsFastPathRegistry {
             .lock()
             .expect("UDS peer cache should not be poisoned")
             .insert(metadata.host_id.clone(), peer);
+        *self
+            .peers_refreshed_at
+            .lock()
+            .expect("UDS peer cache timestamp should not be poisoned") = Some(Instant::now());
         *self
             .local_endpoint
             .lock()
@@ -211,12 +218,33 @@ impl UdsFastPathRegistry {
             .lock()
             .expect("UDS peer cache should not be poisoned")
             .remove(&peer.metadata.host_id);
+        self.async_clients
+            .lock()
+            .expect("UDS async client cache should not be poisoned")
+            .remove(&peer.socket_path);
+        self.blocking_clients
+            .lock()
+            .expect("UDS blocking client cache should not be poisoned")
+            .remove(&peer.socket_path);
         if !peer.socket_path.exists() {
             let _ = fs::remove_file(&peer.metadata_path);
         }
     }
 
     pub(crate) fn refresh_peers(&self) -> HashMap<String, DiscoveredUdsPeer> {
+        if self
+            .peers_refreshed_at
+            .lock()
+            .expect("UDS peer cache timestamp should not be poisoned")
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() < UDS_PEER_DISCOVERY_TTL)
+        {
+            return self
+                .peers
+                .lock()
+                .expect("UDS peer cache should not be poisoned")
+                .clone();
+        }
+
         let discovery_dir = self.discovery_dir();
         let mut discovered = HashMap::new();
         let entries = match fs::read_dir(&discovery_dir) {
@@ -226,6 +254,19 @@ impl UdsFastPathRegistry {
                     .lock()
                     .expect("UDS peer cache should not be poisoned")
                     .clear();
+                self.async_clients
+                    .lock()
+                    .expect("UDS async client cache should not be poisoned")
+                    .clear();
+                self.blocking_clients
+                    .lock()
+                    .expect("UDS blocking client cache should not be poisoned")
+                    .clear();
+                *self
+                    .peers_refreshed_at
+                    .lock()
+                    .expect("UDS peer cache timestamp should not be poisoned") =
+                    Some(Instant::now());
                 return discovered;
             }
             Err(_) => {
@@ -271,7 +312,80 @@ impl UdsFastPathRegistry {
             .peers
             .lock()
             .expect("UDS peer cache should not be poisoned") = discovered.clone();
+        let active_sockets = discovered
+            .values()
+            .map(|peer| peer.socket_path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.async_clients
+            .lock()
+            .expect("UDS async client cache should not be poisoned")
+            .retain(|socket_path, _| active_sockets.contains(socket_path));
+        self.blocking_clients
+            .lock()
+            .expect("UDS blocking client cache should not be poisoned")
+            .retain(|socket_path, _| active_sockets.contains(socket_path));
+        *self
+            .peers_refreshed_at
+            .lock()
+            .expect("UDS peer cache timestamp should not be poisoned") = Some(Instant::now());
         discovered
+    }
+
+    pub(crate) fn async_client_for_peer(&self, peer: &DiscoveredUdsPeer) -> Result<Client> {
+        if let Some(client) = self
+            .async_clients
+            .lock()
+            .expect("UDS async client cache should not be poisoned")
+            .get(&peer.socket_path)
+            .cloned()
+        {
+            return Ok(client);
+        }
+
+        let client = Client::builder()
+            .unix_socket(peer.socket_path.as_path())
+            .build()
+            .with_context(|| {
+                format!(
+                    "failed to build UDS mesh client for `{}`",
+                    peer.socket_path.display()
+                )
+            })?;
+        self.async_clients
+            .lock()
+            .expect("UDS async client cache should not be poisoned")
+            .insert(peer.socket_path.clone(), client.clone());
+        Ok(client)
+    }
+
+    pub(crate) fn blocking_client_for_peer(
+        &self,
+        peer: &DiscoveredUdsPeer,
+    ) -> Result<reqwest::blocking::Client> {
+        if let Some(client) = self
+            .blocking_clients
+            .lock()
+            .expect("UDS blocking client cache should not be poisoned")
+            .get(&peer.socket_path)
+            .cloned()
+        {
+            return Ok(client);
+        }
+
+        let client = reqwest::blocking::Client::builder()
+            .unix_socket(peer.socket_path.as_path())
+            .build()
+            .with_context(|| {
+                format!(
+                    "failed to build blocking UDS mesh client for `{}`",
+                    peer.socket_path.display()
+                )
+            })?;
+        self.blocking_clients
+            .lock()
+            .expect("UDS blocking client cache should not be poisoned")
+            .insert(peer.socket_path.clone(), client.clone());
+        Ok(client)
     }
 }
 

@@ -72,6 +72,9 @@ pub(crate) struct LocalUdsEndpoint {
 pub(crate) struct UdsFastPathRegistry {
     pub(crate) discovery_dir_override: Arc<Mutex<Option<PathBuf>>>,
     pub(crate) peers: Arc<Mutex<HashMap<String, DiscoveredUdsPeer>>>,
+    pub(crate) peers_refreshed_at: Arc<Mutex<Option<Instant>>>,
+    pub(crate) async_clients: Arc<Mutex<HashMap<PathBuf, Client>>>,
+    pub(crate) blocking_clients: Arc<Mutex<HashMap<PathBuf, reqwest::blocking::Client>>>,
     pub(crate) local_endpoint: Arc<Mutex<Option<LocalUdsEndpoint>>>,
 }
 

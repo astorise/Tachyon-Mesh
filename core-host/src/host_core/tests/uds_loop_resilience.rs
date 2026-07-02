@@ -84,6 +84,84 @@ async fn resolve_mesh_response_prefers_local_uds_fast_path() {
 
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.body, Bytes::from("uds-fast-path"));
+    assert_eq!(
+        registry
+            .async_clients
+            .lock()
+            .expect("UDS async client cache should not be poisoned")
+            .len(),
+        1,
+        "mesh fetch should reuse a cached UDS client"
+    );
+    let _ = fs::remove_dir_all(discovery_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn outbound_http_uds_fast_path_supports_post_body_and_reuses_client() {
+    use axum::routing::post;
+
+    async fn echo(body: Bytes) -> Bytes {
+        body
+    }
+
+    let discovery_dir = unique_test_dir("tachyon-uds-outbound-post");
+    let registry = Arc::new(UdsFastPathRegistry::with_discovery_dir(
+        discovery_dir.clone(),
+    ));
+    let mut config = IntegrityConfig::default_sealed();
+    config.host_address = "127.0.0.1:19292".to_owned();
+    let app = axum::Router::new().route("/echo", post(echo));
+    let server = start_uds_fast_path_listener(app, &config, Arc::clone(&registry))
+        .expect("UDS listener should register")
+        .expect("UDS listener should start on Unix");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let first_registry = Arc::clone(&registry);
+    let first_response = tokio::task::spawn_blocking(move || {
+        send_blocking_uds_fast_path_request(
+            first_registry.as_ref(),
+            "http://127.0.0.1:19292/echo",
+            &reqwest::Method::POST,
+            &[("x-test".to_owned(), "uds".to_owned())],
+            b"payload",
+        )
+    })
+    .await
+    .expect("blocking UDS request should not panic")
+    .expect("UDS fast-path should handle POST");
+
+    let second_registry = Arc::clone(&registry);
+    let second_response = tokio::task::spawn_blocking(move || {
+        send_blocking_uds_fast_path_request(
+            second_registry.as_ref(),
+            "http://127.0.0.1:19292/echo",
+            &reqwest::Method::POST,
+            &[],
+            b"again",
+        )
+    })
+    .await
+    .expect("blocking UDS request should not panic")
+    .expect("UDS fast-path should handle repeated POST");
+
+    server.abort();
+    let _ = server.await;
+
+    assert_eq!(first_response.status, StatusCode::OK.as_u16());
+    assert_eq!(first_response.body, b"payload");
+    assert_eq!(second_response.status, StatusCode::OK.as_u16());
+    assert_eq!(second_response.body, b"again");
+    assert_eq!(
+        registry
+            .blocking_clients
+            .lock()
+            .expect("UDS blocking client cache should not be poisoned")
+            .len(),
+        1,
+        "outbound HTTP should reuse a cached blocking UDS client"
+    );
     let _ = fs::remove_dir_all(discovery_dir);
 }
 

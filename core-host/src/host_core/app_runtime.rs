@@ -3635,15 +3635,9 @@ pub(crate) async fn send_mesh_fetch_request(
 ) -> std::result::Result<reqwest::Response, String> {
     #[cfg(unix)]
     if let Some(peer) = _uds_fast_path.discover_peer_for_url(url) {
-        let uds_client = Client::builder()
-            .unix_socket(peer.socket_path.as_path())
-            .build()
-            .map_err(|error| {
-                format!(
-                    "failed to build UDS mesh client for `{}`: {error}",
-                    peer.socket_path.display()
-                )
-            })?;
+        let uds_client = _uds_fast_path
+            .async_client_for_peer(&peer)
+            .map_err(|error| error.to_string())?;
         let request = apply_mesh_fetch_headers(
             uds_client.get(url),
             target_kind,
