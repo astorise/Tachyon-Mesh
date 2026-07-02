@@ -58,6 +58,24 @@ The `core-host` runtime SHALL resolve guest artifacts from the workspace or pack
 - **AND** the guest still receives the HTTP request body through WASI stdin
 - **AND** the host still returns the captured stdout as the HTTP response body
 
+### Requirement: Hot guest execution reuses validated in-memory artifacts
+The `core-host` runtime SHALL keep per-runtime-generation in-memory caches for decoded Component Model artifacts, Component Model `InstancePre` values keyed by component path, WIT world, scope shape, and file metadata, and legacy WASI `InstancePre` values keyed by module path and file metadata. A cache hit SHALL avoid re-reading the full guest artifact, recomputing its content digest, fetching the compiled artifact from redb, and deserializing it again; each invocation SHALL still create a fresh request-scoped `Store`.
+
+#### Scenario: Component artifact cache hit skips cold artifact loading
+- **GIVEN** a Component Model guest artifact whose path, modified time, and length match an entry in the active runtime generation cache
+- **WHEN** the host invokes the guest for a route with the same WIT world and scope shape
+- **THEN** the host reuses the cached `Component` and `InstancePre`
+- **AND** only instantiates the cached `InstancePre` into the fresh request `Store`
+
+#### Scenario: Guest artifact changes invalidate hot entries
+- **WHEN** a guest artifact's modified time or length differs from the cached metadata
+- **THEN** the host discards the stale in-memory entry for that artifact
+- **AND** reloads through the cold compiled-artifact path before repopulating the active runtime cache
+
+#### Scenario: Runtime generation and asset upload clear hot caches
+- **WHEN** the manifest hot reloads or an asset upload succeeds
+- **THEN** stale `Component`, Component Model `InstancePre`, and legacy WASI `InstancePre` entries are not reused for subsequent invocations
+
 ### Requirement: Component guests retrieve secrets through a typed host vault import
 The workspace SHALL define a `secrets-vault` WIT interface in `wit/tachyon.wit`, and `core-host` SHALL implement that import for `faas-guest` components without exposing the same secrets through the guest environment block.
 

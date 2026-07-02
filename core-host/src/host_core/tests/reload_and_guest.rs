@@ -276,6 +276,9 @@ fn execute_guest_returns_component_response_payload() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            component_cache: None,
+            component_instance_pre_cache: None,
+            legacy_instance_pre_cache: None,
             linker_cache: None,
         },
     )
@@ -326,6 +329,9 @@ fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            component_cache: None,
+            component_instance_pre_cache: None,
+            legacy_instance_pre_cache: None,
             linker_cache: None,
         },
     )
@@ -377,6 +383,9 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            component_cache: None,
+            component_instance_pre_cache: None,
+            legacy_instance_pre_cache: None,
             linker_cache: None,
         },
     )
@@ -438,6 +447,9 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
                 host_load: test_host_load(),
                 ai_runtime,
                 instance_pool: None,
+                component_cache: None,
+                component_instance_pre_cache: None,
+                legacy_instance_pre_cache: None,
                 linker_cache: None,
             },
         )
@@ -496,6 +508,9 @@ fn execute_guest_persists_volume_data_for_component_guest() {
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&ai_runtime),
             instance_pool: None,
+            component_cache: None,
+            component_instance_pre_cache: None,
+            legacy_instance_pre_cache: None,
             linker_cache: None,
         },
     )
@@ -533,6 +548,9 @@ fn execute_guest_persists_volume_data_for_component_guest() {
             #[cfg(feature = "ai-inference")]
             ai_runtime,
             instance_pool: None,
+            component_cache: None,
+            component_instance_pre_cache: None,
+            legacy_instance_pre_cache: None,
             linker_cache: None,
         },
     )
@@ -634,6 +652,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
                     host_load: test_host_load(),
                     ai_runtime: ai_runtime_c,
                     instance_pool: None,
+                    component_cache: None,
+                    component_instance_pre_cache: None,
+                    legacy_instance_pre_cache: None,
                     linker_cache: None,
                 },
             );

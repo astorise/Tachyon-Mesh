@@ -2871,6 +2871,9 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
     let task_bridge_manager = Arc::clone(&state.bridge_manager);
     let task_async_log_sender = state.async_log_sender.clone();
     let task_instance_pool = Arc::clone(&runtime.instance_pool);
+    let task_component_cache = Arc::clone(&runtime.component_cache);
+    let task_component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let task_legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let task_linker_cache = Arc::clone(&runtime.linker_cache);
     let task_local_mesh_dispatch = LocalMeshDispatchContext {
         state: state.clone(),
@@ -2939,6 +2942,9 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                             #[cfg(feature = "ai-inference")]
                             ai_runtime: task_ai_runtime,
                             instance_pool: None,
+                            component_cache: Some(task_component_cache),
+                            component_instance_pre_cache: Some(task_component_instance_pre_cache),
+                            legacy_instance_pre_cache: Some(task_legacy_instance_pre_cache),
                             linker_cache: Some(task_linker_cache),
                         },
                     )?;
@@ -2999,6 +3005,9 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                     #[cfg(feature = "ai-inference")]
                     ai_runtime: task_ai_runtime,
                     instance_pool: Some(task_instance_pool),
+                    component_cache: Some(task_component_cache),
+                    component_instance_pre_cache: Some(task_component_instance_pre_cache),
+                    legacy_instance_pre_cache: Some(task_legacy_instance_pre_cache),
                     linker_cache: Some(task_linker_cache),
                 },
             )

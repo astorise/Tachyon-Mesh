@@ -53,11 +53,12 @@ pub(crate) fn execute_guest(
         "default"
     };
 
-    if let Ok(component) = load_component_with_core_store(
+    if let Ok(component) = load_component_with_pool(
         engine,
         &module_path,
         &execution.storage_broker.core_store,
         cache_scope,
+        execution.component_cache.as_deref(),
     ) {
         let component_result = match route.role {
             RouteRole::User => execute_component_guest(
@@ -65,7 +66,7 @@ pub(crate) fn execute_guest(
                 request.clone(),
                 route,
                 &module_path,
-                &component,
+                component.as_ref(),
                 &execution,
             ),
             RouteRole::System => execute_system_component_guest(
@@ -73,7 +74,7 @@ pub(crate) fn execute_guest(
                 request.clone(),
                 route,
                 &module_path,
-                &component,
+                component.as_ref(),
                 &execution,
             ),
         };
@@ -162,6 +163,142 @@ pub(crate) fn load_component_with_core_store(
             module_path.display()
         )
     })
+}
+
+pub(crate) fn load_component_with_pool(
+    engine: &Engine,
+    module_path: &Path,
+    core_store: &store::CoreStore,
+    cache_scope: &str,
+    component_cache: Option<&moka::sync::Cache<PathBuf, CachedComponent>>,
+) -> Result<Arc<Component>> {
+    let normalized = normalize_path(module_path.to_path_buf());
+    let metadata = fs::metadata(module_path).with_context(|| {
+        format!(
+            "failed to stat guest component artifact from {}",
+            module_path.display()
+        )
+    })?;
+    let modified = metadata.modified().ok();
+    let len = metadata.len();
+
+    if let Some(cache) = component_cache {
+        if let Some(cached) = cache.get(&normalized) {
+            if cached.modified == modified && cached.len == len {
+                return Ok(cached.component);
+            }
+            cache.invalidate(&normalized);
+        }
+    }
+
+    let component = Arc::new(load_component_with_core_store(
+        engine,
+        module_path,
+        core_store,
+        cache_scope,
+    )?);
+    if let Some(cache) = component_cache {
+        cache.insert(
+            normalized,
+            CachedComponent {
+                component: Arc::clone(&component),
+                modified,
+                len,
+            },
+        );
+    }
+    Ok(component)
+}
+
+fn component_artifact_metadata(module_path: &Path) -> Result<(Option<SystemTime>, u64)> {
+    let metadata = fs::metadata(module_path).with_context(|| {
+        format!(
+            "failed to stat guest component artifact from {}",
+            module_path.display()
+        )
+    })?;
+    Ok((metadata.modified().ok(), metadata.len()))
+}
+
+fn component_instance_pre(
+    component_path: &Path,
+    world: &'static str,
+    shape: &ScopeShape,
+    component: &Component,
+    linker: &ComponentLinker<ComponentHostState>,
+    execution: &GuestExecutionContext,
+) -> std::result::Result<Arc<ComponentInstancePre<ComponentHostState>>, ExecutionError> {
+    let (modified, len) = component_artifact_metadata(component_path)
+        .map_err(|error| ExecutionError::Internal(error.to_string()))?;
+    let key = ComponentInstancePreKey {
+        path: normalize_path(component_path.to_path_buf()),
+        world,
+        shape: shape.clone(),
+        modified,
+        len,
+    };
+
+    if let Some(cache) = &execution.component_instance_pre_cache {
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached);
+        }
+        let pre = Arc::new(linker.instantiate_pre(component).map_err(|error| {
+            guest_execution_error(
+                error,
+                format!(
+                    "failed to pre-instantiate guest component from {}",
+                    component_path.display()
+                ),
+            )
+        })?);
+        cache.insert(key, Arc::clone(&pre));
+        return Ok(pre);
+    }
+
+    Ok(Arc::new(linker.instantiate_pre(component).map_err(
+        |error| {
+            guest_execution_error(
+                error,
+                format!(
+                    "failed to pre-instantiate guest component from {}",
+                    component_path.display()
+                ),
+            )
+        },
+    )?))
+}
+
+fn legacy_instance_pre(
+    engine: &Engine,
+    module_path: &Path,
+    module: &Module,
+    execution: &GuestExecutionContext,
+) -> std::result::Result<Arc<ModuleInstancePre<LegacyHostState>>, ExecutionError> {
+    let (modified, len) = component_artifact_metadata(module_path)
+        .map_err(|error| ExecutionError::Internal(error.to_string()))?;
+    let key = LegacyInstancePreKey {
+        path: normalize_path(module_path.to_path_buf()),
+        modified,
+        len,
+    };
+
+    if let Some(cache) = &execution.legacy_instance_pre_cache {
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached);
+        }
+        let linker = build_linker(engine)?;
+        let pre =
+            Arc::new(linker.instantiate_pre(module).map_err(|error| {
+                guest_execution_error(error, "failed to pre-link guest module")
+            })?);
+        cache.insert(key, Arc::clone(&pre));
+        return Ok(pre);
+    }
+
+    let linker = build_linker(engine)?;
+    Ok(Arc::new(linker.instantiate_pre(module).map_err(
+        |error| guest_execution_error(error, "failed to pre-link guest module"),
+    )?))
 }
 
 #[cfg(test)]
@@ -455,16 +592,33 @@ pub(crate) fn execute_component_guest(
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
 
-    let bindings = component_bindings::FaasGuest::instantiate(&mut store, component, &*linker)
-        .map_err(|error| {
+    let instance_pre = component_instance_pre(
+        component_path,
+        "faas",
+        &shape,
+        component,
+        &linker,
+        execution,
+    )?;
+    let guest_pre =
+        component_bindings::FaasGuestPre::new((*instance_pre).clone()).map_err(|error| {
             guest_execution_error(
                 error,
                 format!(
-                    "failed to instantiate guest component from {}",
+                    "failed to pre-bind guest component from {}",
                     component_path.display()
                 ),
             )
         })?;
+    let bindings = guest_pre.instantiate(&mut store).map_err(|error| {
+        guest_execution_error(
+            error,
+            format!(
+                "failed to instantiate guest component from {}",
+                component_path.display()
+            ),
+        )
+    })?;
     record_wasm_start(execution.telemetry.as_ref());
     let response = bindings.tachyon_mesh_handler().call_handle_request(
         &mut store,
@@ -514,11 +668,12 @@ pub(crate) fn execute_udp_layer4_guest(
 ) -> std::result::Result<Vec<UdpResponseDatagram>, ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
-    let component = load_component_with_core_store(
+    let component = load_component_with_pool(
         engine,
         &module_path,
         &execution.storage_broker.core_store,
         "default",
+        execution.component_cache.as_deref(),
     )
     .map_err(|error| {
         ExecutionError::Internal(format!(
@@ -531,7 +686,7 @@ pub(crate) fn execute_udp_layer4_guest(
         engine,
         route,
         &module_path,
-        &component,
+        component.as_ref(),
         source,
         payload,
         execution,
@@ -596,23 +751,35 @@ pub(crate) fn execute_udp_component_guest(
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
 
-    let bindings =
-        udp_component_bindings::UdpFaasGuest::instantiate(&mut store, component, &*linker)
-            .map_err(|error| {
-                let message = format!(
-                    "failed to instantiate UDP guest component from {}",
+    let instance_pre =
+        component_instance_pre(component_path, "udp", &shape, component, &linker, execution)?;
+    let guest_pre =
+        udp_component_bindings::UdpFaasGuestPre::new((*instance_pre).clone()).map_err(|error| {
+            let error_message = error.to_string();
+            if error_message.contains("no exported instance named `tachyon:mesh/udp-handler`") {
+                ExecutionError::Internal(format!(
+                    "guest component `{}` does not export the UDP packet handler",
                     component_path.display()
-                );
-                let error_message = error.to_string();
-                if error_message.contains("no exported instance named `tachyon:mesh/udp-handler`") {
-                    ExecutionError::Internal(format!(
-                        "guest component `{}` does not export the UDP packet handler",
+                ))
+            } else {
+                guest_execution_error(
+                    error,
+                    format!(
+                        "failed to pre-bind UDP guest component from {}",
                         component_path.display()
-                    ))
-                } else {
-                    guest_execution_error(error, message)
-                }
-            })?;
+                    ),
+                )
+            }
+        })?;
+    let bindings = guest_pre.instantiate(&mut store).map_err(|error| {
+        guest_execution_error(
+            error,
+            format!(
+                "failed to instantiate UDP guest component from {}",
+                component_path.display()
+            ),
+        )
+    })?;
     record_wasm_start(execution.telemetry.as_ref());
     let source_ip = source.ip().to_string();
     let response = bindings.tachyon_mesh_udp_handler().call_handle_packet(
@@ -655,11 +822,12 @@ pub(crate) fn execute_websocket_guest(
 ) -> std::result::Result<(), ExecutionError> {
     let module_path =
         resolve_guest_module_path(function_name).map_err(ExecutionError::GuestModuleNotFound)?;
-    let component = load_component_with_core_store(
+    let component = load_component_with_pool(
         engine,
         &module_path,
         &execution.storage_broker.core_store,
         "default",
+        execution.component_cache.as_deref(),
     )
     .map_err(|error| {
         ExecutionError::Internal(format!(
@@ -672,7 +840,7 @@ pub(crate) fn execute_websocket_guest(
         engine,
         route,
         &module_path,
-        &component,
+        component.as_ref(),
         incoming,
         outgoing,
         execution,
@@ -763,12 +931,20 @@ pub(crate) fn execute_websocket_component_guest(
         websocket_component_bindings::tachyon::mesh::websocket::Connection,
     >::new_own(stored_connection.rep());
 
-    let bindings = websocket_component_bindings::WebsocketFaasGuest::instantiate(
-        &mut store, component, &*linker,
+    let instance_pre = component_instance_pre(
+        component_path,
+        "websocket",
+        &shape,
+        component,
+        &linker,
+        execution,
+    )?;
+    let guest_pre = websocket_component_bindings::WebsocketFaasGuestPre::new(
+        (*instance_pre).clone(),
     )
     .map_err(|error| {
         let message = format!(
-            "failed to instantiate WebSocket guest component from {}",
+            "failed to pre-bind WebSocket guest component from {}",
             component_path.display()
         );
         let error_message = error.to_string();
@@ -780,6 +956,15 @@ pub(crate) fn execute_websocket_component_guest(
         } else {
             guest_execution_error(error, message)
         }
+    })?;
+    let bindings = guest_pre.instantiate(&mut store).map_err(|error| {
+        guest_execution_error(
+            error,
+            format!(
+                "failed to instantiate WebSocket guest component from {}",
+                component_path.display()
+            ),
+        )
     })?;
     record_wasm_start(execution.telemetry.as_ref());
     let result = bindings.call_on_connect(&mut store, connection);
@@ -879,11 +1064,12 @@ pub(crate) fn execute_streaming_guest(
             return;
         }
     };
-    let component = match load_component_with_core_store(
+    let component = match load_component_with_pool(
         engine,
         &module_path,
         &execution.storage_broker.core_store,
         "default",
+        execution.component_cache.as_deref(),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -899,7 +1085,7 @@ pub(crate) fn execute_streaming_guest(
         engine,
         route,
         &module_path,
-        &component,
+        component.as_ref(),
         request,
         headers_tx,
         chunks_tx,
@@ -1069,8 +1255,44 @@ pub(crate) fn execute_streaming_component_guest(
         return;
     }
 
-    let bindings = match component_bindings::FaasGuest::instantiate(&mut store, component, &*linker)
-    {
+    let instance_pre = match component_instance_pre(
+        component_path,
+        "faas",
+        &shape,
+        component,
+        &linker,
+        execution,
+    ) {
+        Ok(pre) => pre,
+        Err(e) => {
+            let slot = store.data_mut().streaming_body.take();
+            let _ = slot.map(|s| {
+                s.headers_tx
+                    .send((StatusCode::INTERNAL_SERVER_ERROR, vec![]))
+            });
+            tracing::error!(
+                "failed to pre-instantiate streaming guest component from {}: {e:#}",
+                component_path.display()
+            );
+            return;
+        }
+    };
+    let guest_pre = match component_bindings::FaasGuestPre::new((*instance_pre).clone()) {
+        Ok(pre) => pre,
+        Err(e) => {
+            let slot = store.data_mut().streaming_body.take();
+            let _ = slot.map(|s| {
+                s.headers_tx
+                    .send((StatusCode::INTERNAL_SERVER_ERROR, vec![]))
+            });
+            tracing::error!(
+                "failed to pre-bind streaming guest component from {}: {e:#}",
+                component_path.display()
+            );
+            return;
+        }
+    };
+    let bindings = match guest_pre.instantiate(&mut store) {
         Ok(b) => b,
         Err(e) => {
             let slot = store.data_mut().streaming_body.take();
@@ -1285,9 +1507,27 @@ pub(crate) fn execute_system_component_guest(
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
 
-    if let Ok(bindings) = control_plane_component_bindings::ControlPlaneFaas::instantiate(
-        &mut store, component, &*linker,
-    ) {
+    let instance_pre = component_instance_pre(
+        component_path,
+        "system",
+        &shape,
+        component,
+        &linker,
+        execution,
+    )?;
+
+    if let Ok(guest_pre) =
+        control_plane_component_bindings::ControlPlaneFaasPre::new((*instance_pre).clone())
+    {
+        let bindings = guest_pre.instantiate(&mut store).map_err(|error| {
+            guest_execution_error(
+                error,
+                format!(
+                    "failed to instantiate control-plane guest component from {}",
+                    component_path.display()
+                ),
+            )
+        })?;
         record_wasm_start(execution.telemetry.as_ref());
         let response = bindings.tachyon_mesh_handler().call_handle_request(
             &mut store,
@@ -1325,17 +1565,25 @@ pub(crate) fn execute_system_component_guest(
         });
     }
 
-    let bindings =
-        system_component_bindings::SystemFaasGuest::instantiate(&mut store, component, &*linker)
-            .map_err(|error| {
-                guest_execution_error(
-                    error,
-                    format!(
-                        "failed to instantiate system guest component from {}",
-                        component_path.display()
-                    ),
-                )
-            })?;
+    let guest_pre = system_component_bindings::SystemFaasGuestPre::new((*instance_pre).clone())
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                format!(
+                    "failed to pre-bind system guest component from {}",
+                    component_path.display()
+                ),
+            )
+        })?;
+    let bindings = guest_pre.instantiate(&mut store).map_err(|error| {
+        guest_execution_error(
+            error,
+            format!(
+                "failed to instantiate system guest component from {}",
+                component_path.display()
+            ),
+        )
+    })?;
     record_wasm_start(execution.telemetry.as_ref());
     let response = bindings.tachyon_mesh_handler().call_handle_request(
         &mut store,
@@ -1559,7 +1807,6 @@ pub(crate) fn execute_legacy_guest(
     module: Module,
     execution: &GuestExecutionContext,
 ) -> std::result::Result<GuestExecutionOutcome, ExecutionError> {
-    let linker = build_linker(engine)?;
     let stdin_file = create_guest_stdin_file(&body)?;
     let stdout_capture = AsyncGuestOutputCapture::new(
         function_name,
@@ -1622,8 +1869,9 @@ pub(crate) fn execute_legacy_guest(
     );
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
-    let instance = linker
-        .instantiate(&mut store, &module)
+    let instance_pre = legacy_instance_pre(engine, module_path, &module, execution)?;
+    let instance = instance_pre
+        .instantiate(&mut store)
         .map_err(|error| guest_execution_error(error, "failed to instantiate guest module"))?;
     let (entrypoint_name, entrypoint) =
         resolve_guest_entrypoint(&mut store, &instance).map_err(|error| {
@@ -1660,7 +1908,6 @@ pub(crate) fn execute_legacy_guest_with_stdio(
     stdin: impl StdinStream + 'static,
     stdout: impl StdoutStream + 'static,
 ) -> std::result::Result<(), ExecutionError> {
-    let linker = build_linker(engine)?;
     let mut wasi = WasiCtxBuilder::new();
     let traceparent = trace_context_for_request(&execution.request_headers);
     add_route_environment_with_trace(
@@ -1705,8 +1952,9 @@ pub(crate) fn execute_legacy_guest_with_stdio(
     );
     store.limiter(|state| &mut state.limits);
     maybe_set_guest_fuel_budget(&mut store, execution)?;
-    let instance = linker
-        .instantiate(&mut store, &module)
+    let instance_pre = legacy_instance_pre(engine, module_path, &module, execution)?;
+    let instance = instance_pre
+        .instantiate(&mut store)
         .map_err(|error| guest_execution_error(error, "failed to instantiate guest module"))?;
     let (entrypoint_name, entrypoint) =
         resolve_guest_entrypoint(&mut store, &instance).map_err(|error| {

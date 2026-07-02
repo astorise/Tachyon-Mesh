@@ -301,6 +301,9 @@ impl TlsManager {
         let route_overrides = Arc::clone(&state.route_overrides);
         let host_load = Arc::clone(&state.host_load);
         let async_log_sender = state.async_log_sender.clone();
+        let component_cache = Arc::clone(&runtime.component_cache);
+        let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+        let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
         #[cfg(feature = "ai-inference")]
         let ai_runtime = Arc::clone(&runtime.ai_runtime);
 
@@ -329,6 +332,9 @@ impl TlsManager {
                     #[cfg(feature = "ai-inference")]
                     ai_runtime,
                     instance_pool: None,
+                    component_cache: Some(component_cache),
+                    component_instance_pre_cache: Some(component_instance_pre_cache),
+                    legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
                     linker_cache: None,
                 },
             )

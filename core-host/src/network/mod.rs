@@ -644,6 +644,9 @@ pub(crate) async fn handle_udp_layer4_datagram(
     let storage_broker = Arc::clone(&state.storage_broker);
     let concurrency_limits = Arc::clone(&runtime.concurrency_limits);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let component_cache = Arc::clone(&runtime.component_cache);
+    let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let linker_cache = Arc::clone(&runtime.linker_cache);
     let request_headers = HeaderMap::new();
     let route_for_execution = route.clone();
@@ -673,6 +676,9 @@ pub(crate) async fn handle_udp_layer4_datagram(
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
+            component_cache: Some(component_cache),
+            component_instance_pre_cache: Some(component_instance_pre_cache),
+            legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
             linker_cache: Some(linker_cache),
         };
         execute_udp_layer4_guest(
@@ -737,6 +743,9 @@ pub(crate) async fn handle_websocket_connection(
     let route_overrides = Arc::clone(&state.route_overrides);
     let host_load = Arc::clone(&state.host_load);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let component_cache = Arc::clone(&runtime.component_cache);
+    let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let linker_cache = Arc::clone(&runtime.linker_cache);
     let (incoming_tx, incoming_rx) = std::sync::mpsc::channel::<HostWebSocketFrame>();
     let (outgoing_tx, mut outgoing_rx) =
@@ -801,6 +810,9 @@ pub(crate) async fn handle_websocket_connection(
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
+            component_cache: Some(component_cache),
+            component_instance_pre_cache: Some(component_instance_pre_cache),
+            legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
             linker_cache: Some(linker_cache),
         };
         let _ = result_tx.send(execute_websocket_guest(
@@ -885,6 +897,9 @@ pub(crate) async fn handle_streaming_http_request(
     let host_load = Arc::clone(&state.host_load);
     let ai_runtime = Arc::clone(&runtime.ai_runtime);
     let instance_pool = Arc::clone(&runtime.instance_pool);
+    let component_cache = Arc::clone(&runtime.component_cache);
+    let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
+    let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let linker_cache = Arc::clone(&runtime.linker_cache);
     let async_log_sender = state.async_log_sender.clone();
     let request_headers = request
@@ -922,6 +937,9 @@ pub(crate) async fn handle_streaming_http_request(
                 host_load,
                 ai_runtime,
                 instance_pool: Some(instance_pool),
+                component_cache: Some(component_cache),
+                component_instance_pre_cache: Some(component_instance_pre_cache),
+                legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
                 linker_cache: Some(linker_cache),
             };
             execute_streaming_guest(
@@ -1194,6 +1212,9 @@ pub(crate) fn execute_tcp_layer4_guest(
         #[cfg(feature = "ai-inference")]
         ai_runtime,
         instance_pool: None,
+        component_cache: None,
+        component_instance_pre_cache: None,
+        legacy_instance_pre_cache: None,
         linker_cache: None,
     };
     let (module_path, module) = resolve_legacy_guest_module_with_pool(

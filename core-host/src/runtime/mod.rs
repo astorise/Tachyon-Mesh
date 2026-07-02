@@ -36,6 +36,24 @@ pub(crate) fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeStat
             .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
             .build(),
     );
+    let component_cache = Arc::new(
+        moka::sync::Cache::builder()
+            .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
+            .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
+            .build(),
+    );
+    let component_instance_pre_cache = Arc::new(
+        moka::sync::Cache::builder()
+            .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
+            .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
+            .build(),
+    );
+    let legacy_instance_pre_cache = Arc::new(
+        moka::sync::Cache::builder()
+            .max_capacity(INSTANCE_POOL_DEFAULT_CAPACITY)
+            .time_to_idle(INSTANCE_POOL_IDLE_TIMEOUT)
+            .build(),
+    );
     let linker_cache = Arc::new(crate::host_core::scoping::LinkerCache::new(
         LINKER_CACHE_DEFAULT_CAPACITY,
     ));
@@ -47,6 +65,9 @@ pub(crate) fn build_runtime_state(config: IntegrityConfig) -> Result<RuntimeStat
         batch_target_registry: Arc::new(BatchTargetRegistry::build(&config)?),
         concurrency_limits: build_concurrency_limits(&config),
         instance_pool,
+        component_cache,
+        component_instance_pre_cache,
+        legacy_instance_pre_cache,
         linker_cache,
         #[cfg(feature = "ai-inference")]
         ai_runtime: Arc::new(

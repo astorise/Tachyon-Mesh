@@ -110,6 +110,19 @@ pub(crate) struct RuntimeState {
     /// is dropped along with the rest of the runtime, so configuration
     /// changes propagate without a stale-module concern.
     pub(crate) instance_pool: Arc<moka::sync::Cache<PathBuf, Arc<Module>>>,
+    /// In-memory cache of `Arc<Component>` keyed by component file path. Each
+    /// entry carries file metadata and is reused only while `(mtime, len)`
+    /// matches the current artifact, avoiding per-request disk reads, SHA-256,
+    /// redb fetches, and `Component::deserialize` on the hot path.
+    pub(crate) component_cache: Arc<moka::sync::Cache<PathBuf, CachedComponent>>,
+    /// Cache of pre-linked component instances keyed by component path, WIT
+    /// world, scope shape, and file metadata.
+    pub(crate) component_instance_pre_cache: Arc<
+        moka::sync::Cache<ComponentInstancePreKey, Arc<ComponentInstancePre<ComponentHostState>>>,
+    >,
+    /// Cache of pre-linked legacy module instances.
+    pub(crate) legacy_instance_pre_cache:
+        Arc<moka::sync::Cache<LegacyInstancePreKey, Arc<ModuleInstancePre<LegacyHostState>>>>,
     /// LRU cache of `Arc<ComponentLinker<ComponentHostState>>` keyed on
     /// `(world_tag, ScopeShape)`. Two deployments with identical scope grants
     /// for the same WIT world share one compiled linker; the per-request
