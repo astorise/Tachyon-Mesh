@@ -271,6 +271,12 @@ The `core-host` runtime SHALL keep its active route registry, Wasmtime engine, a
 concurrency controls behind an atomically swappable shared state so a `SIGHUP` can reload
 `integrity.lock` without rebinding the Axum listener.
 
+#### Scenario: Active runtime resolves sealed routes through indexed entries
+- **WHEN** the runtime state is built from a sealed manifest
+- **THEN** the active route registry indexes sealed routes by normalized path and normalized domain
+- **AND** request-time route resolution uses those indexed entries instead of scanning the manifest route list
+- **AND** request dispatch shares immutable sealed route metadata through reference-counted handles rather than cloning the full route definition per invocation
+
 #### Scenario: A new sealed route becomes active after `SIGHUP`
 - **WHEN** the running host receives `SIGHUP`
 - **AND** the updated `integrity.lock` passes signature verification and runtime validation

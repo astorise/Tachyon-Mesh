@@ -1102,7 +1102,7 @@ pub(crate) async fn export_metering_batch(
     batch: Vec<String>,
 ) -> std::result::Result<(), String> {
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.sealed_route(SYSTEM_METERING_ROUTE).cloned() else {
+    let Some(route) = runtime.route_registry.sealed_route(SYSTEM_METERING_ROUTE) else {
         return Ok(());
     };
 
@@ -1111,10 +1111,10 @@ pub(crate) async fn export_metering_batch(
     let uri = Uri::from_static(SYSTEM_METERING_ROUTE);
     let body = encode_metering_batch(batch);
     let trailers = Vec::new();
-    let result = execute_route_with_middleware(
+    let result = execute_route_arc_with_middleware(
         state,
         &runtime,
-        &route,
+        route,
         &headers,
         &method,
         &uri,
@@ -1325,7 +1325,7 @@ pub(crate) async fn export_log_batch(
     batch: Vec<AsyncLogEntry>,
 ) -> std::result::Result<(), String> {
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.sealed_route(SYSTEM_LOGGER_ROUTE).cloned() else {
+    let Some(route) = runtime.route_registry.sealed_route(SYSTEM_LOGGER_ROUTE) else {
         return Ok(());
     };
 
@@ -1335,10 +1335,10 @@ pub(crate) async fn export_log_batch(
     let body = serde_json::to_vec(&batch)
         .map_err(|error| format!("failed to serialize log batch: {error}"))?;
     let trailers = Vec::new();
-    let result = execute_route_with_middleware(
+    let result = execute_route_arc_with_middleware(
         state,
         &runtime,
-        &route,
+        route,
         &headers,
         &method,
         &uri,
@@ -1396,10 +1396,10 @@ pub(crate) async fn custom_domain_routing_middleware(
         return next.run(req).await;
     };
     let runtime = state.runtime.load_full();
-    let Some(route) = runtime.config.route_for_domain(&host) else {
+    let Some(route) = runtime.route_registry.route_for_domain(&host) else {
         return next.run(req).await;
     };
-    let path = route_domain_request_path(route, req.uri());
+    let path = route_domain_request_path(&route, req.uri());
     let mut builder = Uri::builder();
     if let Some(scheme) = req.uri().scheme_str() {
         builder = builder.scheme(scheme);
@@ -1808,13 +1808,13 @@ pub(crate) async fn execute_route_override(
         }
     } else {
         let override_path = normalize_route_path(destination);
-        match runtime.config.sealed_route(&override_path).cloned() {
+        match runtime.route_registry.sealed_route(&override_path) {
             Some(override_route) => {
                 let override_headers = clone_headers_with_original_route(headers, route);
-                match execute_route_with_middleware(
+                match execute_route_arc_with_middleware(
                     state,
                     runtime,
-                    &override_route,
+                    override_route,
                     &override_headers,
                     method,
                     uri,
@@ -1909,9 +1909,8 @@ pub(crate) async fn faas_handler(
     );
 
     let (response, fuel_consumed): (Response, Option<u64>) = match runtime
-        .config
+        .route_registry
         .sealed_route(&normalized_path)
-        .cloned()
     {
         None => (
             (
@@ -2022,7 +2021,7 @@ pub(crate) async fn faas_handler(
                                 Ok(upgrade) => {
                                     let upgrade: WebSocketUpgrade = upgrade;
                                     let websocket_state = state.clone();
-                                    let websocket_route = route.clone();
+                                    let websocket_route = route.as_ref().clone();
                                     let websocket_module = selected_target.module.clone();
                                     let websocket_target = selected_target.module.clone();
                                     (
@@ -2083,7 +2082,7 @@ pub(crate) async fn faas_handler(
                                 return match network::handle_streaming_http_request(
                                     state.clone(),
                                     Arc::clone(&runtime),
-                                    route.clone(),
+                                    Arc::clone(&route),
                                     selected_target.module.clone(),
                                     request,
                                 )
@@ -2093,10 +2092,10 @@ pub(crate) async fn faas_handler(
                                     Err((status, message)) => (status, message).into_response(),
                                 };
                             }
-                            match execute_route_with_middleware(
+                            match execute_route_arc_with_middleware(
                                 &state,
                                 &runtime,
-                                &route,
+                                Arc::clone(&route),
                                 &headers,
                                 &method,
                                 &uri,
@@ -2162,7 +2161,7 @@ pub(crate) async fn faas_handler(
                                 return match network::handle_streaming_http_request(
                                     state.clone(),
                                     Arc::clone(&runtime),
-                                    route.clone(),
+                                    Arc::clone(&route),
                                     selected_target.module.clone(),
                                     request,
                                 )
@@ -2172,10 +2171,10 @@ pub(crate) async fn faas_handler(
                                     Err((status, message)) => (status, message).into_response(),
                                 };
                             }
-                            match execute_route_with_middleware(
+                            match execute_route_arc_with_middleware(
                                 &state,
                                 &runtime,
-                                &route,
+                                Arc::clone(&route),
                                 &headers,
                                 &method,
                                 &uri,
@@ -2233,10 +2232,42 @@ pub(crate) async fn execute_route_with_middleware(
     sampled_execution: bool,
     selected_module: Option<&str>,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
+    execute_route_arc_with_middleware(
+        state,
+        runtime,
+        Arc::new(route.clone()),
+        headers,
+        method,
+        uri,
+        body,
+        trailers,
+        hop_limit,
+        trace_id,
+        sampled_execution,
+        selected_module,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_route_arc_with_middleware(
+    state: &AppState,
+    runtime: &Arc<RuntimeState>,
+    route: Arc<IntegrityRoute>,
+    headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    trailers: &GuestHttpFields,
+    hop_limit: HopLimit,
+    trace_id: Option<&str>,
+    sampled_execution: bool,
+    selected_module: Option<&str>,
+) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     let invocation = RouteInvocation {
         state: state.clone(),
         runtime: Arc::clone(runtime),
-        route: route.clone(),
+        route,
         headers: headers.clone(),
         method: method.clone(),
         uri: uri.clone(),
@@ -2274,9 +2305,8 @@ pub(crate) async fn execute_route_with_middleware_inner(
             .resolve_named_route(middleware_name)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
         let middleware_route = runtime
-            .config
+            .route_registry
             .sealed_route(&middleware_resolved.path)
-            .cloned()
             .ok_or_else(|| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2358,9 +2388,8 @@ pub(crate) fn spawn_shadow_traffic_task(
         return;
     }
     let Some(shadow_route) = runtime
-        .config
+        .route_registry
         .sealed_route(SYSTEM_SHADOW_PROXY_ROUTE)
-        .cloned()
     else {
         tracing::warn!(
             route = %route.path,
@@ -2391,10 +2420,10 @@ pub(crate) fn spawn_shadow_traffic_task(
         let headers = HeaderMap::new();
         let method = Method::POST;
         let uri = Uri::from_static(SYSTEM_SHADOW_PROXY_ROUTE);
-        if let Err((status, message)) = execute_route_with_middleware(
+        if let Err((status, message)) = execute_route_arc_with_middleware(
             &state,
             &runtime,
-            &shadow_route,
+            shadow_route,
             &headers,
             &method,
             &uri,
@@ -3507,7 +3536,7 @@ pub(crate) async fn try_dispatch_local_mesh_request(
     let url = reqwest::Url::parse(resolved_url)
         .map_err(|error| format!("internal mesh target `{resolved_url}` is invalid: {error}"))?;
     let normalized_path = normalize_route_path(url.path());
-    let Some(route) = runtime.config.sealed_route(&normalized_path).cloned() else {
+    let Some(route) = runtime.route_registry.sealed_route(&normalized_path) else {
         return Ok(None);
     };
     let selected_target = select_route_target(&route, &HeaderMap::new()).map_err(|error| {
@@ -4117,6 +4146,16 @@ impl RouteRegistry {
         let mut seen_versions = HashMap::<(String, String), String>::new();
 
         for route in &config.routes {
+            let sealed_route = Arc::new(route.clone());
+            registry
+                .sealed_by_path
+                .insert(route.path.clone(), Arc::clone(&sealed_route));
+            for domain in &route.domains {
+                registry
+                    .sealed_by_domain
+                    .insert(domain.clone(), Arc::clone(&sealed_route));
+            }
+
             let version = Version::parse(route.version.trim()).with_context(|| {
                 format!(
                     "Integrity Validation Failed: route `{}` has invalid semantic version `{}`",
@@ -4201,6 +4240,16 @@ impl RouteRegistry {
         }
 
         Ok(registry)
+    }
+
+    pub(crate) fn sealed_route(&self, path: &str) -> Option<Arc<IntegrityRoute>> {
+        let normalized = normalize_route_path(path);
+        self.sealed_by_path.get(&normalized).cloned()
+    }
+
+    pub(crate) fn route_for_domain(&self, domain: &str) -> Option<Arc<IntegrityRoute>> {
+        let normalized = tls_runtime::normalize_domain(domain).ok()?;
+        self.sealed_by_domain.get(&normalized).cloned()
     }
 
     pub(crate) fn ensure_dependencies_satisfied(

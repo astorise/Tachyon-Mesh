@@ -29,6 +29,7 @@ impl IntegrityConfig {
         self.routes.iter().find(|route| route.path == normalized)
     }
 
+    #[cfg(test)]
     pub(crate) fn route_for_domain(&self, domain: &str) -> Option<&IntegrityRoute> {
         let normalized = tls_runtime::normalize_domain(domain).ok()?;
         self.routes.iter().find(|route| {

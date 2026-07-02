@@ -421,7 +421,7 @@ pub(crate) struct HostLoadGuard {
 pub(crate) struct RouteInvocation {
     pub(crate) state: AppState,
     pub(crate) runtime: Arc<RuntimeState>,
-    pub(crate) route: IntegrityRoute,
+    pub(crate) route: Arc<IntegrityRoute>,
     pub(crate) headers: HeaderMap,
     pub(crate) method: Method,
     pub(crate) uri: Uri,

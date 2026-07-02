@@ -491,9 +491,8 @@ pub(crate) fn spawn_buffered_request_replayer(state: AppState) {
                 };
 
                 let Some(route) = runtime
-                    .config
+                    .route_registry
                     .sealed_route(&buffered.request.route_path)
-                    .cloned()
                 else {
                     state.buffered_requests.complete(
                         buffered,

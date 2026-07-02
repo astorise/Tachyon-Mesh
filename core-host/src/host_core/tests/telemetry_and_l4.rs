@@ -371,7 +371,7 @@ async fn tcp_layer4_connection_handler_echoes_payload() {
     });
 
     let (server_stream, _) = listener.accept().await.expect("listener should accept");
-    handle_tcp_layer4_connection(state, route, server_stream)
+    handle_tcp_layer4_connection(state, Arc::new(route), server_stream)
         .await
         .expect("TCP Layer 4 connection should complete");
 

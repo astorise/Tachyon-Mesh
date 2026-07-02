@@ -211,13 +211,13 @@ impl TlsManager {
 
         let runtime = state.runtime.load_full();
         let Some(route) = runtime
-            .config
+            .route_registry
             .sealed_route(crate::SYSTEM_CERT_MANAGER_ROUTE)
         else {
             return Ok(None);
         };
         let storage_path = storage_path_for_domain(domain);
-        let resolved = crate::resolve_storage_write_target(route, &storage_path)
+        let resolved = crate::resolve_storage_write_target(&route, &storage_path)
             .map_err(|error| anyhow!("failed to resolve cert-manager storage path: {error}"))?;
         if !resolved.host_target.exists() {
             return Ok(None);
@@ -263,9 +263,8 @@ impl TlsManager {
     ) -> Result<CertificateMaterial> {
         let runtime = state.runtime.load_full();
         let route = runtime
-            .config
+            .route_registry
             .sealed_route(crate::SYSTEM_CERT_MANAGER_ROUTE)
-            .cloned()
             .ok_or_else(|| {
                 anyhow!(
                     "TLS domain `{domain}` requires the `{}` system route to be sealed",
@@ -480,7 +479,7 @@ fn required_env(name: &str) -> Result<String> {
 
 fn ensure_known_domain(state: &crate::AppState, domain: &str) -> Result<()> {
     let runtime = state.runtime.load_full();
-    if runtime.config.route_for_domain(domain).is_some() {
+    if runtime.route_registry.route_for_domain(domain).is_some() {
         Ok(())
     } else {
         Err(anyhow!("domain `{domain}` is not sealed for native TLS"))

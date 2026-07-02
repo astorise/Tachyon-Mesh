@@ -99,6 +99,25 @@ pub(super) fn l7_domain_route_lookup_uses_normalized_domains() {
     assert_eq!(resolved.path, "/api/domain");
 }
 
+#[test]
+pub(super) fn route_registry_indexes_sealed_routes_by_path_and_domain() {
+    let mut route = IntegrityRoute::user("/api/domain");
+    route.domains.push("example.com".to_owned());
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes.push(route);
+
+    let registry = RouteRegistry::build(&config).expect("route registry should build");
+    let by_path = registry
+        .sealed_route("/api/domain/")
+        .expect("normalized path should resolve route");
+    let by_domain = registry
+        .route_for_domain("EXAMPLE.COM.")
+        .expect("normalized domain should resolve route");
+
+    assert!(Arc::ptr_eq(&by_path, &by_domain));
+    assert_eq!(by_path.path, "/api/domain");
+}
+
 pub(super) struct MtlsTestMaterial {
     pub(super) ca_pem: String,
     pub(super) server_cert_pem: String,
