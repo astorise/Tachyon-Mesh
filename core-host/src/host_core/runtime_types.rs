@@ -657,7 +657,7 @@ impl hyper::body::Body for GuestStreamingBody {
 }
 
 #[derive(
-    Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
+    Clone, Copy, Debug, Deserialize, Hash, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
 )]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RouteRole {

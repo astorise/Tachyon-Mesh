@@ -35,6 +35,50 @@ async fn reload_runtime_from_disk_swaps_in_new_routes() {
 }
 
 #[tokio::test]
+async fn reload_runtime_from_disk_clears_cached_route_identity_tokens() {
+    let temp_dir = unique_test_dir("graceful-reload-identity-cache");
+    let manifest_path = temp_dir.join("integrity.lock");
+    let initial = IntegrityConfig {
+        routes: vec![IntegrityRoute::user(DEFAULT_ROUTE)],
+        ..IntegrityConfig::default_sealed()
+    };
+    write_test_manifest(&manifest_path, &initial, 41);
+    let state = build_test_state_with_manifest(
+        initial,
+        telemetry::init_test_telemetry(),
+        manifest_path.clone(),
+    );
+    state
+        .host_identity
+        .sign_route(&IntegrityRoute::user(DEFAULT_ROUTE))
+        .expect("identity token should sign");
+    assert_eq!(
+        state
+            .host_identity
+            .route_token_cache_len()
+            .expect("cache length should read"),
+        1
+    );
+
+    let reloaded = IntegrityConfig {
+        routes: vec![IntegrityRoute::user(DEFAULT_ROUTE)],
+        ..IntegrityConfig::default_sealed()
+    };
+    write_test_manifest(&manifest_path, &reloaded, 42);
+    reload_runtime_from_disk(&state)
+        .await
+        .expect("runtime should reload from manifest");
+
+    assert_eq!(
+        state
+            .host_identity
+            .route_token_cache_len()
+            .expect("cache length should read"),
+        0
+    );
+}
+
+#[tokio::test]
 async fn reload_runtime_from_disk_keeps_previous_state_on_invalid_manifest() {
     let temp_dir = unique_test_dir("graceful-reload-invalid");
     let manifest_path = temp_dir.join("integrity.lock");

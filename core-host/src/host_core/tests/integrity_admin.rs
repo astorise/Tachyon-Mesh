@@ -417,6 +417,24 @@ fn host_identity_round_trips_signed_route_claims() {
 }
 
 #[test]
+fn host_identity_reuses_route_tokens_until_refresh_window() {
+    let host_identity = test_host_identity(15);
+    let route = IntegrityRoute::user("/api/tenant-a");
+    let token = host_identity
+        .sign_route(&route)
+        .expect("identity token should sign");
+    let reused = host_identity
+        .sign_route(&route)
+        .expect("identity token should be cached");
+    let other_route = host_identity
+        .sign_route(&IntegrityRoute::user("/api/tenant-b"))
+        .expect("other route identity token should sign");
+
+    assert_eq!(token, reused);
+    assert_ne!(token, other_route);
+}
+
+#[test]
 fn host_identity_rejects_expired_tokens() {
     let host_identity = test_host_identity(14);
     let now = unix_timestamp_seconds().expect("system clock should be available");
