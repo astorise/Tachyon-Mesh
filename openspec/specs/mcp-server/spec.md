@@ -295,7 +295,7 @@ The Tachyon MCP server SHALL provide a `recommend_concurrency_policy` tool that 
 - **AND** `risk_level: "medium"` because optimistic conflicts can cause invocation failures
 
 ### Requirement: MCP exposes a generic route patch mutator
-The Tachyon MCP server SHALL provide a `tachyon_patch_route` JSON-RPC tool that accepts `route_path`, a JSON object `patch`, and optional `dry_run`, reads the live manifest, recursively merges the patch into the matching `IntegrityRoute`, validates the patched manifest, and applies it through the admin manifest API when `dry_run` is false.
+The Tachyon MCP server SHALL provide a `tachyon_patch_route` JSON-RPC tool that accepts `route_path`, a JSON object `patch`, and optional `dry_run`, reads the live manifest, recursively merges the patch into the matching `IntegrityRoute` using JSON Merge Patch semantics, validates the patched manifest, and applies it through the admin manifest API when `dry_run` is false.
 
 #### Scenario: Route patch applies configurable route fields
 - **WHEN** an AI agent calls `tachyon_patch_route` with `route_path: "/api/billing"` and `patch: {"concurrency":{"mode":"mesh-singleton","on_conflict":"queue"},"adapter_id":"tenant-a"}`
@@ -303,13 +303,19 @@ The Tachyon MCP server SHALL provide a `tachyon_patch_route` JSON-RPC tool that 
 - **AND** validates the patched manifest before applying it
 - **AND** posts the updated manifest through the existing admin manifest path
 
+#### Scenario: Route patch removes configurable route fields with null
+- **WHEN** an AI agent calls `tachyon_patch_route` with `route_path: "/api/billing"` and `patch: {"canary":null,"concurrency":{"lock_ttl_ms":null},"shadow_target":null}`
+- **THEN** the MCP server removes the existing `canary` field from the matching route
+- **AND** removes the nested `concurrency.lock_ttl_ms` field without replacing unrelated `concurrency` fields
+- **AND** leaves the route unchanged for missing nullable keys such as `shadow_target`
+
 #### Scenario: Route patch dry-run previews validation and merged route
 - **WHEN** an AI agent calls `tachyon_patch_route` with `dry_run: true`
 - **THEN** the tool returns the merged `route_preview`, `manifest_preview`, and validation report
 - **AND** it does not post the manifest to the node
 
 #### Scenario: Route patch rejects structural route changes
-- **WHEN** a `tachyon_patch_route` call includes `path` or `role` inside `patch`
+- **WHEN** a `tachyon_patch_route` call includes `path` or `role` inside `patch`, including with a `null` value
 - **THEN** the server returns an invalid-params error without applying the manifest
 
 #### Scenario: Route patch is rate-limited as a manifest mutator
@@ -317,7 +323,7 @@ The Tachyon MCP server SHALL provide a `tachyon_patch_route` JSON-RPC tool that 
 - **THEN** further calls return the rate-limited error (`-32002`) until the bucket refills
 
 ### Requirement: MCP exposes a generic host-level manifest patch mutator
-The Tachyon MCP server SHALL provide a `tachyon_patch_manifest` JSON-RPC tool that accepts a JSON object `patch` and optional `dry_run`, reads the live manifest, recursively merges the patch at the manifest root, validates the patched manifest, and applies it through the admin manifest API when `dry_run` is false.
+The Tachyon MCP server SHALL provide a `tachyon_patch_manifest` JSON-RPC tool that accepts a JSON object `patch` and optional `dry_run`, reads the live manifest, recursively merges the patch at the manifest root using JSON Merge Patch semantics, validates the patched manifest, and applies it through the admin manifest API when `dry_run` is false.
 
 #### Scenario: Manifest patch applies configurable host-level fields
 - **WHEN** an AI agent calls `tachyon_patch_manifest` with `patch: {"enrollment":{"mode":"both","oidc_issuer":"https://issuer.example"},"require_scopes":true}`
@@ -331,7 +337,7 @@ The Tachyon MCP server SHALL provide a `tachyon_patch_manifest` JSON-RPC tool th
 - **AND** it does not post the manifest to the node
 
 #### Scenario: Manifest patch rejects structural manifest changes
-- **WHEN** a `tachyon_patch_manifest` call includes `routes`, `config_version`, or `asset_versions` inside `patch`
+- **WHEN** a `tachyon_patch_manifest` call includes `routes`, `config_version`, or `asset_versions` inside `patch`, including with a `null` value
 - **THEN** the server returns an invalid-params error without applying the manifest
 
 #### Scenario: Manifest patch is rate-limited as a manifest mutator

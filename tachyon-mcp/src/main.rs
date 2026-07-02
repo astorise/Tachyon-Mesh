@@ -748,7 +748,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_patch_route",
-                    "description": "Patch any configurable fields on a route in the live manifest. Reads the current manifest, recursively merges the JSON patch object into the target route, validates through the node manifest endpoint when applying, and POSTs the modified manifest. Use dry_run=true to preview the merged route and manifest without applying it. The structural fields path and role cannot be patched.",
+                    "description": "Patch any configurable fields on a route in the live manifest. Reads the current manifest, recursively merges the JSON patch object into the target route using JSON Merge Patch semantics: object fields merge recursively, null removes the target key, and missing keys are left unchanged. It validates through the node manifest endpoint when applying, and POSTs the modified manifest. Use dry_run=true to preview the merged route and manifest without applying it. The structural fields path and role cannot be patched, including via null.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["route_path", "patch"],
@@ -759,7 +759,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                             },
                             "patch": {
                                 "type": "object",
-                                "description": "Route fragment to merge, such as {\"concurrency\":{\"mode\":\"mesh-singleton\",\"on_conflict\":\"queue\"},\"distributed_rate_limit\":{\"threshold\":100,\"window_seconds\":60,\"scope\":\"tenant\"},\"adapter_id\":\"tenant-a\"}."
+                                "description": "Route fragment to merge, such as {\"concurrency\":{\"mode\":\"mesh-singleton\",\"on_conflict\":\"queue\"},\"distributed_rate_limit\":{\"threshold\":100,\"window_seconds\":60,\"scope\":\"tenant\"},\"adapter_id\":\"tenant-a\"}. Set a field to null to remove it, for example {\"canary\":null,\"shadow_target\":null}."
                             },
                             "dry_run": {
                                 "type": "boolean",
@@ -771,14 +771,14 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_patch_manifest",
-                    "description": "Patch configurable host-level fields in the live manifest. Reads the current manifest, recursively merges the JSON patch object at the manifest root, validates the merged manifest through the node dry-run endpoint, and POSTs it when dry_run=false. Prefer dry_run=true first to preview host-level edits such as enrollment, layer4, tee_backend, trusted_signers, require_scopes, kv_caches, telemetry_sample_rate, instance_pool_max_memory_bytes, cloud_sync_endpoint, or batch_targets. The structural fields routes, config_version, and asset_versions cannot be patched here; use tachyon_patch_route for route changes.",
+                    "description": "Patch configurable host-level fields in the live manifest. Reads the current manifest, recursively merges the JSON patch object at the manifest root using JSON Merge Patch semantics: object fields merge recursively, null removes the target key, and missing keys are left unchanged. It validates the merged manifest through the node dry-run endpoint, and POSTs it when dry_run=false. Prefer dry_run=true first to preview host-level edits such as enrollment, layer4, tee_backend, trusted_signers, require_scopes, kv_caches, telemetry_sample_rate, instance_pool_max_memory_bytes, cloud_sync_endpoint, or batch_targets. The structural fields routes, config_version, and asset_versions cannot be patched here, including via null; use tachyon_patch_route for route changes.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["patch"],
                         "properties": {
                             "patch": {
                                 "type": "object",
-                                "description": "Manifest-root fragment to merge, such as {\"enrollment\":{\"mode\":\"both\",\"oidc_issuer\":\"https://issuer.example\"},\"require_scopes\":true}."
+                                "description": "Manifest-root fragment to merge, such as {\"enrollment\":{\"mode\":\"both\",\"oidc_issuer\":\"https://issuer.example\"},\"require_scopes\":true}. Set a field to null to remove it, for example {\"tee_backend\":null}."
                             },
                             "dry_run": {
                                 "type": "boolean",
@@ -1193,10 +1193,14 @@ fn merge_json_object(target: &mut Value, patch: Value) {
     match (target, patch) {
         (Value::Object(target_map), Value::Object(patch_map)) => {
             for (key, patch_value) in patch_map {
-                match target_map.get_mut(&key) {
-                    Some(target_value) => merge_json_object(target_value, patch_value),
-                    None => {
-                        target_map.insert(key, patch_value);
+                if patch_value.is_null() {
+                    target_map.remove(&key);
+                } else {
+                    match target_map.get_mut(&key) {
+                        Some(target_value) => merge_json_object(target_value, patch_value),
+                        None => {
+                            target_map.insert(key, patch_value);
+                        }
                     }
                 }
             }
@@ -2209,10 +2213,66 @@ mod tests {
     }
 
     #[test]
+    fn merge_json_object_removes_top_level_key_when_patch_value_is_null() {
+        let mut route = json!({
+            "path": "/api/fn",
+            "canary": {
+                "stable": "v1",
+                "candidate": "v2",
+                "weight_pct": 25
+            },
+            "adapter_id": "tenant-a"
+        });
+
+        merge_json_object(&mut route, json!({"canary": null}));
+
+        assert!(route.get("canary").is_none());
+        assert_eq!(route["adapter_id"], "tenant-a");
+    }
+
+    #[test]
+    fn merge_json_object_removes_nested_key_when_patch_value_is_null() {
+        let mut route = json!({
+            "path": "/api/fn",
+            "concurrency": {
+                "mode": "mesh-singleton",
+                "on_conflict": "queue",
+                "lock_ttl_ms": 5000
+            }
+        });
+
+        merge_json_object(&mut route, json!({"concurrency": {"lock_ttl_ms": null}}));
+
+        assert_eq!(route["concurrency"]["mode"], "mesh-singleton");
+        assert_eq!(route["concurrency"]["on_conflict"], "queue");
+        assert!(route["concurrency"].get("lock_ttl_ms").is_none());
+    }
+
+    #[test]
+    fn merge_json_object_null_for_missing_key_is_noop() {
+        let mut route = json!({
+            "path": "/api/fn",
+            "adapter_id": "tenant-a"
+        });
+
+        merge_json_object(&mut route, json!({"shadow_target": null}));
+
+        assert_eq!(
+            route,
+            json!({
+                "path": "/api/fn",
+                "adapter_id": "tenant-a"
+            })
+        );
+    }
+
+    #[test]
     fn validate_route_patch_rejects_structural_fields() {
         assert!(validate_route_patch(&json!({"concurrency": {"mode": "unrestricted"}})).is_ok());
         assert!(validate_route_patch(&json!({"path": "/api/other"})).is_err());
+        assert!(validate_route_patch(&json!({"path": null})).is_err());
         assert!(validate_route_patch(&json!({"role": "system"})).is_err());
+        assert!(validate_route_patch(&json!({"role": null})).is_err());
         assert!(validate_route_patch(&json!(["not", "object"])).is_err());
     }
 
@@ -2225,8 +2285,11 @@ mod tests {
         }))
         .is_ok());
         assert!(validate_manifest_patch(&json!({"routes": []})).is_err());
+        assert!(validate_manifest_patch(&json!({"routes": null})).is_err());
         assert!(validate_manifest_patch(&json!({"config_version": 2})).is_err());
+        assert!(validate_manifest_patch(&json!({"config_version": null})).is_err());
         assert!(validate_manifest_patch(&json!({"asset_versions": {}})).is_err());
+        assert!(validate_manifest_patch(&json!({"asset_versions": null})).is_err());
         assert!(validate_manifest_patch(&json!(["not", "object"])).is_err());
     }
 
