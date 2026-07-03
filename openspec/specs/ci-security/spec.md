@@ -12,6 +12,12 @@ The CI workflow MUST run dependency vulnerability and policy checks before relea
 - **THEN** it executes `cargo audit`
 - **AND** it executes `cargo deny` using the repository `deny.toml`
 
+#### Scenario: Temporarily ignored advisories are documented
+- **GIVEN** an upstream dependency pins a vulnerable transitive crate below the fixed version
+- **WHEN** the security audit job ignores the advisory temporarily
+- **THEN** the CI workflow documents the affected advisory IDs and blocking parent crates
+- **AND** `deny.toml` records matching ignore entries with the condition for removing them
+
 ### Requirement: Feature matrix validation
 The CI workflow MUST test the core host across default, no-default, all-feature, and selected feature combinations.
 
