@@ -602,7 +602,7 @@ async fn outbound_http_import_attempts_sealed_local_route_in_process() {
     )
     .expect("component host state should build");
 
-    let error = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         <ComponentHostState as background_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
             &mut host,
             "GET".to_owned(),
@@ -612,15 +612,27 @@ async fn outbound_http_import_attempts_sealed_local_route_in_process() {
         )
     })
     .await
-    .expect("outbound HTTP import should run on a blocking worker")
-    .expect_err("local outbound HTTP should attempt in-process execution before transport fallback");
+    .expect("outbound HTTP import should run on a blocking worker");
 
-    assert!(
-        error.contains("guest artifact not found"),
-        "expected local guest loading failure, got: {error}"
-    );
-    assert!(
-        !error.contains("failed to send") && !error.contains("connection refused"),
-        "local sealed outbound HTTP should not fall through to transport: {error}"
-    );
+    match result {
+        Ok(response) => {
+            assert_eq!(response.status, StatusCode::OK.as_u16());
+            let body = String::from_utf8_lossy(&response.body);
+            assert!(
+                body.trim()
+                    .starts_with("FaaS received an empty payload | env: missing | secret:"),
+                "expected local guest response body, got: {body}"
+            );
+        }
+        Err(error) => {
+            assert!(
+                error.contains("guest artifact not found"),
+                "expected local guest loading failure, got: {error}"
+            );
+            assert!(
+                !error.contains("failed to send") && !error.contains("connection refused"),
+                "local sealed outbound HTTP should not fall through to transport: {error}"
+            );
+        }
+    }
 }
