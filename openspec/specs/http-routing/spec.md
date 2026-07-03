@@ -49,28 +49,6 @@ The guest module SHALL read its input from standard input, write its response to
 - **AND** the host reads the captured stdout bytes after execution
 - **AND** the host returns those bytes as the HTTP response body
 
-### Requirement: Host can fulfill mesh fetch commands emitted by a guest
-If the captured guest stdout contains a single line beginning with `MESH_FETCH:`, the host SHALL interpret the remainder as an outbound target and return the fetched response body to the original client. Internal targets that resolve to a sealed route in the same host process SHALL be dispatched through the in-process guest execution pipeline before any UDS or TCP transport is attempted. The transport path remains the fallback for external targets, remote targets, critical local memory pressure, or local route saturation.
-
-#### Scenario: Guest asks the host to reach a legacy service
-- **WHEN** the guest stdout is `MESH_FETCH:http://legacy-service:8081/ping`
-- **THEN** the host issues an outbound HTTP `GET` request to that URL
-- **AND** the host returns the fetched response body as the HTTP response
-- **AND** a failed outbound request results in a gateway-style error response
-
-#### Scenario: Guest asks the host to recurse through another sealed mesh route
-- **WHEN** the guest stdout is `MESH_FETCH:/api/guest-loop`
-- **THEN** the host resolves the relative route against the sealed route registry
-- **AND** the host dispatches the target route in-process when a local concurrency permit is available
-- **AND** the in-process dispatch preserves route target selection, resource admission, concurrency admission, canary routing, cohort propagation, telemetry, and a decremented hop limit
-- **AND** the host returns the downstream response status and body to the original client
-
-#### Scenario: Local route saturation falls back to transport
-- **WHEN** the guest stdout targets a sealed route in the same host process
-- **AND** the target route has no available local concurrency permit or local memory pressure is critical
-- **THEN** the host does not execute the target route in-process
-- **AND** the request falls back to the existing UDS/TCP mesh transport path
-
 ### Requirement: Host enforces a request hop limit for inbound and outbound mesh traffic
 The `core-host` gateway SHALL track a request-scoped hop limit using the `X-Tachyon-Hop-Limit` header so distributed routing loops are rejected before they can exhaust host resources.
 
@@ -217,14 +195,14 @@ highest compatible loaded route version for that logical service.
 - **WHEN** route `faas-a@2.0.0` declares `faas-b = "^2.0"`
 - **AND** the sealed configuration loads `faas-b@2.1.0` at `/api/faas-b-v2`
 - **AND** the sealed configuration also loads `faas-b@3.0.0` at `/api/faas-b-v3`
-- **AND** `faas-a` emits `MESH_FETCH:http://tachyon/faas-b`
+- **AND** `faas-a` calls `tachyon:mesh/outbound-http.send-request` for `http://tachyon/faas-b`
 - **THEN** the host rewrites the internal request to `/api/faas-b-v2`
 - **AND** the breaking `3.0.0` route is ignored for that call
 
 #### Scenario: Undeclared internal dependency is rejected
-- **WHEN** a route emits `MESH_FETCH:http://tachyon/faas-b`
+- **WHEN** a route calls `tachyon:mesh/outbound-http.send-request` for `http://tachyon/faas-b`
 - **AND** its sealed dependency map does not declare `faas-b`
-- **THEN** the host rejects the mesh fetch
+- **THEN** the host rejects the outbound HTTP request
 - **AND** the response surfaces a dependency-declaration error
 
 ### Requirement: Host resolves sealed resource aliases for outbound HTTP

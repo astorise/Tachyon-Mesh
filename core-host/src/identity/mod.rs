@@ -16,6 +16,8 @@ pub(crate) mod enrollment {
 }
 
 use super::*;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 // Extracted caller identity signing and verification.
 
@@ -39,6 +41,20 @@ pub(crate) struct HostIdentity {
     pub(crate) signing_key: Arc<SigningKey>,
     pub(crate) public_key: VerifyingKey,
     pub(crate) public_key_hex: String,
+    route_token_cache: Arc<Mutex<HashMap<RouteIdentityCacheKey, CachedIdentityToken>>>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RouteIdentityCacheKey {
+    route_path: String,
+    role: RouteRole,
+}
+
+#[derive(Clone, Debug)]
+struct CachedIdentityToken {
+    token: String,
+    refresh_after: u64,
+    expires_at: u64,
 }
 
 impl HostIdentity {
@@ -78,19 +94,33 @@ impl HostIdentity {
             signing_key: Arc::new(signing_key),
             public_key_hex: hex::encode(public_key.to_bytes()),
             public_key,
+            route_token_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub(crate) fn sign_route(&self, route: &IntegrityRoute) -> Result<String> {
         let now = unix_timestamp_seconds()?;
-        self.sign_claims(&CallerIdentityClaims {
-            route_path: normalize_route_path(&route.path),
+        let route_path = normalize_route_path(&route.path);
+        let cache_key = RouteIdentityCacheKey {
+            route_path: route_path.clone(),
+            role: route.role,
+        };
+
+        if let Some(token) = self.cached_route_token(&cache_key, now)? {
+            return Ok(token);
+        }
+
+        let expires_at = now.saturating_add(IDENTITY_TOKEN_TTL.as_secs());
+        let token = self.sign_claims(&CallerIdentityClaims {
+            route_path,
             role: route.role,
             tenant_id: None,
             token_id: None,
             issued_at: now,
-            expires_at: now.saturating_add(IDENTITY_TOKEN_TTL.as_secs()),
-        })
+            expires_at,
+        })?;
+        self.store_route_token(cache_key, token.clone(), now, expires_at)?;
+        Ok(token)
     }
 
     pub(crate) fn sign_claims(&self, claims: &CallerIdentityClaims) -> Result<String> {
@@ -102,6 +132,23 @@ impl HostIdentity {
             hex::encode(payload),
             hex::encode(signature.to_bytes())
         ))
+    }
+
+    pub(crate) fn clear_route_token_cache(&self) -> Result<()> {
+        self.route_token_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host identity route token cache is poisoned"))?
+            .clear();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_token_cache_len(&self) -> Result<usize> {
+        Ok(self
+            .route_token_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host identity route token cache is poisoned"))?
+            .len())
     }
 
     pub(crate) fn verify_header(
@@ -153,5 +200,43 @@ impl HostIdentity {
         }
 
         Ok(claims)
+    }
+
+    fn cached_route_token(&self, key: &RouteIdentityCacheKey, now: u64) -> Result<Option<String>> {
+        let mut cache = self
+            .route_token_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host identity route token cache is poisoned"))?;
+        if let Some(cached) = cache.get(key) {
+            if now <= cached.refresh_after && now <= cached.expires_at {
+                return Ok(Some(cached.token.clone()));
+            }
+        }
+        cache.remove(key);
+        Ok(None)
+    }
+
+    fn store_route_token(
+        &self,
+        key: RouteIdentityCacheKey,
+        token: String,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> Result<()> {
+        let ttl_secs = IDENTITY_TOKEN_TTL.as_secs();
+        let refresh_after = issued_at.saturating_add(ttl_secs.saturating_mul(4) / 5);
+        let mut cache = self
+            .route_token_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host identity route token cache is poisoned"))?;
+        cache.insert(
+            key,
+            CachedIdentityToken {
+                token,
+                refresh_after,
+                expires_at,
+            },
+        );
+        Ok(())
     }
 }

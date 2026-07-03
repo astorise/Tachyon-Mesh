@@ -150,9 +150,17 @@ jobs:
         # decryption timing; we only verify JWT signatures with public keys
         # (no private-key ops), so it does not apply. RUSTSEC-2024-0429 is in
         # glib's VariantStrIter; glib is present through the desktop/Tauri GTK
-        # dependency tree, not the headless runtime path. See deny.toml for
-        # the broader advisory policy.
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0429
+        # dependency tree, not the headless runtime path. RUSTSEC-2026-0194 and
+        # RUSTSEC-2026-0195 require quick-xml >= 0.41.0, but the published
+        # parents currently pin lower semver ranges: plist/Tauri and
+        # object_store. Remove those ignores as soon as the parents accept the
+        # fixed quick-xml line. See deny.toml for the broader advisory policy.
+        run: >
+          cargo audit
+          --ignore RUSTSEC-2023-0071
+          --ignore RUSTSEC-2024-0429
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources

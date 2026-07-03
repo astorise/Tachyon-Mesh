@@ -157,23 +157,6 @@ fn guest_resource_limiter_rejects_memory_growth_past_ceiling() {
 }
 
 #[test]
-fn extract_mesh_fetch_url_recognizes_bridge_command() {
-    let stdout = Bytes::from("MESH_FETCH:http://mesh/legacy-service/ping\n");
-
-    assert_eq!(
-        extract_mesh_fetch_url(&stdout),
-        Some("http://mesh/legacy-service/ping")
-    );
-}
-
-#[test]
-fn extract_mesh_fetch_url_ignores_regular_guest_output() {
-    let stdout = Bytes::from("FaaS received: Hello Lean FaaS!\n");
-
-    assert_eq!(extract_mesh_fetch_url(&stdout), None);
-}
-
-#[test]
 fn select_route_module_prefers_matching_header_targets() {
     let route = targeted_route(
         "/api/checkout",
@@ -553,148 +536,6 @@ fn filtered_outbound_http_headers_strips_internal_mesh_headers_for_external_targ
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resolve_mesh_response_forwards_propagated_cohort_headers() {
-    use axum::{extract::State, routing::get, Router};
-
-    async fn capture_headers(
-        State(captured): State<CapturedForwardedHeaders>,
-        headers: HeaderMap,
-    ) -> &'static str {
-        captured
-            .lock()
-            .expect("captured headers should not be poisoned")
-            .push((
-                headers
-                    .get(HOP_LIMIT_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned(),
-                headers
-                    .get(COHORT_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned(),
-                headers
-                    .get(TACHYON_COHORT_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned(),
-                headers
-                    .get(TACHYON_IDENTITY_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned(),
-            ));
-        "ok"
-    }
-
-    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let app = Router::new()
-        .route("/ping", get(capture_headers))
-        .with_state(Arc::clone(&captured));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("mock server should bind");
-    let address = listener
-        .local_addr()
-        .expect("mock server should expose an address");
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("mock server should stay healthy");
-    });
-
-    let mut inbound_headers = HeaderMap::new();
-    inbound_headers.insert(COHORT_HEADER, HeaderValue::from_static("beta"));
-    inbound_headers.insert(
-        TACHYON_IDENTITY_HEADER,
-        HeaderValue::from_static("Bearer spoofed"),
-    );
-    let propagated_headers = extract_propagated_headers(&inbound_headers);
-    let host_identity = test_host_identity(40);
-    let mut config = IntegrityConfig::default_sealed();
-    config.host_address = address.to_string();
-    let route_registry = RouteRegistry::build(&config).expect("route registry should build");
-    let caller_route = config
-        .sealed_route(DEFAULT_ROUTE)
-        .expect("default route should remain sealed");
-    let response = resolve_mesh_response(
-        &Client::new(),
-        &config,
-        &route_registry,
-        caller_route,
-        host_identity.as_ref(),
-        &new_uds_fast_path_registry(),
-        HopLimit(DEFAULT_HOP_LIMIT),
-        &propagated_headers,
-        GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:/ping"),
-    )
-    .await
-    .expect("mesh fetch should succeed");
-
-    server.abort();
-
-    assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body, Bytes::from("ok"));
-    let captured = captured
-        .lock()
-        .expect("captured headers should not be poisoned");
-    assert_eq!(captured.len(), 1);
-    assert_eq!(captured[0].0, (DEFAULT_HOP_LIMIT - 1).to_string());
-    assert_eq!(captured[0].1, "beta");
-    assert_eq!(captured[0].2, "beta");
-    assert_ne!(captured[0].3, "Bearer spoofed");
-    let claims = host_identity
-        .verify_token(
-            captured[0]
-                .3
-                .strip_prefix("Bearer ")
-                .expect("mesh identity header should include a bearer token"),
-        )
-        .expect("mesh identity header should verify");
-    assert_eq!(claims.route_path, DEFAULT_ROUTE);
-    assert_eq!(claims.role, RouteRole::User);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn resolve_mesh_response_attempts_sealed_local_route_in_process() {
-    let mut config = IntegrityConfig::default_sealed();
-    config.host_address = "127.0.0.1:9".to_owned();
-    let config = validate_integrity_config(config).expect("config should validate");
-    let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
-    let runtime = state.runtime.load_full();
-    let route_registry = RouteRegistry::build(&config).expect("route registry should build");
-    let caller_route = config
-        .sealed_route(DEFAULT_ROUTE)
-        .expect("default route should remain sealed");
-
-    let error = resolve_mesh_response_with_local_dispatch(
-        &state,
-        &runtime,
-        &Client::new(),
-        &config,
-        &route_registry,
-        caller_route,
-        state.host_identity.as_ref(),
-        &new_uds_fast_path_registry(),
-        HopLimit(DEFAULT_HOP_LIMIT),
-        &[],
-        GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:/api/guest-example"),
-    )
-    .await
-    .expect_err("local mesh fetch should attempt the in-process guest before transport fallback");
-
-    assert!(
-        error.contains("guest artifact not found"),
-        "expected local guest loading failure, got: {error}"
-    );
-    assert!(
-        !error.contains("failed to send") && !error.contains("connection refused"),
-        "local sealed route should not fall through to HTTP transport: {error}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn local_mesh_dispatch_yields_to_transport_when_route_is_saturated() {
     let mut route = IntegrityRoute::user(DEFAULT_ROUTE);
     route.max_concurrency = 1;
@@ -715,12 +556,15 @@ async fn local_mesh_dispatch_yields_to_transport_when_route_is_saturated() {
         .try_acquire_owned()
         .expect("test should acquire the only local permit");
 
-    let response = try_dispatch_local_mesh_fetch(
+    let response = try_dispatch_local_mesh_request(
         &state,
         &runtime,
         "http://127.0.0.1:9/api/guest-example",
+        &Method::GET,
+        &HeaderMap::new(),
+        Bytes::new(),
+        Vec::new(),
         HopLimit(DEFAULT_HOP_LIMIT),
-        &[],
     )
     .await
     .expect("saturated local route should be a transport fallback");
@@ -758,7 +602,7 @@ async fn outbound_http_import_attempts_sealed_local_route_in_process() {
     )
     .expect("component host state should build");
 
-    let error = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         <ComponentHostState as background_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
             &mut host,
             "GET".to_owned(),
@@ -768,95 +612,27 @@ async fn outbound_http_import_attempts_sealed_local_route_in_process() {
         )
     })
     .await
-    .expect("outbound HTTP import should run on a blocking worker")
-    .expect_err("local outbound HTTP should attempt in-process execution before transport fallback");
+    .expect("outbound HTTP import should run on a blocking worker");
 
-    assert!(
-        error.contains("guest artifact not found"),
-        "expected local guest loading failure, got: {error}"
-    );
-    assert!(
-        !error.contains("failed to send") && !error.contains("connection refused"),
-        "local sealed outbound HTTP should not fall through to transport: {error}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn resolve_mesh_response_does_not_leak_identity_headers_to_external_targets() {
-    use axum::{extract::State, routing::get, Router};
-
-    async fn capture_identity_header(
-        State(captured): State<Arc<std::sync::Mutex<Vec<String>>>>,
-        headers: HeaderMap,
-    ) -> &'static str {
-        captured
-            .lock()
-            .expect("captured headers should not be poisoned")
-            .push(
-                headers
-                    .get(TACHYON_IDENTITY_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned(),
+    match result {
+        Ok(response) => {
+            assert_eq!(response.status, StatusCode::OK.as_u16());
+            let body = String::from_utf8_lossy(&response.body);
+            assert!(
+                body.trim()
+                    .starts_with("FaaS received an empty payload | env: missing | secret:"),
+                "expected local guest response body, got: {body}"
             );
-        "ok"
+        }
+        Err(error) => {
+            assert!(
+                error.contains("guest artifact not found"),
+                "expected local guest loading failure, got: {error}"
+            );
+            assert!(
+                !error.contains("failed to send") && !error.contains("connection refused"),
+                "local sealed outbound HTTP should not fall through to transport: {error}"
+            );
+        }
     }
-
-    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let app = Router::new()
-        .route("/ping", get(capture_identity_header))
-        .with_state(Arc::clone(&captured));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("mock server should bind");
-    let address = listener
-        .local_addr()
-        .expect("mock server should expose an address");
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("mock server should stay healthy");
-    });
-
-    let config = validate_integrity_config(IntegrityConfig {
-        resources: BTreeMap::from([(
-            "external-ping".to_owned(),
-            IntegrityResource::External {
-                target: format!("http://{address}"),
-                allowed_methods: vec!["GET".to_owned()],
-            },
-        )]),
-        ..IntegrityConfig::default_sealed()
-    })
-    .expect("config should validate");
-    let route_registry = RouteRegistry::build(&config).expect("route registry should build");
-    let caller_route = config
-        .sealed_route(DEFAULT_ROUTE)
-        .expect("default route should remain sealed");
-    let host_identity = test_host_identity(41);
-    let response = resolve_mesh_response(
-        &Client::new(),
-        &config,
-        &route_registry,
-        caller_route,
-        host_identity.as_ref(),
-        &new_uds_fast_path_registry(),
-        HopLimit(DEFAULT_HOP_LIMIT),
-        &[],
-        GuestHttpResponse::new(StatusCode::OK, "MESH_FETCH:http://mesh/external-ping/ping"),
-    )
-    .await
-    .expect("external mesh fetch should succeed");
-
-    server.abort();
-
-    assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body, Bytes::from("ok"));
-    assert_eq!(
-        captured
-            .lock()
-            .expect("captured headers should not be poisoned")
-            .as_slice(),
-        &["".to_owned()]
-    );
 }

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 client_file="tachyon-client/src/lib.rs"
-router_file="core-host/src/host_core/app_runtime.rs"
+router_file="core-host/src/host_core/admin_plane.rs"
 ui_cargo="tachyon-ui/Cargo.toml"
 ui_main="tachyon-ui/src/main.rs"
 

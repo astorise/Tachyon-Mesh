@@ -2635,9 +2635,24 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             body,
             outbound_target_host(&url).as_deref(),
         );
+        #[cfg(unix)]
+        if resolved_target.kind.is_internal() {
+            if let Some(context) = self.local_mesh_dispatch.as_ref() {
+                if let Some(response) = send_blocking_uds_fast_path_request(
+                    context.state.uds_fast_path.as_ref(),
+                    &url,
+                    &method,
+                    &headers,
+                    &body,
+                ) {
+                    return Ok(response);
+                }
+            }
+        }
+
         let mut request = self.outbound_http_client.request(method, &url);
-        for (name, value) in headers {
-            request = request.header(&name, &value);
+        for (name, value) in &headers {
+            request = request.header(name, value);
         }
         let response = request
             .body(body)
@@ -2669,6 +2684,75 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             },
         )
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn send_blocking_uds_fast_path_request(
+    uds_fast_path: &UdsFastPathRegistry,
+    url: &str,
+    method: &reqwest::Method,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Option<background_component_bindings::tachyon::mesh::outbound_http::Response> {
+    let peer = uds_fast_path.discover_peer_for_url(url)?;
+    let client = match uds_fast_path.blocking_client_for_peer(&peer) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!(
+                socket = %peer.socket_path.display(),
+                url = %url,
+                "UDS fast-path client unavailable, falling back to TCP: {error:#}"
+            );
+            return None;
+        }
+    };
+
+    let mut request = client.request(method.clone(), url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = match request.body(body.to_vec()).send() {
+        Ok(response) => response,
+        Err(error) => {
+            uds_fast_path.note_connect_failure(&peer);
+            tracing::debug!(
+                socket = %peer.socket_path.display(),
+                url = %url,
+                "UDS fast-path unavailable, falling back to TCP: {error}"
+            );
+            return None;
+        }
+    };
+    let status = response.status().as_u16();
+    let response_headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let body = match response.bytes() {
+        Ok(body) => body.to_vec(),
+        Err(error) => {
+            tracing::debug!(
+                socket = %peer.socket_path.display(),
+                url = %url,
+                "failed to read UDS fast-path response body, falling back to TCP: {error}"
+            );
+            return None;
+        }
+    };
+
+    Some(
+        background_component_bindings::tachyon::mesh::outbound_http::Response {
+            status,
+            headers: response_headers,
+            body,
+        },
+    )
 }
 
 impl ComponentHostState {

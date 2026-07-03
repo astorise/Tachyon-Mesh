@@ -120,6 +120,7 @@ pub(crate) use wasmtime_wasi::{
 #[cfg(feature = "ai-inference")]
 pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;
 
+mod admin_plane;
 mod app_runtime;
 mod background_workers;
 mod bridge;
@@ -147,6 +148,7 @@ mod uds_fast_path;
 mod volume_backup;
 mod volumes;
 
+pub(crate) use admin_plane::*;
 pub(crate) use app_runtime::*;
 pub(crate) use background_workers::*;
 pub(crate) use bridge::*;

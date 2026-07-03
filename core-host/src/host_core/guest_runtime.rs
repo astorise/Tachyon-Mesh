@@ -63,7 +63,7 @@ pub(crate) fn execute_guest(
         let component_result = match route.role {
             RouteRole::User => execute_component_guest(
                 engine,
-                request.clone(),
+                &request,
                 route,
                 &module_path,
                 component.as_ref(),
@@ -71,7 +71,7 @@ pub(crate) fn execute_guest(
             ),
             RouteRole::System => execute_system_component_guest(
                 engine,
-                request.clone(),
+                &request,
                 route,
                 &module_path,
                 component.as_ref(),
@@ -104,6 +104,12 @@ pub(crate) fn execute_guest(
         module,
         &execution,
     )
+}
+
+fn guest_body_for_wit(body: &Bytes) -> Vec<u8> {
+    // WIT currently owns request bodies as `list<u8>`, so Wasmtime must copy
+    // into guest memory. Keep that as the only full body copy on this path.
+    Vec::from(body.as_ref())
 }
 
 #[derive(Clone, Copy)]
@@ -440,7 +446,7 @@ pub(crate) fn compiled_artifact_cache_key(
 
 pub(crate) fn execute_component_guest(
     engine: &Engine,
-    request: GuestRequest,
+    request: &GuestRequest,
     route: &IntegrityRoute,
     component_path: &Path,
     component: &Component,
@@ -623,11 +629,11 @@ pub(crate) fn execute_component_guest(
     let response = bindings.tachyon_mesh_handler().call_handle_request(
         &mut store,
         &component_bindings::exports::tachyon::mesh::handler::Request {
-            method: request.method,
-            uri: request.uri,
-            headers: request.headers,
-            body: request.body.to_vec(),
-            trailers: request.trailers,
+            method: request.method.clone(),
+            uri: request.uri.clone(),
+            headers: request.headers.clone(),
+            body: guest_body_for_wit(&request.body),
+            trailers: request.trailers.clone(),
         },
     );
     record_wasm_end(execution.telemetry.as_ref());
@@ -1309,14 +1315,21 @@ pub(crate) fn execute_streaming_component_guest(
     };
 
     record_wasm_start(execution.telemetry.as_ref());
+    let GuestRequest {
+        method,
+        uri,
+        headers,
+        body,
+        trailers,
+    } = request;
     let response = bindings.tachyon_mesh_handler().call_handle_request(
         &mut store,
         &component_bindings::exports::tachyon::mesh::handler::Request {
-            method: request.method,
-            uri: request.uri,
-            headers: request.headers,
-            body: request.body.to_vec(),
-            trailers: request.trailers,
+            method,
+            uri,
+            headers,
+            body: guest_body_for_wit(&body),
+            trailers,
         },
     );
     record_wasm_end(execution.telemetry.as_ref());
@@ -1355,7 +1368,7 @@ pub(crate) fn execute_streaming_component_guest(
 
 pub(crate) fn execute_system_component_guest(
     engine: &Engine,
-    request: GuestRequest,
+    request: &GuestRequest,
     route: &IntegrityRoute,
     component_path: &Path,
     component: &Component,
@@ -1532,11 +1545,11 @@ pub(crate) fn execute_system_component_guest(
         let response = bindings.tachyon_mesh_handler().call_handle_request(
             &mut store,
             &control_plane_component_bindings::exports::tachyon::mesh::handler::Request {
-                method: request.method,
-                uri: request.uri,
-                headers: request.headers,
-                body: request.body.to_vec(),
-                trailers: request.trailers,
+                method: request.method.clone(),
+                uri: request.uri.clone(),
+                headers: request.headers.clone(),
+                body: guest_body_for_wit(&request.body),
+                trailers: request.trailers.clone(),
             },
         );
         record_wasm_end(execution.telemetry.as_ref());
@@ -1588,11 +1601,11 @@ pub(crate) fn execute_system_component_guest(
     let response = bindings.tachyon_mesh_handler().call_handle_request(
         &mut store,
         &system_component_bindings::exports::tachyon::mesh::handler::Request {
-            method: request.method,
-            uri: request.uri,
-            headers: request.headers,
-            body: request.body.to_vec(),
-            trailers: request.trailers,
+            method: request.method.clone(),
+            uri: request.uri.clone(),
+            headers: request.headers.clone(),
+            body: guest_body_for_wit(&request.body),
+            trailers: request.trailers.clone(),
         },
     );
     record_wasm_end(execution.telemetry.as_ref());
@@ -2674,5 +2687,21 @@ impl RouteExecutionControl {
         self.prewarmed_instances
             .load(Ordering::SeqCst)
             .min(u32::MAX as usize) as u32
+    }
+}
+
+#[cfg(test)]
+mod guest_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn guest_body_for_wit_materializes_owned_body_at_wit_boundary() {
+        let body = Bytes::from_static(b"payload");
+
+        let mut wit_body = guest_body_for_wit(&body);
+        wit_body[0] = b'P';
+
+        assert_eq!(body.as_ref(), b"payload");
+        assert_eq!(wit_body, b"Payload");
     }
 }

@@ -60,6 +60,12 @@ If you prefer to use [`cargo-component`](https://github.com/bytecodealliance/car
 |---|---|
 | `tachyon:mesh` | `handler`, `kv-partition`, `graph`, `vector`, `training`, `outbound-http`, `secrets-vault`, … |
 
+### Outbound HTTP
+
+Use the `tachyon:mesh/outbound-http` WIT import for guest-initiated HTTP calls. The
+older `MESH_FETCH:<url>` stdout/body command is no longer supported. Guests that
+need to call HTTP targets must import `tachyon:mesh/outbound-http`.
+
 ### Pinning a specific version
 
 Replace `1.1.0` with the release tag you want to target, e.g. `0.9.0-rc.1`. To list all published versions:

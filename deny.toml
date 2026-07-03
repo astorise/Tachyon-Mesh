@@ -8,6 +8,8 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is a direct TLS parser dependency; warnings remain surfaced by cargo audit while we track replacement." },
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side-channel applies to RSA private-key decryption; system-faas-node-registry uses rsa only for RS256 JWT signature VERIFICATION with public keys (no private-key ops), so it is not exploitable here. No fixed rsa release is available yet." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml requires >= 0.41.0 for the duplicate-attribute check fix, but the current published parents pin lower semver ranges: plist 1.9.0 via Tauri uses quick-xml 0.39.x and object_store 0.14.0 uses quick-xml 0.40.x. Remove once those parents accept quick-xml >= 0.41.0." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml requires >= 0.41.0 for the NsReader namespace-allocation fix, but the current published parents pin lower semver ranges: plist 1.9.0 via Tauri uses quick-xml 0.39.x and object_store 0.14.0 uses quick-xml 0.40.x. Remove once those parents accept quick-xml >= 0.41.0." },
 ]
 
 [licenses]
