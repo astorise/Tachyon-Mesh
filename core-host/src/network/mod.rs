@@ -809,6 +809,7 @@ pub(crate) async fn handle_websocket_connection(
             propagated_headers: Vec::new(),
             route_overrides,
             host_load,
+            local_mesh_dispatch: None,
             #[cfg(feature = "ai-inference")]
             ai_runtime: Arc::clone(&runtime.ai_runtime),
             instance_pool: Some(instance_pool),
