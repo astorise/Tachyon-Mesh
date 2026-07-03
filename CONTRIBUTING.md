@@ -30,6 +30,9 @@ touches Rust code:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
+for feature in http3 mtls rate-limit resiliency s3-persistence secrets-vault websockets; do
+  cargo check -p core-host --features "$feature"
+done
 ```
 
 For feature-gated code, also run the smallest relevant `cargo check` or test

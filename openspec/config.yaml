@@ -11,7 +11,11 @@ context: |
   an issue resolved while its commits live only on an unmerged branch.
 
   For Rust changes, the canonical local quality check is:
-  `cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used`.
+  `cargo fmt --all -- --check`, then
+  `cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used`,
+  then compile-only `cargo check -p core-host --features <feature>` runs for
+  `http3`, `mtls`, `rate-limit`, `resiliency`, `s3-persistence`,
+  `secrets-vault`, and `websockets`.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.

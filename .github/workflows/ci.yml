@@ -212,6 +212,20 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check core-host feature builds (compile-only)
+        run: |
+          for feature in \
+            http3 \
+            mtls \
+            rate-limit \
+            resiliency \
+            s3-persistence \
+            secrets-vault \
+            websockets
+          do
+            cargo check -p core-host --features "$feature"
+          done
+
       - name: Lint workspace (CPU features)
         # Keep the general quality gate on ubuntu-latest CPU runners: CUDA is
         # validated separately by the arc-gpu-runners job below. `--all-features`
@@ -249,9 +263,6 @@ jobs:
         env:
           TACHYON_REQUIRE_GUEST_OPENAI: "1"
         run: cargo test -p core-host --features ai-inference --bin core-host streaming_guest_openai -- --nocapture
-
-      - name: Check s3-persistence host build
-        run: cargo check -p core-host --features s3-persistence
 
   # ── 3b. CUDA quality gate (requires the self-hosted ARC GPU runner) ────────
   # This job owns the CUDA-enabled Candle build so the default ubuntu-latest
