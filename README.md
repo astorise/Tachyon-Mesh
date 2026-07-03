@@ -247,7 +247,7 @@ scripts/build-guest-artifacts.sh examples/guest-example
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please refer to `CONTRIBUTING.md` (coming soon) and use the `openspec/` directory format for any architectural change proposals.
+Contributions are welcome! Please refer to `CONTRIBUTING.md` and use the `openspec/` directory format for any architectural change proposals.
 
 ---
 

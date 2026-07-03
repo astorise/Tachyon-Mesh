@@ -1,13 +1,17 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  Contributions must land through pull requests targeting `main`; direct
+  implementation pushes to `main` are not allowed. PRs must be up to date with
+  `main` and pass the required checks `quality`, `cuda-quality`,
+  `security-audit`, and `build-guests` before merge.
+
+  Issues are closed only after their fix has landed on `main`. Use `Fixes #N`
+  or `Closes #N` in PR bodies so GitHub closes issues on merge, and do not mark
+  an issue resolved while its commits live only on an unmerged branch.
+
+  For Rust changes, the canonical local quality check is:
+  `cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used`.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
