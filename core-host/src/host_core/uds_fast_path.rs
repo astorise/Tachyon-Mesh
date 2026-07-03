@@ -218,10 +218,6 @@ impl UdsFastPathRegistry {
             .lock()
             .expect("UDS peer cache should not be poisoned")
             .remove(&peer.metadata.host_id);
-        self.async_clients
-            .lock()
-            .expect("UDS async client cache should not be poisoned")
-            .remove(&peer.socket_path);
         self.blocking_clients
             .lock()
             .expect("UDS blocking client cache should not be poisoned")
@@ -253,10 +249,6 @@ impl UdsFastPathRegistry {
                 self.peers
                     .lock()
                     .expect("UDS peer cache should not be poisoned")
-                    .clear();
-                self.async_clients
-                    .lock()
-                    .expect("UDS async client cache should not be poisoned")
                     .clear();
                 self.blocking_clients
                     .lock()
@@ -316,10 +308,6 @@ impl UdsFastPathRegistry {
             .values()
             .map(|peer| peer.socket_path.clone())
             .collect::<std::collections::HashSet<_>>();
-        self.async_clients
-            .lock()
-            .expect("UDS async client cache should not be poisoned")
-            .retain(|socket_path, _| active_sockets.contains(socket_path));
         self.blocking_clients
             .lock()
             .expect("UDS blocking client cache should not be poisoned")
@@ -329,33 +317,6 @@ impl UdsFastPathRegistry {
             .lock()
             .expect("UDS peer cache timestamp should not be poisoned") = Some(Instant::now());
         discovered
-    }
-
-    pub(crate) fn async_client_for_peer(&self, peer: &DiscoveredUdsPeer) -> Result<Client> {
-        if let Some(client) = self
-            .async_clients
-            .lock()
-            .expect("UDS async client cache should not be poisoned")
-            .get(&peer.socket_path)
-            .cloned()
-        {
-            return Ok(client);
-        }
-
-        let client = Client::builder()
-            .unix_socket(peer.socket_path.as_path())
-            .build()
-            .with_context(|| {
-                format!(
-                    "failed to build UDS mesh client for `{}`",
-                    peer.socket_path.display()
-                )
-            })?;
-        self.async_clients
-            .lock()
-            .expect("UDS async client cache should not be poisoned")
-            .insert(peer.socket_path.clone(), client.clone());
-        Ok(client)
     }
 
     pub(crate) fn blocking_client_for_peer(
