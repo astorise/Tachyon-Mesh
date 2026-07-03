@@ -148,13 +148,13 @@ The `publish-docker-images` job SHALL include a matrix entry that builds `Docker
 - **AND** the `-fips` variant uses `Dockerfile.fips` as its Dockerfile
 - **AND** all variants are pushed to `ghcr.io/<owner>/tachyon-mesh` with appropriate tags
 
-### Requirement: CI validates the s3-persistence feature build
-The CI workflow SHALL include a `cargo check -p core-host --features s3-persistence` step in the `rust-ci` job to verify the feature compiles without errors on every push.
+### Requirement: CI validates feature-gated core-host builds in the quality gate
+The CI workflow SHALL include compile-only `cargo check -p core-host --features <feature>` checks in the `quality` job before heavier lint, cross-layer validation, integration test, and downstream matrix jobs. The checks SHALL cover the CPU feature-gated paths exercised by the downstream feature matrix that are not covered by the workspace lint feature set: `http3`, `mtls`, `rate-limit`, `resiliency`, `s3-persistence`, `secrets-vault`, and `websockets`.
 
-#### Scenario: s3-persistence check runs in rust-ci
+#### Scenario: feature compile checks run early in quality
 - **WHEN** the CI workflow runs on GitHub Actions
-- **THEN** it runs `cargo check -p core-host --features s3-persistence`
-- **AND** the step fails the build on any compilation error
+- **THEN** the `quality` job runs `cargo check -p core-host --features <feature>` for each required feature before workspace linting
+- **AND** the step fails the build on any compilation error before downstream feature-matrix jobs are scheduled
 
 ### Requirement: feature-matrix-tests includes s3-persistence combination
 The `feature-matrix-tests` job SHALL include `--features s3-persistence` as one of its matrix entries, uploading the resulting binary as a labeled artifact.
@@ -163,4 +163,3 @@ The `feature-matrix-tests` job SHALL include `--features s3-persistence` as one 
 - **WHEN** the feature-matrix-tests job runs the s3-persistence entry
 - **THEN** it runs `cargo test -p core-host --features s3-persistence` and `cargo build -p core-host --release --features s3-persistence`
 - **AND** uploads the binary as `core-host-linux-x86_64-s3-persistence-<sha>`
-
