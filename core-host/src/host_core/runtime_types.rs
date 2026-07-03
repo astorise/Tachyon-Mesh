@@ -213,6 +213,129 @@ pub(crate) struct GuestExecutionContext {
         Option<Arc<crate::host_core::scoping::LinkerCache<ComponentLinker<ComponentHostState>>>>,
     #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+    _private: (),
+}
+
+pub(crate) struct GuestExecutionContextBuilder {
+    context: GuestExecutionContext,
+}
+
+impl GuestExecutionContext {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn builder(
+        config: IntegrityConfig,
+        sampled_execution: bool,
+        runtime_telemetry: TelemetryHandle,
+        async_log_sender: mpsc::Sender<AsyncLogEntry>,
+        secret_access: SecretAccess,
+        request_headers: HeaderMap,
+        host_identity: Arc<HostIdentity>,
+        storage_broker: Arc<StorageBrokerManager>,
+        bridge_manager: Arc<BridgeManager>,
+        concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
+        propagated_headers: Vec<PropagatedHeader>,
+        route_overrides: Arc<ArcSwap<HashMap<String, String>>>,
+        host_load: Arc<HostLoadCounters>,
+        #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+    ) -> GuestExecutionContextBuilder {
+        GuestExecutionContextBuilder {
+            context: GuestExecutionContext {
+                config,
+                sampled_execution,
+                runtime_telemetry,
+                async_log_sender,
+                secret_access,
+                request_headers,
+                host_identity,
+                storage_broker,
+                bridge_manager,
+                telemetry: None,
+                concurrency_limits,
+                propagated_headers,
+                route_overrides,
+                host_load,
+                local_mesh_dispatch: None,
+                instance_pool: None,
+                component_cache: None,
+                component_instance_pre_cache: None,
+                legacy_instance_pre_cache: None,
+                linker_cache: None,
+                #[cfg(feature = "ai-inference")]
+                ai_runtime,
+                _private: (),
+            },
+        }
+    }
+}
+
+impl GuestExecutionContextBuilder {
+    pub(crate) fn telemetry(mut self, telemetry: Option<GuestTelemetryContext>) -> Self {
+        self.context.telemetry = telemetry;
+        self
+    }
+
+    pub(crate) fn local_mesh_dispatch(
+        mut self,
+        local_mesh_dispatch: Option<LocalMeshDispatchContext>,
+    ) -> Self {
+        self.context.local_mesh_dispatch = local_mesh_dispatch;
+        self
+    }
+
+    pub(crate) fn instance_pool(
+        mut self,
+        instance_pool: Option<Arc<moka::sync::Cache<PathBuf, Arc<Module>>>>,
+    ) -> Self {
+        self.context.instance_pool = instance_pool;
+        self
+    }
+
+    pub(crate) fn component_cache(
+        mut self,
+        component_cache: Option<Arc<moka::sync::Cache<PathBuf, CachedComponent>>>,
+    ) -> Self {
+        self.context.component_cache = component_cache;
+        self
+    }
+
+    pub(crate) fn component_instance_pre_cache(
+        mut self,
+        component_instance_pre_cache: Option<
+            Arc<
+                moka::sync::Cache<
+                    ComponentInstancePreKey,
+                    Arc<ComponentInstancePre<ComponentHostState>>,
+                >,
+            >,
+        >,
+    ) -> Self {
+        self.context.component_instance_pre_cache = component_instance_pre_cache;
+        self
+    }
+
+    pub(crate) fn legacy_instance_pre_cache(
+        mut self,
+        legacy_instance_pre_cache: Option<
+            Arc<moka::sync::Cache<LegacyInstancePreKey, Arc<ModuleInstancePre<LegacyHostState>>>>,
+        >,
+    ) -> Self {
+        self.context.legacy_instance_pre_cache = legacy_instance_pre_cache;
+        self
+    }
+
+    pub(crate) fn linker_cache(
+        mut self,
+        linker_cache: Option<
+            Arc<crate::host_core::scoping::LinkerCache<ComponentLinker<ComponentHostState>>>,
+        >,
+    ) -> Self {
+        self.context.linker_cache = linker_cache;
+        self
+    }
+
+    pub(crate) fn build(self) -> GuestExecutionContext {
+        self.context
+    }
 }
 
 #[derive(Clone)]

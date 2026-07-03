@@ -2346,30 +2346,30 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                         &task_function_name,
                         guest_request,
                         &task_route,
-                        GuestExecutionContext {
-                            config: request_config,
+                        GuestExecutionContext::builder(
+                            request_config,
                             sampled_execution,
                             runtime_telemetry,
-                            async_log_sender: task_async_log_sender,
+                            task_async_log_sender,
                             secret_access,
-                            request_headers: task_request_headers,
-                            host_identity: task_host_identity,
+                            task_request_headers,
+                            task_host_identity,
                             storage_broker,
-                            bridge_manager: task_bridge_manager,
-                            telemetry: telemetry_context,
+                            task_bridge_manager,
                             concurrency_limits,
-                            propagated_headers: task_propagated_headers,
-                            route_overrides: task_route_overrides,
-                            host_load: task_host_load,
-                            local_mesh_dispatch: Some(task_local_mesh_dispatch.clone()),
+                            task_propagated_headers,
+                            task_route_overrides,
+                            task_host_load,
                             #[cfg(feature = "ai-inference")]
-                            ai_runtime: task_ai_runtime,
-                            instance_pool: None,
-                            component_cache: Some(task_component_cache),
-                            component_instance_pre_cache: Some(task_component_instance_pre_cache),
-                            legacy_instance_pre_cache: Some(task_legacy_instance_pre_cache),
-                            linker_cache: Some(task_linker_cache),
-                        },
+                            task_ai_runtime,
+                        )
+                        .telemetry(telemetry_context)
+                        .local_mesh_dispatch(Some(task_local_mesh_dispatch.clone()))
+                        .component_cache(Some(task_component_cache))
+                        .component_instance_pre_cache(Some(task_component_instance_pre_cache))
+                        .legacy_instance_pre_cache(Some(task_legacy_instance_pre_cache))
+                        .linker_cache(Some(task_linker_cache))
+                        .build(),
                     )?;
                     annotate_tee_outcome(&mut outcome, "local-enclave");
                     Ok(outcome)
@@ -2409,30 +2409,31 @@ pub(crate) async fn execute_route_request_with_acquired_permit(
                 &task_function_name,
                 guest_request,
                 &task_route,
-                GuestExecutionContext {
-                    config: request_config,
+                GuestExecutionContext::builder(
+                    request_config,
                     sampled_execution,
                     runtime_telemetry,
-                    async_log_sender: task_async_log_sender,
+                    task_async_log_sender,
                     secret_access,
-                    request_headers: task_request_headers,
-                    host_identity: task_host_identity,
+                    task_request_headers,
+                    task_host_identity,
                     storage_broker,
-                    bridge_manager: task_bridge_manager,
-                    telemetry: telemetry_context,
+                    task_bridge_manager,
                     concurrency_limits,
-                    propagated_headers: task_propagated_headers,
-                    route_overrides: task_route_overrides,
-                    host_load: task_host_load,
-                    local_mesh_dispatch: Some(task_local_mesh_dispatch),
+                    task_propagated_headers,
+                    task_route_overrides,
+                    task_host_load,
                     #[cfg(feature = "ai-inference")]
-                    ai_runtime: task_ai_runtime,
-                    instance_pool: Some(task_instance_pool),
-                    component_cache: Some(task_component_cache),
-                    component_instance_pre_cache: Some(task_component_instance_pre_cache),
-                    legacy_instance_pre_cache: Some(task_legacy_instance_pre_cache),
-                    linker_cache: Some(task_linker_cache),
-                },
+                    task_ai_runtime,
+                )
+                .telemetry(telemetry_context)
+                .local_mesh_dispatch(Some(task_local_mesh_dispatch))
+                .instance_pool(Some(task_instance_pool))
+                .component_cache(Some(task_component_cache))
+                .component_instance_pre_cache(Some(task_component_instance_pre_cache))
+                .legacy_instance_pre_cache(Some(task_legacy_instance_pre_cache))
+                .linker_cache(Some(task_linker_cache))
+                .build(),
             )
         })
         .await

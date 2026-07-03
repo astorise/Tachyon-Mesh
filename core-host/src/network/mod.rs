@@ -659,30 +659,29 @@ pub(crate) async fn handle_udp_layer4_datagram(
     let responses = tokio::task::spawn_blocking(move || {
         let _volume_leases = volume_leases;
         let _permit = permit;
-        let execution = GuestExecutionContext {
-            config: config.clone(),
-            sampled_execution: false,
+        let execution = GuestExecutionContext::builder(
+            config.clone(),
+            false,
             runtime_telemetry,
-            async_log_sender: state.async_log_sender.clone(),
-            secret_access: SecretAccess::from_route(&route_for_execution, &SecretsVault::load()),
+            state.async_log_sender.clone(),
+            SecretAccess::from_route(&route_for_execution, &SecretsVault::load()),
             request_headers,
             host_identity,
             storage_broker,
-            bridge_manager: Arc::clone(&state.bridge_manager),
-            telemetry: None,
+            Arc::clone(&state.bridge_manager),
             concurrency_limits,
-            propagated_headers: Vec::new(),
+            Vec::new(),
             route_overrides,
             host_load,
-            local_mesh_dispatch: None,
             #[cfg(feature = "ai-inference")]
-            ai_runtime: Arc::clone(&runtime.ai_runtime),
-            instance_pool: Some(instance_pool),
-            component_cache: Some(component_cache),
-            component_instance_pre_cache: Some(component_instance_pre_cache),
-            legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
-            linker_cache: Some(linker_cache),
-        };
+            Arc::clone(&runtime.ai_runtime),
+        )
+        .instance_pool(Some(instance_pool))
+        .component_cache(Some(component_cache))
+        .component_instance_pre_cache(Some(component_instance_pre_cache))
+        .legacy_instance_pre_cache(Some(legacy_instance_pre_cache))
+        .linker_cache(Some(linker_cache))
+        .build();
         execute_udp_layer4_guest(
             &engine,
             &route_for_execution,
@@ -794,30 +793,29 @@ pub(crate) async fn handle_websocket_connection(
     std::thread::spawn(move || {
         let _volume_leases = volume_leases;
         let _permit = permit;
-        let execution = GuestExecutionContext {
+        let execution = GuestExecutionContext::builder(
             config,
-            sampled_execution: false,
+            false,
             runtime_telemetry,
-            async_log_sender: state.async_log_sender.clone(),
+            state.async_log_sender.clone(),
             secret_access,
-            request_headers: HeaderMap::new(),
+            HeaderMap::new(),
             host_identity,
             storage_broker,
-            bridge_manager: Arc::clone(&state.bridge_manager),
-            telemetry: None,
+            Arc::clone(&state.bridge_manager),
             concurrency_limits,
-            propagated_headers: Vec::new(),
+            Vec::new(),
             route_overrides,
             host_load,
-            local_mesh_dispatch: None,
             #[cfg(feature = "ai-inference")]
-            ai_runtime: Arc::clone(&runtime.ai_runtime),
-            instance_pool: Some(instance_pool),
-            component_cache: Some(component_cache),
-            component_instance_pre_cache: Some(component_instance_pre_cache),
-            legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
-            linker_cache: Some(linker_cache),
-        };
+            Arc::clone(&runtime.ai_runtime),
+        )
+        .instance_pool(Some(instance_pool))
+        .component_cache(Some(component_cache))
+        .component_instance_pre_cache(Some(component_instance_pre_cache))
+        .legacy_instance_pre_cache(Some(legacy_instance_pre_cache))
+        .linker_cache(Some(linker_cache))
+        .build();
         let _ = result_tx.send(execute_websocket_guest(
             &engine,
             &route,
@@ -923,9 +921,9 @@ pub(crate) async fn handle_streaming_http_request(
         .spawn(move || {
             let _volume_leases = volume_leases;
             let _permit = permit;
-            let execution = GuestExecutionContext {
+            let execution = GuestExecutionContext::builder(
                 config,
-                sampled_execution: false,
+                false,
                 runtime_telemetry,
                 async_log_sender,
                 secret_access,
@@ -933,19 +931,18 @@ pub(crate) async fn handle_streaming_http_request(
                 host_identity,
                 storage_broker,
                 bridge_manager,
-                telemetry: None,
                 concurrency_limits,
-                propagated_headers: Vec::new(),
+                Vec::new(),
                 route_overrides,
                 host_load,
-                local_mesh_dispatch: None,
                 ai_runtime,
-                instance_pool: Some(instance_pool),
-                component_cache: Some(component_cache),
-                component_instance_pre_cache: Some(component_instance_pre_cache),
-                legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
-                linker_cache: Some(linker_cache),
-            };
+            )
+            .instance_pool(Some(instance_pool))
+            .component_cache(Some(component_cache))
+            .component_instance_pre_cache(Some(component_instance_pre_cache))
+            .legacy_instance_pre_cache(Some(legacy_instance_pre_cache))
+            .linker_cache(Some(linker_cache))
+            .build();
             execute_streaming_guest(
                 &engine,
                 &route,
@@ -1197,30 +1194,24 @@ pub(crate) fn execute_tcp_layer4_guest(
     host_load: Arc<HostLoadCounters>,
     #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
 ) -> std::result::Result<(), ExecutionError> {
-    let execution = GuestExecutionContext {
-        config: config.clone(),
-        sampled_execution: false,
+    let execution = GuestExecutionContext::builder(
+        config.clone(),
+        false,
         runtime_telemetry,
-        async_log_sender: disconnected_log_sender(),
-        secret_access: SecretAccess::from_route(route, &SecretsVault::load()),
-        request_headers: HeaderMap::new(),
+        disconnected_log_sender(),
+        SecretAccess::from_route(route, &SecretsVault::load()),
+        HeaderMap::new(),
         host_identity,
         storage_broker,
-        bridge_manager: Arc::new(BridgeManager::default()),
-        telemetry: None,
+        Arc::new(BridgeManager::default()),
         concurrency_limits,
-        propagated_headers: Vec::new(),
+        Vec::new(),
         route_overrides,
         host_load,
-        local_mesh_dispatch: None,
         #[cfg(feature = "ai-inference")]
         ai_runtime,
-        instance_pool: None,
-        component_cache: None,
-        component_instance_pre_cache: None,
-        legacy_instance_pre_cache: None,
-        linker_cache: None,
-    };
+    )
+    .build();
     let (module_path, module) = resolve_legacy_guest_module_with_pool(
         engine,
         function_name,
