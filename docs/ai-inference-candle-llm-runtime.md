@@ -76,7 +76,12 @@ unsupported-architecture error.
 
 ## PagedAttention Status
 
-The pinned `astorise/candle` fork includes Candle's paged flash-attn API
+The pinned `astorise/candle` fork is consumed through a Tachyon release tag
+(`tachyon-v0.11.0-1` at the time of writing), not a raw commit rev, so Renovate
+can track the git ref. Each fork refresh should rebase the fork on the selected
+upstream Candle commit, run the Candle/Tachyon AI inference checks, publish a new
+`tachyon-v<upstream-version>-<N>` tag, and update `core-host/Cargo.toml` plus
+`Cargo.lock` together. The fork includes Candle's paged flash-attn API
 (`flash_attn_varlen_paged_windowed`), but Tachyon does not yet own the required
 runtime state for it: a CUDA KV block pool, per-sequence block tables, and
 block-granular allocation/free during continuous batching.
