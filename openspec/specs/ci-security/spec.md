@@ -25,6 +25,19 @@ The CI workflow MUST run dependency vulnerability and policy checks before relea
 - **AND** `deny.toml` MUST NOT keep stale ignore entries for those advisory IDs
 - **AND** `cargo deny` MUST allow any temporary patched sources required to reach the fixed dependency line
 
+#### Scenario: Direct TLS parser advisory is migrated to maintained APIs
+- **GIVEN** a RustSec advisory marks a direct TLS PEM parsing crate as unmaintained
+- **WHEN** the workspace already depends on maintained PEM parsing APIs through the rustls PKI types
+- **THEN** host TLS code SHALL migrate direct PEM parsing to `rustls::pki_types::pem::PemObject`
+- **AND** direct dependencies on the unmaintained parser crate SHALL be removed from package manifests and `Cargo.lock`
+- **AND** `deny.toml` SHALL remove any ignore entry for the remediated advisory
+
+#### Scenario: Unmaintained dependencies remain only through latest upstream parents
+- **GIVEN** `cargo audit` reports an unmaintained crate reachable only through a third-party parent crate
+- **WHEN** the parent crate is already at its latest published compatible version
+- **THEN** the repository SHALL leave the transitive dependency to upstream rather than patching unrelated crates locally
+- **AND** the dependency tree SHALL identify the blocking parent crate for follow-up
+
 ### Requirement: Feature matrix validation
 The CI workflow MUST test the core host across default, no-default, all-feature, and selected feature combinations.
 
