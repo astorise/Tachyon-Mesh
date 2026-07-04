@@ -101,15 +101,22 @@ The repository SHALL build the `guest-ai` artifact in CI and validate that the o
 
 ### Requirement: Downstream Candle quantization kernels MUST be consumed through the pinned fork
 The AI inference build SHALL consume Candle from the pinned `astorise/candle`
-revision that includes the downstream GPTQ/Marlin, AWQ, and block-wise FP8
+release tag that includes the downstream GPTQ/Marlin, AWQ, and block-wise FP8
 weight-quantization kernel work proposed upstream in `huggingface/candle#3650`.
 This integration SHALL be represented as dependency selection in Tachyon rather
-than by duplicating those Candle kernels in `core-host`.
+than by duplicating those Candle kernels in `core-host`. The fork ref SHALL use
+a Renovate-trackable named ref such as `tag = "tachyon-v<upstream-version>-<N>"`
+rather than a raw git `rev` pin.
 
 #### Scenario: AI inference resolves the forked Candle crates
 - **WHEN** the optional AI inference dependency graph is resolved
 - **THEN** `candle-core`, `candle-nn`, `candle-onnx`, and `candle-transformers` come from `https://github.com/astorise/candle`
-- **AND** Cargo.lock pins them to a single fork revision containing the downstream quantization work
+- **AND** Cargo.lock pins them to a single fork tag containing the downstream quantization work
+
+#### Scenario: Renovate can monitor the forked Candle ref
+- **WHEN** Renovate scans `core-host/Cargo.toml`
+- **THEN** the Candle git dependencies use a named tag ref instead of a raw commit rev
+- **AND** the dependency dashboard does not report `Could not determine new digest for update` for the `astorise/candle` git dependency
 
 #### Scenario: Default builds do not link Candle quantization code
 - **WHEN** `core-host` is built without `--features ai-inference`
@@ -662,8 +669,8 @@ When a model deployment sets `hardware_strategy.paged_attention: true`, the runt
 - **AND** sequence admission and eviction operate at block granularity rather than reallocating a contiguous KV cache per request
 
 ### Requirement: CUDA Graph and FlashInfer decode acceleration MUST be explicit and fail-closed
-The AI inference build SHALL consume the pinned `astorise/candle` fork revision
-that exposes `candle_core::CudaGraph` and the optional
+The AI inference build SHALL consume the pinned `astorise/candle` fork tag that
+exposes `candle_core::CudaGraph` and the optional
 `candle-flashinfer-kernels` crate for the downstream work proposed in
 `huggingface/candle#3651`. Model deployments MAY declare
 `hardware_strategy.cuda_graph_decode` and
