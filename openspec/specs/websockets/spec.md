@@ -11,6 +11,14 @@ The Tachyon WIT package SHALL define a WebSocket connection resource with typed 
 - **WHEN** a WebSocket-capable guest is built against the Tachyon WIT package
 - **THEN** it can export `on-connect` and use a connection resource to send and receive typed frames
 
+### Requirement: WebSocket guests can call scoped outbound HTTP
+The `websocket-faas-guest` WIT world SHALL expose `tachyon:mesh/outbound-http` so WebSocket guests can call sealed mesh routes through the same scoped outbound HTTP host import as other component guests.
+
+#### Scenario: WebSocket guest calls outbound HTTP
+- **WHEN** a WebSocket-capable guest is built against the Tachyon WIT package
+- **THEN** it can import `outbound-http.send-request`
+- **AND** the host validates the target URL against the deployment's HTTP scopes before dispatch
+
 ### Requirement: Routes explicitly opt into WebSocket upgrades
 The integrity manifest SHALL allow a route or target to declare that it expects a WebSocket upgrade instead of standard HTTP-only request handling.
 
