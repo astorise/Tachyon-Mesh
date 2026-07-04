@@ -67,7 +67,10 @@ async fn websocket_route_upgrades_and_echoes_frames() {
         .await
         .expect("WebSocket server should respond")
         .expect("WebSocket frame should be valid");
-    assert!(matches!(text_frame, Message::Text(text) if text == "hello"));
+    assert!(
+        matches!(&text_frame, Message::Text(text) if *text == "hello"),
+        "expected text echo, got: {text_frame:?}"
+    );
 
     client
         .send(Message::Binary(vec![1_u8, 2, 3].into()))
@@ -78,7 +81,10 @@ async fn websocket_route_upgrades_and_echoes_frames() {
         .await
         .expect("WebSocket server should respond to binary frame")
         .expect("WebSocket frame should be valid");
-    assert!(matches!(binary_frame, Message::Binary(bytes) if bytes.as_ref() == [1_u8, 2, 3]));
+    assert!(
+        matches!(&binary_frame, Message::Binary(bytes) if bytes.as_ref() == [1_u8, 2, 3]),
+        "expected binary echo, got: {binary_frame:?}"
+    );
 
     client
         .close(None)
@@ -635,4 +641,141 @@ async fn outbound_http_import_attempts_sealed_local_route_in_process() {
             );
         }
     }
+}
+
+#[cfg(feature = "websockets")]
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_outbound_http_import_attempts_sealed_local_route_in_process() {
+    let websocket_route =
+        targeted_route("/ws/local", vec![websocket_target("guest-websocket-echo")]);
+    let mut config = IntegrityConfig {
+        routes: vec![IntegrityRoute::user(DEFAULT_ROUTE), websocket_route],
+        ..IntegrityConfig::default_sealed()
+    };
+    config.host_address = "127.0.0.1:9".to_owned();
+    let config = validate_integrity_config(config).expect("config should validate");
+    let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+    let runtime = state.runtime.load_full();
+    let caller_route = config
+        .sealed_route("/ws/local")
+        .expect("websocket route should remain sealed");
+    let mut host = ComponentHostState::new(
+        caller_route,
+        config.clone(),
+        runtime.config.guest_memory_limit_bytes,
+        state.telemetry.clone(),
+        SecretAccess::default(),
+        HeaderMap::new(),
+        Arc::clone(&state.host_identity),
+        Arc::clone(&state.storage_broker),
+        Arc::clone(&runtime.concurrency_limits),
+        Vec::new(),
+        Some(LocalMeshDispatchContext {
+            state: state.clone(),
+            runtime,
+            handle: tokio::runtime::Handle::current(),
+        }),
+        &[],
+    )
+    .expect("component host state should build");
+
+    let result = tokio::task::spawn_blocking(move || {
+        <ComponentHostState as websocket_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
+            &mut host,
+            "GET".to_owned(),
+            "http://mesh/api/guest-example".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+    })
+    .await
+    .expect("websocket outbound HTTP import should run on a blocking worker");
+
+    match result {
+        Ok(response) => {
+            assert_eq!(response.status, StatusCode::OK.as_u16());
+            let body = String::from_utf8_lossy(&response.body);
+            assert!(
+                body.trim()
+                    .starts_with("FaaS received an empty payload | env: missing | secret:"),
+                "expected local guest response body, got: {body}"
+            );
+        }
+        Err(error) => {
+            assert!(
+                error.contains("guest artifact not found"),
+                "expected local guest loading failure, got: {error}"
+            );
+            assert!(
+                !error.contains("failed to send") && !error.contains("connection refused"),
+                "websocket sealed outbound HTTP should not fall through to transport: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "websockets")]
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_outbound_http_import_yields_to_transport_when_route_is_saturated() {
+    let mut local_route = IntegrityRoute::user(DEFAULT_ROUTE);
+    local_route.max_concurrency = 1;
+    let websocket_route =
+        targeted_route("/ws/local", vec![websocket_target("guest-websocket-echo")]);
+    let mut config = IntegrityConfig {
+        routes: vec![local_route, websocket_route],
+        ..IntegrityConfig::default_sealed()
+    };
+    config.host_address = "127.0.0.1:9".to_owned();
+    let config = validate_integrity_config(config).expect("config should validate");
+    let state = build_test_state(config.clone(), telemetry::init_test_telemetry());
+    let runtime = state.runtime.load_full();
+    let semaphore = runtime
+        .concurrency_limits
+        .get(DEFAULT_ROUTE)
+        .expect("default route should have a concurrency limiter");
+    let _permit = semaphore
+        .semaphore
+        .clone()
+        .try_acquire_owned()
+        .expect("test should acquire the only local permit");
+    let caller_route = config
+        .sealed_route("/ws/local")
+        .expect("websocket route should remain sealed");
+    let mut host = ComponentHostState::new(
+        caller_route,
+        config.clone(),
+        runtime.config.guest_memory_limit_bytes,
+        state.telemetry.clone(),
+        SecretAccess::default(),
+        HeaderMap::new(),
+        Arc::clone(&state.host_identity),
+        Arc::clone(&state.storage_broker),
+        Arc::clone(&runtime.concurrency_limits),
+        Vec::new(),
+        Some(LocalMeshDispatchContext {
+            state: state.clone(),
+            runtime,
+            handle: tokio::runtime::Handle::current(),
+        }),
+        &[],
+    )
+    .expect("component host state should build");
+
+    let result = tokio::task::spawn_blocking(move || {
+        <ComponentHostState as websocket_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
+            &mut host,
+            "GET".to_owned(),
+            "http://mesh/api/guest-example".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+    })
+    .await
+    .expect("websocket outbound HTTP import should run on a blocking worker")
+    .expect_err("saturated local route should fall back to transport");
+
+    assert!(
+        result.contains("failed to send") || result.contains("connection refused"),
+        "expected transport fallback failure, got: {result}"
+    );
 }

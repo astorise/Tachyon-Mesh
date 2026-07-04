@@ -223,6 +223,12 @@ rewrites the target.
 - **AND** the original method, headers, body, query string, cohort context, route policies, and decremented hop limit are preserved
 - **AND** the host uses UDS/TCP only when the local route is saturated, unavailable, or under critical memory pressure
 
+#### Scenario: WebSocket guest outbound HTTP targets a local sealed route
+- **WHEN** a WebSocket component guest calls `tachyon:mesh/outbound-http.send-request` with an internal mesh URL
+- **AND** the URL resolves to a sealed route in the same host process
+- **THEN** the host dispatches the target route in-process using the WebSocket execution context
+- **AND** the host uses UDS/TCP only when the local route is saturated, unavailable, or under critical memory pressure
+
 #### Scenario: External resource alias rewrites to a sealed HTTPS endpoint
 - **WHEN** a guest requests `http://mesh/payment-gateway/charges?expand=1`
 - **AND** `payment-gateway` is sealed as an external resource alias targeting

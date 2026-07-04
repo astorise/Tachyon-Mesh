@@ -2884,6 +2884,32 @@ impl control_plane_component_bindings::tachyon::mesh::outbound_http::Host for Co
     }
 }
 
+#[cfg(feature = "websockets")]
+impl websocket_component_bindings::tachyon::mesh::outbound_http::Host for ComponentHostState {
+    fn send_request(
+        &mut self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> std::result::Result<
+        websocket_component_bindings::tachyon::mesh::outbound_http::Response,
+        String,
+    > {
+        let response =
+            <Self as background_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
+                self, method, url, headers, body,
+            )?;
+        Ok(
+            websocket_component_bindings::tachyon::mesh::outbound_http::Response {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+            },
+        )
+    }
+}
+
 pub(crate) fn rewrite_outbound_http_url(url: &str, runtime_config: &IntegrityConfig) -> String {
     if let Some(path) = url.strip_prefix("http://mesh") {
         let host = runtime_config

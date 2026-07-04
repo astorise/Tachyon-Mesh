@@ -713,6 +713,11 @@ pub(crate) async fn handle_websocket_connection(
     socket: WebSocket,
 ) -> Result<()> {
     let runtime = state.runtime.load_full();
+    let local_mesh_dispatch = LocalMeshDispatchContext {
+        state: state.clone(),
+        runtime: Arc::clone(&runtime),
+        handle: tokio::runtime::Handle::current(),
+    };
     let volume_leases = state
         .volume_manager
         .acquire_route_volumes(&route, Arc::clone(&state.storage_broker))
@@ -815,6 +820,7 @@ pub(crate) async fn handle_websocket_connection(
         .component_instance_pre_cache(Some(component_instance_pre_cache))
         .legacy_instance_pre_cache(Some(legacy_instance_pre_cache))
         .linker_cache(Some(linker_cache))
+        .local_mesh_dispatch(Some(local_mesh_dispatch))
         .build();
         let _ = result_tx.send(execute_websocket_guest(
             &engine,

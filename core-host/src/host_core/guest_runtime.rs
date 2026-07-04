@@ -897,6 +897,19 @@ pub(crate) fn execute_websocket_component_guest(
                 "failed to add WebSocket host functions to component linker",
             )
         })?;
+        // Authorization-gated: URL validated against scopes.http per call.
+        if shape.grants(ScopeCategory::Http) {
+            websocket_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+                ComponentHostState,
+                ComponentHostState,
+            >(&mut l, |s: &mut ComponentHostState| s)
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add outbound HTTP functions to WebSocket component linker",
+                )
+            })?;
+        }
         Ok(l)
     };
     let linker: Arc<ComponentLinker<ComponentHostState>> = match &execution.linker_cache {
@@ -916,7 +929,7 @@ pub(crate) fn execute_websocket_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
-            None,
+            execution.local_mesh_dispatch.clone(),
             &[],
         )?,
     );
