@@ -317,6 +317,29 @@ fn build_test_state_prewarms_min_instances() {
     assert_eq!(control.prewarmed_instances(), 2);
 }
 
+#[cfg(feature = "websockets")]
+#[test]
+fn build_test_state_prewarm_websocket_with_outbound_http_import() {
+    let mut route = targeted_route("/ws/echo", vec![websocket_target("guest-websocket-echo")]);
+    route.min_instances = 1;
+    route.max_concurrency = 2;
+
+    let state = build_test_state(
+        IntegrityConfig {
+            routes: vec![route.clone()],
+            ..IntegrityConfig::default_sealed()
+        },
+        telemetry::init_test_telemetry(),
+    );
+    let runtime = state.runtime.load_full();
+    let control = runtime
+        .concurrency_limits
+        .get(&route.path)
+        .expect("websocket route should have an execution control");
+
+    assert_eq!(control.prewarmed_instances(), 1);
+}
+
 #[test]
 fn validate_integrity_config_rejects_invalid_telemetry_sample_rate() {
     let error = validate_integrity_config(IntegrityConfig {

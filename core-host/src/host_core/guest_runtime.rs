@@ -3,7 +3,7 @@ use crate::host_core::scoping::{DeploymentScopes, ScopeCategory, ScopeShape};
 
 /// Derives the `ScopeShape` for a route. Parses `route.scopes` if present;
 /// falls back to `allow_all` (with a warning already emitted by the parser).
-fn route_scope_shape(route: &IntegrityRoute) -> ScopeShape {
+pub(crate) fn route_scope_shape(route: &IntegrityRoute) -> ScopeShape {
     let scopes = route
         .scopes
         .as_ref()
