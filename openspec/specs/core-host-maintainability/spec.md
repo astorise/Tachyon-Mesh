@@ -45,6 +45,18 @@ The core host MUST avoid direct `panic!` macros in production source paths.
 - **THEN** no production logic contains direct `panic!` macro calls
 - **AND** fallible initialization paths return errors with context instead
 
+### Requirement: Guest execution context construction is non-exhaustive at call sites
+The core host MUST construct `GuestExecutionContext` through its builder so adding optional
+runtime capabilities does not require updating every request, background worker, L4/L7, or
+feature-gated execution path.
+
+#### Scenario: Optional execution context capability is added
+- **GIVEN** a contributor adds an optional field to `GuestExecutionContext`
+- **WHEN** production and test call sites create guest execution contexts
+- **THEN** those call sites use `GuestExecutionContext::builder(...)`
+- **AND** the builder initializes optional fields to safe defaults such as `None`
+- **AND** only call sites that actively use the capability set it through a builder setter
+
 ### Requirement: Coverage reporting in CI
 The repository CI MUST expose a coverage generation step for core host changes.
 

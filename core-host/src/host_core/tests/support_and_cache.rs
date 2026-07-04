@@ -709,6 +709,45 @@ pub(super) fn build_test_state(config: IntegrityConfig, telemetry: TelemetryHand
     )
 }
 
+pub(super) fn test_guest_execution_context(
+    config: IntegrityConfig,
+    host_identity_seed: u8,
+) -> GuestExecutionContext {
+    test_guest_execution_context_with_secret_access(
+        config,
+        host_identity_seed,
+        SecretAccess::default(),
+    )
+}
+
+pub(super) fn test_guest_execution_context_with_secret_access(
+    config: IntegrityConfig,
+    host_identity_seed: u8,
+    secret_access: SecretAccess,
+) -> GuestExecutionContext {
+    #[cfg(feature = "ai-inference")]
+    let ai_runtime = test_ai_runtime(&config);
+
+    GuestExecutionContext::builder(
+        config.clone(),
+        false,
+        telemetry::init_test_telemetry(),
+        test_log_sender(),
+        secret_access,
+        HeaderMap::new(),
+        test_host_identity(host_identity_seed),
+        Arc::new(StorageBrokerManager::default()),
+        Arc::new(BridgeManager::default()),
+        build_concurrency_limits(&config),
+        Vec::new(),
+        test_route_overrides(),
+        test_host_load(),
+        #[cfg(feature = "ai-inference")]
+        ai_runtime,
+    )
+    .build()
+}
+
 pub(super) fn build_test_state_with_manifest(
     config: IntegrityConfig,
     telemetry: TelemetryHandle,

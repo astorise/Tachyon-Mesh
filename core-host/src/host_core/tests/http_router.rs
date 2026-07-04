@@ -255,30 +255,7 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
     })
     .expect("benchmark config should validate");
     let engine = build_test_engine(&config);
-    let async_execution = GuestExecutionContext {
-        config: config.clone(),
-        sampled_execution: false,
-        runtime_telemetry: telemetry::init_test_telemetry(),
-        async_log_sender: test_log_sender(),
-        secret_access: SecretAccess::default(),
-        request_headers: HeaderMap::new(),
-        host_identity: test_host_identity(44),
-        storage_broker: Arc::new(StorageBrokerManager::default()),
-        bridge_manager: Arc::new(BridgeManager::default()),
-        telemetry: None,
-        concurrency_limits: build_concurrency_limits(&config),
-        propagated_headers: Vec::new(),
-        route_overrides: test_route_overrides(),
-        host_load: test_host_load(),
-        local_mesh_dispatch: None,
-        #[cfg(feature = "ai-inference")]
-        ai_runtime: test_ai_runtime(&config),
-        instance_pool: None,
-        component_cache: None,
-        component_instance_pre_cache: None,
-        legacy_instance_pre_cache: None,
-        linker_cache: None,
-    };
+    let async_execution = test_guest_execution_context(config.clone(), 44);
 
     let request = GuestRequest::new("POST", "/api/guest-log-storm", Bytes::new());
 
@@ -293,30 +270,7 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
     .expect("async log capture should succeed");
     let async_elapsed = async_start.elapsed();
 
-    let sync_execution = GuestExecutionContext {
-        config: config.clone(),
-        sampled_execution: false,
-        runtime_telemetry: telemetry::init_test_telemetry(),
-        async_log_sender: test_log_sender(),
-        secret_access: SecretAccess::default(),
-        request_headers: HeaderMap::new(),
-        host_identity: test_host_identity(45),
-        storage_broker: Arc::new(StorageBrokerManager::default()),
-        bridge_manager: Arc::new(BridgeManager::default()),
-        telemetry: None,
-        concurrency_limits: build_concurrency_limits(&config),
-        propagated_headers: Vec::new(),
-        route_overrides: test_route_overrides(),
-        host_load: test_host_load(),
-        local_mesh_dispatch: None,
-        #[cfg(feature = "ai-inference")]
-        ai_runtime: test_ai_runtime(&config),
-        instance_pool: None,
-        component_cache: None,
-        component_instance_pre_cache: None,
-        legacy_instance_pre_cache: None,
-        linker_cache: None,
-    };
+    let sync_execution = test_guest_execution_context(config.clone(), 45);
     let sync_start = Instant::now();
     let sync_result = execute_legacy_guest_with_sync_file_capture(
         &engine,
@@ -556,37 +510,12 @@ fn system_guest_requires_system_route_role() {
     let config = IntegrityConfig::default_sealed();
     let engine = build_test_engine(&config);
     let route = IntegrityRoute::user("/metrics");
-    #[cfg(feature = "ai-inference")]
-    let ai_runtime = test_ai_runtime(&config);
     let error = execute_guest(
         &engine,
         "metrics",
         GuestRequest::new("GET", "/metrics", Bytes::new()),
         &route,
-        GuestExecutionContext {
-            config,
-            sampled_execution: false,
-            runtime_telemetry: telemetry::init_test_telemetry(),
-            async_log_sender: test_log_sender(),
-            secret_access: SecretAccess::default(),
-            request_headers: HeaderMap::new(),
-            host_identity: test_host_identity(34),
-            storage_broker: Arc::new(StorageBrokerManager::default()),
-            bridge_manager: Arc::new(BridgeManager::default()),
-            telemetry: None,
-            concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
-            propagated_headers: Vec::new(),
-            route_overrides: test_route_overrides(),
-            host_load: test_host_load(),
-            local_mesh_dispatch: None,
-            #[cfg(feature = "ai-inference")]
-            ai_runtime,
-            instance_pool: None,
-            component_cache: None,
-            component_instance_pre_cache: None,
-            legacy_instance_pre_cache: None,
-            linker_cache: None,
-        },
+        test_guest_execution_context(config, 34),
     )
     .expect_err("privileged metrics guest should fail as a user route");
 

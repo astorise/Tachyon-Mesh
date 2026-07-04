@@ -319,30 +319,29 @@ async fn forward_node_registry_faas(
             "system-faas-node-registry",
             request,
             &route,
-            GuestExecutionContext {
+            GuestExecutionContext::builder(
                 config,
-                sampled_execution: false,
+                false,
                 runtime_telemetry,
                 async_log_sender,
-                secret_access: SecretAccess::default(),
-                request_headers: HeaderMap::new(),
+                SecretAccess::default(),
+                HeaderMap::new(),
                 host_identity,
                 storage_broker,
                 bridge_manager,
-                telemetry: None,
                 concurrency_limits,
-                propagated_headers: Vec::new(),
+                Vec::new(),
                 route_overrides,
                 host_load,
-                local_mesh_dispatch: None,
                 #[cfg(feature = "ai-inference")]
                 ai_runtime,
-                instance_pool: Some(instance_pool),
-                component_cache: Some(component_cache),
-                component_instance_pre_cache: Some(component_instance_pre_cache),
-                legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
-                linker_cache: Some(linker_cache),
-            },
+            )
+            .instance_pool(Some(instance_pool))
+            .component_cache(Some(component_cache))
+            .component_instance_pre_cache(Some(component_instance_pre_cache))
+            .legacy_instance_pre_cache(Some(legacy_instance_pre_cache))
+            .linker_cache(Some(linker_cache))
+            .build(),
         )
     })
     .await;

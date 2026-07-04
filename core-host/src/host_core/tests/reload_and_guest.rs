@@ -294,37 +294,16 @@ fn execute_guest_returns_component_response_payload() {
         .sealed_route("/api/guest-example")
         .expect("sealed route should exist")
         .clone();
-    #[cfg(feature = "ai-inference")]
-    let ai_runtime = test_ai_runtime(&config);
     let response = execute_guest(
         &engine,
         "guest-example",
         GuestRequest::new("POST", "/api/guest-example", "Hello Lean FaaS!"),
         &route,
-        GuestExecutionContext {
-            secret_access: SecretAccess::from_route(&route, &SecretsVault::load()),
+        test_guest_execution_context_with_secret_access(
             config,
-            sampled_execution: false,
-            runtime_telemetry: telemetry::init_test_telemetry(),
-            async_log_sender: test_log_sender(),
-            request_headers: HeaderMap::new(),
-            host_identity: test_host_identity(30),
-            storage_broker: Arc::new(StorageBrokerManager::default()),
-            bridge_manager: Arc::new(BridgeManager::default()),
-            telemetry: None,
-            concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
-            propagated_headers: Vec::new(),
-            route_overrides: test_route_overrides(),
-            host_load: test_host_load(),
-            local_mesh_dispatch: None,
-            #[cfg(feature = "ai-inference")]
-            ai_runtime,
-            instance_pool: None,
-            component_cache: None,
-            component_instance_pre_cache: None,
-            legacy_instance_pre_cache: None,
-            linker_cache: None,
-        },
+            30,
+            SecretAccess::from_route(&route, &SecretsVault::load()),
+        ),
     )
     .expect("guest execution should succeed");
 
@@ -347,37 +326,12 @@ fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
     let config = IntegrityConfig::default_sealed();
     let engine = build_test_engine(&config);
     let route = IntegrityRoute::user("/api/guest-call-legacy");
-    #[cfg(feature = "ai-inference")]
-    let ai_runtime = test_ai_runtime(&config);
     let response = execute_guest(
         &engine,
         "guest-call-legacy",
         GuestRequest::new("GET", "/api/guest-call-legacy", Bytes::new()),
         &route,
-        GuestExecutionContext {
-            config,
-            sampled_execution: false,
-            runtime_telemetry: telemetry::init_test_telemetry(),
-            async_log_sender: test_log_sender(),
-            secret_access: SecretAccess::default(),
-            request_headers: HeaderMap::new(),
-            host_identity: test_host_identity(31),
-            storage_broker: Arc::new(StorageBrokerManager::default()),
-            bridge_manager: Arc::new(BridgeManager::default()),
-            telemetry: None,
-            concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
-            propagated_headers: Vec::new(),
-            route_overrides: test_route_overrides(),
-            host_load: test_host_load(),
-            local_mesh_dispatch: None,
-            #[cfg(feature = "ai-inference")]
-            ai_runtime,
-            instance_pool: None,
-            component_cache: None,
-            component_instance_pre_cache: None,
-            legacy_instance_pre_cache: None,
-            linker_cache: None,
-        },
+        test_guest_execution_context(config, 31),
     )
     .expect("legacy guest execution should succeed");
 
@@ -395,8 +349,6 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
     let config = IntegrityConfig::default_sealed();
     let engine = build_test_engine(&config);
     let route = tcp_echo_test_route(1);
-    #[cfg(feature = "ai-inference")]
-    let ai_runtime = test_ai_runtime(&config);
     let response = execute_guest(
         &engine,
         "guest-tcp-echo",
@@ -406,30 +358,7 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
             Bytes::from_static(b"ping over tcp"),
         ),
         &route,
-        GuestExecutionContext {
-            config,
-            sampled_execution: false,
-            runtime_telemetry: telemetry::init_test_telemetry(),
-            async_log_sender: test_log_sender(),
-            secret_access: SecretAccess::default(),
-            request_headers: HeaderMap::new(),
-            host_identity: test_host_identity(32),
-            storage_broker: Arc::new(StorageBrokerManager::default()),
-            bridge_manager: Arc::new(BridgeManager::default()),
-            telemetry: None,
-            concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
-            propagated_headers: Vec::new(),
-            route_overrides: test_route_overrides(),
-            host_load: test_host_load(),
-            local_mesh_dispatch: None,
-            #[cfg(feature = "ai-inference")]
-            ai_runtime,
-            instance_pool: None,
-            component_cache: None,
-            component_instance_pre_cache: None,
-            legacy_instance_pre_cache: None,
-            linker_cache: None,
-        },
+        test_guest_execution_context(config, 32),
     )
     .expect("legacy guest execution should succeed");
 
@@ -459,7 +388,6 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
         ..IntegrityConfig::default_sealed()
     };
     let engine = build_test_engine(&config);
-    let ai_runtime = test_ai_runtime(&config);
 
     let response = execute_guest(
             &engine,
@@ -472,29 +400,7 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
                 ),
             ),
             &route,
-            GuestExecutionContext {
-                config,
-                sampled_execution: false,
-                runtime_telemetry: telemetry::init_test_telemetry(),
-                async_log_sender: test_log_sender(),
-                secret_access: SecretAccess::default(),
-                request_headers: HeaderMap::new(),
-                host_identity: test_host_identity(35),
-                storage_broker: Arc::new(StorageBrokerManager::default()),
-                bridge_manager: Arc::new(BridgeManager::default()),
-                telemetry: None,
-                concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
-                propagated_headers: Vec::new(),
-                route_overrides: test_route_overrides(),
-                host_load: test_host_load(),
-                local_mesh_dispatch: None,
-                ai_runtime,
-                instance_pool: None,
-                component_cache: None,
-                component_instance_pre_cache: None,
-                legacy_instance_pre_cache: None,
-                linker_cache: None,
-            },
+            test_guest_execution_context(config, 35),
         )
         .expect("AI guest execution should succeed");
 
@@ -524,38 +430,12 @@ fn execute_guest_persists_volume_data_for_component_guest() {
         ..IntegrityConfig::default_sealed()
     };
     let engine = build_test_engine(&config);
-    #[cfg(feature = "ai-inference")]
-    let ai_runtime = test_ai_runtime(&config);
-
     let save_response = execute_guest(
         &engine,
         "guest-volume",
         GuestRequest::new("POST", "/api/guest-volume", "Hello Stateful World"),
         &route,
-        GuestExecutionContext {
-            config: config.clone(),
-            sampled_execution: false,
-            runtime_telemetry: telemetry::init_test_telemetry(),
-            async_log_sender: test_log_sender(),
-            secret_access: SecretAccess::default(),
-            request_headers: HeaderMap::new(),
-            host_identity: test_host_identity(32),
-            storage_broker: Arc::new(StorageBrokerManager::default()),
-            bridge_manager: Arc::new(BridgeManager::default()),
-            telemetry: None,
-            concurrency_limits: build_concurrency_limits(&config),
-            propagated_headers: Vec::new(),
-            route_overrides: test_route_overrides(),
-            host_load: test_host_load(),
-            local_mesh_dispatch: None,
-            #[cfg(feature = "ai-inference")]
-            ai_runtime: Arc::clone(&ai_runtime),
-            instance_pool: None,
-            component_cache: None,
-            component_instance_pre_cache: None,
-            legacy_instance_pre_cache: None,
-            linker_cache: None,
-        },
+        test_guest_execution_context(config.clone(), 32),
     )
     .expect("volume guest should write successfully");
 
@@ -572,30 +452,7 @@ fn execute_guest_persists_volume_data_for_component_guest() {
         "guest-volume",
         GuestRequest::new("GET", "/api/guest-volume", Bytes::new()),
         &route,
-        GuestExecutionContext {
-            config: config.clone(),
-            sampled_execution: false,
-            runtime_telemetry: telemetry::init_test_telemetry(),
-            async_log_sender: test_log_sender(),
-            secret_access: SecretAccess::default(),
-            request_headers: HeaderMap::new(),
-            host_identity: test_host_identity(33),
-            storage_broker: Arc::new(StorageBrokerManager::default()),
-            bridge_manager: Arc::new(BridgeManager::default()),
-            telemetry: None,
-            concurrency_limits: build_concurrency_limits(&config),
-            propagated_headers: Vec::new(),
-            route_overrides: test_route_overrides(),
-            host_load: test_host_load(),
-            local_mesh_dispatch: None,
-            #[cfg(feature = "ai-inference")]
-            ai_runtime,
-            instance_pool: None,
-            component_cache: None,
-            component_instance_pre_cache: None,
-            legacy_instance_pre_cache: None,
-            linker_cache: None,
-        },
+        test_guest_execution_context(config.clone(), 33),
     )
     .expect("volume guest should read successfully");
 
@@ -640,8 +497,6 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         ..IntegrityConfig::default_sealed()
     };
     let engine = build_test_engine(&config);
-    let ai_runtime = test_ai_runtime(&config);
-
     // Skip if the wasm component was not built — unless a CI run pins
     // `TACHYON_REQUIRE_GUEST_OPENAI`, in which case a missing artifact is a
     // hard failure (a silent skip would be a false green).
@@ -662,7 +517,6 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         let route_c = route.clone();
         let engine_c = engine.clone();
         let config_c = config.clone();
-        let ai_runtime_c = Arc::clone(&ai_runtime);
         let req = GuestRequest::new(
             "POST",
             "/ai/v1/chat/completions",
@@ -678,29 +532,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
                 req,
                 htx,
                 ctx,
-                &GuestExecutionContext {
-                    config: config_c,
-                    sampled_execution: false,
-                    runtime_telemetry: telemetry::init_test_telemetry(),
-                    async_log_sender: test_log_sender(),
-                    secret_access: SecretAccess::default(),
-                    request_headers: HeaderMap::new(),
-                    host_identity: test_host_identity(seed),
-                    storage_broker: Arc::new(StorageBrokerManager::default()),
-                    bridge_manager: Arc::new(BridgeManager::default()),
-                    telemetry: None,
-                    concurrency_limits: build_concurrency_limits(&IntegrityConfig::default_sealed()),
-                    propagated_headers: Vec::new(),
-                    route_overrides: test_route_overrides(),
-                    host_load: test_host_load(),
-                    local_mesh_dispatch: None,
-                    ai_runtime: ai_runtime_c,
-                    instance_pool: None,
-                    component_cache: None,
-                    component_instance_pre_cache: None,
-                    legacy_instance_pre_cache: None,
-                    linker_cache: None,
-                },
+                &test_guest_execution_context(config_c, seed),
             );
         });
         (hrx, crx)

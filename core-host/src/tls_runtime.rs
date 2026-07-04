@@ -312,9 +312,9 @@ impl TlsManager {
                 &function_name,
                 crate::GuestRequest::new("POST", uri, Bytes::new()),
                 &route,
-                crate::GuestExecutionContext {
+                crate::GuestExecutionContext::builder(
                     config,
-                    sampled_execution: false,
+                    false,
                     runtime_telemetry,
                     async_log_sender,
                     secret_access,
@@ -322,20 +322,17 @@ impl TlsManager {
                     host_identity,
                     storage_broker,
                     bridge_manager,
-                    telemetry: None,
                     concurrency_limits,
-                    propagated_headers: Vec::new(),
+                    Vec::new(),
                     route_overrides,
                     host_load,
-                    local_mesh_dispatch: None,
                     #[cfg(feature = "ai-inference")]
                     ai_runtime,
-                    instance_pool: None,
-                    component_cache: Some(component_cache),
-                    component_instance_pre_cache: Some(component_instance_pre_cache),
-                    legacy_instance_pre_cache: Some(legacy_instance_pre_cache),
-                    linker_cache: None,
-                },
+                )
+                .component_cache(Some(component_cache))
+                .component_instance_pre_cache(Some(component_instance_pre_cache))
+                .legacy_instance_pre_cache(Some(legacy_instance_pre_cache))
+                .build(),
             )
         })
         .await
