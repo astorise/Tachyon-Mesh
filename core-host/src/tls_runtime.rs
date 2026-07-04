@@ -3,11 +3,9 @@ use axum::{
     body::Bytes,
     http::{HeaderMap, HeaderValue, StatusCode},
 };
-use rustls_pemfile::{certs, private_key};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io::BufReader,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -15,7 +13,12 @@ use std::{
     },
 };
 use tokio::sync::Mutex as TokioMutex;
-use tokio_rustls::rustls::{self, crypto::CryptoProvider, ServerConfig};
+use tokio_rustls::rustls::{
+    self,
+    crypto::CryptoProvider,
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
+    ServerConfig,
+};
 
 pub(crate) fn ensure_crypto_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -385,14 +388,11 @@ pub(crate) fn load_mtls_gateway_config_from_env() -> Result<Option<MtlsGatewayCo
 
 fn build_server_config(material: &CertificateMaterial) -> Result<ServerConfig> {
     crate::ensure_rustls_crypto_provider();
-    let mut cert_reader = BufReader::new(material.certificate_pem.as_bytes());
-    let cert_chain = certs(&mut cert_reader)
+    let cert_chain = CertificateDer::pem_slice_iter(material.certificate_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse certificate PEM")?;
-    let mut key_reader = BufReader::new(material.private_key_pem.as_bytes());
-    let private_key = private_key(&mut key_reader)
-        .context("failed to parse private key PEM")?
-        .ok_or_else(|| anyhow!("certificate bundle did not contain a private key"))?;
+    let private_key = PrivateKeyDer::from_pem_slice(material.private_key_pem.as_bytes())
+        .context("failed to parse private key PEM")?;
 
     let mut config = server_config_builder()
         .with_no_client_auth()
@@ -411,8 +411,7 @@ pub(crate) fn build_mtls_server_config(
     crate::ensure_rustls_crypto_provider();
     let cert_chain = parse_cert_chain(certificate_pem)?;
     let private_key = parse_private_key(private_key_pem)?;
-    let mut ca_reader = BufReader::new(ca_certificate_pem.as_bytes());
-    let ca_certs = certs(&mut ca_reader)
+    let ca_certs = CertificateDer::pem_slice_iter(ca_certificate_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse client CA PEM")?;
     let mut roots = rustls::RootCertStore::empty();
@@ -453,17 +452,14 @@ fn enforce_fips_server_config(_config: &ServerConfig) -> Result<()> {
 fn parse_cert_chain(
     certificate_pem: &str,
 ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let mut cert_reader = BufReader::new(certificate_pem.as_bytes());
-    certs(&mut cert_reader)
+    CertificateDer::pem_slice_iter(certificate_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse certificate PEM")
 }
 
 fn parse_private_key(private_key_pem: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let mut key_reader = BufReader::new(private_key_pem.as_bytes());
-    private_key(&mut key_reader)
-        .context("failed to parse private key PEM")?
-        .ok_or_else(|| anyhow!("certificate bundle did not contain a private key"))
+    PrivateKeyDer::from_pem_slice(private_key_pem.as_bytes())
+        .context("failed to parse private key PEM")
 }
 
 fn required_env(name: &str) -> Result<String> {

@@ -106,7 +106,6 @@ quinn = { version = "0.11.9", optional = true, default-features = false, feature
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 redb = "4.0"
-rustls-pemfile = "2"
 semver = "1.0"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
