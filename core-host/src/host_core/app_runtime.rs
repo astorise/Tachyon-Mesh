@@ -2666,22 +2666,37 @@ pub(crate) async fn try_dispatch_local_mesh_request(
     body: Bytes,
     trailers: GuestHttpFields,
     hop_limit: HopLimit,
-) -> std::result::Result<Option<GuestHttpResponse>, String> {
+) -> std::result::Result<LocalMeshDispatchAttempt, String> {
+    let started_at = Instant::now();
     if hop_limit.0 <= 1 {
-        return Ok(Some(GuestHttpResponse::new(
+        return Ok(LocalMeshDispatchAttempt::Handled(GuestHttpResponse::new(
             StatusCode::LOOP_DETECTED,
             "mesh hop limit exhausted",
         )));
     }
     if state.memory_governor.pressure() == memory_governor::MemoryPressure::Critical {
-        return Ok(None);
+        record_mesh_dispatch(
+            MeshDispatchMode::InProcess,
+            MeshDispatchReason::Pressure,
+            started_at.elapsed(),
+        );
+        return Ok(LocalMeshDispatchAttempt::Fallback(
+            MeshDispatchReason::Pressure,
+        ));
     }
 
     let url = reqwest::Url::parse(resolved_url)
         .map_err(|error| format!("internal mesh target `{resolved_url}` is invalid: {error}"))?;
     let normalized_path = normalize_route_path(url.path());
     let Some(route) = runtime.route_registry.sealed_route(&normalized_path) else {
-        return Ok(None);
+        record_mesh_dispatch(
+            MeshDispatchMode::InProcess,
+            MeshDispatchReason::Remote,
+            started_at.elapsed(),
+        );
+        return Ok(LocalMeshDispatchAttempt::Fallback(
+            MeshDispatchReason::Remote,
+        ));
     };
     let selected_target = select_route_target(&route, &HeaderMap::new()).map_err(|error| {
         format!(
@@ -2692,13 +2707,34 @@ pub(crate) async fn try_dispatch_local_mesh_request(
     if !state.host_capabilities.supports(Capabilities::from_mask(
         selected_target.required_capability_mask,
     )) {
-        return Ok(None);
+        record_mesh_dispatch(
+            MeshDispatchMode::InProcess,
+            MeshDispatchReason::Remote,
+            started_at.elapsed(),
+        );
+        return Ok(LocalMeshDispatchAttempt::Fallback(
+            MeshDispatchReason::Remote,
+        ));
     }
     let Some(semaphore) = runtime.concurrency_limits.get(&route.path) else {
-        return Ok(None);
+        record_mesh_dispatch(
+            MeshDispatchMode::InProcess,
+            MeshDispatchReason::Remote,
+            started_at.elapsed(),
+        );
+        return Ok(LocalMeshDispatchAttempt::Fallback(
+            MeshDispatchReason::Remote,
+        ));
     };
     if semaphore.semaphore.available_permits() == 0 {
-        return Ok(None);
+        record_mesh_dispatch(
+            MeshDispatchMode::InProcess,
+            MeshDispatchReason::Saturated,
+            started_at.elapsed(),
+        );
+        return Ok(LocalMeshDispatchAttempt::Fallback(
+            MeshDispatchReason::Saturated,
+        ));
     }
 
     let uri = append_query(&normalized_path, url.query())
@@ -2725,7 +2761,17 @@ pub(crate) async fn try_dispatch_local_mesh_request(
         format!("in-process mesh fetch to `{resolved_url}` failed with {status}: {message}")
     })?;
 
-    Ok(Some(result.response))
+    record_mesh_dispatch(
+        MeshDispatchMode::InProcess,
+        MeshDispatchReason::Ok,
+        started_at.elapsed(),
+    );
+    Ok(LocalMeshDispatchAttempt::Handled(result.response))
+}
+
+pub(crate) enum LocalMeshDispatchAttempt {
+    Handled(GuestHttpResponse),
+    Fallback(MeshDispatchReason),
 }
 
 pub(crate) fn select_route_module(

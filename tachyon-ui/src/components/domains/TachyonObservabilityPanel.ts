@@ -11,6 +11,24 @@ type RuntimeMetrics = {
   p99LatencyMs: number;
   queueDepth: number;
   scopeDenialTotal?: number;
+  meshDispatch?: MeshDispatchMetrics;
+};
+
+type MeshDispatchMetrics = {
+  totals?: MeshDispatchTotal[];
+  durations?: MeshDispatchDuration[];
+};
+
+type MeshDispatchTotal = {
+  mode: string;
+  reason: string;
+  total: number;
+};
+
+type MeshDispatchDuration = {
+  mode: string;
+  count: number;
+  avgLatencyMs: number;
 };
 
 type LogLine = {
@@ -95,6 +113,11 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
         </article>
 
         <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-5">
+          <h3 class="mb-3 text-sm font-semibold uppercase tracking-widest text-cyan-300">Mesh Dispatch</h3>
+          ${this.renderMeshDispatch()}
+        </article>
+
+        <article data-stagger-panel class="rounded-lg border border-slate-800 bg-slate-900 p-5">
           <h3 class="mb-3 text-sm font-semibold uppercase tracking-widest text-cyan-300">${t("observability.logs.title")}</h3>
           ${this.renderLogs()}
         </article>
@@ -147,6 +170,59 @@ export class TachyonObservabilityPanel extends TachyonConfigDashboard {
         <div><dt class="text-slate-500">${t("observability.metrics.queue")}</dt><dd class="font-mono text-slate-200">${this.metrics.queueDepth}</dd></div>
       </dl>
     `;
+  }
+
+  private renderMeshDispatch(): string {
+    const totals = this.metrics?.meshDispatch?.totals ?? [];
+    const durations = this.metrics?.meshDispatch?.durations ?? [];
+    if (totals.length === 0 && durations.length === 0) {
+      return `<p class="text-xs text-slate-500">No inter-FaaS dispatch metrics recorded yet.</p>`;
+    }
+
+    const durationByMode = new Map(durations.map((entry) => [entry.mode, entry]));
+    const modes = Array.from(new Set([
+      ...totals.map((entry) => entry.mode),
+      ...durations.map((entry) => entry.mode),
+    ])).sort();
+
+    return `
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-left text-xs">
+          <thead class="text-slate-500">
+            <tr>
+              <th class="pb-2 pr-4 font-medium">Mode</th>
+              <th class="pb-2 pr-4 font-medium">ok</th>
+              <th class="pb-2 pr-4 font-medium">saturated</th>
+              <th class="pb-2 pr-4 font-medium">pressure</th>
+              <th class="pb-2 pr-4 font-medium">remote</th>
+              <th class="pb-2 pr-4 font-medium">avg ms</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${modes.map((mode) => {
+              const byReason = new Map(totals.filter((entry) => entry.mode === mode).map((entry) => [entry.reason, entry.total]));
+              const duration = durationByMode.get(mode);
+              const displayMode = this.displayMeshDispatchMode(mode);
+              return `
+                <tr class="border-t border-slate-800">
+                  <td class="py-2 pr-4 font-mono text-cyan-300">${displayMode}</td>
+                  <td class="py-2 pr-4 font-mono text-slate-200">${byReason.get("ok") ?? 0}</td>
+                  <td class="py-2 pr-4 font-mono text-slate-200">${byReason.get("saturated") ?? 0}</td>
+                  <td class="py-2 pr-4 font-mono text-slate-200">${byReason.get("pressure") ?? 0}</td>
+                  <td class="py-2 pr-4 font-mono text-slate-200">${byReason.get("remote") ?? 0}</td>
+                  <td class="py-2 pr-4 font-mono text-slate-200">${duration ? duration.avgLatencyMs.toFixed(2) : "0.00"}</td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-2 text-[10px] text-slate-500">Prometheus: <span class="font-mono">faas_mesh_dispatch_total{"{mode,reason}"}</span> and <span class="font-mono">faas_mesh_dispatch_duration_seconds{"{mode}"}</span>.</p>
+    `;
+  }
+
+  private displayMeshDispatchMode(mode: string): string {
+    return ["in_process", "uds", "tcp"].includes(mode) ? mode : "unknown";
   }
 
   private renderLogs(): string {
