@@ -18,6 +18,13 @@ The CI workflow MUST run dependency vulnerability and policy checks before relea
 - **THEN** the CI workflow documents the affected advisory IDs and blocking parent crates
 - **AND** `deny.toml` records matching ignore entries with the condition for removing them
 
+#### Scenario: Fixed transitive advisories are no longer ignored
+- **GIVEN** upstream parent crates can resolve the transitive dependency to the fixed version
+- **WHEN** the lockfile is updated to the fixed dependency line
+- **THEN** the security audit job MUST run without ignores for those fixed advisory IDs
+- **AND** `deny.toml` MUST NOT keep stale ignore entries for those advisory IDs
+- **AND** `cargo deny` MUST allow any temporary patched sources required to reach the fixed dependency line
+
 ### Requirement: Feature matrix validation
 The CI workflow MUST test the core host across default, no-default, all-feature, and selected feature combinations.
 
