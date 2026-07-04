@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(feature = "websockets")]
 use crate::host_core::scoping::ScopeCategory;
 
 /// Maximum number of distinct `Arc<Module>` entries the in-memory instance pool
