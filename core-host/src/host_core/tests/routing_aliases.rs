@@ -588,6 +588,42 @@ async fn local_mesh_dispatch_yields_to_transport_when_route_is_saturated() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn local_mesh_dispatch_honors_bench_force_transport_override() {
+    let config = validate_integrity_config(IntegrityConfig {
+        routes: vec![IntegrityRoute::user(DEFAULT_ROUTE)],
+        ..IntegrityConfig::default_sealed()
+    })
+    .expect("config should validate");
+    let state = build_test_state(config, telemetry::init_test_telemetry());
+    let runtime = state.runtime.load_full();
+
+    std::env::set_var(FORCE_MESH_TRANSPORT_ENV, "1");
+    let before = mesh_dispatch_total_for(MeshDispatchMode::InProcess, MeshDispatchReason::Remote);
+    let response = try_dispatch_local_mesh_request(
+        &state,
+        &runtime,
+        "http://127.0.0.1:9/api/guest-example",
+        &Method::GET,
+        &HeaderMap::new(),
+        Bytes::new(),
+        Vec::new(),
+        HopLimit(DEFAULT_HOP_LIMIT),
+    )
+    .await;
+    std::env::remove_var(FORCE_MESH_TRANSPORT_ENV);
+    let response = response.expect("forced-transport dispatch should not error");
+
+    assert!(matches!(
+        response,
+        LocalMeshDispatchAttempt::Fallback(MeshDispatchReason::Remote)
+    ));
+    assert_eq!(
+        mesh_dispatch_total_for(MeshDispatchMode::InProcess, MeshDispatchReason::Remote),
+        before + 1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn outbound_http_import_attempts_sealed_local_route_in_process() {
     let mut config = IntegrityConfig::default_sealed();
     config.host_address = "127.0.0.1:9".to_owned();

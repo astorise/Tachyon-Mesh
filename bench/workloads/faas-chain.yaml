@@ -1,0 +1,19 @@
+# 3-hop FaaS chain scenario (issue #308): guest-chain-a -> guest-chain-b ->
+# guest-chain-c, exercising the in-process mesh dispatch path (#288-#296).
+# Consumed by bench/run-faas-chain.sh; the two `env` variants below are
+# applied to the tachyon-host Deployment (see
+# .github/workflows/bench-regression.yml) between measurement phases, not by
+# the script itself.
+name: faas-chain
+description: >
+  Compares the p50/p99 latency of a 3-hop in-process mesh dispatch chain
+  against the same chain with local dispatch forcibly disabled (falling back
+  to the UDS/TCP transport), and checks the mesh-dispatch-decision log for
+  the in-process share (see #307's faas_mesh_dispatch_total instrumentation).
+entry_path: /api/guest-chain-a
+variants:
+  in_process:
+    env: {}
+  forced_transport:
+    env:
+      TACHYON_BENCH_FORCE_MESH_TRANSPORT: "1"

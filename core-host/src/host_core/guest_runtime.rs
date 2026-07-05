@@ -244,21 +244,23 @@ fn component_instance_pre(
         len,
     };
 
-    if let Some(cache) = &execution.component_instance_pre_cache {
-        if let Some(cached) = cache.get(&key) {
-            return Ok(cached);
+    if !env_flag(DISABLE_INSTANCE_PRE_CACHE_ENV) {
+        if let Some(cache) = &execution.component_instance_pre_cache {
+            if let Some(cached) = cache.get(&key) {
+                return Ok(cached);
+            }
+            let pre = Arc::new(linker.instantiate_pre(component).map_err(|error| {
+                guest_execution_error(
+                    error,
+                    format!(
+                        "failed to pre-instantiate guest component from {}",
+                        component_path.display()
+                    ),
+                )
+            })?);
+            cache.insert(key, Arc::clone(&pre));
+            return Ok(pre);
         }
-        let pre = Arc::new(linker.instantiate_pre(component).map_err(|error| {
-            guest_execution_error(
-                error,
-                format!(
-                    "failed to pre-instantiate guest component from {}",
-                    component_path.display()
-                ),
-            )
-        })?);
-        cache.insert(key, Arc::clone(&pre));
-        return Ok(pre);
     }
 
     Ok(Arc::new(linker.instantiate_pre(component).map_err(
@@ -288,17 +290,18 @@ fn legacy_instance_pre(
         len,
     };
 
-    if let Some(cache) = &execution.legacy_instance_pre_cache {
-        if let Some(cached) = cache.get(&key) {
-            return Ok(cached);
-        }
-        let linker = build_linker(engine)?;
-        let pre =
-            Arc::new(linker.instantiate_pre(module).map_err(|error| {
+    if !env_flag(DISABLE_INSTANCE_PRE_CACHE_ENV) {
+        if let Some(cache) = &execution.legacy_instance_pre_cache {
+            if let Some(cached) = cache.get(&key) {
+                return Ok(cached);
+            }
+            let linker = build_linker(engine)?;
+            let pre = Arc::new(linker.instantiate_pre(module).map_err(|error| {
                 guest_execution_error(error, "failed to pre-link guest module")
             })?);
-        cache.insert(key, Arc::clone(&pre));
-        return Ok(pre);
+            cache.insert(key, Arc::clone(&pre));
+            return Ok(pre);
+        }
     }
 
     let linker = build_linker(engine)?;
