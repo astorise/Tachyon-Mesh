@@ -1,0 +1,240 @@
+name: Bench Regression
+
+# Periodic only (issue #308) — this exercises a full k3d cluster + Docker
+# build and is too heavy to run on every push/PR. Runs weekly; trigger
+# manually via workflow_dispatch to calibrate bench/results/thresholds.json
+# or to investigate a regression.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # k3d + two Docker image builds is disk-heavy on the standard runner
+      # (mirrors integration.yml's cleanup step).
+      - name: Free up disk space
+        run: |
+          echo "Disk before cleanup:"; df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          echo "Disk after cleanup:"; df -h /
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+
+      # Adds the guest-chain-a/b/c + guest-example bench routes to a local
+      # integrity.lock (never committed) before the image bakes it in — see
+      # scripts/seal-bench-manifest.js for why this doesn't touch the
+      # production integrity.lock.
+      - name: Seal bench routes into integrity.lock
+        run: node scripts/seal-bench-manifest.js
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build tachyon-mesh bench image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          tags: tachyon-mesh:bench
+          load: true
+          cache-from: type=gha,scope=docker-default
+          cache-to: type=gha,mode=max,scope=docker-default
+
+      - name: Build legacy-mock image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: legacy-runtime
+          tags: legacy-mock:test
+          load: true
+          cache-from: type=gha,scope=docker-default
+          cache-to: type=gha,mode=max,scope=docker-default
+
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+          curl -L -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Install fortio
+        run: |
+          FORTIO_VERSION="$(curl -s https://api.github.com/repos/fortio/fortio/releases/latest | grep -oE '"tag_name": *"[^"]+"' | cut -d'"' -f4)"
+          curl -L -o fortio "https://github.com/fortio/fortio/releases/download/${FORTIO_VERSION}/fortio_linux_amd64"
+          chmod +x fortio
+          sudo mv fortio /usr/local/bin/fortio
+          fortio version
+
+      - name: Create cluster and import local images
+        run: |
+          k3d cluster create tachyon-bench --wait
+          k3d image import tachyon-mesh:bench legacy-mock:test -c tachyon-bench
+          docker save tachyon-mesh:bench legacy-mock:test | docker exec -i k3d-tachyon-bench-server-0 ctr -n k8s.io images import -
+          for attempt in $(seq 1 30); do
+            if kubectl cluster-info >/tmp/k3d-cluster-info.log 2>&1; then
+              cat /tmp/k3d-cluster-info.log
+              break
+            fi
+            sleep 2
+            if [ "$attempt" -eq 30 ]; then
+              echo "cluster API did not become ready after image import"
+              exit 1
+            fi
+          done
+          kubectl wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Deploy tachyon-host
+        run: |
+          sed \
+            -e 's|ghcr.io/astorise/tachyon-mesh:latest|tachyon-mesh:bench|g' \
+            -e 's|imagePullPolicy: Always|imagePullPolicy: Never|g' \
+            manifests/deploy.yaml | kubectl apply -f -
+          kubectl rollout status deployment/tachyon-host --timeout=300s
+          kubectl rollout status deployment/legacy-deployment --timeout=300s
+          # Enables the debug-level "mesh dispatch decision" log line (see
+          # mesh_dispatch_metrics.rs) — triggers its own rollout, which also
+          # serves as the run's first cache-clearing restart.
+          kubectl set env deployment/tachyon-host RUST_LOG=info,core_host::host_core::mesh_dispatch_metrics=debug
+          kubectl rollout status deployment/tachyon-host --timeout=300s
+
+      - name: Run in-process phase (InstancePre on, local dispatch on)
+        run: |
+          kubectl port-forward service/tachyon-service 8080:8080 >/tmp/tachyon-port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill "$PF_PID" || true' EXIT
+          for attempt in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8080/metrics >/dev/null && break
+            sleep 2
+            if [ "$attempt" -eq 20 ]; then
+              cat /tmp/tachyon-port-forward.log || true
+              echo "tachyon-host did not become reachable"
+              exit 1
+            fi
+          done
+
+          ROLLOUT_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          bash bench/run-faas-chain.sh
+          kubectl logs deployment/tachyon-host --since-time="$ROLLOUT_SINCE" \
+            > bench/results/raw/dispatch-log-in-process.txt
+
+          kill "$PF_PID" || true
+          trap - EXIT
+
+          for i in $(seq 1 5); do
+            kubectl rollout restart deployment/tachyon-host
+            kubectl rollout status deployment/tachyon-host --timeout=300s
+            kubectl port-forward service/tachyon-service 8080:8080 >/tmp/tachyon-port-forward.log 2>&1 &
+            PF_PID=$!
+            trap 'kill "$PF_PID" || true' EXIT
+            for attempt in $(seq 1 20); do
+              curl -sf http://127.0.0.1:8080/metrics >/dev/null && break
+              sleep 2
+              if [ "$attempt" -eq 20 ]; then
+                cat /tmp/tachyon-port-forward.log || true
+                echo "tachyon-host did not become reachable after restart"
+                exit 1
+              fi
+            done
+            COLD_START_LABEL=with-instance-pre bash bench/run-cold-start.sh
+            kill "$PF_PID" || true
+            trap - EXIT
+          done
+
+      - name: Run forced-transport phase (local dispatch off, InstancePre off)
+        run: |
+          kubectl set env deployment/tachyon-host \
+            TACHYON_BENCH_FORCE_MESH_TRANSPORT=1 \
+            TACHYON_BENCH_DISABLE_INSTANCE_PRE_CACHE=1
+          kubectl rollout status deployment/tachyon-host --timeout=300s
+
+          kubectl port-forward service/tachyon-service 8080:8080 >/tmp/tachyon-port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill "$PF_PID" || true' EXIT
+          for attempt in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8080/metrics >/dev/null && break
+            sleep 2
+            if [ "$attempt" -eq 20 ]; then
+              cat /tmp/tachyon-port-forward.log || true
+              echo "tachyon-host did not become reachable"
+              exit 1
+            fi
+          done
+
+          CHAIN_LABEL=forced-transport bash bench/run-faas-chain.sh
+          kill "$PF_PID" || true
+          trap - EXIT
+
+          for i in $(seq 1 5); do
+            kubectl rollout restart deployment/tachyon-host
+            kubectl rollout status deployment/tachyon-host --timeout=300s
+            kubectl port-forward service/tachyon-service 8080:8080 >/tmp/tachyon-port-forward.log 2>&1 &
+            PF_PID=$!
+            trap 'kill "$PF_PID" || true' EXIT
+            for attempt in $(seq 1 20); do
+              curl -sf http://127.0.0.1:8080/metrics >/dev/null && break
+              sleep 2
+              if [ "$attempt" -eq 20 ]; then
+                cat /tmp/tachyon-port-forward.log || true
+                echo "tachyon-host did not become reachable after restart"
+                exit 1
+              fi
+            done
+            COLD_START_LABEL=without-instance-pre bash bench/run-cold-start.sh
+            kill "$PF_PID" || true
+            trap - EXIT
+          done
+
+      # Best-effort: plain k3d has no metrics-server, so `kubectl top` (used
+      # by this script) is expected to fail there — the report generator
+      # already treats the resource snapshot as optional.
+      - name: Collect cluster resource snapshot
+        run: bash bench/collect-resources.sh || true
+
+      - name: Generate report and check thresholds
+        run: python3 bench/generate-report.py
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-regression-${{ github.run_id }}
+          path: bench/results/**
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get deployments,pods,svc || true
+          kubectl describe deployment/tachyon-host || true
+          kubectl logs deployment/tachyon-host --tail=200 || true
+
+      - name: Delete k3d cluster
+        if: always()
+        run: k3d cluster delete tachyon-bench || true

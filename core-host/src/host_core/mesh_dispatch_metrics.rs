@@ -121,6 +121,15 @@ pub(crate) fn record_mesh_dispatch(
     reason: MeshDispatchReason,
     duration: Duration,
 ) {
+    // Debug-level only: lets the bench regression harness (see `bench/`)
+    // confirm a scenario stayed in-process by grepping `kubectl logs`
+    // instead of requiring authenticated access to `/admin/metrics`.
+    tracing::debug!(
+        mode = mode.as_str(),
+        reason = reason.as_str(),
+        duration_ms = duration.as_secs_f64() * 1_000.0,
+        "mesh dispatch decision"
+    );
     if let Some(counter) = dispatch_total_vec() {
         counter
             .with_label_values(&[mode.as_str(), reason.as_str()])

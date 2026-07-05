@@ -36,6 +36,16 @@ pub(crate) const BOOTSTRAP_IF_UNENROLLED_ENV: &str = "TACHYON_BOOTSTRAP_IF_UNENR
 pub(crate) const ENROLLMENT_CERT_PATH_ENV: &str = "TACHYON_ENROLLMENT_CERT_PATH";
 pub(crate) const NODE_CERT_PEM_ENV: &str = "TACHYON_NODE_CERT_PEM";
 pub(crate) const NODE_KEY_PEM_ENV: &str = "TACHYON_NODE_KEY_PEM";
+/// Bench-only toggle (see `bench/`): forces every in-process mesh dispatch
+/// decision to fall back to the UDS/TCP transport, so the regression bench
+/// can compare the in-process hop against a forced-transport hop without
+/// changing the deployed topology.
+pub(crate) const FORCE_MESH_TRANSPORT_ENV: &str = "TACHYON_BENCH_FORCE_MESH_TRANSPORT";
+/// Bench-only toggle (see `bench/`): disables the `ComponentInstancePre`/
+/// `ModuleInstancePre` caches so every guest invocation pays the full
+/// pre-instantiation cost, for measuring the cold-start benefit of
+/// `InstancePre` caching.
+pub(crate) const DISABLE_INSTANCE_PRE_CACHE_ENV: &str = "TACHYON_BENCH_DISABLE_INSTANCE_PRE_CACHE";
 pub(crate) const DEFAULT_HOP_LIMIT: u32 = 10;
 pub(crate) const HOP_LIMIT_HEADER: &str = "x-tachyon-hop-limit";
 pub(crate) const COHORT_HEADER: &str = "x-cohort";

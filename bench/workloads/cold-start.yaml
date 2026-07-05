@@ -1,0 +1,19 @@
+# Cold-start scenario (issue #308): first-invocation latency right after an
+# in-memory cache invalidation, with and without the ComponentInstancePre /
+# ModuleInstancePre cache. Consumed by bench/run-cold-start.sh; the CI
+# workflow restarts the tachyon-host pod between samples to force a cache
+# miss (see bench-regression.yml's scope-decision note on why this uses a
+# pod restart instead of a live POST /admin/assets upload).
+name: cold-start
+description: >
+  Measures the latency of the first request to /api/guest-example after a
+  cache-clearing restart, with InstancePre enabled (production default) vs.
+  disabled (TACHYON_BENCH_DISABLE_INSTANCE_PRE_CACHE=1), to quantify the
+  benefit of InstancePre caching.
+entry_path: /api/guest-example
+variants:
+  with_instance_pre:
+    env: {}
+  without_instance_pre:
+    env:
+      TACHYON_BENCH_DISABLE_INSTANCE_PRE_CACHE: "1"

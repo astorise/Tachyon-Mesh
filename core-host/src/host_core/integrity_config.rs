@@ -5,10 +5,18 @@ pub(crate) fn init_host_tracing() {
 
     INIT.call_once(|| {
         ensure_rustls_crypto_provider();
+        // Falls back to the previous unconditional-INFO behavior when
+        // `RUST_LOG` is unset, so this stays a no-op for existing
+        // deployments; set `RUST_LOG` (e.g. for the bench regression harness
+        // in `bench/`, which enables `core_host::host_core::mesh_dispatch_metrics=debug`)
+        // to opt into finer-grained logging.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
         let _ = tracing_subscriber::fmt()
             .with_ansi(false)
             .without_time()
             .with_target(true)
+            .with_env_filter(filter)
             .try_init();
     });
 }
