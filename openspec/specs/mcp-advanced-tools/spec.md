@@ -14,14 +14,16 @@ The MCP server SHALL expose a `tachyon_dryrun_manifest` tool that validates a ma
 - **AND** no local or remote Tachyon configuration state is persisted
 
 ### Requirement: MCP Runtime Metrics
-The MCP server SHALL expose a `tachyon_get_metrics` tool that returns active node telemetry through tachyon-client bindings, including scope denial totals introduced by faas-wit-import-scoping.
+The MCP server SHALL expose a `tachyon_get_metrics` tool that returns active node telemetry through tachyon-client bindings, including scope denial totals introduced by faas-wit-import-scoping and inter-FaaS mesh dispatch aggregates.
 
 #### Scenario: Agent queries telemetry
 - **GIVEN** an MCP client calls `tools/call` with `name` set to `tachyon_get_metrics`
 - **WHEN** an active Tachyon node connection is configured
 - **THEN** tachyon-client queries the admin metrics endpoint
-- **AND** the MCP response includes error rate, p50 latency, p99 latency, queue depth, and `scope_denial_total`
+- **AND** the MCP response includes error rate, p50 latency, p99 latency, queue depth, `scope_denial_total`, and `mesh_dispatch`
 - **AND** `scope_denial_total` is the lifetime count of runtime WIT import denials across all deployments and categories
+- **AND** `mesh_dispatch.totals` reports counts by `mode` and `reason`
+- **AND** `mesh_dispatch.durations` reports latency aggregates by dispatch `mode`
 
 ### Requirement: MCP Log Notifications
 The MCP server SHALL expose a `tachyon_tail_logs` tool that returns recent logs and notification-compatible `notifications/message` JSON-RPC payloads.

@@ -223,6 +223,14 @@ rewrites the target.
 - **AND** the original method, headers, body, query string, cohort context, route policies, and decremented hop limit are preserved
 - **AND** the host uses UDS/TCP only when the local route is saturated, unavailable, or under critical memory pressure
 
+#### Scenario: Inter-FaaS dispatch mode metrics are emitted
+- **WHEN** a component guest calls an internal mesh URL through outbound HTTP
+- **THEN** the host increments `faas_mesh_dispatch_total{mode,reason}` for each dispatch decision
+- **AND** `mode` is one of `in_process`, `uds`, or `tcp`
+- **AND** `reason` is one of `ok`, `saturated`, `pressure`, or `remote`
+- **AND** the host observes `faas_mesh_dispatch_duration_seconds{mode}` for completed mode attempts
+- **AND** saturation and critical memory pressure fallbacks are recorded with their specific reason instead of being collapsed into a generic TCP fallback
+
 #### Scenario: WebSocket guest outbound HTTP targets a local sealed route
 - **WHEN** a WebSocket component guest calls `tachyon:mesh/outbound-http.send-request` with an internal mesh URL
 - **AND** the URL resolves to a sealed route in the same host process

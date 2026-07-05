@@ -562,6 +562,8 @@ async fn local_mesh_dispatch_yields_to_transport_when_route_is_saturated() {
         .try_acquire_owned()
         .expect("test should acquire the only local permit");
 
+    let before =
+        mesh_dispatch_total_for(MeshDispatchMode::InProcess, MeshDispatchReason::Saturated);
     let response = try_dispatch_local_mesh_request(
         &state,
         &runtime,
@@ -575,7 +577,14 @@ async fn local_mesh_dispatch_yields_to_transport_when_route_is_saturated() {
     .await
     .expect("saturated local route should be a transport fallback");
 
-    assert!(response.is_none());
+    assert!(matches!(
+        response,
+        LocalMeshDispatchAttempt::Fallback(MeshDispatchReason::Saturated)
+    ));
+    assert_eq!(
+        mesh_dispatch_total_for(MeshDispatchMode::InProcess, MeshDispatchReason::Saturated),
+        before + 1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

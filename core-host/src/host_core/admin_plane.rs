@@ -153,6 +153,8 @@ pub(crate) struct AdminRuntimeMetrics {
     /// Lifetime count of runtime WIT import denials across all deployments and categories.
     /// Per-deployment, per-category breakdowns are available via the prometheus endpoint.
     pub(crate) scope_denial_total: u64,
+    /// Inter-FaaS dispatch counters and latency aggregates by transport mode.
+    pub(crate) mesh_dispatch: MeshDispatchMetricsSnapshot,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,6 +212,7 @@ pub(crate) async fn admin_metrics_handler(
         vram_utilization_pct: state.memory_governor.vram_utilization_pct(),
         ram_offload_active: state.memory_governor.ram_offload_active(),
         scope_denial_total: crate::host_core::scoping::scope_denial_total_lifetime(),
+        mesh_dispatch: mesh_dispatch_metrics_snapshot(),
     })
 }
 

@@ -44,6 +44,12 @@ Tauri commands respectively.
 - **AND** it shows shadow divergences from `get_shadow_diffs` with the
   primary and shadow status codes when present
 
+#### Scenario: Mesh dispatch mode metrics are visible
+- **WHEN** `<tachyon-observability-panel>` receives `meshDispatch` from `get_metrics`
+- **THEN** it shows dispatch totals for `in_process`, `uds`, and `tcp` modes split by `ok`, `saturated`, `pressure`, and `remote` reasons
+- **AND** it shows the average latency per dispatch mode
+- **AND** it identifies the backing Prometheus metrics as `faas_mesh_dispatch_total{mode,reason}` and `faas_mesh_dispatch_duration_seconds{mode}`
+
 #### Scenario: Manual refresh updates all three sections
 - **GIVEN** the panel is open
 - **WHEN** the operator clicks the refresh control
