@@ -2674,6 +2674,16 @@ pub(crate) async fn try_dispatch_local_mesh_request(
             "mesh hop limit exhausted",
         )));
     }
+    if env_flag(FORCE_MESH_TRANSPORT_ENV) {
+        record_mesh_dispatch(
+            MeshDispatchMode::InProcess,
+            MeshDispatchReason::Remote,
+            started_at.elapsed(),
+        );
+        return Ok(LocalMeshDispatchAttempt::Fallback(
+            MeshDispatchReason::Remote,
+        ));
+    }
     if state.memory_governor.pressure() == memory_governor::MemoryPressure::Critical {
         record_mesh_dispatch(
             MeshDispatchMode::InProcess,
