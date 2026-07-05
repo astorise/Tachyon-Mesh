@@ -16,6 +16,7 @@ pub(crate) enum MeshDispatchMode {
     InProcess,
     Uds,
     Tcp,
+    Peer,
 }
 
 impl MeshDispatchMode {
@@ -24,6 +25,7 @@ impl MeshDispatchMode {
             Self::InProcess => "in_process",
             Self::Uds => "uds",
             Self::Tcp => "tcp",
+            Self::Peer => "peer",
         }
     }
 }

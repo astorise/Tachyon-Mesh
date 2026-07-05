@@ -2684,16 +2684,6 @@ pub(crate) async fn try_dispatch_local_mesh_request(
             MeshDispatchReason::Remote,
         ));
     }
-    if state.memory_governor.pressure() == memory_governor::MemoryPressure::Critical {
-        record_mesh_dispatch(
-            MeshDispatchMode::InProcess,
-            MeshDispatchReason::Pressure,
-            started_at.elapsed(),
-        );
-        return Ok(LocalMeshDispatchAttempt::Fallback(
-            MeshDispatchReason::Pressure,
-        ));
-    }
 
     let url = reqwest::Url::parse(resolved_url)
         .map_err(|error| format!("internal mesh target `{resolved_url}` is invalid: {error}"))?;
@@ -2736,15 +2726,42 @@ pub(crate) async fn try_dispatch_local_mesh_request(
             MeshDispatchReason::Remote,
         ));
     };
-    if semaphore.semaphore.available_permits() == 0 {
-        record_mesh_dispatch(
-            MeshDispatchMode::InProcess,
-            MeshDispatchReason::Saturated,
-            started_at.elapsed(),
-        );
-        return Ok(LocalMeshDispatchAttempt::Fallback(
-            MeshDispatchReason::Saturated,
-        ));
+    let saturation_reason =
+        if state.memory_governor.pressure() == memory_governor::MemoryPressure::Critical {
+            Some(MeshDispatchReason::Pressure)
+        } else if semaphore.semaphore.available_permits() == 0 {
+            Some(MeshDispatchReason::Saturated)
+        } else {
+            None
+        };
+
+    if let Some(reason) = saturation_reason {
+        // `network = overflow`: a saturated local route with `allow_overflow`
+        // routes the hop to the least-pressured eligible mesh peer (the same
+        // `control_plane_override_destination` lookup and mTLS transport the
+        // `RoutePermitError::TimedOut` branch of
+        // `execute_route_request_with_acquired_permit` already uses) instead
+        // of looping back into this same node's UDS/TCP fast path. The local
+        // queue remains the last resort when no peer is eligible.
+        if route.allow_overflow {
+            if let Some(response) = try_peer_overflow_dispatch(
+                state,
+                &route,
+                selected_target.required_capability_mask,
+                headers,
+                method,
+                &body,
+                hop_limit,
+                reason,
+                started_at,
+            )
+            .await?
+            {
+                return Ok(LocalMeshDispatchAttempt::Handled(response));
+            }
+        }
+        record_mesh_dispatch(MeshDispatchMode::InProcess, reason, started_at.elapsed());
+        return Ok(LocalMeshDispatchAttempt::Fallback(reason));
     }
 
     let uri = append_query(&normalized_path, url.query())
@@ -2777,6 +2794,52 @@ pub(crate) async fn try_dispatch_local_mesh_request(
         started_at.elapsed(),
     );
     Ok(LocalMeshDispatchAttempt::Handled(result.response))
+}
+
+/// Resolves an eligible mesh peer for a saturated/pressured local route and
+/// forwards the request to it, mirroring the overflow branch that
+/// `execute_route_request_with_acquired_permit` already runs on
+/// `RoutePermitError::TimedOut`. Returns `Ok(None)` when no eligible peer is
+/// known, so the caller falls through to the local UDS/TCP queue.
+#[allow(clippy::too_many_arguments)]
+async fn try_peer_overflow_dispatch(
+    state: &AppState,
+    route: &IntegrityRoute,
+    required_capability_mask: u64,
+    headers: &HeaderMap,
+    method: &Method,
+    body: &Bytes,
+    hop_limit: HopLimit,
+    reason: MeshDispatchReason,
+    started_at: Instant,
+) -> std::result::Result<Option<GuestHttpResponse>, String> {
+    let requested_model = requested_model_alias(route, headers, body);
+    let Some(destination) = control_plane_override_destination(
+        state.route_overrides.as_ref(),
+        &state.peer_capabilities,
+        &route.path,
+        headers,
+        required_capability_mask,
+        requested_model.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+
+    let response = forward_request_to_override_as_guest_response(
+        &state.http_client,
+        &destination,
+        headers,
+        method,
+        body,
+        hop_limit,
+    )
+    .await
+    .map_err(|(status, message)| {
+        format!("mesh peer overflow forward to `{destination}` failed with {status}: {message}")
+    })?;
+
+    record_mesh_dispatch(MeshDispatchMode::Peer, reason, started_at.elapsed());
+    Ok(Some(response))
 }
 
 pub(crate) enum LocalMeshDispatchAttempt {
