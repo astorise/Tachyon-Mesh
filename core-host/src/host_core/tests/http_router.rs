@@ -56,6 +56,7 @@ async fn enrollment_start_is_reachable_without_admin_auth() {
     );
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn other_admin_routes_still_require_auth() {
     // Guard: only enrollment start/poll are exempt — the rest of /admin stays gated.
@@ -73,6 +74,81 @@ async fn other_admin_routes_still_require_auth() {
         .expect("request should complete");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// Worker data-plane profile (`cargo build -p core-host --no-default-features
+// --features <transport...>`, see issue #310): the `admin-plane` feature is
+// off, so `admin_plane::authenticated_routes` never gets mounted at all —
+// this is the "no plan admin" e2e case the feature-matrix `worker` job
+// exercises. Enrollment bootstrap must still work end to end (a worker node
+// must remain enrollable, and must stay a valid answering peer for another
+// node's outbound enrollment call), while the rest of `/admin/*` must be
+// entirely absent (404, not merely 401 — proving the surface truly isn't
+// mounted rather than just being auth-gated).
+#[cfg(not(feature = "admin-plane"))]
+#[tokio::test]
+async fn worker_profile_completes_enrollment_bootstrap_with_no_admin_surface() {
+    let app = build_app(build_test_state(
+        IntegrityConfig::default_sealed(),
+        telemetry::init_test_telemetry(),
+    ));
+
+    let start_response = app
+        .clone()
+        .oneshot(
+            Request::post("/admin/enrollment/start")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"nodePublicKey":"deadbeef"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("enrollment start request should complete");
+
+    assert_eq!(
+        start_response.status(),
+        StatusCode::CREATED,
+        "enrollment bootstrap must stay reachable on a worker (no admin-plane) build"
+    );
+    let body = start_response
+        .into_body()
+        .collect()
+        .await
+        .expect("enrollment start body should collect")
+        .to_bytes();
+    let payload: Value =
+        serde_json::from_slice(&body).expect("enrollment start body should be JSON");
+    let session_id = payload["sessionId"]
+        .as_str()
+        .expect("enrollment start response should carry a sessionId");
+
+    let poll_response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/admin/enrollment/poll/{session_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("enrollment poll request should complete");
+    assert_eq!(
+        poll_response.status(),
+        StatusCode::NO_CONTENT,
+        "enrollment poll must stay reachable (pending approval) on a worker build"
+    );
+
+    let admin_response = app
+        .oneshot(
+            Request::get("/admin/nodes")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("admin route request should complete");
+    assert_eq!(
+        admin_response.status(),
+        StatusCode::NOT_FOUND,
+        "the admin plane must be completely absent on a worker build, not merely unauthorized"
+    );
 }
 
 #[tokio::test]

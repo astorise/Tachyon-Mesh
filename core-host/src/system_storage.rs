@@ -94,6 +94,10 @@ pub(crate) fn resolve_asset_uri(manifest_path: &Path, uri: &str) -> Result<PathB
     Ok(path.canonicalize().unwrap_or(path))
 }
 
+// Reachable only via `admin_plane::authenticated_routes` (`/admin/assets`,
+// `/admin/models/*`), gated behind `admin-plane`. `allow(dead_code)` avoids
+// chasing this through the shared `proxy_request_to_component` plumbing below.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn upload_asset_handler(
     State(state): State<crate::AppState>,
     request: Request,
@@ -101,6 +105,7 @@ pub(crate) async fn upload_asset_handler(
     proxy_request_to_component(state, request, REGISTRY_MODULE_NAME, asset_registry_dir).await
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn init_upload_handler(
     State(state): State<crate::AppState>,
     request: Request,
@@ -108,6 +113,7 @@ pub(crate) async fn init_upload_handler(
     proxy_request_to_component(state, request, MODEL_BROKER_MODULE_NAME, model_broker_dir).await
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn upload_chunk_handler(
     State(state): State<crate::AppState>,
     request: Request,
@@ -115,6 +121,7 @@ pub(crate) async fn upload_chunk_handler(
     proxy_request_to_component(state, request, MODEL_BROKER_MODULE_NAME, model_broker_dir).await
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn commit_upload_handler(
     State(state): State<crate::AppState>,
     request: Request,

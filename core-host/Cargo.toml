@@ -4,7 +4,19 @@ version = "1.0.0"
 edition = "2021"
 
 [features]
-default = ["ring"]
+default = ["admin-plane", "ring"]
+# Gates the `/admin/*` authenticated HTTP surface (operator dashboard, IAM,
+# manifest/canary/chaos control, asset uploads, OpenAPI/Swagger docs) and its
+# route mounting in the router. Disabling it (`--no-default-features`) yields
+# a "worker data-plane only" binary: no `/admin/*` endpoints are exposed
+# (smaller attack surface, faster startup), while the two enrollment-bootstrap
+# routes (`/admin/enrollment/start`, `/admin/enrollment/poll/{id}`) stay
+# reachable — a worker still needs to be enrollable, and it must remain a
+# valid answering peer when a different unenrolled node's outbound enrollment
+# call happens to land on it. `/admin/enrollment/approve` (the operator-facing
+# PIN approval step) stays gated: approval is expected to happen against an
+# admin-plane node via Tachyon Studio.
+admin-plane = []
 # Candle + TurboQuant + ONNX inference — pure Rust, musl-compatible.
 # candle-onnx executes .onnx models; wasmtime-wasi-nn (no ORT) provides the
 # WASI-NN guest interface backed by our CandleOnnxBackend.

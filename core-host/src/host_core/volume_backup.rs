@@ -266,6 +266,7 @@ async fn copy_dir_recursive(source: &std::path::Path, dest: &std::path::Path) ->
 
 /// Restore a snapshot from S3 into the volume's local directory.
 #[cfg_attr(not(feature = "s3-persistence"), allow(unused_variables))]
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn restore_volume(
     config: &IntegrityConfig,
     route_path: &str,
@@ -299,6 +300,7 @@ pub(crate) async fn restore_volume(
 
 /// List available snapshots for a volume, newest first.
 #[cfg_attr(not(feature = "s3-persistence"), allow(unused_variables))]
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn list_volume_backups(
     config: &IntegrityConfig,
     route_path: &str,

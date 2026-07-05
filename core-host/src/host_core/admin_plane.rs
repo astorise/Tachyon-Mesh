@@ -121,22 +121,6 @@ pub(crate) fn authenticated_routes(state: AppState) -> Router<AppState> {
         ))
 }
 
-pub(crate) fn bootstrap_routes() -> Router<AppState> {
-    Router::new()
-        // Enrollment bootstrap endpoints are reachable WITHOUT admin auth: an
-        // unenrolled node has no credentials yet. Security is enforced at
-        // approval: a PIN session needs operator approval, and zero-touch
-        // needs a verified machine identity. `approve` stays authenticated.
-        .route(
-            "/admin/enrollment/start",
-            post(admin_enrollment_start_handler),
-        )
-        .route(
-            "/admin/enrollment/poll/{session_id}",
-            get(admin_enrollment_poll_handler),
-        )
-}
-
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminRuntimeMetrics {

@@ -182,6 +182,7 @@ pub(crate) async fn kv_cache_delete_handler(
 ///
 /// Useful when a model is unloaded and its cached inference state is no longer
 /// relevant. Returns `{ "evicted": N }`.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn kv_cache_evict_handler(
     State(state): State<AppState>,
     Path(model_ref): Path<String>,
@@ -201,6 +202,7 @@ pub(crate) async fn kv_cache_evict_handler(
 }
 
 /// `GET /admin/kv-cache/{model}/stats` — entry count and byte usage for a model.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn kv_cache_stats_handler(
     State(state): State<AppState>,
     Path(model_ref): Path<String>,

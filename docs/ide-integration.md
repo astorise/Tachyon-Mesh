@@ -6,6 +6,8 @@ Tachyon Mesh dynamically serves JSON Schema documents for its configuration file
 
 `core-host` must be running on `http://127.0.0.1:8080` (default). The schema endpoints are protected by the admin bearer token middleware, but most IDEs fetch schemas once at startup with no authentication required for `GET` schema routes.
 
+> All `/admin/*` endpoints, including the schema routes below, require the `admin-plane` Cargo feature (on by default). A worker/data-plane node built with `--no-default-features` (see [Path C in the README](../README.md#path-c--worker--data-plane-node-build-from-source)) does not serve them — point your IDE at an admin-plane node instead.
+
 Available schema endpoints:
 
 | URL | Describes |

@@ -94,6 +94,21 @@ cd tachyon-ui && npm run tauri dev
 
 ---
 
+### Path C — Worker / Data-Plane Node (Build from Source)
+
+A **worker** is a mesh node with no admin surface: it receives its config over the existing gossip/config-update path and serves only FaaS routes plus zero-touch/PIN enrollment bootstrap — no `/admin/*` endpoints, smaller binary, faster startup. Build one by dropping the `admin-plane` feature (part of `default`) and re-adding the transport stack a real mesh member needs:
+
+```bash
+cargo build -p core-host --release --no-default-features \
+  --features ring,rate-limit,resiliency,mtls,secrets-vault,websockets
+```
+
+Deploy the resulting binary like any other node — it stays enrollable (`/admin/enrollment/start` and `/admin/enrollment/poll/{id}` are always compiled in) but `/admin/nodes`, `/admin/iam/*`, manifest/canary/chaos control, and the OpenAPI/Swagger docs 404 rather than requiring auth. Enrollment approval and fleet management still happen against an `admin-plane` node (e.g. one installed via Path A/B) or Tachyon Studio.
+
+`get-tachyon.sh`/`get-tachyon.ps1` currently only publish the full (`admin-plane`-enabled) binary — there is no pre-built worker artifact yet, so worker nodes are a build-from-source deployment for now.
+
+---
+
 ## 🔒 Enterprise Security Posture
 
 Tachyon-Mesh is built for zero-trust environments.

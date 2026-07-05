@@ -167,6 +167,8 @@ pub(crate) enum CanaryPhase {
 
 pub(crate) struct CanaryRolloutState {
     pub(crate) route_path: String,
+    // Only read by `admin_canary_status_handler` (gated behind `admin-plane`).
+    #[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
     pub(crate) current_version: String,
     pub(crate) next_version: String,
     /// Current percentage of traffic directed to `next_version` (0–100).
