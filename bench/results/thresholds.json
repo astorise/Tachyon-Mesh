@@ -1,0 +1,6 @@
+{
+  "_comment": "null = not yet calibrated; fill in after reviewing the first bench-regression.yml run's report.md (add roughly 20% headroom over the observed value). faas_chain_in_process_share_min_pct is a behavioral invariant rather than a hardware-dependent perf number, so it starts enforced.",
+  "faas_chain_in_process_p99_ms": null,
+  "cold_start_with_instance_pre_p99_ms": null,
+  "faas_chain_in_process_share_min_pct": 95
+}
