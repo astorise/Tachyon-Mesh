@@ -7,9 +7,11 @@ pub(crate) fn integrity_manifest_path() -> PathBuf {
 }
 
 pub(crate) fn build_app(state: AppState) -> Router {
-    let app: Router<AppState> = Router::new()
-        .merge(admin_plane::authenticated_routes(state.clone()))
-        .merge(admin_plane::bootstrap_routes())
+    let app: Router<AppState> = Router::new();
+    #[cfg(feature = "admin-plane")]
+    let app = app.merge(admin_plane::authenticated_routes(state.clone()));
+    let app = app
+        .merge(bootstrap_routes())
         .route(
             "/auth/signup/validate-token",
             post(auth::validate_registration_token_handler),

@@ -154,6 +154,9 @@ pub(crate) fn record_mesh_dispatch(
     *state.duration_counts.entry(mode).or_default() += 1;
 }
 
+// Read by `admin_metrics_handler` (gated behind `admin-plane`) to populate
+// `/admin/metrics`; the counters it reads are still recorded unconditionally.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) fn mesh_dispatch_metrics_snapshot() -> MeshDispatchMetricsSnapshot {
     let state = match dispatch_state().lock() {
         Ok(guard) => guard,

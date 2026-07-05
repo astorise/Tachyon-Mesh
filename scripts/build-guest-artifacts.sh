@@ -30,6 +30,7 @@ cargo build -p system-faas-keda --target wasm32-wasip2 --release
 cargo build -p system-faas-k8s-scaler --target wasm32-wasip2 --release
 cargo build -p system-faas-logger --target wasm32-wasip2 --release
 cargo build -p system-faas-model-broker --target wasm32-wasip2 --release
+cargo build -p system-faas-node-registry --target wasm32-wasip2 --release
 cargo build -p system-faas-metering --target wasm32-wasip2 --release
 cargo build -p system-faas-prom --target wasm32-wasip2 --release
 cargo build -p system-faas-registry --target wasm32-wasip2 --release
