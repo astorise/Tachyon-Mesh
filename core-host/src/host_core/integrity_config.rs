@@ -1038,7 +1038,8 @@ fn validate_require_scopes(routes: &[IntegrityRoute]) -> Result<()> {
             None => {
                 return Err(anyhow!(
                     "Integrity Validation Failed: route `{}` is missing a `scopes` block \
-                     and `require_scopes` is enabled on this node",
+                     and `require_scopes` is enabled on this node; call `tachyon_suggest_scopes` \
+                     for a starting scopes configuration for this route",
                     route.path
                 ));
             }
@@ -1048,7 +1049,8 @@ fn validate_require_scopes(routes: &[IntegrityRoute]) -> Result<()> {
                     if scopes.allow_all {
                         return Err(anyhow!(
                             "Integrity Validation Failed: route `{}` resolves to allow-all scopes \
-                             and `require_scopes` is enabled on this node; add explicit scope patterns",
+                             and `require_scopes` is enabled on this node; add explicit scope patterns \
+                             — call `tachyon_suggest_scopes` for a starting scopes configuration for this route",
                             route.path
                         ));
                     }

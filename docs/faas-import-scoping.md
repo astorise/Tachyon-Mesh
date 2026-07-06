@@ -108,4 +108,6 @@ Set `requireScopes: true` in the node configuration to reject manifests without 
 
 Once telemetry shows zero `allow-all` deployments across the fleet, the default will change to deny-when-absent in a separate openspec change. No action required from operators who have completed Phase 2.
 
+**Legacy opt-out.** `require_scopes: false` remains a supported, permanent setting after the fleet default changes — it is not a deprecated flag scheduled for removal. Clusters that cannot or will not scope every deployment (fixed-manifest air-gapped clusters, single-tenant nodes where the authorization boundary doesn't matter) may pin `require_scopes: false` explicitly in their own manifest indefinitely.
+
 **Rollback at any phase:** set `scopes: allow-all` on all manifests to restore prior behavior without downtime. No data migration, no on-disk format change.
