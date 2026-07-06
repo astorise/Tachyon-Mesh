@@ -15,6 +15,7 @@ use std::sync::Arc;
 // any WASM is loaded.
 // =====================================================================
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn iam_users_list_rejects_unauthenticated_caller() {
     let app = build_app(build_test_state(
@@ -34,6 +35,7 @@ async fn iam_users_list_rejects_unauthenticated_caller() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn iam_user_patch_rejects_unauthenticated_caller() {
     let app = build_app(build_test_state(
@@ -56,6 +58,7 @@ async fn iam_user_patch_rejects_unauthenticated_caller() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn iam_user_delete_rejects_unauthenticated_caller() {
     let app = build_app(build_test_state(
@@ -77,6 +80,7 @@ async fn iam_user_delete_rejects_unauthenticated_caller() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn iam_groups_list_rejects_unauthenticated_caller() {
     let app = build_app(build_test_state(
@@ -96,6 +100,7 @@ async fn iam_groups_list_rejects_unauthenticated_caller() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn iam_groups_post_rejects_unauthenticated_caller() {
     let app = build_app(build_test_state(
@@ -120,6 +125,7 @@ async fn iam_groups_post_rejects_unauthenticated_caller() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn iam_group_delete_rejects_unauthenticated_caller() {
     let app = build_app(build_test_state(
@@ -141,6 +147,7 @@ async fn iam_group_delete_rejects_unauthenticated_caller() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn admin_logs_rejects_unauthenticated_caller() {
     let app = build_app(build_test_state(

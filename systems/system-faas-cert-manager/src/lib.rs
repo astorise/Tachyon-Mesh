@@ -726,23 +726,20 @@ mod tests {
     /// loadable by the host TLS runtime.
     #[test]
     fn bundle_loads_into_a_rustls_server_config() {
-        use std::io::BufReader;
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let bundle = cert::issue_leaf_certificate(&test_ca_signing_key(), "api.example.test")
             .expect("issued");
 
-        let mut cert_reader = BufReader::new(bundle.certificate_pem.as_bytes());
-        let cert_chain = rustls_pemfile::certs(&mut cert_reader)
+        let cert_chain = CertificateDer::pem_slice_iter(bundle.certificate_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .expect("certificate chain parses");
         assert_eq!(cert_chain.len(), 2, "chain must be leaf + CA");
 
-        let mut key_reader = BufReader::new(bundle.private_key_pem.as_bytes());
-        let private_key = rustls_pemfile::private_key(&mut key_reader)
-            .expect("private key parses")
-            .expect("private key present");
+        let private_key = PrivateKeyDer::from_pem_slice(bundle.private_key_pem.as_bytes())
+            .expect("private key parses");
 
         rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -787,9 +784,9 @@ mod tests {
 
     /// Helper: decode the first PEM certificate (the leaf) into DER.
     fn first_certificate_der(pem: &str) -> Vec<u8> {
-        use std::io::BufReader;
-        let mut reader = BufReader::new(pem.as_bytes());
-        let mut certs = rustls_pemfile::certs(&mut reader);
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+
+        let mut certs = CertificateDer::pem_slice_iter(pem.as_bytes());
         let first = certs
             .next()
             .expect("at least one certificate")

@@ -923,6 +923,11 @@ pub(crate) async fn authorize_admin_headers(
     }
 }
 
+// Only mounted as a `route_layer` by `admin_plane::authenticated_routes`
+// (gated behind `admin-plane`). `allow(dead_code)` rather than `cfg`-removing
+// it avoids having to chase every type it shares with other admin-only
+// handlers through a dead-code cascade.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_auth_middleware(
     State(state): State<crate::AppState>,
     mut request: Request,
@@ -958,12 +963,14 @@ pub(crate) async fn admin_auth_middleware(
 
 /// `GET /admin/identity/public-key` — returns the node's stable Ed25519 public
 /// key in hex so operators can register it in peer `trusted_signers` lists.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NodePublicKeyResponse {
     public_key: String,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn node_public_key_handler(
     State(state): State<crate::AppState>,
 ) -> axum::Json<NodePublicKeyResponse> {
@@ -972,6 +979,12 @@ pub(crate) async fn node_public_key_handler(
     })
 }
 
+// Reachable only via `admin_plane::authenticated_routes` (gated behind
+// `admin-plane`), but exercised directly by unit tests regardless of that
+// feature — `allow(dead_code)` (rather than `cfg`-removing the fn) keeps it
+// compiling in a `--no-default-features` test build instead of orphaning
+// those tests.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_status_handler(State(state): State<crate::AppState>) -> String {
     let runtime = state.runtime.load();
     format!(
@@ -981,6 +994,7 @@ pub(crate) async fn admin_status_handler(State(state): State<crate::AppState>) -
     )
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn generate_recovery_codes_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<RecoveryCodeRequest>,
@@ -1183,6 +1197,7 @@ pub(crate) async fn finalize_login_handler(
     Ok(Json(session))
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn issue_step_up_session_handler(
     Extension(claims): Extension<AuthClaims>,
     Json(payload): Json<StepUpSessionRequest>,
@@ -1212,6 +1227,7 @@ pub(crate) async fn issue_step_up_session_handler(
     }))
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn regenerate_account_security_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -1237,6 +1253,7 @@ pub(crate) async fn regenerate_account_security_handler(
     Ok(Json(RecoveryCodeResponse { codes }))
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn issue_pat_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -1294,6 +1311,7 @@ pub(crate) async fn consume_recovery_code_handler(
     Ok(Json(ConsumeRecoveryCodeResponse { token }))
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn list_users_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -1334,6 +1352,7 @@ pub(crate) async fn list_users_handler(
     Ok(Json(users))
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn update_user_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -1386,6 +1405,7 @@ pub(crate) async fn update_user_handler(
     Ok(Json(summary))
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn delete_user_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -1433,6 +1453,7 @@ pub(crate) async fn delete_user_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn list_groups_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -1473,6 +1494,7 @@ pub(crate) async fn list_groups_handler(
     Ok(Json(groups))
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn upsert_group_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -1517,6 +1539,7 @@ pub(crate) async fn upsert_group_handler(
     Ok(Json(summary))
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn delete_group_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
@@ -1564,6 +1587,7 @@ pub(crate) struct AuditLogQuery {
     pub(crate) lines: Option<usize>,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn audit_log_handler(
     State(state): State<crate::AppState>,
     axum::extract::Query(query): axum::extract::Query<AuditLogQuery>,

@@ -704,7 +704,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_get_metrics",
-                    "description": "Return active node telemetry: error rate, p50/p99 latency, queue depth, and scope_denial_total (lifetime count of WIT import denials across all deployments and categories).",
+                    "description": "Return active node telemetry: error rate, p50/p99 latency, queue depth, scope_denial_total, and mesh_dispatch counters/latency aggregates for in_process, uds, and tcp dispatch modes.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}

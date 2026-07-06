@@ -3,7 +3,7 @@ use crate::host_core::scoping::{DeploymentScopes, ScopeCategory, ScopeShape};
 
 /// Derives the `ScopeShape` for a route. Parses `route.scopes` if present;
 /// falls back to `allow_all` (with a warning already emitted by the parser).
-fn route_scope_shape(route: &IntegrityRoute) -> ScopeShape {
+pub(crate) fn route_scope_shape(route: &IntegrityRoute) -> ScopeShape {
     let scopes = route
         .scopes
         .as_ref()
@@ -244,21 +244,23 @@ fn component_instance_pre(
         len,
     };
 
-    if let Some(cache) = &execution.component_instance_pre_cache {
-        if let Some(cached) = cache.get(&key) {
-            return Ok(cached);
+    if !env_flag(DISABLE_INSTANCE_PRE_CACHE_ENV) {
+        if let Some(cache) = &execution.component_instance_pre_cache {
+            if let Some(cached) = cache.get(&key) {
+                return Ok(cached);
+            }
+            let pre = Arc::new(linker.instantiate_pre(component).map_err(|error| {
+                guest_execution_error(
+                    error,
+                    format!(
+                        "failed to pre-instantiate guest component from {}",
+                        component_path.display()
+                    ),
+                )
+            })?);
+            cache.insert(key, Arc::clone(&pre));
+            return Ok(pre);
         }
-        let pre = Arc::new(linker.instantiate_pre(component).map_err(|error| {
-            guest_execution_error(
-                error,
-                format!(
-                    "failed to pre-instantiate guest component from {}",
-                    component_path.display()
-                ),
-            )
-        })?);
-        cache.insert(key, Arc::clone(&pre));
-        return Ok(pre);
     }
 
     Ok(Arc::new(linker.instantiate_pre(component).map_err(
@@ -288,17 +290,18 @@ fn legacy_instance_pre(
         len,
     };
 
-    if let Some(cache) = &execution.legacy_instance_pre_cache {
-        if let Some(cached) = cache.get(&key) {
-            return Ok(cached);
-        }
-        let linker = build_linker(engine)?;
-        let pre =
-            Arc::new(linker.instantiate_pre(module).map_err(|error| {
+    if !env_flag(DISABLE_INSTANCE_PRE_CACHE_ENV) {
+        if let Some(cache) = &execution.legacy_instance_pre_cache {
+            if let Some(cached) = cache.get(&key) {
+                return Ok(cached);
+            }
+            let linker = build_linker(engine)?;
+            let pre = Arc::new(linker.instantiate_pre(module).map_err(|error| {
                 guest_execution_error(error, "failed to pre-link guest module")
             })?);
-        cache.insert(key, Arc::clone(&pre));
-        return Ok(pre);
+            cache.insert(key, Arc::clone(&pre));
+            return Ok(pre);
+        }
     }
 
     let linker = build_linker(engine)?;
@@ -897,6 +900,19 @@ pub(crate) fn execute_websocket_component_guest(
                 "failed to add WebSocket host functions to component linker",
             )
         })?;
+        // Authorization-gated: URL validated against scopes.http per call.
+        if shape.grants(ScopeCategory::Http) {
+            websocket_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+                ComponentHostState,
+                ComponentHostState,
+            >(&mut l, |s: &mut ComponentHostState| s)
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add outbound HTTP functions to WebSocket component linker",
+                )
+            })?;
+        }
         Ok(l)
     };
     let linker: Arc<ComponentLinker<ComponentHostState>> = match &execution.linker_cache {
@@ -916,7 +932,7 @@ pub(crate) fn execute_websocket_component_guest(
             Arc::clone(&execution.storage_broker),
             Arc::clone(&execution.concurrency_limits),
             execution.propagated_headers.clone(),
-            None,
+            execution.local_mesh_dispatch.clone(),
             &[],
         )?,
     );

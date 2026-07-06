@@ -83,6 +83,7 @@ impl MemoryGovernor {
         self.vram_utilization_pct.load(Ordering::Relaxed)
     }
 
+    #[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
     pub(crate) fn ram_offload_active(&self) -> bool {
         self.ram_offload_active.load(Ordering::Acquire)
     }

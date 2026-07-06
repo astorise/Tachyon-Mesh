@@ -51,9 +51,14 @@ pub(crate) use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::from_fn,
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post, put},
+    routing::{get, post},
     Extension, Router,
 };
+// DELETE/PATCH/PUT leading route handlers only appear in `admin_plane`'s
+// `/admin/*` surface today; every always-on route (FaaS fallback, enrollment
+// bootstrap, kv-cache) only ever leads with `get`/`post`.
+#[cfg(feature = "admin-plane")]
+pub(crate) use axum::routing::{delete, patch, put};
 pub(crate) use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 pub(crate) use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 #[cfg(feature = "websockets")]
@@ -120,6 +125,7 @@ pub(crate) use wasmtime_wasi::{
 #[cfg(feature = "ai-inference")]
 pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;
 
+#[cfg(feature = "admin-plane")]
 mod admin_plane;
 mod app_runtime;
 mod background_workers;
@@ -137,6 +143,8 @@ mod guest_runtime;
 mod integrity_config;
 pub(crate) mod kv_cache;
 mod leader_election;
+mod mesh_dispatch_metrics;
+#[cfg(feature = "admin-plane")]
 pub(crate) mod openapi;
 mod peer_pressure;
 mod prewarm;
@@ -148,6 +156,7 @@ mod uds_fast_path;
 mod volume_backup;
 mod volumes;
 
+#[cfg(feature = "admin-plane")]
 pub(crate) use admin_plane::*;
 pub(crate) use app_runtime::*;
 pub(crate) use background_workers::*;
@@ -160,6 +169,7 @@ pub(crate) use graph_store::*;
 pub(crate) use guest_output::*;
 pub(crate) use guest_runtime::*;
 pub(crate) use integrity_config::*;
+pub(crate) use mesh_dispatch_metrics::*;
 pub(crate) use peer_pressure::*;
 pub(crate) use prewarm::*;
 pub(crate) use runtime_types::*;

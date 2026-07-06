@@ -95,6 +95,7 @@ async fn router_emits_async_telemetry_metrics() {
     assert!(record["host_overhead_us"].as_u64().is_some());
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn admin_metrics_endpoint_returns_runtime_snapshot() {
     let telemetry = telemetry::init_test_telemetry();
@@ -107,6 +108,7 @@ async fn admin_metrics_endpoint_returns_runtime_snapshot() {
     assert_eq!(response.queue_depth, 1);
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn admin_shadow_diffs_endpoint_returns_json_array() {
     let response = admin_shadow_diffs_handler().await.0;
@@ -114,6 +116,7 @@ async fn admin_shadow_diffs_endpoint_returns_json_array() {
     assert!(response.is_empty());
 }
 
+#[cfg(feature = "admin-plane")]
 #[tokio::test]
 async fn admin_chaos_endpoint_accepts_supported_scenario() {
     let response = admin_chaos_scenario_handler(axum::Json(AdminChaosScenarioRequest {

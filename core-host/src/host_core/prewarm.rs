@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "websockets")]
+use crate::host_core::scoping::ScopeCategory;
 
 /// Maximum number of distinct `Arc<Module>` entries the in-memory instance pool
 /// keeps warm in a single runtime generation. Sized well above any reasonable
@@ -472,6 +474,7 @@ pub(crate) fn prewarm_websocket_component_instance(
     storage_broker: Arc<StorageBrokerManager>,
     concurrency_limits: Arc<HashMap<String, Arc<RouteExecutionControl>>>,
 ) -> std::result::Result<(), ExecutionError> {
+    let shape = route_scope_shape(route);
     let mut linker = ComponentLinker::new(engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
         guest_execution_error(
@@ -499,6 +502,18 @@ pub(crate) fn prewarm_websocket_component_instance(
             "failed to add WebSocket functions to prewarm component linker",
         )
     })?;
+    if shape.grants(ScopeCategory::Http) {
+        websocket_component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+            ComponentHostState,
+            ComponentHostState,
+        >(&mut linker, |state: &mut ComponentHostState| state)
+        .map_err(|error| {
+            guest_execution_error(
+                error,
+                "failed to add outbound HTTP functions to prewarm WebSocket component linker",
+            )
+        })?;
+    }
 
     let mut store = Store::new(
         engine,

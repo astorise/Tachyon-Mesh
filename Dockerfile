@@ -64,6 +64,7 @@ COPY --from=planner /workspace/recipe.json recipe.json
 # the -p/--target lists so the recipe matches the real build.
 RUN cargo chef cook --release --target wasm32-wasip2 --recipe-path recipe.json \
     -p guest-example -p guest-volume -p guest-openai \
+    -p guest-chain-a -p guest-chain-b -p guest-chain-c \
     -p system-faas-authn -p system-faas-authz -p system-faas-keda \
     -p system-faas-k8s-scaler -p system-faas-model-broker \
     -p system-faas-node-registry -p system-faas-cert-manager \
@@ -81,6 +82,7 @@ COPY . .
 # compiled by `cargo chef cook` above, so these only build our crates.
 RUN cargo build --target wasm32-wasip2 --release \
     -p guest-example -p guest-volume -p guest-openai \
+    -p guest-chain-a -p guest-chain-b -p guest-chain-c \
     -p system-faas-authn -p system-faas-authz -p system-faas-keda \
     -p system-faas-k8s-scaler -p system-faas-model-broker \
     -p system-faas-node-registry -p system-faas-cert-manager \
@@ -258,6 +260,9 @@ WORKDIR /app
 COPY --from=wasm-builder /etc/ssl/certs /etc/ssl/certs
 COPY --from=host-builder /workspace/target/x86_64-unknown-linux-musl/release/core-host /app/core-host
 COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/guest_example.wasm /app/guest-modules/guest_example.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/guest_chain_a.wasm /app/guest-modules/guest_chain_a.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/guest_chain_b.wasm /app/guest-modules/guest_chain_b.wasm
+COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/guest_chain_c.wasm /app/guest-modules/guest_chain_c.wasm
 COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/guest_volume.wasm /app/guest-modules/guest_volume.wasm
 COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/guest_openai.wasm /app/guest-modules/guest_openai.wasm
 COPY --from=wasm-builder /workspace/target/wasm32-wasip2/release/system_faas_authn.wasm /app/guest-modules/system_faas_authn.wasm

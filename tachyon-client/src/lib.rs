@@ -595,6 +595,31 @@ pub struct RuntimeMetrics {
     pub ram_offload_active: bool,
     #[serde(default)]
     pub scope_denial_total: u64,
+    #[serde(default)]
+    pub mesh_dispatch: MeshDispatchMetrics,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshDispatchMetrics {
+    pub totals: Vec<MeshDispatchTotal>,
+    pub durations: Vec<MeshDispatchDuration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshDispatchTotal {
+    pub mode: String,
+    pub reason: String,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshDispatchDuration {
+    pub mode: String,
+    pub count: u64,
+    pub avg_latency_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2134,6 +2159,7 @@ pub async fn get_metrics() -> Result<RuntimeMetrics> {
         vram_utilization_pct: 0,
         ram_offload_active: false,
         scope_denial_total: 0,
+        mesh_dispatch: MeshDispatchMetrics::default(),
     })
 }
 

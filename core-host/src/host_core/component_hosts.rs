@@ -2610,16 +2610,19 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             &self.propagated_headers,
             &resolved_target.kind,
         );
-        if resolved_target.kind.is_internal() {
-            if let Some(response) = self.try_send_in_process_outbound_request(
+        let local_fallback_reason = if resolved_target.kind.is_internal() {
+            match self.try_send_in_process_outbound_request(
                 &resolved_target.url,
                 &method,
                 &outbound_headers,
                 &body,
             )? {
-                return Ok(response);
+                LocalMeshOutboundAttempt::Handled(response) => return Ok(response),
+                LocalMeshOutboundAttempt::Fallback(reason) => Some(reason),
             }
-        }
+        } else {
+            None
+        };
 
         let url = rewrite_outbound_http_url(&resolved_target.url, &self.runtime_config);
 
@@ -2654,6 +2657,7 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
         for (name, value) in &headers {
             request = request.header(name, value);
         }
+        let tcp_started_at = Instant::now();
         let response = request
             .body(body)
             .send()
@@ -2675,6 +2679,13 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
                 format!("failed to read outbound HTTP response body from `{url}`: {error}")
             })?
             .to_vec();
+        if resolved_target.kind.is_internal() {
+            record_mesh_dispatch(
+                MeshDispatchMode::Tcp,
+                local_fallback_reason.unwrap_or(MeshDispatchReason::Remote),
+                tcp_started_at.elapsed(),
+            );
+        }
 
         Ok(
             background_component_bindings::tachyon::mesh::outbound_http::Response {
@@ -2694,7 +2705,18 @@ pub(crate) fn send_blocking_uds_fast_path_request(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Option<background_component_bindings::tachyon::mesh::outbound_http::Response> {
-    let peer = uds_fast_path.discover_peer_for_url(url)?;
+    let started_at = Instant::now();
+    let peer = match uds_fast_path.discover_peer_for_url(url) {
+        Some(peer) => peer,
+        None => {
+            record_mesh_dispatch(
+                MeshDispatchMode::Uds,
+                MeshDispatchReason::Remote,
+                started_at.elapsed(),
+            );
+            return None;
+        }
+    };
     let client = match uds_fast_path.blocking_client_for_peer(&peer) {
         Ok(client) => client,
         Err(error) => {
@@ -2702,6 +2724,11 @@ pub(crate) fn send_blocking_uds_fast_path_request(
                 socket = %peer.socket_path.display(),
                 url = %url,
                 "UDS fast-path client unavailable, falling back to TCP: {error:#}"
+            );
+            record_mesh_dispatch(
+                MeshDispatchMode::Uds,
+                MeshDispatchReason::Remote,
+                started_at.elapsed(),
             );
             return None;
         }
@@ -2719,6 +2746,11 @@ pub(crate) fn send_blocking_uds_fast_path_request(
                 socket = %peer.socket_path.display(),
                 url = %url,
                 "UDS fast-path unavailable, falling back to TCP: {error}"
+            );
+            record_mesh_dispatch(
+                MeshDispatchMode::Uds,
+                MeshDispatchReason::Remote,
+                started_at.elapsed(),
             );
             return None;
         }
@@ -2742,9 +2774,20 @@ pub(crate) fn send_blocking_uds_fast_path_request(
                 url = %url,
                 "failed to read UDS fast-path response body, falling back to TCP: {error}"
             );
+            record_mesh_dispatch(
+                MeshDispatchMode::Uds,
+                MeshDispatchReason::Remote,
+                started_at.elapsed(),
+            );
             return None;
         }
     };
+
+    record_mesh_dispatch(
+        MeshDispatchMode::Uds,
+        MeshDispatchReason::Ok,
+        started_at.elapsed(),
+    );
 
     Some(
         background_component_bindings::tachyon::mesh::outbound_http::Response {
@@ -2762,12 +2805,11 @@ impl ComponentHostState {
         method: &reqwest::Method,
         headers: &[(String, String)],
         body: &[u8],
-    ) -> std::result::Result<
-        Option<background_component_bindings::tachyon::mesh::outbound_http::Response>,
-        String,
-    > {
+    ) -> std::result::Result<LocalMeshOutboundAttempt, String> {
         let Some(context) = self.local_mesh_dispatch.as_ref() else {
-            return Ok(None);
+            return Ok(LocalMeshOutboundAttempt::Fallback(
+                MeshDispatchReason::Remote,
+            ));
         };
         let method = Method::from_bytes(method.as_str().as_bytes())
             .map_err(|error| format!("invalid local outbound HTTP method `{method}`: {error}"))?;
@@ -2784,14 +2826,24 @@ impl ComponentHostState {
                 .unwrap_or(HopLimit(DEFAULT_HOP_LIMIT)),
         ))?;
 
-        Ok(response.map(|response| {
-            background_component_bindings::tachyon::mesh::outbound_http::Response {
-                status: response.status.as_u16(),
-                headers: response.headers,
-                body: response.body.to_vec(),
+        Ok(match response {
+            LocalMeshDispatchAttempt::Handled(response) => LocalMeshOutboundAttempt::Handled(
+                background_component_bindings::tachyon::mesh::outbound_http::Response {
+                    status: response.status.as_u16(),
+                    headers: response.headers,
+                    body: response.body.to_vec(),
+                },
+            ),
+            LocalMeshDispatchAttempt::Fallback(reason) => {
+                LocalMeshOutboundAttempt::Fallback(reason)
             }
-        }))
+        })
     }
+}
+
+enum LocalMeshOutboundAttempt {
+    Handled(background_component_bindings::tachyon::mesh::outbound_http::Response),
+    Fallback(MeshDispatchReason),
 }
 
 impl background_component_bindings::tachyon::mesh::outbox_store::Host for ComponentHostState {
@@ -2876,6 +2928,32 @@ impl control_plane_component_bindings::tachyon::mesh::outbound_http::Host for Co
             )?;
         Ok(
             control_plane_component_bindings::tachyon::mesh::outbound_http::Response {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+            },
+        )
+    }
+}
+
+#[cfg(feature = "websockets")]
+impl websocket_component_bindings::tachyon::mesh::outbound_http::Host for ComponentHostState {
+    fn send_request(
+        &mut self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> std::result::Result<
+        websocket_component_bindings::tachyon::mesh::outbound_http::Response,
+        String,
+    > {
+        let response =
+            <Self as background_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
+                self, method, url, headers, body,
+            )?;
+        Ok(
+            websocket_component_bindings::tachyon::mesh::outbound_http::Response {
                 status: response.status,
                 headers: response.headers,
                 body: response.body,

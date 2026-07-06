@@ -23,6 +23,33 @@
       "dependencies": {}
     },
     {
+      "path": "/api/guest-chain-a",
+      "role": "user",
+      "name": "guest-chain-a",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "1.0.0",
+      "dependencies": { "guest-chain-b": "^1.0" }
+    },
+    {
+      "path": "/api/guest-chain-b",
+      "role": "user",
+      "name": "guest-chain-b",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "1.0.0",
+      "dependencies": { "guest-chain-c": "^1.0" }
+    },
+    {
+      "path": "/api/guest-chain-c",
+      "role": "user",
+      "name": "guest-chain-c",
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "1.0.0",
+      "dependencies": {}
+    },
+    {
       "path": "/api/guest-example",
       "role": "user",
       "name": "guest-example",

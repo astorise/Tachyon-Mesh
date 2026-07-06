@@ -5,10 +5,18 @@ pub(crate) fn init_host_tracing() {
 
     INIT.call_once(|| {
         ensure_rustls_crypto_provider();
+        // Falls back to the previous unconditional-INFO behavior when
+        // `RUST_LOG` is unset, so this stays a no-op for existing
+        // deployments; set `RUST_LOG` (e.g. for the bench regression harness
+        // in `bench/`, which enables `core_host::host_core::mesh_dispatch_metrics=debug`)
+        // to opt into finer-grained logging.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
         let _ = tracing_subscriber::fmt()
             .with_ansi(false)
             .without_time()
             .with_target(true)
+            .with_env_filter(filter)
             .try_init();
     });
 }
@@ -180,6 +188,7 @@ pub(crate) struct AdminEnrollmentStartRequest {
     pub(crate) identity_token: Option<String>,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminEnrollmentApproveRequest {
@@ -246,6 +255,7 @@ pub(crate) async fn admin_enrollment_start_handler(
 /// `POST /admin/enrollment/approve` — operator-driven approval entered via
 /// Tachyon Studio. Validates the PIN against the recorded session and stages
 /// the signed certificate bytes for the unenrolled node's next poll.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_enrollment_approve_handler(
     State(state): State<AppState>,
     axum::Json(payload): axum::Json<AdminEnrollmentApproveRequest>,
@@ -278,6 +288,25 @@ pub(crate) async fn admin_enrollment_poll_handler(
         Bytes::new(),
     )
     .await
+}
+
+/// Routes reachable WITHOUT admin auth: an unenrolled node has no credentials
+/// yet. Security is enforced at approval: a PIN session needs operator
+/// approval, and zero-touch needs a verified machine identity. Kept outside
+/// `admin_plane` (and thus outside the `admin-plane` feature gate) so a
+/// worker data-plane build stays enrollable — `/admin/enrollment/approve`
+/// stays behind `admin_plane::authenticated_routes` since approval is an
+/// operator action against an admin-plane node.
+pub(crate) fn bootstrap_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/admin/enrollment/start",
+            post(admin_enrollment_start_handler),
+        )
+        .route(
+            "/admin/enrollment/poll/{session_id}",
+            get(admin_enrollment_poll_handler),
+        )
 }
 
 async fn forward_node_registry_faas(
@@ -424,6 +453,7 @@ pub(crate) struct RegistryEnrolledNode {
     pub(crate) capabilities: RegistryNodeCapabilities,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RegistrySystem {
@@ -433,6 +463,7 @@ pub(crate) struct RegistrySystem {
     pub(crate) description: String,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RegistryDeployedSystem {
@@ -444,6 +475,7 @@ pub(crate) struct RegistryDeployedSystem {
     pub(crate) nodes: Vec<RegistryActiveSystemNode>,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RegistryActiveSystemNode {
@@ -451,6 +483,7 @@ pub(crate) struct RegistryActiveSystemNode {
     pub(crate) version: String,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_nodes_handler(State(state): State<AppState>) -> Response {
     let mut nodes = match list_registry_nodes(&state.core_store) {
         Ok(nodes) => nodes,
@@ -465,6 +498,7 @@ pub(crate) async fn admin_nodes_handler(State(state): State<AppState>) -> Respon
     (StatusCode::OK, axum::Json(nodes)).into_response()
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 fn self_registry_node(node_id: &str, state: &AppState) -> RegistryEnrolledNode {
     use sysinfo::System;
     let mut sys = System::new();
@@ -502,6 +536,7 @@ fn self_registry_node(node_id: &str, state: &AppState) -> RegistryEnrolledNode {
     }
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 fn detect_self_gpus(capabilities: &Capabilities) -> Vec<RegistryGpuStats> {
     // Report one placeholder GPU entry when CUDA acceleration is detected.
     // Detailed per-GPU stats (VRAM, utilization) require NVML and are
@@ -519,6 +554,7 @@ fn detect_self_gpus(capabilities: &Capabilities) -> Vec<RegistryGpuStats> {
     }
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_node_capabilities_handler(
     State(state): State<AppState>,
     axum::extract::Path(node_id): axum::extract::Path<String>,
@@ -563,10 +599,12 @@ pub(crate) async fn admin_node_capabilities_handler(
     }
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_registered_systems_handler() -> Response {
     (StatusCode::OK, axum::Json(read_system_manifest())).into_response()
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_deployed_systems_handler(State(state): State<AppState>) -> Response {
     let nodes = match list_registry_nodes(&state.core_store) {
         Ok(nodes) => nodes,
@@ -581,6 +619,7 @@ pub(crate) async fn admin_deployed_systems_handler(State(state): State<AppState>
     (StatusCode::OK, axum::Json(systems)).into_response()
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 fn list_registry_nodes(core_store: &store::CoreStore) -> Result<Vec<RegistryEnrolledNode>> {
     Ok(core_store
         .kv_partition_get_range("node-registry", "", "\u{10ffff}", 10_000, 0)?
@@ -589,6 +628,7 @@ fn list_registry_nodes(core_store: &store::CoreStore) -> Result<Vec<RegistryEnro
         .collect())
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 fn read_system_manifest() -> Vec<RegistrySystem> {
     let Ok(raw) = std::fs::read_to_string(PathBuf::from("systems").join("manifest.toml")) else {
         return Vec::new();
@@ -596,6 +636,7 @@ fn read_system_manifest() -> Vec<RegistrySystem> {
     parse_system_manifest(&raw)
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 fn parse_system_manifest(raw: &str) -> Vec<RegistrySystem> {
     let mut systems = Vec::new();
     let mut current = RegistrySystem::default();
@@ -627,6 +668,7 @@ fn parse_system_manifest(raw: &str) -> Vec<RegistrySystem> {
     systems
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 fn deployed_system_from_nodes(
     system: &RegistrySystem,
     nodes: &[RegistryEnrolledNode],
@@ -663,6 +705,7 @@ fn deployed_system_from_nodes(
     }
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 fn current_unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -688,6 +731,7 @@ pub(crate) type ConfigUpdate = ConfigUpdateEvent;
 /// `GET /admin/manifest` — returns the active `IntegrityConfig` as JSON.
 /// This is the canonical way for connected clients to obtain the live topology
 /// without depending on a local `integrity.lock` file.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_get_manifest_handler(State(state): State<AppState>) -> Response {
     let config = state.runtime.load().config.clone();
     match serde_json::to_vec(&config) {
@@ -711,6 +755,7 @@ pub(crate) async fn admin_get_manifest_handler(State(state): State<AppState>) ->
 /// embedded boot manifest. Updates are accepted only when the new
 /// `config_version` is strictly greater than the running one — a defense
 /// against rollback / replay across the cluster.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_manifest_update_handler(
     State(state): State<AppState>,
     body: Bytes,
@@ -904,6 +949,7 @@ pub(crate) fn validate_integrity_config(mut config: IntegrityConfig) -> Result<I
 /// is the legitimate disaster-recovery payload and must load even if the asset
 /// blobs are still being rehydrated. The guarantee is enforced at the point the
 /// manifest is created, not at the point it is recovered.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) fn validate_route_asset_availability(
     config: &IntegrityConfig,
     manifest_path: &Path,
@@ -992,7 +1038,8 @@ fn validate_require_scopes(routes: &[IntegrityRoute]) -> Result<()> {
             None => {
                 return Err(anyhow!(
                     "Integrity Validation Failed: route `{}` is missing a `scopes` block \
-                     and `require_scopes` is enabled on this node",
+                     and `require_scopes` is enabled on this node; call `tachyon_suggest_scopes` \
+                     for a starting scopes configuration for this route",
                     route.path
                 ));
             }
@@ -1002,7 +1049,8 @@ fn validate_require_scopes(routes: &[IntegrityRoute]) -> Result<()> {
                     if scopes.allow_all {
                         return Err(anyhow!(
                             "Integrity Validation Failed: route `{}` resolves to allow-all scopes \
-                             and `require_scopes` is enabled on this node; add explicit scope patterns",
+                             and `require_scopes` is enabled on this node; add explicit scope patterns \
+                             — call `tachyon_suggest_scopes` for a starting scopes configuration for this route",
                             route.path
                         ));
                     }
@@ -2296,6 +2344,7 @@ pub(crate) fn decode_hex_array<const N: usize>(value: &str, label: &str) -> Resu
 // Smart deployment pipeline — bundle apply
 // =====================================================================
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BundleConflictResponseEntry {
@@ -2304,6 +2353,7 @@ pub(crate) struct BundleConflictResponseEntry {
     pub(crate) cluster_version: String,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BundleApplyResponse {
@@ -2315,12 +2365,14 @@ struct BundleApplyResponse {
     requires_resolution: bool,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct BundleManifestFields {
     pub(crate) config_payload: String,
     pub(crate) dependencies: Vec<BundleManifestDependency>,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct BundleManifestDependency {
     pub(crate) name: String,
@@ -2328,6 +2380,7 @@ pub(crate) struct BundleManifestDependency {
     pub(crate) source: Option<String>,
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn admin_manifest_bundle_handler(
     State(state): State<AppState>,
     body: Bytes,
@@ -2587,6 +2640,7 @@ pub(crate) async fn admin_manifest_bundle_handler(
     (StatusCode::OK, axum::Json(response)).into_response()
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) fn parse_bundle_manifest_yaml(yaml: &str) -> Result<BundleManifestFields, String> {
     let mut config_payload_lines: Vec<String> = Vec::new();
     let mut dependencies: Vec<BundleManifestDependency> = Vec::new();
@@ -2683,6 +2737,7 @@ pub(crate) fn parse_bundle_manifest_yaml(yaml: &str) -> Result<BundleManifestFie
     })
 }
 
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 fn strip_yaml_string(value: &str) -> String {
     let trimmed = value.trim();
     let trimmed = trimmed
@@ -2701,6 +2756,7 @@ fn strip_yaml_string(value: &str) -> String {
 /// In that situation the bundled asset would silently shadow a better
 /// available version, so the apply is halted and a 428 is returned to let the
 /// operator decide whether to use the cluster version or pin the local one.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) fn detect_dependency_conflicts(
     dependencies: &[BundleManifestDependency],
     cluster_versions: &std::collections::BTreeMap<String, String>,
@@ -2754,6 +2810,7 @@ pub(crate) fn detect_dependency_conflicts(
 /// Strips SemVer range operators (`^`, `~`, `>=`, `>`, `<=`, `<`, `=`) from
 /// the start of a version constraint string and returns the bare version
 /// portion if it parses as a valid `semver::Version`.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) fn extract_semver_version(constraint: &str) -> Option<String> {
     let stripped = constraint
         .trim()

@@ -58,18 +58,22 @@ async function navigateTo(page: Page, route: string): Promise<void> {
   await page.waitForTimeout(600);
 }
 
-// ── Policy-form panels that MUST show the badge ─────────────────────────────
+// ── Retired policy-form badge: runtime-backed panels MUST NOT show it ───────
+// Per openspec/specs/tachyon-ui-policy-form-badge/spec.md, the badge pattern
+// is retired: these panels are manifest-backed and no longer flagged as
+// policy-only.
 
-const POLICY_ROUTES: Array<{ route: string; panelTag: string }> = [
-  { route: "resilience",    panelTag: "tachyon-resilience-panel" },
+const RUNTIME_BACKED_ROUTES: Array<{ route: string; panelTag: string }> = [
+  { route: "resilience",      panelTag: "tachyon-resilience-panel" },
   { route: "identity-config", panelTag: "tachyon-identity-panel" },
-  { route: "rbac",          panelTag: "tachyon-rbac-panel" },
-  { route: "supply-chain",  panelTag: "tachyon-supply-chain-panel" },
-  { route: "fleet",         panelTag: "tachyon-fleet-panel" },
+  { route: "routing",         panelTag: "tachyon-routing-panel" },
+  { route: "ai",              panelTag: "tachyon-ai-panel" },
+  { route: "storage",         panelTag: "tachyon-storage-panel" },
+  { route: "observability",   panelTag: "tachyon-observability-panel" },
 ];
 
-for (const { route, panelTag } of POLICY_ROUTES) {
-  test(`${route} panel shows "Policy form" badge`, async ({ page }) => {
+for (const { route, panelTag } of RUNTIME_BACKED_ROUTES) {
+  test(`${route} panel does not show the retired "Policy form" badge`, async ({ page }) => {
     await installMocks(page);
     await page.goto("/");
     await authenticate(page);
@@ -79,9 +83,23 @@ for (const { route, panelTag } of POLICY_ROUTES) {
     await page.waitForTimeout(400);
     const panel = page.locator(panelTag);
 
-    // The badge must be present in the shadow DOM (Playwright pierces shadow roots).
-    const badge = panel.locator("tachyon-policy-form-badge");
-    await expect(badge).toHaveCount(1, { timeout: 5000 });
+    await expect(panel.locator("tachyon-policy-form-badge")).toHaveCount(0);
+  });
+}
+
+// ── Legacy policy-only panels are retired from navigation ───────────────────
+// These routes no longer exist in the component registry, so normalizeRoute()
+// silently falls back to the "dashboard" static panel (see TachyonAppShell).
+
+for (const route of ["rbac", "fleet", "supply-chain"]) {
+  test(`${route} route is retired — falls back to dashboard, not a panel`, async ({ page }) => {
+    await installMocks(page);
+    await page.goto("/");
+    await authenticate(page);
+    await navigateTo(page, route);
+
+    await expect(page.locator(`tachyon-${route}-panel`)).toHaveCount(0);
+    await expect(page.locator('[data-route-panel="dashboard"]')).toBeVisible({ timeout: 5000 });
   });
 }
 

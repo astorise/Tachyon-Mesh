@@ -557,6 +557,12 @@ jobs:
       matrix:
         features:
           - ""
+          # Since #310, `admin-plane` joined `default` — this bare
+          # `--no-default-features` entry now also builds/tests with no
+          # `/admin/*` surface (previously it only dropped `ring`). The
+          # dedicated worker-profile entry below is the realistic worker
+          # build (transport stack included); this one is the maximally
+          # minimal floor.
           - "--no-default-features"
           # "All CPU features": every feature except core-host/candle-cuda, which
           # pulls in cudarc and requires `nvcc` (validated separately by the
@@ -566,6 +572,14 @@ jobs:
           - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
+          # Worker data-plane profile (#310): `admin-plane` is in `default`, so
+          # dropping it requires `--no-default-features` plus the transport
+          # stack a real mesh member needs back (TLS, mTLS gateway, websocket
+          # mesh dispatch, rate limiting/resiliency). Asserts no `/admin/*`
+          # surface except enrollment bootstrap — see
+          # `worker_profile_completes_enrollment_bootstrap_with_no_admin_surface`
+          # in `core-host/src/host_core/tests/http_router.rs`.
+          - "--no-default-features --features ring,rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D dead_code"
@@ -628,6 +642,9 @@ jobs:
           - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
+          # Worker data-plane profile (#310) — see the matching comment on
+          # `feature-matrix-tests` above.
+          - "--no-default-features --features ring,rate-limit,resiliency,mtls,secrets-vault,websockets"
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D dead_code"
@@ -673,6 +690,7 @@ jobs:
             "--features ai-inference,"*)                               label="all" ;;
             "--features http3")                                        label="http3" ;;
             "--features rate-limit,resiliency,mtls,secrets-vault,websockets") label="security" ;;
+            "--no-default-features --features ring,"*)                 label="worker" ;;
             *)                                                         label="custom" ;;
           esac
           echo "label=${label}" >> "$GITHUB_OUTPUT"

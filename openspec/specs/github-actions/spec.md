@@ -119,7 +119,7 @@ The `publish-server-binaries` matrix SHALL include `windows-latest / x86_64-pc-w
 - **AND** uploads the zip as a release artifact
 
 ### Requirement: CI runs a dedicated feature-matrix test job across multiple feature flag combinations
-The CI workflow SHALL run a `feature-matrix-tests` job that tests `core-host` across at least five distinct feature flag combinations including default, `--no-default-features`, `--all-features`, `--features http3`, and a security bundle, uploading a release binary artifact for each combination.
+The CI workflow SHALL run a `feature-matrix-tests` job that tests `core-host` across at least six distinct feature flag combinations including default, `--no-default-features`, `--all-features`, `--features http3`, a security bundle, and a worker data-plane profile (`--no-default-features` plus the transport features a mesh member needs with `admin-plane` omitted), uploading a release binary artifact for each combination.
 
 #### Scenario: All feature combinations build and test successfully
 - **WHEN** the feature-matrix-tests job runs
@@ -129,6 +129,11 @@ The CI workflow SHALL run a `feature-matrix-tests` job that tests `core-host` ac
 #### Scenario: All-features combination installs FIPS build dependencies
 - **WHEN** the matrix entry with `--all-features` runs
 - **THEN** it installs `cmake nasm protobuf-compiler` via apt before building
+
+#### Scenario: Worker profile combination has no admin surface
+- **WHEN** the worker-profile matrix entry runs
+- **THEN** it builds and tests `core-host` with `admin-plane` disabled
+- **AND** the router-level test suite confirms `/admin/*` routes other than enrollment bootstrap are unreachable
 
 ### Requirement: CI includes a dedicated FIPS test job
 The CI workflow SHALL include a `fips-tests` job that installs FIPS build dependencies and validates `core-host --features fips` independently of the main `rust-ci` job.

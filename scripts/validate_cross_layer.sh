@@ -2,7 +2,14 @@
 set -euo pipefail
 
 client_file="tachyon-client/src/lib.rs"
-router_file="core-host/src/host_core/admin_plane.rs"
+# Enrollment bootstrap routes (start/poll) live in integrity_config.rs, not
+# admin_plane.rs, so they stay compiled when the `admin-plane` Cargo feature
+# is disabled (see the worker-dataplane-profile capability); everything else
+# under /admin/* is still declared in admin_plane.rs.
+router_files=(
+    "core-host/src/host_core/admin_plane.rs"
+    "core-host/src/host_core/integrity_config.rs"
+)
 ui_cargo="tachyon-ui/Cargo.toml"
 ui_main="tachyon-ui/src/main.rs"
 
@@ -15,7 +22,14 @@ while IFS= read -r entry; do
         continue
     fi
 
-    if grep -Fq "\"${path}\"" "${router_file}" || grep -Fq "\"${path}/" "${router_file}"; then
+    found=0
+    for router_file in "${router_files[@]}"; do
+        if grep -Fq "\"${path}\"" "${router_file}" || grep -Fq "\"${path}/" "${router_file}"; then
+            found=1
+            break
+        fi
+    done
+    if [[ "${found}" -eq 1 ]]; then
         continue
     fi
 
@@ -35,7 +49,14 @@ openapi_routes=(
     "/admin/iam/users"
 )
 for route in "${openapi_routes[@]}"; do
-    if ! grep -Fq "\"${route}\"" "${router_file}" && ! grep -Fq "\"${route}/" "${router_file}"; then
+    found=0
+    for router_file in "${router_files[@]}"; do
+        if grep -Fq "\"${route}\"" "${router_file}" || grep -Fq "\"${route}/" "${router_file}"; then
+            found=1
+            break
+        fi
+    done
+    if [[ "${found}" -eq 0 ]]; then
         echo "missing core-host route for OpenAPI contract: ${route}" >&2
         failures=$((failures + 1))
     fi

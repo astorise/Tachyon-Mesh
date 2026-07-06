@@ -1313,7 +1313,6 @@ dependencies = [
  "rcgen",
  "redb",
  "reqwest",
- "rustls-pemfile",
  "schemars 1.2.1",
  "semver",
  "serde",
@@ -3987,6 +3986,27 @@ name = "guest-call-legacy"
 version = "1.0.0"
 
 [[package]]
+name = "guest-chain-a"
+version = "1.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "guest-chain-b"
+version = "1.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "guest-chain-c"
+version = "1.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "guest-chat-ui"
 version = "0.1.0"
 dependencies = [
@@ -5213,6 +5233,15 @@ dependencies = [
  "log",
  "tendril",
  "web_atoms",
+]
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
 ]
 
 [[package]]
@@ -7343,15 +7372,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8318,7 +8338,6 @@ dependencies = [
  "pkcs8",
  "rand_core 0.6.4",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "spki",
@@ -9547,10 +9566,14 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
 ]

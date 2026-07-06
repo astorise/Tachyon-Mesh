@@ -733,6 +733,7 @@ static SCOPE_DENIAL_LIFETIME: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 /// Total scope denials recorded since process start, across all deployments and categories.
 /// Suitable for surfacing in the admin `/admin/metrics` JSON response.
+#[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) fn scope_denial_total_lifetime() -> u64 {
     SCOPE_DENIAL_LIFETIME.load(std::sync::atomic::Ordering::Relaxed)
 }

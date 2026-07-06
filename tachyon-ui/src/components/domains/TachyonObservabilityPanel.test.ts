@@ -26,6 +26,10 @@ function makeMetrics(overrides: Partial<{
   p99LatencyMs: number;
   queueDepth: number;
   scopeDenialTotal: number;
+  meshDispatch: {
+    totals: Array<{ mode: string; reason: string; total: number }>;
+    durations: Array<{ mode: string; count: number; avgLatencyMs: number }>;
+  };
 }> = {}) {
   return {
     source: "test-node",
@@ -34,6 +38,7 @@ function makeMetrics(overrides: Partial<{
     p99LatencyMs: 2.0,
     queueDepth: 0,
     scopeDenialTotal: 0,
+    meshDispatch: { totals: [], durations: [] },
     ...overrides,
   };
 }
@@ -209,5 +214,35 @@ describe("TachyonObservabilityPanel — E2E scope widget integration (task 6.4)"
     await vi.advanceTimersByTimeAsync(30_000);
     await flushAll();
     expect(vi.mocked(scopesController.readScopeMetrics).mock.calls.length).toBe(3);
+  });
+
+  it("shows mesh dispatch totals and latency aggregates", async () => {
+    mockInvokeForObservability({
+      meshDispatch: {
+        totals: [
+          { mode: "in_process", reason: "ok", total: 11 },
+          { mode: "in_process", reason: "saturated", total: 2 },
+          { mode: "tcp", reason: "saturated", total: 2 },
+        ],
+        durations: [
+          { mode: "in_process", count: 13, avgLatencyMs: 0.42 },
+          { mode: "tcp", count: 2, avgLatencyMs: 5.5 },
+        ],
+      },
+    });
+    vi.mocked(scopesController.readScopeMetrics).mockResolvedValue({ scopeDenialTotal: 0 });
+
+    const panel = document.createElement("tachyon-observability-panel");
+    document.body.appendChild(panel);
+    await flushAll();
+
+    const text = panel.shadowRoot!.textContent ?? "";
+    expect(text).toContain("Mesh Dispatch");
+    expect(text).toContain("faas_mesh_dispatch_total");
+    expect(text).toContain("in_process");
+    expect(text).toContain("11");
+    expect(text).toContain("0.42");
+    expect(text).toContain("tcp");
+    expect(text).toContain("5.50");
   });
 });
