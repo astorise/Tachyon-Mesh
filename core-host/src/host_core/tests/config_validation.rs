@@ -102,6 +102,10 @@ fn require_scopes_flag_rejects_missing_scopes_block() {
         msg.contains("scopes") || msg.contains("require_scopes"),
         "error should reference the missing scopes block; got: {msg}"
     );
+    assert!(
+        msg.contains("tachyon_suggest_scopes"),
+        "error should point operators at the remediation tool; got: {msg}"
+    );
 }
 
 #[test]
@@ -119,6 +123,10 @@ fn require_scopes_flag_rejects_allow_all_scopes() {
     assert!(
         msg.contains("allow-all") || msg.contains("scopes"),
         "error should reference allow-all; got: {msg}"
+    );
+    assert!(
+        msg.contains("tachyon_suggest_scopes"),
+        "error should point operators at the remediation tool; got: {msg}"
     );
 }
 
