@@ -261,6 +261,17 @@ produce code with no way to execute, which is worse than not writing it.
   now covered by CPU-only regression tests
   (`paged_attention_pool_is_capped_at_one_sequence_even_with_abundant_free_vram`)
   instead of only being discoverable on real GPU hardware.
+- **[Risk] Hardcoded kernel constants can silently violate a real CUDA
+  kernel's requirements** — **this also actually happened.** After fixing
+  the OOM above, the very next `cuda-quality` run got past sizing but
+  failed inside the forward pass itself:
+  `candle_flash_attn`'s paged kernel hard-requires `page_block_size % 32 ==
+  0`, and the original `PAGED_ATTENTION_PAGE_BLOCK_SIZE = 16` violated it —
+  again, only discoverable on real hardware, since the CPU build never
+  exercises the kernel at all. Fixed by changing the constant to `32` and
+  adding a `const _: () = assert!(PAGED_ATTENTION_PAGE_BLOCK_SIZE.is_multiple_of(32),
+  ..)` compile-time check, so reintroducing this exact value fails the
+  build instead of needing another real-GPU round-trip to catch.
 - **[Risk] Renovate cannot bump the fork automatically** (pinned by tag,
   flagged in the (now superseded) audit doc as a standing gap). →
   Mitigation: the tag bump for this change is manual and reviewed like the
