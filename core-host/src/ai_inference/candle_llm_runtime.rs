@@ -4017,6 +4017,127 @@ fn fixture_weights() -> anyhow::Result<HashMap<String, Tensor>> {
     Ok(tensors)
 }
 
+/// Head-dim-compatible tiny Llama fixture for CUDA-only paged-attention
+/// tests. `candle_flash_attn`'s paged kernel additionally requires head
+/// sizes to be a multiple of 8 ("only supports head sizes that are a
+/// multiple of 8 (got 4)") — a third real constraint caught only by a real
+/// `cuda-quality` run, since the shared `FIXTURE_HIDDEN_SIZE`/`FIXTURE_NUM_HEADS`
+/// (head_dim 4) never exercises this kernel via the CPU/dense tests. Doubles
+/// hidden_size to 16 (head_dim 8) and reuses every other tiny-fixture
+/// dimension; a separate function rather than changing `FIXTURE_HIDDEN_SIZE`
+/// itself, which every architecture's fixture (Qwen, Gemma, Phi, DeepSeek,
+/// Mixtral, NVFP4 — ~180 other tests) depends on.
+#[cfg(test)]
+fn write_tachyon_tiny_paged_attention_fixture(root: &Path) -> anyhow::Result<()> {
+    const HIDDEN: usize = 16;
+    const NUM_HEADS: usize = 2;
+    fs::create_dir_all(root)?;
+    fs::write(
+        root.join(CONFIG_JSON),
+        serde_json::json!({
+            "model_type": LLAMA_MODEL_TYPE,
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": HIDDEN,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_attention_heads": NUM_HEADS,
+            "num_key_value_heads": NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null
+        })
+        .to_string(),
+    )?;
+    fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON)?;
+
+    let inter = FIXTURE_INTERMEDIATE_SIZE;
+    let head_dim = HIDDEN / NUM_HEADS;
+    let q = NUM_HEADS * head_dim;
+    let kv = NUM_HEADS * head_dim;
+    let mut tensors = HashMap::new();
+    let mut seed = 1u64;
+    let mut dense =
+        |tensors: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]| -> anyhow::Result<()> {
+            let len: usize = dims.iter().product();
+            let values = deterministic_fill(seed, len);
+            seed = seed.wrapping_add(1);
+            tensors.insert(
+                name.to_owned(),
+                Tensor::from_vec(values, dims.to_vec(), &Device::Cpu)?,
+            );
+            Ok(())
+        };
+    let norm = |tensors: &mut HashMap<String, Tensor>, name: &str| -> anyhow::Result<()> {
+        tensors.insert(
+            name.to_owned(),
+            Tensor::from_vec(vec![1f32; HIDDEN], (HIDDEN,), &Device::Cpu)?,
+        );
+        Ok(())
+    };
+
+    dense(
+        &mut tensors,
+        "model.embed_tokens.weight",
+        &[FIXTURE_VOCAB_SIZE, HIDDEN],
+    )?;
+    for layer in 0..FIXTURE_NUM_LAYERS {
+        let prefix = format!("model.layers.{layer}");
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            &[q, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            &[kv, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            &[kv, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            &[HIDDEN, q],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            &[inter, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.mlp.up_proj.weight"),
+            &[inter, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            &[HIDDEN, inter],
+        )?;
+        norm(&mut tensors, &format!("{prefix}.input_layernorm.weight"))?;
+        norm(
+            &mut tensors,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+        )?;
+    }
+    norm(&mut tensors, "model.norm.weight")?;
+    dense(
+        &mut tensors,
+        "lm_head.weight",
+        &[FIXTURE_VOCAB_SIZE, HIDDEN],
+    )?;
+
+    candle_core::safetensors::save(&tensors, root.join(MODEL_SAFETENSORS))?;
+    Ok(())
+}
+
 #[cfg(test)]
 fn write_tachyon_tiny_qwen_fixture(
     root: &Path,
@@ -6466,7 +6587,10 @@ mod tests {
     #[cfg(feature = "candle-cuda")]
     #[test]
     fn single_device_llama_paged_attention_generates_a_real_decode_on_cuda() {
-        let dir = write_fixture_dir("paged-attn-cuda");
+        let dir = write_fixture_dir_with(
+            "paged-attn-cuda",
+            write_tachyon_tiny_paged_attention_fixture,
+        );
         let strategy = HardwareStrategy {
             paged_attention: true,
             ..Default::default()
