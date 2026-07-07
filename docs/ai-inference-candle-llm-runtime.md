@@ -101,14 +101,38 @@ upstream Candle commit, run the Candle/Tachyon AI inference checks, publish a ne
 `Cargo.lock` together. The fork includes Candle's paged flash-attn API
 (`flash_attn_varlen_paged_windowed`) and an additive `Cache::set_paged_kv`/
 `paged_kv` per-layer seam in `candle-transformers::models::llama` (tag
-`tachyon-v0.11.0-3`, [astorise/candle#8](https://github.com/astorise/candle/issues/8)),
-but Tachyon does not yet own the required runtime state to use it: a CUDA KV
-block pool, per-sequence block tables, and block-granular allocation/free
-during continuous batching (tracked by `wire-paged-attention-decode-path`,
-which also depends on this doc's "Single-Device GPU Execution" section above
-for its CUDA baseline).
+`tachyon-v0.11.0-3`, [astorise/candle#8](https://github.com/astorise/candle/issues/8)).
 
-Model bindings can declare the future mode with:
+`hardware_strategy.paged_attention: true` is enabled for a **Llama checkpoint
+on a CUDA device** (see "Single-Device GPU Execution" above for that
+baseline): `core-host/src/ai_inference/paged_kv.rs` owns a `PagedBlockPool`
+(fixed-size free-list allocator) and a per-request `SequenceBlockTable`;
+`candle_llm_runtime.rs` allocates one `(key_cache, value_cache)` tensor pair
+per transformer layer, sized from real NVML free-VRAM telemetry (a fixed
+heuristic — 50% of free VRAM remaining after weight load, with a floor of
+one full-length sequence at the checkpoint's `max_position_embeddings` —
+not yet a configurable `hardware_strategy` knob), and attaches
+`cache.set_paged_kv(..)` for every layer on every forward step. Every other
+architecture, and any non-CUDA device or build without `candle-cuda`, still
+returns the existing typed unsupported-model error instead of silently
+falling back to the contiguous per-request KV cache.
+
+**BF16, not F32**: `candle-flash-attn`'s kernels only support F16/BF16 (an
+industry-standard constraint of fused attention kernels, not specific to
+Tachyon), so a paged-attention Llama deployment loads its weights and KV
+cache in BF16 instead of the contiguous path's F32. Generation is a real,
+deterministic decode (repeating the same greedy request yields identical
+output), but is not expected to be bit-identical to the F32 contiguous path.
+
+Not yet supported in combination with paged attention: speculative decoding
+(falls back to plain generation rather than erroring, since verification
+would otherwise dtype-mismatch against the BF16 model) and continuous
+batching across concurrent sequences (each request gets its own block table
+today; the shared pool is reused across requests, but only one sequence is
+in flight per forward pass). LoRA adapters are unaffected either way — they
+already reload an independent CPU/F32 model per request.
+
+Model bindings can opt in with:
 
 ```json
 {
@@ -117,10 +141,6 @@ Model bindings can declare the future mode with:
   }
 }
 ```
-
-Until the block allocator and block-table path are wired, the Candle LLM runtime
-rejects that setting with a typed unsupported-model error instead of silently
-falling back to the contiguous per-request KV cache.
 
 ## CUDA Graphs and FlashInfer Status
 

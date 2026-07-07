@@ -12,13 +12,8 @@
 //! leaving allocation/eviction policy in `core-host` per that design's
 //! Decision 1.
 //!
-//! Wiring this into the load/decode path (attaching a `PagedKvCache` via
-//! `Cache::set_paged_kv` and growing/freeing a `SequenceBlockTable` per
-//! request) is `wire-paged-attention-decode-path`'s tasks.md Section 3, not
-//! yet done — nothing here is called from `candle_llm_runtime.rs` yet, hence
-//! the module-wide `allow(dead_code)` below rather than `#[allow(dead_code)]`
-//! disappearing item by item as Section 3 lands.
-#![allow(dead_code)]
+//! `candle_llm_runtime.rs` wires this in for Llama on CUDA
+//! (`wire-paged-attention-decode-path`'s tasks.md Section 3).
 
 use candle_core::{Device, Result as CandleResult, Tensor};
 use std::fmt;
