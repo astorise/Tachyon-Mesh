@@ -245,11 +245,22 @@ produce code with no way to execute, which is worse than not writing it.
   change claimed to complete before it existed, same pattern as
   `gpu-accelerated-inference-execution`'s "superseded/deferred" task notes.
 - **[Risk] Paged KV storage changes the memory-sizing story** (a block pool
-  reserves VRAM up front instead of growing per-request). → Mitigation:
-  size the pool from an explicit config knob with a documented default,
-  fail load with a typed error if the requested pool doesn't fit reported
-  free VRAM (reuses the existing NVML free-VRAM telemetry from the
-  tensor-parallel path).
+  reserves VRAM up front instead of growing per-request) — **this actually
+  happened and OOM'd a real GPU.** The first `size_paged_kv_pool` sized the
+  pool to whatever fit the *entire* free-VRAM budget (a fixed 50% fraction)
+  and omitted `num_hidden_layers` from the per-block byte cost; for the tiny
+  CI test fixture against a real GPU with gigabytes nominally free, that
+  computed millions of blocks, and `single_device_llama_paged_attention_generates_a_real_decode_on_cuda`
+  failed on `cuda-quality` with `CUDA_ERROR_OUT_OF_MEMORY` — caught only by
+  the real hardware run, not by CPU compilation or unit tests. Fixed by
+  capping the pool at exactly `min_blocks` (one full-length sequence; only
+  one sequence is ever in flight per model until continuous batching lands)
+  regardless of how much more VRAM is free, and including
+  `num_hidden_layers` in the cost. The sizing arithmetic was also extracted
+  into a pure `size_paged_kv_pool` function so this exact class of bug is
+  now covered by CPU-only regression tests
+  (`paged_attention_pool_is_capped_at_one_sequence_even_with_abundant_free_vram`)
+  instead of only being discoverable on real GPU hardware.
 - **[Risk] Renovate cannot bump the fork automatically** (pinned by tag,
   flagged in the (now superseded) audit doc as a standing gap). →
   Mitigation: the tag bump for this change is manual and reviewed like the
