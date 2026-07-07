@@ -7,6 +7,7 @@ unsound = "workspace"
 yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side-channel applies to RSA private-key decryption; system-faas-node-registry uses rsa only for RS256 JWT signature VERIFICATION with public keys (no private-key ops), so it is not exploitable here. No fixed rsa release is available yet." },
+    { id = "RUSTSEC-2026-0204", reason = "Invalid-pointer dereference in crossbeam-epoch's fmt::Pointer impl for Atomic/Shared, reached only via Debug/Display formatting of those types; Tachyon's dependency tree never formats them. Remove once a fixed crossbeam-epoch (advisory says >=0.9.20) is picked up." },
 ]
 
 [licenses]
