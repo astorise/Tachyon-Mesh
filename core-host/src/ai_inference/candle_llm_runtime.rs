@@ -33,7 +33,8 @@ use crate::{GpuDistribution, HardwareStrategy};
 use super::expert_parallel_llama::ExpertParallelLlama;
 use super::modelopt_nvfp4;
 use super::paged_kv::{
-    build_block_table_tensor, build_cumulative_seqlens_tensor, PagedBlockPool, SequenceBlockTable,
+    build_block_table_tensor, build_cumulative_seqlens_tensor, PagedBlockPool, PagedKvError,
+    SequenceBlockTable,
 };
 use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
@@ -489,6 +490,56 @@ fn paged_llama_forward(
 /// sequence per model (continuous batching, which shares the pool across
 /// many concurrent sequences, is a separate follow-up), and fails the load
 /// with a typed error if the budget can't fit even that.
+const PAGED_ATTENTION_PAGE_BLOCK_SIZE: usize = 16;
+
+/// Sizes the shared paged-KV block pool. Pure arithmetic (no device/tensor
+/// allocation), so this is unit-testable on CPU independent of real NVML
+/// telemetry — see `paged_attention_pool_is_capped_at_one_sequence_even_with_abundant_free_vram`,
+/// a regression test for a real bug this exact function used to have (an
+/// omitted `num_hidden_layers` factor plus sizing to the *entire* budget
+/// instead of just what one sequence needs OOM'd a real GPU on a tiny test
+/// fixture that had gigabytes of nominally "free" VRAM to claim).
+///
+/// Only one sequence is ever in flight per model today (continuous
+/// batching, which would benefit from a larger shared pool, is a separate
+/// follow-up — issue #312 step 4), so the pool is capped at exactly
+/// `min_blocks` (one full-length sequence at `config.max_position_embeddings`)
+/// regardless of how much more VRAM is free, rather than claiming whatever
+/// fits the entire budget.
+fn size_paged_kv_pool(
+    config: &Config,
+    dtype: DType,
+    free_vram_bytes: u64,
+) -> Result<PagedBlockPool, PagedKvError> {
+    const FREE_VRAM_BUDGET_FRACTION: f64 = 0.5;
+
+    let head_dim = config.hidden_size / config.num_attention_heads;
+    // Cost of one logical block across *every* transformer layer: `layer_kv`
+    // allocates one (key_cache, value_cache) pair per layer, each sized by
+    // `num_blocks`, so a block's true footprint is this per-layer cost times
+    // `num_hidden_layers`, not just one layer's worth.
+    let bytes_per_block = 2u64 // key + value
+        * PAGED_ATTENTION_PAGE_BLOCK_SIZE as u64
+        * config.num_key_value_heads as u64
+        * head_dim as u64
+        * dtype.size_in_bytes() as u64
+        * config.num_hidden_layers as u64;
+    let min_blocks = config
+        .max_position_embeddings
+        .div_ceil(PAGED_ATTENTION_PAGE_BLOCK_SIZE);
+
+    let min_blocks_bytes = bytes_per_block.saturating_mul(min_blocks as u64);
+    let budget_bytes =
+        ((free_vram_bytes as f64 * FREE_VRAM_BUDGET_FRACTION) as u64).min(min_blocks_bytes);
+
+    PagedBlockPool::try_new_within_budget(
+        PAGED_ATTENTION_PAGE_BLOCK_SIZE,
+        bytes_per_block,
+        budget_bytes,
+        min_blocks,
+    )
+}
+
 fn build_paged_attention_runtime(
     alias: &str,
     root: &Path,
@@ -496,43 +547,28 @@ fn build_paged_attention_runtime(
     device: &Device,
     dtype: DType,
 ) -> Result<PagedAttentionRuntime, CandleLlmError> {
-    const PAGE_BLOCK_SIZE: usize = 16;
-    const FREE_VRAM_BUDGET_FRACTION: f64 = 0.5;
     const CUDA_ORDINAL_DEVICE_ID: u32 = 1; // see discover_cluster_topology: ordinal 0 -> device_id 1
 
     let head_dim = config.hidden_size / config.num_attention_heads;
-    let bytes_per_block = 2u64 // key + value
-        * PAGE_BLOCK_SIZE as u64
-        * config.num_key_value_heads as u64
-        * head_dim as u64
-        * dtype.size_in_bytes() as u64;
-    let min_blocks = config.max_position_embeddings.div_ceil(PAGE_BLOCK_SIZE);
-
     let free_vram_bytes = discover_cluster_topology()
         .devices
         .iter()
         .find(|info| info.device_id == CUDA_ORDINAL_DEVICE_ID)
         .map(|info| info.free_vram_bytes)
         .unwrap_or(0);
-    let budget_bytes = (free_vram_bytes as f64 * FREE_VRAM_BUDGET_FRACTION) as u64;
-
-    let pool = PagedBlockPool::try_new_within_budget(
-        PAGE_BLOCK_SIZE,
-        bytes_per_block,
-        budget_bytes,
-        min_blocks,
-    )
-    .map_err(|error| CandleLlmError::UnsupportedModel {
-        alias: alias.to_owned(),
-        path: root.to_path_buf(),
-        detail: format!("paged_attention KV cache pool could not be sized: {error}"),
+    let pool = size_paged_kv_pool(config, dtype, free_vram_bytes).map_err(|error| {
+        CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: format!("paged_attention KV cache pool could not be sized: {error}"),
+        }
     })?;
 
     let num_blocks = pool.total_blocks();
     let alloc_layer_kv = || -> candle_core::Result<(Tensor, Tensor)> {
         let shape = (
             num_blocks,
-            PAGE_BLOCK_SIZE,
+            PAGED_ATTENTION_PAGE_BLOCK_SIZE,
             config.num_key_value_heads,
             head_dim,
         );
@@ -555,7 +591,7 @@ fn build_paged_attention_runtime(
     Ok(PagedAttentionRuntime {
         pool: Mutex::new(pool),
         layer_kv,
-        page_block_size: PAGE_BLOCK_SIZE,
+        page_block_size: PAGED_ATTENTION_PAGE_BLOCK_SIZE,
     })
 }
 
@@ -6309,6 +6345,74 @@ mod tests {
             "cuda-resident Llama generation must not be empty/mocked"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // Regression test for a real bug caught by `cuda-quality` on real GPU
+    // hardware: `size_paged_kv_pool` used to omit `num_hidden_layers` from
+    // its byte-per-block cost, and sized the pool to whatever fit the
+    // *entire* free-VRAM budget instead of just what one sequence needs.
+    // For the tiny fixture's config (hidden_size 8, 2 heads, 2 layers) that
+    // computed `max_blocks` in the millions given a real GPU's worth of
+    // free VRAM, and the resulting multi-gigabyte allocation attempt OOM'd
+    // a real CUDA device that easily had room for the tiny model's actual
+    // weights. This test runs on CPU (no GPU/candle-cuda needed): it feeds a
+    // large `free_vram_bytes` and asserts the pool still comes out capped at
+    // exactly one full-length sequence's worth of blocks.
+    #[test]
+    fn paged_attention_pool_is_capped_at_one_sequence_even_with_abundant_free_vram() {
+        let llama_config: LlamaConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null
+        }))
+        .expect("fixture-shaped JSON should deserialize as LlamaConfig");
+        let config = llama_config.into_config(false);
+
+        // A generously large free-VRAM figure (16 GiB) that would size the
+        // pool into the millions of blocks under the old (buggy) sizing.
+        let abundant_free_vram_bytes = 16u64 * 1024 * 1024 * 1024;
+        let pool = size_paged_kv_pool(&config, DType::BF16, abundant_free_vram_bytes)
+            .expect("a tiny model's one-sequence pool must fit comfortably in 16 GiB");
+
+        let expected_min_blocks =
+            FIXTURE_MAX_POSITION_EMBEDDINGS.div_ceil(PAGED_ATTENTION_PAGE_BLOCK_SIZE);
+        assert_eq!(
+            pool.total_blocks(),
+            expected_min_blocks,
+            "pool must be capped at one sequence's worth of blocks, not whatever the free-VRAM budget allows"
+        );
+    }
+
+    #[test]
+    fn paged_attention_pool_sizing_fails_closed_when_even_one_sequence_does_not_fit() {
+        let llama_config: LlamaConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null
+        }))
+        .expect("fixture-shaped JSON should deserialize as LlamaConfig");
+        let config = llama_config.into_config(false);
+
+        size_paged_kv_pool(&config, DType::BF16, 0)
+            .expect_err("zero free VRAM must not fit even one sequence's worth of blocks");
     }
 
     // Holds on every build (with or without `candle-cuda`): only a Llama
