@@ -490,7 +490,19 @@ fn paged_llama_forward(
 /// sequence per model (continuous batching, which shares the pool across
 /// many concurrent sequences, is a separate follow-up), and fails the load
 /// with a typed error if the budget can't fit even that.
-const PAGED_ATTENTION_PAGE_BLOCK_SIZE: usize = 16;
+// `candle_flash_attn`'s paged kernel hard-requires `page_block_size % 32 == 0`
+// (checked at runtime in candle-flash-attn/src/lib.rs) — 32 is the smallest
+// valid value, minimizing memory waste for the single-in-flight-sequence
+// scope this runtime supports today. The `const` assertion below turns a
+// violation into a compile error instead of a real-GPU-only runtime failure
+// (this exact mistake — 16, not a multiple of 32 — previously only surfaced
+// on a real `cuda-quality` run: "paged flash-attn requires page_block_size
+// to be a multiple of 32").
+const PAGED_ATTENTION_PAGE_BLOCK_SIZE: usize = 32;
+const _: () = assert!(
+    PAGED_ATTENTION_PAGE_BLOCK_SIZE.is_multiple_of(32),
+    "paged flash-attn requires page_block_size to be a multiple of 32"
+);
 
 /// Sizes the shared paged-KV block pool. Pure arithmetic (no device/tensor
 /// allocation), so this is unit-testable on CPU independent of real NVML
