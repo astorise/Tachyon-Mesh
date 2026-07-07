@@ -159,6 +159,39 @@ originally assumed before this GPU was discovered.
 down to the cases that still reject (non-Llama architecture, non-CUDA
 device); a new CUDA-gated test covers the now-enabled Llama+CUDA case.
 
+### 5. Paged attention requires BF16, not F32 (discovered starting Section 3)
+`candle-flash-attn`'s CUDA dispatch is exhaustive over exactly two dtypes —
+`match q.dtype() { F16 => .., BF16 => .., dt => bail!("flash-attn is only
+supported for f16/bf16 ({dt:?})") }` — every kernel file in the crate is
+named `*_fp16_*`/`*_bf16_*`, none `*_fp32_*`. The single-device Llama path
+(`VarBuilder`, `Cache`) loads/computes in F32 unconditionally today. This
+means enabling paged attention isn't just "attach a block table" — it
+requires switching the model's working dtype for a paged deployment, the
+same constraint every real paged-attention implementation has (vLLM,
+TensorRT-LLM also require FP16/BF16 for their fused attention kernels; this
+isn't a corner cut specific to Tachyon).
+
+`load_safetensors` now selects `DType::BF16` (over `DType::F16`, for its
+wider exponent range / better numerical stability for LLM inference,
+matching modern industry default) for the `VarBuilder` and `Cache` only
+when `architecture == Llama && strategy.paged_attention`; every other
+combination stays `F32`, byte-for-byte unchanged. `Cache::new`'s rotary
+cos/sin precompute and `candle_nn::rotary_emb::rope` already parametrize
+over `dtype` generically (no upstream change needed for that part — only
+the new `PagedKvCache` seam itself required a fork change). The forward
+closure that attaches `cache.set_paged_kv` converts the model's BF16 logits
+back to `F32` before they reach the shared sampling/FSM-masking pipeline,
+which assumes `F32` throughout (`mask_row_for_fsm`'s `to_vec1::<f32>()`
+would otherwise error on a BF16 tensor).
+
+**Consequence for the "matches the non-paged path's output" test goal**:
+BF16 vs. F32 will not produce bit-identical logits (precision loss
+compounds over decode steps), so Task 4.2's test proves a real, non-empty,
+*deterministic* decode (repeating the same greedy request against the
+shared block pool yields identical output) rather than exact numerical
+parity with the F32 dense path — the same relaxation the NVFP4 dequantized
+forward-pass test already accepted for a different precision trade-off.
+
 ## Newly discovered blocker (found while starting implementation)
 
 Section 3's premise — "attach paged KV to a Llama binding on a CUDA device"

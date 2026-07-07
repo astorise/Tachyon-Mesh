@@ -29,5 +29,13 @@ When a model deployment sets `hardware_strategy.paged_attention: true`, the runt
 - **AND** a Llama model binding requesting a CUDA device sets `hardware_strategy.paged_attention: true`
 - **WHEN** the Candle LLM runtime loads the binding
 - **THEN** the load succeeds and decode uses the block-paged attention path
+- **AND** the model's weights and KV cache load in BF16 rather than the contiguous path's F32, because the paged flash-attention kernel only supports F16/BF16
 - **AND** sequence admission and eviction operate at block granularity rather than reallocating a contiguous KV cache per request
-- **AND** generation output is a real decode over the loaded weights, not a mock or approximation of the contiguous path's output
+- **AND** generation output is a real decode over the loaded weights (not a mock), consistent (repeated identical greedy requests against the same loaded binding produce identical output) though not necessarily bit-identical to the F32 contiguous path given the BF16 precision difference
+
+#### Scenario: PagedAttention KV pool sizing fails closed when the budget can't fit one full sequence
+- **GIVEN** a Llama model binding on a CUDA device sets `hardware_strategy.paged_attention: true`
+- **AND** the device's free VRAM (after the model's weights are loaded) cannot fit enough paged KV blocks to hold one sequence of the checkpoint's `max_position_embeddings` length
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming the sizing shortfall
+- **AND** no paged KV block pool or per-layer tensors are left allocated

@@ -374,6 +374,13 @@ jobs:
       - name: Run single-device Llama CUDA execution proof
         run: cargo test -p core-host --features candle-cuda single_device_llama_executes_on_a_real_cuda_device -- --nocapture
 
+      # Proves hardware_strategy.paged_attention (wire-paged-attention-decode-path)
+      # actually attaches cache.set_paged_kv and runs a real decode through
+      # flash_attn_varlen_paged_windowed on this runner's GPU, including a
+      # second request reusing the same shared block pool.
+      - name: Run paged-attention CUDA execution proof
+        run: cargo test -p core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
+
       - name: Fetch CUTLASS headers
         if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
         run: git clone --depth 1 --branch v4.3.5 https://github.com/NVIDIA/cutlass.git .ci-cutlass
