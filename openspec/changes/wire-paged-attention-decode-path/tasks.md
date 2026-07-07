@@ -9,7 +9,7 @@ engines reach real CUDA, and they use their own duplicated cache types, not
 `candle_transformers::models::llama::Cache` (the type the new `set_paged_kv`
 seam was added to). See `design.md`'s "Newly discovered blocker" section.
 
-- [ ] 0.1 Land `openspec/changes/enable-single-device-llama-cuda-execution/` (a separate, narrower change scoped to just the CUDA device baseline for single-device Llama, no paged attention) on `main`. Do not attach `cache.set_paged_kv` to a load path that can never construct a CUDA device — Sections 3+ below are blocked until that change's Task 1 (device resolution) and Task 2 (generate-time device threading) are done.
+- [x] 0.1 Landed: [astorise/Tachyon-Mesh#341](https://github.com/astorise/Tachyon-Mesh/pull/341) merged to `main` 2026-07-07. Section 3+ (attaching `cache.set_paged_kv`) can now build on a real CUDA device for single-device Llama.
 
 ## 1. External prerequisite (astorise/candle fork, separate repository)
 
