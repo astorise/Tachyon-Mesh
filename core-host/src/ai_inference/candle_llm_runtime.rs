@@ -355,7 +355,15 @@ enum LoadedModel {
 /// architectures are added here without leaking their Candle model/cache types
 /// into request parsing, sampling, stop handling, or streaming.
 enum SingleDeviceBackend {
-    Llama { model: Llama, config: Config },
+    /// `device` is the device the weights were actually loaded onto: `Cpu`
+    /// unless `enable-single-device-llama-cuda-execution`'s gate selected a
+    /// real CUDA device for this checkpoint. Every other variant here stays
+    /// `Cpu`-only, so only `Llama` carries this field.
+    Llama {
+        model: Llama,
+        config: Config,
+        device: Device,
+    },
     Qwen2(Mutex<Qwen2Model>),
     Qwen3(Mutex<Qwen3Model>),
     Qwen3Moe(Mutex<Qwen3MoeModel>),
@@ -383,7 +391,7 @@ impl SingleDeviceBackend {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<(), CandleLlmError> {
         match self {
-            Self::Llama { model, config } => {
+            Self::Llama { model, config, .. } => {
                 let mut cache = Cache::new(true, DType::F32, config, device).map_err(|error| {
                     runtime.execution_error(format!("failed to build KV cache: {error}"))
                 })?;
@@ -505,7 +513,7 @@ impl SingleDeviceBackend {
 
     fn last_logits(&self, input: &Tensor, device: &Device) -> Tensor {
         match self {
-            Self::Llama { model, config } => {
+            Self::Llama { model, config, .. } => {
                 let mut cache =
                     Cache::new(true, DType::F32, config, device).expect("cache should build");
                 model
@@ -569,6 +577,22 @@ impl SingleDeviceBackend {
                     .forward(input, 0)
                     .expect("DeepSeek forward pass should run")
             }
+        }
+    }
+
+    /// The device this backend's weights were actually loaded onto. `Cpu` for
+    /// every architecture except a Llama checkpoint that
+    /// `load_safetensors` resolved a real CUDA device for.
+    fn device(&self) -> Device {
+        match self {
+            Self::Llama { device, .. } => device.clone(),
+            Self::Qwen2(_)
+            | Self::Qwen3(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Phi3(_)
+            | Self::DeepSeek(_) => Device::Cpu,
         }
     }
 }
@@ -1028,13 +1052,19 @@ impl CandleLlmRuntime {
             });
         }
 
-        // The single-device path remains CPU-only in this runtime (GPU
-        // execution of the dense path is the separate
-        // `gpu-accelerated-inference-execution` change), so a GPU request on a
-        // `single` deployment still returns the existing typed error. A
-        // non-`single` strategy resolves its devices from the validated plan
-        // instead, so it does not go through this check.
-        if strategy.distribution_mode == GpuDistribution::Single && requested_device != "cpu" {
+        // The single-device path executes on a real CUDA device only for a
+        // Llama checkpoint on a `candle-cuda` build (see
+        // `enable-single-device-llama-cuda-execution`); every other
+        // architecture, or any build without that feature, still returns the
+        // existing typed error for a non-`cpu` request. A non-`single`
+        // strategy resolves its devices from the validated plan instead, so
+        // it does not go through this check.
+        let single_device_cuda_supported =
+            cfg!(feature = "candle-cuda") && architecture == ModelArchitecture::Llama;
+        if strategy.distribution_mode == GpuDistribution::Single
+            && requested_device != "cpu"
+            && !single_device_cuda_supported
+        {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
@@ -1069,7 +1099,7 @@ impl CandleLlmRuntime {
 
         let (inner, limits) = if strategy.distribution_mode == GpuDistribution::Single {
             match format {
-                ModelFormat::Safetensors => Self::load_safetensors(alias, root)?,
+                ModelFormat::Safetensors => Self::load_safetensors(alias, root, requested_device)?,
                 ModelFormat::Gguf => Self::load_gguf(alias, root)?,
             }
         } else {
@@ -1091,9 +1121,18 @@ impl CandleLlmRuntime {
 
     /// Load a registered Hugging Face safetensors architecture from
     /// `config.json` plus single-file or sharded weights.
+    ///
+    /// `requested_device` only ever selects a non-`cpu` device here for a
+    /// Llama checkpoint: `try_load_with_topology`'s single-device gate has
+    /// already rejected every other architecture/build combination before
+    /// this is reached, so `Device::cuda_if_available` is only called when
+    /// that gate already guarantees a `candle-cuda` build and a Llama
+    /// checkpoint. Every other architecture keeps loading on `Device::Cpu`
+    /// unconditionally, unchanged.
     fn load_safetensors(
         alias: &str,
         root: &Path,
+        requested_device: &str,
     ) -> Result<(LoadedModel, GenerationLimits), CandleLlmError> {
         let raw_config =
             fs::read(root.join(CONFIG_JSON)).map_err(|error| CandleLlmError::InvalidComponent {
@@ -1105,7 +1144,16 @@ impl CandleLlmRuntime {
         let architecture = inspect_hf_architecture(alias, root, &raw_config)?;
         let eos_tokens = generation_eos_token_ids(alias, root, &raw_config)?;
         let weight_paths = safetensors_paths(alias, root)?;
-        let device = Device::Cpu;
+        let device = if architecture == ModelArchitecture::Llama && requested_device != "cpu" {
+            Device::cuda_if_available(0).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            })?
+        } else {
+            Device::Cpu
+        };
         // SAFETY: the model files live in the (uploaded) model directory and are
         // not mutated for the lifetime of the mmap held by the VarBuilder/model.
         let var_builder =
@@ -1138,7 +1186,11 @@ impl CandleLlmRuntime {
                 let eos_tokens = eos_token_ids(&config);
                 let model = Llama::load(var_builder, &config).map_err(invalid_weights)?;
                 (
-                    SingleDeviceBackend::Llama { model, config },
+                    SingleDeviceBackend::Llama {
+                        model,
+                        config,
+                        device: device.clone(),
+                    },
                     limits,
                     eos_tokens,
                 )
@@ -1398,7 +1450,11 @@ impl CandleLlmRuntime {
             }
         })?;
         let inner = LoadedModel::Safetensors {
-            backend: SingleDeviceBackend::Llama { model, config },
+            backend: SingleDeviceBackend::Llama {
+                model,
+                config,
+                device: device.clone(),
+            },
             eos_tokens,
         };
 
@@ -2114,7 +2170,13 @@ impl CandleLlmRuntime {
                 self.execution_error(format!("failed to build input tensor: {error}"))
             })?;
         match &*self.inner {
-            LoadedModel::Safetensors { backend, .. } => Ok(backend.last_logits(&input, &device)),
+            LoadedModel::Safetensors { backend, .. } => {
+                let backend_device = backend.device();
+                let input = input.to_device(&backend_device).map_err(|error| {
+                    self.execution_error(format!("failed to move input to device: {error}"))
+                })?;
+                Ok(backend.last_logits(&input, &backend_device))
+            }
             LoadedModel::Gguf { model, .. } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
@@ -2198,7 +2260,10 @@ impl CandleLlmRuntime {
             LoadedModel::Safetensors {
                 backend,
                 eos_tokens,
-            } => backend.decode(self, prompt_ids, request, eos_tokens, &device, on_token),
+            } => {
+                let device = backend.device();
+                backend.decode(self, prompt_ids, request, eos_tokens, &device, on_token)
+            }
             LoadedModel::Gguf { model, eos_tokens } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
@@ -2584,7 +2649,10 @@ impl CandleLlmRuntime {
     #[cfg(test)]
     pub(crate) fn debug_last_logits(&self, prompt: &str) -> Vec<f32> {
         let ids = self.encode_ids(prompt).expect("prompt should tokenize");
-        let device = Device::Cpu;
+        let device = match &*self.inner {
+            LoadedModel::Safetensors { backend, .. } => backend.device(),
+            _ => Device::Cpu,
+        };
         let input = Tensor::new(ids.as_slice(), &device)
             .and_then(|tensor| tensor.unsqueeze(0))
             .expect("input tensor should build");
@@ -5882,11 +5950,18 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // On a build without `candle-cuda`, the single-device path stays cpu-only
+    // for every architecture, Llama included — `enable-single-device-llama-cuda-execution`
+    // only lifts this for a Llama checkpoint on a `candle-cuda` build (see
+    // `single_device_llama_executes_on_a_real_cuda_device` below).
+    #[cfg(not(feature = "candle-cuda"))]
     #[test]
     fn single_strategy_still_rejects_a_gpu_device_request() {
         let dir = write_fixture_dir("single-gpu-reject");
         let error = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &HardwareStrategy::default())
-            .expect_err("single-device path is cpu-only and must reject a gpu request");
+            .expect_err(
+                "single-device path is cpu-only without candle-cuda and must reject a gpu request",
+            );
         match error {
             CandleLlmError::UnsupportedModel { detail, .. } => {
                 assert!(
@@ -5896,6 +5971,58 @@ mod tests {
             }
             other => panic!("expected UnsupportedModel, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Holds on every build (with or without `candle-cuda`): only a Llama
+    // checkpoint gets a real device on the single-device path.
+    #[test]
+    fn single_strategy_still_rejects_a_gpu_device_request_for_a_non_llama_architecture() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-qwen2-single-gpu-reject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        write_tachyon_tiny_qwen_fixture(&dir, ModelArchitecture::Qwen2)
+            .expect("Qwen fixture should be written");
+        let error =
+            CandleLlmRuntime::try_load("tiny-qwen", &dir, "cuda", &HardwareStrategy::default())
+                .expect_err("a non-Llama architecture must keep rejecting a gpu request");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("cpu` execution only"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Requires a real CUDA device (`arc-gpu-runners`/`cuda-quality`, or a
+    // dev machine with a working `candle-cuda` build) — see
+    // `enable-single-device-llama-cuda-execution`'s design.md for why this
+    // isn't runnable on this repo's default Windows dev sandbox today.
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn single_device_llama_executes_on_a_real_cuda_device() {
+        let dir = write_fixture_dir("single-gpu-llama");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny", &dir, "cuda", &HardwareStrategy::default())
+                .expect("a Llama checkpoint must load on a real cuda device")
+                .expect("tiny fixture should select the native Candle runtime");
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
+        let output = runtime
+            .generate(&[request])
+            .expect("generation must run a real decode on the cuda device");
+        assert!(
+            !output.is_empty(),
+            "cuda-resident Llama generation must not be empty/mocked"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

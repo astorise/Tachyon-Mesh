@@ -74,17 +74,39 @@ safetensors. The registered Qwen 3.5 MoE compatibility profile executes through
 its dedicated hybrid runtime; unmatched architectures return an explicit
 unsupported-architecture error.
 
+## Single-Device GPU Execution
+
+The single-device (`GpuDistribution::Single`) path executes on a real CUDA
+device only for a Llama-family checkpoint, and only on a build with the
+`candle-cuda` feature: `load_safetensors` resolves
+`Device::cuda_if_available(0)` when the binding requests a non-`cpu` device
+for a Llama checkpoint, falling back to `Device::Cpu` silently if no
+physical GPU is found at runtime (the same convention the tensor/pipeline/
+expert-parallel engines already use). Every other architecture on the
+single-device path — Qwen2/3, Gemma2/3, Phi3/4, the DeepSeek family — and
+every build without `candle-cuda` still return the existing typed
+`UnsupportedModel` error for a non-`cpu` request; multi-GPU placement
+already had its own real CUDA path via `distribution_mode:
+tensor_parallelism`/`pipeline_parallelism`/`expert_parallelism`, unaffected
+by this.
+
 ## PagedAttention Status
 
 The pinned `astorise/candle` fork is consumed through a Tachyon release tag
-(`tachyon-v0.11.0-1` at the time of writing), not a raw commit rev, so Renovate
+(bumped as the fork gains capabilities Tachyon depends on — see
+`core-host/Cargo.toml` for the current pin), not a raw commit rev, so Renovate
 can track the git ref. Each fork refresh should rebase the fork on the selected
 upstream Candle commit, run the Candle/Tachyon AI inference checks, publish a new
 `tachyon-v<upstream-version>-<N>` tag, and update `core-host/Cargo.toml` plus
 `Cargo.lock` together. The fork includes Candle's paged flash-attn API
-(`flash_attn_varlen_paged_windowed`), but Tachyon does not yet own the required
-runtime state for it: a CUDA KV block pool, per-sequence block tables, and
-block-granular allocation/free during continuous batching.
+(`flash_attn_varlen_paged_windowed`) and an additive `Cache::set_paged_kv`/
+`paged_kv` per-layer seam in `candle-transformers::models::llama` (tag
+`tachyon-v0.11.0-3`, [astorise/candle#8](https://github.com/astorise/candle/issues/8)),
+but Tachyon does not yet own the required runtime state to use it: a CUDA KV
+block pool, per-sequence block tables, and block-granular allocation/free
+during continuous batching (tracked by `wire-paged-attention-decode-path`,
+which also depends on this doc's "Single-Device GPU Execution" section above
+for its CUDA baseline).
 
 Model bindings can declare the future mode with:
 
