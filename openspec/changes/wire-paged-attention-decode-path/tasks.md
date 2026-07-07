@@ -19,6 +19,8 @@ seam was added to). See `design.md`'s "Newly discovered blocker" section.
 
 ## 2. Block allocator and block table (core-host, CPU-testable, unblocked today)
 
+Opened as [astorise/Tachyon-Mesh#342](https://github.com/astorise/Tachyon-Mesh/pull/342), stacked on [#341](https://github.com/astorise/Tachyon-Mesh/pull/341) (`enable-single-device-llama-cuda-execution`) since this module's tasks.md edit lands in the same directory #341 introduces.
+
 - [x] 2.1 Added `core-host/src/ai_inference/paged_kv.rs` with `PagedBlockPool` (fixed `page_block_size`, free-list `allocate_block`/`free_blocks`) and `SequenceBlockTable` (per-sequence `Vec<BlockId>`, `grow_to`/`free`). Module-wide `#![allow(dead_code)]` since nothing calls it yet (Section 3 is the caller) — matches the precedent in `parallel.rs` for shipped-ahead-of-its-wiring code, and keeps the `-D dead_code` feature-matrix gate green in the meantime.
 - [ ] 2.2 Partially done — implemented the generic sizing primitive — `PagedBlockPool::try_new_within_budget(page_block_size, bytes_per_block, budget_bytes, min_blocks)` fits as many blocks as a byte budget allows and rejects with a typed `PagedKvError::BudgetTooSmall` if it can't fit `min_blocks`. **Not done**: reading an actual `hardware_strategy` config knob, sourcing the real budget from NVML free-VRAM telemetry (`discover_cluster_topology()`), and turning `PagedKvError` into a `CandleLlmError` that fails the load — all of that needs `candle_llm_runtime.rs`'s load path, i.e. Section 3.
 - [x] 2.3 Added `build_block_table_tensor` (`(batch_size, max_blocks)`, zero-padded) and `build_cumulative_seqlens_tensor` (`(batch_size + 1,)`), matching `flash_attn_varlen_paged_windowed`/`PagedKvCache`'s expected layout exactly (field doc comments cite the shapes).
