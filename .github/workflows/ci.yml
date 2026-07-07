@@ -150,11 +150,17 @@ jobs:
         # decryption timing; we only verify JWT signatures with public keys
         # (no private-key ops), so it does not apply. RUSTSEC-2024-0429 is in
         # glib's VariantStrIter; glib is present through the desktop/Tauri GTK
-        # dependency tree, not the headless runtime path.
+        # dependency tree, not the headless runtime path. RUSTSEC-2026-0204
+        # (published 2026-07-06) is an invalid-pointer dereference in
+        # crossbeam-epoch's `fmt::Pointer` impl for `Atomic`/`Shared`, reached
+        # only by formatting those types for Debug/Display; Tachyon's
+        # dependency tree never does that. Remove this ignore once a fixed
+        # crossbeam-epoch (advisory says >=0.9.20) is picked up.
         run: >
           cargo audit
           --ignore RUSTSEC-2023-0071
           --ignore RUSTSEC-2024-0429
+          --ignore RUSTSEC-2026-0204
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
