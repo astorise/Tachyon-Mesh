@@ -12,6 +12,8 @@ mod candle_onnx_backend;
 pub(crate) mod expert_parallel_llama;
 #[path = "ai_inference/modelopt_nvfp4.rs"]
 mod modelopt_nvfp4;
+#[path = "ai_inference/paged_kv.rs"]
+mod paged_kv;
 #[path = "ai_inference/parallel.rs"]
 pub(crate) mod parallel;
 #[path = "ai_inference/pipeline_parallel_llama.rs"]
