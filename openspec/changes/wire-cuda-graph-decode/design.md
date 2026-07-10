@@ -152,12 +152,20 @@ supply pre-computed device indices directly, since Tachyon's own
 ever uploading `block_table` — the fork doesn't need to re-derive it via a
 round-trip. Filed as [astorise/candle#15](https://github.com/astorise/candle/issues/15) —
 a **fourth** fork dependency this change did not originally anticipate, on
-top of `Cache::set_decode_position` (already landed). Until it lands,
-`cuda_graph_decode` remains rejected — this change's Section 2 gate work
-(requiring `paged_attention`, rejecting every other combination) is
-implemented and real, but the actual capture/replay orchestration is not,
-and should not be attempted against the current `write_new_kv`
-implementation.
+top of `Cache::set_decode_position` (already landed).
+
+**Resolved (2026-07-10)**: landed via [astorise/candle#16](https://github.com/astorise/candle/pull/16),
+tagged `tachyon-v0.11.0-6`, as option (b) — `Cache::set_paged_kv_decode_slot(&mut
+self, block_idx, indices: Tensor)` attaches a persistent `(b_sz,)` `U32`
+device tensor per layer; `write_new_kv` gained a `decode_slot: Option<&Tensor>`
+parameter and scatters directly against it when present (decode-only,
+`seq_len == 1`, same as `set_decode_position`), skipping the host readback
+and `Tensor::from_vec` allocation entirely. Section 2's capture/replay
+orchestration below is now implemented against this seam
+(`CudaGraphDecodeSession` in `candle_llm_runtime.rs`), computing the flat
+scatter index itself from the host-side `SequenceBlockTable` (which already
+knows the block assignment) instead of asking the fork to re-derive it from
+a device round-trip.
 
 ## Risks / Trade-offs
 

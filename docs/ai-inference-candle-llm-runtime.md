@@ -176,11 +176,16 @@ combination (non-Llama architecture, non-CUDA device, or a build without
 
 ## CUDA Graph Decode Status
 
-The fork also carries `candle_core::CudaGraph` (capture/replay) and an
-additive `Cache::set_decode_position` seam that lets a captured decode step
-read its rotary-embedding position from a persistent, in-place-updatable
-device tensor instead of the host-side `narrow(0, index_pos, seq_len)` a
-replayed graph would otherwise silently bake in.
+The fork carries `candle_core::CudaGraph` (capture/replay) plus two additive
+seams a captured decode step needs: `Cache::set_decode_position` (rotary
+embeddings read a persistent, in-place-updatable device tensor instead of the
+host-side `narrow(0, index_pos, seq_len)` a replayed graph would otherwise
+silently bake in) and `Cache::set_paged_kv_decode_slot` (the KV-cache scatter
+destination is likewise a persistent device tensor the caller updates in
+place, instead of `PagedKvCache::write_new_kv` deriving it via a blocking
+device-to-host block-table readback — itself not capturable at all).
+
+A Llama model binding on a CUDA device can opt in with both flags together:
 
 ```json
 {
@@ -191,18 +196,24 @@ replayed graph would otherwise silently bake in.
 }
 ```
 
-`cuda_graph_decode` is still rejected today, now with a typed error naming
-`hardware_strategy.paged_attention` as a required dependency when it's
-missing (the contiguous KV cache's per-step reallocation via `Tensor::cat` is
-incompatible with CUDA graph replay — only the pre-allocated `PagedKvCache`
-layout is a candidate). Actually wiring capture/replay surfaced a further
-blocker: paged attention's own `PagedKvCache::write_new_kv` computes each
-forward pass's scatter destinations by reading the block table back from
-device to host (`Tensor::to_vec2`) — a blocking synchronization CUDA graph
-capture cannot include. Resolving this needs its own additive fork-side seam
-(an on-device index computation, or accepting host-precomputed indices
-directly) before capture/replay can be implemented; not yet filed. See
-`openspec/changes/wire-cuda-graph-decode`.
+`cuda_graph_decode` requires `paged_attention: true` (typed error naming the
+dependency when missing) — the contiguous KV cache's per-step reallocation
+via `Tensor::cat` is incompatible with CUDA graph replay, and the
+pre-allocated `PagedKvCache` layout is the only candidate this runtime has.
+Once both flags are set on a supported build, `CudaGraphDecodeSession` runs
+the steady-state decode step (post-prefill, one token at a time) through a
+real captured/replayed graph: the block-table/seqlens/position/decode-slot
+tensors are sized once at their full maximum width and updated only via
+`Tensor::slice_set`, `model.forward`'s `index_pos` argument becomes
+irrelevant once both position/decode-slot seams are attached (the real
+position flows through those device tensors instead), and every decode step
+after the first captured one is a single `CudaGraph::replay()` call. Prefill,
+LoRA adapters, and speculative decoding are unaffected (prefill always uses
+the existing uncaptured path — chunk shapes vary chunk to chunk; speculative
+decoding already falls back to plain generation for any paged-attention
+target/draft). Every other combination (non-Llama architecture, non-CUDA
+device, or `cuda_graph_decode` without `paged_attention`) keeps the existing
+typed rejection. See `openspec/changes/wire-cuda-graph-decode`.
 
 ## Speculative Decoding Status
 
