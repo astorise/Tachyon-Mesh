@@ -729,7 +729,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-3#0f5b15dafd68a883ed00c554f27429ac6c757c77"
+source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-4#dd1056321630ef7132798c12edd38789870f9162"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -757,7 +757,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-3#0f5b15dafd68a883ed00c554f27429ac6c757c77"
+source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-4#dd1056321630ef7132798c12edd38789870f9162"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -768,7 +768,7 @@ dependencies = [
 [[package]]
 name = "candle-flashinfer-kernels"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-3#0f5b15dafd68a883ed00c554f27429ac6c757c77"
+source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-4#dd1056321630ef7132798c12edd38789870f9162"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -780,7 +780,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-3#0f5b15dafd68a883ed00c554f27429ac6c757c77"
+source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-4#dd1056321630ef7132798c12edd38789870f9162"
 dependencies = [
  "cudaforge",
 ]
@@ -788,7 +788,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-3#0f5b15dafd68a883ed00c554f27429ac6c757c77"
+source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-4#dd1056321630ef7132798c12edd38789870f9162"
 dependencies = [
  "candle-core",
  "half",
@@ -803,7 +803,7 @@ dependencies = [
 [[package]]
 name = "candle-onnx"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-3#0f5b15dafd68a883ed00c554f27429ac6c757c77"
+source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-4#dd1056321630ef7132798c12edd38789870f9162"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -814,11 +814,12 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-3#0f5b15dafd68a883ed00c554f27429ac6c757c77"
+source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-4#dd1056321630ef7132798c12edd38789870f9162"
 dependencies = [
  "byteorder",
  "candle-core",
  "candle-flash-attn",
+ "candle-flashinfer-kernels",
  "candle-nn",
  "fancy-regex 0.18.0",
  "num-traits",
@@ -833,7 +834,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.11.0"
-source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-3#0f5b15dafd68a883ed00c554f27429ac6c757c77"
+source = "git+https://github.com/astorise/candle?tag=tachyon-v0.11.0-4#dd1056321630ef7132798c12edd38789870f9162"
 dependencies = [
  "ug",
  "ug-cuda",

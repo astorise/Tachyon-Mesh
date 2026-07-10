@@ -142,30 +142,67 @@ Model bindings can opt in with:
 }
 ```
 
-## CUDA Graphs and FlashInfer Status
+## FlashInfer Decode Attention Status
 
-The pinned `astorise/candle` fork also includes the downstream APIs proposed in
-`huggingface/candle#3651`: `candle_core::CudaGraph` for capture/replay and the
-optional `candle-flashinfer-kernels` crate for FlashInfer-style decode
-attention.
+The pinned `astorise/candle` fork carries an additive `use_flashinfer_attention`
+seam on `candle_transformers::models::llama::Config` (mirroring the existing
+`use_flash_attn` flag), wired to the optional `candle-flashinfer-kernels`
+crate's `flashinfer_decode_attention`.
 
-Model bindings can declare the future modes with:
+A Llama model binding on a CUDA device with the `candle-flashinfer` Cargo
+feature compiled in can opt in with:
 
 ```json
 {
   "hardware_strategy": {
-    "cuda_graph_decode": true,
     "flashinfer_attention": true
   }
 }
 ```
 
-Tachyon rejects both settings today. CUDA Graph replay requires a steady-state
-GPU decode loop with fixed shapes and stable device buffers; FlashInfer requires
-the decode-attention call site to pass single-token Q/K/V tensors to
-`candle-flashinfer-kernels::flashinfer_decode_attention`. Until those runtime
-paths are wired, the host fails closed instead of using the uncaptured/default
-attention path.
+The decode step (one query token per sequence) then attends via
+`candle_flashinfer_kernels::flashinfer_decode_attention` against the
+pre-`repeat_kv` contiguous KV cache instead of the dense matmul+softmax (or
+`flash_attn`) path; prefill is unaffected. Unlike `paged_attention`, this needs
+no dtype switch — a flashinfer-attention deployment stays on the same F32 path
+as the plain dense Llama path, since the kernel supports F32/F16/BF16 with no
+block-size or head-dim alignment requirement. `flashinfer_attention` cannot be
+combined with `paged_attention` in the same deployment (they select different
+decode-attention kernels over different KV cache layouts) — that combination
+is rejected with a typed error rather than silently picking one. Every other
+combination (non-Llama architecture, non-CUDA device, or a build without
+`candle-flashinfer` compiled in) keeps the existing typed rejection. See
+`openspec/changes/wire-flashinfer-decode-attention`.
+
+## CUDA Graph Decode Status
+
+The fork also carries `candle_core::CudaGraph` (capture/replay) and an
+additive `Cache::set_decode_position` seam that lets a captured decode step
+read its rotary-embedding position from a persistent, in-place-updatable
+device tensor instead of the host-side `narrow(0, index_pos, seq_len)` a
+replayed graph would otherwise silently bake in.
+
+```json
+{
+  "hardware_strategy": {
+    "paged_attention": true,
+    "cuda_graph_decode": true
+  }
+}
+```
+
+`cuda_graph_decode` is still rejected today, now with a typed error naming
+`hardware_strategy.paged_attention` as a required dependency when it's
+missing (the contiguous KV cache's per-step reallocation via `Tensor::cat` is
+incompatible with CUDA graph replay — only the pre-allocated `PagedKvCache`
+layout is a candidate). Actually wiring capture/replay surfaced a further
+blocker: paged attention's own `PagedKvCache::write_new_kv` computes each
+forward pass's scatter destinations by reading the block table back from
+device to host (`Tensor::to_vec2`) — a blocking synchronization CUDA graph
+capture cannot include. Resolving this needs its own additive fork-side seam
+(an on-device index computation, or accepting host-precomputed indices
+directly) before capture/replay can be implemented; not yet filed. See
+`openspec/changes/wire-cuda-graph-decode`.
 
 ## Speculative Decoding Status
 
