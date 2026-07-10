@@ -150,13 +150,14 @@ with a device-side offset, no host readback), or (b) letting the caller
 supply pre-computed device indices directly, since Tachyon's own
 `SequenceBlockTable` already knows the block assignment on the host before
 ever uploading `block_table` — the fork doesn't need to re-derive it via a
-round-trip. Not yet filed upstream; this is a **new, fourth** fork
-dependency this change did not originally anticipate, on top of
-`Cache::set_decode_position` (already landed). Until it lands, `cuda_graph_decode`
-remains rejected — this change's Section 2 gate work (requiring `paged_attention`,
-rejecting every other combination) is implemented and real, but the actual
-capture/replay orchestration is not, and should not be attempted against the
-current `write_new_kv` implementation.
+round-trip. Filed as [astorise/candle#15](https://github.com/astorise/candle/issues/15) —
+a **fourth** fork dependency this change did not originally anticipate, on
+top of `Cache::set_decode_position` (already landed). Until it lands,
+`cuda_graph_decode` remains rejected — this change's Section 2 gate work
+(requiring `paged_attention`, rejecting every other combination) is
+implemented and real, but the actual capture/replay orchestration is not,
+and should not be attempted against the current `write_new_kv`
+implementation.
 
 ## Risks / Trade-offs
 
