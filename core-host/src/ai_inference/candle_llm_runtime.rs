@@ -1301,9 +1301,17 @@ impl CandleLlmRuntime {
         // architecture, or any build without that feature, still returns the
         // existing typed error for a non-`cpu` request. A non-`single`
         // strategy resolves its devices from the validated plan instead, so
-        // it does not go through this check.
-        let single_device_cuda_supported =
-            cfg!(feature = "candle-cuda") && architecture == ModelArchitecture::Llama;
+        // it does not go through this check — and, critically, none of
+        // `load_parallel`'s tensor/pipeline/expert engines read
+        // `paged_attention`/`flashinfer_attention`/`cuda_graph_decode` at all
+        // (they carry their own separate cache types). Without also
+        // requiring `distribution_mode == Single` here, a parallel-mode
+        // request setting one of those flags would pass this gate and then
+        // silently dispatch to `load_parallel`, which ignores the flag
+        // entirely — accepted but not actually wired.
+        let single_device_cuda_supported = cfg!(feature = "candle-cuda")
+            && architecture == ModelArchitecture::Llama
+            && strategy.distribution_mode == GpuDistribution::Single;
 
         // paged_attention needs that same Llama+CUDA baseline — the paged
         // flash-attn kernel is CUDA-only — plus an actual non-`cpu` request.
@@ -1385,6 +1393,21 @@ impl CandleLlmRuntime {
                             .to_owned(),
                 });
             }
+            // Every prerequisite above is satisfiable, but capture/replay
+            // orchestration itself is not implemented anywhere in the decode
+            // path yet (blocked on a further fork seam — see
+            // `wire-cuda-graph-decode`'s design.md Decision 5,
+            // astorise/candle#15). Fail closed unconditionally rather than
+            // silently falling through to the uncaptured paged-attention
+            // decode loop for a manifest that explicitly requested CUDA
+            // graph replay.
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail:
+                    "cuda_graph_decode requires Tachyon's steady-state GPU decode loop to capture fixed-shape operations through candle_core::CudaGraph, which is not yet wired even for a paged-attention Llama/CUDA deployment"
+                        .to_owned(),
+            });
         }
 
         if strategy.distribution_mode == GpuDistribution::Single
@@ -6636,6 +6659,45 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // Regression for a real bug an automated review caught: `load_parallel`'s
+    // tensor/pipeline/expert engines never read `paged_attention` at all (they
+    // carry their own separate cache types), so a tensor-parallel request
+    // setting it used to pass this gate and then silently dispatch to
+    // `load_parallel`, which just ignored the flag — accepted but not wired.
+    // Holds on every build (with or without `candle-cuda`): a non-`Single`
+    // distribution mode must keep rejecting paged_attention regardless of
+    // architecture/device.
+    #[test]
+    fn paged_attention_strategy_is_rejected_for_a_non_single_distribution_mode() {
+        let dir = write_fixture_dir("paged-attn-tp-reject");
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::TensorParallelism,
+            device_ids: vec![0, 1],
+            paged_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect_err(
+            "a tensor-parallel request must keep rejecting paged_attention, not silently ignore it",
+        );
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("flash_attn_varlen_paged_windowed"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     // Requires a real CUDA device (`arc-gpu-runners`/`cuda-quality`) — not
     // runnable on this repo's default Windows dev sandbox, same as
     // `single_device_llama_executes_on_a_real_cuda_device`.
@@ -6739,6 +6801,35 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // Regression for a real bug an automated review caught: with every
+    // prerequisite satisfied (Llama, CUDA, paged_attention: true), the gate
+    // used to fall all the way through with no rejection at all, silently
+    // running the uncaptured paged-attention decode loop for a manifest that
+    // explicitly requested CUDA graph replay. Capture/replay itself is not
+    // implemented yet, so this must still fail closed.
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn cuda_graph_decode_strategy_is_rejected_even_with_paged_attention_until_capture_is_wired() {
+        let dir = write_fixture_dir("cuda-graph-with-paged-reject");
+        let strategy = HardwareStrategy {
+            cuda_graph_decode: true,
+            paged_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &strategy)
+            .expect_err("cuda_graph_decode must not silently run the uncaptured paged-attention loop even when paged_attention is also requested");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("candle_core::CudaGraph"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn flashinfer_attention_strategy_is_rejected_until_decode_attention_is_wired() {
         let dir = write_fixture_dir("flashinfer-reject");
@@ -6781,6 +6872,44 @@ mod tests {
         };
         let error = CandleLlmRuntime::try_load("tiny-qwen", &dir, "cuda", &strategy).expect_err(
             "a non-Llama architecture must keep rejecting flashinfer_attention even on a cuda request",
+        );
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("flashinfer_decode_attention"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Regression for a real bug an automated review caught: for a
+    // tensor/pipeline/expert-parallel Llama deployment, `load_parallel`'s
+    // Config never sets `use_flashinfer_attention` (it has no FlashInfer path
+    // at all), so a parallel-mode request setting this flag used to pass this
+    // gate and then silently load with the default attention implementation.
+    // Holds on every build: a non-`Single` distribution mode must keep
+    // rejecting flashinfer_attention regardless of architecture/device.
+    #[test]
+    fn flashinfer_attention_strategy_is_rejected_for_a_non_single_distribution_mode() {
+        let dir = write_fixture_dir("flashinfer-tp-reject");
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::TensorParallelism,
+            device_ids: vec![0, 1],
+            flashinfer_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect_err(
+            "a tensor-parallel request must keep rejecting flashinfer_attention, not silently ignore it",
         );
         match error {
             CandleLlmError::UnsupportedModel { detail, .. } => {
