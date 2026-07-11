@@ -559,7 +559,13 @@ impl CudaGraphDecodeSession {
         let decode_slot_buf = Tensor::zeros(1, DType::U32, device)?;
         let block_table_buf = Tensor::zeros((1, min_blocks), DType::U32, device)?;
         let seqlens_buf = Tensor::zeros(2, DType::U32, device)?;
-        let logits_buf = Tensor::zeros((1, 1, vocab_size), DType::F32, device)?;
+        // `Llama::forward`'s natural output is `(batch, vocab_size)` — no
+        // separate seq_len dimension (confirmed by `cuda-quality`: an
+        // earlier `(1, 1, vocab_size)` allocation here failed with
+        // `unexpected rank, expected: 3, got: 2` — and matches
+        // `decode_loop_from_logits`'s own `logits.squeeze(0)`, which removes
+        // exactly one (batch) dimension before sampling).
+        let logits_buf = Tensor::zeros((1, vocab_size), DType::F32, device)?;
 
         Self::write_step(
             table,
