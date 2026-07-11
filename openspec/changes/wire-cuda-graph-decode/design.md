@@ -167,6 +167,43 @@ scatter index itself from the host-side `SequenceBlockTable` (which already
 knows the block assignment) instead of asking the fork to re-derive it from
 a device round-trip.
 
+## Known limitation (found 2026-07-11, via `cuda-quality` on real hardware): only one `cuda_graph_decode` request per loaded model
+
+A single request's capture → warm-up → replay cycle is proven correct on
+real GPU hardware: its output exactly matches the non-captured
+paged-attention path's greedy output for the same prompt
+(`single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda`).
+Multiple *decode steps within one request* also work correctly (the test
+generates 4 tokens — one capture, three replays).
+
+A **second, independent request against the same already-loaded model**
+fails: `Cache::new(...)` — the very first operation of the second request,
+unrelated to anything the first request's session touched — errors with
+`DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")`. Ruled out: a
+timing/ordering issue (an extra `device.synchronize()` in
+`CudaGraphDecodeSession`'s `Drop`, run immediately before the graph's own
+teardown, made no difference — identical failure) and cross-model
+interference (isolated to two back-to-back calls on the *same* runtime with
+no other model touched in between — identical failure). `CudaGraph::capture`'s
+own doc comment names `CUDA_ERROR_INVALID_VALUE` as the exact failure mode
+of an internal event-tracking mechanism (`CudaDevice::pause_event_tracking`)
+it works around for a single capture; our best (unconfirmed — this is
+`candle-core`-internal state we can't inspect from the caller side) guess is
+that two independent captures on the same device leave that bookkeeping
+inconsistent in a way that only surfaces on a later, unrelated allocation.
+Filed as [astorise/candle#17](https://github.com/astorise/candle/issues/17).
+
+**Current scope**: `cuda_graph_decode` is real and correct for the first
+request served against a freshly-loaded model. It is not yet safe for a
+model that serves more than one request over its lifetime — which is every
+realistic production deployment. Shipping this as-is without a safeguard
+would mean the second request against any `cuda_graph_decode`-enabled model
+fails outright. Whether to add a caller-side mitigation (e.g., falling back
+to the uncaptured paged-attention path for every request after the first
+against a given loaded model, trading the graph-replay speedup for
+correctness) or wait for the fork-side fix is an open scope question for
+whoever picks this back up — not resolved by this document.
+
 ## Risks / Trade-offs
 
 - **[Risk] This change depends on work in a different repository this
@@ -201,3 +238,6 @@ a device round-trip.
   continuous batching (issue #312 step 4) would need its own design pass
   on top of this one, not the reverse — this is part of why continuous
   batching is expected to land *before* `cuda_graph_decode` in practice.
+  "No cross-request graph reuse" turned out to be more than a missed
+  optimization — see the Known Limitation above: a *second* request
+  currently fails outright, not just "doesn't get the speedup."
