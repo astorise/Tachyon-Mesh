@@ -480,6 +480,21 @@ struct CudaGraphDecodeSession {
     page_block_size: usize,
 }
 
+// A CUDA_ERROR_INVALID_VALUE surfaced from an unrelated Cache::new call for
+// the *next* request on the same device, immediately after a first request's
+// CudaGraphDecodeSession (and its CudaGraph) was dropped — even though every
+// replay is already followed by `device.synchronize()`. Synchronizing again
+// here, immediately before the graph's own Drop impl destroys the CUDA graph
+// exec/template, is a defensive measure against that graph teardown racing
+// with (or otherwise interacting badly with) the very next CUDA operation on
+// the same stream/device.
+#[cfg(feature = "candle-cuda")]
+impl Drop for CudaGraphDecodeSession {
+    fn drop(&mut self) {
+        let _ = self.logits_buf.device().synchronize();
+    }
+}
+
 #[cfg(feature = "candle-cuda")]
 impl CudaGraphDecodeSession {
     /// Writes one decode step's real state into the persistent buffers
