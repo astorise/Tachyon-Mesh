@@ -12,6 +12,8 @@ mod candle_onnx_backend;
 pub(crate) mod expert_parallel_llama;
 #[path = "ai_inference/modelopt_nvfp4.rs"]
 mod modelopt_nvfp4;
+#[path = "ai_inference/paged_kv.rs"]
+mod paged_kv;
 #[path = "ai_inference/parallel.rs"]
 pub(crate) mod parallel;
 #[path = "ai_inference/pipeline_parallel_llama.rs"]
@@ -247,12 +249,16 @@ impl SharedInputTensor {
 trait BackendModel: Send + Sync {
     fn residency(&self) -> AcceleratorMemoryResidency;
     fn as_any(&self) -> &dyn Any;
-    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>>;
+    /// Executes one or more independent requests and returns exactly one
+    /// output per input, in the same order — never a single shared output
+    /// broadcast across the whole batch (see `process_batch`, which routes
+    /// `outputs[i]` back to `inputs[i]`'s own caller).
+    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>>;
     fn execute_with_adapter(
         &self,
         inputs: &[SharedInputTensor],
         adapter: &ResolvedLoraAdapter,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<Vec<u8>>> {
         let _ = inputs;
         bail!(
             "LoRA adapter `{}` was resolved, but this backend does not support adapter injection",
@@ -264,15 +270,23 @@ trait BackendModel: Send + Sync {
     /// The default implementation runs `execute` and emits the entire output as
     /// a single fragment — a correct, non-incremental fallback for backends that
     /// cannot stream (mock, NVFP4). Backends that can decode token-by-token
-    /// override this for real time-to-first-token.
+    /// override this for real time-to-first-token. Only ever called with a
+    /// single input (streaming is inherently one request, one client).
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
         on_token: &mut dyn FnMut(&str),
     ) -> Result<()> {
-        let output = self.execute(inputs)?;
-        let text =
-            String::from_utf8(output).map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
+        let mut outputs = self.execute(inputs)?;
+        if outputs.len() != 1 {
+            bail!(
+                "stream_text expects exactly one input, got {} output(s) for {} input(s)",
+                outputs.len(),
+                inputs.len()
+            );
+        }
+        let text = String::from_utf8(outputs.remove(0))
+            .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
         if !text.is_empty() {
             on_token(&text);
         }
@@ -1111,7 +1125,22 @@ fn process_batch(
         .map(|job| job.input.clone())
         .collect::<Vec<_>>();
     match model.run_mock_batch(&inputs, adapter) {
-        Ok(output) => batch.iter().map(|_| Ok(output.clone())).collect(),
+        // Each job's own output is routed back to that job, never a shared
+        // clone of one job's result broadcast to the whole batch.
+        Ok(outputs) if outputs.len() == batch.len() => outputs.into_iter().map(Ok).collect(),
+        Ok(outputs) => {
+            let message = format!(
+                "{} backend for model `{}` returned {} output(s) for a batch of {} request(s)",
+                accelerator.as_str(),
+                model.alias,
+                outputs.len(),
+                batch.len()
+            );
+            batch
+                .iter()
+                .map(|_| Err(anyhow::anyhow!("{}", message.clone())))
+                .collect()
+        }
         Err(error) => {
             let message = format!(
                 "{} backend failed for model `{}`: {}",
@@ -1347,7 +1376,7 @@ impl BackendModel for CandleBackendModel {
         self
     }
 
-    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<u8>> {
+    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
         match &self.kind {
             CandleBackendModelKind::Qwen35Moe(runtime) => {
                 if inputs
@@ -1359,17 +1388,21 @@ impl BackendModel for CandleBackendModel {
                         self.source.alias
                     ));
                 }
-                let prompts = inputs
+                // Each input is an independent request: the underlying runtime
+                // only ever decodes one prompt per call, so a shared multi-prompt
+                // slice here would silently decode just the first and broadcast
+                // its output to every other request in the batch.
+                let result = inputs
                     .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                let result = runtime.generate(&prompts).map_err(|error| {
-                    anyhow!(
-                        "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
-                        self.source.alias,
-                        runtime.root().display()
-                    )
-                });
+                    .map(|input| runtime.generate(&[input.data.as_ref()]))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        anyhow!(
+                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
+                            self.source.alias,
+                            runtime.root().display()
+                        )
+                    });
                 record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
                 return result;
             }
@@ -1383,17 +1416,17 @@ impl BackendModel for CandleBackendModel {
                         self.source.alias
                     ));
                 }
-                let prompts = inputs
+                let result = inputs
                     .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                let result = runtime.generate(&prompts).map_err(|error| {
-                    anyhow!(
-                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
-                        self.source.alias,
-                        runtime.root().display()
-                    )
-                });
+                    .map(|input| runtime.generate(&[input.data.as_ref()]))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        anyhow!(
+                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                            self.source.alias,
+                            runtime.root().display()
+                        )
+                    });
                 let executed_on = match (&self.kind, self.source.accelerator) {
                     (CandleBackendModelKind::ModelOptNvfp4(_), AcceleratorKind::Gpu) => {
                         "gpu_fallback"
@@ -1418,25 +1451,27 @@ impl BackendModel for CandleBackendModel {
                         self.source.alias
                     ));
                 }
-                let prompts = inputs
+                let result = inputs
                     .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                let result = match speculative {
-                    Some(speculative) => target.generate_speculative(
-                        &prompts,
-                        &speculative.draft,
-                        speculative.draft_tokens,
-                    ),
-                    None => target.generate(&prompts),
-                }
-                .map_err(|error| {
-                    anyhow!(
-                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
-                        self.source.alias,
-                        target.root().display()
-                    )
-                });
+                    .map(|input| {
+                        let prompt = input.data.as_ref();
+                        match speculative {
+                            Some(speculative) => target.generate_speculative(
+                                &[prompt],
+                                &speculative.draft,
+                                speculative.draft_tokens,
+                            ),
+                            None => target.generate(&[prompt]),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        anyhow!(
+                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                            self.source.alias,
+                            target.root().display()
+                        )
+                    });
                 let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
                     "gpu"
                 } else {
@@ -1446,10 +1481,13 @@ impl BackendModel for CandleBackendModel {
                 return result;
             }
             CandleBackendModelKind::Vendor(runtime) => {
-                let input = inputs
-                    .first()
-                    .ok_or_else(|| anyhow!("vendor backend requires one input tensor"))?;
-                let result = runtime.execute(input.data.as_ref());
+                if inputs.is_empty() {
+                    return Err(anyhow!("vendor backend requires one input tensor"));
+                }
+                let result = inputs
+                    .iter()
+                    .map(|input| runtime.execute(input.data.as_ref()))
+                    .collect::<Result<Vec<_>, _>>();
                 record_execution(
                     &self.source.alias,
                     self.source.accelerator.as_str(),
@@ -1485,25 +1523,32 @@ impl BackendModel for CandleBackendModel {
                 .context("failed to prepare candle mock batch")?;
         let _resident_weights = self.source.model_size_bytes;
         record_execution(&self.source.alias, self.source.accelerator.as_str(), true);
-        Ok(b"MOCK_LLM_RESPONSE".to_vec())
+        Ok(inputs
+            .iter()
+            .map(|_| b"MOCK_LLM_RESPONSE".to_vec())
+            .collect())
     }
 
     fn execute_with_adapter(
         &self,
         inputs: &[SharedInputTensor],
         adapter: &ResolvedLoraAdapter,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<Vec<u8>>> {
         match &self.kind {
             CandleBackendModelKind::Mock => self.execute(inputs),
             CandleBackendModelKind::TextGeneration { target, .. }
             | CandleBackendModelKind::ModelOptNvfp4(target) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
-                let prompts = inputs
+                inputs
                     .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                target
-                    .generate_with_adapter(&prompts, &adapter.id, &adapter.path)
+                    .map(|input| {
+                        target.generate_with_adapter(
+                            &[input.data.as_ref()],
+                            &adapter.id,
+                            &adapter.path,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
                         anyhow!(
                             "Candle LLM model `{}` failed with LoRA adapter `{}` at `{}`: {error}",
@@ -1644,14 +1689,21 @@ impl BackendModel for CandleBackendModel {
                 )
             }
             CandleBackendModelKind::Mock => {
-                let output = self.execute(inputs);
+                let outputs = self.execute(inputs);
                 record_execution(
                     &self.source.alias,
                     self.source.accelerator.as_str(),
-                    output.is_ok(),
+                    outputs.is_ok(),
                 );
-                let output = output?;
-                let text = String::from_utf8(output)
+                let outputs = outputs?;
+                if outputs.len() != 1 {
+                    bail!(
+                        "mock backend expected exactly one output for streaming, got {} for {} input(s)",
+                        outputs.len(),
+                        inputs.len()
+                    );
+                }
+                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default())
                     .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
                 if !text.is_empty() {
                     on_token(&text);
@@ -1659,8 +1711,15 @@ impl BackendModel for CandleBackendModel {
                 Ok(())
             }
             CandleBackendModelKind::Vendor(_) => {
-                let output = self.execute(inputs)?;
-                let text = String::from_utf8(output)
+                let outputs = self.execute(inputs)?;
+                if outputs.len() != 1 {
+                    bail!(
+                        "vendor backend expected exactly one output for streaming, got {} for {} input(s)",
+                        outputs.len(),
+                        inputs.len()
+                    );
+                }
+                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default())
                     .map_err(|error| anyhow!("vendor output was not UTF-8: {error}"))?;
                 on_token(&text);
                 Ok(())
@@ -1749,7 +1808,7 @@ impl CandleModel {
         &self,
         inputs: &[SharedInputTensor],
         adapter: Option<&ResolvedLoraAdapter>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<Vec<u8>>> {
         match adapter {
             Some(adapter) => self.backend_model.execute_with_adapter(inputs, adapter),
             None => self.backend_model.execute(inputs),
@@ -2974,6 +3033,81 @@ mod tests {
         assert_eq!(snapshot.batches_processed, snapshot.decode_steps_processed);
         assert!(snapshot.max_batch_size >= 1);
         assert_eq!(snapshot.queued_requests, 0);
+    }
+
+    /// Regression test for a cross-contamination bug: `process_batch` used to
+    /// clone one job's output across every job sharing its scheduler batch,
+    /// so concurrent *different* prompts to the same real model could receive
+    /// each other's generated text. `scheduler_batches_concurrent_requests_for_same_alias`
+    /// above didn't catch it because every thread sent the identical prompt to
+    /// a mock model with a fixed response — contamination and correctness look
+    /// identical in that setup. This test uses a real Candle Llama fixture with
+    /// distinct prompts so a misrouted response is observable.
+    #[test]
+    fn scheduler_routes_distinct_concurrent_prompts_to_their_own_response() {
+        let model_dir = unique_candle_llm_dir("concurrent-distinct-prompts");
+        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
+            .expect("fixture should be written");
+        let runtime =
+            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
+                .expect("runtime should load real Candle LLM fixture");
+
+        // The fixture's tokenizer vocab is exactly `<unk> hello tachyon mesh`
+        // (see `TINY_TOKENIZER_JSON`), so these three are distinct, valid,
+        // deterministic (greedy) prompts for the same loaded model.
+        let prompts = ["hello", "tachyon", "mesh"];
+        let expected = prompts.map(|prompt| {
+            runtime
+                .compute_component_prompt("tiny", prompt)
+                .unwrap_or_else(|error| {
+                    panic!("reference generation for `{prompt}` failed: {error}")
+                })
+        });
+        assert_ne!(
+            expected[0], expected[1],
+            "fixture prompts must decode differently, or this test can't detect misrouting"
+        );
+        assert_ne!(
+            expected[0], expected[2],
+            "fixture prompts must decode differently, or this test can't detect misrouting"
+        );
+        assert_ne!(
+            expected[1], expected[2],
+            "fixture prompts must decode differently, or this test can't detect misrouting"
+        );
+
+        let runtime = Arc::new(runtime);
+        let barrier = Arc::new(std::sync::Barrier::new(prompts.len()));
+        let handles = prompts
+            .into_iter()
+            .map(|prompt| {
+                let runtime = Arc::clone(&runtime);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let output = runtime
+                        .compute_component_prompt("tiny", prompt)
+                        .unwrap_or_else(|error| {
+                            panic!("concurrent generation for `{prompt}` failed: {error}")
+                        });
+                    (prompt, output)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            let (prompt, output) = handle.join().expect("worker should join");
+            let expected_output = &expected[prompts
+                .iter()
+                .position(|p| *p == prompt)
+                .expect("prompt should be one of the fixed test prompts")];
+            assert_eq!(
+                &output, expected_output,
+                "prompt `{prompt}` received another concurrent request's output"
+            );
+        }
+
+        let _ = fs::remove_dir_all(model_dir);
     }
 
     #[test]

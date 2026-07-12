@@ -15,7 +15,7 @@ use candle_transformers::models::deepseek2::{
 use candle_transformers::models::gemma2::{Config as Gemma2Config, Model as Gemma2Model};
 use candle_transformers::models::gemma3::{Config as Gemma3Config, Model as Gemma3Model};
 use candle_transformers::models::llama::{
-    Cache, Config, Llama, LlamaConfig, LlamaEosToks, LlamaLoadConfig, LoraConfig,
+    Cache, Config, Llama, LlamaConfig, LlamaEosToks, LlamaLoadConfig, LoraConfig, PagedKvCache,
 };
 use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
 use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlama;
@@ -32,6 +32,10 @@ use crate::{GpuDistribution, HardwareStrategy};
 
 use super::expert_parallel_llama::ExpertParallelLlama;
 use super::modelopt_nvfp4;
+use super::paged_kv::{
+    build_block_table_tensor, build_cumulative_seqlens_tensor, PagedBlockPool, PagedKvError,
+    SequenceBlockTable,
+};
 use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::samplers::{FsmCache, FsmLogitProcessor};
@@ -355,7 +359,28 @@ enum LoadedModel {
 /// architectures are added here without leaking their Candle model/cache types
 /// into request parsing, sampling, stop handling, or streaming.
 enum SingleDeviceBackend {
-    Llama { model: Llama, config: Config },
+    /// `device` is the device the weights were actually loaded onto: `Cpu`
+    /// unless `enable-single-device-llama-cuda-execution`'s gate selected a
+    /// real CUDA device for this checkpoint. Every other variant here stays
+    /// `Cpu`-only, so only `Llama` carries this field.
+    ///
+    /// `dtype` matches whatever the weights were actually loaded in: `F32`
+    /// unless `paged` is `Some`, in which case it's `BF16` —
+    /// `candle_flash_attn` (and so `flash_attn_varlen_paged_windowed`) only
+    /// supports F16/BF16, never F32, so paged attention requires switching
+    /// the whole model's working dtype, not just attaching a block table.
+    Llama {
+        model: Llama,
+        config: Config,
+        device: Device,
+        dtype: DType,
+        paged: Option<PagedAttentionRuntime>,
+        /// `hardware_strategy.cuda_graph_decode`. Only ever `true` when
+        /// `paged` is also `Some` — `try_load_with_topology` requires
+        /// `paged_attention` for `cuda_graph_decode` (the contiguous cache's
+        /// per-step reallocation is incompatible with `CudaGraph` capture).
+        cuda_graph_decode: bool,
+    },
     Qwen2(Mutex<Qwen2Model>),
     Qwen3(Mutex<Qwen3Model>),
     Qwen3Moe(Mutex<Qwen3MoeModel>),
@@ -372,6 +397,453 @@ struct DecodeLoopContext<'a> {
     on_token: &'a mut dyn FnMut(&str),
 }
 
+/// Model-level `hardware_strategy.paged_attention` state for a Llama
+/// checkpoint: one block pool and one pre-allocated (key_cache, value_cache)
+/// tensor pair per transformer layer, sized once at load time (see
+/// `build_paged_attention_runtime`) and reused for the lifetime of the
+/// loaded model. Each generation request gets its own [`PagedSequenceGuard`]
+/// drawing blocks from the shared `pool`; there is no cross-request sharing
+/// of *content* (every request starts a fresh sequence), only of the
+/// physical block storage. Concurrent requests to the same model are safe at
+/// the allocator level (the free-list is `Mutex`-guarded) but not yet
+/// batched together into a single forward pass — that is continuous
+/// batching, a separate follow-up (issue #312 step 4).
+#[derive(Debug)]
+struct PagedAttentionRuntime {
+    pool: Mutex<PagedBlockPool>,
+    /// One `(key_cache, value_cache)` pair per transformer layer, each
+    /// `(num_blocks, page_block_size, num_kv_heads, head_dim)`.
+    layer_kv: Vec<(Tensor, Tensor)>,
+    page_block_size: usize,
+}
+
+/// Owns one generation request's [`SequenceBlockTable`] for the lifetime of
+/// its decode. Frees the table's blocks back to the shared pool on drop —
+/// including on an early return or error from the decode loop — so a failed
+/// or short-circuited generation never leaks blocks.
+struct PagedSequenceGuard<'a> {
+    table: SequenceBlockTable,
+    pool: &'a Mutex<PagedBlockPool>,
+}
+
+impl<'a> PagedSequenceGuard<'a> {
+    fn new(pool: &'a Mutex<PagedBlockPool>) -> Self {
+        Self {
+            table: SequenceBlockTable::new(),
+            pool,
+        }
+    }
+}
+
+impl Drop for PagedSequenceGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pool) = self.pool.lock() {
+            self.table.free(&mut pool);
+        }
+    }
+}
+
+/// Per-request `CudaGraph` capture/replay state for the paged-attention
+/// decode step (`hardware_strategy.cuda_graph_decode`). Established on the
+/// first post-prefill decode step and reused for the rest of that request —
+/// `SingleDeviceBackend::decode` drops it when the request completes; there
+/// is no cross-request graph reuse yet (see `wire-cuda-graph-decode`'s
+/// design.md Decision 4).
+///
+/// Every tensor here is allocated once, before capture, and updated only by
+/// writing its *contents* in place via `Tensor::slice_set` — never replaced
+/// or reallocated — matching `CudaGraph::capture`'s documented contract
+/// (buffer addresses touched by the captured closure must stay identical
+/// across replays). `block_table_buf` is sized to the paged pool's full
+/// `min_blocks` width from the start (the pool is already capped at exactly
+/// one full-length sequence's worth of blocks, see
+/// `wire-paged-attention-decode-path`'s OOM-bug fix), so its *shape* never
+/// needs to change within a request.
+///
+/// `model.forward`'s `index_pos` argument is always passed as `0` for every
+/// warm-up/capture/replay call: with both `Cache::set_decode_position` and
+/// `Cache::set_paged_kv_decode_slot` attached (below), the paged decode path
+/// never reads the host `index_pos` argument at all — rotary embeddings and
+/// KV-cache placement are both driven entirely by `position_buf`/
+/// `decode_slot_buf`'s device-side contents instead. The *real* position
+/// still flows through this session via those two buffers, updated from the
+/// real `index_pos` each step in [`Self::write_step`].
+#[cfg(feature = "candle-cuda")]
+struct CudaGraphDecodeSession {
+    graph: candle_core::CudaGraph,
+    token_buf: Tensor,
+    position_buf: Tensor,
+    decode_slot_buf: Tensor,
+    block_table_buf: Tensor,
+    seqlens_buf: Tensor,
+    logits_buf: Tensor,
+    page_block_size: usize,
+}
+
+// A CUDA_ERROR_INVALID_VALUE surfaced from an unrelated Cache::new call for
+// the *next* request on the same device, immediately after a first request's
+// CudaGraphDecodeSession (and its CudaGraph) was dropped — even though every
+// replay is already followed by `device.synchronize()`. Synchronizing again
+// here, immediately before the graph's own Drop impl destroys the CUDA graph
+// exec/template, is a defensive measure against that graph teardown racing
+// with (or otherwise interacting badly with) the very next CUDA operation on
+// the same stream/device.
+#[cfg(feature = "candle-cuda")]
+impl Drop for CudaGraphDecodeSession {
+    fn drop(&mut self) {
+        let _ = self.logits_buf.device().synchronize();
+    }
+}
+
+#[cfg(feature = "candle-cuda")]
+impl CudaGraphDecodeSession {
+    /// Writes one decode step's real state into the persistent buffers
+    /// (device-to-device only — no host readback of `block_table`, unlike
+    /// the pre-`astorise/candle#15` `write_new_kv` path this seam replaces).
+    /// Does not itself capture or replay anything.
+    #[allow(clippy::too_many_arguments)]
+    fn write_step(
+        table: &SequenceBlockTable,
+        index_pos: usize,
+        page_block_size: usize,
+        token: &Tensor,
+        token_buf: &Tensor,
+        position_buf: &Tensor,
+        decode_slot_buf: &Tensor,
+        block_table_buf: &Tensor,
+        seqlens_buf: &Tensor,
+        device: &Device,
+    ) -> candle_core::Result<()> {
+        token_buf.slice_set(&token.contiguous()?, 0, 0)?;
+        position_buf.slice_set(&Tensor::new(&[index_pos as u32], device)?, 0, 0)?;
+
+        let logical_block = index_pos / page_block_size;
+        let offset = index_pos % page_block_size;
+        let physical_block = *table.blocks().get(logical_block).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "cuda_graph_decode: position {index_pos} needs logical block {logical_block}, but the sequence's block table only has {} block(s)",
+                table.blocks().len()
+            ))
+        })? as usize;
+        // Matches `PagedKvCache::write_new_kv`'s own host-derived formula
+        // (`physical_block * page_block_size + offset`) exactly — this is
+        // that same computation, just done here instead of via a block-table
+        // readback, per the `Cache::set_paged_kv_decode_slot` seam
+        // (astorise/candle#15).
+        let flat_slot = (physical_block * page_block_size + offset) as u32;
+        decode_slot_buf.slice_set(&Tensor::new(&[flat_slot], device)?, 0, 0)?;
+
+        let blocks = table.blocks();
+        let current_row = Tensor::from_vec(blocks.to_vec(), (1, blocks.len()), device)?;
+        block_table_buf.slice_set(&current_row, 1, 0)?;
+
+        let seqlens = Tensor::new(&[0u32, (index_pos + 1) as u32], device)?;
+        seqlens_buf.slice_set(&seqlens, 0, 0)?;
+        Ok(())
+    }
+
+    /// Establishes the session on the first decode step: allocates the
+    /// persistent buffers at their full maximum width, attaches them to
+    /// every transformer layer, runs one uncaptured warm-up forward pass
+    /// (per `CudaGraph::capture`'s requirement to JIT-load kernels and
+    /// populate the host-to-device upload cache before capture), then
+    /// captures a second logical call as the replayable graph. Returns the
+    /// session plus this first decode step's real logits.
+    #[allow(clippy::too_many_arguments)]
+    fn establish(
+        model: &Llama,
+        cache: &mut Cache,
+        paged: &PagedAttentionRuntime,
+        table: &SequenceBlockTable,
+        cuda_device: &candle_core::CudaDevice,
+        device: &Device,
+        vocab_size: usize,
+        token: &Tensor,
+        index_pos: usize,
+    ) -> candle_core::Result<(Self, Tensor)> {
+        let num_layers = paged.layer_kv.len();
+        let page_block_size = paged.page_block_size;
+        let min_blocks = paged
+            .pool
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("paged KV block pool mutex was poisoned".into()))?
+            .total_blocks();
+
+        let token_buf = Tensor::zeros((1, 1), DType::U32, device)?;
+        let position_buf = Tensor::zeros(1, DType::U32, device)?;
+        let decode_slot_buf = Tensor::zeros(1, DType::U32, device)?;
+        let block_table_buf = Tensor::zeros((1, min_blocks), DType::U32, device)?;
+        let seqlens_buf = Tensor::zeros(2, DType::U32, device)?;
+        // `Llama::forward`'s natural output is `(batch, vocab_size)` — no
+        // separate seq_len dimension (confirmed by `cuda-quality`: an
+        // earlier `(1, 1, vocab_size)` allocation here failed with
+        // `unexpected rank, expected: 3, got: 2` — and matches
+        // `decode_loop_from_logits`'s own `logits.squeeze(0)`, which removes
+        // exactly one (batch) dimension before sampling).
+        let logits_buf = Tensor::zeros((1, vocab_size), DType::F32, device)?;
+
+        Self::write_step(
+            table,
+            index_pos,
+            page_block_size,
+            token,
+            &token_buf,
+            &position_buf,
+            &decode_slot_buf,
+            &block_table_buf,
+            &seqlens_buf,
+            device,
+        )?;
+
+        for layer_idx in 0..num_layers {
+            cache.set_decode_position(layer_idx, position_buf.clone())?;
+            cache.set_paged_kv_decode_slot(layer_idx, decode_slot_buf.clone())?;
+            let (key_cache, value_cache) = &paged.layer_kv[layer_idx];
+            cache.set_paged_kv(
+                layer_idx,
+                PagedKvCache {
+                    key_cache: key_cache.clone(),
+                    value_cache: value_cache.clone(),
+                    block_table: block_table_buf.clone(),
+                    seqlens_k: seqlens_buf.clone(),
+                    page_block_size,
+                },
+            )?;
+        }
+
+        // Warm-up: a real (uncaptured) forward pass, wrapped in its own
+        // host-to-device upload cache guard — `CudaGraph::capture` only
+        // holds that guard for its own call, not for whatever warm-up the
+        // caller ran beforehand.
+        {
+            let _warmup_guard = cuda_device.enable_cuda_graph_htod_cache();
+            let logits = model.forward(&token_buf, 0, cache)?.to_dtype(DType::F32)?;
+            logits_buf.slice_set(&logits, 0, 0)?;
+        }
+        device.synchronize()?;
+
+        let (graph, ()) = candle_core::CudaGraph::capture(cuda_device, || {
+            let logits = model.forward(&token_buf, 0, cache)?.to_dtype(DType::F32)?;
+            logits_buf.slice_set(&logits, 0, 0)?;
+            Ok(())
+        })?;
+
+        // Capture only records the operations; it does not execute them.
+        // Replay once to get this first decode step's real computed logits.
+        graph.replay()?;
+        device.synchronize()?;
+
+        Ok((
+            Self {
+                graph,
+                token_buf,
+                position_buf,
+                decode_slot_buf,
+                block_table_buf,
+                seqlens_buf,
+                logits_buf: logits_buf.clone(),
+                page_block_size,
+            },
+            logits_buf,
+        ))
+    }
+
+    /// Writes a subsequent decode step's real state into the persistent
+    /// buffers and replays the captured graph, returning this step's logits.
+    fn replay_step(
+        &self,
+        table: &SequenceBlockTable,
+        device: &Device,
+        token: &Tensor,
+        index_pos: usize,
+    ) -> candle_core::Result<Tensor> {
+        Self::write_step(
+            table,
+            index_pos,
+            self.page_block_size,
+            token,
+            &self.token_buf,
+            &self.position_buf,
+            &self.decode_slot_buf,
+            &self.block_table_buf,
+            &self.seqlens_buf,
+            device,
+        )?;
+        self.graph.replay()?;
+        device.synchronize()?;
+        Ok(self.logits_buf.clone())
+    }
+}
+
+/// Attaches this forward step's paged KV state to every transformer layer
+/// (growing `table` from `paged.pool` as needed so it can hold
+/// `index_pos + seq_len` tokens), then runs the forward pass and converts
+/// the model's BF16 logits back to F32 for the shared sampling/FSM pipeline,
+/// which assumes F32 throughout.
+fn paged_llama_forward(
+    model: &Llama,
+    cache: &mut Cache,
+    paged: &PagedAttentionRuntime,
+    table: &mut SequenceBlockTable,
+    device: &Device,
+    input: &Tensor,
+    index_pos: usize,
+) -> candle_core::Result<Tensor> {
+    let seq_len = input.dims2()?.1;
+    {
+        let mut pool = paged.pool.lock().map_err(|_| {
+            candle_core::Error::Msg("paged KV block pool mutex was poisoned".into())
+        })?;
+        table
+            .grow_to(index_pos + seq_len, &mut pool)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+    }
+    let block_table = build_block_table_tensor(&[table], device)?;
+    let seqlens_k = build_cumulative_seqlens_tensor(&[index_pos + seq_len], device)?;
+    for (layer_idx, (key_cache, value_cache)) in paged.layer_kv.iter().enumerate() {
+        cache.set_paged_kv(
+            layer_idx,
+            PagedKvCache {
+                key_cache: key_cache.clone(),
+                value_cache: value_cache.clone(),
+                block_table: block_table.clone(),
+                seqlens_k: seqlens_k.clone(),
+                page_block_size: paged.page_block_size,
+            },
+        )?;
+    }
+    model.forward(input, index_pos, cache)?.to_dtype(DType::F32)
+}
+
+/// Sizes and allocates the shared paged-KV block pool and per-layer
+/// `(key_cache, value_cache)` tensors for a Llama checkpoint. Queries free
+/// VRAM *after* the caller has already loaded the model's weights onto
+/// `device` (via `discover_cluster_topology`), so the budget reflects what's
+/// actually left, and uses a fixed fraction of that remaining free VRAM — a
+/// configurable knob is a follow-up (see
+/// `wire-paged-attention-decode-path`'s tasks.md 2.2). Requires enough
+/// blocks to hold one full-length sequence (`config.max_position_embeddings`
+/// tokens); this is deliberately conservative for a single in-flight
+/// sequence per model (continuous batching, which shares the pool across
+/// many concurrent sequences, is a separate follow-up), and fails the load
+/// with a typed error if the budget can't fit even that.
+// `candle_flash_attn`'s paged kernel hard-requires `page_block_size % 32 == 0`
+// (checked at runtime in candle-flash-attn/src/lib.rs) — 32 is the smallest
+// valid value, minimizing memory waste for the single-in-flight-sequence
+// scope this runtime supports today. The `const` assertion below turns a
+// violation into a compile error instead of a real-GPU-only runtime failure
+// (this exact mistake — 16, not a multiple of 32 — previously only surfaced
+// on a real `cuda-quality` run: "paged flash-attn requires page_block_size
+// to be a multiple of 32").
+const PAGED_ATTENTION_PAGE_BLOCK_SIZE: usize = 32;
+const _: () = assert!(
+    PAGED_ATTENTION_PAGE_BLOCK_SIZE.is_multiple_of(32),
+    "paged flash-attn requires page_block_size to be a multiple of 32"
+);
+
+/// Sizes the shared paged-KV block pool. Pure arithmetic (no device/tensor
+/// allocation), so this is unit-testable on CPU independent of real NVML
+/// telemetry — see `paged_attention_pool_is_capped_at_one_sequence_even_with_abundant_free_vram`,
+/// a regression test for a real bug this exact function used to have (an
+/// omitted `num_hidden_layers` factor plus sizing to the *entire* budget
+/// instead of just what one sequence needs OOM'd a real GPU on a tiny test
+/// fixture that had gigabytes of nominally "free" VRAM to claim).
+///
+/// Only one sequence is ever in flight per model today (continuous
+/// batching, which would benefit from a larger shared pool, is a separate
+/// follow-up — issue #312 step 4), so the pool is capped at exactly
+/// `min_blocks` (one full-length sequence at `config.max_position_embeddings`)
+/// regardless of how much more VRAM is free, rather than claiming whatever
+/// fits the entire budget.
+fn size_paged_kv_pool(
+    config: &Config,
+    dtype: DType,
+    free_vram_bytes: u64,
+) -> Result<PagedBlockPool, PagedKvError> {
+    const FREE_VRAM_BUDGET_FRACTION: f64 = 0.5;
+
+    let head_dim = config.hidden_size / config.num_attention_heads;
+    // Cost of one logical block across *every* transformer layer: `layer_kv`
+    // allocates one (key_cache, value_cache) pair per layer, each sized by
+    // `num_blocks`, so a block's true footprint is this per-layer cost times
+    // `num_hidden_layers`, not just one layer's worth.
+    let bytes_per_block = 2u64 // key + value
+        * PAGED_ATTENTION_PAGE_BLOCK_SIZE as u64
+        * config.num_key_value_heads as u64
+        * head_dim as u64
+        * dtype.size_in_bytes() as u64
+        * config.num_hidden_layers as u64;
+    let min_blocks = config
+        .max_position_embeddings
+        .div_ceil(PAGED_ATTENTION_PAGE_BLOCK_SIZE);
+
+    let min_blocks_bytes = bytes_per_block.saturating_mul(min_blocks as u64);
+    let budget_bytes =
+        ((free_vram_bytes as f64 * FREE_VRAM_BUDGET_FRACTION) as u64).min(min_blocks_bytes);
+
+    PagedBlockPool::try_new_within_budget(
+        PAGED_ATTENTION_PAGE_BLOCK_SIZE,
+        bytes_per_block,
+        budget_bytes,
+        min_blocks,
+    )
+}
+
+fn build_paged_attention_runtime(
+    alias: &str,
+    root: &Path,
+    config: &Config,
+    device: &Device,
+    dtype: DType,
+) -> Result<PagedAttentionRuntime, CandleLlmError> {
+    const CUDA_ORDINAL_DEVICE_ID: u32 = 1; // see discover_cluster_topology: ordinal 0 -> device_id 1
+
+    let head_dim = config.hidden_size / config.num_attention_heads;
+    let free_vram_bytes = discover_cluster_topology()
+        .devices
+        .iter()
+        .find(|info| info.device_id == CUDA_ORDINAL_DEVICE_ID)
+        .map(|info| info.free_vram_bytes)
+        .unwrap_or(0);
+    let pool = size_paged_kv_pool(config, dtype, free_vram_bytes).map_err(|error| {
+        CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: format!("paged_attention KV cache pool could not be sized: {error}"),
+        }
+    })?;
+
+    let num_blocks = pool.total_blocks();
+    let alloc_layer_kv = || -> candle_core::Result<(Tensor, Tensor)> {
+        let shape = (
+            num_blocks,
+            PAGED_ATTENTION_PAGE_BLOCK_SIZE,
+            config.num_key_value_heads,
+            head_dim,
+        );
+        Ok((
+            Tensor::zeros(shape, dtype, device)?,
+            Tensor::zeros(shape, dtype, device)?,
+        ))
+    };
+    let mut layer_kv = Vec::with_capacity(config.num_hidden_layers);
+    for _ in 0..config.num_hidden_layers {
+        layer_kv.push(
+            alloc_layer_kv().map_err(|error| CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!("failed to allocate paged_attention KV cache: {error}"),
+            })?,
+        );
+    }
+
+    Ok(PagedAttentionRuntime {
+        pool: Mutex::new(pool),
+        layer_kv,
+        page_block_size: PAGED_ATTENTION_PAGE_BLOCK_SIZE,
+    })
+}
+
 impl SingleDeviceBackend {
     fn decode(
         &self,
@@ -383,24 +855,152 @@ impl SingleDeviceBackend {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<(), CandleLlmError> {
         match self {
-            Self::Llama { model, config } => {
-                let mut cache = Cache::new(true, DType::F32, config, device).map_err(|error| {
+            Self::Llama {
+                model,
+                config,
+                dtype,
+                paged,
+                cuda_graph_decode,
+                ..
+            } => {
+                let mut cache = Cache::new(true, *dtype, config, device).map_err(|error| {
                     runtime.execution_error(format!("failed to build KV cache: {error}"))
                 })?;
-                let (logits, index_pos) = runtime
-                    .llama_prefill_with_prefix_cache(model, prompt_ids, &mut cache, device)?;
-                runtime.decode_loop_from_logits(
-                    logits,
-                    index_pos,
-                    prompt_ids,
-                    DecodeLoopContext {
-                        request,
-                        eos_tokens,
-                        input_device: device,
-                        on_token,
-                    },
-                    |input, index_pos| model.forward(input, index_pos, &mut cache),
-                )
+                match paged {
+                    Some(paged) if *cuda_graph_decode => {
+                        #[cfg_attr(not(feature = "candle-cuda"), allow(unused_mut))]
+                        let mut guard = PagedSequenceGuard::new(&paged.pool);
+                        #[cfg(feature = "candle-cuda")]
+                        {
+                            let mut session: Option<CudaGraphDecodeSession> = None;
+                            runtime.decode_loop(
+                                prompt_ids,
+                                request,
+                                eos_tokens,
+                                device,
+                                on_token,
+                                |input, index_pos| {
+                                    let seq_len = input.dims2()?.1;
+                                    if seq_len != 1 {
+                                        // Prefill: shapes vary chunk to chunk,
+                                        // never captured — always the
+                                        // existing uncaptured paged path.
+                                        return paged_llama_forward(
+                                            model,
+                                            &mut cache,
+                                            paged,
+                                            &mut guard.table,
+                                            device,
+                                            input,
+                                            index_pos,
+                                        );
+                                    }
+                                    {
+                                        let mut pool = paged.pool.lock().map_err(|_| {
+                                            candle_core::Error::Msg(
+                                                "paged KV block pool mutex was poisoned".into(),
+                                            )
+                                        })?;
+                                        guard.table.grow_to(index_pos + 1, &mut pool).map_err(
+                                            |error| candle_core::Error::Msg(error.to_string()),
+                                        )?;
+                                    }
+                                    match &session {
+                                        None => {
+                                            // `try_load_with_topology` already
+                                            // requires a real CUDA device for
+                                            // `cuda_graph_decode`, so this
+                                            // should always match; fall back
+                                            // to the uncaptured path rather
+                                            // than panicking if it somehow
+                                            // doesn't.
+                                            let Device::Cuda(cuda_device) = device else {
+                                                return paged_llama_forward(
+                                                    model,
+                                                    &mut cache,
+                                                    paged,
+                                                    &mut guard.table,
+                                                    device,
+                                                    input,
+                                                    index_pos,
+                                                );
+                                            };
+                                            let (established, logits) =
+                                                CudaGraphDecodeSession::establish(
+                                                    model,
+                                                    &mut cache,
+                                                    paged,
+                                                    &guard.table,
+                                                    cuda_device,
+                                                    device,
+                                                    config.vocab_size,
+                                                    input,
+                                                    index_pos,
+                                                )?;
+                                            session = Some(established);
+                                            Ok(logits)
+                                        }
+                                        Some(established) => established.replay_step(
+                                            &guard.table,
+                                            device,
+                                            input,
+                                            index_pos,
+                                        ),
+                                    }
+                                },
+                            )
+                        }
+                        #[cfg(not(feature = "candle-cuda"))]
+                        {
+                            // `try_load_with_topology` requires `candle-cuda`
+                            // for `cuda_graph_decode`, so this is unreachable
+                            // in practice; kept only so this match stays
+                            // exhaustive on non-CUDA builds.
+                            let _ = &guard;
+                            Err(runtime.execution_error(
+                                "cuda_graph_decode requires the candle-cuda feature".to_owned(),
+                            ))
+                        }
+                    }
+                    Some(paged) => {
+                        let mut guard = PagedSequenceGuard::new(&paged.pool);
+                        runtime.decode_loop(
+                            prompt_ids,
+                            request,
+                            eos_tokens,
+                            device,
+                            on_token,
+                            |input, index_pos| {
+                                paged_llama_forward(
+                                    model,
+                                    &mut cache,
+                                    paged,
+                                    &mut guard.table,
+                                    device,
+                                    input,
+                                    index_pos,
+                                )
+                            },
+                        )
+                    }
+                    None => {
+                        let (logits, index_pos) = runtime.llama_prefill_with_prefix_cache(
+                            model, prompt_ids, &mut cache, device,
+                        )?;
+                        runtime.decode_loop_from_logits(
+                            logits,
+                            index_pos,
+                            prompt_ids,
+                            DecodeLoopContext {
+                                request,
+                                eos_tokens,
+                                input_device: device,
+                                on_token,
+                            },
+                            |input, index_pos| model.forward(input, index_pos, &mut cache),
+                        )
+                    }
+                }
             }
             Self::Qwen2(model) => {
                 let mut model = model.lock().map_err(|_| {
@@ -505,11 +1105,23 @@ impl SingleDeviceBackend {
 
     fn last_logits(&self, input: &Tensor, device: &Device) -> Tensor {
         match self {
-            Self::Llama { model, config } => {
+            Self::Llama {
+                model,
+                config,
+                dtype,
+                ..
+            } => {
+                // Intentionally the plain contiguous-cache path even when this
+                // backend is paged-attention-enabled (`dtype` may be `BF16`):
+                // callers (constrained-decoding lookahead, the `debug_last_logits`
+                // test helper) don't have a `PagedAttentionRuntime`/block table to
+                // attach, so this always runs the dense forward, converting back
+                // to F32 for the shared sampling/FSM code that expects it.
                 let mut cache =
-                    Cache::new(true, DType::F32, config, device).expect("cache should build");
+                    Cache::new(true, *dtype, config, device).expect("cache should build");
                 model
                     .forward(input, 0, &mut cache)
+                    .and_then(|logits| logits.to_dtype(DType::F32))
                     .expect("forward pass should run")
             }
             Self::Qwen2(model) => {
@@ -569,6 +1181,22 @@ impl SingleDeviceBackend {
                     .forward(input, 0)
                     .expect("DeepSeek forward pass should run")
             }
+        }
+    }
+
+    /// The device this backend's weights were actually loaded onto. `Cpu` for
+    /// every architecture except a Llama checkpoint that
+    /// `load_safetensors` resolved a real CUDA device for.
+    fn device(&self) -> Device {
+        match self {
+            Self::Llama { device, .. } => device.clone(),
+            Self::Qwen2(_)
+            | Self::Qwen3(_)
+            | Self::Qwen3Moe(_)
+            | Self::Gemma2(_)
+            | Self::Gemma3(_)
+            | Self::Phi3(_)
+            | Self::DeepSeek(_) => Device::Cpu,
         }
     }
 }
@@ -1000,41 +1628,115 @@ impl CandleLlmRuntime {
                 detail,
             });
         }
-        if strategy.paged_attention {
+        // The single-device path executes on a real CUDA device only for a
+        // Llama checkpoint on a `candle-cuda` build (see
+        // `enable-single-device-llama-cuda-execution`); every other
+        // architecture, or any build without that feature, still returns the
+        // existing typed error for a non-`cpu` request. A non-`single`
+        // strategy resolves its devices from the validated plan instead, so
+        // it does not go through this check — and, critically, none of
+        // `load_parallel`'s tensor/pipeline/expert engines read
+        // `paged_attention`/`flashinfer_attention`/`cuda_graph_decode` at all
+        // (they carry their own separate cache types). Without also
+        // requiring `distribution_mode == Single` here, a parallel-mode
+        // request setting one of those flags would pass this gate and then
+        // silently dispatch to `load_parallel`, which ignores the flag
+        // entirely — accepted but not actually wired.
+        let single_device_cuda_supported = cfg!(feature = "candle-cuda")
+            && architecture == ModelArchitecture::Llama
+            && strategy.distribution_mode == GpuDistribution::Single;
+
+        // paged_attention needs that same Llama+CUDA baseline — the paged
+        // flash-attn kernel is CUDA-only — plus an actual non-`cpu` request.
+        // `load_safetensors` only wires `cache.set_paged_kv` for that exact
+        // combination (see `wire-paged-attention-decode-path`'s design.md),
+        // so every other architecture/build/device combination still fails
+        // closed here.
+        let paged_attention_supported = single_device_cuda_supported && requested_device != "cpu";
+        if strategy.paged_attention && !paged_attention_supported {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
                 detail:
-                    "paged_attention requires Tachyon's block allocator and per-sequence block table to be wired to candle_flash_attn::flash_attn_varlen_paged_windowed"
-                        .to_owned(),
-            });
-        }
-        if strategy.cuda_graph_decode {
-            return Err(CandleLlmError::UnsupportedModel {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                detail:
-                    "cuda_graph_decode requires Tachyon's steady-state GPU decode loop to capture fixed-shape operations through candle_core::CudaGraph"
-                        .to_owned(),
-            });
-        }
-        if strategy.flashinfer_attention {
-            return Err(CandleLlmError::UnsupportedModel {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                detail:
-                    "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention"
+                    "paged_attention requires Tachyon's block allocator and per-sequence block table to be wired to candle_flash_attn::flash_attn_varlen_paged_windowed, and is only available for a Llama checkpoint on a CUDA device"
                         .to_owned(),
             });
         }
 
-        // The single-device path remains CPU-only in this runtime (GPU
-        // execution of the dense path is the separate
-        // `gpu-accelerated-inference-execution` change), so a GPU request on a
-        // `single` deployment still returns the existing typed error. A
-        // non-`single` strategy resolves its devices from the validated plan
-        // instead, so it does not go through this check.
-        if strategy.distribution_mode == GpuDistribution::Single && requested_device != "cpu" {
+        // flashinfer_attention needs the same Llama+CUDA baseline plus the
+        // separate, optional `candle-flashinfer` Cargo feature: unlike
+        // `flash-attn` (unconditionally bundled into `candle-cuda`, so
+        // `single_device_cuda_supported` alone is enough for paged_attention),
+        // `candle-transformers/flashinfer-kernels` is only compiled in when
+        // `candle-flashinfer` is enabled. Without that check, a `candle-cuda`
+        // build lacking `candle-flashinfer` would report this as supported and
+        // then panic at decode time (`unimplemented!("compile with
+        // '--features flashinfer-kernels'")`).
+        let flashinfer_attention_supported = single_device_cuda_supported
+            && cfg!(feature = "candle-flashinfer")
+            && requested_device != "cpu";
+        if strategy.flashinfer_attention {
+            if !flashinfer_attention_supported {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail:
+                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Llama checkpoint on a CUDA device with the candle-flashinfer feature compiled in"
+                            .to_owned(),
+                });
+            }
+            // The fork's `flashinfer_decode_attention` attends over the
+            // contiguous cache shape; paged attention's block-table layout is
+            // a different shape entirely, and composing both would need its
+            // own design (see `wire-flashinfer-decode-attention`'s design.md
+            // Non-Goals). Reject explicitly rather than silently picking one.
+            if strategy.paged_attention {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail:
+                        "flashinfer_attention cannot be combined with paged_attention — they select different decode-attention kernels over different KV cache layouts; enable exactly one"
+                            .to_owned(),
+                });
+            }
+        }
+
+        if strategy.cuda_graph_decode {
+            if !paged_attention_supported {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail:
+                        "cuda_graph_decode requires Tachyon's steady-state GPU decode loop to capture fixed-shape operations through candle_core::CudaGraph, and is only available for a Llama checkpoint on a CUDA device"
+                            .to_owned(),
+                });
+            }
+            // The contiguous KV cache grows via a fresh, differently-shaped
+            // allocation every decode step (`Tensor::cat`), which
+            // `CudaGraph::capture` disallows; paged attention's pre-allocated,
+            // in-place-updated `PagedKvCache` is the only KV layout this
+            // runtime has that is graph-capture-safe (see
+            // `wire-cuda-graph-decode`'s design.md).
+            if !strategy.paged_attention {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail:
+                        "cuda_graph_decode requires hardware_strategy.paged_attention: true — the contiguous KV cache's per-step reallocation is incompatible with CUDA graph replay"
+                            .to_owned(),
+                });
+            }
+            // Every prerequisite above is satisfiable, and capture/replay is
+            // now real (`CudaGraphDecodeSession`, gated on `candle-cuda`,
+            // wired via `astorise/candle#12`/`#15`'s
+            // `set_decode_position`/`set_paged_kv_decode_slot` seams) — fall
+            // through to load normally instead of rejecting.
+        }
+
+        if strategy.distribution_mode == GpuDistribution::Single
+            && requested_device != "cpu"
+            && !single_device_cuda_supported
+        {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
@@ -1069,7 +1771,9 @@ impl CandleLlmRuntime {
 
         let (inner, limits) = if strategy.distribution_mode == GpuDistribution::Single {
             match format {
-                ModelFormat::Safetensors => Self::load_safetensors(alias, root)?,
+                ModelFormat::Safetensors => {
+                    Self::load_safetensors(alias, root, requested_device, strategy)?
+                }
                 ModelFormat::Gguf => Self::load_gguf(alias, root)?,
             }
         } else {
@@ -1091,9 +1795,23 @@ impl CandleLlmRuntime {
 
     /// Load a registered Hugging Face safetensors architecture from
     /// `config.json` plus single-file or sharded weights.
+    ///
+    /// `requested_device` only ever selects a non-`cpu` device here for a
+    /// Llama checkpoint: `try_load_with_topology`'s single-device gate has
+    /// already rejected every other architecture/build combination before
+    /// this is reached, so `Device::cuda_if_available` is only called when
+    /// that gate already guarantees a `candle-cuda` build and a Llama
+    /// checkpoint. Every other architecture keeps loading on `Device::Cpu`
+    /// unconditionally, unchanged.
+    ///
+    /// Similarly, `strategy.paged_attention` only ever takes effect for a
+    /// Llama checkpoint: `try_load_with_topology`'s paged-attention gate has
+    /// already rejected every other case before this is reached.
     fn load_safetensors(
         alias: &str,
         root: &Path,
+        requested_device: &str,
+        strategy: &HardwareStrategy,
     ) -> Result<(LoadedModel, GenerationLimits), CandleLlmError> {
         let raw_config =
             fs::read(root.join(CONFIG_JSON)).map_err(|error| CandleLlmError::InvalidComponent {
@@ -1105,17 +1823,37 @@ impl CandleLlmRuntime {
         let architecture = inspect_hf_architecture(alias, root, &raw_config)?;
         let eos_tokens = generation_eos_token_ids(alias, root, &raw_config)?;
         let weight_paths = safetensors_paths(alias, root)?;
-        let device = Device::Cpu;
+        let device = if architecture == ModelArchitecture::Llama && requested_device != "cpu" {
+            Device::cuda_if_available(0).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            })?
+        } else {
+            Device::Cpu
+        };
+        // BF16 only for a paged-attention Llama deployment: candle-flash-attn
+        // (and so `flash_attn_varlen_paged_windowed`) hard-errors on F32
+        // ("flash-attn is only supported for f16/bf16"), so paged attention
+        // needs the whole model's working dtype switched, not just a block
+        // table attached. Every other case keeps today's F32 unchanged.
+        let dtype = if architecture == ModelArchitecture::Llama && strategy.paged_attention {
+            DType::BF16
+        } else {
+            DType::F32
+        };
         // SAFETY: the model files live in the (uploaded) model directory and are
         // not mutated for the lifetime of the mmap held by the VarBuilder/model.
         let var_builder =
-            unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &device) }
-                .map_err(|error| CandleLlmError::InvalidComponent {
+            unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, dtype, &device) }.map_err(
+                |error| CandleLlmError::InvalidComponent {
                     alias: alias.to_owned(),
                     path: root.to_path_buf(),
                     component: MODEL_SAFETENSORS,
                     detail: error.to_string(),
-                })?;
+                },
+            )?;
         let invalid_weights = |error: candle_core::Error| CandleLlmError::InvalidComponent {
             alias: alias.to_owned(),
             path: root.to_path_buf(),
@@ -1133,12 +1871,37 @@ impl CandleLlmRuntime {
                             detail: error.to_string(),
                         }
                     })?;
-                let config = llama_config.into_config(false);
+                let mut config = llama_config.into_config(false);
+                // `Config::use_flashinfer_attention` exists regardless of the
+                // `candle-flashinfer` Cargo feature (only its dead-code lint
+                // is feature-gated on the fork side), and
+                // `try_load_with_topology` has already rejected every request
+                // where this would be `true` without that feature compiled
+                // in, so assigning it unconditionally here is safe — it's a
+                // no-op `false` on any build without the feature.
+                config.use_flashinfer_attention = strategy.flashinfer_attention;
                 let limits = GenerationLimits::with_context(config.max_position_embeddings);
                 let eos_tokens = eos_token_ids(&config);
                 let model = Llama::load(var_builder, &config).map_err(invalid_weights)?;
+                let paged = if strategy.paged_attention {
+                    Some(build_paged_attention_runtime(
+                        alias, root, &config, &device, dtype,
+                    )?)
+                } else {
+                    None
+                };
                 (
-                    SingleDeviceBackend::Llama { model, config },
+                    SingleDeviceBackend::Llama {
+                        model,
+                        config,
+                        device: device.clone(),
+                        dtype,
+                        // `try_load_with_topology` requires `paged_attention`
+                        // whenever `cuda_graph_decode` is set, so `paged` is
+                        // always `Some` here when this is `true`.
+                        cuda_graph_decode: strategy.cuda_graph_decode,
+                        paged,
+                    },
                     limits,
                     eos_tokens,
                 )
@@ -1398,7 +2161,14 @@ impl CandleLlmRuntime {
             }
         })?;
         let inner = LoadedModel::Safetensors {
-            backend: SingleDeviceBackend::Llama { model, config },
+            backend: SingleDeviceBackend::Llama {
+                model,
+                config,
+                device: device.clone(),
+                dtype: DType::F32,
+                paged: None,
+                cuda_graph_decode: false,
+            },
             eos_tokens,
         };
 
@@ -1974,6 +2744,16 @@ impl CandleLlmRuntime {
         if prompts.len() != 1 || !self.has_compatible_tokenizer(draft) {
             return self.generate_streaming(prompts, on_token);
         }
+        // Verification (`greedy_next_token_id`/`last_logits`) always builds a
+        // fresh contiguous `Cache` from `self`'s already-loaded model, which
+        // would dtype-mismatch against a paged-attention deployment's BF16
+        // weights combined with block-table state it doesn't attach. Neither
+        // paged attention nor speculative verification are wired to compose
+        // yet, so fall back to plain generation for either side — the same
+        // pattern this function already uses for an incompatible tokenizer.
+        if self.is_paged_attention_enabled() || draft.is_paged_attention_enabled() {
+            return self.generate_streaming(prompts, on_token);
+        }
         let request = self.parse_request(prompts[0])?;
         if !request.sampling.is_greedy() || request.fsm.is_some() {
             return self.generate_streaming(prompts, on_token);
@@ -2053,6 +2833,21 @@ impl CandleLlmRuntime {
         self.tokenizer.get_vocab(true) == draft.tokenizer.get_vocab(true)
     }
 
+    /// `true` for a Llama safetensors backend loaded with
+    /// `hardware_strategy.paged_attention: true` (BF16 weights, a shared
+    /// block pool). Used to keep features that aren't wired to compose with
+    /// paged attention yet (speculative-decoding verification) from hitting
+    /// a dtype mismatch instead of falling back cleanly.
+    fn is_paged_attention_enabled(&self) -> bool {
+        matches!(
+            &*self.inner,
+            LoadedModel::Safetensors {
+                backend: SingleDeviceBackend::Llama { paged: Some(_), .. },
+                ..
+            }
+        )
+    }
+
     fn is_eos_token(&self, token: u32) -> bool {
         match &*self.inner {
             LoadedModel::Safetensors { eos_tokens, .. } | LoadedModel::Gguf { eos_tokens, .. } => {
@@ -2114,7 +2909,13 @@ impl CandleLlmRuntime {
                 self.execution_error(format!("failed to build input tensor: {error}"))
             })?;
         match &*self.inner {
-            LoadedModel::Safetensors { backend, .. } => Ok(backend.last_logits(&input, &device)),
+            LoadedModel::Safetensors { backend, .. } => {
+                let backend_device = backend.device();
+                let input = input.to_device(&backend_device).map_err(|error| {
+                    self.execution_error(format!("failed to move input to device: {error}"))
+                })?;
+                Ok(backend.last_logits(&input, &backend_device))
+            }
             LoadedModel::Gguf { model, .. } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
@@ -2198,7 +2999,10 @@ impl CandleLlmRuntime {
             LoadedModel::Safetensors {
                 backend,
                 eos_tokens,
-            } => backend.decode(self, prompt_ids, request, eos_tokens, &device, on_token),
+            } => {
+                let device = backend.device();
+                backend.decode(self, prompt_ids, request, eos_tokens, &device, on_token)
+            }
             LoadedModel::Gguf { model, eos_tokens } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
@@ -2584,7 +3388,10 @@ impl CandleLlmRuntime {
     #[cfg(test)]
     pub(crate) fn debug_last_logits(&self, prompt: &str) -> Vec<f32> {
         let ids = self.encode_ids(prompt).expect("prompt should tokenize");
-        let device = Device::Cpu;
+        let device = match &*self.inner {
+            LoadedModel::Safetensors { backend, .. } => backend.device(),
+            _ => Device::Cpu,
+        };
         let input = Tensor::new(ids.as_slice(), &device)
             .and_then(|tensor| tensor.unsqueeze(0))
             .expect("input tensor should build");
@@ -3614,6 +4421,127 @@ fn fixture_weights() -> anyhow::Result<HashMap<String, Tensor>> {
         &[FIXTURE_VOCAB_SIZE, hidden],
     )?;
     Ok(tensors)
+}
+
+/// Head-dim-compatible tiny Llama fixture for CUDA-only paged-attention
+/// tests. `candle_flash_attn`'s paged kernel additionally requires head
+/// sizes to be a multiple of 8 ("only supports head sizes that are a
+/// multiple of 8 (got 4)") — a third real constraint caught only by a real
+/// `cuda-quality` run, since the shared `FIXTURE_HIDDEN_SIZE`/`FIXTURE_NUM_HEADS`
+/// (head_dim 4) never exercises this kernel via the CPU/dense tests. Doubles
+/// hidden_size to 16 (head_dim 8) and reuses every other tiny-fixture
+/// dimension; a separate function rather than changing `FIXTURE_HIDDEN_SIZE`
+/// itself, which every architecture's fixture (Qwen, Gemma, Phi, DeepSeek,
+/// Mixtral, NVFP4 — ~180 other tests) depends on.
+#[cfg(test)]
+fn write_tachyon_tiny_paged_attention_fixture(root: &Path) -> anyhow::Result<()> {
+    const HIDDEN: usize = 16;
+    const NUM_HEADS: usize = 2;
+    fs::create_dir_all(root)?;
+    fs::write(
+        root.join(CONFIG_JSON),
+        serde_json::json!({
+            "model_type": LLAMA_MODEL_TYPE,
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": HIDDEN,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_attention_heads": NUM_HEADS,
+            "num_key_value_heads": NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null
+        })
+        .to_string(),
+    )?;
+    fs::write(root.join(TOKENIZER_JSON), TINY_TOKENIZER_JSON)?;
+
+    let inter = FIXTURE_INTERMEDIATE_SIZE;
+    let head_dim = HIDDEN / NUM_HEADS;
+    let q = NUM_HEADS * head_dim;
+    let kv = NUM_HEADS * head_dim;
+    let mut tensors = HashMap::new();
+    let mut seed = 1u64;
+    let mut dense =
+        |tensors: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]| -> anyhow::Result<()> {
+            let len: usize = dims.iter().product();
+            let values = deterministic_fill(seed, len);
+            seed = seed.wrapping_add(1);
+            tensors.insert(
+                name.to_owned(),
+                Tensor::from_vec(values, dims.to_vec(), &Device::Cpu)?,
+            );
+            Ok(())
+        };
+    let norm = |tensors: &mut HashMap<String, Tensor>, name: &str| -> anyhow::Result<()> {
+        tensors.insert(
+            name.to_owned(),
+            Tensor::from_vec(vec![1f32; HIDDEN], (HIDDEN,), &Device::Cpu)?,
+        );
+        Ok(())
+    };
+
+    dense(
+        &mut tensors,
+        "model.embed_tokens.weight",
+        &[FIXTURE_VOCAB_SIZE, HIDDEN],
+    )?;
+    for layer in 0..FIXTURE_NUM_LAYERS {
+        let prefix = format!("model.layers.{layer}");
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            &[q, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            &[kv, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            &[kv, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            &[HIDDEN, q],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            &[inter, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.mlp.up_proj.weight"),
+            &[inter, HIDDEN],
+        )?;
+        dense(
+            &mut tensors,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            &[HIDDEN, inter],
+        )?;
+        norm(&mut tensors, &format!("{prefix}.input_layernorm.weight"))?;
+        norm(
+            &mut tensors,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+        )?;
+    }
+    norm(&mut tensors, "model.norm.weight")?;
+    dense(
+        &mut tensors,
+        "lm_head.weight",
+        &[FIXTURE_VOCAB_SIZE, HIDDEN],
+    )?;
+
+    candle_core::safetensors::save(&tensors, root.join(MODEL_SAFETENSORS))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5882,11 +6810,18 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // On a build without `candle-cuda`, the single-device path stays cpu-only
+    // for every architecture, Llama included — `enable-single-device-llama-cuda-execution`
+    // only lifts this for a Llama checkpoint on a `candle-cuda` build (see
+    // `single_device_llama_executes_on_a_real_cuda_device` below).
+    #[cfg(not(feature = "candle-cuda"))]
     #[test]
     fn single_strategy_still_rejects_a_gpu_device_request() {
         let dir = write_fixture_dir("single-gpu-reject");
         let error = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &HardwareStrategy::default())
-            .expect_err("single-device path is cpu-only and must reject a gpu request");
+            .expect_err(
+                "single-device path is cpu-only without candle-cuda and must reject a gpu request",
+            );
         match error {
             CandleLlmError::UnsupportedModel { detail, .. } => {
                 assert!(
@@ -5896,6 +6831,233 @@ mod tests {
             }
             other => panic!("expected UnsupportedModel, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Holds on every build (with or without `candle-cuda`): only a Llama
+    // checkpoint gets a real device on the single-device path.
+    #[test]
+    fn single_strategy_still_rejects_a_gpu_device_request_for_a_non_llama_architecture() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-qwen2-single-gpu-reject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        write_tachyon_tiny_qwen_fixture(&dir, ModelArchitecture::Qwen2)
+            .expect("Qwen fixture should be written");
+        let error =
+            CandleLlmRuntime::try_load("tiny-qwen", &dir, "cuda", &HardwareStrategy::default())
+                .expect_err("a non-Llama architecture must keep rejecting a gpu request");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("cpu` execution only"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Requires a real CUDA device (`arc-gpu-runners`/`cuda-quality`, or a
+    // dev machine with a working `candle-cuda` build) — see
+    // `enable-single-device-llama-cuda-execution`'s design.md for why this
+    // isn't runnable on this repo's default Windows dev sandbox today.
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn single_device_llama_executes_on_a_real_cuda_device() {
+        let dir = write_fixture_dir("single-gpu-llama");
+        let runtime =
+            CandleLlmRuntime::try_load("tiny", &dir, "cuda", &HardwareStrategy::default())
+                .expect("a Llama checkpoint must load on a real cuda device")
+                .expect("tiny fixture should select the native Candle runtime");
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
+        let output = runtime
+            .generate(&[request])
+            .expect("generation must run a real decode on the cuda device");
+        assert!(
+            !output.is_empty(),
+            "cuda-resident Llama generation must not be empty/mocked"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Regression test for a real bug caught by `cuda-quality` on real GPU
+    // hardware: `size_paged_kv_pool` used to omit `num_hidden_layers` from
+    // its byte-per-block cost, and sized the pool to whatever fit the
+    // *entire* free-VRAM budget instead of just what one sequence needs.
+    // For the tiny fixture's config (hidden_size 8, 2 heads, 2 layers) that
+    // computed `max_blocks` in the millions given a real GPU's worth of
+    // free VRAM, and the resulting multi-gigabyte allocation attempt OOM'd
+    // a real CUDA device that easily had room for the tiny model's actual
+    // weights. This test runs on CPU (no GPU/candle-cuda needed): it feeds a
+    // large `free_vram_bytes` and asserts the pool still comes out capped at
+    // exactly one full-length sequence's worth of blocks.
+    #[test]
+    fn paged_attention_pool_is_capped_at_one_sequence_even_with_abundant_free_vram() {
+        let llama_config: LlamaConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null
+        }))
+        .expect("fixture-shaped JSON should deserialize as LlamaConfig");
+        let config = llama_config.into_config(false);
+
+        // A generously large free-VRAM figure (16 GiB) that would size the
+        // pool into the millions of blocks under the old (buggy) sizing.
+        let abundant_free_vram_bytes = 16u64 * 1024 * 1024 * 1024;
+        let pool = size_paged_kv_pool(&config, DType::BF16, abundant_free_vram_bytes)
+            .expect("a tiny model's one-sequence pool must fit comfortably in 16 GiB");
+
+        let expected_min_blocks =
+            FIXTURE_MAX_POSITION_EMBEDDINGS.div_ceil(PAGED_ATTENTION_PAGE_BLOCK_SIZE);
+        assert_eq!(
+            pool.total_blocks(),
+            expected_min_blocks,
+            "pool must be capped at one sequence's worth of blocks, not whatever the free-VRAM budget allows"
+        );
+    }
+
+    #[test]
+    fn paged_attention_pool_sizing_fails_closed_when_even_one_sequence_does_not_fit() {
+        let llama_config: LlamaConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": FIXTURE_HIDDEN_SIZE,
+            "intermediate_size": FIXTURE_INTERMEDIATE_SIZE,
+            "vocab_size": FIXTURE_VOCAB_SIZE,
+            "num_hidden_layers": FIXTURE_NUM_LAYERS,
+            "num_attention_heads": FIXTURE_NUM_HEADS,
+            "num_key_value_heads": FIXTURE_NUM_HEADS,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": null
+        }))
+        .expect("fixture-shaped JSON should deserialize as LlamaConfig");
+        let config = llama_config.into_config(false);
+
+        size_paged_kv_pool(&config, DType::BF16, 0)
+            .expect_err("zero free VRAM must not fit even one sequence's worth of blocks");
+    }
+
+    // Holds on every build (with or without `candle-cuda`): only a Llama
+    // checkpoint on a CUDA device can get paged attention wired.
+    #[test]
+    fn paged_attention_strategy_is_rejected_for_a_non_llama_architecture() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-qwen2-paged-attn-reject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        write_tachyon_tiny_qwen_fixture(&dir, ModelArchitecture::Qwen2)
+            .expect("Qwen fixture should be written");
+        let strategy = HardwareStrategy {
+            paged_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny-qwen", &dir, "cuda", &strategy).expect_err(
+            "a non-Llama architecture must keep rejecting paged_attention even on a cuda request",
+        );
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("flash_attn_varlen_paged_windowed"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Regression for a real bug an automated review caught: `load_parallel`'s
+    // tensor/pipeline/expert engines never read `paged_attention` at all (they
+    // carry their own separate cache types), so a tensor-parallel request
+    // setting it used to pass this gate and then silently dispatch to
+    // `load_parallel`, which just ignored the flag — accepted but not wired.
+    // Holds on every build (with or without `candle-cuda`): a non-`Single`
+    // distribution mode must keep rejecting paged_attention regardless of
+    // architecture/device.
+    #[test]
+    fn paged_attention_strategy_is_rejected_for_a_non_single_distribution_mode() {
+        let dir = write_fixture_dir("paged-attn-tp-reject");
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::TensorParallelism,
+            device_ids: vec![0, 1],
+            paged_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect_err(
+            "a tensor-parallel request must keep rejecting paged_attention, not silently ignore it",
+        );
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("flash_attn_varlen_paged_windowed"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Requires a real CUDA device (`arc-gpu-runners`/`cuda-quality`) — not
+    // runnable on this repo's default Windows dev sandbox, same as
+    // `single_device_llama_executes_on_a_real_cuda_device`.
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn single_device_llama_paged_attention_generates_a_real_decode_on_cuda() {
+        let dir = write_fixture_dir_with(
+            "paged-attn-cuda",
+            write_tachyon_tiny_paged_attention_fixture,
+        );
+        let strategy = HardwareStrategy {
+            paged_attention: true,
+            ..Default::default()
+        };
+        let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &strategy)
+            .expect("a paged-attention Llama checkpoint must load on a real cuda device")
+            .expect("tiny fixture should select the native Candle runtime");
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4,"temperature":0.0}"#;
+        let first = runtime
+            .generate(&[request])
+            .expect("paged-attention generation must run a real decode on the cuda device");
+        assert!(
+            !first.is_empty(),
+            "paged-attention generation must not be empty/mocked"
+        );
+        let second = runtime
+            .generate(&[request])
+            .expect("a second paged-attention request must reuse the block pool correctly");
+        assert_eq!(
+            first, second,
+            "greedy paged-attention generation must be deterministic across requests reusing the same shared block pool"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -5941,6 +7103,93 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // Reaching the paged_attention-dependency message (rather than the
+    // device/arch rejection above) requires candle-cuda, so this can only
+    // exercise the specific "requires paged_attention" wording on a build
+    // that has it.
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn cuda_graph_decode_strategy_is_rejected_without_paged_attention() {
+        let dir = write_fixture_dir("cuda-graph-no-paged-reject");
+        let strategy = HardwareStrategy {
+            cuda_graph_decode: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &strategy)
+            .expect_err("cuda_graph_decode must not silently run without paged_attention");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("requires hardware_strategy.paged_attention"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Requires a real CUDA device (`arc-gpu-runners`/`cuda-quality`) — not
+    // runnable on this repo's default Windows dev sandbox, same as
+    // `single_device_llama_paged_attention_generates_a_real_decode_on_cuda`.
+    // Exercises `CudaGraphDecodeSession`'s establish (warm-up + capture +
+    // first replay) and every subsequent step's replay, cross-checked
+    // against the non-captured paged-attention path's output for the same
+    // checkpoint/prompt: a captured decode replaying incorrectly could still
+    // produce non-empty but *wrong* output, so a plain non-emptiness check
+    // wouldn't catch a subtle correctness bug (e.g. a stale position/decode
+    // slot) the way this equality check does.
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda() {
+        let dir = write_fixture_dir_with(
+            "cuda-graph-decode-cuda",
+            write_tachyon_tiny_paged_attention_fixture,
+        );
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4,"temperature":0.0}"#;
+
+        let paged_only_strategy = HardwareStrategy {
+            paged_attention: true,
+            ..Default::default()
+        };
+        let paged_only_runtime =
+            CandleLlmRuntime::try_load("tiny", &dir, "cuda", &paged_only_strategy)
+                .expect("the checkpoint must load with paged_attention alone")
+                .expect("tiny fixture should select the native Candle runtime");
+        let paged_only_output = paged_only_runtime
+            .generate(&[request])
+            .expect("paged-attention generation must run a real decode on the cuda device");
+        drop(paged_only_runtime);
+
+        // A single cuda_graph_decode request per loaded runtime: proven
+        // correct on real hardware (matches the non-captured paged-attention
+        // path exactly). A *second* sequential request against the same
+        // already-warmed-up runtime is a known, currently-unresolved
+        // limitation — see design.md's "Known limitation" note and
+        // astorise/candle#17 — so this test deliberately exercises only one
+        // request per runtime for now, matching what's actually supported.
+        let captured_strategy = HardwareStrategy {
+            paged_attention: true,
+            cuda_graph_decode: true,
+            ..Default::default()
+        };
+        let captured_runtime = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &captured_strategy)
+            .expect("a paged-attention + cuda_graph_decode Llama checkpoint must load on a real cuda device")
+            .expect("tiny fixture should select the native Candle runtime");
+        let captured_output = captured_runtime
+            .generate(&[request])
+            .expect("cuda_graph_decode generation must run a real captured/replayed decode");
+        assert!(
+            !captured_output.is_empty(),
+            "cuda_graph_decode generation must not be empty/mocked"
+        );
+        assert_eq!(
+            captured_output, paged_only_output,
+            "cuda_graph_decode's captured/replayed decode must match the non-captured paged-attention path's greedy output for the same prompt"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn flashinfer_attention_strategy_is_rejected_until_decode_attention_is_wired() {
         let dir = write_fixture_dir("flashinfer-reject");
@@ -5959,6 +7208,146 @@ mod tests {
             }
             other => panic!("expected UnsupportedModel, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Holds on every build (with or without candle-cuda/candle-flashinfer):
+    // only a Llama checkpoint on a CUDA device can get flashinfer_attention
+    // wired.
+    #[test]
+    fn flashinfer_attention_strategy_is_rejected_for_a_non_llama_architecture() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-qwen2-flashinfer-reject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        write_tachyon_tiny_qwen_fixture(&dir, ModelArchitecture::Qwen2)
+            .expect("Qwen fixture should be written");
+        let strategy = HardwareStrategy {
+            flashinfer_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny-qwen", &dir, "cuda", &strategy).expect_err(
+            "a non-Llama architecture must keep rejecting flashinfer_attention even on a cuda request",
+        );
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("flashinfer_decode_attention"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Regression for a real bug an automated review caught: for a
+    // tensor/pipeline/expert-parallel Llama deployment, `load_parallel`'s
+    // Config never sets `use_flashinfer_attention` (it has no FlashInfer path
+    // at all), so a parallel-mode request setting this flag used to pass this
+    // gate and then silently load with the default attention implementation.
+    // Holds on every build: a non-`Single` distribution mode must keep
+    // rejecting flashinfer_attention regardless of architecture/device.
+    #[test]
+    fn flashinfer_attention_strategy_is_rejected_for_a_non_single_distribution_mode() {
+        let dir = write_fixture_dir("flashinfer-tp-reject");
+        let strategy = HardwareStrategy {
+            distribution_mode: GpuDistribution::TensorParallelism,
+            device_ids: vec![0, 1],
+            flashinfer_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load_with_topology(
+            "tiny",
+            &dir,
+            "cuda",
+            &strategy,
+            &two_device_topology(),
+        )
+        .expect_err(
+            "a tensor-parallel request must keep rejecting flashinfer_attention, not silently ignore it",
+        );
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("flashinfer_decode_attention"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Reaching the paged-attention conflict message (rather than the "feature
+    // not compiled in" rejection) requires both candle-cuda and
+    // candle-flashinfer, same as the real execution test below.
+    #[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]
+    #[test]
+    fn flashinfer_attention_and_paged_attention_combination_is_rejected() {
+        let dir = write_fixture_dir("flashinfer-paged-combo-reject");
+        let strategy = HardwareStrategy {
+            flashinfer_attention: true,
+            paged_attention: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &strategy)
+            .expect_err("flashinfer_attention and paged_attention must not silently compose");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("cannot be combined with paged_attention"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Requires a real CUDA device (`arc-gpu-runners`/`cuda-quality`) — not
+    // runnable on this repo's default Windows dev sandbox, same as
+    // `single_device_llama_paged_attention_generates_a_real_decode_on_cuda`.
+    #[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]
+    #[test]
+    fn single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda() {
+        let dir = write_fixture_dir("flashinfer-attn-cuda");
+        let strategy = HardwareStrategy {
+            flashinfer_attention: true,
+            ..Default::default()
+        };
+        let runtime = CandleLlmRuntime::try_load("tiny", &dir, "cuda", &strategy)
+            .expect("a flashinfer-attention Llama checkpoint must load on a real cuda device")
+            .expect("tiny fixture should select the native Candle runtime");
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4,"temperature":0.0}"#;
+        let flashinfer_output = runtime
+            .generate(&[request])
+            .expect("flashinfer-attention generation must run a real decode on the cuda device");
+        assert!(
+            !flashinfer_output.is_empty(),
+            "flashinfer-attention generation must not be empty/mocked"
+        );
+
+        // flashinfer_decode_attention is numerically equivalent to the dense
+        // matmul+softmax computation for a single decode token (proven by the
+        // fork's own `flashinfer_decode_matches_dense_path` test), so greedy
+        // generation over the same checkpoint/prompt should match the dense
+        // path's output, not just be non-empty.
+        let dense_runtime =
+            CandleLlmRuntime::try_load("tiny", &dir, "cuda", &HardwareStrategy::default())
+                .expect("the same checkpoint must also load without flashinfer_attention")
+                .expect("tiny fixture should select the native Candle runtime");
+        let dense_output = dense_runtime
+            .generate(&[request])
+            .expect("dense generation must run a real decode on the cuda device");
+        assert_eq!(
+            flashinfer_output, dense_output,
+            "flashinfer-attention decode must match the dense path's greedy output for the same prompt"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

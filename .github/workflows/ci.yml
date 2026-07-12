@@ -150,11 +150,17 @@ jobs:
         # decryption timing; we only verify JWT signatures with public keys
         # (no private-key ops), so it does not apply. RUSTSEC-2024-0429 is in
         # glib's VariantStrIter; glib is present through the desktop/Tauri GTK
-        # dependency tree, not the headless runtime path.
+        # dependency tree, not the headless runtime path. RUSTSEC-2026-0204
+        # (published 2026-07-06) is an invalid-pointer dereference in
+        # crossbeam-epoch's `fmt::Pointer` impl for `Atomic`/`Shared`, reached
+        # only by formatting those types for Debug/Display; Tachyon's
+        # dependency tree never does that. Remove this ignore once a fixed
+        # crossbeam-epoch (advisory says >=0.9.20) is picked up.
         run: >
           cargo audit
           --ignore RUSTSEC-2023-0071
           --ignore RUSTSEC-2024-0429
+          --ignore RUSTSEC-2026-0204
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
@@ -361,6 +367,43 @@ jobs:
       # ranks, see parallel.rs), not just that candle-cuda compiles/lints.
       - name: Run CUDA NCCL all-reduce proof
         run: cargo test -p core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
+
+      # Proves the single-device Llama path (enable-single-device-llama-cuda-execution)
+      # actually loads weights and runs a real autoregressive decode on this
+      # runner's GPU instead of falling back to `Device::Cpu`.
+      - name: Run single-device Llama CUDA execution proof
+        run: cargo test -p core-host --features candle-cuda single_device_llama_executes_on_a_real_cuda_device -- --nocapture
+
+      # Proves hardware_strategy.paged_attention (wire-paged-attention-decode-path)
+      # actually attaches cache.set_paged_kv and runs a real decode through
+      # flash_attn_varlen_paged_windowed on this runner's GPU, including a
+      # second request reusing the same shared block pool.
+      - name: Run paged-attention CUDA execution proof
+        run: cargo test -p core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
+
+      # Proves cuda_graph_decode still fails closed without paged_attention
+      # (wire-cuda-graph-decode's Section 2.1 gate).
+      - name: Run CUDA Graph decode gate proof
+        run: cargo test -p core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected_without_paged_attention -- --nocapture
+
+      # Proves hardware_strategy.cuda_graph_decode (wire-cuda-graph-decode)
+      # actually captures and replays the steady-state decode step through
+      # candle_core::CudaGraph on this runner's GPU (CudaGraphDecodeSession:
+      # warm-up, capture, first replay, then plain replays), and that its
+      # output matches the non-captured paged-attention path's greedy decode
+      # for the same checkpoint/prompt — not just that it runs without error.
+      - name: Run CUDA Graph decode capture/replay execution proof
+        run: cargo test -p core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
+
+      # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
+      # actually dispatches through candle-flashinfer-kernels::flashinfer_decode_attention
+      # for the decode step on this runner's GPU, and that its output matches the
+      # dense (non-flashinfer) path's greedy decode for the same checkpoint/prompt.
+      - name: Run FlashInfer decode-attention CUDA execution proof
+        run: cargo test -p core-host --features "candle-cuda candle-flashinfer" single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
+
+      - name: Run FlashInfer/paged-attention combination rejection proof
+        run: cargo test -p core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
 
       - name: Fetch CUTLASS headers
         if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
