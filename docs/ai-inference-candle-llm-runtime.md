@@ -217,15 +217,22 @@ typed rejection.
 
 A capture, warm-up, and however many replays a single request needs are all
 correct — confirmed on real GPU hardware, output identical to the
-non-captured paged-attention path for the same prompt. A second, independent
-request against the same already-loaded model briefly failed with a
-low-level CUDA driver error (`CUDA_ERROR_INVALID_VALUE`) during real-hardware
-testing: `candle-core` only paused its internal event-tracking bookkeeping
-for the duration of the capture call itself, so a later, independent capture
-on the same device could observe stale tracking state from the first. Fixed
-upstream ([astorise/candle#17](https://github.com/astorise/candle/issues/17))
-by holding that bookkeeping paused for the captured graph's entire lifetime;
-no Tachyon-Mesh code changes were needed beyond the pinned tag bump. See
+non-captured paged-attention path for the same prompt.
+
+**Known limitation, still open**: a **second, independent request against
+the same already-loaded model currently fails** with a low-level CUDA driver
+error (`CUDA_ERROR_INVALID_VALUE`) on an unrelated allocation. The first
+upstream fix attempt ([astorise/candle#17](https://github.com/astorise/candle/issues/17),
+`tachyon-v0.11.0-7`) held `candle-core`'s internal event-tracking bookkeeping
+paused for a captured graph's entire lifetime instead of just the capture
+call — matching the originally suspected mechanism exactly, and verified by
+the fork's own new regression test — but re-testing our real deployment
+scenario on real hardware still hit the identical failure. The likely
+difference: our captured region is a full multi-layer `Llama::forward`, not
+the fork test's single elementwise operation. Reported back and reopened the
+issue; investigation ongoing. **Do not enable `cuda_graph_decode` for any
+model expected to serve more than one request** until this resolves —
+effectively every production deployment today. See
 `openspec/changes/wire-cuda-graph-decode` for the full investigation.
 
 ## Speculative Decoding Status

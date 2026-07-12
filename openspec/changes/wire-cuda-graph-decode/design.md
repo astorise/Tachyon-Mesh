@@ -167,46 +167,50 @@ scatter index itself from the host-side `SequenceBlockTable` (which already
 knows the block assignment) instead of asking the fork to re-derive it from
 a device round-trip.
 
-## Resolved limitation (found 2026-07-11, fixed upstream 2026-07-12): a second `cuda_graph_decode` request used to fail
+## Known limitation, still open (found 2026-07-11; first fix attempt 2026-07-12 confirmed insufficient): a second `cuda_graph_decode` request fails
 
-A single request's capture → warm-up → replay cycle was proven correct on
-real GPU hardware from the start: its output exactly matches the
-non-captured paged-attention path's greedy output for the same prompt
+A single request's capture → warm-up → replay cycle is proven correct on
+real GPU hardware: its output exactly matches the non-captured
+paged-attention path's greedy output for the same prompt
 (`single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda`),
 including multiple *decode steps within one request* (one capture, three
 replays for a 4-token generation).
 
 A **second, independent request against the same already-loaded model**
-used to fail: `Cache::new(...)` — the very first operation of the second
-request, unrelated to anything the first request's session touched — errored
-with `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")`. Ruled out
-before filing upstream: a timing/ordering issue (an extra
-`device.synchronize()` in `CudaGraphDecodeSession`'s `Drop`, run immediately
-before the graph's own teardown, made no difference) and cross-model
-interference (isolated to two back-to-back calls on the *same* runtime with
-no other model touched in between — identical failure either way).
-`CudaGraph::capture`'s own doc comment named `CUDA_ERROR_INVALID_VALUE` as
-the exact failure mode of an internal event-tracking mechanism
-(`CudaDevice::pause_event_tracking`) it works around for a single capture —
-filed as [astorise/candle#17](https://github.com/astorise/candle/issues/17)
-with that hypothesis.
+fails: `Cache::new(...)` — the very first operation of the second request,
+unrelated to anything the first request's session touched — errors with
+`DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")`. Ruled out before
+filing upstream: a timing/ordering issue (an extra `device.synchronize()` in
+`CudaGraphDecodeSession`'s `Drop`, run immediately before the graph's own
+teardown, made no difference) and cross-model interference (isolated to two
+back-to-back calls on the *same* runtime with no other model touched in
+between — identical failure either way). `CudaGraph::capture`'s own doc
+comment named `CUDA_ERROR_INVALID_VALUE` as the exact failure mode of an
+internal event-tracking mechanism (`CudaDevice::pause_event_tracking`) it
+works around for a single capture — filed as
+[astorise/candle#17](https://github.com/astorise/candle/issues/17) with that
+hypothesis.
 
-**Root cause, confirmed by the fix**: `CudaGraph::capture` only paused event
-tracking for the duration of the `capture` call itself, then let it resume.
-cudarc unconditionally re-records a tensor's dependency event on every
-access regardless of whether tracking is paused; a tensor written into
-during capture (e.g. a model-level paged-attention KV cache, alive across
-requests) already owns a captured event node from that capture. Once
-tracking resumed after `capture()` returned, any *later* access to that same
-tensor — including a second, independent `capture()` on the same device —
-recorded a plain, non-captured update to an event the first graph still
-owned a captured node for, which is what `CUDA_ERROR_INVALID_VALUE` signals.
-Fixed by holding the `EventTrackingGuard` for the `CudaGraph` struct's entire
-lifetime (a new field, dropped only when the graph itself is destroyed) —
-tagged `tachyon-v0.11.0-7`. No Tachyon-Mesh-side API changes were needed;
-`CudaGraphDecodeSession` required no changes beyond the pinned tag bump, and
-the second-request regression assertion was restored to the real-hardware
-test.
+**First fix attempt (tag `tachyon-v0.11.0-7`), confirmed insufficient**: the
+fork held the `EventTrackingGuard` for the `CudaGraph` struct's entire
+lifetime instead of just the `capture()` call — exactly the mechanism our
+hypothesis named, verified by the fork's own new regression test
+(`second_independent_capture_after_first_graph_dropped`, a single captured
+elementwise multiply against a shared tensor, plus an unrelated allocation
+after the first graph drops). Re-testing our actual scenario against this
+tag on real hardware: **identical failure, same location, unchanged**.
+Confirmed the CI run genuinely compiled against the fix commit (not a stale
+tag). The likely difference: our captured closure is a full multi-layer
+`Llama::forward()` — many kernel launches and graph-owned intermediate
+allocations per layer — not the fork's test's single op. Reported back on
+[astorise/candle#17](https://github.com/astorise/candle/issues/17) (reopened)
+with this finding and a hypothesis that a capture region with many more
+graph-owned allocations may exercise memory-pool-level bookkeeping the
+per-tensor event-tracking guard fix doesn't cover. No Tachyon-Mesh-side
+mitigation has been found; the second-request regression assertion was
+added back to the real-hardware test then **removed again** once this first
+fix attempt was shown insufficient — `cuda_graph_decode` remains scoped to
+one request per loaded model.
 
 ## Risks / Trade-offs
 
@@ -242,9 +246,10 @@ test.
   continuous batching (issue #312 step 4) would need its own design pass
   on top of this one, not the reverse — this is part of why continuous
   batching is expected to land *before* `cuda_graph_decode` in practice.
-  "No cross-request graph reuse" briefly turned out to be more than a
-  missed optimization — see the Resolved Limitation above: a *second*
-  request used to fail outright, not just "not get the speedup," until the
-  fork-side event-tracking fix landed. Still true as designed: each request
-  captures and owns its own graph; nothing is cached/reused *across*
+  "No cross-request graph reuse" turned out to be more than a missed
+  optimization — see the Known Limitation above: a *second* request
+  currently fails outright, not just "doesn't get the speedup," and the
+  first fork-side fix attempt didn't resolve it. Still true as designed:
+  each request captures and owns its own graph; nothing is cached/reused
+  *across*
   requests on purpose.
