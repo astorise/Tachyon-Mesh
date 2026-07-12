@@ -381,6 +381,30 @@ jobs:
       - name: Run paged-attention CUDA execution proof
         run: cargo test -p core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
 
+      # Proves cuda_graph_decode still fails closed without paged_attention
+      # (wire-cuda-graph-decode's Section 2.1 gate).
+      - name: Run CUDA Graph decode gate proof
+        run: cargo test -p core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected_without_paged_attention -- --nocapture
+
+      # Proves hardware_strategy.cuda_graph_decode (wire-cuda-graph-decode)
+      # actually captures and replays the steady-state decode step through
+      # candle_core::CudaGraph on this runner's GPU (CudaGraphDecodeSession:
+      # warm-up, capture, first replay, then plain replays), and that its
+      # output matches the non-captured paged-attention path's greedy decode
+      # for the same checkpoint/prompt — not just that it runs without error.
+      - name: Run CUDA Graph decode capture/replay execution proof
+        run: cargo test -p core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
+
+      # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
+      # actually dispatches through candle-flashinfer-kernels::flashinfer_decode_attention
+      # for the decode step on this runner's GPU, and that its output matches the
+      # dense (non-flashinfer) path's greedy decode for the same checkpoint/prompt.
+      - name: Run FlashInfer decode-attention CUDA execution proof
+        run: cargo test -p core-host --features "candle-cuda candle-flashinfer" single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
+
+      - name: Run FlashInfer/paged-attention combination rejection proof
+        run: cargo test -p core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
+
       - name: Fetch CUTLASS headers
         if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
         run: git clone --depth 1 --branch v4.3.5 https://github.com/NVIDIA/cutlass.git .ci-cutlass
