@@ -7161,13 +7161,6 @@ mod tests {
             .expect("paged-attention generation must run a real decode on the cuda device");
         drop(paged_only_runtime);
 
-        // A single cuda_graph_decode request per loaded runtime: proven
-        // correct on real hardware (matches the non-captured paged-attention
-        // path exactly). A *second* sequential request against the same
-        // already-warmed-up runtime is a known, currently-unresolved
-        // limitation — see design.md's "Known limitation" note and
-        // astorise/candle#17 — so this test deliberately exercises only one
-        // request per runtime for now, matching what's actually supported.
         let captured_strategy = HardwareStrategy {
             paged_attention: true,
             cuda_graph_decode: true,
@@ -7186,6 +7179,20 @@ mod tests {
         assert_eq!(
             captured_output, paged_only_output,
             "cuda_graph_decode's captured/replayed decode must match the non-captured paged-attention path's greedy output for the same prompt"
+        );
+
+        // Regression for astorise/candle#17: a second, independent request
+        // against the same already-loaded runtime used to fail establishing
+        // its own new CudaGraphDecodeSession with CUDA_ERROR_INVALID_VALUE,
+        // from event-tracking state the first request's graph left
+        // inconsistent. Fixed upstream by keeping event tracking paused for
+        // the CudaGraph's entire lifetime, not just the capture call.
+        let second_captured_output = captured_runtime
+            .generate(&[request])
+            .expect("a second cuda_graph_decode request must establish its own new session and replay correctly");
+        assert_eq!(
+            captured_output, second_captured_output,
+            "greedy cuda_graph_decode generation must be deterministic across requests"
         );
         let _ = fs::remove_dir_all(dir);
     }

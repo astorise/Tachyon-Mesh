@@ -215,20 +215,17 @@ target/draft). Every other combination (non-Llama architecture, non-CUDA
 device, or `cuda_graph_decode` without `paged_attention`) keeps the existing
 typed rejection.
 
-**Known limitation**: only the *first* request served against a freshly
-loaded `cuda_graph_decode` model is currently proven to work. A capture,
-warm-up, and however many replays a single request needs are all correct —
-confirmed on real GPU hardware, output identical to the non-captured
-paged-attention path for the same prompt. A **second, independent request
-against the same already-loaded model currently fails** with a low-level
-CUDA driver error (`CUDA_ERROR_INVALID_VALUE`) on an unrelated allocation,
-suspected to be `candle-core`-internal event-tracking state left
-inconsistent by the first request's `CudaGraph::capture`/teardown cycle —
-not something inspectable or fixable from Tachyon-Mesh's side. Tracked as
-[astorise/candle#17](https://github.com/astorise/candle/issues/17). Until
-that's resolved (or a caller-side mitigation is added), **do not enable
-`cuda_graph_decode` for any model expected to serve more than one request**
-— which is effectively every production deployment today. See
+A capture, warm-up, and however many replays a single request needs are all
+correct — confirmed on real GPU hardware, output identical to the
+non-captured paged-attention path for the same prompt. A second, independent
+request against the same already-loaded model briefly failed with a
+low-level CUDA driver error (`CUDA_ERROR_INVALID_VALUE`) during real-hardware
+testing: `candle-core` only paused its internal event-tracking bookkeeping
+for the duration of the capture call itself, so a later, independent capture
+on the same device could observe stale tracking state from the first. Fixed
+upstream ([astorise/candle#17](https://github.com/astorise/candle/issues/17))
+by holding that bookkeeping paused for the captured graph's entire lifetime;
+no Tachyon-Mesh code changes were needed beyond the pinned tag bump. See
 `openspec/changes/wire-cuda-graph-decode` for the full investigation.
 
 ## Speculative Decoding Status
