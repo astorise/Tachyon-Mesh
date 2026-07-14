@@ -12,6 +12,22 @@
       "description": "All GitHub Actions updates (majors included) in a single PR — action bumps are low-risk and reviewed together.",
       "matchManagers": ["github-actions"],
       "groupName": "github-actions"
+    },
+    {
+      "description": "Next-gen RustCrypto wave — rand_core 0.9+ renamed the `getrandom` feature to `os_rng`, and der/spki/pkcs8/const-oid/x509-cert/p256/ed25519-dalek follow suit. Renovate sees 0.x minors but this is a coordinated breaking code migration (issue #362). Held for dashboard approval so it stops breaking the weekly group.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "rand_core",
+        "der",
+        "spki",
+        "pkcs8",
+        "const-oid",
+        "x509-cert",
+        "p256",
+        "ed25519-dalek"
+      ],
+      "groupName": "rustcrypto-next-gen",
+      "dependencyDashboardApproval": true
     }
   ]
 }
