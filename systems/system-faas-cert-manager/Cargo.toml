@@ -43,7 +43,7 @@ getrandom = "0.4"
 # / sec1 0.7 stack, so it stays wasm32-wasip2-safe (no protoc / C deps). Features:
 # `ecdsa` (signing key type), `pkcs8` + `pem` (PKCS#8 PEM export of the leaf key),
 # `arithmetic` (curve arithmetic needed to derive the verifying key / SPKI).
-p256 = { version = "0.13", default-features = false, features = [
+p256 = { version = "0.14", default-features = false, features = [
     "ecdsa",
     "pkcs8",
     "pem",
