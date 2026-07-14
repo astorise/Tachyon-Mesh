@@ -1,6 +1,17 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Group updates aggressively: CI validates Renovate PRs with a compile-only fast lane (see .github/workflows/ci.yml), so fewer, bigger PRs beat many small ones — especially for the resource-limited arc-gpu-runners cuda-quality check.",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "group:allNonMajor",
+    "schedule:weekly"
+  ],
+  "timezone": "Europe/Paris",
+  "packageRules": [
+    {
+      "description": "All GitHub Actions updates (majors included) in a single PR — action bumps are low-risk and reviewed together.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    }
   ]
 }
