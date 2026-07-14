@@ -28,6 +28,14 @@
       ],
       "groupName": "rustcrypto-next-gen",
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "sha2 0.10 → 0.11 is part of the same wave where it meets rsa 0.9 (digest 0.10): node-registry's RS256 JWT verification (`VerifyingKey::<Sha256>`) stops compiling with a digest-0.11 sha2. Only the 0.10 jump is held — crates already on 0.11 keep getting patches through the weekly group. See issue #362.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["sha2"],
+      "matchCurrentVersion": "<0.11",
+      "groupName": "rustcrypto-next-gen",
+      "dependencyDashboardApproval": true
     }
   ]
 }
