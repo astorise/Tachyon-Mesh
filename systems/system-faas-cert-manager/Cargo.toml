@@ -12,7 +12,7 @@ serde_json = "1"
 wit-bindgen = "0.59"
 # Pure-Rust (wasm-safe) ed25519 signing for the cluster CA. `pkcs8`/`pem`
 # export the leaf private key as PKCS#8 PEM; `alloc` is required by both.
-ed25519-dalek = { version = "2", default-features = false, features = [
+ed25519-dalek = { version = "3", default-features = false, features = [
     "alloc",
     "pkcs8",
     "pem",
