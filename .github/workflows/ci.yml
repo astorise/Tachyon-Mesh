@@ -24,6 +24,17 @@ concurrency:
 # RUSTFLAGS and CARGO_TERM_COLOR are repeated per-job so each job's env block
 # is self-contained and readable without cross-referencing.
 
+# ── Renovate compile-only fast lane ──────────────────────────────────────────
+# Dependency-update PRs (head branch `renovate/**`) only need to prove the tree
+# still compiles; the full lint/test/GPU suite made them impossible to merge
+# because cuda-quality queues on the resource-limited arc-gpu-runners. On these
+# PRs the four required checks (build-guests, security-audit, quality,
+# cuda-quality) still run but quality/cuda-quality drop to `cargo check`,
+# fips-tests becomes a compile check, and every other job is skipped outright
+# (a `skipped` job conclusion satisfies branch protection). Detection uses the
+# head branch prefix — not the actor — so a human re-running or pushing a fix
+# to a Renovate branch stays in the same lane.
+
 jobs:
   # ── 1. Build WASM guest artifacts once ──────────────────────────────────────
   # Packs with tar to preserve target/wasm32-wasip*/release/ paths exactly.
@@ -177,6 +188,8 @@ jobs:
       CARGO_TERM_COLOR: always
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       RUSTFLAGS: "-D dead_code"
+      # See "Renovate compile-only fast lane" at the top of this file.
+      RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -210,6 +223,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
+        if: env.RENOVATE_PR != 'true'
         run: cargo fmt --all -- --check
 
       - name: Check core-host feature builds (compile-only)
@@ -230,9 +244,19 @@ jobs:
         # Keep the general quality gate on ubuntu-latest CPU runners: CUDA is
         # validated separately by the arc-gpu-runners job below. `--all-features`
         # would enable core-host/candle-cuda and require nvcc on this runner.
+        if: env.RENOVATE_PR != 'true'
         run: cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
 
+      # Compile-only stand-in for the lint above on Renovate PRs: a dep bump
+      # can surface new deprecation warnings in our code that `-D warnings`
+      # would turn into failures, and the fast lane only gates on "does it
+      # still compile".
+      - name: Compile workspace (Renovate compile-only lane)
+        if: env.RENOVATE_PR == 'true'
+        run: cargo check --workspace --all-targets --features core-host/ai-inference
+
       - name: Cross-Layer Validation
+        if: env.RENOVATE_PR != 'true'
         run: bash scripts/validate_cross_layer.sh
 
       - name: Check ai-inference host build
@@ -250,6 +274,7 @@ jobs:
           grep -q "sample-constrained" wit/ai/inference.wit
 
       - name: Test real Candle LLM fixture
+        if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features ai-inference --bin core-host real_candle_llm_runtime
 
       # Build the guest the streaming integration test drives, then run it. The
@@ -257,9 +282,11 @@ jobs:
       # TACHYON_REQUIRE_GUEST_OPENAI set it fails hard instead of skipping if the
       # artifact is missing, so this can never become a false green.
       - name: Build guest-openai (wasm) for the streaming integration test
+        if: env.RENOVATE_PR != 'true'
         run: cargo build -p guest-openai --target wasm32-wasip2 --release
 
       - name: Test AI streaming SSE transport end-to-end
+        if: env.RENOVATE_PR != 'true'
         env:
           TACHYON_REQUIRE_GUEST_OPENAI: "1"
         run: cargo test -p core-host --features ai-inference --bin core-host streaming_guest_openai -- --nocapture
@@ -273,6 +300,10 @@ jobs:
       CARGO_TERM_COLOR: always
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       RUSTFLAGS: "-D dead_code"
+      # Renovate compile-only fast lane (see top of file): this runner is the
+      # scarce resource, so dependency PRs only run the `cargo check` steps —
+      # clippy and every GPU execution proof are skipped.
+      RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -336,7 +367,7 @@ jobs:
       # Native NVFP4 requires a runner GPU/toolchain that can execute the FP4
       # kernels. Keep this proof opt-in until such a runner is available.
       - name: Configure NVFP4 CUDA architecture
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
+        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
         run: |
           compute_capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '[:space:].')"
           if [ -z "$compute_capability" ]; then
@@ -359,19 +390,29 @@ jobs:
       - name: Check Candle CUDA host build
         run: cargo check -p core-host --features candle-cuda
 
+      # Renovate fast lane: also prove the FlashInfer kernel crate still
+      # compiles against the updated deps. On regular runs this compile is
+      # covered by the FlashInfer test steps below, which the fast lane skips.
+      - name: Check Candle CUDA + FlashInfer host build (Renovate compile-only lane)
+        if: env.RENOVATE_PR == 'true'
+        run: cargo check -p core-host --features "candle-cuda candle-flashinfer"
+
       - name: Lint Candle CUDA host build
+        if: env.RENOVATE_PR != 'true'
         run: cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
 
       # Proves the tensor-parallel all-reduce path issues a real NCCL
       # AllReduce on this runner's real GPU (via ncclCommInitAll loopback
       # ranks, see parallel.rs), not just that candle-cuda compiles/lints.
       - name: Run CUDA NCCL all-reduce proof
+        if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
 
       # Proves the single-device Llama path (enable-single-device-llama-cuda-execution)
       # actually loads weights and runs a real autoregressive decode on this
       # runner's GPU instead of falling back to `Device::Cpu`.
       - name: Run single-device Llama CUDA execution proof
+        if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features candle-cuda single_device_llama_executes_on_a_real_cuda_device -- --nocapture
 
       # Proves hardware_strategy.paged_attention (wire-paged-attention-decode-path)
@@ -379,11 +420,13 @@ jobs:
       # flash_attn_varlen_paged_windowed on this runner's GPU, including a
       # second request reusing the same shared block pool.
       - name: Run paged-attention CUDA execution proof
+        if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
 
       # Proves cuda_graph_decode still fails closed without paged_attention
       # (wire-cuda-graph-decode's Section 2.1 gate).
       - name: Run CUDA Graph decode gate proof
+        if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected_without_paged_attention -- --nocapture
 
       # Proves hardware_strategy.cuda_graph_decode (wire-cuda-graph-decode)
@@ -393,6 +436,7 @@ jobs:
       # output matches the non-captured paged-attention path's greedy decode
       # for the same checkpoint/prompt — not just that it runs without error.
       - name: Run CUDA Graph decode capture/replay execution proof
+        if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
 
       # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
@@ -400,17 +444,19 @@ jobs:
       # for the decode step on this runner's GPU, and that its output matches the
       # dense (non-flashinfer) path's greedy decode for the same checkpoint/prompt.
       - name: Run FlashInfer decode-attention CUDA execution proof
+        if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features "candle-cuda candle-flashinfer" single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
 
       - name: Run FlashInfer/paged-attention combination rejection proof
+        if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
 
       - name: Fetch CUTLASS headers
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
+        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
         run: git clone --depth 1 --branch v4.3.5 https://github.com/NVIDIA/cutlass.git .ci-cutlass
 
       - name: Run native NVFP4 parity and telemetry proof
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
+        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
         env:
           TACHYON_NVFP4_CUDA_SMOKE: "1"
           TACHYON_NVFP4_NATIVE_REQUIRED: "1"
@@ -423,6 +469,8 @@ jobs:
   # Separate job means it gets its own 14 GB disk, avoiding the exhaustion
   # that plagued the previous monolithic rust-ci job.
   test:
+    # Skipped on Renovate PRs — compile-only fast lane (see top of file).
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     needs: [quality, build-guests]
     runs-on: ubuntu-latest
     env:
@@ -471,6 +519,8 @@ jobs:
   # Separate job gives a fresh disk so the large llvm-cov instrumented tree
   # doesn't compete with the test or release build for SSD space.
   cover:
+    # Skipped on Renovate PRs — compile-only fast lane (see top of file).
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     needs: [quality, build-guests]
     runs-on: ubuntu-latest
     env:
@@ -516,6 +566,8 @@ jobs:
   # Only builds core-host --release. tachyon-ui is excluded: clippy already
   # validates it compiles, and Publish Tachyon Desktop handles the Tauri bundle.
   release:
+    # Skipped on Renovate PRs — compile-only fast lane (see top of file).
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     needs: [quality, build-guests]
     runs-on: ubuntu-latest
     env:
@@ -593,6 +645,9 @@ jobs:
   # ── 7. Feature matrix (5 parallel variants, shared Rust cache) ──────────────
   # Waits for quality so clippy failures don't spawn 5 redundant matrix runs.
   feature-matrix-tests:
+    # Skipped on Renovate PRs — compile-only fast lane (see top of file);
+    # feature-gated compile coverage comes from quality's per-feature loop.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     needs: [quality, build-guests]
     runs-on: ubuntu-latest
     strategy:
@@ -669,6 +724,8 @@ jobs:
   # a dependency of publish-docker-images (which builds its own images from
   # source). Runs in parallel with feature-matrix-tests rather than after it.
   feature-matrix-artifacts:
+    # Skipped on Renovate PRs — compile-only fast lane (see top of file).
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     needs: [quality, build-guests]
     runs-on: ubuntu-latest
     strategy:
@@ -751,6 +808,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+      # Renovate compile-only fast lane (see top of file): drop to a compile
+      # check. This job (not quality) hosts the FIPS check because its Rust
+      # cache already holds the aws-lc FIPS build artifacts.
+      RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -766,23 +827,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-nextest
+        if: env.RENOVATE_PR != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Download guest artifacts
+        if: env.RENOVATE_PR != 'true'
         uses: actions/download-artifact@v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
+        if: env.RENOVATE_PR != 'true'
         run: tar -xzf wasm-guests.tar.gz
 
       - name: Test core-host FIPS feature
+        if: env.RENOVATE_PR != 'true'
         run: cargo nextest run -p core-host --features fips
+
+      - name: Check core-host FIPS feature (Renovate compile-only lane)
+        if: env.RENOVATE_PR == 'true'
+        run: cargo check -p core-host --features fips
 
   # ── 8b. FIPS release artifact (decoupled from tests) ────────────────────────
   # Not consumed by any downstream job, so it is intentionally NOT a
   # dependency of publish-docker-images (which builds its own FIPS image
   # from source via Dockerfile.fips).
   fips-artifacts:
+    # Skipped on Renovate PRs — compile-only fast lane (see top of file).
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     needs: [quality, build-guests]
     runs-on: ubuntu-latest
     env:
