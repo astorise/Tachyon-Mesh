@@ -314,6 +314,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: cuda-quality
+          # Keep the expensive CUDA dependency build when a later GPU proof
+          # fails or times out, so the next run can resume from the cache.
+          cache-on-failure: true
 
       # The ARC GPU runner on Talos has the NVIDIA driver (nvidia-smi works) but
       # cudarc/candle-kernels need `nvcc` from the CUDA toolkit at build time.
@@ -406,7 +409,7 @@ jobs:
       - name: Build Candle CUDA test binaries
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 30
-        run: cargo test -p core-host --features candle-cuda --no-run
+        run: cargo test -p core-host --bin core-host --features candle-cuda --no-run
 
       # Proves the tensor-parallel all-reduce path issues a real NCCL
       # AllReduce on this runner's real GPU (via ncclCommInitAll loopback
@@ -414,7 +417,7 @@ jobs:
       - name: Run CUDA NCCL all-reduce proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 10
-        run: cargo test -p core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
 
       # Proves the single-device Llama path (enable-single-device-llama-cuda-execution)
       # actually loads weights and runs a real autoregressive decode on this
@@ -422,7 +425,7 @@ jobs:
       - name: Run single-device Llama CUDA execution proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 15
-        run: cargo test -p core-host --features candle-cuda single_device_llama_executes_on_a_real_cuda_device -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_executes_on_a_real_cuda_device -- --nocapture
 
       # Proves hardware_strategy.paged_attention (wire-paged-attention-decode-path)
       # actually attaches cache.set_paged_kv and runs a real decode through
@@ -431,14 +434,14 @@ jobs:
       - name: Run paged-attention CUDA execution proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 15
-        run: cargo test -p core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
 
       # Proves cuda_graph_decode still fails closed without paged_attention
       # (wire-cuda-graph-decode's Section 2.1 gate).
       - name: Run CUDA Graph decode gate proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 10
-        run: cargo test -p core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected_without_paged_attention -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected_without_paged_attention -- --nocapture
 
       # Proves hardware_strategy.cuda_graph_decode (wire-cuda-graph-decode)
       # actually captures and replays the steady-state decode step through
@@ -449,14 +452,14 @@ jobs:
       - name: Run CUDA Graph decode capture/replay execution proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 20
-        run: cargo test -p core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
 
       # FlashInfer adds its own CUDA crate, so prepare those test binaries
       # before applying the execution-proof timeout below.
       - name: Build FlashInfer CUDA test binaries
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 30
-        run: cargo test -p core-host --features "candle-cuda candle-flashinfer" --no-run
+        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" --no-run
 
       # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
       # actually dispatches through candle-flashinfer-kernels::flashinfer_decode_attention
@@ -465,12 +468,12 @@ jobs:
       - name: Run FlashInfer decode-attention CUDA execution proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 15
-        run: cargo test -p core-host --features "candle-cuda candle-flashinfer" single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
+        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
 
       - name: Run FlashInfer/paged-attention combination rejection proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 10
-        run: cargo test -p core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
+        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
 
       - name: Fetch CUTLASS headers
         if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
