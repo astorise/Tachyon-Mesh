@@ -401,6 +401,13 @@ jobs:
         if: env.RENOVATE_PR != 'true'
         run: cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
 
+      # Compile test binaries separately so execution-proof timeouts only
+      # cover the GPU operation, not a cold Candle CUDA compilation.
+      - name: Build Candle CUDA test binaries
+        if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 30
+        run: cargo test -p core-host --features candle-cuda --no-run
+
       # Proves the tensor-parallel all-reduce path issues a real NCCL
       # AllReduce on this runner's real GPU (via ncclCommInitAll loopback
       # ranks, see parallel.rs), not just that candle-cuda compiles/lints.
@@ -443,6 +450,13 @@ jobs:
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 20
         run: cargo test -p core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
+
+      # FlashInfer adds its own CUDA crate, so prepare those test binaries
+      # before applying the execution-proof timeout below.
+      - name: Build FlashInfer CUDA test binaries
+        if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 30
+        run: cargo test -p core-host --features "candle-cuda candle-flashinfer" --no-run
 
       # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
       # actually dispatches through candle-flashinfer-kernels::flashinfer_decode_attention
