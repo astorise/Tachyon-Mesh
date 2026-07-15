@@ -165,5 +165,5 @@ prost = "0.14"
 rcgen = "0.14"
 tempfile = "3"
 tokio-test = "0.4"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 tower = { version = "0.5", features = ["util"] }

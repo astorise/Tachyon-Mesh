@@ -15,6 +15,10 @@ concurrency:
 
 jobs:
   k3d-integration:
+    # Renovate dependency PRs are validated by the compile-only fast lane in
+    # ci.yml (see the note at the top of that file); the docker/k3d stack is
+    # skipped for them and runs again on the merge push to main.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     runs-on: ubuntu-latest
 
     steps:
