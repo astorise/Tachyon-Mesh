@@ -408,7 +408,6 @@ jobs:
       # cover the GPU operation, not a cold Candle CUDA compilation.
       - name: Build Candle CUDA test binaries
         if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 30
         run: cargo test -p core-host --bin core-host --features candle-cuda --no-run
 
       # Proves the tensor-parallel all-reduce path issues a real NCCL
