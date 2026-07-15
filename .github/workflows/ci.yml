@@ -406,6 +406,7 @@ jobs:
       # ranks, see parallel.rs), not just that candle-cuda compiles/lints.
       - name: Run CUDA NCCL all-reduce proof
         if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 10
         run: cargo test -p core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
 
       # Proves the single-device Llama path (enable-single-device-llama-cuda-execution)
@@ -413,6 +414,7 @@ jobs:
       # runner's GPU instead of falling back to `Device::Cpu`.
       - name: Run single-device Llama CUDA execution proof
         if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 15
         run: cargo test -p core-host --features candle-cuda single_device_llama_executes_on_a_real_cuda_device -- --nocapture
 
       # Proves hardware_strategy.paged_attention (wire-paged-attention-decode-path)
@@ -421,12 +423,14 @@ jobs:
       # second request reusing the same shared block pool.
       - name: Run paged-attention CUDA execution proof
         if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 15
         run: cargo test -p core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
 
       # Proves cuda_graph_decode still fails closed without paged_attention
       # (wire-cuda-graph-decode's Section 2.1 gate).
       - name: Run CUDA Graph decode gate proof
         if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 10
         run: cargo test -p core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected_without_paged_attention -- --nocapture
 
       # Proves hardware_strategy.cuda_graph_decode (wire-cuda-graph-decode)
@@ -437,6 +441,7 @@ jobs:
       # for the same checkpoint/prompt — not just that it runs without error.
       - name: Run CUDA Graph decode capture/replay execution proof
         if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 20
         run: cargo test -p core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
 
       # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
@@ -445,10 +450,12 @@ jobs:
       # dense (non-flashinfer) path's greedy decode for the same checkpoint/prompt.
       - name: Run FlashInfer decode-attention CUDA execution proof
         if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 15
         run: cargo test -p core-host --features "candle-cuda candle-flashinfer" single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
 
       - name: Run FlashInfer/paged-attention combination rejection proof
         if: env.RENOVATE_PR != 'true'
+        timeout-minutes: 10
         run: cargo test -p core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
 
       - name: Fetch CUTLASS headers
