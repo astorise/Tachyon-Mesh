@@ -302,20 +302,28 @@ async fn async_logger_exports_log_storm_without_leaking_logs_into_response() {
     assert_eq!(String::from_utf8_lossy(&body).trim(), "storm-complete");
 
     let log_file = log_dir.join("guest-logs.ndjson");
-    for _ in 0..30 {
-        if log_file.exists()
-            && fs::metadata(&log_file)
-                .map(|metadata| metadata.len() > 0)
-                .unwrap_or(false)
-        {
-            break;
+    let mut contents = String::new();
+    for _ in 0..100 {
+        if let Ok(current) = fs::read_to_string(&log_file) {
+            if current.contains("\"target_name\":\"guest-log-storm\"")
+                && current.contains("\"message\":\"storm-")
+            {
+                contents = current;
+                break;
+            }
+            contents = current;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let contents = fs::read_to_string(&log_file).expect("logger output should exist");
-    assert!(contents.contains("\"target_name\":\"guest-log-storm\""));
-    assert!(contents.contains("\"message\":\"storm-"));
+    assert!(
+        contents.contains("\"target_name\":\"guest-log-storm\""),
+        "logger output should contain guest-log-storm target, got: {contents}"
+    );
+    assert!(
+        contents.contains("\"message\":\"storm-"),
+        "logger output should contain storm messages, got: {contents}"
+    );
 
     let _ = fs::remove_dir_all(log_dir);
 }

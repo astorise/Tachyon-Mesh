@@ -7161,13 +7161,6 @@ mod tests {
             .expect("paged-attention generation must run a real decode on the cuda device");
         drop(paged_only_runtime);
 
-        // A single cuda_graph_decode request per loaded runtime: proven
-        // correct on real hardware (matches the non-captured paged-attention
-        // path exactly). A *second* sequential request against the same
-        // already-warmed-up runtime is a known, currently-unresolved
-        // limitation — see design.md's "Known limitation" note and
-        // astorise/candle#17 — so this test deliberately exercises only one
-        // request per runtime for now, matching what's actually supported.
         let captured_strategy = HardwareStrategy {
             paged_attention: true,
             cuda_graph_decode: true,
@@ -7187,6 +7180,14 @@ mod tests {
             captured_output, paged_only_output,
             "cuda_graph_decode's captured/replayed decode must match the non-captured paged-attention path's greedy output for the same prompt"
         );
+
+        // A *second*, independent request against the same already-loaded
+        // runtime is a known, still-unresolved limitation — see design.md's
+        // "Known limitation" note and astorise/candle#17 (reopened: the
+        // fork's first fix attempt, verified against its own simpler
+        // regression test, did not resolve our real-world scenario — a
+        // captured multi-layer Llama::forward, not a single elementwise op —
+        // so this assertion is deliberately not restored yet).
         let _ = fs::remove_dir_all(dir);
     }
 

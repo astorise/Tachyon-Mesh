@@ -215,20 +215,24 @@ target/draft). Every other combination (non-Llama architecture, non-CUDA
 device, or `cuda_graph_decode` without `paged_attention`) keeps the existing
 typed rejection.
 
-**Known limitation**: only the *first* request served against a freshly
-loaded `cuda_graph_decode` model is currently proven to work. A capture,
-warm-up, and however many replays a single request needs are all correct —
-confirmed on real GPU hardware, output identical to the non-captured
-paged-attention path for the same prompt. A **second, independent request
-against the same already-loaded model currently fails** with a low-level
-CUDA driver error (`CUDA_ERROR_INVALID_VALUE`) on an unrelated allocation,
-suspected to be `candle-core`-internal event-tracking state left
-inconsistent by the first request's `CudaGraph::capture`/teardown cycle —
-not something inspectable or fixable from Tachyon-Mesh's side. Tracked as
-[astorise/candle#17](https://github.com/astorise/candle/issues/17). Until
-that's resolved (or a caller-side mitigation is added), **do not enable
-`cuda_graph_decode` for any model expected to serve more than one request**
-— which is effectively every production deployment today. See
+A capture, warm-up, and however many replays a single request needs are all
+correct — confirmed on real GPU hardware, output identical to the
+non-captured paged-attention path for the same prompt.
+
+**Known limitation, still open**: a **second, independent request against
+the same already-loaded model currently fails** with a low-level CUDA driver
+error (`CUDA_ERROR_INVALID_VALUE`) on an unrelated allocation. The first
+upstream fix attempt ([astorise/candle#17](https://github.com/astorise/candle/issues/17),
+`tachyon-v0.11.0-7`) held `candle-core`'s internal event-tracking bookkeeping
+paused for a captured graph's entire lifetime instead of just the capture
+call — matching the originally suspected mechanism exactly, and verified by
+the fork's own new regression test — but re-testing our real deployment
+scenario on real hardware still hit the identical failure. The likely
+difference: our captured region is a full multi-layer `Llama::forward`, not
+the fork test's single elementwise operation. Reported back and reopened the
+issue; investigation ongoing. **Do not enable `cuda_graph_decode` for any
+model expected to serve more than one request** until this resolves —
+effectively every production deployment today. See
 `openspec/changes/wire-cuda-graph-decode` for the full investigation.
 
 ## Speculative Decoding Status
