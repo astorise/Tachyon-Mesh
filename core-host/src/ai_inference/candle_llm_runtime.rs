@@ -1647,18 +1647,20 @@ impl CandleLlmRuntime {
             && strategy.distribution_mode == GpuDistribution::Single;
 
         // paged_attention needs that same Llama+CUDA baseline — the paged
-        // flash-attn kernel is CUDA-only — plus an actual non-`cpu` request.
-        // `load_safetensors` only wires `cache.set_paged_kv` for that exact
-        // combination (see `wire-paged-attention-decode-path`'s design.md),
-        // so every other architecture/build/device combination still fails
-        // closed here.
-        let paged_attention_supported = single_device_cuda_supported && requested_device != "cpu";
+        // flash-attn kernel is CUDA-only — plus a Safetensors checkpoint and
+        // an actual non-`cpu` request. `load_safetensors` is the only loader
+        // that wires `cache.set_paged_kv`; GGUF uses its quantized CPU loader.
+        // Every other architecture/format/build/device combination therefore
+        // fails closed here instead of silently running the contiguous path.
+        let paged_attention_supported = single_device_cuda_supported
+            && format == ModelFormat::Safetensors
+            && requested_device != "cpu";
         if strategy.paged_attention && !paged_attention_supported {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
                 detail:
-                    "paged_attention requires Tachyon's block allocator and per-sequence block table to be wired to candle_flash_attn::flash_attn_varlen_paged_windowed, and is only available for a Llama checkpoint on a CUDA device"
+                    "paged_attention requires a Safetensors Llama checkpoint on a CUDA device because only that loader wires Tachyon's block allocator and per-sequence block table to candle_flash_attn::flash_attn_varlen_paged_windowed"
                         .to_owned(),
             });
         }
@@ -1707,7 +1709,7 @@ impl CandleLlmRuntime {
                     alias: alias.to_owned(),
                     path: root.to_path_buf(),
                     detail:
-                        "cuda_graph_decode requires Tachyon's steady-state GPU decode loop to capture fixed-shape operations through candle_core::CudaGraph, and is only available for a Llama checkpoint on a CUDA device"
+                    "cuda_graph_decode requires a Safetensors Llama checkpoint on a CUDA device because it captures Tachyon's paged, steady-state GPU decode loop through candle_core::CudaGraph"
                             .to_owned(),
                 });
             }
@@ -7181,13 +7183,37 @@ mod tests {
             "cuda_graph_decode's captured/replayed decode must match the non-captured paged-attention path's greedy output for the same prompt"
         );
 
-        // A *second*, independent request against the same already-loaded
-        // runtime is a known, still-unresolved limitation — see design.md's
-        // "Known limitation" note and astorise/candle#17 (reopened: the
-        // fork's first fix attempt, verified against its own simpler
-        // regression test, did not resolve our real-world scenario — a
-        // captured multi-layer Llama::forward, not a single elementwise op —
-        // so this assertion is deliberately not restored yet).
+        let captured_second_output = captured_runtime
+            .generate(&[request])
+            .expect("cuda_graph_decode must support a second independent request");
+        assert_eq!(
+            captured_second_output, paged_only_output,
+            "cuda_graph_decode's second request must match the non-captured paged-attention path's greedy output"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn cuda_graph_decode_strategy_is_rejected_for_gguf() {
+        let (runtime, dir) = load_gguf_fixture("cuda-graph-gguf-reject");
+        drop(runtime);
+        let strategy = HardwareStrategy {
+            paged_attention: true,
+            cuda_graph_decode: true,
+            ..Default::default()
+        };
+        let error = CandleLlmRuntime::try_load("tiny-gguf", &dir, "cuda", &strategy)
+            .expect_err("cuda_graph_decode must not silently load GGUF on CPU");
+        match error {
+            CandleLlmError::UnsupportedModel { detail, .. } => {
+                assert!(
+                    detail.contains("Safetensors Llama checkpoint"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected UnsupportedModel, got {other:?}"),
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
