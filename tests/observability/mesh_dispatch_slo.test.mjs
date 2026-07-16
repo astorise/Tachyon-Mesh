@@ -16,6 +16,10 @@ test("single-node mesh dispatch alert preserves the locality SLO contract", () =
   assert.match(rule, /tachyon_mesh_topology="single-node"/);
   assert.match(rule, /reason!="remote"/);
   assert.match(rule, /mode="in_process"/);
+  assert.match(
+    rule,
+    /or on \(job, instance, tachyon_mesh_topology\)\s+\(0 \* tachyon:mesh_dispatch_eligible_total:increase15m\)/,
+  );
   assert.match(rule, /< 0\.95/);
   assert.match(rule, />= 100/);
   assert.match(rule, /for: 10m/);
