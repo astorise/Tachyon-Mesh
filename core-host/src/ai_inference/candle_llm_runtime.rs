@@ -72,6 +72,11 @@ struct MixtralConfigJson {
     num_local_experts: usize,
 }
 
+#[cfg(feature = "candle-cuda")]
+const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = true;
+#[cfg(not(feature = "candle-cuda"))]
+const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = false;
+
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
 /// Hugging Face tokenizer settings; carries the `chat_template` (Jinja2) and the
@@ -2481,7 +2486,7 @@ impl CandleLlmRuntime {
             });
         }
         Ok(MixtralConfigJson {
-            config: raw.base.into_config(false),
+            config: raw.base.into_config(PARALLEL_LLAMA_USE_FLASH_ATTN),
             num_local_experts: raw.num_local_experts,
         })
     }
@@ -2522,7 +2527,7 @@ impl CandleLlmRuntime {
                 detail: error.to_string(),
             }
         })?;
-        Ok(llama_config.into_config(false))
+        Ok(llama_config.into_config(PARALLEL_LLAMA_USE_FLASH_ATTN))
     }
 
     /// Buffered generation: run the decode and return the full UTF-8 output. A

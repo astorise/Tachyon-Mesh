@@ -44,10 +44,11 @@ candle-cuda = [
     # Compiles in candle-transformers' paged-attention call site (the
     # cache.set_paged_kv/paged_kv seam added for hardware_strategy.paged_attention);
     # gated behind this feature because it pulls in the CUDA-only
-    # candle-flash-attn crate. Does not change runtime behavior on its own —
-    # the model only takes the paged path when the host attaches a
-    # PagedKvCache via cache.set_paged_kv.
+    # candle-flash-attn crate. Parallel Llama engines use the fused kernel for
+    # replicated attention; single-device Llama only takes the paged path when
+    # the host attaches a PagedKvCache via cache.set_paged_kv.
     "candle-transformers/flash-attn",
+    "dep:candle-flash-attn",
     "dep:cudarc",
     "dep:nvml-wrapper",
 ]
@@ -77,6 +78,7 @@ axum = "0.8"
 blake3 = "1.5"
 bytes = "1.5"
 candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-8", version = "0.11.0", optional = true }
+candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-8", version = "0.11.0", optional = true }
 candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-8", version = "0.11.0", optional = true, default-features = false }
 candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-8", version = "0.11.0", optional = true }
 candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-8", version = "0.11.0", optional = true }
