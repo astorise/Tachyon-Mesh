@@ -1,5 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
 import type { ScopesMap } from "../types/scopes";
+import { loggedInvoke as invoke, logUiError } from "../utils/appLogger";
 
 type ManifestConfig = {
   routes?: Array<{
@@ -28,7 +28,7 @@ export async function readRouteScopes(routePath: string): Promise<{
   const config = await invoke<ManifestConfig>("get_manifest_config");
   const route = config.routes?.find((r) => r.path === routePath);
   if (!route) {
-    throw new Error(`Route '${routePath}' not found in manifest`);
+    throw logMissingRoute(routePath);
   }
   const rawScopes = route.scopes;
   if (!rawScopes || rawScopes === "allow-all") {
@@ -45,7 +45,7 @@ export async function writeRouteScopes(
   const routes = config.routes ?? [];
   const idx = routes.findIndex((r) => r.path === routePath);
   if (idx === -1) {
-    throw new Error(`Route '${routePath}' not found in manifest`);
+    throw logMissingRoute(routePath);
   }
   const updated = { ...routes[idx], scopes };
   const newConfig: ManifestConfig = {
@@ -58,4 +58,10 @@ export async function writeRouteScopes(
 export async function readScopeMetrics(): Promise<{ scopeDenialTotal: number }> {
   const metrics = await invoke<RuntimeMetrics>("get_metrics");
   return { scopeDenialTotal: metrics.scopeDenialTotal ?? 0 };
+}
+
+function logMissingRoute(routePath: string): Error {
+  const error = new Error(`Route '${routePath}' not found in manifest`);
+  logUiError("scopes.manifest", error);
+  return error;
 }
