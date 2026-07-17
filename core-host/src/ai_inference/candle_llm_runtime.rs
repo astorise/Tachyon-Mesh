@@ -7150,19 +7150,6 @@ mod tests {
         );
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4,"temperature":0.0}"#;
 
-        let paged_only_strategy = HardwareStrategy {
-            paged_attention: true,
-            ..Default::default()
-        };
-        let paged_only_runtime =
-            CandleLlmRuntime::try_load("tiny", &dir, "cuda", &paged_only_strategy)
-                .expect("the checkpoint must load with paged_attention alone")
-                .expect("tiny fixture should select the native Candle runtime");
-        let paged_only_output = paged_only_runtime
-            .generate(&[request])
-            .expect("paged-attention generation must run a real decode on the cuda device");
-        drop(paged_only_runtime);
-
         let captured_strategy = HardwareStrategy {
             paged_attention: true,
             cuda_graph_decode: true,
@@ -7187,8 +7174,25 @@ mod tests {
             .generate(&[request])
             .expect("cuda_graph_decode must support a second independent request");
         assert_eq!(
-            captured_second_output, paged_only_output,
-            "cuda_graph_decode's second request must match the non-captured paged-attention path's greedy output"
+            captured_second_output, captured_output,
+            "cuda_graph_decode's second request must match the first captured request's greedy output"
+        );
+        drop(captured_runtime);
+
+        let paged_only_strategy = HardwareStrategy {
+            paged_attention: true,
+            ..Default::default()
+        };
+        let paged_only_runtime =
+            CandleLlmRuntime::try_load("tiny", &dir, "cuda", &paged_only_strategy)
+                .expect("the checkpoint must load with paged_attention alone")
+                .expect("tiny fixture should select the native Candle runtime");
+        let paged_only_output = paged_only_runtime
+            .generate(&[request])
+            .expect("paged-attention generation must run a real decode on the cuda device");
+        assert_eq!(
+            captured_output, paged_only_output,
+            "cuda_graph_decode's captured/replayed decode must match the non-captured paged-attention path's greedy output for the same prompt"
         );
         let _ = fs::remove_dir_all(dir);
     }
