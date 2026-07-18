@@ -32,16 +32,15 @@ remote dispatch as a locality regression.
 The rule records the eligible count and in-process ratio before evaluating:
 
 ```promql
-sum by (job, instance, tachyon_mesh_topology) (
-  increase(faas_mesh_dispatch_total{tachyon_mesh_topology="single-node",mode="in_process",reason!="remote"}[15m])
+(
+  sum by (job, instance, tachyon_mesh_topology) (
+    increase(faas_mesh_dispatch_total{tachyon_mesh_topology="single-node",mode="in_process",reason!="remote"}[15m])
+  )
+  or on (job, instance, tachyon_mesh_topology)
+  (0 * tachyon:mesh_dispatch_eligible_total:increase15m)
 )
 /
-clamp_min(
-  sum by (job, instance, tachyon_mesh_topology) (
-    increase(faas_mesh_dispatch_total{tachyon_mesh_topology="single-node",reason!="remote"}[15m])
-  ),
-  1
-)
+clamp_min(tachyon:mesh_dispatch_eligible_total:increase15m, 1)
 ```
 
 `MeshDispatchLocalityDegraded` fires when the ratio is below `0.95`, the
