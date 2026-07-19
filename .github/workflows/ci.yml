@@ -435,12 +435,12 @@ jobs:
         timeout-minutes: 15
         run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
 
-      # Proves cuda_graph_decode still fails closed without paged_attention
-      # (wire-cuda-graph-decode's Section 2.1 gate).
+      # Proves cuda_graph_decode fails closed without paged_attention and for
+      # GGUF, which has no paged GPU cache (wire-cuda-graph-decode's Section 2.1 gate).
       - name: Run CUDA Graph decode gate proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected_without_paged_attention -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected -- --nocapture
 
       # Proves hardware_strategy.cuda_graph_decode (wire-cuda-graph-decode)
       # actually captures and replays the steady-state decode step through

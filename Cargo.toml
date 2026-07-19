@@ -77,6 +77,9 @@ resolver = "2"
 # Temporary security patches until crates.io releases include quick-xml >= 0.41.
 object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "fd44ebb9c1158660795ec22d7b11acf31c3fe113" }
 plist = { git = "https://github.com/ebarnard/rust-plist.git", rev = "0a2f9e79fe4b85abcfb8013a9f3c97e490750b50" }
+# Required by Candle tachyon-v0.11.0-10: its CUDA graph teardown fix must be
+# patched from the workspace root to affect this dependency graph.
+cudarc = { git = "https://github.com/astorise/cudarc", tag = "candle-v0.19.9" }
 
 [profile.release]
 # Tachyon brands itself as a high-performance runtime (AI inference, near-zero

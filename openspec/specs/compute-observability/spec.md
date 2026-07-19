@@ -50,6 +50,26 @@ Tauri commands respectively.
 - **AND** it shows the average latency per dispatch mode
 - **AND** it identifies the backing Prometheus metrics as `faas_mesh_dispatch_total{mode,reason}` and `faas_mesh_dispatch_duration_seconds{mode}`
 
+### Requirement: Single-node mesh dispatch locality is documented
+The observability documentation SHALL provide an optional
+`MeshDispatchLocalityDegraded` Prometheus alert for scrape targets labelled
+`tachyon_mesh_topology="single-node"`. The alert SHALL require at least 100
+eligible internal dispatches in a rolling 15-minute window, SHALL fire when
+less than 95% use `in_process` for 10 minutes, and SHALL exclude samples whose
+reason is `remote` from the ratio.
+
+#### Scenario: Sustained local fallback raises an alert
+- **WHEN** a labelled single-node target records at least 100 eligible internal
+  dispatches in 15 minutes
+- **AND** less than 95% of those dispatches use `in_process` for 10 minutes
+- **THEN** `MeshDispatchLocalityDegraded` fires with warning severity
+- **AND** `saturated` and `pressure` samples remain in the denominator
+
+#### Scenario: Multi-node and sparse traffic are not alerted
+- **WHEN** a target has no `tachyon_mesh_topology="single-node"` scrape label
+- **OR** fewer than 100 eligible dispatches occur in the 15-minute window
+- **THEN** `MeshDispatchLocalityDegraded` does not fire
+
 #### Scenario: Manual refresh updates all three sections
 - **GIVEN** the panel is open
 - **WHEN** the operator clicks the refresh control
