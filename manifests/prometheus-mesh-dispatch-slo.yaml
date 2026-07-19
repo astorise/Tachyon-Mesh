@@ -1,0 +1,44 @@
+# Apply only on clusters that run the Prometheus Operator. The scrape target
+# for a single-node Tachyon deployment must carry
+# tachyon_mesh_topology="single-node"; multi-node targets must not.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tachyon-mesh-dispatch-slo
+  labels:
+    app: tachyon-mesh
+spec:
+  groups:
+    - name: tachyon-mesh-dispatch-slo
+      interval: 1m
+      rules:
+        - record: tachyon:mesh_dispatch_eligible_total:increase15m
+          expr: |
+            sum by (job, instance, tachyon_mesh_topology) (
+              increase(faas_mesh_dispatch_total{tachyon_mesh_topology="single-node",reason!="remote"}[15m])
+            )
+        - record: tachyon:mesh_dispatch_in_process_ratio:increase15m
+          expr: |
+            (
+              sum by (job, instance, tachyon_mesh_topology) (
+                increase(faas_mesh_dispatch_total{tachyon_mesh_topology="single-node",mode="in_process",reason!="remote"}[15m])
+              )
+              or on (job, instance, tachyon_mesh_topology)
+              (0 * tachyon:mesh_dispatch_eligible_total:increase15m)
+            )
+            /
+            clamp_min(tachyon:mesh_dispatch_eligible_total:increase15m, 1)
+        - alert: MeshDispatchLocalityDegraded
+          expr: |
+            (tachyon:mesh_dispatch_in_process_ratio:increase15m{tachyon_mesh_topology="single-node"} < 0.95)
+            and on (job, instance, tachyon_mesh_topology)
+            (tachyon:mesh_dispatch_eligible_total:increase15m{tachyon_mesh_topology="single-node"} >= 100)
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Single-node mesh dispatch is falling back from in-process execution
+            description: >-
+              In-process dispatch has remained below 95% of eligible internal
+              mesh dispatches for 10 minutes. Inspect saturated and pressure
+              fallback reasons before changing the routing policy.
