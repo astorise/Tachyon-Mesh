@@ -45,6 +45,7 @@ impl AppLogger {
                 )
             })?;
         }
+        prune_rotations(&file_path, config.retained_files)?;
         Ok(Self {
             inner: Arc::new(LoggerInner {
                 minimum_level: config.level,
@@ -180,9 +181,68 @@ fn rotated_path(file_path: &Path, index: usize) -> PathBuf {
     PathBuf::from(suffixed)
 }
 
+fn prune_rotations(file_path: &Path, retained_files: usize) -> Result<(), String> {
+    let Some(parent) = file_path.parent() else {
+        return Ok(());
+    };
+    let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    let rotation_prefix = format!("{file_name}.");
+    let entries = fs::read_dir(parent).map_err(|error| {
+        format!(
+            "failed to inspect log directory '{}': {error}",
+            parent.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to inspect an entry in log directory '{}': {error}",
+                parent.display()
+            )
+        })?;
+        let entry_name = entry.file_name();
+        let Some(suffix) = entry_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&rotation_prefix))
+        else {
+            continue;
+        };
+        let Ok(index) = suffix.parse::<usize>() else {
+            continue;
+        };
+        if index == 0 || index <= retained_files {
+            continue;
+        }
+        let entry_path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|error| {
+                format!(
+                    "failed to inspect rotated log '{}': {error}",
+                    entry_path.display()
+                )
+            })?
+            .is_file()
+        {
+            continue;
+        }
+        fs::remove_file(&entry_path).map_err(|error| {
+            format!(
+                "failed to remove rotated log '{}': {error}",
+                entry_path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AppLogger;
+    use super::{rotated_path, AppLogger};
     use crate::app_config::{LogLevel, LoggingConfig};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -241,6 +301,35 @@ mod tests {
 
         assert!(directory.join("logs/tachyon-ui.jsonl").exists());
         assert!(directory.join("logs/tachyon-ui.jsonl.1").exists());
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn prunes_rotations_above_configured_retention_on_startup() {
+        let directory = test_directory("reduced-retention");
+        let log_path = directory.join("logs/tachyon-ui.jsonl");
+        fs::create_dir_all(log_path.parent().expect("log path should have a parent"))
+            .expect("log directory should be created");
+        for index in 1..=20 {
+            fs::write(rotated_path(&log_path, index), format!("rotation {index}"))
+                .expect("rotation should be created");
+        }
+        let unrelated_path = directory.join("logs/tachyon-ui.jsonl.backup");
+        fs::write(&unrelated_path, "unrelated").expect("unrelated file should be created");
+
+        let config = LoggingConfig {
+            retained_files: 5,
+            ..LoggingConfig::default()
+        };
+        let _logger = AppLogger::new(&directory, &config).expect("logger should initialize");
+
+        for index in 1..=5 {
+            assert!(rotated_path(&log_path, index).exists());
+        }
+        for index in 6..=20 {
+            assert!(!rotated_path(&log_path, index).exists());
+        }
+        assert!(unrelated_path.exists());
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 }
