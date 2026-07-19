@@ -10,11 +10,11 @@
 - [x] 2.1 Add a note to `docs/faas-import-scoping.md`'s "Phase 4 — flip the default" section documenting that `require_scopes: false` remains a supported, permanent explicit setting after the fleet default changes — not a deprecated flag.
 - [x] 2.2 Cross-link the new note to the rollback note already present in that section so operators find both together.
 
-## 3. Blocked prerequisites (do not implement in this change)
+## 3. Deferred follow-ups (outside this change, tracked by issue #311)
 
-- [ ] 3.1 **[BLOCKED — needs real fleet telemetry]** Run the 2+ week observation window against the D1 criteria in `design.md`: `faas_scopes_allow_all_total` flat fleet-wide, `tachyon_get_scope_denials` reporting `allow_all: false` for every route, no unexplained `require_scopes: false`.
-- [ ] 3.2 **[BLOCKED — needs link-time verification + re-signing tooling]** Migrate `/metrics` and `/system/logger` in the reference `integrity.lock` off allow-all: confirm whether an explicit empty `scopes: {}` block breaks `system-faas-guest` linking for these two components (they don't call `storage-broker`/`outbound-http` via WIT, only via mounted volumes), then re-sign the manifest with a sealing script analogous to `scripts/seal-guest-openai.js`.
-- [ ] 3.3 **[BLOCKED — depends on 3.1]** Open the Phase 4 openspec change that flips `require_scopes`'s compiled-in default to `true`, citing the closed observation window from 3.1 in its proposal.
+- Run the 2+ week observation window against the D1 criteria in `design.md`: `faas_scopes_allow_all_total` flat fleet-wide, `tachyon_get_scope_denials` reporting `allow_all: false` for every route, no unexplained `require_scopes: false`.
+- Migrate `/metrics` and `/system/logger` in the reference `integrity.lock` off allow-all after link-time verification and the addition of re-signing tooling analogous to `scripts/seal-guest-openai.js`.
+- After the observation window closes successfully, open a separate Phase 4 OpenSpec change that flips the compiled-in `require_scopes` default to `true` and cites the collected evidence.
 
 ## 4. Pre-merge validation (for tasks 1–2 only)
 
