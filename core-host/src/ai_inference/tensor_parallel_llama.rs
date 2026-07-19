@@ -126,8 +126,9 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> CandleResult<T
 
 /// Replicated (unsharded) causal self-attention, run entirely on the
 /// "primary" device. Identical math to upstream
-/// `candle_transformers::models::llama::CausalSelfAttention::forward`, minus
-/// the `flash-attn` feature path (not enabled by this crate).
+/// `candle_transformers::models::llama::CausalSelfAttention::forward`, with
+/// the Flash Attention path enabled by `core-host/candle-cuda` on CUDA tensors
+/// (F32 activations are narrowed to F16 for the fused kernel).
 ///
 /// `pub(crate)` (rather than module-private) so `expert_parallel_llama.rs`
 /// can build MoE blocks that reuse this exact attention implementation
@@ -140,7 +141,19 @@ pub(crate) struct ReplicatedAttention {
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
+    use_flash_attn: bool,
     max_position_embeddings: usize,
+}
+
+#[cfg(feature = "candle-cuda")]
+fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> CandleResult<Tensor> {
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
 impl ReplicatedAttention {
@@ -156,6 +169,7 @@ impl ReplicatedAttention {
             num_attention_heads: cfg.num_attention_heads,
             num_key_value_heads: cfg.num_key_value_heads,
             head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            use_flash_attn: cfg.use_flash_attn,
             max_position_embeddings: cfg.max_position_embeddings,
         })
     }
@@ -170,6 +184,22 @@ impl ReplicatedAttention {
         let cos = cache.cos.narrow(0, index_pos, seq_len)?;
         let sin = cache.sin.narrow(0, index_pos, seq_len)?;
         candle_nn::rotary_emb::rope(x, &cos, &sin)
+    }
+
+    fn flash_attn_dtype(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Option<DType> {
+        if !self.use_flash_attn
+            || !cfg!(feature = "candle-cuda")
+            || q.device().is_cpu()
+            || q.dtype() != k.dtype()
+            || q.dtype() != v.dtype()
+        {
+            return None;
+        }
+        match q.dtype() {
+            DType::F16 | DType::BF16 => Some(q.dtype()),
+            DType::F32 => Some(DType::F16),
+            _ => None,
+        }
     }
 
     pub(crate) fn forward(
@@ -230,19 +260,38 @@ impl ReplicatedAttention {
         let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
         let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
 
-        let in_dtype = q.dtype();
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
-        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-        let att = if seq_len == 1 {
-            att
+        let y = if let Some(flash_dtype) = self.flash_attn_dtype(&q, &k, &v) {
+            #[cfg(feature = "candle-cuda")]
+            {
+                let in_dtype = q.dtype();
+                let q = q.to_dtype(flash_dtype)?.transpose(1, 2)?;
+                let k = k.to_dtype(flash_dtype)?.transpose(1, 2)?;
+                let v = v.to_dtype(flash_dtype)?.transpose(1, 2)?;
+                let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
+                flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?
+                    .transpose(1, 2)?
+                    .to_dtype(in_dtype)?
+            }
+            #[cfg(not(feature = "candle-cuda"))]
+            {
+                let _ = flash_dtype;
+                unreachable!("flash_attn_dtype is None without core-host/candle-cuda")
+            }
         } else {
-            let mask = cache.mask(seq_len, index_pos)?.broadcast_as(att.shape())?;
-            masked_fill(&att, &mask, f32::NEG_INFINITY)?
+            let in_dtype = q.dtype();
+            let q = q.to_dtype(DType::F32)?;
+            let k = k.to_dtype(DType::F32)?;
+            let v = v.to_dtype(DType::F32)?;
+            let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+            let att = if seq_len == 1 {
+                att
+            } else {
+                let mask = cache.mask(seq_len, index_pos)?.broadcast_as(att.shape())?;
+                masked_fill(&att, &mask, f32::NEG_INFINITY)?
+            };
+            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
         };
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let y = att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?;
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
         self.o_proj.forward(&y)
     }
@@ -456,6 +505,48 @@ mod tests {
         .unwrap();
         let dense_model = DenseLlama::load(dense_vb, &config).unwrap();
         let mut dense_cache = DenseCache::new(false, DType::F32, &config, &dense_device).unwrap();
+
+        let tp_devices = vec![Device::Cpu, Device::Cpu];
+        let tp_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &tp_devices[0])
+        }
+        .unwrap();
+        let tp_model = TensorParallelLlama::load(tp_vb, &config, &tp_devices).unwrap();
+        let mut tp_cache =
+            TensorParallelCache::new(false, DType::F32, &config, &tp_devices[0]).unwrap();
+
+        let input = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &dense_device).unwrap();
+
+        let dense_logits = dense_model.forward(&input, 0, &mut dense_cache).unwrap();
+        let tp_logits = tp_model.forward(&input, 0, &mut tp_cache).unwrap();
+
+        let dense_logits: Vec<f32> = dense_logits.flatten_all().unwrap().to_vec1().unwrap();
+        let tp_logits: Vec<f32> = tp_logits.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(dense_logits.len(), tp_logits.len());
+        for (a, b) in dense_logits.iter().zip(tp_logits.iter()) {
+            assert!((a - b).abs() < 1e-3, "{a} != {b}");
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_llama_cuda_flash_attn_flag_keeps_naive_fallback_on_cpu_f32() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tachyon_tiny_fixture(dir.path()).unwrap();
+        let mut config = load_config(dir.path());
+        config.use_flash_attn = true;
+
+        let weight_paths = vec![dir.path().join("model.safetensors")];
+
+        let mut dense_config = config.clone();
+        dense_config.use_flash_attn = false;
+        let dense_device = Device::Cpu;
+        let dense_vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &dense_device)
+        }
+        .unwrap();
+        let dense_model = DenseLlama::load(dense_vb, &dense_config).unwrap();
+        let mut dense_cache =
+            DenseCache::new(false, DType::F32, &dense_config, &dense_device).unwrap();
 
         let tp_devices = vec![Device::Cpu, Device::Cpu];
         let tp_vb = unsafe {

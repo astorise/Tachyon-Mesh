@@ -1288,6 +1288,7 @@ dependencies = [
  "blake3",
  "bytes",
  "candle-core",
+ "candle-flash-attn",
  "candle-flashinfer-kernels",
  "candle-nn",
  "candle-onnx",

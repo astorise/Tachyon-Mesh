@@ -453,6 +453,22 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 - **THEN** the runtime performs the existing host-staged manual sum across devices
 - **AND** the result is unchanged from the pre-existing behavior, with no regression in any CPU-only test
 
+### Requirement: Parallel Llama attention MUST use Flash Attention when compiled for CUDA
+When the runtime is built with the `candle-cuda` Cargo feature, tensor-, pipeline-, and expert-parallel Llama-family engines SHALL enable Candle's Flash Attention kernel for replicated causal self-attention on CUDA tensors while preserving the existing naïve matmul/softmax attention as the fallback for CPU tensors and unsupported dtypes.
+
+#### Scenario: Flash Attention is selected for CUDA parallel attention
+- **GIVEN** the runtime is built with the `candle-cuda` feature
+- **AND** a tensor-, pipeline-, or expert-parallel Llama-family deployment runs replicated attention on CUDA tensors
+- **WHEN** `ReplicatedAttention::forward` computes causal self-attention
+- **THEN** the runtime dispatches through `candle-flash-attn`
+- **AND** F32 activations are narrowed to F16 for the fused kernel and converted back to the original dtype before the output projection
+
+#### Scenario: Naïve attention remains the fallback outside CUDA Flash Attention support
+- **GIVEN** the runtime is built without the `candle-cuda` feature, or attention runs on CPU tensors, or the tensor dtype is unsupported by the fused kernel
+- **WHEN** `ReplicatedAttention::forward` computes causal self-attention
+- **THEN** the runtime uses the existing matmul, causal-mask, softmax, and value-projection path
+- **AND** CPU/F32 parallel Llama tests remain numerically equivalent to the dense reference path
+
 ### Requirement: The runtime MUST execute pipeline-parallel inference across multiple nodes
 When a model deployment is configured with `hardware_strategy.distribution_mode: pipeline_parallelism`, the runtime SHALL assign contiguous layer ranges to distinct nodes/GPUs, SHALL stream activations between pipeline stages over a point-to-point transport implementing `StageTransport`, and SHALL support full autoregressive generation (prefill followed by an arbitrary number of decode steps), not prefill alone.
 
