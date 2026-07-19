@@ -3,6 +3,11 @@
     windows_subsystem = "windows"
 )]
 
+mod app_config;
+mod app_logging;
+
+use app_config::{AppConfig, LogLevel};
+use app_logging::{AppLogger, FrontendLogPayload};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -990,6 +995,14 @@ fn stronghold_profile_key(data_dir: &std::path::Path) -> Result<Vec<u8>, String>
     }
 }
 
+#[tauri::command]
+fn log_frontend_event(
+    logger: tauri::State<'_, AppLogger>,
+    payload: FrontendLogPayload,
+) -> Result<(), String> {
+    logger.write_frontend(payload)
+}
+
 fn main() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -998,6 +1011,20 @@ fn main() {
                 .path()
                 .app_local_data_dir()
                 .map_err(|error| tauri::Error::Anyhow(error.into()))?;
+            let config = AppConfig::load_or_create(&data_dir)
+                .map_err(|error| tauri::Error::Anyhow(std::io::Error::other(error).into()))?;
+            let logger = AppLogger::new(&data_dir, &config.logging)
+                .map_err(|error| tauri::Error::Anyhow(std::io::Error::other(error).into()))?;
+            logger.register_global();
+            logger
+                .write(
+                    LogLevel::Info,
+                    "application.startup",
+                    "Tachyon UI is starting",
+                )
+                .map_err(|error| tauri::Error::Anyhow(std::io::Error::other(error).into()))?;
+            app.manage(logger);
+            app.manage(config);
             // Export the runtime workspace root so tachyon-client can resolve
             // integrity.lock without relying on the compile-time CARGO_MANIFEST_DIR.
             std::env::set_var("TACHYON_WORKSPACE_ROOT", &data_dir);
@@ -1081,11 +1108,13 @@ fn main() {
             load_custom_ca,
             clear_custom_ca,
             verify_session_totp,
-            stronghold_available
+            stronghold_available,
+            log_frontend_event
         ])
         .run(tauri::generate_context!());
 
     if let Err(error) = result {
+        app_logging::write_global(LogLevel::Error, "application.fatal", &error.to_string());
         eprintln!("Tachyon UI encountered a fatal error: {error}");
         std::process::exit(1);
     }

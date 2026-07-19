@@ -1,6 +1,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import { connectionStore } from "../stores/connectionStore";
+import { logUiError } from "./appLogger";
 import { ensureMfa } from "./authSudo";
 import { translateBackendError } from "./i18n";
 
@@ -40,6 +41,7 @@ export async function resilientInvoke<T>(command: string, args?: Record<string, 
     connectionStore.getState().setStatus("connected");
     return result;
   } catch (error) {
+    logUiError(`ipc.${command}`, error);
     connectionStore.getState().setStatus("disconnected");
     startReconnectLoop();
     const raw = error instanceof Error ? error.message : String(error);
@@ -76,7 +78,8 @@ function startReconnectLoop(): void {
         connectionStore.getState().setStatus("connected");
         reconnectLoop = null;
         return;
-      } catch {
+      } catch (error) {
+        logUiError("ipc.get_engine_status.reconnect", error);
         // Continue to next attempt.
       }
     }

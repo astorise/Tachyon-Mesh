@@ -2,7 +2,7 @@ import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
 import { resilientInvoke } from "../../utils/network";
 import { t } from "../../utils/i18n";
-import { invoke } from "@tauri-apps/api/core";
+import { loggedInvoke as invoke } from "../../utils/appLogger";
 import { listManifestRoutes, writeRouteCanary, type ManifestRouteOption } from "../../controllers/manifestConfigController";
 
 type ImportPackageResult = {

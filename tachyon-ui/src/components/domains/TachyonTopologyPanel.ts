@@ -1,6 +1,6 @@
-import { invoke } from "@tauri-apps/api/core";
 import { TachyonConfigDashboard } from "../base/TachyonConfigDashboard";
 import { el } from "../../utils/dom-safe";
+import { loggedInvoke as invoke } from "../../utils/appLogger";
 import { t } from "../../utils/i18n";
 import stylesheetText from "../../style.css?inline";
 
