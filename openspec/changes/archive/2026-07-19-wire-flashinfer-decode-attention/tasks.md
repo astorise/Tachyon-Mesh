@@ -15,15 +15,15 @@
 
 - [x] 3.1 Added `flashinfer_attention_strategy_is_rejected_for_a_non_llama_architecture` (mirrors the equivalent paged_attention test) confirming the rejection still fires for a non-Llama architecture on every build. The pre-existing `flashinfer_attention_strategy_is_rejected_until_decode_attention_is_wired` test (requests `cpu`) still passes unchanged — rejection still fires for a non-CUDA device request regardless of feature/build.
 - [x] 3.2 Added `flashinfer_attention_and_paged_attention_combination_is_rejected` (`#[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]`), asserting the combination is rejected with a typed error naming the conflict.
-- [ ] 3.3 Added `single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda` (`#[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]`) loading the shared tiny fixture (no dedicated fixture needed — confirmed no block-size/head-dim constraint in the kernel source, matching design.md's expectation) with `flashinfer_attention: true`, asserting non-empty output *and* that it matches the dense (non-flashinfer) path's greedy output for the same prompt. Written and reasoned through carefully, but **not yet verified on real GPU hardware** — this dev machine's local CUDA toolchain doesn't compile (see `project_hardware_strategy_accelerations` memory); awaiting a `cuda-quality` CI run.
+- [x] 3.3 Added `single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda` (`#[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]`) loading the shared tiny fixture with `flashinfer_attention: true`, asserting non-empty output and equality with the dense path. Verified on real GPU hardware by PR #369's green `cuda-quality` job.
 - [x] 3.4 Regression: `cargo test -p core-host --features ai-inference ai_inference::` (188/188, 0 regressions) and `--features candle-flashinfer` (189/189, 0 regressions); `cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used` and `-p core-host --features candle-flashinfer --all-targets` (both clean); `RUSTFLAGS="-D dead_code" cargo check` on both feature sets (clean); `cargo fmt --all -- --check` (clean).
 
 ## 4. CI
 
-- [ ] 4.1 Added `cuda-quality` steps for Task 3.3's flashinfer-attention generation proof and Task 3.2's combination-rejection proof on `arc-gpu-runners`, modeled on the paged-attention and single-device-CUDA proof steps. Not yet confirmed green on real hardware.
+- [x] 4.1 Added `cuda-quality` steps for Task 3.3's flashinfer-attention generation proof and Task 3.2's combination-rejection proof on `arc-gpu-runners`, modeled on the paged-attention and single-device-CUDA proof steps. Confirmed green on real hardware by PR #369.
 
 ## 5. Docs
 
 - [x] 5.1 Updated `docs/ai-inference-candle-llm-runtime.md`: split the old combined "CUDA Graphs and FlashInfer Status" section into its own "FlashInfer Decode Attention Status" (describing the now-enabled path) and "CUDA Graph Decode Status" (still rejected, now documenting the `paged_attention` dependency and the newly-discovered `write_new_kv` graph-capture blocker).
 - [x] 5.2 `CHANGELOG.md` entry.
-- [ ] 5.3 Update issue #312 status once this lands and CI confirms: flashinfer_attention done, `cuda_graph_decode` blocked on a new fork-side seam (see `wire-cuda-graph-decode`'s updated design.md), continuous batching's correctness fix already landed (`fix-continuous-batching-response-routing`), true fused batching remains a follow-up.
+- [x] 5.3 Updated issue #312 after CI confirmation: flashinfer_attention, CUDA Graph decode, and continuous-batching response correctness are implemented; true fused batching remains a distinct throughput follow-up.
