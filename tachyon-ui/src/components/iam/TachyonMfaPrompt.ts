@@ -1,6 +1,5 @@
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-
 import stylesheetText from "../../style.css?inline";
+import { loggedInvoke as tauriInvoke } from "../../utils/appLogger";
 import { t } from "../../utils/i18n";
 
 const mfaStylesheet = new CSSStyleSheet();

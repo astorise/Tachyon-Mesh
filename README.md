@@ -92,6 +92,36 @@ After setup:
 cd tachyon-ui && npm run tauri dev
 ```
 
+### Tachyon UI logging
+
+Tachyon UI writes failed backend invocations, uncaught frontend errors, and
+fatal application errors to a structured JSON Lines log. On first launch it
+creates the configuration file in its local application-data directory:
+
+- Windows: `%LOCALAPPDATA%\com.tachyonmesh.ui\tachyon-ui.config.json`
+- Linux: `$XDG_DATA_HOME/com.tachyonmesh.ui/tachyon-ui.config.json` or the
+  platform local-data equivalent used by Tauri
+
+Default configuration:
+
+```json
+{
+  "schemaVersion": 1,
+  "logging": {
+    "level": "info",
+    "file": "logs/tachyon-ui.jsonl",
+    "maxFileBytes": 5242880,
+    "retainedFiles": 5
+  }
+}
+```
+
+`logging.level` accepts `trace`, `debug`, `info`, `warn`, `error`, or `off`.
+The file path is relative to the application-data directory; log rotation
+produces suffixes such as `.1` and `.2`. Configuration changes are loaded on
+the next application start. Invocation parameters are intentionally excluded
+from log records because they may contain credentials or tokens.
+
 ---
 
 ### Path C — Worker / Data-Plane Node (Build from Source)
