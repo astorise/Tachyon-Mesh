@@ -60,8 +60,8 @@
 
 - [x] 4.1 `openspec/specs/ai-inference/spec.md`: new scenario under the
   existing continuous-batching requirement (this change's spec delta).
-- [ ] 4.2 `CHANGELOG.md` entry describing the bug and fix.
-- [ ] 4.3 Note in issue #312 that the "continuous batching" item's scheduling
+- [x] 4.2 `CHANGELOG.md` entry describing the bug and fix.
+- [x] 4.3 Noted in issue #312: the "continuous batching" item's scheduling
   infrastructure already existed and was already spec-compliant on paper;
   this change closes the gap between that spec and the implementation. True
   fused multi-sequence GPU batching (throughput) remains open as a distinct,

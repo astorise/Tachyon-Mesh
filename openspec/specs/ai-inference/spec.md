@@ -50,7 +50,10 @@ target devices so the host can preload model bindings before serving inference.
 ### Requirement: Inference requests are continuously batched by the host
 The host SHALL run a continuous batching scheduler that admits compatible inference sequences into
 an active set, advances each sequence through explicit `prefill` and `decode` phases, and chooses
-the next compatible step without waiting for a fixed time window.
+the next compatible step without waiting for a fixed time window. When multiple requests are
+processed in the same batched step, each request's own generated output SHALL be routed back to
+that request's own caller — never another request's output, and never silently dropped in favor of
+processing only the first request in the batch.
 
 #### Scenario: Compatible inference requests are active together
 - **WHEN** several compatible inference requests are active on the same accelerator
@@ -61,6 +64,16 @@ the next compatible step without waiting for a fixed time window.
 - **WHEN** a new higher-QoS inference request arrives while another sequence is already active
 - **THEN** the scheduler may admit the new request into the active set before the existing sequence completes
 - **AND** the next eligible step is selected by QoS and compatibility rather than by the original arrival batch
+
+#### Scenario: A shared decode batch contains distinct prompts for the same model
+- **GIVEN** two or more inference requests for the same model alias and adapter are grouped into
+  the same decode batch
+- **AND** the requests carry different prompts
+- **WHEN** the scheduler processes that batch
+- **THEN** each request's response is generated from that request's own prompt
+- **AND** no request receives another request's generated output
+- **AND** a backend that cannot produce a distinct output per request in the batch fails the batch
+  with an error rather than silently returning fewer outputs than requests
 
 ### Requirement: Candle LLM prefill is chunked and configurable
 The Candle LLM runtime SHALL split prompt prefill into bounded token chunks before entering
@@ -670,19 +683,44 @@ For the single-device Llama safetensors backend, the runtime SHOULD keep a bound
 - **AND** PagedAttention remains rejected until block tables and paged flash-attention are wired explicitly
 
 ### Requirement: PagedAttention MUST require an explicit block-table runtime path
-When a model deployment sets `hardware_strategy.paged_attention: true`, the runtime SHALL NOT silently fall back to the existing contiguous per-request KV cache. Tachyon SHALL enable this mode only after its core-host runtime owns a block allocator, a per-sequence block table, and a Candle paged flash-attn call using `flash_attn_varlen_paged_windowed` or a compatible successor API.
+When a model deployment sets `hardware_strategy.paged_attention: true`, the runtime SHALL NOT silently fall back to the existing contiguous per-request KV cache. Tachyon SHALL enable this mode only for architectures and devices where its core-host runtime owns a block allocator, a per-sequence block table, and a Candle paged flash-attn call using `flash_attn_varlen_paged_windowed` or a compatible successor API; every other architecture/device combination SHALL keep failing closed with a typed error.
 
 #### Scenario: PagedAttention request is rejected before Tachyon block tables are wired
 - **GIVEN** a model binding sets `hardware_strategy.paged_attention: true`
+- **AND** the runtime build does not yet have the block allocator/block-table integration for that binding's architecture
 - **WHEN** the Candle LLM runtime loads the binding
 - **THEN** loading fails with a typed `UnsupportedModel` error naming the missing block allocator and block-table integration
 - **AND** the runtime does not execute the contiguous KV-cache path as a fallback
 
-#### Scenario: PagedAttention can be enabled only after block-paged KV integration
-- **GIVEN** the runtime has a CUDA block pool, per-sequence block tables, context lengths, and a paged K/V tensor layout compatible with Candle's paged flash-attn API
-- **WHEN** a deployment enables `hardware_strategy.paged_attention`
-- **THEN** decode uses the block-paged attention path
+#### Scenario: PagedAttention is rejected on a non-Llama architecture
+- **GIVEN** a model binding sets `hardware_strategy.paged_attention: true`
+- **AND** the binding's architecture is not Llama
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming the unsupported architecture
+- **AND** the runtime does not execute the contiguous KV-cache path as a fallback
+
+#### Scenario: PagedAttention is rejected on a non-CUDA device
+- **GIVEN** a Llama model binding sets `hardware_strategy.paged_attention: true`
+- **AND** the requested device is not a CUDA device
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming the CUDA-only requirement
+- **AND** the runtime does not execute the contiguous KV-cache path as a fallback
+
+#### Scenario: PagedAttention is enabled for a Llama binding on CUDA once block-paged KV integration is available
+- **GIVEN** the runtime build owns a CUDA block pool, per-sequence block tables, and a paged K/V tensor layout compatible with Candle's paged flash-attn API
+- **AND** a Llama model binding requesting a CUDA device sets `hardware_strategy.paged_attention: true`
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** the load succeeds and decode uses the block-paged attention path
+- **AND** the model's weights and KV cache load in BF16 rather than the contiguous path's F32, because the paged flash-attention kernel only supports F16/BF16
 - **AND** sequence admission and eviction operate at block granularity rather than reallocating a contiguous KV cache per request
+- **AND** generation output is a real decode over the loaded weights (not a mock), consistent (repeated identical greedy requests against the same loaded binding produce identical output) though not necessarily bit-identical to the F32 contiguous path given the BF16 precision difference
+
+#### Scenario: PagedAttention KV pool sizing fails closed when the budget can't fit one full sequence
+- **GIVEN** a Llama model binding on a CUDA device sets `hardware_strategy.paged_attention: true`
+- **AND** the device's free VRAM (after the model's weights are loaded) cannot fit enough paged KV blocks to hold one sequence of the checkpoint's `max_position_embeddings` length
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming the sizing shortfall
+- **AND** no paged KV block pool or per-layer tensors are left allocated
 
 ### Requirement: CUDA Graph and FlashInfer decode acceleration MUST be explicit and fail-closed
 The AI inference build SHALL consume the pinned `astorise/candle` fork tag that
@@ -690,19 +728,42 @@ exposes `candle_core::CudaGraph` and the optional
 `candle-flashinfer-kernels` crate for the downstream work proposed in
 `huggingface/candle#3651`. Model deployments MAY declare
 `hardware_strategy.cuda_graph_decode` and
-`hardware_strategy.flashinfer_attention`, but the runtime SHALL reject those
-settings until Tachyon's GPU decode loop has fixed-shape buffers and an
-attention call site wired to those Candle APIs.
+`hardware_strategy.flashinfer_attention`. `cuda_graph_decode` SHALL be
+enabled only for a Llama-family checkpoint on a CUDA device that also
+declares `hardware_strategy.paged_attention: true` — the contiguous KV
+cache's per-step reallocation is fundamentally incompatible with CUDA
+graph replay, so `cuda_graph_decode` without `paged_attention` SHALL
+continue to fail closed with a typed error naming that dependency, not
+just naming the missing `CudaGraph` wiring. `flashinfer_attention`'s
+requirement is unchanged from the prior modification in
+`wire-flashinfer-decode-attention`.
 
 #### Scenario: CUDA Graph decode request is rejected before capture is wired
 - **GIVEN** a model binding sets `hardware_strategy.cuda_graph_decode: true`
+- **AND** the runtime build does not yet have the capture/replay decode path wired for that binding's architecture, device, or build
 - **WHEN** the Candle LLM runtime loads the binding
 - **THEN** loading fails with a typed `UnsupportedModel` error naming
   `candle_core::CudaGraph`
 - **AND** the runtime does not silently execute the uncaptured decode loop
 
+#### Scenario: CUDA Graph decode without paged attention is rejected
+- **GIVEN** a Llama model binding on CUDA sets `hardware_strategy.cuda_graph_decode: true`
+- **AND** does not also set `hardware_strategy.paged_attention: true`
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming the `paged_attention` dependency
+- **AND** the runtime does not silently fall back to capturing the contiguous KV cache path
+
+#### Scenario: CUDA Graph decode is enabled for a paged-attention Llama binding on CUDA once capture is wired
+- **GIVEN** the runtime build has the decode-position seam and capture/replay orchestration wired
+- **AND** a Llama model binding requesting a CUDA device sets both `hardware_strategy.paged_attention: true` and `hardware_strategy.cuda_graph_decode: true`
+- **WHEN** the Candle LLM runtime loads the binding and generates
+- **THEN** the load succeeds, the first decode step runs a warm-up call followed by a `CudaGraph` capture, and every subsequent decode step replays that captured graph after updating the input-token, position, and paged block-table/seqlens buffers in place
+- **AND** the block-table/seqlens tensors are sized to their full maximum width (`min_blocks`) from the first decode step, so no recapture occurs within a single request
+- **AND** generation output is a real decode over the loaded weights, not a mock
+
 #### Scenario: FlashInfer attention request is rejected before attention dispatch is wired
 - **GIVEN** a model binding sets `hardware_strategy.flashinfer_attention: true`
+- **AND** the runtime build does not yet have the decode-attention dispatch wired for that binding's architecture, device, or build
 - **WHEN** the Candle LLM runtime loads the binding
 - **THEN** loading fails with a typed `UnsupportedModel` error naming
   `candle-flashinfer-kernels::flashinfer_decode_attention`
