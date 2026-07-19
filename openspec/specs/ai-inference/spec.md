@@ -734,9 +734,13 @@ declares `hardware_strategy.paged_attention: true` — the contiguous KV
 cache's per-step reallocation is fundamentally incompatible with CUDA
 graph replay, so `cuda_graph_decode` without `paged_attention` SHALL
 continue to fail closed with a typed error naming that dependency, not
-just naming the missing `CudaGraph` wiring. `flashinfer_attention`'s
-requirement is unchanged from the prior modification in
-`wire-flashinfer-decode-attention`.
+just naming the missing `CudaGraph` wiring. `flashinfer_attention` SHALL
+be enabled only for a Llama-family checkpoint on a CUDA device when the
+`candle-flashinfer` build feature and decode-attention dispatch are available.
+Every other architecture, non-CUDA device, or build without that feature SHALL
+fail closed with a typed error. Prefill (multi-token) forward passes SHALL
+continue to use the existing attention path because
+`flashinfer_decode_attention` is decode-only.
 
 #### Scenario: CUDA Graph decode request is rejected before capture is wired
 - **GIVEN** a model binding sets `hardware_strategy.cuda_graph_decode: true`
@@ -768,6 +772,28 @@ requirement is unchanged from the prior modification in
 - **THEN** loading fails with a typed `UnsupportedModel` error naming
   `candle-flashinfer-kernels::flashinfer_decode_attention`
 - **AND** the runtime does not silently use the default attention path
+
+#### Scenario: FlashInfer attention is rejected on a non-Llama architecture or a non-CUDA device
+- **GIVEN** a model binding sets `hardware_strategy.flashinfer_attention: true`
+- **AND** the binding's architecture is not Llama, or the requested device is not CUDA
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error
+- **AND** the runtime does not execute the default attention path as a fallback
+
+#### Scenario: FlashInfer attention is enabled for a Llama binding on CUDA
+- **GIVEN** the runtime build has the decode-step attention dispatch wired to `candle-flashinfer-kernels::flashinfer_decode_attention`
+- **AND** a Llama model binding requesting a CUDA device sets `hardware_strategy.flashinfer_attention: true`
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** the load succeeds and every decode step runs through `flashinfer_decode_attention`
+- **AND** prefill multi-token forward passes continue to use the existing attention path unchanged
+- **AND** the model's weights and KV cache retain their existing dtype, unlike `paged_attention`
+- **AND** generation output is a real decode over the loaded weights, not a mock
+
+#### Scenario: FlashInfer attention combined with paged attention is rejected
+- **GIVEN** a Llama model binding on CUDA sets both `hardware_strategy.flashinfer_attention: true` and `hardware_strategy.paged_attention: true`
+- **WHEN** the Candle LLM runtime loads the binding
+- **THEN** loading fails with a typed `UnsupportedModel` error naming the unsupported combination
+- **AND** the runtime does not silently pick one attention path over the other
 
 #### Scenario: FlashInfer remains an optional dependency
 - **WHEN** `core-host` is built without the `candle-flashinfer` feature
@@ -872,4 +898,3 @@ backend boundaries SHALL remain unchanged.
 - **THEN** the existing specialized dispatcher handles it
 - **AND** the generic architecture registry does not reinterpret it as a dense
   Qwen, Gemma, Phi, or DeepSeek checkpoint
-
