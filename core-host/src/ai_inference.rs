@@ -964,7 +964,6 @@ impl ActiveInferenceSequence {
     fn batch_key(&self) -> InferenceBatchKey {
         InferenceBatchKey {
             alias: self.job.alias.clone(),
-            adapter_id: self.job.adapter.as_ref().map(|adapter| adapter.id.clone()),
         }
     }
 
@@ -979,9 +978,7 @@ impl ActiveInferenceSequence {
         batch_key: &InferenceBatchKey,
         phase: InferenceSequencePhase,
     ) -> bool {
-        self.phase == phase
-            && self.job.alias == batch_key.alias
-            && self.job.adapter.as_ref().map(|adapter| &adapter.id) == batch_key.adapter_id.as_ref()
+        self.phase == phase && self.job.alias == batch_key.alias
     }
 }
 
@@ -1116,6 +1113,23 @@ impl TenantFairness {
         *self.deficits.entry(tenant.to_owned()).or_insert(0) -= total_weight * cost as i64;
     }
 
+    fn charge_batch(
+        &mut self,
+        active: &[ActiveInferenceSequence],
+        indices: &[usize],
+        eligible_tenants: &[String],
+    ) {
+        let mut tenant_costs: HashMap<String, usize> = HashMap::new();
+        for sequence in indices.iter().filter_map(|index| active.get(*index)) {
+            *tenant_costs
+                .entry(sequence.job.tenant_id().to_owned())
+                .or_insert(0) += 1;
+        }
+        for (tenant, cost) in tenant_costs {
+            self.charge(&tenant, eligible_tenants, cost);
+        }
+    }
+
     fn deficit(&self, tenant: &str) -> i64 {
         self.deficits.get(tenant).copied().unwrap_or_default()
     }
@@ -1205,7 +1219,6 @@ fn drain_ready_jobs(
 
 struct InferenceBatchKey {
     alias: String,
-    adapter_id: Option<String>,
 }
 
 fn run_continuous_step(
@@ -1275,11 +1288,7 @@ fn select_active_batch(
         })
         .collect::<Vec<_>>();
     indices.sort_unstable();
-    tenant_fairness.charge(
-        &selection.tenant,
-        &selection.eligible_tenants,
-        indices.len(),
-    );
+    tenant_fairness.charge_batch(active, &indices, &selection.eligible_tenants);
     Some(indices)
 }
 
@@ -1301,45 +1310,81 @@ fn process_batch(
     batch: &[InferenceJob],
 ) -> Vec<Result<Vec<u8>, anyhow::Error>> {
     let model = Arc::clone(&batch[0].model);
-    let adapter = batch[0].adapter.as_ref();
     #[cfg(test)]
     if model.mock_latency > Duration::ZERO {
         thread::sleep(model.mock_latency);
     }
-    let inputs = batch
-        .iter()
-        .map(|job| job.input.clone())
-        .collect::<Vec<_>>();
-    match model.run_mock_batch(&inputs, adapter) {
-        // Each job's own output is routed back to that job, never a shared
-        // clone of one job's result broadcast to the whole batch.
-        Ok(outputs) if outputs.len() == batch.len() => outputs.into_iter().map(Ok).collect(),
-        Ok(outputs) => {
-            let message = format!(
-                "{} backend for model `{}` returned {} output(s) for a batch of {} request(s)",
-                accelerator.as_str(),
-                model.alias,
-                outputs.len(),
-                batch.len()
-            );
-            batch
-                .iter()
-                .map(|_| Err(anyhow::anyhow!("{}", message.clone())))
-                .collect()
-        }
-        Err(error) => {
-            let message = format!(
-                "{} backend failed for model `{}`: {}",
-                accelerator.as_str(),
-                model.alias,
-                error
-            );
-            batch
-                .iter()
-                .map(|_| Err(anyhow::anyhow!("{}", message.clone())))
-                .collect()
+
+    let mut results = (0..batch.len()).map(|_| None).collect::<Vec<_>>();
+    for group in adapter_sub_batches(batch) {
+        let adapter = batch[group[0]].adapter.as_ref();
+        let inputs = group
+            .iter()
+            .map(|index| batch[*index].input.clone())
+            .collect::<Vec<_>>();
+        match model.run_mock_batch(&inputs, adapter) {
+            // Each job's own output is routed back to that job, never a shared
+            // clone of one job's result broadcast to the whole batch.
+            Ok(outputs) if outputs.len() == group.len() => {
+                for (index, output) in group.into_iter().zip(outputs) {
+                    results[index] = Some(Ok(output));
+                }
+            }
+            Ok(outputs) => {
+                let message = format!(
+                    "{} backend for model `{}` adapter `{}` returned {} output(s) for a sub-batch of {} request(s)",
+                    accelerator.as_str(),
+                    model.alias,
+                    adapter.map(|adapter| adapter.id.as_str()).unwrap_or("base"),
+                    outputs.len(),
+                    group.len()
+                );
+                for index in group {
+                    results[index] = Some(Err(anyhow::anyhow!("{}", message.clone())));
+                }
+            }
+            Err(error) => {
+                let message = format!(
+                    "{} backend failed for model `{}` adapter `{}`: {}",
+                    accelerator.as_str(),
+                    model.alias,
+                    adapter.map(|adapter| adapter.id.as_str()).unwrap_or("base"),
+                    error
+                );
+                for index in group {
+                    results[index] = Some(Err(anyhow::anyhow!("{}", message.clone())));
+                }
+            }
         }
     }
+    results
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "{} backend for model `{}` did not produce a result for every request",
+                    accelerator.as_str(),
+                    model.alias
+                ))
+            })
+        })
+        .collect()
+}
+
+fn adapter_sub_batches(batch: &[InferenceJob]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+    for (index, job) in batch.iter().enumerate() {
+        let adapter_id = job.adapter.as_ref().map(|adapter| adapter.id.as_str());
+        if let Some((_, indices)) = groups
+            .iter_mut()
+            .find(|(known_adapter_id, _)| *known_adapter_id == adapter_id)
+        {
+            indices.push(index);
+        } else {
+            groups.push((adapter_id, vec![index]));
+        }
+    }
+    groups.into_iter().map(|(_, indices)| indices).collect()
 }
 
 // Unified candle-native backend model â€” replaces the WasiNnBackend abstraction.
@@ -2772,6 +2817,62 @@ mod tests {
         }
     }
 
+    struct AdapterEchoBackend;
+
+    impl BackendModel for AdapterEchoBackend {
+        fn residency(&self) -> AcceleratorMemoryResidency {
+            AcceleratorMemoryResidency::Vram
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                })
+                .collect())
+        }
+
+        fn execute_with_adapter(
+            &self,
+            inputs: &[SharedInputTensor],
+            adapter: &ResolvedLoraAdapter,
+        ) -> Result<Vec<Vec<u8>>> {
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!(
+                        "{}:{}",
+                        adapter.id,
+                        String::from_utf8_lossy(input.data.as_ref())
+                    )
+                    .into_bytes()
+                })
+                .collect())
+        }
+    }
+
+    fn adapter_echo_model(alias: &str) -> Arc<CandleModel> {
+        Arc::new(
+            CandleModel::load_mock_with_backend(
+                &IntegrityModelBinding {
+                    alias: alias.to_owned(),
+                    path: format!("mock:{alias}"),
+                    device: ModelDevice::Cuda,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                },
+                Arc::new(AdapterEchoBackend),
+            )
+            .expect("adapter echo model should load"),
+        )
+    }
+
     #[test]
     fn runtime_preloads_model_aliases_from_config() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
@@ -3334,7 +3435,8 @@ mod tests {
 
     #[test]
     fn scheduler_tenant_weights_select_weighted_share_within_same_qos() {
-        let model = mock_scheduler_model("shared");
+        let model_a = mock_scheduler_model("shared-a");
+        let model_b = mock_scheduler_model("shared-b");
         let mut tenant_fairness = TenantFairness::new(SchedulerConfig {
             tenant_weights: std::collections::BTreeMap::from([
                 ("tenant-a".to_owned(), 3),
@@ -3349,13 +3451,13 @@ mod tests {
                 qos_score: RouteQos::Standard.score(),
                 sequence: 0,
                 phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-a", tenant_a_tx),
+                job: mock_inference_job(&model_a, "tenant-a", tenant_a_tx),
             },
             ActiveInferenceSequence {
                 qos_score: RouteQos::Standard.score(),
                 sequence: 1,
                 phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-b", tenant_b_tx),
+                job: mock_inference_job(&model_b, "tenant-b", tenant_b_tx),
             },
         ];
 
@@ -3433,11 +3535,12 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_tenant_fairness_charges_selected_batch_by_request_count() {
-        let model = mock_scheduler_model("batch-shared");
+    fn scheduler_batches_distinct_lora_adapters_as_sub_batches_for_same_model() {
+        let model = adapter_echo_model("batch-shared");
         let mut tenant_fairness = TenantFairness::new(SchedulerConfig::default());
         let (tenant_a_tx_1, _tenant_a_rx_1) = mpsc::channel();
         let (tenant_a_tx_2, _tenant_a_rx_2) = mpsc::channel();
+        let (base_tx, _base_rx) = mpsc::channel();
         let (tenant_b_tx, _tenant_b_rx) = mpsc::channel();
         let active = vec![
             ActiveInferenceSequence {
@@ -3456,6 +3559,23 @@ mod tests {
                 qos_score: RouteQos::Standard.score(),
                 sequence: 2,
                 phase: InferenceSequencePhase::Decode,
+                job: InferenceJob {
+                    alias: model.alias.clone(),
+                    adapter: None,
+                    model: Arc::clone(&model),
+                    qos: model.qos,
+                    input: SharedInputTensor {
+                        dimensions: vec![1],
+                        ty: TensorType::U8,
+                        data: Arc::from(b"plain".as_slice()),
+                    },
+                    response_tx: base_tx,
+                },
+            },
+            ActiveInferenceSequence {
+                qos_score: RouteQos::Standard.score(),
+                sequence: 3,
+                phase: InferenceSequencePhase::Decode,
                 job: mock_inference_job(&model, "tenant-b", tenant_b_tx),
             },
         ];
@@ -3465,18 +3585,31 @@ mod tests {
             InferenceSequencePhase::Decode,
             &mut tenant_fairness,
         )
-        .expect("first tenant should be selected");
-        assert_eq!(first.len(), 2);
-        assert_eq!(active[first[0]].job.tenant_id(), "tenant-a");
+        .expect("same base model should be selected");
+        assert_eq!(
+            first,
+            vec![0, 1, 2, 3],
+            "different adapters for the same model should share one scheduler step"
+        );
 
-        let second = select_active_batch(
-            &active,
-            InferenceSequencePhase::Decode,
-            &mut tenant_fairness,
-        )
-        .expect("second tenant should be selected");
-        assert_eq!(second.len(), 1);
-        assert_eq!(active[second[0]].job.tenant_id(), "tenant-b");
+        let batch = first
+            .iter()
+            .map(|index| active[*index].job.clone())
+            .collect::<Vec<_>>();
+        let outputs = process_batch(AcceleratorKind::Gpu, &batch)
+            .into_iter()
+            .map(|result| String::from_utf8(result.expect("sub-batch output")).expect("utf8"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec![
+                "tenant-a:tenant-a".to_owned(),
+                "tenant-a:tenant-a".to_owned(),
+                "base:plain".to_owned(),
+                "tenant-b:tenant-b".to_owned(),
+            ],
+            "adapter-specific sub-batches must route each output back to its original request"
+        );
     }
 
     #[test]

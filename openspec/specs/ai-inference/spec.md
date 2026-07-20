@@ -177,6 +177,31 @@ The `wasi-nn-candle` execution engine SHALL dynamically inject and remove `.safe
 - **AND** the swap operation occurs without reloading the foundation model into VRAM
 - **AND** the engine enforces the configured maximum adapter-switch rate to keep aggregate latency within target SLOs
 
+### Requirement: Continuous batching MUST group Multi-LoRA requests by base model before adapter execution
+The AI inference scheduler SHALL treat requests for the same base model alias as compatible within a continuous-batching step even when their `adapter_id` values differ. The execution layer SHALL partition that selected step into adapter-specific sub-batches, run each sub-batch with its resolved adapter, and route every output back to the originating request. Requests without an `adapter_id` SHALL remain in a separate base-model sub-batch and SHALL preserve the existing no-adapter behavior.
+
+#### Scenario: Distinct adapters share one scheduler step
+- **GIVEN** multiple active requests target the same model alias
+- **AND** those requests use different `adapter_id` values
+- **WHEN** the scheduler selects the next compatible decode or prefill step
+- **THEN** the selected step includes all compatible requests for that base model
+- **AND** the execution layer splits the step into one sub-batch per adapter
+- **AND** each response is routed back to the request that produced it
+
+#### Scenario: No-adapter requests remain isolated from adapter sub-batches
+- **GIVEN** one request targets the base model without `adapter_id`
+- **AND** another request targets the same model with an adapter
+- **WHEN** both requests are selected in one scheduler step
+- **THEN** the base request runs in a no-adapter sub-batch
+- **AND** the adapted request runs in the adapter-specific sub-batch
+- **AND** the base output is not generated with the adapter active
+
+#### Scenario: Heterogeneous LoRA single-forward support depends on Candle kernels
+- **GIVEN** the host can group distinct adapters into one scheduler step
+- **WHEN** the Candle backend lacks S-LoRA, Punica, or equivalent SGMV adapter kernels
+- **THEN** Tachyon runs adapter groups as sequential sub-batches
+- **AND** true same-forward heterogeneous LoRA batching remains unavailable until the Candle fork exposes the required kernels and API
+
 ### Requirement: Inference workloads MUST support declarative LoRA Multiplexing
 The `system-faas-model-broker` SHALL allow the sharing of a single base model in VRAM across multiple tenants by dynamically loading LoRA (Low-Rank Adaptation) weights based on Layer 7 routing conditions defined in the GitOps configuration.
 
