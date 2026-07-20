@@ -2563,6 +2563,27 @@ impl system_component_bindings::tachyon::mesh::model_events::Host for ComponentH
     }
 }
 
+impl component_bindings::tachyon::mesh::outbound_http::Host for ComponentHostState {
+    fn send_request(
+        &mut self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> std::result::Result<component_bindings::tachyon::mesh::outbound_http::Response, String>
+    {
+        let response =
+            <Self as background_component_bindings::tachyon::mesh::outbound_http::Host>::send_request(
+                self, method, url, headers, body,
+            )?;
+        Ok(component_bindings::tachyon::mesh::outbound_http::Response {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        })
+    }
+}
+
 impl background_component_bindings::tachyon::mesh::outbound_http::Host for ComponentHostState {
     fn send_request(
         &mut self,

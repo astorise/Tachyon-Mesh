@@ -550,6 +550,18 @@ pub(crate) fn execute_component_guest(
         })?;
         // Infrastructure — streaming body sink; always linked. Guests that do
         // not call `get-streaming-response` incur no overhead.
+        if shape.grants(ScopeCategory::Http) {
+            component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+                ComponentHostState,
+                ComponentHostState,
+            >(&mut l, |s: &mut ComponentHostState| s)
+            .map_err(|e| {
+                guest_execution_error(
+                    e,
+                    "failed to add outbound HTTP functions to component linker",
+                )
+            })?;
+        }
         component_bindings::tachyon::mesh::response_body::add_to_linker::<
             ComponentHostState,
             ComponentHostState,
@@ -1196,6 +1208,15 @@ pub(crate) fn execute_streaming_component_guest(
                 ComponentHostState,
             >(&mut l, |s| s)
             .map_err(|e| guest_execution_error(e, "failed to add metrics to streaming linker"))?;
+            if shape.grants(ScopeCategory::Http) {
+                component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+                    ComponentHostState,
+                    ComponentHostState,
+                >(&mut l, |s| s)
+                .map_err(|e| {
+                    guest_execution_error(e, "failed to add outbound HTTP to streaming linker")
+                })?;
+            }
             component_bindings::tachyon::mesh::response_body::add_to_linker::<
                 ComponentHostState,
                 ComponentHostState,
