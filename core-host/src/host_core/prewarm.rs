@@ -355,6 +355,16 @@ pub(crate) fn prewarm_http_component_instance(
             "failed to add training functions to prewarm HTTP component linker",
         )
     })?;
+    component_bindings::tachyon::mesh::outbound_http::add_to_linker::<
+        ComponentHostState,
+        ComponentHostState,
+    >(&mut linker, |state: &mut ComponentHostState| state)
+    .map_err(|error| {
+        guest_execution_error(
+            error,
+            "failed to add outbound HTTP functions to prewarm HTTP component linker",
+        )
+    })?;
     #[cfg(feature = "ai-inference")]
     add_accelerator_interfaces_to_component_linker(
         &mut linker,

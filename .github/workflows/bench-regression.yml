@@ -86,9 +86,9 @@ jobs:
       - name: Install fortio
         run: |
           FORTIO_VERSION="$(curl -s https://api.github.com/repos/fortio/fortio/releases/latest | grep -oE '"tag_name": *"[^"]+"' | cut -d'"' -f4)"
-          curl -L -o fortio "https://github.com/fortio/fortio/releases/download/${FORTIO_VERSION}/fortio_linux_amd64"
-          chmod +x fortio
-          sudo mv fortio /usr/local/bin/fortio
+          FORTIO_DEB_VERSION="${FORTIO_VERSION#v}"
+          curl -L --fail -o fortio.deb "https://github.com/fortio/fortio/releases/download/${FORTIO_VERSION}/fortio_${FORTIO_DEB_VERSION}_amd64.deb"
+          sudo apt-get install -y ./fortio.deb
           fortio version
 
       - name: Create cluster and import local images

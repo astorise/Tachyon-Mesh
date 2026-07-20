@@ -3,7 +3,7 @@ mod bindings {
 
     wit_bindgen::generate!({
         path: "../../wit/tachyon.wit",
-        world: "system-faas-guest",
+        world: "faas-guest",
     });
 
     export!(Component);
