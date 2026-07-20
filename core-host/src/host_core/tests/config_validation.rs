@@ -55,6 +55,114 @@ fn validate_integrity_config_rejects_duplicate_routes() {
 }
 
 #[test]
+fn validate_integrity_config_accepts_scheduler_policy_for_known_tenants() {
+    let mut route = IntegrityRoute::user("/api/guest-ai");
+    route.adapter_id = Some("tenant-a".to_owned());
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![route];
+    config.scheduler = SchedulerConfig {
+        tenant_weights: std::collections::BTreeMap::from([
+            ("tenant-a".to_owned(), 3),
+            ("default".to_owned(), 1),
+        ]),
+        tier_preemptible: SchedulerTierPreemptible {
+            realtime: false,
+            standard: true,
+            batch: true,
+        },
+        spill_budget_bytes: 512 * 1024 * 1024,
+        spill_tier_max: SchedulerSpillTier::Nvme,
+        pinned_ram_pool_bytes: 256 * 1024 * 1024,
+    };
+
+    let config = validate_integrity_config(config).expect("scheduler policy should validate");
+
+    assert_eq!(config.scheduler.tenant_weights["tenant-a"], 3);
+    assert!(!config
+        .scheduler
+        .tier_preemptible
+        .is_preemptible(RouteQos::RealTime));
+    assert!(config
+        .scheduler
+        .tier_preemptible
+        .is_preemptible(RouteQos::Standard));
+    assert!(config
+        .scheduler
+        .tier_preemptible
+        .is_preemptible(RouteQos::Batch));
+}
+
+#[test]
+fn manifest_schema_exposes_scheduler_config_fields() {
+    let schema = serde_json::to_value(schemars::schema_for!(IntegrityConfig))
+        .expect("IntegrityConfig schema should serialize");
+    let defs = schema
+        .get("$defs")
+        .or_else(|| schema.get("definitions"))
+        .and_then(serde_json::Value::as_object)
+        .expect("schema should expose definitions");
+    let scheduler_def = defs
+        .get("SchedulerConfig")
+        .expect("SchedulerConfig definition should be present");
+    let properties = scheduler_def["properties"]
+        .as_object()
+        .expect("SchedulerConfig properties should be an object");
+
+    for field in [
+        "tenant_weights",
+        "tier_preemptible",
+        "spill_budget_bytes",
+        "spill_tier_max",
+        "pinned_ram_pool_bytes",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "SchedulerConfig schema should expose `{field}`"
+        );
+    }
+}
+
+#[test]
+fn default_scheduler_config_serializes_out_of_default_manifest() {
+    let config = IntegrityConfig::default_sealed();
+    let value = serde_json::to_value(&config).expect("default config should serialize");
+
+    assert!(
+        value.get("scheduler").is_none(),
+        "default scheduler config should be omitted for backwards-compatible manifests"
+    );
+}
+
+#[test]
+fn validate_integrity_config_rejects_scheduler_zero_weight() {
+    let mut route = IntegrityRoute::user("/api/guest-ai");
+    route.adapter_id = Some("tenant-a".to_owned());
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![route];
+    config.scheduler.tenant_weights =
+        std::collections::BTreeMap::from([("tenant-a".to_owned(), 0)]);
+
+    let error =
+        validate_integrity_config(config).expect_err("zero tenant weights must fail validation");
+
+    assert!(error.to_string().contains("must be greater than zero"));
+}
+
+#[test]
+fn validate_integrity_config_rejects_scheduler_unknown_tenant() {
+    let mut config = IntegrityConfig::default_sealed();
+    config.scheduler.tenant_weights =
+        std::collections::BTreeMap::from([("tenant-missing".to_owned(), 1)]);
+
+    let error =
+        validate_integrity_config(config).expect_err("unknown tenant weights must fail validation");
+
+    assert!(error
+        .to_string()
+        .contains("unknown tenant `tenant-missing`"));
+}
+
+#[test]
 fn validate_integrity_config_rejects_typo_in_scope_category() {
     let mut route = IntegrityRoute::user("/api/guest-example");
     route.scopes = Some(json!({ "secrest": ["db/prod/*"] }));

@@ -75,6 +75,20 @@ processing only the first request in the batch.
 - **AND** a backend that cannot produce a distinct output per request in the batch fails the batch
   with an error rather than silently returning fewer outputs than requests
 
+### Requirement: AI scheduler MUST apply declarative tenant fairness within QoS tiers
+The AI inference scheduler SHALL consume `IntegrityConfig.scheduler.tenant_weights` when selecting the next sequence to admit or advance on an accelerator. Tenant identity SHALL come from the request adapter/tenant id when present and SHALL fall back to `default`; the scheduler SHALL keep QoS ordering first, then apply weighted tenant fairness within the currently eligible QoS tier. With no declared tenant weights, every tenant SHALL behave as weight `1`, preserving the previous QoS-only behavior.
+
+#### Scenario: Weighted tenants share saturated decode capacity
+- **GIVEN** two saturated tenants in the same QoS tier with weights `3` and `1`
+- **WHEN** the scheduler repeatedly selects decode work for a compatible accelerator
+- **THEN** the higher-weight tenant receives approximately three quarters of the selected work over the scheduling window
+- **AND** the lower-weight tenant continues to receive work rather than being starved
+
+#### Scenario: QoS priority remains stronger than tenant weight
+- **GIVEN** a `RealTime` sequence and a `Batch` sequence are both eligible
+- **WHEN** the scheduler chooses the next step
+- **THEN** the `RealTime` sequence is selected before the `Batch` sequence even if the batch tenant has a higher declared tenant weight
+
 ### Requirement: Candle LLM prefill is chunked and configurable
 The Candle LLM runtime SHALL split prompt prefill into bounded token chunks before entering
 autoregressive decode. The default chunk size SHALL be 8192 tokens, model bindings MAY configure

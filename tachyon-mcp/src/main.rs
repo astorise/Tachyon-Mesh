@@ -771,7 +771,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_patch_manifest",
-                    "description": "Patch configurable host-level fields in the live manifest. Reads the current manifest, recursively merges the JSON patch object at the manifest root using JSON Merge Patch semantics: object fields merge recursively, null removes the target key, and missing keys are left unchanged. It validates the merged manifest through the node dry-run endpoint, and POSTs it when dry_run=false. Prefer dry_run=true first to preview host-level edits such as enrollment, layer4, tee_backend, trusted_signers, require_scopes, kv_caches, telemetry_sample_rate, instance_pool_max_memory_bytes, cloud_sync_endpoint, or batch_targets. The structural fields routes, config_version, and asset_versions cannot be patched here, including via null; use tachyon_patch_route for route changes.",
+                    "description": "Patch configurable host-level fields in the live manifest. Reads the current manifest, recursively merges the JSON patch object at the manifest root using JSON Merge Patch semantics: object fields merge recursively, null removes the target key, and missing keys are left unchanged. It validates the merged manifest through the node dry-run endpoint, and POSTs it when dry_run=false. Prefer dry_run=true first to preview host-level edits such as enrollment, layer4, tee_backend, trusted_signers, require_scopes, kv_caches, scheduler, telemetry_sample_rate, instance_pool_max_memory_bytes, cloud_sync_endpoint, or batch_targets. The structural fields routes, config_version, and asset_versions cannot be patched here, including via null; use tachyon_patch_route for route changes.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["patch"],
@@ -2511,6 +2511,13 @@ mod tests {
         assert_eq!(
             patch_manifest["inputSchema"]["properties"]["dry_run"]["default"],
             true
+        );
+        assert!(
+            patch_manifest["description"]
+                .as_str()
+                .expect("patch_manifest description should be a string")
+                .contains("scheduler"),
+            "patch_manifest description should advertise scheduler host-level edits"
         );
     }
 
