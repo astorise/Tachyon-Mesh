@@ -58,7 +58,9 @@ enum TensorType {
     Fp32,
 }
 
-use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos, SchedulerConfig};
+use crate::{
+    IntegrityConfig, IntegrityModelBinding, RouteQos, SchedulerConfig, SchedulerSpillTier,
+};
 
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 const DEFAULT_BATCH_SIZE: usize = 32;
@@ -326,6 +328,8 @@ pub(crate) struct SchedulerSnapshot {
     pub(crate) realtime_queued: usize,
     pub(crate) standard_queued: usize,
     pub(crate) batch_queued: usize,
+    pub(crate) kv_recompute_preemptions: usize,
+    pub(crate) kv_swap_preemptions: usize,
     pub(crate) completed_aliases: Vec<String>,
 }
 
@@ -800,6 +804,11 @@ impl AcceleratorScheduler {
             realtime_queued: self.metrics.realtime_queued.load(Ordering::Relaxed),
             standard_queued: self.metrics.standard_queued.load(Ordering::Relaxed),
             batch_queued: self.metrics.batch_queued.load(Ordering::Relaxed),
+            kv_recompute_preemptions: self
+                .metrics
+                .kv_recompute_preemptions
+                .load(Ordering::Relaxed),
+            kv_swap_preemptions: self.metrics.kv_swap_preemptions.load(Ordering::Relaxed),
             completed_aliases: self
                 .metrics
                 .completed_aliases
@@ -839,6 +848,8 @@ struct SchedulerMetrics {
     realtime_queued: AtomicUsize,
     standard_queued: AtomicUsize,
     batch_queued: AtomicUsize,
+    kv_recompute_preemptions: AtomicUsize,
+    kv_swap_preemptions: AtomicUsize,
     next_sequence: AtomicUsize,
     #[cfg(test)]
     completed_aliases: Mutex<Vec<String>>,
@@ -884,6 +895,18 @@ impl SchedulerMetrics {
                 .lock()
                 .expect("scheduler completion log should not be poisoned")
                 .push(format!("{}:decode", first.alias));
+        }
+    }
+
+    fn record_kv_preemption(&self, mode: paged_kv::KvPreemptionMode) {
+        match mode {
+            paged_kv::KvPreemptionMode::Recompute => {
+                self.kv_recompute_preemptions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            paged_kv::KvPreemptionMode::Swap => {
+                self.kv_swap_preemptions.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1153,7 +1176,7 @@ fn run_scheduler(
     let mut queued = BinaryHeap::new();
     let mut active = Vec::new();
     let mut admission_fairness = TenantFairness::new(scheduler_config.clone());
-    let mut tenant_fairness = TenantFairness::new(scheduler_config);
+    let mut tenant_fairness = TenantFairness::new(scheduler_config.clone());
 
     loop {
         drain_ready_jobs(&mut receiver, &mut queued);
@@ -1173,7 +1196,13 @@ fn run_scheduler(
             continue;
         }
 
-        run_continuous_step(accelerator, &mut active, &metrics, &mut tenant_fairness);
+        run_continuous_step(
+            accelerator,
+            &mut active,
+            &metrics,
+            &mut tenant_fairness,
+            &scheduler_config,
+        );
         age_waiting_jobs(&mut queued);
     }
 }
@@ -1213,10 +1242,12 @@ fn run_continuous_step(
     active: &mut Vec<ActiveInferenceSequence>,
     metrics: &SchedulerMetrics,
     tenant_fairness: &mut TenantFairness,
+    scheduler_config: &SchedulerConfig,
 ) {
     if let Some(indices) =
         select_active_batch(active, InferenceSequencePhase::Prefill, tenant_fairness)
     {
+        record_scheduler_kv_preemptions(active, &indices, metrics, scheduler_config);
         let prefill_batch = indices
             .iter()
             .map(|index| active[*index].job.clone())
@@ -1245,6 +1276,40 @@ fn run_continuous_step(
         metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
         metrics.record_dequeue(job.qos);
         let _ = job.response_tx.send(result);
+    }
+}
+
+fn record_scheduler_kv_preemptions(
+    active: &[ActiveInferenceSequence],
+    selected_indices: &[usize],
+    metrics: &SchedulerMetrics,
+    scheduler_config: &SchedulerConfig,
+) {
+    let Some(selected_score) = selected_indices
+        .iter()
+        .filter_map(|index| active.get(*index))
+        .map(|sequence| sequence.qos_score)
+        .max()
+    else {
+        return;
+    };
+    for (index, sequence) in active.iter().enumerate() {
+        if selected_indices.binary_search(&index).is_ok()
+            || sequence.qos_score >= selected_score
+            || !scheduler_config
+                .tier_preemptible
+                .is_preemptible(sequence.job.qos)
+        {
+            continue;
+        }
+        let mode = if scheduler_config.spill_tier_max == SchedulerSpillTier::Nvme
+            && scheduler_config.spill_budget_bytes > 0
+        {
+            paged_kv::KvPreemptionMode::Swap
+        } else {
+            paged_kv::KvPreemptionMode::Recompute
+        };
+        metrics.record_kv_preemption(mode);
     }
 }
 
@@ -3561,12 +3626,14 @@ mod tests {
             &mut active,
             &metrics,
             &mut tenant_fairness,
+            &SchedulerConfig::default(),
         );
         run_continuous_step(
             AcceleratorKind::Gpu,
             &mut active,
             &metrics,
             &mut tenant_fairness,
+            &SchedulerConfig::default(),
         );
 
         let _ = realtime_rx
@@ -3582,6 +3649,7 @@ mod tests {
             &mut active,
             &metrics,
             &mut tenant_fairness,
+            &SchedulerConfig::default(),
         );
         let _ = batch_rx
             .recv()
@@ -3610,6 +3678,12 @@ mod tests {
             realtime_decode_position < batch_decode_position,
             "realtime decode should be inserted ahead of an active batch decode"
         );
+        assert_eq!(
+            metrics.kv_recompute_preemptions.load(Ordering::Relaxed),
+            1,
+            "one lower-tier KV context should be marked for recompute"
+        );
+        assert_eq!(metrics.kv_swap_preemptions.load(Ordering::Relaxed), 0);
     }
 
     #[test]
