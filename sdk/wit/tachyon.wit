@@ -239,6 +239,7 @@ world faas-guest {
     import vector;
     import training;
     import kv-partition;
+    import outbound-http;
     export handler;
 }
 

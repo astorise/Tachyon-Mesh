@@ -14,6 +14,7 @@ if ! command -v fortio >/dev/null 2>&1; then
 fi
 
 mkdir -p "$RESULT_DIR"
+curl -sf --retry 5 --retry-delay 1 --max-time 30 "$CHAIN_URL" >/dev/null
 fortio load \
   -json "$RESULT_DIR/faas-chain-${CHAIN_LABEL}.json" \
   -qps "$QPS" \
