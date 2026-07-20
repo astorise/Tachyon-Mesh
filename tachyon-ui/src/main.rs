@@ -8,7 +8,7 @@ mod app_logging;
 
 use app_config::{AppConfig, LogLevel};
 use app_logging::{AppLogger, FrontendLogPayload};
-use rand_core::{OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -983,7 +983,9 @@ fn stronghold_profile_key(data_dir: &std::path::Path) -> Result<Vec<u8>, String>
                     .map_err(|error| format!("failed to create Stronghold key dir: {error}"))?;
             }
             let mut key = vec![0_u8; STRONGHOLD_PROFILE_KEY_BYTES];
-            OsRng.fill_bytes(&mut key);
+            SysRng
+                .try_fill_bytes(&mut key)
+                .map_err(|error| format!("failed to generate Stronghold profile key: {error}"))?;
             std::fs::write(&key_path, &key)
                 .map_err(|error| format!("failed to write Stronghold profile key: {error}"))?;
             Ok(key)

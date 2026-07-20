@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
-use rand_core::OsRng;
+use rand::rngs::SysRng;
+use rand_core::UnwrapErr;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -1999,7 +2000,7 @@ async fn load_or_create_local_signing_key() -> Result<SigningKey> {
             Ok(SigningKey::from_bytes(&seed))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let signing_key = SigningKey::generate(&mut OsRng);
+            let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
             tokio::fs::write(&path, signing_key.to_bytes())
                 .await
                 .with_context(|| {
