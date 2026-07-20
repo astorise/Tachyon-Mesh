@@ -58,7 +58,7 @@ enum TensorType {
     Fp32,
 }
 
-use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
+use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos, SchedulerConfig};
 
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 const DEFAULT_BATCH_SIZE: usize = 32;
@@ -343,7 +343,11 @@ impl AiInferenceRuntime {
             .map(|accelerator| {
                 (
                     accelerator,
-                    AcceleratorScheduler::new(accelerator, DEFAULT_BATCH_SIZE),
+                    AcceleratorScheduler::new(
+                        accelerator,
+                        DEFAULT_BATCH_SIZE,
+                        config.scheduler.clone(),
+                    ),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -717,7 +721,11 @@ struct AcceleratorScheduler {
 }
 
 impl AcceleratorScheduler {
-    fn new(accelerator: AcceleratorKind, max_active_sequences: usize) -> Self {
+    fn new(
+        accelerator: AcceleratorKind,
+        max_active_sequences: usize,
+        scheduler_config: SchedulerConfig,
+    ) -> Self {
         let (sender, receiver) = tokio_mpsc::channel(ACCELERATOR_QUEUE_CAPACITY);
         let metrics = Arc::new(SchedulerMetrics::default());
         let worker_metrics = Arc::clone(&metrics);
@@ -725,7 +733,13 @@ impl AcceleratorScheduler {
         thread::Builder::new()
             .name(format!("tachyon-{}-dispatcher", accelerator.as_str()))
             .spawn(move || {
-                run_scheduler(accelerator, receiver, worker_metrics, max_active_sequences)
+                run_scheduler(
+                    accelerator,
+                    receiver,
+                    worker_metrics,
+                    max_active_sequences,
+                    scheduler_config,
+                )
             })
             .expect("AI inference scheduler thread should start");
 
@@ -892,6 +906,15 @@ struct InferenceJob {
     response_tx: mpsc::Sender<Result<Vec<u8>, anyhow::Error>>,
 }
 
+impl InferenceJob {
+    fn tenant_id(&self) -> &str {
+        self.adapter
+            .as_ref()
+            .map(|adapter| adapter.id.as_str())
+            .unwrap_or("default")
+    }
+}
+
 struct PrioritizedInferenceJob {
     qos_score: u16,
     sequence: usize,
@@ -962,6 +985,74 @@ impl ActiveInferenceSequence {
     }
 }
 
+struct TenantFairness {
+    config: SchedulerConfig,
+    deficits: HashMap<String, i64>,
+}
+
+impl TenantFairness {
+    fn new(config: SchedulerConfig) -> Self {
+        Self {
+            config,
+            deficits: HashMap::new(),
+        }
+    }
+
+    fn select<'a>(
+        &mut self,
+        candidates: Vec<(usize, &'a ActiveInferenceSequence)>,
+        max_qos_score: u16,
+    ) -> Option<(usize, &'a ActiveInferenceSequence)> {
+        let qos_candidates = candidates
+            .into_iter()
+            .filter(|(_, sequence)| sequence.qos_score == max_qos_score)
+            .collect::<Vec<_>>();
+        if qos_candidates.is_empty() {
+            return None;
+        }
+
+        let mut active_tenants = Vec::new();
+        for (_, sequence) in &qos_candidates {
+            let tenant = sequence.job.tenant_id().to_owned();
+            if !active_tenants.contains(&tenant) {
+                active_tenants.push(tenant);
+            }
+        }
+
+        let total_weight = active_tenants
+            .iter()
+            .map(|tenant| self.config.tenant_weight(tenant) as i64)
+            .sum::<i64>()
+            .max(1);
+        for tenant in &active_tenants {
+            let weight = self.config.tenant_weight(tenant) as i64;
+            *self.deficits.entry(tenant.clone()).or_insert(0) += weight;
+        }
+
+        let selected = qos_candidates.into_iter().max_by(|(_, left), (_, right)| {
+            let left_deficit = self
+                .deficits
+                .get(left.job.tenant_id())
+                .copied()
+                .unwrap_or_default();
+            let right_deficit = self
+                .deficits
+                .get(right.job.tenant_id())
+                .copied()
+                .unwrap_or_default();
+            left_deficit
+                .cmp(&right_deficit)
+                .then_with(|| left.priority_cmp(right))
+        })?;
+
+        *self
+            .deficits
+            .entry(selected.1.job.tenant_id().to_owned())
+            .or_insert(0) -= total_weight;
+        Some(selected)
+    }
+}
+
 impl PartialEq for PrioritizedInferenceJob {
     fn eq(&self, other: &Self) -> bool {
         self.qos_score == other.qos_score && self.sequence == other.sequence
@@ -989,9 +1080,11 @@ fn run_scheduler(
     mut receiver: tokio_mpsc::Receiver<PrioritizedInferenceJob>,
     metrics: Arc<SchedulerMetrics>,
     max_active_sequences: usize,
+    scheduler_config: SchedulerConfig,
 ) {
     let mut queued = BinaryHeap::new();
     let mut active = Vec::new();
+    let mut tenant_fairness = TenantFairness::new(scheduler_config);
 
     loop {
         drain_ready_jobs(&mut receiver, &mut queued);
@@ -1005,7 +1098,7 @@ fn run_scheduler(
             continue;
         }
 
-        run_continuous_step(accelerator, &mut active, &metrics);
+        run_continuous_step(accelerator, &mut active, &metrics, &mut tenant_fairness);
         age_waiting_jobs(&mut queued);
     }
 }
@@ -1043,8 +1136,11 @@ fn run_continuous_step(
     accelerator: AcceleratorKind,
     active: &mut Vec<ActiveInferenceSequence>,
     metrics: &SchedulerMetrics,
+    tenant_fairness: &mut TenantFairness,
 ) {
-    if let Some(indices) = select_active_batch(active, InferenceSequencePhase::Prefill) {
+    if let Some(indices) =
+        select_active_batch(active, InferenceSequencePhase::Prefill, tenant_fairness)
+    {
         let prefill_batch = indices
             .iter()
             .map(|index| active[*index].job.clone())
@@ -1056,7 +1152,9 @@ fn run_continuous_step(
         return;
     }
 
-    let Some(indices) = select_active_batch(active, InferenceSequencePhase::Decode) else {
+    let Some(indices) =
+        select_active_batch(active, InferenceSequencePhase::Decode, tenant_fairness)
+    else {
         return;
     };
     let mut decode_batch = Vec::with_capacity(indices.len());
@@ -1077,12 +1175,18 @@ fn run_continuous_step(
 fn select_active_batch(
     active: &[ActiveInferenceSequence],
     phase: InferenceSequencePhase,
+    tenant_fairness: &mut TenantFairness,
 ) -> Option<Vec<usize>> {
-    let (_, first) = active
+    let candidates = active
         .iter()
         .enumerate()
         .filter(|(_, sequence)| sequence.phase == phase)
-        .max_by(|(_, left), (_, right)| left.priority_cmp(right))?;
+        .collect::<Vec<_>>();
+    let max_qos_score = candidates
+        .iter()
+        .map(|(_, sequence)| sequence.qos_score)
+        .max()?;
+    let (_, first) = tenant_fairness.select(candidates, max_qos_score)?;
     let batch_key = first.batch_key();
     let mut indices = active
         .iter()
@@ -3111,6 +3215,99 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_tenant_weights_select_weighted_share_within_same_qos() {
+        let model = Arc::new(
+            CandleModel::load_mock(&IntegrityModelBinding {
+                alias: "shared".to_owned(),
+                path: "mock:shared".to_owned(),
+                device: ModelDevice::Cuda,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            })
+            .expect("shared model should load"),
+        );
+        let mut tenant_fairness = TenantFairness::new(SchedulerConfig {
+            tenant_weights: std::collections::BTreeMap::from([
+                ("tenant-a".to_owned(), 3),
+                ("tenant-b".to_owned(), 1),
+            ]),
+            ..SchedulerConfig::default()
+        });
+        let (tenant_a_tx, _tenant_a_rx) = mpsc::channel();
+        let (tenant_b_tx, _tenant_b_rx) = mpsc::channel();
+        let active = vec![
+            ActiveInferenceSequence {
+                qos_score: RouteQos::Standard.score(),
+                sequence: 0,
+                phase: InferenceSequencePhase::Decode,
+                job: InferenceJob {
+                    alias: model.alias.clone(),
+                    adapter: Some(ResolvedLoraAdapter {
+                        id: "tenant-a".to_owned(),
+                        path: PathBuf::from("tenant-a.safetensors"),
+                    }),
+                    model: Arc::clone(&model),
+                    qos: model.qos,
+                    input: SharedInputTensor {
+                        dimensions: vec![1],
+                        ty: TensorType::U8,
+                        data: Arc::from(b"tenant-a".as_slice()),
+                    },
+                    response_tx: tenant_a_tx,
+                },
+            },
+            ActiveInferenceSequence {
+                qos_score: RouteQos::Standard.score(),
+                sequence: 1,
+                phase: InferenceSequencePhase::Decode,
+                job: InferenceJob {
+                    alias: model.alias.clone(),
+                    adapter: Some(ResolvedLoraAdapter {
+                        id: "tenant-b".to_owned(),
+                        path: PathBuf::from("tenant-b.safetensors"),
+                    }),
+                    model: Arc::clone(&model),
+                    qos: model.qos,
+                    input: SharedInputTensor {
+                        dimensions: vec![1],
+                        ty: TensorType::U8,
+                        data: Arc::from(b"tenant-b".as_slice()),
+                    },
+                    response_tx: tenant_b_tx,
+                },
+            },
+        ];
+
+        let selected = (0..8)
+            .map(|_| {
+                let indices = select_active_batch(
+                    &active,
+                    InferenceSequencePhase::Decode,
+                    &mut tenant_fairness,
+                )
+                .expect("tenant should be selected");
+                active[indices[0]].job.tenant_id().to_owned()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|tenant| tenant.as_str() == "tenant-a")
+                .count(),
+            6
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|tenant| tenant.as_str() == "tenant-b")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn realtime_qos_preempts_batch_backlog_on_gpu_scheduler() {
         let batch_model = Arc::new(
             CandleModel::load_mock(&IntegrityModelBinding {
@@ -3179,8 +3376,19 @@ mod tests {
         ));
 
         admit_sequences(&mut queued, &mut active, 2, &metrics);
-        run_continuous_step(AcceleratorKind::Gpu, &mut active, &metrics);
-        run_continuous_step(AcceleratorKind::Gpu, &mut active, &metrics);
+        let mut tenant_fairness = TenantFairness::new(SchedulerConfig::default());
+        run_continuous_step(
+            AcceleratorKind::Gpu,
+            &mut active,
+            &metrics,
+            &mut tenant_fairness,
+        );
+        run_continuous_step(
+            AcceleratorKind::Gpu,
+            &mut active,
+            &metrics,
+            &mut tenant_fairness,
+        );
 
         let _ = realtime_rx
             .recv()
@@ -3190,7 +3398,12 @@ mod tests {
             batch_rx.try_recv().is_err(),
             "active batch decode should not complete before inserted realtime decode"
         );
-        run_continuous_step(AcceleratorKind::Gpu, &mut active, &metrics);
+        run_continuous_step(
+            AcceleratorKind::Gpu,
+            &mut active,
+            &metrics,
+            &mut tenant_fairness,
+        );
         let _ = batch_rx
             .recv()
             .expect("batch response should arrive")

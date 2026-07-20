@@ -29,6 +29,26 @@ serde_json::to_string(&schema)
 - **THEN** core-host returns the generated `IntegrityConfig` JSON Schema
 - **AND** the schema exposes snake_case properties matching serde deserialization
 - **AND** it includes nested route configuration such as `targets`, `models`, `hardware_strategy`, `volumes`, `runtime`, `concurrency`, `distributed_rate_limit`, and `canary.metrics`
+- **AND** it includes the host-level `scheduler` block with `tenant_weights`, `tier_preemptible`, `spill_budget_bytes`, `spill_tier_max`, and `pinned_ram_pool_bytes`
+
+### Requirement: Manifest validation MUST cover declarative AI scheduler policy
+The integrity manifest SHALL accept a host-level `scheduler` block that declares tenant weights, QoS-tier preemptibility, spill budget, maximum spill tier, and pinned RAM pool sizing. Omitted scheduler fields SHALL deserialize to the previous scheduler behavior: no tenant-specific weighting, `RealTime` not preemptible/pageable, `Standard` and `Batch` preemptible/pageable, RAM as the maximum spill tier, and zero explicit spill/pinned-pool budget. Validation SHALL reject non-positive tenant weights and tenant keys that do not resolve to `default` or a tenant declared by route-level `adapter_id`.
+
+#### Scenario: Scheduler policy appears in the manifest schema
+- **WHEN** an operator requests `GET /admin/schema/manifest`
+- **THEN** the schema exposes `scheduler.tenant_weights`, `scheduler.tier_preemptible`, `scheduler.spill_budget_bytes`, `scheduler.spill_tier_max`, and `scheduler.pinned_ram_pool_bytes`
+- **AND** MCP host-level manifest patching can describe and patch the `scheduler` block through the generated manifest schema
+
+#### Scenario: Scheduler validation rejects unknown or zero-weight tenants
+- **WHEN** a manifest declares `scheduler.tenant_weights` with a weight of `0`
+- **THEN** validation fails before the manifest is sealed
+- **WHEN** a manifest declares a scheduler tenant that is neither `default` nor a route `adapter_id`
+- **THEN** validation fails before the manifest is sealed
+
+#### Scenario: RealTime remains non-preemptible by default
+- **WHEN** a manifest omits `scheduler.tier_preemptible`
+- **THEN** `RealTime` routes are not preemptible/pageable
+- **AND** `Standard` and `Batch` routes remain preemptible/pageable
 
 ### Requirement: The host provides an incremental body-flush streaming transport
 

@@ -1010,6 +1010,78 @@ impl EnrollmentConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SchedulerSpillTier {
+    #[default]
+    Ram,
+    Nvme,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+pub(crate) struct SchedulerTierPreemptible {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) realtime: bool,
+    #[serde(default = "default_true")]
+    pub(crate) standard: bool,
+    #[serde(default = "default_true")]
+    pub(crate) batch: bool,
+}
+
+impl Default for SchedulerTierPreemptible {
+    fn default() -> Self {
+        Self {
+            realtime: false,
+            standard: true,
+            batch: true,
+        }
+    }
+}
+
+impl SchedulerTierPreemptible {
+    pub(crate) fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    pub(crate) fn is_preemptible(self, qos: RouteQos) -> bool {
+        match qos {
+            RouteQos::RealTime => self.realtime,
+            RouteQos::Standard => self.standard,
+            RouteQos::Batch => self.batch,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+pub(crate) struct SchedulerConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) tenant_weights: BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "SchedulerTierPreemptible::is_default")]
+    pub(crate) tier_preemptible: SchedulerTierPreemptible,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(crate) spill_budget_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_default_scheduler_spill_tier")]
+    pub(crate) spill_tier_max: SchedulerSpillTier,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(crate) pinned_ram_pool_bytes: u64,
+}
+
+impl SchedulerConfig {
+    pub(crate) fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    pub(crate) fn tenant_weight(&self, tenant: &str) -> u32 {
+        self.tenant_weights.get(tenant).copied().unwrap_or(1)
+    }
+}
+
+pub(crate) fn is_default_scheduler_spill_tier(value: &SchedulerSpillTier) -> bool {
+    *value == SchedulerSpillTier::Ram
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct IntegrityConfig {
     pub(crate) host_address: String,
@@ -1076,6 +1148,11 @@ pub(crate) struct IntegrityConfig {
     /// when that model is hot on the receiving node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) kv_caches: Vec<IntegrityKvCacheConfig>,
+    /// Declarative AI scheduler policy. Defaults preserve the pre-existing
+    /// QoS-only scheduler behavior; non-default values are supplied by the
+    /// sealed manifest so core owns mechanism while operators own policy.
+    #[serde(default, skip_serializing_if = "SchedulerConfig::is_default")]
+    pub(crate) scheduler: SchedulerConfig,
     /// When `true`, manifests whose `scopes:` block is absent or resolves to
     /// `allow-all` are rejected at submission time. Default `false` — the
     /// transition from implicit allow-all to explicit scopes is operator-paced.
@@ -1109,6 +1186,7 @@ impl Default for IntegrityConfig {
             trusted_signers: Vec::new(),
             asset_versions: BTreeMap::new(),
             kv_caches: Vec::new(),
+            scheduler: SchedulerConfig::default(),
             require_scopes: false,
         }
     }
