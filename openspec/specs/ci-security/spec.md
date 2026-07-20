@@ -38,6 +38,13 @@ The CI workflow MUST run dependency vulnerability and policy checks before relea
 - **THEN** the repository SHALL leave the transitive dependency to upstream rather than patching unrelated crates locally
 - **AND** the dependency tree SHALL identify the blocking parent crate for follow-up
 
+#### Scenario: Coordinated RustCrypto migrations are isolated from weekly dependency groups
+- **GIVEN** RustCrypto crates share public `rand_core`, `signature`, DER, SPKI, PKCS#8, or digest trait families across Tachyon packages
+- **WHEN** Renovate proposes a next-generation RustCrypto wave that changes those trait families
+- **THEN** the affected crates SHALL be migrated and validated together in a dedicated change
+- **AND** direct randomness usage SHALL use the published OS RNG API for the selected `rand`/`rand_core` generation
+- **AND** crates blocked by an upstream trait-family mismatch, such as `rsa` remaining on an older `digest` family, SHALL stay pinned with an explanatory manifest comment until the blocking parent crate supports the newer family
+
 ### Requirement: Feature matrix validation
 The CI workflow MUST test the core host across default, no-default, all-feature, and selected feature combinations.
 

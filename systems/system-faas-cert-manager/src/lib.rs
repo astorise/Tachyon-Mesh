@@ -277,17 +277,17 @@ fn issue_leaf_certificate(domain: &str) -> Result<CertificateBundle, String> {
 mod cert {
     use super::{now_seconds, CertificateBundle, SigningKey};
     use const_oid::db::rfc5280::ID_KP_SERVER_AUTH;
-    use const_oid::db::rfc8410::ID_ED_25519;
     use const_oid::AssociatedOid;
-    use der::asn1::{BitString, GeneralizedTime, Ia5String, OctetString, UtcTime};
+    use der::asn1::{GeneralizedTime, Ia5String, OctetString, UtcTime};
     use der::flagset::FlagSet;
     use der::{Decode, Encode, EncodePem};
-    use ed25519_dalek::Signer;
-    use pkcs8::EncodePrivateKey;
-    use spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
+    use p256::elliptic_curve::Generate;
+    use p256::pkcs8::EncodePrivateKey;
+    use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
     use std::str::FromStr;
     use std::time::Duration;
-    use x509_cert::certificate::{Certificate, TbsCertificate, Version};
+    use x509_cert::builder::{profile::BuilderProfile, Builder, CertificateBuilder};
+    use x509_cert::certificate::{Certificate, TbsCertificate};
     use x509_cert::ext::pkix::name::GeneralName;
     use x509_cert::ext::pkix::{
         BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, SubjectAltName,
@@ -341,10 +341,12 @@ mod cert {
 
     /// Generate a fresh random ECDSA P-256 (NIST secp256r1) leaf keypair.
     ///
-    /// `OsRng` is getrandom-backed (WASI on wasm32-wasip2), the same entropy
+    /// `SysRng` is getrandom-backed (WASI on wasm32-wasip2), the same entropy
     /// source the cluster CA seed loading relies on.
     fn generate_leaf_key() -> p256::ecdsa::SigningKey {
-        p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)
+        p256::ecdsa::SigningKey::generate_from_rng(&mut rand::rand_core::UnwrapErr(
+            rand::rngs::SysRng,
+        ))
     }
 
     /// Build the deterministic self-signed cluster-CA certificate.
@@ -389,7 +391,8 @@ mod cert {
             subject_alt_name_extension(domain)?,
         ];
         // The leaf's SPKI is the P-256 verifying key.
-        let spki = subject_public_key_info(leaf_signing_key.verifying_key())?;
+        let leaf_public_key = p256::PublicKey::from(leaf_signing_key.verifying_key());
+        let spki = subject_public_key_info(&leaf_public_key)?;
         sign_certificate(
             ca_signing_key,
             spki,
@@ -418,39 +421,42 @@ mod cert {
         validity: Validity,
         extensions: Extensions,
     ) -> Result<Certificate, String> {
-        let signature_algorithm = ed25519_algorithm_identifier();
-        let tbs_certificate = TbsCertificate {
-            version: Version::V3,
-            serial_number,
-            signature: signature_algorithm.clone(),
+        let profile = StaticProfile {
             issuer,
-            validity,
             subject,
-            subject_public_key_info,
-            issuer_unique_id: None,
-            subject_unique_id: None,
-            extensions: Some(extensions),
+            extensions,
         };
+        let builder =
+            CertificateBuilder::new(profile, serial_number, validity, subject_public_key_info)
+                .map_err(|error| format!("failed to build certificate TBS: {error}"))?;
 
-        let tbs_der = tbs_certificate
-            .to_der()
-            .map_err(|error| format!("failed to encode TBSCertificate: {error}"))?;
-        let signature = ca_signing_key.sign(&tbs_der);
-        let signature_bits = BitString::from_bytes(&signature.to_bytes())
-            .map_err(|error| format!("failed to encode certificate signature: {error}"))?;
-
-        Ok(Certificate {
-            tbs_certificate,
-            signature_algorithm,
-            signature: signature_bits,
-        })
+        builder
+            .build::<_, ed25519_dalek::Signature>(ca_signing_key)
+            .map_err(|error| format!("failed to sign certificate: {error}"))
     }
 
-    /// `AlgorithmIdentifier` for Ed25519 (OID 1.3.101.112, absent parameters).
-    fn ed25519_algorithm_identifier() -> AlgorithmIdentifierOwned {
-        AlgorithmIdentifierOwned {
-            oid: ID_ED_25519,
-            parameters: None,
+    struct StaticProfile {
+        issuer: Name,
+        subject: Name,
+        extensions: Extensions,
+    }
+
+    impl BuilderProfile for StaticProfile {
+        fn get_issuer(&self, _subject: &Name) -> Name {
+            self.issuer.clone()
+        }
+
+        fn get_subject(&self) -> Name {
+            self.subject.clone()
+        }
+
+        fn build_extensions(
+            &self,
+            _spk: spki::SubjectPublicKeyInfoRef<'_>,
+            _issuer_spk: spki::SubjectPublicKeyInfoRef<'_>,
+            _tbs: &TbsCertificate,
+        ) -> x509_cert::builder::Result<Vec<Extension>> {
+            Ok(self.extensions.clone())
         }
     }
 
@@ -483,10 +489,10 @@ mod cert {
     }
 
     fn validity(not_before_secs: u64, not_after_secs: u64) -> Result<Validity, String> {
-        Ok(Validity {
-            not_before: x509_time(not_before_secs)?,
-            not_after: x509_time(not_after_secs)?,
-        })
+        Ok(Validity::new(
+            x509_time(not_before_secs)?,
+            x509_time(not_after_secs)?,
+        ))
     }
 
     /// Encode a unix timestamp as an X.509 `Time`, using `UTCTime` through 2049
