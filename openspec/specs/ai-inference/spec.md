@@ -178,31 +178,32 @@ The `wasi-nn-candle` execution engine SHALL dynamically inject and remove `.safe
 - **AND** the engine enforces the configured maximum adapter-switch rate to keep aggregate latency within target SLOs
 
 ### Requirement: Continuous batching MUST group Multi-LoRA requests by base model before adapter execution
-The AI inference scheduler SHALL treat requests for the same base model alias as compatible within a continuous-batching step even when their `adapter_id` values differ. The execution layer SHALL partition that selected step into adapter-specific sub-batches, run each sub-batch with its resolved adapter, and route every output back to the originating request. Requests without an `adapter_id` SHALL remain in a separate base-model sub-batch and SHALL preserve the existing no-adapter behavior.
+The AI inference scheduler SHALL treat requests for the same base model alias as compatible within a continuous-batching step even when their `adapter_id` values differ. The execution layer SHALL first attempt a backend-native mixed-adapter batch that passes one adapter assignment per selected row and routes every output back to the originating request. When the backend or request shape cannot execute a native mixed-adapter batch, the execution layer SHALL fall back to adapter-specific sub-batches. Requests without an `adapter_id` SHALL preserve the existing no-adapter behavior in either path.
 
 #### Scenario: Distinct adapters share one scheduler step
 - **GIVEN** multiple active requests target the same model alias
 - **AND** those requests use different `adapter_id` values
 - **WHEN** the scheduler selects the next compatible decode or prefill step
 - **THEN** the selected step includes all compatible requests for that base model
-- **AND** the execution layer splits the step into one sub-batch per adapter
+- **AND** the execution layer passes one adapter assignment per selected row to a backend-native batch when supported
 - **AND** each response is routed back to the request that produced it
 
-#### Scenario: No-adapter requests remain isolated from adapter sub-batches
+#### Scenario: No-adapter requests remain isolated in mixed adapter batches
 - **GIVEN** one request targets the base model without `adapter_id`
 - **AND** another request targets the same model with an adapter
 - **WHEN** both requests are selected in one scheduler step
-- **THEN** the base request runs in a no-adapter sub-batch
-- **AND** the adapted request runs in the adapter-specific sub-batch
+- **THEN** the base request is assigned `None`
+- **AND** the adapted request is assigned its resolved adapter
 - **AND** the base output is not generated with the adapter active
 
-#### Scenario: Heterogeneous LoRA batch-native decode depends on Candle runtime seams
+#### Scenario: Heterogeneous LoRA batch-native decode uses Candle runtime seams
 - **GIVEN** the host can group distinct adapters into one scheduler step
 - **AND** the Candle fork provides S-LoRA, Punica, or equivalent SGMV adapter kernels through `Llama::forward_with_adapters`
 - **AND** the Candle fork provides a batch-native decode loop through `Llama::generate_with_adapters`
-- **WHEN** Tachyon's generation loop is not yet executing multiple prompt rows through one batch-native decode loop
-- **THEN** Tachyon runs adapter groups as sequential sub-batches
-- **AND** the Candle `generate_with_adapters` path remains the required next integration point for true same-forward heterogeneous LoRA batching
+- **WHEN** the selected request rows have compatible rectangular prompt tokens for a no-paged-attention Llama safetensors runtime
+- **THEN** Tachyon executes prefill/decode with one `forward_with_adapters` call per step
+- **AND** each row's sampled output is routed back to its originating request
+- **AND** unsupported backend or request shapes fall back to sequential adapter sub-batches
 
 ### Requirement: Inference workloads MUST support declarative LoRA Multiplexing
 The `system-faas-model-broker` SHALL allow the sharing of a single base model in VRAM across multiple tenants by dynamically loading LoRA (Low-Rank Adaptation) weights based on Layer 7 routing conditions defined in the GitOps configuration.

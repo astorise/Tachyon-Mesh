@@ -40,6 +40,7 @@ use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::samplers::{FsmCache, FsmLogitProcessor};
 use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
+use super::ResolvedLoraAdapter;
 use parallel_topology::{
     validate_parallel_topology, ClusterTopology, ParallelExecutionPlan, ParallelStrategy,
 };
@@ -2554,6 +2555,155 @@ impl CandleLlmRuntime {
         Ok(out.into_bytes())
     }
 
+    pub(crate) fn try_generate_batch_with_adapters(
+        &self,
+        prompts: &[&[u8]],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Result<Option<Vec<Vec<u8>>>, CandleLlmError> {
+        if prompts.is_empty() {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: "at least one U8 prompt tensor is required".to_owned(),
+            });
+        }
+        if prompts.len() != adapters.len() {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "{} adapter assignment(s) for {} prompt(s)",
+                    adapters.len(),
+                    prompts.len()
+                ),
+            });
+        }
+        if prompts.len() > self.limits.max_batch_size {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "batch size {} exceeds max batch size {}",
+                    prompts.len(),
+                    self.limits.max_batch_size
+                ),
+            });
+        }
+
+        let parsed = prompts
+            .iter()
+            .map(|prompt| self.parse_request(prompt))
+            .collect::<Result<Vec<_>, _>>()?;
+        let prompt_ids = parsed
+            .iter()
+            .map(|request| self.encode_ids(&request.prompt))
+            .collect::<Result<Vec<_>, _>>()?;
+        if prompt_ids.iter().any(Vec::is_empty) {
+            return Err(CandleLlmError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: "prompt produced no tokens to condition on".to_owned(),
+            });
+        }
+        let prompt_len = prompt_ids[0].len();
+        if prompt_ids.iter().any(|ids| ids.len() != prompt_len) {
+            return Ok(None);
+        }
+        if prompt_len > self.limits.max_position_embeddings {
+            return Ok(Some(vec![Vec::new(); prompts.len()]));
+        }
+
+        let LoadedModel::Safetensors {
+            backend,
+            eos_tokens,
+        } = &*self.inner
+        else {
+            return Ok(None);
+        };
+        let SingleDeviceBackend::Llama {
+            config,
+            device,
+            dtype,
+            paged,
+            cuda_graph_decode,
+            ..
+        } = backend
+        else {
+            return Ok(None);
+        };
+        if paged.is_some() || *cuda_graph_decode {
+            return Ok(None);
+        }
+
+        let mut unique_adapters: Vec<&ResolvedLoraAdapter> = Vec::new();
+        for adapter in adapters.iter().flatten() {
+            if !unique_adapters.iter().any(|known| known.id == adapter.id) {
+                unique_adapters.push(adapter);
+            }
+        }
+        if unique_adapters.is_empty() {
+            return Ok(None);
+        }
+
+        let mut load_config = LlamaLoadConfig::default();
+        for adapter in unique_adapters {
+            let (lora_config, prefix) = lora_load_config_from_adapter(&adapter.path, device)
+                .map_err(|error| CandleLlmError::InvalidComponent {
+                    alias: self.alias.clone(),
+                    path: adapter.path.clone(),
+                    component: MODEL_SAFETENSORS,
+                    detail: error.to_string(),
+                })?;
+            let adapter_vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[adapter.path.clone()], *dtype, device)
+            }
+            .map_err(|error| CandleLlmError::InvalidComponent {
+                alias: self.alias.clone(),
+                path: adapter.path.clone(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            })?;
+            load_config = load_config.with_lora_adapter_prefixed(
+                &adapter.id,
+                adapter_vb,
+                lora_config,
+                prefix,
+            );
+        }
+
+        let weight_paths = safetensors_paths(&self.alias, &self.root)?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, *dtype, device) }
+            .map_err(|error| CandleLlmError::InvalidComponent {
+                alias: self.alias.clone(),
+                path: self.root.clone(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            })?;
+        let mut model = Llama::load_with_config(vb, config, load_config).map_err(|error| {
+            CandleLlmError::InvalidComponent {
+                alias: self.alias.clone(),
+                path: self.root.clone(),
+                component: MODEL_SAFETENSORS,
+                detail: error.to_string(),
+            }
+        })?;
+        let mut cache = Cache::new(true, *dtype, config, device).map_err(|error| {
+            self.execution_error(format!(
+                "failed to build batch-native LoRA KV cache: {error}"
+            ))
+        })?;
+        let adapter_assignments = adapters
+            .iter()
+            .map(|adapter| adapter.as_ref().map(|adapter| adapter.id.as_str()))
+            .collect::<Vec<_>>();
+        self.decode_batch_with_adapters(
+            &mut model,
+            &mut cache,
+            &prompt_ids,
+            &parsed,
+            eos_tokens,
+            device,
+            &adapter_assignments,
+        )
+        .map(Some)
+    }
+
     fn generate_with_adapter_streaming(
         &self,
         prompts: &[&[u8]],
@@ -3169,6 +3319,140 @@ impl CandleLlmRuntime {
         logits
             .ok_or_else(|| self.execution_error("prompt produced no prefill logits".to_owned()))
             .map(|logits| (logits, index_pos))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_batch_with_adapters(
+        &self,
+        model: &mut Llama,
+        cache: &mut Cache,
+        prompt_ids: &[Vec<u32>],
+        requests: &[ParsedGenerationRequest],
+        eos_tokens: &[u32],
+        device: &Device,
+        adapter_assignments: &[Option<&str>],
+    ) -> Result<Vec<Vec<u8>>, CandleLlmError> {
+        let batch = prompt_ids.len();
+        let prompt_len = prompt_ids
+            .first()
+            .map(Vec::len)
+            .ok_or_else(|| self.execution_error("empty batch-native decode".to_owned()))?;
+        let flat_prompt = prompt_ids
+            .iter()
+            .flat_map(|ids| ids.iter().copied())
+            .collect::<Vec<_>>();
+        let prompt =
+            Tensor::from_vec(flat_prompt, (batch, prompt_len), device).map_err(|error| {
+                self.execution_error(format!("failed to build batched prompt tensor: {error}"))
+            })?;
+        let mut logits = model
+            .forward_with_adapters(&prompt, 0, cache, adapter_assignments)
+            .map_err(|error| {
+                self.execution_error(format!(
+                    "batch-native LoRA prefill forward pass failed: {error}"
+                ))
+            })?;
+        let mut processors = requests
+            .iter()
+            .map(|request| request.sampling.processor())
+            .collect::<Vec<_>>();
+        let mut fsm_processors = requests
+            .iter()
+            .map(|request| {
+                request
+                    .fsm
+                    .as_ref()
+                    .map(|fsm| FsmLogitProcessor::new(Arc::clone(fsm)))
+            })
+            .collect::<Vec<_>>();
+        let vocab_size = self.tokenizer.get_vocab_size(true);
+        let mut generated = requests
+            .iter()
+            .map(|request| Vec::with_capacity(request.max_new_tokens))
+            .collect::<Vec<_>>();
+        let mut done = vec![false; batch];
+        let mut next_tokens = vec![0u32; batch];
+        let max_new_tokens = requests
+            .iter()
+            .map(|request| request.max_new_tokens)
+            .max()
+            .unwrap_or(0);
+
+        for step in 0..max_new_tokens {
+            for row in 0..batch {
+                if done[row] || generated[row].len() >= requests[row].max_new_tokens {
+                    done[row] = true;
+                    continue;
+                }
+                let row_logits = logits.get(row).map_err(|error| {
+                    self.execution_error(format!("failed to select logits row {row}: {error}"))
+                })?;
+                let row_logits = match &fsm_processors[row] {
+                    Some(fsm) => self.mask_row_for_fsm(&row_logits, fsm, vocab_size, eos_tokens)?,
+                    None => row_logits,
+                };
+                let next = processors[row].sample(&row_logits).map_err(|error| {
+                    self.execution_error(format!(
+                        "failed to sample next token for row {row}: {error}"
+                    ))
+                })?;
+                if let Some(fsm) = fsm_processors[row].as_mut() {
+                    if !eos_tokens.contains(&next) {
+                        let text = self.tokenizer.decode(&[next], false).map_err(|error| {
+                            self.execution_error(format!(
+                                "failed to decode token for row {row}: {error}"
+                            ))
+                        })?;
+                        fsm.commit(&text);
+                    }
+                }
+                generated[row].push(next);
+                next_tokens[row] = next;
+                let text = self.decode_generated(&generated[row])?;
+                if eos_tokens.contains(&next)
+                    || find_earliest_stop(&text, &requests[row].stop).is_some()
+                {
+                    done[row] = true;
+                }
+            }
+
+            if done.iter().all(|done| *done) || step + 1 == max_new_tokens {
+                break;
+            }
+            if prompt_len + step + 1 > self.limits.max_position_embeddings {
+                break;
+            }
+            for row in 0..batch {
+                if done[row] {
+                    next_tokens[row] = eos_tokens
+                        .first()
+                        .copied()
+                        .or_else(|| generated[row].last().copied())
+                        .unwrap_or(0);
+                }
+            }
+            let input =
+                Tensor::from_vec(next_tokens.clone(), (batch, 1), device).map_err(|error| {
+                    self.execution_error(format!("failed to build batched decode tensor: {error}"))
+                })?;
+            logits = model
+                .forward_with_adapters(&input, prompt_len + step, cache, adapter_assignments)
+                .map_err(|error| {
+                    self.execution_error(format!(
+                        "batch-native LoRA decode forward pass failed: {error}"
+                    ))
+                })?;
+        }
+
+        generated
+            .iter()
+            .zip(requests)
+            .map(|(tokens, request)| {
+                let text = self.decode_generated(tokens)?;
+                let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
+                Ok(text[..end].as_bytes().to_vec())
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
