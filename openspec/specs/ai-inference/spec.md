@@ -794,6 +794,15 @@ When local VRAM pressure requires paging, the host SHALL evict paged-attention K
 - **AND** the block is not counted as spilled
 - **AND** the scheduler may recover by recomputing the KV context from the prompt
 
+#### Scenario: Five and ten agent paging scenarios expose spill and resume metrics
+- **GIVEN** local paging is disabled for a five-agent scheduling window
+- **WHEN** the scheduler completes the window without KV eviction
+- **THEN** spilled bytes and resume latency metrics remain zero
+- **GIVEN** local paging is enabled for a ten-agent scheduling window
+- **WHEN** each agent spills one preemptible KV block
+- **THEN** the first blocks occupy pinned RAM before later blocks use encrypted NVMe
+- **AND** restoring every block records restored bytes and monotonic resume p50/p99 metrics
+
 ### Requirement: CUDA Graph and FlashInfer decode acceleration MUST be explicit and fail-closed
 The AI inference build SHALL consume the pinned `astorise/candle` fork tag that
 exposes `candle_core::CudaGraph` and the optional

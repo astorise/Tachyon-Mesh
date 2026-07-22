@@ -952,6 +952,74 @@ mod tests {
     }
 
     #[test]
+    fn five_and_ten_agent_paging_scenarios_record_spill_and_resume_metrics() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let no_paging = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 0,
+                spill_budget_bytes: 0,
+                spill_tier_max: SchedulerSpillTier::Ram,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path().join("off"),
+            [2; 32],
+        );
+        assert_eq!(no_paging.snapshot().spilled_bytes, 0);
+        assert_eq!(no_paging.snapshot().resume_latency_p99_us, 0);
+
+        let mut pager = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 5 * 16,
+                spill_budget_bytes: 10 * 16,
+                spill_tier_max: SchedulerSpillTier::Nvme,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path().join("on"),
+            [4; 32],
+        );
+
+        for agent in 0..10 {
+            let tenant = format!("tenant-{agent}");
+            let payload = vec![agent as u8; 16];
+            let mode = pager
+                .preempt_block(
+                    RouteQos::Standard,
+                    KvBlockPayload {
+                        tenant_id: tenant,
+                        block_id: agent,
+                        bytes: payload,
+                    },
+                    1_000,
+                    1,
+                )
+                .expect("agent KV block should spill");
+            assert_eq!(mode, KvPreemptionMode::Swap);
+        }
+
+        let snapshot = pager.snapshot();
+        assert_eq!(snapshot.pinned_ram_blocks, 5);
+        assert_eq!(snapshot.nvme_blocks, 5);
+        assert_eq!(snapshot.swap_preemptions, 10);
+        assert_eq!(snapshot.spilled_bytes, 10 * 16);
+
+        for agent in 0..10 {
+            let restored = pager
+                .restore_block(agent)
+                .expect("agent KV block should restore");
+            assert_eq!(restored, vec![agent as u8; 16]);
+        }
+
+        let snapshot = pager.snapshot();
+        assert_eq!(snapshot.pinned_ram_blocks, 0);
+        assert_eq!(snapshot.nvme_blocks, 0);
+        assert_eq!(snapshot.restored_bytes, 10 * 16);
+        assert!(
+            snapshot.resume_latency_p50_us <= snapshot.resume_latency_p99_us,
+            "resume latency percentiles should be monotonic"
+        );
+    }
+
+    #[test]
     fn tenant_ids_cannot_escape_spill_root() {
         let temp = tempfile::tempdir().expect("temp dir");
         let pager = KvTierPager::new(
