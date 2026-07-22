@@ -764,6 +764,36 @@ When a model deployment sets `hardware_strategy.paged_attention: true`, the runt
 - **THEN** loading fails with a typed `UnsupportedModel` error naming the sizing shortfall
 - **AND** no paged KV block pool or per-layer tensors are left allocated
 
+### Requirement: PagedAttention KV blocks MUST tier through pinned RAM before encrypted NVMe spill
+When local VRAM pressure requires paging, the host SHALL evict paged-attention KV blocks only at request preemption boundaries and only for scheduler tiers marked preemptible. `RealTime` requests SHALL remain non-preemptible by default. Eviction SHALL move blocks from VRAM to pinned host RAM first and then to tenant-isolated encrypted NVMe spill files when the pinned RAM budget is exhausted. The host SHALL choose recompute for short contexts when prefill cost is lower than swap transfer cost, choose swap for longer contexts, and expose block-residency, preemption-mode, spill-throughput, and resume-latency metrics. Spill files are cache material only: a slow, full, or lost NVMe tier SHALL degrade into recompute/cache-miss behavior rather than corrupting generation correctness.
+
+#### Scenario: RealTime KV blocks are never paged
+- **GIVEN** a paged-attention request runs in the `RealTime` QoS tier
+- **WHEN** the local pager considers evicting one of its KV blocks
+- **THEN** the pager rejects the eviction as a non-preemptible tier
+- **AND** no RAM or NVMe spill record is created
+
+#### Scenario: Standard and Batch blocks spill through RAM before NVMe
+- **GIVEN** a `Standard` or `Batch` request is preemptible
+- **AND** pinned host RAM has enough budget for the selected KV block
+- **WHEN** the pager chooses swap over recompute
+- **THEN** the block is recorded in the pinned RAM tier
+- **AND** the NVMe spill file is not used
+
+#### Scenario: NVMe spill is encrypted and isolated by tenant
+- **GIVEN** the pinned RAM budget is exhausted
+- **AND** the configured maximum spill tier is `nvme`
+- **WHEN** two tenants spill KV blocks
+- **THEN** each tenant writes to a distinct spill pool path
+- **AND** the bytes persisted on disk are AES-GCM ciphertext, not plaintext KV contents
+
+#### Scenario: Spill failure remains reconstructible
+- **GIVEN** pinned RAM and NVMe capacity cannot accept a selected block
+- **WHEN** the pager attempts to swap that block
+- **THEN** the operation fails with a typed capacity error
+- **AND** the block is not counted as spilled
+- **AND** the scheduler may recover by recomputing the KV context from the prompt
+
 ### Requirement: CUDA Graph and FlashInfer decode acceleration MUST be explicit and fail-closed
 The AI inference build SHALL consume the pinned `astorise/candle` fork tag that
 exposes `candle_core::CudaGraph` and the optional
