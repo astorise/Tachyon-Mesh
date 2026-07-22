@@ -2908,6 +2908,48 @@ impl SemanticContextFlattener {
     }
 }
 
+impl CandleBackendModel {
+    fn execute_with_adapters_sequential(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Result<Vec<Vec<u8>>> {
+        if inputs.len() != adapters.len() {
+            bail!(
+                "adapter assignment count {} does not match input count {}",
+                adapters.len(),
+                inputs.len()
+            );
+        }
+        let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+        for group in adapter_assignment_groups(adapters) {
+            let adapter = adapters[group[0]].as_ref();
+            let group_inputs = group
+                .iter()
+                .map(|index| inputs[*index].clone())
+                .collect::<Vec<_>>();
+            let outputs = match adapter {
+                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter)?,
+                None => self.execute(&group_inputs)?,
+            };
+            if outputs.len() != group.len() {
+                bail!(
+                    "Candle backend returned {} output(s) for an adapter group of {} input(s)",
+                    outputs.len(),
+                    group.len()
+                );
+            }
+            for (index, output) in group.into_iter().zip(outputs) {
+                results[index] = Some(output);
+            }
+        }
+        Ok(results
+            .into_iter()
+            .map(|output| output.expect("adapter groups cover every input"))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4553,47 +4595,5 @@ mod tests {
         assert!(records.iter().any(|record| {
             record.alias == "telemetry-model" && record.executed_on == "cpu" && record.succeeded
         }));
-    }
-}
-
-impl CandleBackendModel {
-    fn execute_with_adapters_sequential(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<Vec<u8>>> {
-        if inputs.len() != adapters.len() {
-            bail!(
-                "adapter assignment count {} does not match input count {}",
-                adapters.len(),
-                inputs.len()
-            );
-        }
-        let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-        for group in adapter_assignment_groups(adapters) {
-            let adapter = adapters[group[0]].as_ref();
-            let group_inputs = group
-                .iter()
-                .map(|index| inputs[*index].clone())
-                .collect::<Vec<_>>();
-            let outputs = match adapter {
-                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter)?,
-                None => self.execute(&group_inputs)?,
-            };
-            if outputs.len() != group.len() {
-                bail!(
-                    "Candle backend returned {} output(s) for an adapter group of {} input(s)",
-                    outputs.len(),
-                    group.len()
-                );
-            }
-            for (index, output) in group.into_iter().zip(outputs) {
-                results[index] = Some(output);
-            }
-        }
-        Ok(results
-            .into_iter()
-            .map(|output| output.expect("adapter groups cover every input"))
-            .collect())
     }
 }

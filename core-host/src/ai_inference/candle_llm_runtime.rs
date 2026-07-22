@@ -2651,7 +2651,11 @@ impl CandleLlmRuntime {
                     detail: error.to_string(),
                 })?;
             let adapter_vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[adapter.path.clone()], *dtype, device)
+                VarBuilder::from_mmaped_safetensors(
+                    std::slice::from_ref(&adapter.path),
+                    *dtype,
+                    device,
+                )
             }
             .map_err(|error| CandleLlmError::InvalidComponent {
                 alias: self.alias.clone(),
@@ -3450,7 +3454,7 @@ impl CandleLlmRuntime {
             .map(|(tokens, request)| {
                 let text = self.decode_generated(tokens)?;
                 let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
-                Ok(text[..end].as_bytes().to_vec())
+                Ok(text.as_bytes()[..end].to_vec())
             })
             .collect()
     }
