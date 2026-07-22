@@ -198,9 +198,10 @@ The AI inference scheduler SHALL treat requests for the same base model alias as
 
 #### Scenario: Heterogeneous LoRA single-forward support depends on Candle kernels
 - **GIVEN** the host can group distinct adapters into one scheduler step
-- **WHEN** the Candle backend lacks S-LoRA, Punica, or equivalent SGMV adapter kernels
+- **AND** the Candle fork provides S-LoRA, Punica, or equivalent SGMV adapter kernels through `Llama::forward_with_adapters`
+- **WHEN** Tachyon's generation loop is not yet executing multiple prompt rows through one batch-native decode loop
 - **THEN** Tachyon runs adapter groups as sequential sub-batches
-- **AND** true same-forward heterogeneous LoRA batching remains unavailable until the Candle fork exposes the required kernels and API
+- **AND** the Candle `forward_with_adapters` path remains the required next integration point for true same-forward heterogeneous LoRA batching
 
 ### Requirement: Inference workloads MUST support declarative LoRA Multiplexing
 The `system-faas-model-broker` SHALL allow the sharing of a single base model in VRAM across multiple tenants by dynamically loading LoRA (Low-Rank Adaptation) weights based on Layer 7 routing conditions defined in the GitOps configuration.

@@ -38,7 +38,7 @@ candle-cuda = [
     "ai-inference",
     "candle-core/cuda",
     "candle-flashinfer-kernels?/cuda",
-    "candle-nn/cuda",
+    "candle-nn/lora-cuda",
     "candle-onnx/cuda",
     "candle-transformers/cuda",
     # Compiles in candle-transformers' paged-attention call site (the
@@ -77,15 +77,15 @@ arc-swap = "1.7"
 axum = "0.8"
 blake3 = "1.5"
 bytes = "1.5"
-candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-10", version = "0.11.0", optional = true }
-candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-10", version = "0.11.0", optional = true }
-candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-10", version = "0.11.0", optional = true, default-features = false }
-candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-10", version = "0.11.0", optional = true }
-candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-10", version = "0.11.0", optional = true }
+candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-11", version = "0.11.0", optional = true }
+candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-11", version = "0.11.0", optional = true }
+candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-11", version = "0.11.0", optional = true, default-features = false }
+candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-11", version = "0.11.0", optional = true }
+candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-11", version = "0.11.0", optional = true }
 # Standard transformer architectures (Llama family) for running real, uploaded
 # checkpoints. Weights are mmapped from the model directory at runtime — never
 # compiled into the Tachyon artifact.
-candle-transformers = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-10", version = "0.11.0", optional = true, default-features = false }
+candle-transformers = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-11", version = "0.11.0", optional = true, default-features = false }
 parallel-topology = { path = "../crates/parallel-topology", optional = true }
 # Same cudarc version `candle-core`'s CUDA backend already vendors (see
 # Cargo.lock), so this reuses one NCCL binding instead of introducing a
