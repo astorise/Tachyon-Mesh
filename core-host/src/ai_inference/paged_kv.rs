@@ -33,6 +33,7 @@ use crate::{RouteQos, SchedulerConfig, SchedulerSpillTier, SchedulerTierPreempti
 /// A physical KV block's id within a [`PagedBlockPool`]. Meaningful only
 /// relative to the pool that issued it.
 pub(crate) type BlockId = u32;
+const AES_GCM_TAG_BYTES: u64 = 16;
 
 #[derive(Debug)]
 pub(crate) enum PagedKvError {
@@ -270,7 +271,7 @@ impl KvTierPager {
         if !self.config.tier_preemptible.is_preemptible(qos) {
             return Err(PagedKvError::NonPreemptibleTier(qos));
         }
-        validate_tenant_id(&payload.tenant_id)?;
+        validate_scheduler_compatible_tenant_id(&payload.tenant_id)?;
         let mode = Self::choose_preemption_mode(
             prefill_cost_us,
             payload.bytes.len() as u64,
@@ -302,11 +303,12 @@ impl KvTierPager {
                 record.pinned_ram.unwrap_or_default()
             }
             KvBlockTier::Nvme => {
-                self.nvme_used_bytes = self.nvme_used_bytes.saturating_sub(record.bytes);
                 let pointer = record.nvme.ok_or_else(|| {
                     PagedKvError::SpillIo(format!("block {block_id} is missing its spill pointer"))
                 })?;
-                read_encrypted_block(&pointer, &self.tde_key)?
+                let bytes = read_encrypted_block(&pointer, &self.tde_key)?;
+                self.reclaim_nvme_spill(pointer)?;
+                bytes
             }
         };
         self.metrics.restored_bytes += bytes.len() as u64;
@@ -322,7 +324,9 @@ impl KvTierPager {
                 self.pinned_ram_used_bytes =
                     self.pinned_ram_used_bytes.saturating_sub(record.bytes);
             } else if record.tier == KvBlockTier::Nvme {
-                self.nvme_used_bytes = self.nvme_used_bytes.saturating_sub(record.bytes);
+                if let Some(pointer) = record.nvme.take() {
+                    let _ = self.reclaim_nvme_spill(pointer);
+                }
             }
             if let Some(bytes) = record.pinned_ram.as_mut() {
                 zeroize(bytes);
@@ -335,8 +339,7 @@ impl KvTierPager {
     }
 
     pub(crate) fn tenant_spill_path(&self, tenant_id: &str) -> Result<PathBuf, PagedKvError> {
-        validate_tenant_id(tenant_id)?;
-        Ok(self.spill_root.join(tenant_id).join("kv-spill.pool"))
+        Ok(self.tenant_spill_dir(tenant_id)?.join("kv-spill.pool"))
     }
 
     fn spill_block(&mut self, payload: KvBlockPayload) -> Result<(), PagedKvError> {
@@ -361,39 +364,69 @@ impl KvTierPager {
             return Ok(());
         }
 
+        let physical_requested = encrypted_spill_len(requested)?;
         let nvme_available = self
             .config
             .spill_budget_bytes
             .saturating_sub(self.nvme_used_bytes);
-        if self.config.spill_tier_max != SchedulerSpillTier::Nvme || requested > nvme_available {
+        if self.config.spill_tier_max != SchedulerSpillTier::Nvme
+            || physical_requested > nvme_available
+        {
             return Err(PagedKvError::SpillCapacityExhausted {
-                requested_bytes: requested,
+                requested_bytes: physical_requested,
                 pinned_ram_available_bytes: pinned_available,
                 nvme_available_bytes: nvme_available,
             });
         }
 
-        let path = self.tenant_spill_path(&payload.tenant_id)?;
         let nonce = self.next_nonce;
         self.next_nonce = self.next_nonce.saturating_add(1);
-        let pointer = append_encrypted_block(&path, &payload.bytes, nonce, &self.tde_key)?;
-        self.nvme_used_bytes += requested;
+        let path = self.block_spill_path(&payload.tenant_id, payload.block_id, nonce)?;
+        let pointer = write_encrypted_block(&path, &payload.bytes, nonce, &self.tde_key)?;
+        self.nvme_used_bytes += pointer.len;
         self.metrics.spilled_bytes += requested;
         self.records.insert(
             payload.block_id,
             SpillRecord {
                 tenant_id: payload.tenant_id,
                 tier: KvBlockTier::Nvme,
-                bytes: requested,
+                bytes: pointer.len,
                 pinned_ram: None,
                 nvme: Some(pointer),
             },
         );
         Ok(())
     }
+
+    fn tenant_spill_dir(&self, tenant_id: &str) -> Result<PathBuf, PagedKvError> {
+        validate_scheduler_compatible_tenant_id(tenant_id)?;
+        Ok(self.spill_root.join(tenant_path_segment(tenant_id)))
+    }
+
+    fn block_spill_path(
+        &self,
+        tenant_id: &str,
+        block_id: BlockId,
+        nonce: u64,
+    ) -> Result<PathBuf, PagedKvError> {
+        Ok(self
+            .tenant_spill_dir(tenant_id)?
+            .join(format!("kv-spill-{block_id}-{nonce}.bin")))
+    }
+
+    fn reclaim_nvme_spill(&mut self, pointer: SpillPointer) -> Result<(), PagedKvError> {
+        fs::remove_file(&pointer.path).map_err(|error| {
+            PagedKvError::SpillIo(format!(
+                "failed to remove spill file `{}`: {error}",
+                pointer.path.display()
+            ))
+        })?;
+        self.nvme_used_bytes = self.nvme_used_bytes.saturating_sub(pointer.len);
+        Ok(())
+    }
 }
 
-fn append_encrypted_block(
+fn write_encrypted_block(
     path: &Path,
     plaintext: &[u8],
     nonce: u64,
@@ -410,13 +443,9 @@ fn append_encrypted_block(
         .encrypt(&nonce_ref, plaintext)
         .map_err(|_| PagedKvError::Crypto("AES-GCM encryption failed".to_owned()))?;
     let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
+        .create_new(true)
+        .write(true)
         .open(path)
-        .map_err(|error| PagedKvError::SpillIo(error.to_string()))?;
-    let offset = file
-        .seek(SeekFrom::End(0))
         .map_err(|error| PagedKvError::SpillIo(error.to_string()))?;
     file.write_all(&ciphertext)
         .map_err(|error| PagedKvError::SpillIo(error.to_string()))?;
@@ -424,7 +453,7 @@ fn append_encrypted_block(
         .map_err(|error| PagedKvError::SpillIo(error.to_string()))?;
     Ok(SpillPointer {
         path: path.to_path_buf(),
-        offset,
+        offset: 0,
         len: ciphertext.len() as u64,
         nonce,
     })
@@ -446,16 +475,30 @@ fn read_encrypted_block(pointer: &SpillPointer, key: &[u8; 32]) -> Result<Vec<u8
         .map_err(|_| PagedKvError::Crypto("AES-GCM authentication failed".to_owned()))
 }
 
-fn validate_tenant_id(tenant_id: &str) -> Result<(), PagedKvError> {
+fn validate_scheduler_compatible_tenant_id(tenant_id: &str) -> Result<(), PagedKvError> {
     let valid = !tenant_id.is_empty()
+        && tenant_id.trim() == tenant_id
+        && !tenant_id.contains("..")
+        && !tenant_id.contains('/')
+        && !tenant_id.contains('\\')
         && tenant_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '@'));
     if valid {
         Ok(())
     } else {
         Err(PagedKvError::InvalidTenantId(tenant_id.to_owned()))
     }
+}
+
+fn tenant_path_segment(tenant_id: &str) -> String {
+    format!("t-{}", hex::encode(tenant_id.as_bytes()))
+}
+
+fn encrypted_spill_len(plaintext_len: u64) -> Result<u64, PagedKvError> {
+    plaintext_len
+        .checked_add(AES_GCM_TAG_BYTES)
+        .ok_or_else(|| PagedKvError::SpillIo("spill block length overflowed".to_owned()))
 }
 
 fn nonce_bytes(value: u64) -> [u8; 12] {
@@ -904,7 +947,12 @@ mod tests {
         let tenant_b_path = pager.tenant_spill_path("tenant-b").expect("tenant-b path");
         assert_ne!(tenant_a_path, tenant_b_path);
 
-        let on_disk = fs::read(&tenant_a_path).expect("spill file should exist");
+        let tenant_a_file = fs::read_dir(tenant_a_path.parent().expect("tenant-a dir"))
+            .expect("tenant-a spill dir should exist")
+            .map(|entry| entry.expect("dir entry").path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "bin"))
+            .expect("tenant-a spill file should exist");
+        let on_disk = fs::read(&tenant_a_file).expect("spill file should exist");
         assert!(
             !on_disk
                 .windows(b"tenant-a conversation KV".len())
@@ -918,6 +966,112 @@ mod tests {
         assert_eq!(
             pager.restore_block(11).expect("tenant-b restore"),
             b"tenant-b conversation KV"
+        );
+        assert!(
+            !tenant_a_file.exists(),
+            "restoring the block should reclaim the physical spill file"
+        );
+    }
+
+    #[test]
+    fn configured_tenant_ids_are_encoded_for_spill_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut pager = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 0,
+                spill_budget_bytes: 4096,
+                spill_tier_max: SchedulerSpillTier::Nvme,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path(),
+            [6; 32],
+        );
+
+        pager
+            .preempt_block(
+                RouteQos::Standard,
+                KvBlockPayload {
+                    tenant_id: "team.a:user@example".to_owned(),
+                    block_id: 12,
+                    bytes: b"encoded tenant KV".to_vec(),
+                },
+                1_000,
+                1,
+            )
+            .expect("scheduler-compatible tenant id should spill");
+
+        let spill_path = pager
+            .tenant_spill_path("team.a:user@example")
+            .expect("tenant path should be derivable");
+        let tenant_dir = spill_path.parent().expect("tenant spill dir");
+        assert!(tenant_dir.exists());
+        assert_eq!(
+            tenant_dir.file_name().and_then(|name| name.to_str()),
+            Some("t-7465616d2e613a75736572406578616d706c65")
+        );
+        assert_eq!(
+            pager.restore_block(12).expect("block should restore"),
+            b"encoded tenant KV"
+        );
+    }
+
+    #[test]
+    fn nvme_restore_and_evict_reclaim_physical_spill_budget() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut pager = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 0,
+                spill_budget_bytes: 64,
+                spill_tier_max: SchedulerSpillTier::Nvme,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path(),
+            [8; 32],
+        );
+
+        pager
+            .preempt_block(
+                RouteQos::Batch,
+                KvBlockPayload {
+                    tenant_id: "tenant-a".to_owned(),
+                    block_id: 20,
+                    bytes: vec![1; 16],
+                },
+                1_000,
+                1,
+            )
+            .expect("first block should spill");
+        let first_spill = fs::read_dir(temp.path().join(tenant_path_segment("tenant-a")))
+            .expect("tenant spill dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "bin"))
+            .expect("first spill file");
+        assert_eq!(fs::metadata(&first_spill).expect("metadata").len(), 32);
+
+        assert_eq!(
+            pager.restore_block(20).expect("first block should restore"),
+            vec![1; 16]
+        );
+        assert!(!first_spill.exists());
+
+        pager
+            .preempt_block(
+                RouteQos::Batch,
+                KvBlockPayload {
+                    tenant_id: "tenant-a".to_owned(),
+                    block_id: 21,
+                    bytes: vec![2; 16],
+                },
+                1_000,
+                1,
+            )
+            .expect("restored budget should be reusable");
+        pager.evict_block(21);
+        assert!(
+            fs::read_dir(temp.path().join(tenant_path_segment("tenant-a")))
+                .expect("tenant spill dir")
+                .all(|entry| entry.expect("dir entry").path().extension() != Some("bin".as_ref())),
+            "evicting an NVMe block should reclaim its physical spill file"
         );
     }
 
