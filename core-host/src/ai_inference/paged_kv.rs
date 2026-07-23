@@ -395,7 +395,7 @@ impl KvTierPager {
                     self.pinned_ram_used_bytes.saturating_sub(record.bytes);
             } else if record.tier == KvBlockTier::Nvme {
                 if let Some(pointer) = record.nvme.take() {
-                    let _ = self.reclaim_nvme_spill(pointer);
+                    self.reclaim_evicted_nvme_spill(pointer);
                 }
             }
             if let Some(bytes) = record.pinned_ram.as_mut() {
@@ -500,6 +500,11 @@ impl KvTierPager {
         })?;
         self.nvme_used_bytes = self.nvme_used_bytes.saturating_sub(pointer.len);
         Ok(())
+    }
+
+    fn reclaim_evicted_nvme_spill(&mut self, pointer: SpillPointer) {
+        let _ = fs::remove_file(&pointer.path);
+        self.nvme_used_bytes = self.nvme_used_bytes.saturating_sub(pointer.len);
     }
 }
 
@@ -1465,6 +1470,47 @@ mod tests {
                 .all(|entry| entry.expect("dir entry").path().extension() != Some("bin".as_ref())),
             "evicting an NVMe block should reclaim its physical spill file"
         );
+    }
+
+    #[test]
+    fn nvme_evict_reclaims_budget_when_spill_file_is_already_gone() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut pager = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 0,
+                spill_budget_bytes: 40,
+                spill_tier_max: SchedulerSpillTier::Nvme,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path(),
+            [18; 32],
+        );
+
+        pager
+            .preempt_block(
+                RouteQos::Batch,
+                kv_payload("tenant-a", "seq-a", 0, 20, vec![1; 16]),
+                1_000,
+                1,
+            )
+            .expect("first block should spill");
+        let spill_file = fs::read_dir(temp.path().join(tenant_path_segment("tenant-a")))
+            .expect("tenant spill dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "bin"))
+            .expect("spill file");
+        fs::remove_file(&spill_file).expect("test should remove spill file first");
+
+        pager.evict_block(&kv_key("tenant-a", "seq-a", 0));
+
+        pager
+            .preempt_block(
+                RouteQos::Batch,
+                kv_payload("tenant-a", "seq-a", 1, 21, vec![2; 16]),
+                1_000,
+                1,
+            )
+            .expect("eviction should reclaim budget even when file cleanup already happened");
     }
 
     #[test]

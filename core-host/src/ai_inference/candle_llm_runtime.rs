@@ -925,7 +925,7 @@ impl SingleDeviceBackend {
                                             // doesn't.
                                             let Device::Cuda(cuda_device) = device else {
                                                 return paged_llama_forward(
-                                                    model,
+                                                    &model,
                                                     &mut cache,
                                                     paged,
                                                     &mut guard.table,
@@ -936,7 +936,7 @@ impl SingleDeviceBackend {
                                             };
                                             let (established, logits) =
                                                 CudaGraphDecodeSession::establish(
-                                                    model,
+                                                    &model,
                                                     &mut cache,
                                                     paged,
                                                     &guard.table,
@@ -2771,7 +2771,7 @@ impl CandleLlmRuntime {
         };
 
         let (lora_config, prefix) =
-            lora_load_config_from_adapter(adapter_path, &device).map_err(|error| {
+            lora_load_config_from_adapter(adapter_path, device).map_err(|error| {
                 CandleLlmError::InvalidComponent {
                     alias: self.alias.clone(),
                     path: adapter_path.to_path_buf(),
