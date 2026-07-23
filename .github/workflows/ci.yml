@@ -176,12 +176,62 @@ jobs:
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
 
-  # ── 3. Quality gate (runs in parallel with build-guests + security-audit) ───
-  # Fast checks that gate everything downstream: fmt, clippy, cross-layer
-  # validation and per-feature compilation checks.
-  # cargo build -p tachyon-ui --release is intentionally absent: clippy
-  # --workspace already verifies the crate compiles, and the Publish Tachyon
-  # Desktop workflow handles the full Tauri bundle on main and version tags.
+  # Offline manifest schemas must stay compatible with the latest published
+  # release unless a PR intentionally carries the breaking-manifest label.
+  manifest-schema-compatibility:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      GH_TOKEN: ${{ github.token }}
+      BREAKING_MANIFEST_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'breaking-manifest') }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate HEAD integrity schemas
+        run: cargo run -p core-host -- schema --output-dir target/schemas-head
+
+      - name: Download latest release integrity schemas
+        id: previous
+        shell: bash
+        run: |
+          tag="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName // ""')"
+          if [ -z "$tag" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No previous release found; skipping manifest schema compatibility diff."
+            exit 0
+          fi
+          mkdir -p target/schemas-prev
+          if ! gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir target/schemas-prev \
+            --pattern integrity-config.schema.json \
+            --pattern integrity-lock.schema.json; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Latest release $tag has no integrity schema assets; skipping compatibility diff."
+            exit 0
+          fi
+          if [ ! -f target/schemas-prev/integrity-config.schema.json ] || [ ! -f target/schemas-prev/integrity-lock.schema.json ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Latest release $tag does not include both integrity schema assets; skipping compatibility diff."
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check manifest schema compatibility
+        if: steps.previous.outputs.found == 'true' && env.BREAKING_MANIFEST_LABEL != 'true'
+        run: |
+          node scripts/check-schema-compat.js target/schemas-prev/integrity-config.schema.json target/schemas-head/integrity-config.schema.json
+          node scripts/check-schema-compat.js target/schemas-prev/integrity-lock.schema.json target/schemas-head/integrity-lock.schema.json
+
+      - name: Acknowledge intentional manifest break
+        if: steps.previous.outputs.found == 'true' && env.BREAKING_MANIFEST_LABEL == 'true'
+        run: echo "breaking-manifest label present; schema compatibility diff is advisory for this PR."
+
+  # Quality gate: fmt, clippy, cross-layer validation and per-feature compilation checks.
   quality:
     runs-on: ubuntu-latest
     env:
@@ -927,7 +977,7 @@ jobs:
   # blocks on it.
   publish-docker-images:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [docker-base, quality, test, cover, release, feature-matrix-tests, fips-tests]
+    needs: [docker-base, quality, manifest-schema-compatibility, test, cover, release, feature-matrix-tests, fips-tests]
     runs-on: ubuntu-latest
     env:
       BUILDKIT_PROGRESS: plain

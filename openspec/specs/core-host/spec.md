@@ -127,6 +127,15 @@ A new endpoint `GET /admin/schema/integrity-lock` SHALL return a JSON Schema doc
 - **THEN** the response is JSON with top-level `config_payload`, `public_key`, and `signature` properties
 - **AND** it does not document camelCase runtime fields such as `hostAddress`
 
+### Requirement: core-host MUST generate release-ready manifest schema files
+The `core-host` binary SHALL provide a `schema` command that writes `integrity-config.schema.json` from `IntegrityConfig` and `integrity-lock.schema.json` from `IntegrityManifest`. The generated file schemas SHALL use the same schemars generation path as the live admin endpoints. When a release tag is supplied, each schema SHALL include a `$id` pointing at the corresponding GitHub Release asset URL.
+
+#### Scenario: Operator generates versioned schema files from source
+- **WHEN** a developer runs `cargo run -p core-host -- schema --output-dir target/schemas --release-tag v1.2.3`
+- **THEN** `target/schemas/integrity-config.schema.json` is written from the `IntegrityConfig` schema
+- **AND** `target/schemas/integrity-lock.schema.json` is written from the `IntegrityManifest` schema
+- **AND** each schema contains a `$id` under `https://github.com/astorise/tachyon-mesh/releases/download/v1.2.3/`
+
 ### Requirement: core-host MUST expose a zero-copy layer-wise inference WIT contract
 The project SHALL define `wit/ai/inference.wit` in the existing `tachyon:mesh@1.1.0` WIT package and SHALL expose a `layer-execution` interface with opaque `tensor-handle` values so Wasm guests can sequence model layers without copying intermediate tensors through linear memory.
 
