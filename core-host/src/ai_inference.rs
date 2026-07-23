@@ -1088,6 +1088,10 @@ impl TenantFairness {
         }
     }
 
+    fn allows_cross_tenant_active_batching(&self) -> bool {
+        self.config.tenant_weights.is_empty()
+    }
+
     fn select_active<'a>(
         &mut self,
         candidates: Vec<(usize, &'a ActiveInferenceSequence)>,
@@ -1407,12 +1411,14 @@ fn select_active_batch(
     let selection = tenant_fairness.select_active(candidates, max_qos_score)?;
     let (_, first) = selection.selected;
     let batch_key = first.batch_key();
+    let selected_tenant = selection.tenant.as_str();
+    let allow_cross_tenant_batch = tenant_fairness.allows_cross_tenant_active_batching();
     let mut indices = active
         .iter()
         .enumerate()
         .filter_map(|(index, sequence)| {
-            sequence
-                .is_compatible_with(&batch_key, phase)
+            (sequence.is_compatible_with(&batch_key, phase)
+                && (allow_cross_tenant_batch || sequence.job.tenant_id() == selected_tenant))
                 .then_some(index)
         })
         .collect::<Vec<_>>();
@@ -3951,6 +3957,47 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].job.tenant_id(), "tenant-high");
         assert_eq!(queued.len(), 4);
+    }
+
+    #[test]
+    fn scheduler_tenant_weights_do_not_batch_lower_weight_tenant_on_same_model() {
+        let model = adapter_echo_model("weighted-batch-shared");
+        let mut tenant_fairness = TenantFairness::new(SchedulerConfig {
+            tenant_weights: std::collections::BTreeMap::from([
+                ("tenant-high".to_owned(), 3),
+                ("tenant-low".to_owned(), 1),
+            ]),
+            ..SchedulerConfig::default()
+        });
+        let (tenant_high_tx, _tenant_high_rx) = mpsc::channel();
+        let (tenant_low_tx, _tenant_low_rx) = mpsc::channel();
+        let active = vec![
+            ActiveInferenceSequence {
+                qos_score: RouteQos::Standard.score(),
+                sequence: 0,
+                phase: InferenceSequencePhase::Decode,
+                job: mock_inference_job(&model, "tenant-high", tenant_high_tx),
+            },
+            ActiveInferenceSequence {
+                qos_score: RouteQos::Standard.score(),
+                sequence: 1,
+                phase: InferenceSequencePhase::Decode,
+                job: mock_inference_job(&model, "tenant-low", tenant_low_tx),
+            },
+        ];
+
+        let first = select_active_batch(
+            &active,
+            InferenceSequencePhase::Decode,
+            &mut tenant_fairness,
+        )
+        .expect("tenant should be selected");
+
+        assert_eq!(
+            first,
+            vec![0],
+            "configured tenant weights must not let another tenant hitchhike on a same-alias batch"
+        );
     }
 
     #[test]

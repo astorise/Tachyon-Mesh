@@ -2640,6 +2640,9 @@ impl CandleLlmRuntime {
         if unique_adapters.is_empty() {
             return Ok(None);
         }
+        if matches!(device, Device::Cuda(_)) {
+            return Ok(None);
+        }
 
         let mut load_config = LlamaLoadConfig::default();
         for adapter in unique_adapters {
