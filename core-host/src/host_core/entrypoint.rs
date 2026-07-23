@@ -22,6 +22,10 @@ pub(crate) async fn run() -> Result<()> {
             };
             std::process::exit(exit_code);
         }
+        HostCommand::Schema(command) => {
+            write_integrity_schema_files(&command)?;
+            Ok(())
+        }
     }
 }
 

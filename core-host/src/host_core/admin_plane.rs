@@ -204,7 +204,7 @@ pub(crate) async fn admin_metrics_handler(
 /// format accepted by `POST /admin/manifest`. LLM agents and MCP clients can
 /// fetch this schema to validate manifest payloads before submission.
 pub(crate) async fn admin_manifest_schema_handler() -> axum::Json<serde_json::Value> {
-    axum::Json(integrity_config_schema())
+    axum::Json(integrity_config_schema(None))
 }
 
 /// Serves the OpenAPI 3.1 JSON document generated from the compile-time `ApiDoc`.
@@ -219,22 +219,12 @@ pub(crate) async fn admin_openapi_schema_handler() -> impl IntoResponse {
 
 /// Serves a JSON Schema describing the `integrity.lock` file format.
 pub(crate) async fn admin_integrity_lock_schema_handler() -> impl IntoResponse {
-    let schema = integrity_manifest_schema();
+    let schema = integrity_manifest_schema(None);
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         schema.to_string(),
     )
-}
-
-fn integrity_config_schema() -> serde_json::Value {
-    serde_json::to_value(schemars::schema_for!(IntegrityConfig))
-        .expect("IntegrityConfig JSON Schema should serialize")
-}
-
-fn integrity_manifest_schema() -> serde_json::Value {
-    serde_json::to_value(schemars::schema_for!(IntegrityManifest))
-        .expect("IntegrityManifest JSON Schema should serialize")
 }
 
 #[cfg(test)]
@@ -243,7 +233,7 @@ mod schema_tests {
 
     #[test]
     fn manifest_schema_uses_integrity_config_field_names() {
-        let schema = integrity_config_schema();
+        let schema = integrity_config_schema(None);
         let properties = schema
             .get("properties")
             .and_then(serde_json::Value::as_object)
@@ -261,7 +251,7 @@ mod schema_tests {
 
     #[test]
     fn manifest_schema_covers_route_nested_config() {
-        let schema = integrity_config_schema();
+        let schema = integrity_config_schema(None);
         let text = schema.to_string();
 
         for field in [
@@ -287,7 +277,7 @@ mod schema_tests {
 
     #[test]
     fn integrity_lock_schema_uses_signed_manifest_field_names() {
-        let schema = integrity_manifest_schema();
+        let schema = integrity_manifest_schema(None);
         let properties = schema
             .get("properties")
             .and_then(serde_json::Value::as_object)
@@ -298,6 +288,20 @@ mod schema_tests {
         assert!(properties.contains_key("signature"));
         assert!(!properties.contains_key("configPayload"));
         assert!(!properties.contains_key("hostAddress"));
+    }
+
+    #[test]
+    fn release_schema_id_targets_release_asset() {
+        let schema = integrity_config_schema(Some(&release_schema_id(
+            "v1.2.3",
+            INTEGRITY_CONFIG_SCHEMA_FILE,
+        )));
+        assert_eq!(
+            schema.get("$id").and_then(serde_json::Value::as_str),
+            Some(
+                "https://github.com/astorise/tachyon-mesh/releases/download/v1.2.3/integrity-config.schema.json"
+            )
+        );
     }
 }
 

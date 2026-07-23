@@ -109,6 +109,27 @@ The desktop release workflow SHALL build the Tauri bundles from the `tachyon-ui`
 - **THEN** `projectPath` points to `tachyon-ui`
 - **AND** frontend dependencies are installed from the `tachyon-ui` directory
 
+### Requirement: Release workflow publishes versioned integrity schema assets
+The release workflow SHALL publish `integrity-config.schema.json` and `integrity-lock.schema.json` as GitHub Release assets for version tags. The workflow SHALL generate those files from the checked-out source using `core-host schema` and stamp their `$id` values with the pushed release tag.
+
+#### Scenario: Release tag uploads manifest schema assets
+- **WHEN** a maintainer pushes a tag such as `v1.2.3`
+- **THEN** the release workflow runs a schema publishing job on a Linux runner
+- **AND** it generates `integrity-config.schema.json` and `integrity-lock.schema.json`
+- **AND** it uploads both files to the GitHub Release for that tag
+
+### Requirement: CI checks manifest schema compatibility against the latest release
+The CI workflow SHALL generate HEAD integrity schemas and compare them with the latest non-draft, non-prerelease GitHub Release schema assets when both previous assets exist. Adding required fields, removing properties, changing schema types, or removing enum values SHALL fail CI unless the pull request is explicitly labeled `breaking-manifest`.
+
+#### Scenario: Backward-incompatible manifest schema change fails CI
+- **WHEN** a pull request changes the generated manifest schema incompatibly with the latest release assets
+- **AND** the pull request does not carry the `breaking-manifest` label
+- **THEN** the manifest schema compatibility job fails and reports the breaking paths
+
+#### Scenario: Missing historical schema assets skip the diff
+- **WHEN** the latest release does not include both integrity schema assets
+- **THEN** CI records a notice and skips the compatibility diff rather than failing unrelated changes
+
 ### Requirement: Release workflow MUST publish Windows binaries as .zip
 The `publish-server-binaries` matrix SHALL include `windows-latest / x86_64-pc-windows-msvc`. The packaging step SHALL produce `tachyon-mesh-VERSION-windows-x86_64.zip` containing `core-host.exe` and `tachyon-mcp.exe`.
 
