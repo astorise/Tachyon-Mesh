@@ -216,7 +216,7 @@ struct SpillPointer {
     path: PathBuf,
     offset: u64,
     len: u64,
-    nonce: u64,
+    nonce: [u8; 12],
 }
 
 #[derive(Clone, Debug)]
@@ -266,7 +266,6 @@ pub(crate) struct KvTierPager {
     tde_key: [u8; 32],
     pinned_ram_used_bytes: u64,
     nvme_used_bytes: u64,
-    next_nonce: u64,
     records: HashMap<KvSpillBlockKey, SpillRecord>,
     metrics: KvTieringMetrics,
 }
@@ -283,7 +282,6 @@ impl KvTierPager {
             tde_key,
             pinned_ram_used_bytes: 0,
             nvme_used_bytes: 0,
-            next_nonce: 1,
             records: HashMap::new(),
             metrics: KvTieringMetrics::default(),
         }
@@ -446,8 +444,7 @@ impl KvTierPager {
             });
         }
 
-        let nonce = self.next_nonce;
-        self.next_nonce = self.next_nonce.saturating_add(1);
+        let nonce = random_spill_nonce();
         let path = self.block_spill_path(&payload.key, payload.block_id, nonce)?;
         let pointer = write_encrypted_block(&path, &payload.bytes, nonce, &self.tde_key)?;
         self.nvme_used_bytes += pointer.len;
@@ -474,11 +471,13 @@ impl KvTierPager {
         &self,
         key: &KvSpillBlockKey,
         block_id: BlockId,
-        nonce: u64,
+        nonce: [u8; 12],
     ) -> Result<PathBuf, PagedKvError> {
-        Ok(self
-            .tenant_spill_dir(&key.tenant_id)?
-            .join(format!("{}-p-{block_id}-n-{nonce}.bin", key.path_stem())))
+        Ok(self.tenant_spill_dir(&key.tenant_id)?.join(format!(
+            "{}-p-{block_id}-n-{}.bin",
+            key.path_stem(),
+            hex::encode(nonce)
+        )))
     }
 
     fn reclaim_nvme_spill(&mut self, pointer: SpillPointer) -> Result<(), PagedKvError> {
@@ -496,15 +495,14 @@ impl KvTierPager {
 fn write_encrypted_block(
     path: &Path,
     plaintext: &[u8],
-    nonce: u64,
+    nonce: [u8; 12],
     key: &[u8; 32],
 ) -> Result<SpillPointer, PagedKvError> {
     let parent = path.parent().ok_or_else(|| {
         PagedKvError::SpillIo(format!("spill path `{}` has no parent", path.display()))
     })?;
     fs::create_dir_all(parent).map_err(|error| PagedKvError::SpillIo(error.to_string()))?;
-    let nonce_bytes = nonce_bytes(nonce);
-    let nonce_ref = Nonce::try_from(nonce_bytes.as_slice())
+    let nonce_ref = Nonce::try_from(nonce.as_slice())
         .map_err(|_| PagedKvError::Crypto("invalid nonce".to_owned()))?;
     let ciphertext = Aes256Gcm::new(key.into())
         .encrypt(&nonce_ref, plaintext)
@@ -534,8 +532,7 @@ fn read_encrypted_block(pointer: &SpillPointer, key: &[u8; 32]) -> Result<Vec<u8
     let mut ciphertext = vec![0_u8; pointer.len as usize];
     file.read_exact(&mut ciphertext)
         .map_err(|error| PagedKvError::SpillIo(error.to_string()))?;
-    let nonce = nonce_bytes(pointer.nonce);
-    let nonce = Nonce::try_from(nonce.as_slice())
+    let nonce = Nonce::try_from(pointer.nonce.as_slice())
         .map_err(|_| PagedKvError::Crypto("invalid nonce".to_owned()))?;
     Aes256Gcm::new(key.into())
         .decrypt(&nonce, ciphertext.as_slice())
@@ -581,10 +578,8 @@ fn encrypted_spill_len(plaintext_len: u64) -> Result<u64, PagedKvError> {
         .ok_or_else(|| PagedKvError::SpillIo("spill block length overflowed".to_owned()))
 }
 
-fn nonce_bytes(value: u64) -> [u8; 12] {
-    let mut nonce = [0_u8; 12];
-    nonce[4..].copy_from_slice(&value.to_be_bytes());
-    nonce
+fn random_spill_nonce() -> [u8; 12] {
+    rand::random()
 }
 
 fn zeroize(bytes: &mut [u8]) {
@@ -1104,6 +1099,57 @@ mod tests {
         assert!(
             !tenant_a_file.exists(),
             "restoring the block should reclaim the physical spill file"
+        );
+    }
+
+    #[test]
+    fn nvme_spill_nonces_do_not_repeat_after_pager_restart() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config = KvTierPagerConfig {
+            pinned_ram_pool_bytes: 0,
+            spill_budget_bytes: 4096,
+            spill_tier_max: SchedulerSpillTier::Nvme,
+            tier_preemptible: SchedulerTierPreemptible::default(),
+        };
+        let tde_key = [14; 32];
+        let first_key = kv_key("tenant-a", "seq-a", 0);
+        let second_key = kv_key("tenant-a", "seq-b", 0);
+
+        let mut first_pager = KvTierPager::new(config.clone(), temp.path().join("first"), tde_key);
+        first_pager
+            .preempt_block(
+                RouteQos::Batch,
+                kv_payload("tenant-a", "seq-a", 0, 7, b"first-nonce-kv"),
+                1_000,
+                1,
+            )
+            .expect("first pager should spill to NVMe");
+        let first_nonce = first_pager
+            .records
+            .get(&first_key)
+            .and_then(|record| record.nvme.as_ref())
+            .map(|pointer| pointer.nonce)
+            .expect("first spill should have a nonce");
+
+        let mut restarted_pager = KvTierPager::new(config, temp.path().join("second"), tde_key);
+        restarted_pager
+            .preempt_block(
+                RouteQos::Batch,
+                kv_payload("tenant-a", "seq-b", 0, 7, b"second-nonce-kv"),
+                1_000,
+                1,
+            )
+            .expect("recreated pager should spill to NVMe");
+        let second_nonce = restarted_pager
+            .records
+            .get(&second_key)
+            .and_then(|record| record.nvme.as_ref())
+            .map(|pointer| pointer.nonce)
+            .expect("second spill should have a nonce");
+
+        assert_ne!(
+            first_nonce, second_nonce,
+            "recreating a pager with the same TDE key must not restart AES-GCM nonces"
         );
     }
 
