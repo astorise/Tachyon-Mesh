@@ -79,6 +79,16 @@ function compareSchemas(previousRoot, currentRoot, previousSchema, currentSchema
     return;
   }
 
+  if (
+    previousSchema.const !== undefined &&
+    currentSchema.const !== undefined &&
+    JSON.stringify(previousSchema.const) !== JSON.stringify(currentSchema.const)
+  ) {
+    failures.push(
+      `${pathLabel(parts)} changed const from ${JSON.stringify(previousSchema.const)} to ${JSON.stringify(currentSchema.const)}`
+    );
+  }
+
   if (Array.isArray(previousSchema.enum) && Array.isArray(currentSchema.enum)) {
     const currentValues = new Set(currentSchema.enum.map((value) => JSON.stringify(value)));
     for (const value of previousSchema.enum) {
@@ -137,6 +147,11 @@ function compareSchemas(previousRoot, currentRoot, previousSchema, currentSchema
     const currentVariants = currentSchema[key];
     if (!Array.isArray(previousVariants) || !Array.isArray(currentVariants)) {
       continue;
+    }
+    if ((key === 'anyOf' || key === 'oneOf') && currentVariants.length < previousVariants.length) {
+      failures.push(
+        `${pathLabel(parts)} removed ${previousVariants.length - currentVariants.length} ${key} variant(s)`
+      );
     }
     const count = Math.min(previousVariants.length, currentVariants.length);
     for (let index = 0; index < count; index += 1) {

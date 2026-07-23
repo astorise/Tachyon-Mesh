@@ -119,7 +119,7 @@ The release workflow SHALL publish `integrity-config.schema.json` and `integrity
 - **AND** it uploads both files to the GitHub Release for that tag
 
 ### Requirement: CI checks manifest schema compatibility against the latest release
-The CI workflow SHALL generate HEAD integrity schemas and compare them with the latest non-draft, non-prerelease GitHub Release schema assets when both previous assets exist. Adding required fields, removing properties, changing schema types, or removing enum values SHALL fail CI unless the pull request is explicitly labeled `breaking-manifest`.
+The CI workflow SHALL generate HEAD integrity schemas and compare them with the latest non-draft, non-prerelease GitHub Release schema assets when both previous assets exist. Adding required fields, removing properties, changing schema types, changing `const` literal values, removing enum values, or removing `oneOf`/`anyOf` variants SHALL fail CI unless the pull request is explicitly labeled `breaking-manifest`.
 
 #### Scenario: Backward-incompatible manifest schema change fails CI
 - **WHEN** a pull request changes the generated manifest schema incompatibly with the latest release assets
