@@ -15,7 +15,7 @@ use candle_transformers::models::deepseek2::{
 use candle_transformers::models::gemma2::{Config as Gemma2Config, Model as Gemma2Model};
 use candle_transformers::models::gemma3::{Config as Gemma3Config, Model as Gemma3Model};
 use candle_transformers::models::llama::{
-    Cache, Config, Llama, LlamaConfig, LlamaEosToks, LlamaLoadConfig, LoraConfig, PagedKvCache,
+    Cache, Config, Llama, LlamaConfig, LlamaEosToks, LoraConfig, PagedKvCache,
 };
 use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
 use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlama;
@@ -376,7 +376,7 @@ enum SingleDeviceBackend {
     /// supports F16/BF16, never F32, so paged attention requires switching
     /// the whole model's working dtype, not just attaching a block table.
     Llama {
-        model: Llama,
+        model: Mutex<Llama>,
         config: Config,
         device: Device,
         dtype: DType,
@@ -869,6 +869,9 @@ impl SingleDeviceBackend {
                 cuda_graph_decode,
                 ..
             } => {
+                let model = model.lock().map_err(|_| {
+                    runtime.execution_error("Llama model mutex was poisoned".to_owned())
+                })?;
                 let mut cache = Cache::new(true, *dtype, config, device).map_err(|error| {
                     runtime.execution_error(format!("failed to build KV cache: {error}"))
                 })?;
@@ -892,7 +895,7 @@ impl SingleDeviceBackend {
                                         // never captured — always the
                                         // existing uncaptured paged path.
                                         return paged_llama_forward(
-                                            model,
+                                            &model,
                                             &mut cache,
                                             paged,
                                             &mut guard.table,
@@ -978,7 +981,7 @@ impl SingleDeviceBackend {
                             on_token,
                             |input, index_pos| {
                                 paged_llama_forward(
-                                    model,
+                                    &model,
                                     &mut cache,
                                     paged,
                                     &mut guard.table,
@@ -991,7 +994,7 @@ impl SingleDeviceBackend {
                     }
                     None => {
                         let (logits, index_pos) = runtime.llama_prefill_with_prefix_cache(
-                            model, prompt_ids, &mut cache, device,
+                            &model, prompt_ids, &mut cache, device,
                         )?;
                         runtime.decode_loop_from_logits(
                             logits,
@@ -1125,6 +1128,7 @@ impl SingleDeviceBackend {
                 // to F32 for the shared sampling/FSM code that expects it.
                 let mut cache =
                     Cache::new(true, *dtype, config, device).expect("cache should build");
+                let model = model.lock().expect("llama mutex should not be poisoned");
                 model
                     .forward(input, 0, &mut cache)
                     .and_then(|logits| logits.to_dtype(DType::F32))
@@ -1900,7 +1904,7 @@ impl CandleLlmRuntime {
                 };
                 (
                     SingleDeviceBackend::Llama {
-                        model,
+                        model: Mutex::new(model),
                         config,
                         device: device.clone(),
                         dtype,
@@ -2170,7 +2174,7 @@ impl CandleLlmRuntime {
         })?;
         let inner = LoadedModel::Safetensors {
             backend: SingleDeviceBackend::Llama {
-                model,
+                model: Mutex::new(model),
                 config,
                 device: device.clone(),
                 dtype: DType::F32,
@@ -2617,12 +2621,12 @@ impl CandleLlmRuntime {
             return Ok(None);
         };
         let SingleDeviceBackend::Llama {
+            model,
             config,
             device,
             dtype,
             paged,
             cuda_graph_decode,
-            ..
         } = backend
         else {
             return Ok(None);
@@ -2640,11 +2644,10 @@ impl CandleLlmRuntime {
         if unique_adapters.is_empty() {
             return Ok(None);
         }
-        if matches!(device, Device::Cuda(_)) {
-            return Ok(None);
-        }
 
-        let mut load_config = LlamaLoadConfig::default();
+        let mut model = model
+            .lock()
+            .map_err(|_| self.execution_error("Llama model mutex was poisoned".to_owned()))?;
         for adapter in unique_adapters {
             let (lora_config, prefix) = lora_load_config_from_adapter(&adapter.path, device)
                 .map_err(|error| CandleLlmError::InvalidComponent {
@@ -2666,30 +2669,16 @@ impl CandleLlmRuntime {
                 component: MODEL_SAFETENSORS,
                 detail: error.to_string(),
             })?;
-            load_config = load_config.with_lora_adapter_prefixed(
-                &adapter.id,
-                adapter_vb,
-                lora_config,
-                prefix,
-            );
+            model
+                .load_lora_adapter_prefixed(&adapter.id, adapter_vb, lora_config, prefix)
+                .map_err(|error| CandleLlmError::InvalidComponent {
+                    alias: self.alias.clone(),
+                    path: adapter.path.clone(),
+                    component: MODEL_SAFETENSORS,
+                    detail: error.to_string(),
+                })?;
         }
 
-        let weight_paths = safetensors_paths(&self.alias, &self.root)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, *dtype, device) }
-            .map_err(|error| CandleLlmError::InvalidComponent {
-                alias: self.alias.clone(),
-                path: self.root.clone(),
-                component: MODEL_SAFETENSORS,
-                detail: error.to_string(),
-            })?;
-        let mut model = Llama::load_with_config(vb, config, load_config).map_err(|error| {
-            CandleLlmError::InvalidComponent {
-                alias: self.alias.clone(),
-                path: self.root.clone(),
-                component: MODEL_SAFETENSORS,
-                detail: error.to_string(),
-            }
-        })?;
         let mut cache = Cache::new(true, *dtype, config, device).map_err(|error| {
             self.execution_error(format!(
                 "failed to build batch-native LoRA KV cache: {error}"
@@ -2765,7 +2754,14 @@ impl CandleLlmRuntime {
                         .to_owned(),
             });
         };
-        let SingleDeviceBackend::Llama { config, .. } = backend else {
+        let SingleDeviceBackend::Llama {
+            model,
+            config,
+            device,
+            dtype,
+            ..
+        } = backend
+        else {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: self.alias.clone(),
                 path: self.root.clone(),
@@ -2774,7 +2770,6 @@ impl CandleLlmRuntime {
             });
         };
 
-        let device = Device::Cpu;
         let (lora_config, prefix) =
             lora_load_config_from_adapter(adapter_path, &device).map_err(|error| {
                 CandleLlmError::InvalidComponent {
@@ -2785,7 +2780,7 @@ impl CandleLlmRuntime {
                 }
             })?;
         let adapter_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[adapter_path.to_path_buf()], DType::F32, &device)
+            VarBuilder::from_mmaped_safetensors(&[adapter_path.to_path_buf()], *dtype, device)
         }
         .map_err(|error| CandleLlmError::InvalidComponent {
             alias: self.alias.clone(),
@@ -2793,28 +2788,17 @@ impl CandleLlmRuntime {
             component: MODEL_SAFETENSORS,
             detail: error.to_string(),
         })?;
-        let load_config = LlamaLoadConfig::default().with_lora_adapter_prefixed(
-            adapter_id,
-            adapter_vb,
-            lora_config,
-            prefix,
-        );
-        let weight_paths = safetensors_paths(&self.alias, &self.root)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &device) }
+        let mut model = model
+            .lock()
+            .map_err(|_| self.execution_error("Llama model mutex was poisoned".to_owned()))?;
+        model
+            .load_lora_adapter_prefixed(adapter_id, adapter_vb, lora_config, prefix)
             .map_err(|error| CandleLlmError::InvalidComponent {
-                alias: self.alias.clone(),
-                path: self.root.clone(),
-                component: MODEL_SAFETENSORS,
-                detail: error.to_string(),
-            })?;
-        let mut model = Llama::load_with_config(vb, config, load_config).map_err(|error| {
-            CandleLlmError::InvalidComponent {
                 alias: self.alias.clone(),
                 path: adapter_path.to_path_buf(),
                 component: MODEL_SAFETENSORS,
                 detail: error.to_string(),
-            }
-        })?;
+            })?;
         model
             .set_active_adapter(Some(adapter_id))
             .map_err(|error| CandleLlmError::InvalidComponent {
@@ -2823,17 +2807,27 @@ impl CandleLlmRuntime {
                 component: MODEL_SAFETENSORS,
                 detail: error.to_string(),
             })?;
-        let mut cache = Cache::new(true, DType::F32, config, &device).map_err(|error| {
+        let mut cache = Cache::new(true, *dtype, config, device).map_err(|error| {
             self.execution_error(format!("failed to build LoRA KV cache: {error}"))
         })?;
-        self.decode_loop(
+        let result = self.decode_loop(
             &prompt_ids,
             request,
             eos_tokens,
-            &device,
+            device,
             on_token,
             |input, index_pos| model.forward(input, index_pos, &mut cache),
-        )
+        );
+        let reset =
+            model
+                .set_active_adapter(None)
+                .map_err(|error| CandleLlmError::InvalidComponent {
+                    alias: self.alias.clone(),
+                    path: adapter_path.to_path_buf(),
+                    component: MODEL_SAFETENSORS,
+                    detail: error.to_string(),
+                });
+        result.and(reset)
     }
 
     pub(crate) fn generate_speculative(
