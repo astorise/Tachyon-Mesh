@@ -266,6 +266,7 @@ pub(crate) struct KvTierPager {
     tde_key: [u8; 32],
     pinned_ram_used_bytes: u64,
     nvme_used_bytes: u64,
+    startup_cleanup_error: Option<String>,
     records: HashMap<KvSpillBlockKey, SpillRecord>,
     metrics: KvTieringMetrics,
 }
@@ -276,12 +277,17 @@ impl KvTierPager {
         spill_root: impl Into<PathBuf>,
         tde_key: [u8; 32],
     ) -> Self {
+        let spill_root = spill_root.into();
+        let startup_cleanup_error = cleanup_stale_spill_files(&spill_root)
+            .err()
+            .map(|error| error.to_string());
         Self {
             config,
-            spill_root: spill_root.into(),
+            spill_root,
             tde_key,
             pinned_ram_used_bytes: 0,
             nvme_used_bytes: 0,
+            startup_cleanup_error,
             records: HashMap::new(),
             metrics: KvTieringMetrics::default(),
         }
@@ -310,6 +316,11 @@ impl KvTierPager {
     ) -> Result<KvPreemptionMode, PagedKvError> {
         if !self.config.tier_preemptible.is_preemptible(qos) {
             return Err(PagedKvError::NonPreemptibleTier(qos));
+        }
+        if let Some(error) = &self.startup_cleanup_error {
+            return Err(PagedKvError::SpillIo(format!(
+                "paged KV spill startup cleanup failed: {error}"
+            )));
         }
         validate_scheduler_compatible_tenant_id(&payload.tenant_id)?;
         if payload.key.tenant_id != payload.tenant_id {
@@ -537,6 +548,41 @@ fn read_encrypted_block(pointer: &SpillPointer, key: &[u8; 32]) -> Result<Vec<u8
     Aes256Gcm::new(key.into())
         .decrypt(&nonce, ciphertext.as_slice())
         .map_err(|_| PagedKvError::Crypto("AES-GCM authentication failed".to_owned()))
+}
+
+fn cleanup_stale_spill_files(root: &Path) -> Result<(), PagedKvError> {
+    if !root.exists() {
+        return Ok(());
+    }
+    cleanup_stale_spill_files_recursive(root)
+}
+
+fn cleanup_stale_spill_files_recursive(path: &Path) -> Result<(), PagedKvError> {
+    for entry in fs::read_dir(path).map_err(|error| {
+        PagedKvError::SpillIo(format!(
+            "failed to scan spill directory `{}`: {error}",
+            path.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| PagedKvError::SpillIo(error.to_string()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| PagedKvError::SpillIo(error.to_string()))?;
+        if file_type.is_dir() {
+            cleanup_stale_spill_files_recursive(&path)?;
+        } else if file_type.is_file()
+            && path.extension().is_some_and(|extension| extension == "bin")
+        {
+            fs::remove_file(&path).map_err(|error| {
+                PagedKvError::SpillIo(format!(
+                    "failed to remove stale spill file `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_scheduler_compatible_tenant_id(tenant_id: &str) -> Result<(), PagedKvError> {
@@ -1151,6 +1197,58 @@ mod tests {
             first_nonce, second_nonce,
             "recreating a pager with the same TDE key must not restart AES-GCM nonces"
         );
+    }
+
+    #[test]
+    fn pager_startup_removes_untracked_nvme_spill_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config = KvTierPagerConfig {
+            pinned_ram_pool_bytes: 0,
+            spill_budget_bytes: 4096,
+            spill_tier_max: SchedulerSpillTier::Nvme,
+            tier_preemptible: SchedulerTierPreemptible::default(),
+        };
+        let spill_root = temp.path().join("spill-root");
+        let tenant_dir = spill_root.join(tenant_path_segment("tenant-a"));
+        let keep_file = tenant_dir.join("operator-note.txt");
+        let stale_file;
+
+        {
+            let mut first_pager = KvTierPager::new(config.clone(), &spill_root, [15; 32]);
+            first_pager
+                .preempt_block(
+                    RouteQos::Batch,
+                    kv_payload("tenant-a", "seq-a", 0, 7, b"stale-nvme-kv"),
+                    1_000,
+                    1,
+                )
+                .expect("first pager should spill to NVMe");
+            stale_file = fs::read_dir(&tenant_dir)
+                .expect("tenant spill dir")
+                .map(|entry| entry.expect("dir entry").path())
+                .find(|path| path.extension().is_some_and(|extension| extension == "bin"))
+                .expect("stale spill file should exist");
+            fs::write(&keep_file, b"not a spill").expect("non-spill file should be writable");
+        }
+
+        let mut restarted_pager = KvTierPager::new(config, &spill_root, [15; 32]);
+        assert!(
+            !stale_file.exists(),
+            "pager startup should remove untracked stale spill files"
+        );
+        assert!(
+            keep_file.exists(),
+            "pager startup should not remove unrelated files"
+        );
+        assert_eq!(restarted_pager.snapshot().nvme_blocks, 0);
+        restarted_pager
+            .preempt_block(
+                RouteQos::Batch,
+                kv_payload("tenant-a", "seq-b", 0, 8, b"fresh-nvme-kv"),
+                1_000,
+                1,
+            )
+            .expect("new spill should be accepted after startup cleanup");
     }
 
     #[test]
