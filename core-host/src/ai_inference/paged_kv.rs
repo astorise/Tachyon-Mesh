@@ -337,22 +337,38 @@ impl KvTierPager {
 
     pub(crate) fn restore_block(&mut self, key: &KvSpillBlockKey) -> Result<Vec<u8>, PagedKvError> {
         let started = Instant::now();
-        let record = self.records.remove(key).ok_or_else(|| {
-            PagedKvError::SpillIo(format!("block {key:?} is not present in any spill tier"))
-        })?;
-        let bytes = match record.tier {
-            KvBlockTier::Vram => record.pinned_ram.unwrap_or_default(),
+        let tier = self
+            .records
+            .get(key)
+            .ok_or_else(|| {
+                PagedKvError::SpillIo(format!("block {key:?} is not present in any spill tier"))
+            })?
+            .tier;
+        let bytes = match tier {
+            KvBlockTier::Vram => self
+                .records
+                .remove(key)
+                .and_then(|record| record.pinned_ram)
+                .unwrap_or_default(),
             KvBlockTier::PinnedRam => {
+                let record = self.records.remove(key).ok_or_else(|| {
+                    PagedKvError::SpillIo(format!("block {key:?} is not present in any spill tier"))
+                })?;
                 self.pinned_ram_used_bytes =
                     self.pinned_ram_used_bytes.saturating_sub(record.bytes);
                 record.pinned_ram.unwrap_or_default()
             }
             KvBlockTier::Nvme => {
-                let pointer = record.nvme.ok_or_else(|| {
-                    PagedKvError::SpillIo(format!("block {key:?} is missing its spill pointer"))
-                })?;
+                let pointer = self
+                    .records
+                    .get(key)
+                    .and_then(|record| record.nvme.clone())
+                    .ok_or_else(|| {
+                        PagedKvError::SpillIo(format!("block {key:?} is missing its spill pointer"))
+                    })?;
                 let bytes = read_encrypted_block(&pointer, &self.tde_key)?;
                 self.reclaim_nvme_spill(pointer)?;
+                self.records.remove(key);
                 bytes
             }
         };
@@ -1145,6 +1161,65 @@ mod tests {
                 .expect("tenant spill dir")
                 .all(|entry| entry.expect("dir entry").path().extension() != Some("bin".as_ref())),
             "restoring the original block should reclaim its only spill file"
+        );
+    }
+
+    #[test]
+    fn nvme_restore_keeps_record_when_read_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut pager = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 0,
+                spill_budget_bytes: 128,
+                spill_tier_max: SchedulerSpillTier::Nvme,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path(),
+            [13; 32],
+        );
+
+        pager
+            .preempt_block(
+                RouteQos::Batch,
+                kv_payload("tenant-a", "seq-a", 0, 7, b"retryable-nvme-kv"),
+                1_000,
+                1,
+            )
+            .expect("block should spill to NVMe");
+
+        let tenant_dir = temp.path().join(tenant_path_segment("tenant-a"));
+        let spill_file = fs::read_dir(&tenant_dir)
+            .expect("tenant spill dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "bin"))
+            .expect("spill file should exist");
+        let hidden_file = spill_file.with_extension("missing");
+        fs::rename(&spill_file, &hidden_file).expect("spill file should be movable");
+
+        let first_error = pager
+            .restore_block(&kv_key("tenant-a", "seq-a", 0))
+            .expect_err("missing spill file should fail restore");
+        assert!(
+            first_error.to_string().contains("I/O failed"),
+            "unexpected error: {first_error}"
+        );
+        assert_eq!(
+            pager.snapshot().nvme_blocks,
+            1,
+            "failed restore must keep the spill record retryable"
+        );
+
+        fs::rename(&hidden_file, &spill_file).expect("spill file should be restorable");
+        assert_eq!(
+            pager
+                .restore_block(&kv_key("tenant-a", "seq-a", 0))
+                .expect("retry should restore once the file is back"),
+            b"retryable-nvme-kv"
+        );
+        assert_eq!(pager.snapshot().nvme_blocks, 0);
+        assert!(
+            !spill_file.exists(),
+            "successful retry should reclaim the physical spill file"
         );
     }
 
