@@ -177,6 +177,36 @@ The `wasi-nn-candle` execution engine SHALL dynamically inject and remove `.safe
 - **AND** the swap operation occurs without reloading the foundation model into VRAM
 - **AND** the engine enforces the configured maximum adapter-switch rate to keep aggregate latency within target SLOs
 
+### Requirement: Continuous batching MUST group Multi-LoRA requests by base model before adapter execution
+The AI inference scheduler SHALL treat requests for the same base model alias as compatible within a continuous-batching step even when their `adapter_id` values differ. The execution layer SHALL first attempt a backend-native mixed-adapter batch that passes one adapter assignment per selected row and routes every output back to the originating request. When the backend or request shape cannot execute a native mixed-adapter batch, the execution layer SHALL fall back to adapter-specific sub-batches. Requests without an `adapter_id` SHALL preserve the existing no-adapter behavior in either path.
+
+#### Scenario: Distinct adapters share one scheduler step
+- **GIVEN** multiple active requests target the same model alias
+- **AND** those requests use different `adapter_id` values
+- **WHEN** the scheduler selects the next compatible decode or prefill step
+- **THEN** the selected step includes all compatible requests for that base model
+- **AND** the execution layer passes one adapter assignment per selected row to a backend-native batch when supported
+- **AND** each response is routed back to the request that produced it
+
+#### Scenario: No-adapter requests remain isolated in mixed adapter batches
+- **GIVEN** one request targets the base model without `adapter_id`
+- **AND** another request targets the same model with an adapter
+- **WHEN** both requests are selected in one scheduler step
+- **THEN** the base request is assigned `None`
+- **AND** the adapted request is assigned its resolved adapter
+- **AND** the base output is not generated with the adapter active
+
+#### Scenario: Heterogeneous LoRA batch-native decode uses Candle runtime seams
+- **GIVEN** the host can group distinct adapters into one scheduler step
+- **AND** the Candle fork provides S-LoRA, Punica, or equivalent SGMV adapter kernels through `Llama::forward_with_adapters`
+- **AND** the Candle fork provides a batch-native decode loop through `Llama::generate_with_adapters`
+- **WHEN** the selected request rows have compatible rectangular prompt tokens for a no-paged-attention Llama safetensors runtime
+- **THEN** Tachyon executes prefill/decode with `forward_with_adapters` calls over rectangular rows
+- **AND** batched prefill honors `hardware_strategy.prefill_chunk_tokens` before entering token decode
+- **AND** each row's sampled output is routed back to its originating request
+- **AND** unsupported backend or request shapes fall back to sequential adapter sub-batches
+- **AND** an adapter-specific sub-batch failure is reported only to rows using that adapter assignment
+
 ### Requirement: Inference workloads MUST support declarative LoRA Multiplexing
 The `system-faas-model-broker` SHALL allow the sharing of a single base model in VRAM across multiple tenants by dynamically loading LoRA (Low-Rank Adaptation) weights based on Layer 7 routing conditions defined in the GitOps configuration.
 
@@ -735,6 +765,48 @@ When a model deployment sets `hardware_strategy.paged_attention: true`, the runt
 - **WHEN** the Candle LLM runtime loads the binding
 - **THEN** loading fails with a typed `UnsupportedModel` error naming the sizing shortfall
 - **AND** no paged KV block pool or per-layer tensors are left allocated
+
+### Requirement: PagedAttention KV blocks MUST tier through pinned RAM before encrypted NVMe spill
+When local VRAM pressure requires paging, the host SHALL evict paged-attention KV blocks only at request preemption boundaries and only for scheduler tiers marked preemptible. `RealTime` requests SHALL remain non-preemptible by default. Eviction SHALL move blocks from VRAM to pinned host RAM first and then to tenant-isolated encrypted NVMe spill files when the pinned RAM budget is exhausted. The host SHALL choose recompute for short contexts when prefill cost is lower than swap transfer cost, choose swap for longer contexts, and expose block-residency, preemption-mode, spill-throughput, and resume-latency metrics. Spill files are cache material only: a slow, full, or lost NVMe tier SHALL degrade into recompute/cache-miss behavior rather than corrupting generation correctness.
+
+#### Scenario: RealTime KV blocks are never paged
+- **GIVEN** a paged-attention request runs in the `RealTime` QoS tier
+- **WHEN** the local pager considers evicting one of its KV blocks
+- **THEN** the pager rejects the eviction as a non-preemptible tier
+- **AND** no RAM or NVMe spill record is created
+
+#### Scenario: Standard and Batch blocks spill through RAM before NVMe
+- **GIVEN** a `Standard` or `Batch` request is preemptible
+- **AND** pinned host RAM has enough budget for the selected KV block
+- **WHEN** the pager chooses swap over recompute
+- **THEN** the block is recorded in the pinned RAM tier
+- **AND** the NVMe spill file is not used
+- **AND** spill records are keyed by stable logical sequence/block identity rather than by reusable physical KV slot id
+- **AND** a duplicate spill for an unreclaimed logical key is rejected before charging additional spill capacity
+
+#### Scenario: NVMe spill is encrypted and isolated by tenant
+- **GIVEN** the pinned RAM budget is exhausted
+- **AND** the configured maximum spill tier is `nvme`
+- **WHEN** two tenants spill KV blocks
+- **THEN** each tenant writes to a distinct spill pool path
+- **AND** the bytes persisted on disk are AES-GCM ciphertext, not plaintext KV contents
+- **AND** restoring or evicting an NVMe-spilled block reclaims the physical spill file before the budget is reused
+
+#### Scenario: Spill failure remains reconstructible
+- **GIVEN** pinned RAM and NVMe capacity cannot accept a selected block
+- **WHEN** the pager attempts to swap that block
+- **THEN** the operation fails with a typed capacity error
+- **AND** the block is not counted as spilled
+- **AND** the scheduler may recover by recomputing the KV context from the prompt
+
+#### Scenario: Five and ten agent paging scenarios expose spill and resume metrics
+- **GIVEN** local paging is disabled for a five-agent scheduling window
+- **WHEN** the scheduler completes the window without KV eviction
+- **THEN** spilled bytes and resume latency metrics remain zero
+- **GIVEN** local paging is enabled for a ten-agent scheduling window
+- **WHEN** each agent spills one preemptible KV block
+- **THEN** the first blocks occupy pinned RAM before later blocks use encrypted NVMe
+- **AND** restoring every block records restored bytes and monotonic resume p50/p99 metrics
 
 ### Requirement: CUDA Graph and FlashInfer decode acceleration MUST be explicit and fail-closed
 The AI inference build SHALL consume the pinned `astorise/candle` fork tag that
