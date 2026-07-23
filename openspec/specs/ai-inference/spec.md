@@ -201,7 +201,8 @@ The AI inference scheduler SHALL treat requests for the same base model alias as
 - **AND** the Candle fork provides S-LoRA, Punica, or equivalent SGMV adapter kernels through `Llama::forward_with_adapters`
 - **AND** the Candle fork provides a batch-native decode loop through `Llama::generate_with_adapters`
 - **WHEN** the selected request rows have compatible rectangular prompt tokens for a no-paged-attention Llama safetensors runtime
-- **THEN** Tachyon executes prefill/decode with one `forward_with_adapters` call per step
+- **THEN** Tachyon executes prefill/decode with `forward_with_adapters` calls over rectangular rows
+- **AND** batched prefill honors `hardware_strategy.prefill_chunk_tokens` before entering token decode
 - **AND** each row's sampled output is routed back to its originating request
 - **AND** unsupported backend or request shapes fall back to sequential adapter sub-batches
 
@@ -779,6 +780,7 @@ When local VRAM pressure requires paging, the host SHALL evict paged-attention K
 - **WHEN** the pager chooses swap over recompute
 - **THEN** the block is recorded in the pinned RAM tier
 - **AND** the NVMe spill file is not used
+- **AND** spill records are keyed by stable logical sequence/block identity rather than by reusable physical KV slot id
 
 #### Scenario: NVMe spill is encrypted and isolated by tenant
 - **GIVEN** the pinned RAM budget is exhausted
@@ -786,6 +788,7 @@ When local VRAM pressure requires paging, the host SHALL evict paged-attention K
 - **WHEN** two tenants spill KV blocks
 - **THEN** each tenant writes to a distinct spill pool path
 - **AND** the bytes persisted on disk are AES-GCM ciphertext, not plaintext KV contents
+- **AND** restoring or evicting an NVMe-spilled block reclaims the physical spill file before the budget is reused
 
 #### Scenario: Spill failure remains reconstructible
 - **GIVEN** pinned RAM and NVMe capacity cannot accept a selected block

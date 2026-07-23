@@ -35,6 +35,39 @@ use crate::{RouteQos, SchedulerConfig, SchedulerSpillTier, SchedulerTierPreempti
 pub(crate) type BlockId = u32;
 const AES_GCM_TAG_BYTES: u64 = 16;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct KvSpillBlockKey {
+    tenant_id: String,
+    sequence_id: String,
+    logical_block_index: u32,
+}
+
+impl KvSpillBlockKey {
+    pub(crate) fn new(
+        tenant_id: impl Into<String>,
+        sequence_id: impl Into<String>,
+        logical_block_index: u32,
+    ) -> Result<Self, PagedKvError> {
+        let tenant_id = tenant_id.into();
+        let sequence_id = sequence_id.into();
+        validate_scheduler_compatible_tenant_id(&tenant_id)?;
+        validate_spill_key_segment(&sequence_id)?;
+        Ok(Self {
+            tenant_id,
+            sequence_id,
+            logical_block_index,
+        })
+    }
+
+    fn path_stem(&self) -> String {
+        format!(
+            "kv-spill-s-{}-b-{}",
+            hex::encode(self.sequence_id.as_bytes()),
+            self.logical_block_index
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum PagedKvError {
     /// [`PagedBlockPool::allocate_block`] was called with no free blocks left.
@@ -144,7 +177,10 @@ struct KvTieringMetrics {
 }
 
 impl KvTieringMetrics {
-    fn snapshot(&self, records: &HashMap<BlockId, SpillRecord>) -> KvTieringMetricsSnapshot {
+    fn snapshot(
+        &self,
+        records: &HashMap<KvSpillBlockKey, SpillRecord>,
+    ) -> KvTieringMetricsSnapshot {
         let mut latencies = self.resume_latencies_us.clone();
         latencies.sort_unstable();
         KvTieringMetricsSnapshot {
@@ -189,6 +225,7 @@ struct SpillRecord {
 
 #[derive(Clone, Debug)]
 pub(crate) struct KvBlockPayload {
+    pub(crate) key: KvSpillBlockKey,
     pub(crate) tenant_id: String,
     pub(crate) block_id: BlockId,
     pub(crate) bytes: Vec<u8>,
@@ -225,7 +262,7 @@ pub(crate) struct KvTierPager {
     pinned_ram_used_bytes: u64,
     nvme_used_bytes: u64,
     next_nonce: u64,
-    records: HashMap<BlockId, SpillRecord>,
+    records: HashMap<KvSpillBlockKey, SpillRecord>,
     metrics: KvTieringMetrics,
 }
 
@@ -272,6 +309,9 @@ impl KvTierPager {
             return Err(PagedKvError::NonPreemptibleTier(qos));
         }
         validate_scheduler_compatible_tenant_id(&payload.tenant_id)?;
+        if payload.key.tenant_id != payload.tenant_id {
+            return Err(PagedKvError::InvalidTenantId(payload.tenant_id));
+        }
         let mode = Self::choose_preemption_mode(
             prefill_cost_us,
             payload.bytes.len() as u64,
@@ -290,10 +330,10 @@ impl KvTierPager {
         }
     }
 
-    pub(crate) fn restore_block(&mut self, block_id: BlockId) -> Result<Vec<u8>, PagedKvError> {
+    pub(crate) fn restore_block(&mut self, key: &KvSpillBlockKey) -> Result<Vec<u8>, PagedKvError> {
         let started = Instant::now();
-        let record = self.records.remove(&block_id).ok_or_else(|| {
-            PagedKvError::SpillIo(format!("block {block_id} is not present in any spill tier"))
+        let record = self.records.remove(key).ok_or_else(|| {
+            PagedKvError::SpillIo(format!("block {key:?} is not present in any spill tier"))
         })?;
         let bytes = match record.tier {
             KvBlockTier::Vram => record.pinned_ram.unwrap_or_default(),
@@ -304,7 +344,7 @@ impl KvTierPager {
             }
             KvBlockTier::Nvme => {
                 let pointer = record.nvme.ok_or_else(|| {
-                    PagedKvError::SpillIo(format!("block {block_id} is missing its spill pointer"))
+                    PagedKvError::SpillIo(format!("block {key:?} is missing its spill pointer"))
                 })?;
                 let bytes = read_encrypted_block(&pointer, &self.tde_key)?;
                 self.reclaim_nvme_spill(pointer)?;
@@ -318,8 +358,8 @@ impl KvTierPager {
         Ok(bytes)
     }
 
-    pub(crate) fn evict_block(&mut self, block_id: BlockId) {
-        if let Some(mut record) = self.records.remove(&block_id) {
+    pub(crate) fn evict_block(&mut self, key: &KvSpillBlockKey) {
+        if let Some(mut record) = self.records.remove(key) {
             if record.tier == KvBlockTier::PinnedRam {
                 self.pinned_ram_used_bytes =
                     self.pinned_ram_used_bytes.saturating_sub(record.bytes);
@@ -352,7 +392,7 @@ impl KvTierPager {
             self.pinned_ram_used_bytes += requested;
             self.metrics.spilled_bytes += requested;
             self.records.insert(
-                payload.block_id,
+                payload.key,
                 SpillRecord {
                     tenant_id: payload.tenant_id,
                     tier: KvBlockTier::PinnedRam,
@@ -381,12 +421,12 @@ impl KvTierPager {
 
         let nonce = self.next_nonce;
         self.next_nonce = self.next_nonce.saturating_add(1);
-        let path = self.block_spill_path(&payload.tenant_id, payload.block_id, nonce)?;
+        let path = self.block_spill_path(&payload.key, payload.block_id, nonce)?;
         let pointer = write_encrypted_block(&path, &payload.bytes, nonce, &self.tde_key)?;
         self.nvme_used_bytes += pointer.len;
         self.metrics.spilled_bytes += requested;
         self.records.insert(
-            payload.block_id,
+            payload.key,
             SpillRecord {
                 tenant_id: payload.tenant_id,
                 tier: KvBlockTier::Nvme,
@@ -405,13 +445,13 @@ impl KvTierPager {
 
     fn block_spill_path(
         &self,
-        tenant_id: &str,
+        key: &KvSpillBlockKey,
         block_id: BlockId,
         nonce: u64,
     ) -> Result<PathBuf, PagedKvError> {
         Ok(self
-            .tenant_spill_dir(tenant_id)?
-            .join(format!("kv-spill-{block_id}-{nonce}.bin")))
+            .tenant_spill_dir(&key.tenant_id)?
+            .join(format!("{}-p-{block_id}-n-{nonce}.bin", key.path_stem())))
     }
 
     fn reclaim_nvme_spill(&mut self, pointer: SpillPointer) -> Result<(), PagedKvError> {
@@ -488,6 +528,19 @@ fn validate_scheduler_compatible_tenant_id(tenant_id: &str) -> Result<(), PagedK
         Ok(())
     } else {
         Err(PagedKvError::InvalidTenantId(tenant_id.to_owned()))
+    }
+}
+
+fn validate_spill_key_segment(segment: &str) -> Result<(), PagedKvError> {
+    let valid = !segment.is_empty()
+        && segment.trim() == segment
+        && !segment.contains("..")
+        && !segment.contains('/')
+        && !segment.contains('\\');
+    if valid {
+        Ok(())
+    } else {
+        Err(PagedKvError::InvalidTenantId(segment.to_owned()))
     }
 }
 
@@ -664,6 +717,26 @@ pub(crate) fn build_cumulative_seqlens_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kv_key(tenant: &str, sequence: &str, logical_block_index: u32) -> KvSpillBlockKey {
+        KvSpillBlockKey::new(tenant, sequence, logical_block_index)
+            .expect("test spill key should be valid")
+    }
+
+    fn kv_payload(
+        tenant: &str,
+        sequence: &str,
+        logical_block_index: u32,
+        physical_block_id: BlockId,
+        bytes: impl Into<Vec<u8>>,
+    ) -> KvBlockPayload {
+        KvBlockPayload {
+            key: kv_key(tenant, sequence, logical_block_index),
+            tenant_id: tenant.to_owned(),
+            block_id: physical_block_id,
+            bytes: bytes.into(),
+        }
+    }
 
     #[test]
     fn blocks_allocate_and_free_through_the_pool() {
@@ -850,11 +923,7 @@ mod tests {
         let error = pager
             .preempt_block(
                 RouteQos::RealTime,
-                KvBlockPayload {
-                    tenant_id: "tenant-a".to_owned(),
-                    block_id: 1,
-                    bytes: b"secret-kv".to_vec(),
-                },
+                kv_payload("tenant-a", "seq-a", 0, 1, b"secret-kv"),
                 1_000,
                 1,
             )
@@ -882,11 +951,7 @@ mod tests {
         let mode = pager
             .preempt_block(
                 RouteQos::Standard,
-                KvBlockPayload {
-                    tenant_id: "tenant-a".to_owned(),
-                    block_id: 4,
-                    bytes: b"host-ram-kv".to_vec(),
-                },
+                kv_payload("tenant-a", "seq-a", 0, 4, b"host-ram-kv"),
                 100,
                 1,
             )
@@ -897,7 +962,9 @@ mod tests {
         assert_eq!(snapshot.nvme_blocks, 0);
         assert_eq!(snapshot.swap_preemptions, 1);
 
-        let restored = pager.restore_block(4).expect("block should restore");
+        let restored = pager
+            .restore_block(&kv_key("tenant-a", "seq-a", 0))
+            .expect("block should restore");
         assert_eq!(restored, b"host-ram-kv");
         let snapshot = pager.snapshot();
         assert_eq!(snapshot.pinned_ram_blocks, 0);
@@ -921,11 +988,7 @@ mod tests {
         pager
             .preempt_block(
                 RouteQos::Batch,
-                KvBlockPayload {
-                    tenant_id: "tenant-a".to_owned(),
-                    block_id: 10,
-                    bytes: b"tenant-a conversation KV".to_vec(),
-                },
+                kv_payload("tenant-a", "seq-a", 0, 10, b"tenant-a conversation KV"),
                 1_000,
                 1,
             )
@@ -933,11 +996,7 @@ mod tests {
         pager
             .preempt_block(
                 RouteQos::Batch,
-                KvBlockPayload {
-                    tenant_id: "tenant-b".to_owned(),
-                    block_id: 11,
-                    bytes: b"tenant-b conversation KV".to_vec(),
-                },
+                kv_payload("tenant-b", "seq-b", 0, 11, b"tenant-b conversation KV"),
                 1_000,
                 1,
             )
@@ -960,11 +1019,15 @@ mod tests {
             "spill file must not contain plaintext KV"
         );
         assert_eq!(
-            pager.restore_block(10).expect("tenant-a restore"),
+            pager
+                .restore_block(&kv_key("tenant-a", "seq-a", 0))
+                .expect("tenant-a restore"),
             b"tenant-a conversation KV"
         );
         assert_eq!(
-            pager.restore_block(11).expect("tenant-b restore"),
+            pager
+                .restore_block(&kv_key("tenant-b", "seq-b", 0))
+                .expect("tenant-b restore"),
             b"tenant-b conversation KV"
         );
         assert!(
@@ -990,11 +1053,13 @@ mod tests {
         pager
             .preempt_block(
                 RouteQos::Standard,
-                KvBlockPayload {
-                    tenant_id: "team.a:user@example".to_owned(),
-                    block_id: 12,
-                    bytes: b"encoded tenant KV".to_vec(),
-                },
+                kv_payload(
+                    "team.a:user@example",
+                    "seq@example",
+                    0,
+                    12,
+                    b"encoded tenant KV",
+                ),
                 1_000,
                 1,
             )
@@ -1010,7 +1075,9 @@ mod tests {
             Some("t-7465616d2e613a75736572406578616d706c65")
         );
         assert_eq!(
-            pager.restore_block(12).expect("block should restore"),
+            pager
+                .restore_block(&kv_key("team.a:user@example", "seq@example", 0))
+                .expect("block should restore"),
             b"encoded tenant KV"
         );
     }
@@ -1032,11 +1099,7 @@ mod tests {
         pager
             .preempt_block(
                 RouteQos::Batch,
-                KvBlockPayload {
-                    tenant_id: "tenant-a".to_owned(),
-                    block_id: 20,
-                    bytes: vec![1; 16],
-                },
+                kv_payload("tenant-a", "seq-a", 0, 20, vec![1; 16]),
                 1_000,
                 1,
             )
@@ -1049,7 +1112,9 @@ mod tests {
         assert_eq!(fs::metadata(&first_spill).expect("metadata").len(), 32);
 
         assert_eq!(
-            pager.restore_block(20).expect("first block should restore"),
+            pager
+                .restore_block(&kv_key("tenant-a", "seq-a", 0))
+                .expect("first block should restore"),
             vec![1; 16]
         );
         assert!(!first_spill.exists());
@@ -1057,21 +1122,62 @@ mod tests {
         pager
             .preempt_block(
                 RouteQos::Batch,
-                KvBlockPayload {
-                    tenant_id: "tenant-a".to_owned(),
-                    block_id: 21,
-                    bytes: vec![2; 16],
-                },
+                kv_payload("tenant-a", "seq-a", 1, 21, vec![2; 16]),
                 1_000,
                 1,
             )
             .expect("restored budget should be reusable");
-        pager.evict_block(21);
+        pager.evict_block(&kv_key("tenant-a", "seq-a", 1));
         assert!(
             fs::read_dir(temp.path().join(tenant_path_segment("tenant-a")))
                 .expect("tenant spill dir")
                 .all(|entry| entry.expect("dir entry").path().extension() != Some("bin".as_ref())),
             "evicting an NVMe block should reclaim its physical spill file"
+        );
+    }
+
+    #[test]
+    fn logical_spill_keys_survive_physical_block_reuse() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut pager = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 0,
+                spill_budget_bytes: 128,
+                spill_tier_max: SchedulerSpillTier::Nvme,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path(),
+            [10; 32],
+        );
+
+        pager
+            .preempt_block(
+                RouteQos::Standard,
+                kv_payload("tenant-a", "seq-a", 0, 7, b"seq-a physical-slot-7"),
+                1_000,
+                1,
+            )
+            .expect("first logical block should spill");
+        pager
+            .preempt_block(
+                RouteQos::Standard,
+                kv_payload("tenant-b", "seq-b", 0, 7, b"seq-b reused-slot-7"),
+                1_000,
+                1,
+            )
+            .expect("second logical block should spill despite physical id reuse");
+
+        assert_eq!(
+            pager
+                .restore_block(&kv_key("tenant-a", "seq-a", 0))
+                .expect("first logical block should restore"),
+            b"seq-a physical-slot-7"
+        );
+        assert_eq!(
+            pager
+                .restore_block(&kv_key("tenant-b", "seq-b", 0))
+                .expect("second logical block should restore"),
+            b"seq-b reused-slot-7"
         );
     }
 
@@ -1092,11 +1198,7 @@ mod tests {
         let error = pager
             .preempt_block(
                 RouteQos::Standard,
-                KvBlockPayload {
-                    tenant_id: "tenant-a".to_owned(),
-                    block_id: 42,
-                    bytes: b"too-large-for-spill".to_vec(),
-                },
+                kv_payload("tenant-a", "seq-a", 0, 42, b"too-large-for-spill"),
                 1_000,
                 1,
             )
@@ -1138,11 +1240,7 @@ mod tests {
             let mode = pager
                 .preempt_block(
                     RouteQos::Standard,
-                    KvBlockPayload {
-                        tenant_id: tenant,
-                        block_id: agent,
-                        bytes: payload,
-                    },
+                    kv_payload(&tenant, &format!("seq-{agent}"), 0, agent, payload),
                     1_000,
                     1,
                 )
@@ -1158,7 +1256,11 @@ mod tests {
 
         for agent in 0..10 {
             let restored = pager
-                .restore_block(agent)
+                .restore_block(&kv_key(
+                    &format!("tenant-{agent}"),
+                    &format!("seq-{agent}"),
+                    0,
+                ))
                 .expect("agent KV block should restore");
             assert_eq!(restored, vec![agent as u8; 16]);
         }

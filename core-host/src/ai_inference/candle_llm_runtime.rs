@@ -3341,21 +3341,32 @@ impl CandleLlmRuntime {
             .first()
             .map(Vec::len)
             .ok_or_else(|| self.execution_error("empty batch-native decode".to_owned()))?;
-        let flat_prompt = prompt_ids
-            .iter()
-            .flat_map(|ids| ids.iter().copied())
-            .collect::<Vec<_>>();
-        let prompt =
-            Tensor::from_vec(flat_prompt, (batch, prompt_len), device).map_err(|error| {
-                self.execution_error(format!("failed to build batched prompt tensor: {error}"))
-            })?;
-        let mut logits = model
-            .forward_with_adapters(&prompt, 0, cache, adapter_assignments)
-            .map_err(|error| {
-                self.execution_error(format!(
-                    "batch-native LoRA prefill forward pass failed: {error}"
-                ))
-            })?;
+        let mut index_pos = 0usize;
+        let mut logits = None;
+        while index_pos < prompt_len {
+            let remaining = prompt_len - index_pos;
+            let chunk_len = self.limits.next_prefill_chunk_len(remaining);
+            let flat_prompt = prompt_ids
+                .iter()
+                .flat_map(|ids| ids[index_pos..index_pos + chunk_len].iter().copied())
+                .collect::<Vec<_>>();
+            let prompt =
+                Tensor::from_vec(flat_prompt, (batch, chunk_len), device).map_err(|error| {
+                    self.execution_error(format!("failed to build batched prompt tensor: {error}"))
+                })?;
+            let next_logits = model
+                .forward_with_adapters(&prompt, index_pos, cache, adapter_assignments)
+                .map_err(|error| {
+                    self.execution_error(format!(
+                        "batch-native LoRA prefill forward pass failed: {error}"
+                    ))
+                })?;
+            index_pos += chunk_len;
+            logits = Some(next_logits);
+        }
+        let mut logits = logits.ok_or_else(|| {
+            self.execution_error("batch-native LoRA prompt produced no prefill logits".to_owned())
+        })?;
         let mut processors = requests
             .iter()
             .map(|request| request.sampling.processor())
