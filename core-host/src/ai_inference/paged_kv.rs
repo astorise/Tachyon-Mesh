@@ -89,6 +89,8 @@ pub(crate) enum PagedKvError {
     },
     /// Tenant id or spill root would escape the per-tenant spill boundary.
     InvalidTenantId(String),
+    /// A logical sequence/block key is already present in a spill tier.
+    DuplicateSpillRecord(String),
     /// Spill encryption or authentication failed.
     Crypto(String),
     /// Raw spill block I/O failed.
@@ -121,6 +123,9 @@ impl fmt::Display for PagedKvError {
             ),
             Self::InvalidTenantId(tenant) => {
                 write!(f, "tenant id `{tenant}` is not valid for KV spill isolation")
+            }
+            Self::DuplicateSpillRecord(key) => {
+                write!(f, "paged KV spill record `{key}` already exists")
             }
             Self::Crypto(detail) => write!(f, "paged KV spill crypto failed: {detail}"),
             Self::SpillIo(detail) => write!(f, "paged KV spill I/O failed: {detail}"),
@@ -383,6 +388,12 @@ impl KvTierPager {
     }
 
     fn spill_block(&mut self, payload: KvBlockPayload) -> Result<(), PagedKvError> {
+        if self.records.contains_key(&payload.key) {
+            return Err(PagedKvError::DuplicateSpillRecord(format!(
+                "{:?}",
+                payload.key
+            )));
+        }
         let requested = payload.bytes.len() as u64;
         let pinned_available = self
             .config
@@ -972,6 +983,50 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_pinned_spill_key_is_rejected_before_charging_capacity() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut pager = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 32,
+                spill_budget_bytes: 0,
+                spill_tier_max: SchedulerSpillTier::Ram,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path(),
+            [11; 32],
+        );
+
+        pager
+            .preempt_block(
+                RouteQos::Standard,
+                kv_payload("tenant-a", "seq-a", 0, 4, b"first-kv"),
+                100,
+                1,
+            )
+            .expect("first logical block should spill");
+        let error = pager
+            .preempt_block(
+                RouteQos::Standard,
+                kv_payload("tenant-a", "seq-a", 0, 5, b"replacement-kv"),
+                100,
+                1,
+            )
+            .expect_err("duplicate logical block should be rejected");
+        assert!(matches!(error, PagedKvError::DuplicateSpillRecord(_)));
+
+        let snapshot = pager.snapshot();
+        assert_eq!(snapshot.pinned_ram_blocks, 1);
+        assert_eq!(snapshot.spilled_bytes, b"first-kv".len() as u64);
+        assert_eq!(
+            pager
+                .restore_block(&kv_key("tenant-a", "seq-a", 0))
+                .expect("original block should remain restoreable"),
+            b"first-kv"
+        );
+        assert_eq!(pager.snapshot().pinned_ram_blocks, 0);
+    }
+
+    #[test]
     fn nvme_tier_encrypts_and_isolates_tenant_spill_files() {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut pager = KvTierPager::new(
@@ -1033,6 +1088,63 @@ mod tests {
         assert!(
             !tenant_a_file.exists(),
             "restoring the block should reclaim the physical spill file"
+        );
+    }
+
+    #[test]
+    fn duplicate_nvme_spill_key_is_rejected_without_orphaning_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut pager = KvTierPager::new(
+            KvTierPagerConfig {
+                pinned_ram_pool_bytes: 0,
+                spill_budget_bytes: 128,
+                spill_tier_max: SchedulerSpillTier::Nvme,
+                tier_preemptible: SchedulerTierPreemptible::default(),
+            },
+            temp.path(),
+            [12; 32],
+        );
+
+        pager
+            .preempt_block(
+                RouteQos::Batch,
+                kv_payload("tenant-a", "seq-a", 0, 7, b"first-nvme-kv"),
+                1_000,
+                1,
+            )
+            .expect("first block should spill to NVMe");
+        let error = pager
+            .preempt_block(
+                RouteQos::Batch,
+                kv_payload("tenant-a", "seq-a", 0, 8, b"replacement-nvme-kv"),
+                1_000,
+                1,
+            )
+            .expect_err("duplicate logical block should be rejected");
+        assert!(matches!(error, PagedKvError::DuplicateSpillRecord(_)));
+
+        let tenant_dir = temp.path().join(tenant_path_segment("tenant-a"));
+        let spill_files = fs::read_dir(&tenant_dir)
+            .expect("tenant spill dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "bin"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spill_files.len(),
+            1,
+            "duplicate retry must not orphan a file"
+        );
+        assert_eq!(
+            pager
+                .restore_block(&kv_key("tenant-a", "seq-a", 0))
+                .expect("original block should remain restoreable"),
+            b"first-nvme-kv"
+        );
+        assert!(
+            fs::read_dir(tenant_dir)
+                .expect("tenant spill dir")
+                .all(|entry| entry.expect("dir entry").path().extension() != Some("bin".as_ref())),
+            "restoring the original block should reclaim its only spill file"
         );
     }
 

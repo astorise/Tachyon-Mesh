@@ -272,12 +272,23 @@ trait BackendModel: Send + Sync {
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
     ) -> Result<Vec<Vec<u8>>> {
+        self.execute_with_adapter_results(inputs, adapters)
+            .into_iter()
+            .collect()
+    }
+
+    fn execute_with_adapter_results(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Vec<Result<Vec<u8>>> {
         if inputs.len() != adapters.len() {
-            bail!(
+            let message = format!(
                 "adapter assignment count {} does not match input count {}",
                 adapters.len(),
                 inputs.len()
             );
+            return repeat_batch_error(inputs.len().max(adapters.len()), message);
         }
         let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
         for group in adapter_assignment_groups(adapters) {
@@ -287,24 +298,38 @@ trait BackendModel: Send + Sync {
                 .map(|index| inputs[*index].clone())
                 .collect::<Vec<_>>();
             let outputs = match adapter {
-                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter)?,
-                None => self.execute(&group_inputs)?,
+                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter),
+                None => self.execute(&group_inputs),
+            };
+            let outputs = match outputs {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    let message = error.to_string();
+                    for index in group {
+                        results[index] = Some(Err(anyhow!("{}", message)));
+                    }
+                    continue;
+                }
             };
             if outputs.len() != group.len() {
-                bail!(
+                let message = format!(
                     "backend returned {} output(s) for an adapter group of {} input(s)",
                     outputs.len(),
                     group.len()
                 );
+                for index in group {
+                    results[index] = Some(Err(anyhow!("{}", message)));
+                }
+                continue;
             }
             for (index, output) in group.into_iter().zip(outputs) {
-                results[index] = Some(output);
+                results[index] = Some(Ok(output));
             }
         }
-        Ok(results
+        results
             .into_iter()
             .map(|output| output.expect("adapter groups cover every input"))
-            .collect())
+            .collect()
     }
 
     /// Stream decoded text fragments through `on_token` as they are produced.
@@ -1427,7 +1452,15 @@ fn process_batch(
         .iter()
         .map(|job| job.adapter.clone())
         .collect::<Vec<_>>();
-    match model.run_batch_with_adapters(&inputs, &adapters) {
+    let results = model.run_batch_with_adapter_results(&inputs, &adapters);
+    if results.len() == batch.len() {
+        return results;
+    }
+
+    match results
+        .into_iter()
+        .collect::<Result<Vec<Vec<u8>>, anyhow::Error>>()
+    {
         // Each job's own output is routed back to that job, never a shared
         // clone of one job's result broadcast to the whole batch.
         Ok(outputs) if outputs.len() == batch.len() => outputs.into_iter().map(Ok).collect(),
@@ -1895,12 +1928,23 @@ impl BackendModel for CandleBackendModel {
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
     ) -> Result<Vec<Vec<u8>>> {
+        self.execute_with_adapter_results(inputs, adapters)
+            .into_iter()
+            .collect()
+    }
+
+    fn execute_with_adapter_results(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Vec<Result<Vec<u8>>> {
         if inputs.len() != adapters.len() {
-            bail!(
+            let message = format!(
                 "adapter assignment count {} does not match input count {}",
                 adapters.len(),
                 inputs.len()
             );
+            return repeat_batch_error(inputs.len().max(adapters.len()), message);
         }
         match &self.kind {
             CandleBackendModelKind::TextGeneration {
@@ -1908,22 +1952,34 @@ impl BackendModel for CandleBackendModel {
                 speculative: None,
             }
             | CandleBackendModelKind::ModelOptNvfp4(target) => {
-                validate_u8_prompts(&self.source.alias, inputs)?;
+                if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
+                    return repeat_batch_error(inputs.len(), error.to_string());
+                }
                 let prompts = inputs
                     .iter()
                     .map(|input| input.data.as_ref())
                     .collect::<Vec<_>>();
                 match target.try_generate_batch_with_adapters(&prompts, adapters) {
                     Ok(Some(outputs)) => {
+                        if outputs.len() != inputs.len() {
+                            return repeat_batch_error(
+                                inputs.len(),
+                                format!(
+                                    "Candle backend returned {} output(s) for a native mixed-adapter batch of {} input(s)",
+                                    outputs.len(),
+                                    inputs.len()
+                                ),
+                            );
+                        }
                         let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
                             "gpu"
                         } else {
                             "cpu"
                         };
                         record_execution(&self.source.alias, executed_on, true);
-                        Ok(outputs)
+                        outputs.into_iter().map(Ok).collect()
                     }
-                    Ok(None) => self.execute_with_adapters_sequential(inputs, adapters),
+                    Ok(None) => self.execute_with_adapters_sequential_results(inputs, adapters),
                     Err(error) => {
                         let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
                             "gpu"
@@ -1931,19 +1987,20 @@ impl BackendModel for CandleBackendModel {
                             "cpu"
                         };
                         record_execution(&self.source.alias, executed_on, false);
-                        Err(anyhow!(
+                        tracing::warn!(
                             "Candle LLM model `{}` loaded from `{}` failed during batch-native LoRA decode: {error}",
                             self.source.alias,
                             target.root().display()
-                        ))
+                        );
+                        self.execute_with_adapters_sequential_results(inputs, adapters)
                     }
                 }
             }
             CandleBackendModelKind::TextGeneration {
                 speculative: Some(_),
                 ..
-            } => self.execute_with_adapters_sequential(inputs, adapters),
-            _ => self.execute_with_adapters_sequential(inputs, adapters),
+            } => self.execute_with_adapters_sequential_results(inputs, adapters),
+            _ => self.execute_with_adapters_sequential_results(inputs, adapters),
         }
     }
 
@@ -2180,12 +2237,13 @@ impl CandleModel {
         self
     }
 
-    fn run_batch_with_adapters(
+    fn run_batch_with_adapter_results(
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<Vec<u8>>> {
-        self.backend_model.execute_with_adapters(inputs, adapters)
+    ) -> Vec<Result<Vec<u8>>> {
+        self.backend_model
+            .execute_with_adapter_results(inputs, adapters)
     }
 }
 
@@ -2908,18 +2966,24 @@ impl SemanticContextFlattener {
     }
 }
 
+fn repeat_batch_error(count: usize, message: impl Into<String>) -> Vec<Result<Vec<u8>>> {
+    let message = message.into();
+    (0..count).map(|_| Err(anyhow!("{}", message))).collect()
+}
+
 impl CandleBackendModel {
-    fn execute_with_adapters_sequential(
+    fn execute_with_adapters_sequential_results(
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Vec<Result<Vec<u8>>> {
         if inputs.len() != adapters.len() {
-            bail!(
+            let message = format!(
                 "adapter assignment count {} does not match input count {}",
                 adapters.len(),
                 inputs.len()
             );
+            return repeat_batch_error(inputs.len().max(adapters.len()), message);
         }
         let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
         for group in adapter_assignment_groups(adapters) {
@@ -2929,24 +2993,38 @@ impl CandleBackendModel {
                 .map(|index| inputs[*index].clone())
                 .collect::<Vec<_>>();
             let outputs = match adapter {
-                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter)?,
-                None => self.execute(&group_inputs)?,
+                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter),
+                None => self.execute(&group_inputs),
+            };
+            let outputs = match outputs {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    let message = error.to_string();
+                    for index in group {
+                        results[index] = Some(Err(anyhow!("{}", message)));
+                    }
+                    continue;
+                }
             };
             if outputs.len() != group.len() {
-                bail!(
+                let message = format!(
                     "Candle backend returned {} output(s) for an adapter group of {} input(s)",
                     outputs.len(),
                     group.len()
                 );
+                for index in group {
+                    results[index] = Some(Err(anyhow!("{}", message)));
+                }
+                continue;
             }
             for (index, output) in group.into_iter().zip(outputs) {
-                results[index] = Some(output);
+                results[index] = Some(Ok(output));
             }
         }
-        Ok(results
+        results
             .into_iter()
             .map(|output| output.expect("adapter groups cover every input"))
-            .collect())
+            .collect()
     }
 }
 
@@ -3040,6 +3118,48 @@ mod tests {
         }
     }
 
+    struct FailingAdapterBackend;
+
+    impl BackendModel for FailingAdapterBackend {
+        fn residency(&self) -> AcceleratorMemoryResidency {
+            AcceleratorMemoryResidency::Vram
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                })
+                .collect())
+        }
+
+        fn execute_with_adapter(
+            &self,
+            inputs: &[SharedInputTensor],
+            adapter: &ResolvedLoraAdapter,
+        ) -> Result<Vec<Vec<u8>>> {
+            if adapter.id == "broken" {
+                bail!("adapter `{}` is malformed", adapter.id);
+            }
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!(
+                        "{}:{}",
+                        adapter.id,
+                        String::from_utf8_lossy(input.data.as_ref())
+                    )
+                    .into_bytes()
+                })
+                .collect())
+        }
+    }
+
     #[derive(Default)]
     struct NativeAdapterBatchBackend {
         native_batches: AtomicUsize,
@@ -3089,12 +3209,22 @@ mod tests {
             inputs: &[SharedInputTensor],
             adapters: &[Option<ResolvedLoraAdapter>],
         ) -> Result<Vec<Vec<u8>>> {
+            self.execute_with_adapter_results(inputs, adapters)
+                .into_iter()
+                .collect()
+        }
+
+        fn execute_with_adapter_results(
+            &self,
+            inputs: &[SharedInputTensor],
+            adapters: &[Option<ResolvedLoraAdapter>],
+        ) -> Vec<Result<Vec<u8>>> {
             self.native_batches.fetch_add(1, Ordering::SeqCst);
-            Ok(inputs
+            inputs
                 .iter()
                 .zip(adapters)
                 .map(|(input, adapter)| {
-                    format!(
+                    Ok(format!(
                         "{}:{}",
                         adapter
                             .as_ref()
@@ -3102,9 +3232,9 @@ mod tests {
                             .unwrap_or("base"),
                         String::from_utf8_lossy(input.data.as_ref())
                     )
-                    .into_bytes()
+                    .into_bytes())
                 })
-                .collect())
+                .collect()
         }
     }
 
@@ -3142,6 +3272,23 @@ mod tests {
                 backend,
             )
             .expect("native adapter batch model should load"),
+        )
+    }
+
+    fn failing_adapter_model(alias: &str) -> Arc<CandleModel> {
+        Arc::new(
+            CandleModel::load_mock_with_backend(
+                &IntegrityModelBinding {
+                    alias: alias.to_owned(),
+                    path: format!("mock:{alias}"),
+                    device: ModelDevice::Cuda,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                },
+                Arc::new(FailingAdapterBackend),
+            )
+            .expect("failing adapter model should load"),
         )
     }
 
@@ -3923,6 +4070,54 @@ mod tests {
         );
         assert_eq!(backend.native_batches.load(Ordering::SeqCst), 1);
         assert_eq!(backend.sequential_adapter_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn process_batch_scopes_adapter_group_failures_to_matching_rows() {
+        let model = failing_adapter_model("adapter-failure-scope");
+        let (ok_tx, _ok_rx) = mpsc::channel();
+        let (base_tx, _base_rx) = mpsc::channel();
+        let (broken_tx, _broken_rx) = mpsc::channel();
+        let mut broken_job = mock_inference_job(&model, "broken", broken_tx);
+        broken_job.input.data = Arc::from(b"broken-input".as_slice());
+        let batch = vec![
+            mock_inference_job(&model, "tenant-ok", ok_tx),
+            InferenceJob {
+                alias: model.alias.clone(),
+                adapter: None,
+                model: Arc::clone(&model),
+                qos: model.qos,
+                input: SharedInputTensor {
+                    dimensions: vec![1],
+                    ty: TensorType::U8,
+                    data: Arc::from(b"plain".as_slice()),
+                },
+                response_tx: base_tx,
+            },
+            broken_job,
+        ];
+
+        let mut results = process_batch(AcceleratorKind::Gpu, &batch);
+        assert_eq!(
+            String::from_utf8(
+                results
+                    .remove(0)
+                    .expect("healthy adapter row should succeed")
+            )
+            .expect("utf8"),
+            "tenant-ok:tenant-ok"
+        );
+        assert_eq!(
+            String::from_utf8(results.remove(0).expect("base row should succeed")).expect("utf8"),
+            "base:plain"
+        );
+        let error = results
+            .remove(0)
+            .expect_err("broken adapter row should fail independently");
+        assert!(
+            error.to_string().contains("adapter `broken` is malformed"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

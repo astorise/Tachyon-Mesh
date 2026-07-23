@@ -205,6 +205,7 @@ The AI inference scheduler SHALL treat requests for the same base model alias as
 - **AND** batched prefill honors `hardware_strategy.prefill_chunk_tokens` before entering token decode
 - **AND** each row's sampled output is routed back to its originating request
 - **AND** unsupported backend or request shapes fall back to sequential adapter sub-batches
+- **AND** an adapter-specific sub-batch failure is reported only to rows using that adapter assignment
 
 ### Requirement: Inference workloads MUST support declarative LoRA Multiplexing
 The `system-faas-model-broker` SHALL allow the sharing of a single base model in VRAM across multiple tenants by dynamically loading LoRA (Low-Rank Adaptation) weights based on Layer 7 routing conditions defined in the GitOps configuration.
@@ -781,6 +782,7 @@ When local VRAM pressure requires paging, the host SHALL evict paged-attention K
 - **THEN** the block is recorded in the pinned RAM tier
 - **AND** the NVMe spill file is not used
 - **AND** spill records are keyed by stable logical sequence/block identity rather than by reusable physical KV slot id
+- **AND** a duplicate spill for an unreclaimed logical key is rejected before charging additional spill capacity
 
 #### Scenario: NVMe spill is encrypted and isolated by tenant
 - **GIVEN** the pinned RAM budget is exhausted
