@@ -133,6 +133,7 @@ fn handle_rag(body: Vec<u8>) -> Result<Vec<u8>, String> {
         &request.index,
         &embedding_source,
         query_embedding.len() as u32,
+        &request_id,
     );
     let request_prefix =
         request_doc_prefix(&request_id, &request.query, &effective_index, &documents);
@@ -310,12 +311,23 @@ fn cleanup_temp_docs(
     Ok(())
 }
 
-fn effective_index_name(requested: &str, embedding_source: &str, dim: u32) -> String {
+fn effective_index_name(
+    requested: &str,
+    embedding_source: &str,
+    dim: u32,
+    request_id: &str,
+) -> String {
+    // A stable index shared across concurrent calls is unsafe: the host's
+    // vector store does a non-atomic read-modify-write on upsert/remove and
+    // caps search results at 100 globally, so concurrent requests can lose
+    // each other's documents or crowd each other out of the result set.
+    // Keeping request_id here isolates each call into its own index.
     format!(
-        "demo-{}-{}-d{}",
+        "demo-{}-{}-d{}-{}",
         sanitize_index_part(requested),
         short_hash_hex(embedding_source.as_bytes()),
         dim,
+        sanitize_index_part(request_id)
     )
 }
 
