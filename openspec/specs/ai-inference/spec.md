@@ -217,13 +217,20 @@ The `system-faas-model-broker` SHALL allow the sharing of a single base model in
 - **AND** processes the prompt without reloading the base model weights, achieving zero-overhead multi-tenancy.
 
 ### Requirement: Large Models MUST support declarative Tensor Parallelism
-The orchestration configuration SHALL allow operators to define a `tensor_parallelism` strategy, forcing the underlying `wasi-nn` backend to partition model layers across multiple available GPUs to prevent OOM errors on large models.
+The orchestration configuration SHALL allow operators to define a `tensor_parallelism` strategy, forcing the underlying `wasi-nn` backend to partition model layers across multiple available GPUs on one node to prevent OOM errors on large models. Placement of one model across multiple machines is out of the active target unless a roadmap model exceeds the aggregate VRAM capacity of a single target node.
 
 #### Scenario: Partitioning a model across GPUs
 - **GIVEN** an AI deployment configured with `tensor_parallelism`
 - **WHEN** the model broker loads a model that exceeds a single GPU's available VRAM
 - **THEN** the runtime partitions model layers across the configured GPU set
 - **AND** rejects startup with a typed configuration error if the requested GPU topology is unavailable.
+
+#### Scenario: Cross-node model placement remains a watchlist item
+- **GIVEN** no roadmap model exceeds the aggregate VRAM capacity of a single target node
+- **WHEN** an operator evaluates multi-node NCCL or pipeline placement for one model
+- **THEN** Tachyon treats that work as deferred rather than an active implementation requirement
+- **AND** request-level overflow to peer nodes remains the horizontal scaling path for models that fit on one node
+- **AND** reactivation starts by reassessing `discover_cluster_topology()`, `core-host/src/ai_inference/parallel.rs`, and the TCP stage transport before estimating NUMA binding and peer-failure handling work
 
 ### Requirement: AI inference bindings MUST classify ModelOpt/NVFP4 directories without mock execution
 
