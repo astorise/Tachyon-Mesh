@@ -646,6 +646,28 @@ pub struct KvCacheFlushOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VectorSearchRequest {
+    pub query: String,
+    pub index: String,
+    pub top_k: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<VectorSearchDocument>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorSearchDocument {
+    pub id: String,
+    pub text: String,
+}
+
+pub type VectorSearchResponse = serde_json::Value;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LogLine {
     pub timestamp: String,
     pub level: String,
@@ -2340,6 +2362,30 @@ pub async fn kv_cache_flush(model: &str) -> Result<KvCacheFlushOutcome> {
 }
 
 // ── WASM function lifecycle ───────────────────────────────────────────────────
+
+/// Query a read-only RAG/vector search route. By default this calls the
+/// `examples/guest-rag-vector` route and lets the guest perform WIT vector
+/// lookup plus optional OpenAI-compatible completion.
+pub async fn vector_search(
+    route_path: &str,
+    request: &VectorSearchRequest,
+) -> Result<VectorSearchResponse> {
+    if request.query.trim().is_empty() {
+        anyhow::bail!("vector search query must not be empty");
+    }
+    if request.index.trim().is_empty() {
+        anyhow::bail!("vector search index must not be empty");
+    }
+    if request.top_k == 0 {
+        anyhow::bail!("vector search top_k must be greater than zero");
+    }
+    let path = if route_path.trim().is_empty() {
+        "/api/guest-rag-vector"
+    } else {
+        route_path.trim()
+    };
+    post_admin_json(path, request).await
+}
 
 /// List deployed functions (routes) by reading the live mesh graph.
 pub async fn list_functions() -> Result<Vec<MeshRouteSummary>> {

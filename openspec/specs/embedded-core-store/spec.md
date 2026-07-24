@@ -35,3 +35,24 @@ The Mesh SHALL expose a `wit/store/vector.wit` interface in the Wasm Component M
 - **AND** returns the matching IDs and scores to the guest
 - **AND** the index data remains isolated from other tenants according to the optional TDE policy
 
+### Requirement: Repository provides an end-to-end RAG vector guest example
+The repository SHALL provide an `examples/guest-rag-vector` user FaaS example that demonstrates document ingestion, embedding generation, vector upsert/search through `tachyon:mesh/vector`, and answer generation with retrieved context. The example SHALL try the OpenAI-compatible `/ai/v1/embeddings` and `/ai/v1/chat/completions` routes through scoped outbound HTTP when they are available, and SHALL provide deterministic local fallbacks so the route remains smoke-testable without a loaded model.
+
+#### Scenario: RAG guest indexes documents and returns nearest context
+- **WHEN** `/api/guest-rag-vector` receives a JSON request with `query`, `index`, `topK`, and optional `documents`
+- **THEN** the guest creates or reuses the named vector index
+- **AND** upserts document embeddings with payload text
+- **AND** searches the index with the query embedding
+- **AND** returns `matches` containing document IDs, scores, and payload text
+
+#### Scenario: RAG guest uses OpenAI-compatible routes when available
+- **GIVEN** the route's deployment scopes grant outbound HTTP access to `/ai/v1/embeddings` and `/ai/v1/chat/completions`
+- **WHEN** those routes return successful OpenAI-compatible responses
+- **THEN** `guest-rag-vector` uses their embeddings and completion content
+- **AND** the response identifies the OpenAI-compatible embedding and completion sources
+
+#### Scenario: RAG guest falls back without a loaded model
+- **GIVEN** the OpenAI-compatible routes are absent, unavailable, or return unusable payloads
+- **WHEN** `/api/guest-rag-vector` handles a request
+- **THEN** it computes deterministic local embeddings
+- **AND** returns a fallback answer grounded in the best retrieved match
