@@ -533,21 +533,21 @@ When the runtime is built with the `candle-cuda` Cargo feature, tensor-, pipelin
 - **THEN** the runtime uses the existing matmul, causal-mask, softmax, and value-projection path
 - **AND** CPU/F32 parallel Llama tests remain numerically equivalent to the dense reference path
 
-### Requirement: The runtime MUST execute pipeline-parallel inference across multiple nodes
-When a model deployment is configured with `hardware_strategy.distribution_mode: pipeline_parallelism`, the runtime SHALL assign contiguous layer ranges to distinct nodes/GPUs, SHALL stream activations between pipeline stages over a point-to-point transport implementing `StageTransport`, and SHALL support full autoregressive generation (prefill followed by an arbitrary number of decode steps), not prefill alone.
+### Requirement: The runtime MUST execute pipeline-parallel prefill across local stages
+When a model deployment is configured with `hardware_strategy.distribution_mode: pipeline_parallelism`, the runtime SHALL assign contiguous layer ranges to local pipeline stages on the target node's configured GPU/device set and SHALL hand off activations between stages through a point-to-point transport implementing `StageTransport`. Cross-machine placement of one live model remains deferred per the cross-node watchlist scenario, and token decode SHALL fail closed until a persistent per-stage KV-cache decode loop is implemented.
 
 #### Scenario: Layers are split across pipeline stages
-- **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` across N nodes
+- **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` across N local stages
 - **WHEN** the model broker loads the model
-- **THEN** each node is assigned a contiguous, non-overlapping range of layers
-- **AND** each node executes its layer range with a real transformer-block forward pass
+- **THEN** each stage is assigned a contiguous, non-overlapping range of layers
+- **AND** each stage executes its layer range with a real transformer-block forward pass
 
-#### Scenario: A pipeline-parallel deployment generates more than one token
+#### Scenario: A pipeline-parallel deployment rejects decode until per-stage KV reuse is wired
 - **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` and successfully loaded
 - **WHEN** a generation request is submitted with `max_tokens > 1`
 - **THEN** the runtime completes an initial prefill pass across all stages
-- **AND** completes a decode pass for each subsequent token, each stage reusing a persistent per-stage KV cache rather than rebuilding it from scratch
-- **AND** the final output is numerically equivalent (within floating-point tolerance) to a dense single-device reference run of the same model and prompt for the same number of tokens
+- **AND** returns a typed "decode not yet supported for pipeline parallelism" error before producing incorrect token output
+- **AND** does not silently downgrade to a dense single-device execution plan
 
 #### Scenario: Pipeline depth bounds in-flight micro-batches
 - **GIVEN** a pipeline-parallel deployment with a configured pipeline depth
@@ -556,7 +556,7 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 - **AND** additional requests queue rather than unboundedly growing per-stage memory usage
 
 ### Requirement: The runtime MUST execute expert-parallel inference for Mixture-of-Experts checkpoints
-For checkpoints declaring expert tensors (e.g. Mixtral-style `model_type: mixtral` checkpoints), the runtime SHALL load the checkpoint, partition experts across the configured GPU/node set, and SHALL route each token only to the device(s) hosting its selected expert, rather than rejecting expert-parallel deployments outright or replicating all experts on every device.
+For checkpoints declaring expert tensors (e.g. Mixtral-style `model_type: mixtral` checkpoints), the runtime SHALL load the checkpoint, partition experts across the configured local GPU/device set, and SHALL route each token only to the device(s) hosting its selected expert, rather than rejecting expert-parallel deployments outright or replicating all experts on every device.
 
 #### Scenario: An MoE checkpoint is loaded and partitioned across devices
 - **GIVEN** a model deployment configured with `distribution_mode: expert_parallelism` and a checkpoint whose `config.json` declares `model_type: mixtral`
@@ -590,7 +590,7 @@ For checkpoints declaring expert tensors (e.g. Mixtral-style `model_type: mixtra
 - **AND** does not silently truncate routing to top-1
 
 ### Requirement: Parallel execution plans MUST be validated against discovered hardware topology before deployment
-The runtime SHALL reject, with a typed topology error, any `tensor_parallelism`, `pipeline_parallelism`, or `expert_parallelism` deployment whose GPU/node count, interconnect class, or per-shard VRAM requirement cannot be satisfied by the cluster's discovered hardware topology. On CUDA builds, per-device free VRAM SHALL be sourced from real NVML telemetry rather than a hardcoded placeholder value, so the VRAM check can actually reject an oversized deployment in production.
+The runtime SHALL reject, with a typed topology error, any `tensor_parallelism`, `pipeline_parallelism`, or `expert_parallelism` deployment whose requested local GPU/device count, interconnect class, or per-shard VRAM requirement cannot be satisfied by the target node's discovered hardware topology. On CUDA builds, per-device free VRAM SHALL be sourced from real NVML telemetry rather than a hardcoded placeholder value, so the VRAM check can actually reject an oversized deployment in production.
 
 #### Scenario: Insufficient GPU count is rejected at deploy time
 - **WHEN** a deployment requests `tensor_parallelism` across more GPUs than are available on the target node
