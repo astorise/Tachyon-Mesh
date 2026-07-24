@@ -294,6 +294,7 @@ fn missing_required_args(tool_name: &str, arguments: Option<&Value>) -> Option<V
         "tachyon_kv_put" => &["namespace", "key", "value"],
         "tachyon_kv_delete" => &["namespace", "key"],
         "tachyon_kv_cache_stats" | "tachyon_kv_cache_flush" => &["model"],
+        "tachyon_vector_search" => &["query", "index", "top_k"],
         "tachyon_canary_split" => &["route_path", "weight_pct"],
         "tachyon_register_resource" => &["name", "type", "target"],
         "tachyon_dryrun_manifest" => &["manifest"],
@@ -371,6 +372,7 @@ fn rate_limit_spec(tool_name: &str) -> Option<RateLimitSpec> {
         | "tachyon_lora_training_status"
         | "tachyon_kv_get"
         | "tachyon_kv_cache_stats"
+        | "tachyon_vector_search"
         | "tachyon_dryrun_manifest"
         | "validate_faas_capabilities"
         | "run_chaos_scenario"
@@ -736,7 +738,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                             },
                             "scopes": {
                                 "type": "object",
-                                "description": "Scopes block to merge. Keys are WIT categories (secrets, kv, graph, sql, http_client, blob, messaging, crypto, routing, compute); values are arrays of glob patterns or 'allow-all'."
+                                "description": "Scopes block to merge. Keys are WIT categories (secrets, kv, graph, sql, http, blob, messaging, crypto, routing, compute); values are arrays of glob patterns or 'allow-all'."
                             },
                             "dry_run": {
                                 "type": "boolean",
@@ -771,7 +773,7 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                 },
                 {
                     "name": "tachyon_patch_manifest",
-                    "description": "Patch configurable host-level fields in the live manifest. Reads the current manifest, recursively merges the JSON patch object at the manifest root using JSON Merge Patch semantics: object fields merge recursively, null removes the target key, and missing keys are left unchanged. It validates the merged manifest through the node dry-run endpoint, and POSTs it when dry_run=false. Prefer dry_run=true first to preview host-level edits such as enrollment, layer4, tee_backend, trusted_signers, require_scopes, kv_caches, telemetry_sample_rate, instance_pool_max_memory_bytes, cloud_sync_endpoint, or batch_targets. The structural fields routes, config_version, and asset_versions cannot be patched here, including via null; use tachyon_patch_route for route changes.",
+                    "description": "Patch configurable host-level fields in the live manifest. Reads the current manifest, recursively merges the JSON patch object at the manifest root using JSON Merge Patch semantics: object fields merge recursively, null removes the target key, and missing keys are left unchanged. It validates the merged manifest through the node dry-run endpoint, and POSTs it when dry_run=false. Prefer dry_run=true first to preview host-level edits such as enrollment, layer4, tee_backend, trusted_signers, require_scopes, kv_caches, scheduler, telemetry_sample_rate, instance_pool_max_memory_bytes, cloud_sync_endpoint, or batch_targets. The structural fields routes, config_version, and asset_versions cannot be patched here, including via null; use tachyon_patch_route for route changes.",
                     "inputSchema": {
                         "type": "object",
                         "required": ["patch"],
@@ -982,6 +984,34 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
                         "required": ["model"],
                         "properties": {
                             "model": { "type": "string", "description": "Model reference declared in IntegrityConfig.kv_caches[].model_ref." }
+                        }
+                    }
+                },
+                {
+                    "name": "tachyon_vector_search",
+                    "description": "Read-only RAG/vector query. Forwards query, index, and top_k to the configured vector-search route (default /api/guest-rag-vector), returning nearest context and the route's answer without mutating MCP state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["query", "index", "top_k"],
+                        "properties": {
+                            "query": { "type": "string", "description": "Natural-language query to embed and search." },
+                            "index": { "type": "string", "description": "Vector index name, for example `tenant-kb`." },
+                            "top_k": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum number of nearest matches to return." },
+                            "route_path": { "type": "string", "default": "/api/guest-rag-vector", "description": "Optional Tachyon route that implements the RAG/vector HTTP contract." },
+                            "embedding_model": { "type": "string", "description": "Optional OpenAI-compatible embedding model alias passed to the route." },
+                            "chat_model": { "type": "string", "description": "Optional OpenAI-compatible chat model alias passed to the route." },
+                            "documents": {
+                                "type": "array",
+                                "description": "Optional demo documents to ingest before search. Each item has id and text.",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["id", "text"],
+                                    "properties": {
+                                        "id": { "type": "string" },
+                                        "text": { "type": "string" }
+                                    }
+                                }
+                            }
                         }
                     }
                 },
@@ -1675,7 +1705,7 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                 (
                     Some(
                         "# Conservative starting point — tighten patterns after observing runtime behaviour\n\
-                         scopes:\n  secrets: [\"**\"]\n  kv: [\"**\"]\n  http_client: [\"**\"]\n\
+                         scopes:\n  secrets: [\"**\"]\n  kv: [\"**\"]\n  http: [\"**\"]\n\
                          # Remove categories your function does not use"
                             .to_string(),
                     ),
@@ -1952,6 +1982,57 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
             Ok(text_tool_result(&outcome)?)
         }
 
+        // ── Vector/RAG search ─────────────────────────────────────────────────
+        "tachyon_vector_search" => {
+            let arguments = params
+                .and_then(|v| v.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let query = arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .context("missing query")?
+                .to_owned();
+            let index = arguments
+                .get("index")
+                .and_then(Value::as_str)
+                .context("missing index")?
+                .to_owned();
+            let top_k = arguments
+                .get("top_k")
+                .and_then(Value::as_u64)
+                .context("missing top_k")?
+                .min(50) as u32;
+            let route_path = arguments
+                .get("route_path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| env::var("TACHYON_MCP_VECTOR_SEARCH_PATH").ok())
+                .unwrap_or_else(|| "/api/guest-rag-vector".to_owned());
+            let documents = arguments
+                .get("documents")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("invalid documents payload")?;
+            let request = tachyon_client::VectorSearchRequest {
+                query,
+                index,
+                top_k,
+                documents,
+                embedding_model: arguments
+                    .get("embedding_model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                chat_model: arguments
+                    .get("chat_model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                request_id: None,
+            };
+            let result = tachyon_client::vector_search(&route_path, &request).await?;
+            Ok(text_tool_result(&result)?)
+        }
         // ── Canary traffic split ──────────────────────────────────────────────
         "tachyon_canary_split" => {
             let arguments = params
@@ -2465,6 +2546,27 @@ mod tests {
         assert_eq!(flush.limit, 30);
     }
 
+    #[test]
+    fn vector_search_required_args_and_rate_limit_match_spec() {
+        assert_eq!(
+            missing_required_args("tachyon_vector_search", Some(&json!({}))),
+            Some(vec![
+                "query".to_owned(),
+                "index".to_owned(),
+                "top_k".to_owned()
+            ])
+        );
+        assert!(missing_required_args(
+            "tachyon_vector_search",
+            Some(&json!({"query": "q", "index": "tenant-kb", "top_k": 3}))
+        )
+        .is_none());
+
+        let spec =
+            rate_limit_spec("tachyon_vector_search").expect("vector search must have a rate limit");
+        assert_eq!(spec.limit, 100);
+    }
+
     #[tokio::test]
     async fn tools_list_includes_kv_cache_admin_tools() {
         let context = McpContext::new_for_tests(test_state_path("tools-list-kv-cache"));
@@ -2486,6 +2588,7 @@ mod tests {
 
         assert!(names.contains(&"tachyon_kv_cache_stats"));
         assert!(names.contains(&"tachyon_kv_cache_flush"));
+        assert!(names.contains(&"tachyon_vector_search"));
     }
 
     #[tokio::test]
@@ -2511,6 +2614,13 @@ mod tests {
         assert_eq!(
             patch_manifest["inputSchema"]["properties"]["dry_run"]["default"],
             true
+        );
+        assert!(
+            patch_manifest["description"]
+                .as_str()
+                .expect("patch_manifest description should be a string")
+                .contains("scheduler"),
+            "patch_manifest description should advertise scheduler host-level edits"
         );
     }
 

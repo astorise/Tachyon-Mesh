@@ -327,6 +327,7 @@ world faas-guest {
     import kv-partition;
     import graph;
     import custom-metrics;
+    import outbound-http;
     import response-body;
     export handler;
 }

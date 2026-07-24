@@ -175,7 +175,9 @@ wkg list ghcr.io/astorise/tachyon-mesh-wit
 
 ## 🛠️ IDE Integration & Schema Validation
 
-While `core-host` is running, it serves live JSON Schema documents for its configuration files — enabling real-time validation and autocompletion in VS Code, JetBrains, and Neovim without copying schema files.
+While `core-host` is running, it serves live JSON Schema documents for its configuration files — enabling real-time validation and autocompletion in VS Code, JetBrains, and Neovim without copying schema files. Each versioned GitHub release also publishes offline `integrity-config.schema.json` and `integrity-lock.schema.json` assets with release-pinned `$id` values.
+
+Use release URLs such as `https://github.com/astorise/tachyon-mesh/releases/download/v1.2.3/integrity-config.schema.json` when you need a stable `$schema` value for CI, air-gapped validation, or editor completion pinned to a Tachyon version.
 
 **VS Code quick setup** (`.vscode/settings.json`):
 ```json

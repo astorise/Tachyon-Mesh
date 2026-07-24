@@ -29,6 +29,26 @@ serde_json::to_string(&schema)
 - **THEN** core-host returns the generated `IntegrityConfig` JSON Schema
 - **AND** the schema exposes snake_case properties matching serde deserialization
 - **AND** it includes nested route configuration such as `targets`, `models`, `hardware_strategy`, `volumes`, `runtime`, `concurrency`, `distributed_rate_limit`, and `canary.metrics`
+- **AND** it includes the host-level `scheduler` block with `tenant_weights`, `tier_preemptible`, `spill_budget_bytes`, `spill_tier_max`, and `pinned_ram_pool_bytes`
+
+### Requirement: Manifest validation MUST cover declarative AI scheduler policy
+The integrity manifest SHALL accept a host-level `scheduler` block that declares tenant weights, QoS-tier preemptibility, spill budget, maximum spill tier, and pinned RAM pool sizing. Omitted scheduler fields SHALL deserialize to the previous scheduler behavior: no tenant-specific weighting, `RealTime` not preemptible/pageable, `Standard` and `Batch` preemptible/pageable, RAM as the maximum spill tier, and zero explicit spill/pinned-pool budget. Validation SHALL reject non-positive tenant weights and tenant keys that do not resolve to `default` or a tenant declared by route-level `adapter_id`.
+
+#### Scenario: Scheduler policy appears in the manifest schema
+- **WHEN** an operator requests `GET /admin/schema/manifest`
+- **THEN** the schema exposes `scheduler.tenant_weights`, `scheduler.tier_preemptible`, `scheduler.spill_budget_bytes`, `scheduler.spill_tier_max`, and `scheduler.pinned_ram_pool_bytes`
+- **AND** MCP host-level manifest patching can describe and patch the `scheduler` block through the generated manifest schema
+
+#### Scenario: Scheduler validation rejects unknown or zero-weight tenants
+- **WHEN** a manifest declares `scheduler.tenant_weights` with a weight of `0`
+- **THEN** validation fails before the manifest is sealed
+- **WHEN** a manifest declares a scheduler tenant that is neither `default` nor a route `adapter_id`
+- **THEN** validation fails before the manifest is sealed
+
+#### Scenario: RealTime remains non-preemptible by default
+- **WHEN** a manifest omits `scheduler.tier_preemptible`
+- **THEN** `RealTime` routes are not preemptible/pageable
+- **AND** `Standard` and `Batch` routes remain preemptible/pageable
 
 ### Requirement: The host provides an incremental body-flush streaming transport
 
@@ -106,6 +126,15 @@ A new endpoint `GET /admin/schema/integrity-lock` SHALL return a JSON Schema doc
 - **WHEN** an agent calls `GET /admin/schema/integrity-lock`
 - **THEN** the response is JSON with top-level `config_payload`, `public_key`, and `signature` properties
 - **AND** it does not document camelCase runtime fields such as `hostAddress`
+
+### Requirement: core-host MUST generate release-ready manifest schema files
+The `core-host` binary SHALL provide a `schema` command that writes `integrity-config.schema.json` from `IntegrityConfig` and `integrity-lock.schema.json` from `IntegrityManifest`. The generated file schemas SHALL use the same schemars generation path as the live admin endpoints. When a release tag is supplied, each schema SHALL include a `$id` pointing at the corresponding GitHub Release asset URL.
+
+#### Scenario: Operator generates versioned schema files from source
+- **WHEN** a developer runs `cargo run -p core-host -- schema --output-dir target/schemas --release-tag v1.2.3`
+- **THEN** `target/schemas/integrity-config.schema.json` is written from the `IntegrityConfig` schema
+- **AND** `target/schemas/integrity-lock.schema.json` is written from the `IntegrityManifest` schema
+- **AND** each schema contains a `$id` under `https://github.com/astorise/tachyon-mesh/releases/download/v1.2.3/`
 
 ### Requirement: core-host MUST expose a zero-copy layer-wise inference WIT contract
 The project SHALL define `wit/ai/inference.wit` in the existing `tachyon:mesh@1.1.0` WIT package and SHALL expose a `layer-execution` interface with opaque `tensor-handle` values so Wasm guests can sequence model layers without copying intermediate tensors through linear memory.

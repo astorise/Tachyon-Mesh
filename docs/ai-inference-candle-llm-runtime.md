@@ -90,6 +90,27 @@ already had its own real CUDA path via `distribution_mode:
 tensor_parallelism`/`pipeline_parallelism`/`expert_parallelism`, unaffected
 by this.
 
+## Cross-Node Model Placement Watchlist
+
+Tachyon currently optimizes for homelab/edge deployments where the target model
+fits within one RTX-class node. Multi-GPU model parallelism is active only as a
+single-node placement concern. `parallel.rs` contains the NCCL all-reduce path
+for CUDA tensor-parallel ranks and a minimal TCP stage transport that can move
+pipeline activations over a real socket, but Tachyon does not treat placement of
+one live model across multiple machines as an active product requirement.
+
+Keep production cross-machine placement of one live model in watchlist status
+until a roadmap model exceeds the aggregate VRAM capacity of a single target
+node, for example a 100B+ unquantized checkpoint or an unusually long-context
+deployment. The existing NCCL TCP bootstrap and `StageTransport` socket
+primitives remain valid groundwork, but they are not by themselves a product
+requirement to orchestrate one forward pass across machines. Until the roadmap
+trigger is met, scale horizontally by overflowing whole requests to peers that
+already host the model. On reactivation, reassess how far
+`discover_cluster_topology()`, `parallel.rs`, and the TCP bootstrap cover the
+target topology before sizing placement, NUMA binding, peer failure during
+forward, and production orchestration work.
+
 ## PagedAttention Status
 
 The pinned `astorise/candle` fork is consumed through a Tachyon release tag

@@ -20,6 +20,7 @@ through the sealed manifest path. The live schema is available from
 | `require_scopes` | Routing panel, Manifest routing controls |
 | `trusted_signers` | Identity panel, Trusted manifest signers form |
 | `telemetry_sample_rate`, `instance_pool_max_memory_bytes`, `cloud_sync_endpoint`, `batch_targets` | Routing panel, Manifest routing controls |
+| `scheduler.tenant_weights`, `scheduler.tier_preemptible`, `scheduler.spill_budget_bytes`, `scheduler.spill_tier_max`, `scheduler.pinned_ram_pool_bytes` | AI/Hardware panel, manifest schema editor |
 
 ## Manifest Only
 

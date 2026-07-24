@@ -9,7 +9,10 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::IpAddr,
     path::PathBuf,
-    sync::{OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock, RwLock,
+    },
 };
 use sysinfo::System;
 
@@ -62,6 +65,7 @@ pub struct InstanceConfig {
 static CONNECTION_STATE: OnceLock<RwLock<Option<InstanceConfig>>> = OnceLock::new();
 static SESSION_OPERATOR: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 static HTTP_CLIENT_CACHE: OnceLock<RwLock<BTreeMap<String, reqwest::Client>>> = OnceLock::new();
+static VECTOR_SEARCH_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -643,6 +647,30 @@ pub struct KvCacheFlushOutcome {
     pub model: String,
     pub evicted: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorSearchRequest {
+    pub query: String,
+    pub index: String,
+    pub top_k: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<VectorSearchDocument>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorSearchDocument {
+    pub id: String,
+    pub text: String,
+}
+
+pub type VectorSearchResponse = serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2340,6 +2368,43 @@ pub async fn kv_cache_flush(model: &str) -> Result<KvCacheFlushOutcome> {
 }
 
 // ── WASM function lifecycle ───────────────────────────────────────────────────
+
+/// Query a read-only RAG/vector search route. By default this calls the
+/// `examples/guest-rag-vector` route and lets the guest perform WIT vector
+/// lookup plus optional OpenAI-compatible completion.
+pub async fn vector_search(
+    route_path: &str,
+    request: &VectorSearchRequest,
+) -> Result<VectorSearchResponse> {
+    if request.query.trim().is_empty() {
+        anyhow::bail!("vector search query must not be empty");
+    }
+    if request.index.trim().is_empty() {
+        anyhow::bail!("vector search index must not be empty");
+    }
+    if request.top_k == 0 {
+        anyhow::bail!("vector search top_k must be greater than zero");
+    }
+    let path = if route_path.trim().is_empty() {
+        "/api/guest-rag-vector"
+    } else {
+        route_path.trim()
+    };
+    let mut request = request.clone();
+    if request.request_id.is_none() {
+        request.request_id = Some(vector_search_request_id());
+    }
+    post_admin_json(path, &request).await
+}
+
+fn vector_search_request_id() -> String {
+    let counter = VECTOR_SEARCH_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}-{counter}", std::process::id())
+}
 
 /// List deployed functions (routes) by reading the live mesh graph.
 pub async fn list_functions() -> Result<Vec<MeshRouteSummary>> {
@@ -4757,6 +4822,16 @@ mod tests {
         assert_eq!(stats.total_bytes, 2048);
         assert_eq!(stats.expired_count, 1);
         assert_eq!(stats.hit_rate, None);
+    }
+
+    #[test]
+    fn vector_search_request_ids_are_unique() {
+        let first = vector_search_request_id();
+        let second = vector_search_request_id();
+
+        assert_ne!(first, second);
+        assert!(!first.trim().is_empty());
+        assert!(!second.trim().is_empty());
     }
 
     #[test]

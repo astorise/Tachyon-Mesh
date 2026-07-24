@@ -180,6 +180,26 @@ The MCP server SHALL expose LLM inference KV-cache administration tools backed b
 - **WHEN** `tachyon_kv_cache_flush` exhausts its per-minute mutator bucket
 - **THEN** further calls return the structured rate-limit error (`-32002`) with `retry_after_ms`
 
+### Requirement: MCP exposes read-only vector search for RAG agents
+The MCP server SHALL expose a `tachyon_vector_search` JSON-RPC tool for agent-facing RAG queries. The tool SHALL require `query`, `index`, and `top_k`, SHALL accept optional `route_path`, `embedding_model`, `chat_model`, and request-local `documents`, and SHALL delegate through `tachyon_client::vector_search` to a configured Tachyon route that implements the RAG/vector HTTP contract. The default route SHALL be `/api/guest-rag-vector`, overridable per call via `route_path` or per process via `TACHYON_MCP_VECTOR_SEARCH_PATH`. The delegated client request SHALL include an internal request identifier so temporary RAG vector documents are isolated per tool call. The tool SHALL be read-only from MCP's perspective and SHALL use the read-oriented rate-limit bucket.
+
+#### Scenario: Agent calls vector search with required arguments
+- **WHEN** an MCP client calls `tachyon_vector_search` with `query`, `index`, and `top_k`
+- **THEN** the server forwards those values to `tachyon_client::vector_search`
+- **AND** the client posts the request to `/api/guest-rag-vector` unless an override route is configured
+- **AND** the posted payload carries a per-call request identifier
+- **AND** the tool returns the route's JSON response as text tool content
+
+#### Scenario: Missing vector search arguments are rejected before cluster dispatch
+- **WHEN** a `tachyon_vector_search` call omits `query`, `index`, or `top_k`
+- **THEN** the MCP server returns an invalid-params error (`-32602`)
+- **AND** it does not contact the cluster
+
+#### Scenario: Vector search is rate-limited as a read-only tool
+- **WHEN** `tachyon_vector_search` is called within its read-oriented per-minute budget
+- **THEN** the request is permitted independently from mutator tool buckets
+- **AND** exceeding the read bucket returns the structured rate-limit error (`-32002`) with `retry_after_ms`
+
 ### Requirement: tachyon-mcp MUST have a stdio E2E test harness
 A Rust integration test at `tachyon-mcp/tests/mcp_e2e_runner.rs` SHALL spawn the compiled `tachyon-mcp` binary, drive it via stdin/stdout, and assert that: (1) `initialize` returns the correct MCP protocol version; (2) `tools/list` returns a structurally valid JSON-RPC response; (3) with a live cluster, the core tools are present and read-only calls do not return `-32603`.
 
