@@ -10,6 +10,7 @@ mod bindings {
 }
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DEFAULT_INDEX: &str = "tenant-kb";
 const DEFAULT_EMBEDDING_MODEL: &str = "demo-embedding";
@@ -17,6 +18,8 @@ const DEFAULT_CHAT_MODEL: &str = "demo-chat";
 const FALLBACK_EMBEDDING_DIM: u32 = 16;
 
 struct Component;
+
+static LOCAL_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +35,8 @@ struct RagRequest {
     embedding_model: String,
     #[serde(default = "default_chat_model")]
     chat_model: String,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -119,12 +124,18 @@ fn handle_rag(body: Vec<u8>) -> Result<Vec<u8>, String> {
     let query_embedding = embeddings
         .pop()
         .ok_or_else(|| "embedding pipeline returned no query embedding".to_owned())?;
+    let request_id = request
+        .request_id
+        .clone()
+        .unwrap_or_else(|| local_request_id(&request.query, &documents));
     let effective_index = effective_index_name(
         &request.index,
         &embedding_source,
         query_embedding.len() as u32,
+        &request_id,
     );
-    let request_prefix = request_doc_prefix(&request.query, &effective_index, &documents);
+    let request_prefix =
+        request_doc_prefix(&request_id, &request.query, &effective_index, &documents);
 
     let _ = bindings::tachyon::mesh::vector::create_index(
         &bindings::tachyon::mesh::vector::IndexSpec {
@@ -151,12 +162,15 @@ fn handle_rag(body: Vec<u8>) -> Result<Vec<u8>, String> {
     bindings::tachyon::mesh::vector::upsert(&effective_index, &vector_docs)
         .map_err(|error| format!("vector upsert failed: {error}"))?;
 
+    let search_top_k = request.top_k.saturating_add(vector_docs.len() as u32);
     let search_result =
-        bindings::tachyon::mesh::vector::search(&effective_index, &query_embedding, request.top_k);
+        bindings::tachyon::mesh::vector::search(&effective_index, &query_embedding, search_top_k);
     cleanup_temp_docs(&effective_index, &vector_docs)?;
     let matches = search_result
         .map_err(|error| format!("vector search failed: {error}"))?
         .into_iter()
+        .filter(|item| item.id.starts_with(&request_prefix))
+        .take(request.top_k as usize)
         .map(|item| {
             let payload = item.payload.unwrap_or_default();
             let doc = serde_json::from_slice::<InputDocument>(&payload).ok();
@@ -296,17 +310,29 @@ fn cleanup_temp_docs(
     Ok(())
 }
 
-fn effective_index_name(requested: &str, embedding_source: &str, dim: u32) -> String {
+fn effective_index_name(
+    requested: &str,
+    embedding_source: &str,
+    dim: u32,
+    request_id: &str,
+) -> String {
     format!(
-        "demo-{}-{}-d{}",
+        "demo-{}-{}-d{}-{}",
         sanitize_index_part(requested),
         short_hash_hex(embedding_source.as_bytes()),
-        dim
+        dim,
+        sanitize_index_part(request_id)
     )
 }
 
-fn request_doc_prefix(query: &str, index: &str, documents: &[InputDocument]) -> String {
+fn request_doc_prefix(
+    request_id: &str,
+    query: &str,
+    index: &str,
+    documents: &[InputDocument],
+) -> String {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(request_id.as_bytes());
     bytes.extend_from_slice(index.as_bytes());
     bytes.extend_from_slice(query.as_bytes());
     for doc in documents {
@@ -314,6 +340,17 @@ fn request_doc_prefix(query: &str, index: &str, documents: &[InputDocument]) -> 
         bytes.extend_from_slice(doc.text.as_bytes());
     }
     format!("req-{}", short_hash_hex(&bytes))
+}
+
+fn local_request_id(query: &str, documents: &[InputDocument]) -> String {
+    let counter = LOCAL_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = counter.to_le_bytes().to_vec();
+    bytes.extend_from_slice(query.as_bytes());
+    for doc in documents {
+        bytes.extend_from_slice(doc.id.as_bytes());
+        bytes.extend_from_slice(doc.text.as_bytes());
+    }
+    format!("local-{}", short_hash_hex(&bytes))
 }
 
 fn temp_doc_id(prefix: &str, doc_id: &str) -> String {

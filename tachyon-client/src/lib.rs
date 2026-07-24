@@ -9,7 +9,10 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::IpAddr,
     path::PathBuf,
-    sync::{OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock, RwLock,
+    },
 };
 use sysinfo::System;
 
@@ -62,6 +65,7 @@ pub struct InstanceConfig {
 static CONNECTION_STATE: OnceLock<RwLock<Option<InstanceConfig>>> = OnceLock::new();
 static SESSION_OPERATOR: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 static HTTP_CLIENT_CACHE: OnceLock<RwLock<BTreeMap<String, reqwest::Client>>> = OnceLock::new();
+static VECTOR_SEARCH_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -656,6 +660,8 @@ pub struct VectorSearchRequest {
     pub embedding_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2384,7 +2390,20 @@ pub async fn vector_search(
     } else {
         route_path.trim()
     };
-    post_admin_json(path, request).await
+    let mut request = request.clone();
+    if request.request_id.is_none() {
+        request.request_id = Some(vector_search_request_id());
+    }
+    post_admin_json(path, &request).await
+}
+
+fn vector_search_request_id() -> String {
+    let counter = VECTOR_SEARCH_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}-{counter}", std::process::id())
 }
 
 /// List deployed functions (routes) by reading the live mesh graph.
@@ -4803,6 +4822,16 @@ mod tests {
         assert_eq!(stats.total_bytes, 2048);
         assert_eq!(stats.expired_count, 1);
         assert_eq!(stats.hit_rate, None);
+    }
+
+    #[test]
+    fn vector_search_request_ids_are_unique() {
+        let first = vector_search_request_id();
+        let second = vector_search_request_id();
+
+        assert_ne!(first, second);
+        assert!(!first.trim().is_empty());
+        assert!(!second.trim().is_empty());
     }
 
     #[test]

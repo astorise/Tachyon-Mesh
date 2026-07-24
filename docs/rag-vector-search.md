@@ -68,7 +68,7 @@ Expected response fields:
 
 - `answer`: model answer or fallback answer grounded in the best match,
 - `matches`: nearest documents with scores and payload text,
-- `effectiveIndex`: temporary dimension/source-specific index used internally,
+- `effectiveIndex`: temporary per-request, dimension/source-specific index used internally,
 - `embeddingSource`: `openai-compatible:<model>` or local fallback,
 - `completionSource`: `openai-compatible:<model>` or local fallback.
 
@@ -110,4 +110,6 @@ Optional arguments:
 - `documents`: temporary documents to ingest before the search.
 
 The MCP server applies the normal connection/auth flow (`TACHYON_MCP_URL` and
-`TACHYON_MCP_PAT`) and rate-limits the tool as a high-throughput read operation.
+`TACHYON_MCP_PAT`), injects an internal request identifier so temporary vector
+documents are isolated per call, and rate-limits the tool as a high-throughput
+read operation.

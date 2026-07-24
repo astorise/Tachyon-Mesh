@@ -181,12 +181,13 @@ The MCP server SHALL expose LLM inference KV-cache administration tools backed b
 - **THEN** further calls return the structured rate-limit error (`-32002`) with `retry_after_ms`
 
 ### Requirement: MCP exposes read-only vector search for RAG agents
-The MCP server SHALL expose a `tachyon_vector_search` JSON-RPC tool for agent-facing RAG queries. The tool SHALL require `query`, `index`, and `top_k`, SHALL accept optional `route_path`, `embedding_model`, `chat_model`, and request-local `documents`, and SHALL delegate through `tachyon_client::vector_search` to a configured Tachyon route that implements the RAG/vector HTTP contract. The default route SHALL be `/api/guest-rag-vector`, overridable per call via `route_path` or per process via `TACHYON_MCP_VECTOR_SEARCH_PATH`. The tool SHALL be read-only from MCP's perspective and SHALL use the read-oriented rate-limit bucket.
+The MCP server SHALL expose a `tachyon_vector_search` JSON-RPC tool for agent-facing RAG queries. The tool SHALL require `query`, `index`, and `top_k`, SHALL accept optional `route_path`, `embedding_model`, `chat_model`, and request-local `documents`, and SHALL delegate through `tachyon_client::vector_search` to a configured Tachyon route that implements the RAG/vector HTTP contract. The default route SHALL be `/api/guest-rag-vector`, overridable per call via `route_path` or per process via `TACHYON_MCP_VECTOR_SEARCH_PATH`. The delegated client request SHALL include an internal request identifier so temporary RAG vector documents are isolated per tool call. The tool SHALL be read-only from MCP's perspective and SHALL use the read-oriented rate-limit bucket.
 
 #### Scenario: Agent calls vector search with required arguments
 - **WHEN** an MCP client calls `tachyon_vector_search` with `query`, `index`, and `top_k`
 - **THEN** the server forwards those values to `tachyon_client::vector_search`
 - **AND** the client posts the request to `/api/guest-rag-vector` unless an override route is configured
+- **AND** the posted payload carries a per-call request identifier
 - **AND** the tool returns the route's JSON response as text tool content
 
 #### Scenario: Missing vector search arguments are rejected before cluster dispatch

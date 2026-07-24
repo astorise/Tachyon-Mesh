@@ -2028,6 +2028,7 @@ async fn handle_tool_dispatch(name: &str, params: Option<&Value>) -> Result<Valu
                     .get("chat_model")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                request_id: None,
             };
             let result = tachyon_client::vector_search(&route_path, &request).await?;
             Ok(text_tool_result(&result)?)

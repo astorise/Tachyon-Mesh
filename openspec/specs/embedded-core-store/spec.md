@@ -40,9 +40,10 @@ The repository SHALL provide an `examples/guest-rag-vector` user FaaS example th
 
 #### Scenario: RAG guest indexes temporary documents and returns nearest context
 - **WHEN** `/api/guest-rag-vector` receives a JSON request with `query`, `index`, `topK`, and optional `documents`
-- **THEN** the guest derives an effective vector index name from the requested index, embedding source, and embedding dimension
+- **THEN** the guest derives an effective vector index name from the requested index, embedding source, embedding dimension, and request identifier
 - **AND** upserts request-local document embeddings with payload text
-- **AND** searches the index with the query embedding
+- **AND** searches the request-specific index with the query embedding
+- **AND** filters returned vector IDs to the current request prefix before building matches
 - **AND** removes the request-local document IDs from the index before returning
 - **AND** returns `matches` containing document IDs, scores, and payload text
 
