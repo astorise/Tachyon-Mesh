@@ -498,12 +498,13 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 - **THEN** the runtime issues a real NCCL `AllReduce` collective across the participating devices' communicators
 - **AND** the reduced result matches the existing host-staged-sum reference within `1e-4` tolerance
 
-#### Scenario: Inter-node tensor parallelism bootstraps NCCL over TCP
-- **GIVEN** the runtime is built with the `candle-cuda` feature and a tensor-parallel shard group spans more than one host process
-- **WHEN** rank 0 starts an NCCL TCP bootstrap rendezvous
-- **THEN** it generates one NCCL unique id and broadcasts the 128-byte rendezvous payload to each remote process over TCP
-- **AND** every process initializes its local CUDA devices with `ncclCommInitRank` using non-overlapping global ranks and the shared world size
+#### Scenario: NCCL TCP bootstrap remains groundwork for deferred cross-machine placement
+- **GIVEN** the runtime's NCCL bootstrap primitive is exercised as groundwork for future cross-machine placement
+- **WHEN** rank 0 starts an NCCL TCP bootstrap rendezvous in a focused bootstrap test or reactivation spike
+- **THEN** it generates one NCCL unique id and broadcasts the 128-byte rendezvous payload to each peer process over TCP
+- **AND** participating CUDA processes can initialize local devices with `ncclCommInitRank` using non-overlapping global ranks and the shared world size
 - **AND** CPU-only builds can still validate the TCP framing without linking CUDA or NCCL
+- **AND** this primitive does not make production tensor-parallel placement across multiple host machines an active requirement before the cross-machine watchlist trigger is met
 
 #### Scenario: A CUDA worker may be pinned to a NUMA node before NCCL initialization
 - **GIVEN** the runtime is built with the `candle-cuda` feature on Linux
