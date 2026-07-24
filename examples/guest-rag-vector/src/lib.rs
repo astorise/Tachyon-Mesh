@@ -10,6 +10,8 @@ mod bindings {
 }
 
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -349,13 +351,19 @@ fn request_doc_prefix(
 }
 
 fn local_request_id(query: &str, documents: &[InputDocument]) -> String {
+    // Each request runs in a freshly instantiated component, so this counter
+    // restarts at 1 every time and the wall clock alone can tie under
+    // concurrent load; mix in OS-backed randomness (WASI random_get via
+    // RandomState) so two concurrent requests never derive the same id.
     let counter = LOCAL_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
+    let entropy = RandomState::new().build_hasher().finish();
     let mut bytes = counter.to_le_bytes().to_vec();
     bytes.extend_from_slice(&nanos.to_le_bytes());
+    bytes.extend_from_slice(&entropy.to_le_bytes());
     bytes.extend_from_slice(query.as_bytes());
     for doc in documents {
         bytes.extend_from_slice(doc.id.as_bytes());
