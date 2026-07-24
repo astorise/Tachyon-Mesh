@@ -45,6 +45,7 @@ struct InputDocument {
 struct RagResponse {
     query: String,
     index: String,
+    effective_index: String,
     answer: String,
     matches: Vec<RagMatch>,
     embedding_source: String,
@@ -118,10 +119,16 @@ fn handle_rag(body: Vec<u8>) -> Result<Vec<u8>, String> {
     let query_embedding = embeddings
         .pop()
         .ok_or_else(|| "embedding pipeline returned no query embedding".to_owned())?;
+    let effective_index = effective_index_name(
+        &request.index,
+        &embedding_source,
+        query_embedding.len() as u32,
+    );
+    let request_prefix = request_doc_prefix(&request.query, &effective_index, &documents);
 
     let _ = bindings::tachyon::mesh::vector::create_index(
         &bindings::tachyon::mesh::vector::IndexSpec {
-            name: request.index.clone(),
+            name: effective_index.clone(),
             dim: query_embedding.len() as u32,
             m: 16,
             ef_construction: 200,
@@ -133,28 +140,38 @@ fn handle_rag(body: Vec<u8>) -> Result<Vec<u8>, String> {
         .zip(embeddings.iter())
         .map(
             |(doc, embedding)| bindings::tachyon::mesh::vector::Document {
-                id: doc.id.clone(),
+                id: temp_doc_id(&request_prefix, &doc.id),
                 embedding: embedding.clone(),
-                payload: Some(doc.text.as_bytes().to_vec()),
+                payload: Some(
+                    serde_json::to_vec(doc).unwrap_or_else(|_| doc.text.as_bytes().to_vec()),
+                ),
             },
         )
         .collect::<Vec<_>>();
-    bindings::tachyon::mesh::vector::upsert(&request.index, &vector_docs)
+    bindings::tachyon::mesh::vector::upsert(&effective_index, &vector_docs)
         .map_err(|error| format!("vector upsert failed: {error}"))?;
 
-    let matches =
-        bindings::tachyon::mesh::vector::search(&request.index, &query_embedding, request.top_k)
-            .map_err(|error| format!("vector search failed: {error}"))?
-            .into_iter()
-            .map(|item| RagMatch {
-                id: item.id,
+    let search_result =
+        bindings::tachyon::mesh::vector::search(&effective_index, &query_embedding, request.top_k);
+    cleanup_temp_docs(&effective_index, &vector_docs)?;
+    let matches = search_result
+        .map_err(|error| format!("vector search failed: {error}"))?
+        .into_iter()
+        .map(|item| {
+            let payload = item.payload.unwrap_or_default();
+            let doc = serde_json::from_slice::<InputDocument>(&payload).ok();
+            RagMatch {
+                id: doc
+                    .as_ref()
+                    .map(|doc| doc.id.clone())
+                    .unwrap_or_else(|| item.id),
                 score: item.score,
-                text: item
-                    .payload
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .unwrap_or_default(),
-            })
-            .collect::<Vec<_>>();
+                text: doc
+                    .map(|doc| doc.text)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&payload).into_owned()),
+            }
+        })
+        .collect::<Vec<_>>();
 
     let context = matches
         .iter()
@@ -172,6 +189,7 @@ fn handle_rag(body: Vec<u8>) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&RagResponse {
         query: request.query,
         index: request.index,
+        effective_index,
         answer,
         matches,
         embedding_source,
@@ -265,6 +283,64 @@ fn fallback_answer(query: &str, matches: &[RagMatch]) -> String {
         "Best context for `{query}` is `{}` with score {:.3}: {}",
         best.id, best.score, best.text
     )
+}
+
+fn cleanup_temp_docs(
+    index: &str,
+    docs: &[bindings::tachyon::mesh::vector::Document],
+) -> Result<(), String> {
+    for doc in docs {
+        bindings::tachyon::mesh::vector::remove(index, &doc.id)
+            .map_err(|error| format!("vector cleanup failed for `{}`: {error}", doc.id))?;
+    }
+    Ok(())
+}
+
+fn effective_index_name(requested: &str, embedding_source: &str, dim: u32) -> String {
+    format!(
+        "demo-{}-{}-d{}",
+        sanitize_index_part(requested),
+        short_hash_hex(embedding_source.as_bytes()),
+        dim
+    )
+}
+
+fn request_doc_prefix(query: &str, index: &str, documents: &[InputDocument]) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(index.as_bytes());
+    bytes.extend_from_slice(query.as_bytes());
+    for doc in documents {
+        bytes.extend_from_slice(doc.id.as_bytes());
+        bytes.extend_from_slice(doc.text.as_bytes());
+    }
+    format!("req-{}", short_hash_hex(&bytes))
+}
+
+fn temp_doc_id(prefix: &str, doc_id: &str) -> String {
+    format!("{prefix}-{}", sanitize_index_part(doc_id))
+}
+
+fn sanitize_index_part(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    sanitized.trim_matches('-').to_owned()
+}
+
+fn short_hash_hex(bytes: &[u8]) -> String {
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    format!("{hash:016x}")
 }
 
 fn deterministic_embedding(text: &str) -> Vec<f32> {

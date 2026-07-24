@@ -68,6 +68,7 @@ Expected response fields:
 
 - `answer`: model answer or fallback answer grounded in the best match,
 - `matches`: nearest documents with scores and payload text,
+- `effectiveIndex`: temporary dimension/source-specific index used internally,
 - `embeddingSource`: `openai-compatible:<model>` or local fallback,
 - `completionSource`: `openai-compatible:<model>` or local fallback.
 

@@ -38,11 +38,12 @@ The Mesh SHALL expose a `wit/store/vector.wit` interface in the Wasm Component M
 ### Requirement: Repository provides an end-to-end RAG vector guest example
 The repository SHALL provide an `examples/guest-rag-vector` user FaaS example that demonstrates document ingestion, embedding generation, vector upsert/search through `tachyon:mesh/vector`, and answer generation with retrieved context. The example SHALL try the OpenAI-compatible `/ai/v1/embeddings` and `/ai/v1/chat/completions` routes through scoped outbound HTTP when they are available, and SHALL provide deterministic local fallbacks so the route remains smoke-testable without a loaded model.
 
-#### Scenario: RAG guest indexes documents and returns nearest context
+#### Scenario: RAG guest indexes temporary documents and returns nearest context
 - **WHEN** `/api/guest-rag-vector` receives a JSON request with `query`, `index`, `topK`, and optional `documents`
-- **THEN** the guest creates or reuses the named vector index
-- **AND** upserts document embeddings with payload text
+- **THEN** the guest derives an effective vector index name from the requested index, embedding source, and embedding dimension
+- **AND** upserts request-local document embeddings with payload text
 - **AND** searches the index with the query embedding
+- **AND** removes the request-local document IDs from the index before returning
 - **AND** returns `matches` containing document IDs, scores, and payload text
 
 #### Scenario: RAG guest uses OpenAI-compatible routes when available
