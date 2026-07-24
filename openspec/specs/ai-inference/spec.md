@@ -225,12 +225,13 @@ The orchestration configuration SHALL allow operators to define a `tensor_parall
 - **THEN** the runtime partitions model layers across the configured GPU set
 - **AND** rejects startup with a typed configuration error if the requested GPU topology is unavailable.
 
-#### Scenario: Cross-node model placement remains a watchlist item
+#### Scenario: Cross-machine model placement remains a watchlist item
 - **GIVEN** no roadmap model exceeds the aggregate VRAM capacity of a single target node
-- **WHEN** an operator evaluates multi-node NCCL or pipeline placement for one model
+- **WHEN** an operator evaluates placing one live model across multiple machines
 - **THEN** Tachyon treats that work as deferred rather than an active implementation requirement
 - **AND** request-level overflow to peer nodes remains the horizontal scaling path for models that fit on one node
-- **AND** reactivation starts by reassessing `discover_cluster_topology()`, `core-host/src/ai_inference/parallel.rs`, and the TCP stage transport before estimating NUMA binding and peer-failure handling work
+- **AND** existing TCP/NCCL bootstrap and `StageTransport` primitives remain groundwork, not a requirement to orchestrate production cross-machine forwards
+- **AND** reactivation starts by reassessing `discover_cluster_topology()`, `core-host/src/ai_inference/parallel.rs`, and the TCP stage transport before estimating placement, NUMA binding, and peer-failure handling work
 
 ### Requirement: AI inference bindings MUST classify ModelOpt/NVFP4 directories without mock execution
 
@@ -533,8 +534,8 @@ When the runtime is built with the `candle-cuda` Cargo feature, tensor-, pipelin
 - **THEN** the runtime uses the existing matmul, causal-mask, softmax, and value-projection path
 - **AND** CPU/F32 parallel Llama tests remain numerically equivalent to the dense reference path
 
-### Requirement: The runtime MUST execute pipeline-parallel prefill across local stages
-When a model deployment is configured with `hardware_strategy.distribution_mode: pipeline_parallelism`, the runtime SHALL assign contiguous layer ranges to local pipeline stages on the target node's configured GPU/device set and SHALL hand off activations between stages through a point-to-point transport implementing `StageTransport`. Cross-machine placement of one live model remains deferred per the cross-node watchlist scenario, and token decode SHALL fail closed until a persistent per-stage KV-cache decode loop is implemented.
+### Requirement: The runtime MUST execute pipeline-parallel inference across local stages
+When a model deployment is configured with `hardware_strategy.distribution_mode: pipeline_parallelism`, the runtime SHALL assign contiguous layer ranges to local pipeline stages on the target node's configured GPU/device set, SHALL hand off activations between stages through a point-to-point transport implementing `StageTransport`, and SHALL support full autoregressive generation with persistent per-stage KV caches. Cross-machine placement of one live model remains deferred per the cross-machine watchlist scenario.
 
 #### Scenario: Layers are split across pipeline stages
 - **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` across N local stages
@@ -542,12 +543,12 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 - **THEN** each stage is assigned a contiguous, non-overlapping range of layers
 - **AND** each stage executes its layer range with a real transformer-block forward pass
 
-#### Scenario: A pipeline-parallel deployment rejects decode until per-stage KV reuse is wired
+#### Scenario: A pipeline-parallel deployment generates more than one token locally
 - **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` and successfully loaded
 - **WHEN** a generation request is submitted with `max_tokens > 1`
 - **THEN** the runtime completes an initial prefill pass across all stages
-- **AND** returns a typed "decode not yet supported for pipeline parallelism" error before producing incorrect token output
-- **AND** does not silently downgrade to a dense single-device execution plan
+- **AND** completes a decode pass for each subsequent token, each stage reusing a persistent per-stage KV cache rather than rebuilding it from scratch
+- **AND** the final output is numerically equivalent (within floating-point tolerance) to a dense single-device reference run of the same model and prompt for the same number of tokens
 
 #### Scenario: Pipeline depth bounds in-flight micro-batches
 - **GIVEN** a pipeline-parallel deployment with a configured pipeline depth
@@ -704,7 +705,7 @@ When a model deployment declares `hardware_strategy.distribution_mode` other tha
 - **WHEN** the runtime loads the model
 - **THEN** the model is loaded as a pipeline-parallel engine with the configured stage ranges
 - **AND** a prefill request returns prompt logits equivalent to the dense reference
-- **AND** a token-streaming (decode) request returns a typed "decode not yet supported for pipeline parallelism" error rather than incorrect output
+- **AND** a token-streaming (decode) request reuses per-stage KV caches and returns output equivalent to the dense reference
 
 #### Scenario: An expert-parallel deployment is validated but refused until a MoE loader exists
 - **GIVEN** a model binding whose `distribution_mode` is `expert_parallelism`
