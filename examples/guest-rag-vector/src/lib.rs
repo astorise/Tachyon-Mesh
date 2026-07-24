@@ -11,6 +11,7 @@ mod bindings {
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_INDEX: &str = "tenant-kb";
 const DEFAULT_EMBEDDING_MODEL: &str = "demo-embedding";
@@ -132,7 +133,6 @@ fn handle_rag(body: Vec<u8>) -> Result<Vec<u8>, String> {
         &request.index,
         &embedding_source,
         query_embedding.len() as u32,
-        &request_id,
     );
     let request_prefix =
         request_doc_prefix(&request_id, &request.query, &effective_index, &documents);
@@ -310,18 +310,12 @@ fn cleanup_temp_docs(
     Ok(())
 }
 
-fn effective_index_name(
-    requested: &str,
-    embedding_source: &str,
-    dim: u32,
-    request_id: &str,
-) -> String {
+fn effective_index_name(requested: &str, embedding_source: &str, dim: u32) -> String {
     format!(
-        "demo-{}-{}-d{}-{}",
+        "demo-{}-{}-d{}",
         sanitize_index_part(requested),
         short_hash_hex(embedding_source.as_bytes()),
         dim,
-        sanitize_index_part(request_id)
     )
 }
 
@@ -344,7 +338,12 @@ fn request_doc_prefix(
 
 fn local_request_id(query: &str, documents: &[InputDocument]) -> String {
     let counter = LOCAL_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
     let mut bytes = counter.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&nanos.to_le_bytes());
     bytes.extend_from_slice(query.as_bytes());
     for doc in documents {
         bytes.extend_from_slice(doc.id.as_bytes());
