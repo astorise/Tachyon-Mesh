@@ -1,6 +1,8 @@
 # IDE Integration & Schema Validation
 
-Tachyon Mesh dynamically serves JSON Schema documents for its configuration files while `core-host` is running. Binding these to your IDE gives real-time validation and autocompletion — no copying `.schema.json` files needed.
+Tachyon Mesh serves JSON Schema documents for its configuration files while `core-host` is running. Binding these to your IDE gives real-time validation and autocompletion without copying `.schema.json` files.
+
+For offline, CI, or air-gapped validation, every versioned GitHub release also publishes `integrity-config.schema.json` and `integrity-lock.schema.json` assets. Those release assets include a versioned `$id`, for example `https://github.com/astorise/tachyon-mesh/releases/download/v1.2.3/integrity-config.schema.json`.
 
 ## Prerequisites
 
@@ -115,7 +117,7 @@ require("lspconfig").jsonls.setup({
 
 ## Offline / Air-Gapped Environments
 
-If you cannot reach a running `core-host`, fetch the schemas once and commit them:
+If you cannot reach a running `core-host`, either download the versioned release assets or fetch the live schemas once and commit them:
 
 ```bash
 curl -s http://127.0.0.1:8080/admin/schema/integrity-lock > .schemas/integrity-lock.json
@@ -123,3 +125,11 @@ curl -s http://127.0.0.1:8080/admin/schema/manifest       > .schemas/manifest.js
 ```
 
 Then point your IDE configuration to the local paths instead of the HTTP URLs.
+
+To generate schemas directly from a source checkout:
+
+```bash
+cargo run -p core-host -- schema --output-dir .schemas --release-tag v1.2.3
+```
+
+CI compares the generated HEAD schemas against the latest release assets. Adding a required field, removing a field, changing a type, or removing an enum value fails the compatibility check unless the PR carries the `breaking-manifest` label.

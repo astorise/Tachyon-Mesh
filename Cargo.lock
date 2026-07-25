@@ -4214,6 +4214,8 @@ dependencies = [
 name = "guest-rag-vector"
 version = "1.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "wit-bindgen 0.46.0",
 ]
 
