@@ -38,6 +38,21 @@ pretty-printed JSON.
 - **WHEN** an MCP client calls `tachyon_import_package` with a valid `package_path`
 - **THEN** the tool delegates to `tachyon_client::import_faas_package` and returns `{ content: [{ type: "text", text: <json> }] }`
 
+### Requirement: RAG vector example is importable as a FaaS package
+The repository SHALL provide a package manifest for `examples/guest-rag-vector` that can be bundled with its compiled WASM artifact and imported through `tachyon_import_package`. The manifest SHALL declare `/api/guest-rag-vector` as a user route backed by the `guest-rag-vector` module, with explicit `vector` scope for its demo indexes and explicit `http` scope for the OpenAI-compatible embedding and chat completion routes.
+
+#### Scenario: Operator imports the RAG vector example package
+- **WHEN** an operator imports a package containing `guest-rag-vector.wasm` and `examples/guest-rag-vector/manifest.json`
+- **THEN** the import maps the manifest's `guest-rag-vector` module reference to the uploaded WASM asset URI
+- **AND** the live manifest gains the `/api/guest-rag-vector` route
+- **AND** the route has `vector` and `http` scopes sufficient to run the documented RAG demo
+
+#### Scenario: Imported RAG route is agent-queryable
+- **GIVEN** `/api/guest-rag-vector` has been imported and applied
+- **WHEN** an MCP agent calls `tachyon_vector_search` without specifying `route_path`
+- **THEN** the MCP tool queries `/api/guest-rag-vector`
+- **AND** returns the route's RAG response to the agent
+
 ### Requirement: Tauri command and Workloads UI for package import
 The system SHALL provide a `import_faas_package(bytes: Vec<u8>)` Tauri command
 and an *Import & Deploy* section in `TachyonWorkloadsPanel` that lets the
