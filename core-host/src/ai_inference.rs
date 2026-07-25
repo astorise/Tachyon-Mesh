@@ -58,7 +58,9 @@ enum TensorType {
     Fp32,
 }
 
-use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos, SchedulerConfig};
+use crate::{
+    IntegrityConfig, IntegrityModelBinding, RouteQos, SchedulerConfig, SchedulerSpillTier,
+};
 
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 const DEFAULT_BATCH_SIZE: usize = 32;
@@ -265,6 +267,70 @@ trait BackendModel: Send + Sync {
             adapter.id
         )
     }
+    fn execute_with_adapters(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Result<Vec<Vec<u8>>> {
+        self.execute_with_adapter_results(inputs, adapters)
+            .into_iter()
+            .collect()
+    }
+
+    fn execute_with_adapter_results(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Vec<Result<Vec<u8>>> {
+        if inputs.len() != adapters.len() {
+            let message = format!(
+                "adapter assignment count {} does not match input count {}",
+                adapters.len(),
+                inputs.len()
+            );
+            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+        }
+        let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+        for group in adapter_assignment_groups(adapters) {
+            let adapter = adapters[group[0]].as_ref();
+            let group_inputs = group
+                .iter()
+                .map(|index| inputs[*index].clone())
+                .collect::<Vec<_>>();
+            let outputs = match adapter {
+                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter),
+                None => self.execute(&group_inputs),
+            };
+            let outputs = match outputs {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    let message = error.to_string();
+                    for index in group {
+                        results[index] = Some(Err(anyhow!("{}", message)));
+                    }
+                    continue;
+                }
+            };
+            if outputs.len() != group.len() {
+                let message = format!(
+                    "backend returned {} output(s) for an adapter group of {} input(s)",
+                    outputs.len(),
+                    group.len()
+                );
+                for index in group {
+                    results[index] = Some(Err(anyhow!("{}", message)));
+                }
+                continue;
+            }
+            for (index, output) in group.into_iter().zip(outputs) {
+                results[index] = Some(Ok(output));
+            }
+        }
+        results
+            .into_iter()
+            .map(|output| output.expect("adapter groups cover every input"))
+            .collect()
+    }
 
     /// Stream decoded text fragments through `on_token` as they are produced.
     /// The default implementation runs `execute` and emits the entire output as
@@ -326,6 +392,8 @@ pub(crate) struct SchedulerSnapshot {
     pub(crate) realtime_queued: usize,
     pub(crate) standard_queued: usize,
     pub(crate) batch_queued: usize,
+    pub(crate) kv_recompute_preemptions: usize,
+    pub(crate) kv_swap_preemptions: usize,
     pub(crate) completed_aliases: Vec<String>,
 }
 
@@ -673,9 +741,9 @@ impl AiInferenceRuntime {
 }
 
 #[derive(Clone)]
-struct ResolvedLoraAdapter {
-    id: String,
-    path: PathBuf,
+pub(crate) struct ResolvedLoraAdapter {
+    pub(crate) id: String,
+    pub(crate) path: PathBuf,
 }
 
 fn resolve_lora_adapter_path(adapter_id: &str) -> Result<ResolvedLoraAdapter, String> {
@@ -800,6 +868,11 @@ impl AcceleratorScheduler {
             realtime_queued: self.metrics.realtime_queued.load(Ordering::Relaxed),
             standard_queued: self.metrics.standard_queued.load(Ordering::Relaxed),
             batch_queued: self.metrics.batch_queued.load(Ordering::Relaxed),
+            kv_recompute_preemptions: self
+                .metrics
+                .kv_recompute_preemptions
+                .load(Ordering::Relaxed),
+            kv_swap_preemptions: self.metrics.kv_swap_preemptions.load(Ordering::Relaxed),
             completed_aliases: self
                 .metrics
                 .completed_aliases
@@ -839,6 +912,8 @@ struct SchedulerMetrics {
     realtime_queued: AtomicUsize,
     standard_queued: AtomicUsize,
     batch_queued: AtomicUsize,
+    kv_recompute_preemptions: AtomicUsize,
+    kv_swap_preemptions: AtomicUsize,
     next_sequence: AtomicUsize,
     #[cfg(test)]
     completed_aliases: Mutex<Vec<String>>,
@@ -884,6 +959,18 @@ impl SchedulerMetrics {
                 .lock()
                 .expect("scheduler completion log should not be poisoned")
                 .push(format!("{}:decode", first.alias));
+        }
+    }
+
+    fn record_kv_preemption(&self, mode: paged_kv::KvPreemptionMode) {
+        match mode {
+            paged_kv::KvPreemptionMode::Recompute => {
+                self.kv_recompute_preemptions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            paged_kv::KvPreemptionMode::Swap => {
+                self.kv_swap_preemptions.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -964,7 +1051,6 @@ impl ActiveInferenceSequence {
     fn batch_key(&self) -> InferenceBatchKey {
         InferenceBatchKey {
             alias: self.job.alias.clone(),
-            adapter_id: self.job.adapter.as_ref().map(|adapter| adapter.id.clone()),
         }
     }
 
@@ -979,9 +1065,7 @@ impl ActiveInferenceSequence {
         batch_key: &InferenceBatchKey,
         phase: InferenceSequencePhase,
     ) -> bool {
-        self.phase == phase
-            && self.job.alias == batch_key.alias
-            && self.job.adapter.as_ref().map(|adapter| &adapter.id) == batch_key.adapter_id.as_ref()
+        self.phase == phase && self.job.alias == batch_key.alias
     }
 }
 
@@ -1002,6 +1086,10 @@ impl TenantFairness {
             config,
             deficits: HashMap::new(),
         }
+    }
+
+    fn allows_cross_tenant_active_batching(&self) -> bool {
+        self.config.tenant_weights.is_empty()
     }
 
     fn select_active<'a>(
@@ -1116,6 +1204,23 @@ impl TenantFairness {
         *self.deficits.entry(tenant.to_owned()).or_insert(0) -= total_weight * cost as i64;
     }
 
+    fn charge_batch(
+        &mut self,
+        active: &[ActiveInferenceSequence],
+        indices: &[usize],
+        eligible_tenants: &[String],
+    ) {
+        let mut tenant_costs: HashMap<String, usize> = HashMap::new();
+        for sequence in indices.iter().filter_map(|index| active.get(*index)) {
+            *tenant_costs
+                .entry(sequence.job.tenant_id().to_owned())
+                .or_insert(0) += 1;
+        }
+        for (tenant, cost) in tenant_costs {
+            self.charge(&tenant, eligible_tenants, cost);
+        }
+    }
+
     fn deficit(&self, tenant: &str) -> i64 {
         self.deficits.get(tenant).copied().unwrap_or_default()
     }
@@ -1153,7 +1258,7 @@ fn run_scheduler(
     let mut queued = BinaryHeap::new();
     let mut active = Vec::new();
     let mut admission_fairness = TenantFairness::new(scheduler_config.clone());
-    let mut tenant_fairness = TenantFairness::new(scheduler_config);
+    let mut tenant_fairness = TenantFairness::new(scheduler_config.clone());
 
     loop {
         drain_ready_jobs(&mut receiver, &mut queued);
@@ -1173,7 +1278,13 @@ fn run_scheduler(
             continue;
         }
 
-        run_continuous_step(accelerator, &mut active, &metrics, &mut tenant_fairness);
+        run_continuous_step(
+            accelerator,
+            &mut active,
+            &metrics,
+            &mut tenant_fairness,
+            &scheduler_config,
+        );
         age_waiting_jobs(&mut queued);
     }
 }
@@ -1205,7 +1316,6 @@ fn drain_ready_jobs(
 
 struct InferenceBatchKey {
     alias: String,
-    adapter_id: Option<String>,
 }
 
 fn run_continuous_step(
@@ -1213,10 +1323,12 @@ fn run_continuous_step(
     active: &mut Vec<ActiveInferenceSequence>,
     metrics: &SchedulerMetrics,
     tenant_fairness: &mut TenantFairness,
+    scheduler_config: &SchedulerConfig,
 ) {
     if let Some(indices) =
         select_active_batch(active, InferenceSequencePhase::Prefill, tenant_fairness)
     {
+        record_scheduler_kv_preemptions(active, &indices, metrics, scheduler_config);
         let prefill_batch = indices
             .iter()
             .map(|index| active[*index].job.clone())
@@ -1248,6 +1360,40 @@ fn run_continuous_step(
     }
 }
 
+fn record_scheduler_kv_preemptions(
+    active: &[ActiveInferenceSequence],
+    selected_indices: &[usize],
+    metrics: &SchedulerMetrics,
+    scheduler_config: &SchedulerConfig,
+) {
+    let Some(selected_score) = selected_indices
+        .iter()
+        .filter_map(|index| active.get(*index))
+        .map(|sequence| sequence.qos_score)
+        .max()
+    else {
+        return;
+    };
+    for (index, sequence) in active.iter().enumerate() {
+        if selected_indices.binary_search(&index).is_ok()
+            || sequence.qos_score >= selected_score
+            || !scheduler_config
+                .tier_preemptible
+                .is_preemptible(sequence.job.qos)
+        {
+            continue;
+        }
+        let mode = if scheduler_config.spill_tier_max == SchedulerSpillTier::Nvme
+            && scheduler_config.spill_budget_bytes > 0
+        {
+            paged_kv::KvPreemptionMode::Swap
+        } else {
+            paged_kv::KvPreemptionMode::Recompute
+        };
+        metrics.record_kv_preemption(mode);
+    }
+}
+
 fn select_active_batch(
     active: &[ActiveInferenceSequence],
     phase: InferenceSequencePhase,
@@ -1265,21 +1411,19 @@ fn select_active_batch(
     let selection = tenant_fairness.select_active(candidates, max_qos_score)?;
     let (_, first) = selection.selected;
     let batch_key = first.batch_key();
+    let selected_tenant = selection.tenant.as_str();
+    let allow_cross_tenant_batch = tenant_fairness.allows_cross_tenant_active_batching();
     let mut indices = active
         .iter()
         .enumerate()
         .filter_map(|(index, sequence)| {
-            sequence
-                .is_compatible_with(&batch_key, phase)
+            (sequence.is_compatible_with(&batch_key, phase)
+                && (allow_cross_tenant_batch || sequence.job.tenant_id() == selected_tenant))
                 .then_some(index)
         })
         .collect::<Vec<_>>();
     indices.sort_unstable();
-    tenant_fairness.charge(
-        &selection.tenant,
-        &selection.eligible_tenants,
-        indices.len(),
-    );
+    tenant_fairness.charge_batch(active, &indices, &selection.eligible_tenants);
     Some(indices)
 }
 
@@ -1301,16 +1445,28 @@ fn process_batch(
     batch: &[InferenceJob],
 ) -> Vec<Result<Vec<u8>, anyhow::Error>> {
     let model = Arc::clone(&batch[0].model);
-    let adapter = batch[0].adapter.as_ref();
     #[cfg(test)]
     if model.mock_latency > Duration::ZERO {
         thread::sleep(model.mock_latency);
     }
+
     let inputs = batch
         .iter()
         .map(|job| job.input.clone())
         .collect::<Vec<_>>();
-    match model.run_mock_batch(&inputs, adapter) {
+    let adapters = batch
+        .iter()
+        .map(|job| job.adapter.clone())
+        .collect::<Vec<_>>();
+    let results = model.run_batch_with_adapter_results(&inputs, &adapters);
+    if results.len() == batch.len() {
+        return results;
+    }
+
+    match results
+        .into_iter()
+        .collect::<Result<Vec<Vec<u8>>, anyhow::Error>>()
+    {
         // Each job's own output is routed back to that job, never a shared
         // clone of one job's result broadcast to the whole batch.
         Ok(outputs) if outputs.len() == batch.len() => outputs.into_iter().map(Ok).collect(),
@@ -1340,6 +1496,22 @@ fn process_batch(
                 .collect()
         }
     }
+}
+
+fn adapter_assignment_groups(adapters: &[Option<ResolvedLoraAdapter>]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+    for (index, adapter) in adapters.iter().enumerate() {
+        let adapter_id = adapter.as_ref().map(|adapter| adapter.id.as_str());
+        if let Some((_, indices)) = groups
+            .iter_mut()
+            .find(|(known_adapter_id, _)| *known_adapter_id == adapter_id)
+        {
+            indices.push(index);
+        } else {
+            groups.push((adapter_id, vec![index]));
+        }
+    }
+    groups.into_iter().map(|(_, indices)| indices).collect()
 }
 
 // Unified candle-native backend model â€” replaces the WasiNnBackend abstraction.
@@ -1757,6 +1929,87 @@ impl BackendModel for CandleBackendModel {
         }
     }
 
+    fn execute_with_adapters(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Result<Vec<Vec<u8>>> {
+        self.execute_with_adapter_results(inputs, adapters)
+            .into_iter()
+            .collect()
+    }
+
+    fn execute_with_adapter_results(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Vec<Result<Vec<u8>>> {
+        if inputs.len() != adapters.len() {
+            let message = format!(
+                "adapter assignment count {} does not match input count {}",
+                adapters.len(),
+                inputs.len()
+            );
+            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+        }
+        match &self.kind {
+            CandleBackendModelKind::TextGeneration {
+                target,
+                speculative: None,
+            }
+            | CandleBackendModelKind::ModelOptNvfp4(target) => {
+                if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
+                    return repeat_batch_error(inputs.len(), error.to_string());
+                }
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                match target.try_generate_batch_with_adapters(&prompts, adapters) {
+                    Ok(Some(outputs)) => {
+                        if outputs.len() != inputs.len() {
+                            return repeat_batch_error(
+                                inputs.len(),
+                                format!(
+                                    "Candle backend returned {} output(s) for a native mixed-adapter batch of {} input(s)",
+                                    outputs.len(),
+                                    inputs.len()
+                                ),
+                            );
+                        }
+                        let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
+                            "gpu"
+                        } else {
+                            "cpu"
+                        };
+                        record_execution(&self.source.alias, executed_on, true);
+                        outputs.into_iter().map(Ok).collect()
+                    }
+                    Ok(None) => self.execute_with_adapters_sequential_results(inputs, adapters),
+                    Err(error) => {
+                        let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
+                            "gpu"
+                        } else {
+                            "cpu"
+                        };
+                        record_execution(&self.source.alias, executed_on, false);
+                        tracing::warn!(
+                            "Candle LLM model `{}` loaded from `{}` failed during batch-native LoRA decode: {error}",
+                            self.source.alias,
+                            target.root().display()
+                        );
+                        self.execute_with_adapters_sequential_results(inputs, adapters)
+                    }
+                }
+            }
+            CandleBackendModelKind::TextGeneration {
+                speculative: Some(_),
+                ..
+            } => self.execute_with_adapters_sequential_results(inputs, adapters),
+            _ => self.execute_with_adapters_sequential_results(inputs, adapters),
+        }
+    }
+
     fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
         if !matches!(input.ty, TensorType::U8) {
             bail!(
@@ -1990,15 +2243,13 @@ impl CandleModel {
         self
     }
 
-    fn run_mock_batch(
+    fn run_batch_with_adapter_results(
         &self,
         inputs: &[SharedInputTensor],
-        adapter: Option<&ResolvedLoraAdapter>,
-    ) -> Result<Vec<Vec<u8>>> {
-        match adapter {
-            Some(adapter) => self.backend_model.execute_with_adapter(inputs, adapter),
-            None => self.backend_model.execute(inputs),
-        }
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Vec<Result<Vec<u8>>> {
+        self.backend_model
+            .execute_with_adapter_results(inputs, adapters)
     }
 }
 
@@ -2721,6 +2972,68 @@ impl SemanticContextFlattener {
     }
 }
 
+fn repeat_batch_error(count: usize, message: impl Into<String>) -> Vec<Result<Vec<u8>>> {
+    let message = message.into();
+    (0..count).map(|_| Err(anyhow!("{}", message))).collect()
+}
+
+impl CandleBackendModel {
+    fn execute_with_adapters_sequential_results(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapters: &[Option<ResolvedLoraAdapter>],
+    ) -> Vec<Result<Vec<u8>>> {
+        if inputs.len() != adapters.len() {
+            let message = format!(
+                "adapter assignment count {} does not match input count {}",
+                adapters.len(),
+                inputs.len()
+            );
+            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+        }
+        let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+        for group in adapter_assignment_groups(adapters) {
+            let adapter = adapters[group[0]].as_ref();
+            let group_inputs = group
+                .iter()
+                .map(|index| inputs[*index].clone())
+                .collect::<Vec<_>>();
+            let outputs = match adapter {
+                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter),
+                None => self.execute(&group_inputs),
+            };
+            let outputs = match outputs {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    let message = error.to_string();
+                    for index in group {
+                        results[index] = Some(Err(anyhow!("{}", message)));
+                    }
+                    continue;
+                }
+            };
+            if outputs.len() != group.len() {
+                let message = format!(
+                    "Candle backend returned {} output(s) for an adapter group of {} input(s)",
+                    outputs.len(),
+                    group.len()
+                );
+                for index in group {
+                    results[index] = Some(Err(anyhow!("{}", message)));
+                }
+                continue;
+            }
+            for (index, output) in group.into_iter().zip(outputs) {
+                results[index] = Some(Ok(output));
+            }
+        }
+        results
+            .into_iter()
+            .map(|output| output.expect("adapter groups cover every input"))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2770,6 +3083,219 @@ mod tests {
             },
             response_tx,
         }
+    }
+
+    struct AdapterEchoBackend;
+
+    impl BackendModel for AdapterEchoBackend {
+        fn residency(&self) -> AcceleratorMemoryResidency {
+            AcceleratorMemoryResidency::Vram
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                })
+                .collect())
+        }
+
+        fn execute_with_adapter(
+            &self,
+            inputs: &[SharedInputTensor],
+            adapter: &ResolvedLoraAdapter,
+        ) -> Result<Vec<Vec<u8>>> {
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!(
+                        "{}:{}",
+                        adapter.id,
+                        String::from_utf8_lossy(input.data.as_ref())
+                    )
+                    .into_bytes()
+                })
+                .collect())
+        }
+    }
+
+    struct FailingAdapterBackend;
+
+    impl BackendModel for FailingAdapterBackend {
+        fn residency(&self) -> AcceleratorMemoryResidency {
+            AcceleratorMemoryResidency::Vram
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                })
+                .collect())
+        }
+
+        fn execute_with_adapter(
+            &self,
+            inputs: &[SharedInputTensor],
+            adapter: &ResolvedLoraAdapter,
+        ) -> Result<Vec<Vec<u8>>> {
+            if adapter.id == "broken" {
+                bail!("adapter `{}` is malformed", adapter.id);
+            }
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!(
+                        "{}:{}",
+                        adapter.id,
+                        String::from_utf8_lossy(input.data.as_ref())
+                    )
+                    .into_bytes()
+                })
+                .collect())
+        }
+    }
+
+    #[derive(Default)]
+    struct NativeAdapterBatchBackend {
+        native_batches: AtomicUsize,
+        sequential_adapter_calls: AtomicUsize,
+    }
+
+    impl BackendModel for NativeAdapterBatchBackend {
+        fn residency(&self) -> AcceleratorMemoryResidency {
+            AcceleratorMemoryResidency::Vram
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+            self.sequential_adapter_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                })
+                .collect())
+        }
+
+        fn execute_with_adapter(
+            &self,
+            inputs: &[SharedInputTensor],
+            adapter: &ResolvedLoraAdapter,
+        ) -> Result<Vec<Vec<u8>>> {
+            self.sequential_adapter_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(inputs
+                .iter()
+                .map(|input| {
+                    format!(
+                        "{}:{}",
+                        adapter.id,
+                        String::from_utf8_lossy(input.data.as_ref())
+                    )
+                    .into_bytes()
+                })
+                .collect())
+        }
+
+        fn execute_with_adapters(
+            &self,
+            inputs: &[SharedInputTensor],
+            adapters: &[Option<ResolvedLoraAdapter>],
+        ) -> Result<Vec<Vec<u8>>> {
+            self.execute_with_adapter_results(inputs, adapters)
+                .into_iter()
+                .collect()
+        }
+
+        fn execute_with_adapter_results(
+            &self,
+            inputs: &[SharedInputTensor],
+            adapters: &[Option<ResolvedLoraAdapter>],
+        ) -> Vec<Result<Vec<u8>>> {
+            self.native_batches.fetch_add(1, Ordering::SeqCst);
+            inputs
+                .iter()
+                .zip(adapters)
+                .map(|(input, adapter)| {
+                    Ok(format!(
+                        "{}:{}",
+                        adapter
+                            .as_ref()
+                            .map(|adapter| adapter.id.as_str())
+                            .unwrap_or("base"),
+                        String::from_utf8_lossy(input.data.as_ref())
+                    )
+                    .into_bytes())
+                })
+                .collect()
+        }
+    }
+
+    fn adapter_echo_model(alias: &str) -> Arc<CandleModel> {
+        Arc::new(
+            CandleModel::load_mock_with_backend(
+                &IntegrityModelBinding {
+                    alias: alias.to_owned(),
+                    path: format!("mock:{alias}"),
+                    device: ModelDevice::Cuda,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                },
+                Arc::new(AdapterEchoBackend),
+            )
+            .expect("adapter echo model should load"),
+        )
+    }
+
+    fn native_adapter_batch_model(
+        alias: &str,
+        backend: Arc<NativeAdapterBatchBackend>,
+    ) -> Arc<CandleModel> {
+        Arc::new(
+            CandleModel::load_mock_with_backend(
+                &IntegrityModelBinding {
+                    alias: alias.to_owned(),
+                    path: format!("mock:{alias}"),
+                    device: ModelDevice::Cuda,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                },
+                backend,
+            )
+            .expect("native adapter batch model should load"),
+        )
+    }
+
+    fn failing_adapter_model(alias: &str) -> Arc<CandleModel> {
+        Arc::new(
+            CandleModel::load_mock_with_backend(
+                &IntegrityModelBinding {
+                    alias: alias.to_owned(),
+                    path: format!("mock:{alias}"),
+                    device: ModelDevice::Cuda,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                },
+                Arc::new(FailingAdapterBackend),
+            )
+            .expect("failing adapter model should load"),
+        )
     }
 
     #[test]
@@ -3334,7 +3860,8 @@ mod tests {
 
     #[test]
     fn scheduler_tenant_weights_select_weighted_share_within_same_qos() {
-        let model = mock_scheduler_model("shared");
+        let model_a = mock_scheduler_model("shared-a");
+        let model_b = mock_scheduler_model("shared-b");
         let mut tenant_fairness = TenantFairness::new(SchedulerConfig {
             tenant_weights: std::collections::BTreeMap::from([
                 ("tenant-a".to_owned(), 3),
@@ -3349,13 +3876,13 @@ mod tests {
                 qos_score: RouteQos::Standard.score(),
                 sequence: 0,
                 phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-a", tenant_a_tx),
+                job: mock_inference_job(&model_a, "tenant-a", tenant_a_tx),
             },
             ActiveInferenceSequence {
                 qos_score: RouteQos::Standard.score(),
                 sequence: 1,
                 phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-b", tenant_b_tx),
+                job: mock_inference_job(&model_b, "tenant-b", tenant_b_tx),
             },
         ];
 
@@ -3433,11 +3960,53 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_tenant_fairness_charges_selected_batch_by_request_count() {
-        let model = mock_scheduler_model("batch-shared");
+    fn scheduler_tenant_weights_do_not_batch_lower_weight_tenant_on_same_model() {
+        let model = adapter_echo_model("weighted-batch-shared");
+        let mut tenant_fairness = TenantFairness::new(SchedulerConfig {
+            tenant_weights: std::collections::BTreeMap::from([
+                ("tenant-high".to_owned(), 3),
+                ("tenant-low".to_owned(), 1),
+            ]),
+            ..SchedulerConfig::default()
+        });
+        let (tenant_high_tx, _tenant_high_rx) = mpsc::channel();
+        let (tenant_low_tx, _tenant_low_rx) = mpsc::channel();
+        let active = vec![
+            ActiveInferenceSequence {
+                qos_score: RouteQos::Standard.score(),
+                sequence: 0,
+                phase: InferenceSequencePhase::Decode,
+                job: mock_inference_job(&model, "tenant-high", tenant_high_tx),
+            },
+            ActiveInferenceSequence {
+                qos_score: RouteQos::Standard.score(),
+                sequence: 1,
+                phase: InferenceSequencePhase::Decode,
+                job: mock_inference_job(&model, "tenant-low", tenant_low_tx),
+            },
+        ];
+
+        let first = select_active_batch(
+            &active,
+            InferenceSequencePhase::Decode,
+            &mut tenant_fairness,
+        )
+        .expect("tenant should be selected");
+
+        assert_eq!(
+            first,
+            vec![0],
+            "configured tenant weights must not let another tenant hitchhike on a same-alias batch"
+        );
+    }
+
+    #[test]
+    fn scheduler_batches_distinct_lora_adapters_as_sub_batches_for_same_model() {
+        let model = adapter_echo_model("batch-shared");
         let mut tenant_fairness = TenantFairness::new(SchedulerConfig::default());
         let (tenant_a_tx_1, _tenant_a_rx_1) = mpsc::channel();
         let (tenant_a_tx_2, _tenant_a_rx_2) = mpsc::channel();
+        let (base_tx, _base_rx) = mpsc::channel();
         let (tenant_b_tx, _tenant_b_rx) = mpsc::channel();
         let active = vec![
             ActiveInferenceSequence {
@@ -3456,6 +4025,23 @@ mod tests {
                 qos_score: RouteQos::Standard.score(),
                 sequence: 2,
                 phase: InferenceSequencePhase::Decode,
+                job: InferenceJob {
+                    alias: model.alias.clone(),
+                    adapter: None,
+                    model: Arc::clone(&model),
+                    qos: model.qos,
+                    input: SharedInputTensor {
+                        dimensions: vec![1],
+                        ty: TensorType::U8,
+                        data: Arc::from(b"plain".as_slice()),
+                    },
+                    response_tx: base_tx,
+                },
+            },
+            ActiveInferenceSequence {
+                qos_score: RouteQos::Standard.score(),
+                sequence: 3,
+                phase: InferenceSequencePhase::Decode,
                 job: mock_inference_job(&model, "tenant-b", tenant_b_tx),
             },
         ];
@@ -3465,18 +4051,120 @@ mod tests {
             InferenceSequencePhase::Decode,
             &mut tenant_fairness,
         )
-        .expect("first tenant should be selected");
-        assert_eq!(first.len(), 2);
-        assert_eq!(active[first[0]].job.tenant_id(), "tenant-a");
+        .expect("same base model should be selected");
+        assert_eq!(
+            first,
+            vec![0, 1, 2, 3],
+            "different adapters for the same model should share one scheduler step"
+        );
 
-        let second = select_active_batch(
-            &active,
-            InferenceSequencePhase::Decode,
-            &mut tenant_fairness,
-        )
-        .expect("second tenant should be selected");
-        assert_eq!(second.len(), 1);
-        assert_eq!(active[second[0]].job.tenant_id(), "tenant-b");
+        let batch = first
+            .iter()
+            .map(|index| active[*index].job.clone())
+            .collect::<Vec<_>>();
+        let outputs = process_batch(AcceleratorKind::Gpu, &batch)
+            .into_iter()
+            .map(|result| String::from_utf8(result.expect("sub-batch output")).expect("utf8"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec![
+                "tenant-a:tenant-a".to_owned(),
+                "tenant-a:tenant-a".to_owned(),
+                "base:plain".to_owned(),
+                "tenant-b:tenant-b".to_owned(),
+            ],
+            "adapter-specific sub-batches must route each output back to its original request"
+        );
+    }
+
+    #[test]
+    fn process_batch_uses_native_multi_adapter_batch_when_backend_supports_it() {
+        let backend = Arc::new(NativeAdapterBatchBackend::default());
+        let model = native_adapter_batch_model("native-batch-shared", Arc::clone(&backend));
+        let (tenant_a_tx, _tenant_a_rx) = mpsc::channel();
+        let (base_tx, _base_rx) = mpsc::channel();
+        let (tenant_b_tx, _tenant_b_rx) = mpsc::channel();
+        let batch = vec![
+            mock_inference_job(&model, "tenant-a", tenant_a_tx),
+            InferenceJob {
+                alias: model.alias.clone(),
+                adapter: None,
+                model: Arc::clone(&model),
+                qos: model.qos,
+                input: SharedInputTensor {
+                    dimensions: vec![1],
+                    ty: TensorType::U8,
+                    data: Arc::from(b"plain".as_slice()),
+                },
+                response_tx: base_tx,
+            },
+            mock_inference_job(&model, "tenant-b", tenant_b_tx),
+        ];
+
+        let outputs = process_batch(AcceleratorKind::Gpu, &batch)
+            .into_iter()
+            .map(|result| String::from_utf8(result.expect("native batch output")).expect("utf8"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            outputs,
+            vec![
+                "tenant-a:tenant-a".to_owned(),
+                "base:plain".to_owned(),
+                "tenant-b:tenant-b".to_owned(),
+            ]
+        );
+        assert_eq!(backend.native_batches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.sequential_adapter_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn process_batch_scopes_adapter_group_failures_to_matching_rows() {
+        let model = failing_adapter_model("adapter-failure-scope");
+        let (ok_tx, _ok_rx) = mpsc::channel();
+        let (base_tx, _base_rx) = mpsc::channel();
+        let (broken_tx, _broken_rx) = mpsc::channel();
+        let mut broken_job = mock_inference_job(&model, "broken", broken_tx);
+        broken_job.input.data = Arc::from(b"broken-input".as_slice());
+        let batch = vec![
+            mock_inference_job(&model, "tenant-ok", ok_tx),
+            InferenceJob {
+                alias: model.alias.clone(),
+                adapter: None,
+                model: Arc::clone(&model),
+                qos: model.qos,
+                input: SharedInputTensor {
+                    dimensions: vec![1],
+                    ty: TensorType::U8,
+                    data: Arc::from(b"plain".as_slice()),
+                },
+                response_tx: base_tx,
+            },
+            broken_job,
+        ];
+
+        let mut results = process_batch(AcceleratorKind::Gpu, &batch);
+        assert_eq!(
+            String::from_utf8(
+                results
+                    .remove(0)
+                    .expect("healthy adapter row should succeed")
+            )
+            .expect("utf8"),
+            "tenant-ok:tenant-ok"
+        );
+        assert_eq!(
+            String::from_utf8(results.remove(0).expect("base row should succeed")).expect("utf8"),
+            "base:plain"
+        );
+        let error = results
+            .remove(0)
+            .expect_err("broken adapter row should fail independently");
+        assert!(
+            error.to_string().contains("adapter `broken` is malformed"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3561,12 +4249,14 @@ mod tests {
             &mut active,
             &metrics,
             &mut tenant_fairness,
+            &SchedulerConfig::default(),
         );
         run_continuous_step(
             AcceleratorKind::Gpu,
             &mut active,
             &metrics,
             &mut tenant_fairness,
+            &SchedulerConfig::default(),
         );
 
         let _ = realtime_rx
@@ -3582,6 +4272,7 @@ mod tests {
             &mut active,
             &metrics,
             &mut tenant_fairness,
+            &SchedulerConfig::default(),
         );
         let _ = batch_rx
             .recv()
@@ -3610,6 +4301,12 @@ mod tests {
             realtime_decode_position < batch_decode_position,
             "realtime decode should be inserted ahead of an active batch decode"
         );
+        assert_eq!(
+            metrics.kv_recompute_preemptions.load(Ordering::Relaxed),
+            1,
+            "one lower-tier KV context should be marked for recompute"
+        );
+        assert_eq!(metrics.kv_swap_preemptions.load(Ordering::Relaxed), 0);
     }
 
     #[test]

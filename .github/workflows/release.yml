@@ -12,6 +12,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  publish-integrity-schemas:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate versioned integrity schemas
+        run: cargo run -p core-host -- schema --output-dir target/schemas --release-tag "${{ github.ref_name }}"
+
+      - name: Upload schema assets to GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            target/schemas/integrity-config.schema.json
+            target/schemas/integrity-lock.schema.json
+
   # ── Server-side binary tarballs (core-host + tachyon-mcp) ────────────────────
   # Published only on version tags; used by scripts/get-tachyon.sh.
   publish-server-binaries:

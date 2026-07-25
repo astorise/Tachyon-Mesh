@@ -149,6 +149,7 @@ pub(crate) mod openapi;
 mod peer_pressure;
 mod prewarm;
 mod runtime_types;
+mod schema;
 pub(crate) mod scoping;
 mod storage_broker;
 mod supervisors;
@@ -173,6 +174,7 @@ pub(crate) use mesh_dispatch_metrics::*;
 pub(crate) use peer_pressure::*;
 pub(crate) use prewarm::*;
 pub(crate) use runtime_types::*;
+pub(crate) use schema::*;
 pub(crate) use supervisors::*;
 pub(crate) use volumes::*;
 

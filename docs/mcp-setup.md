@@ -79,6 +79,7 @@ The server speaks JSON-RPC 2.0 over stdin/stdout.
 | `tachyon_run_chaos_scenario` | Trigger a named chaos harness scenario |
 | `tachyon_hardware_status` | Local RAM and accelerator inventory |
 | `validate_faas_capabilities` | Check whether a hardware policy is admissible |
+| `tachyon_vector_search` | Read-only RAG/vector query via `/api/guest-rag-vector`; see [RAG vector search demo](rag-vector-search.md) |
 
 ---
 
@@ -88,6 +89,7 @@ The server speaks JSON-RPC 2.0 over stdin/stdout.
 |----------|----------|-------------|
 | `TACHYON_MCP_URL` | Yes | Base URL of a running `core-host` (e.g. `http://127.0.0.1:8080`) |
 | `TACHYON_MCP_PAT` | Yes | Personal Access Token with operator privileges |
+| `TACHYON_MCP_VECTOR_SEARCH_PATH` | No | Route used by `tachyon_vector_search` when `route_path` is omitted. Defaults to `/api/guest-rag-vector` |
 
 ## Available resources
 

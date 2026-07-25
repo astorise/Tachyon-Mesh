@@ -1277,6 +1277,7 @@ pub(crate) enum AccelerationMode {
 pub(crate) enum HostCommand {
     Serve,
     Run(RunCommand),
+    Schema(SchemaCommand),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -1285,6 +1286,16 @@ pub(crate) struct RunCommand {
     pub(crate) manifest: Option<PathBuf>,
     #[arg(long)]
     pub(crate) target: String,
+}
+
+#[derive(Debug, ClapArgs)]
+pub(crate) struct SchemaCommand {
+    /// Directory receiving integrity-config.schema.json and integrity-lock.schema.json.
+    #[arg(long, default_value = "target/schemas")]
+    pub(crate) output_dir: PathBuf,
+    /// Release tag used to stamp each schema's $id, for example v1.2.3.
+    #[arg(long)]
+    pub(crate) release_tag: Option<String>,
 }
 
 #[cfg(test)]

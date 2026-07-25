@@ -1,0 +1,21 @@
+{
+  "routes": [
+    {
+      "path": "/api/guest-rag-vector",
+      "role": "user",
+      "name": "guest-rag-vector",
+      "targets": [{ "module": "guest-rag-vector", "weight": 100 }],
+      "min_instances": 0,
+      "max_concurrency": 100,
+      "version": "1.0.0",
+      "scopes": {
+        "vector": ["tenant-kb", "demo-*"],
+        "http": ["/ai/v1/embeddings", "/ai/v1/chat/completions"]
+      },
+      "dependencies": {
+        "openai-embeddings": "^1.0",
+        "openai-chat": "^1.0"
+      }
+    }
+  ]
+}
