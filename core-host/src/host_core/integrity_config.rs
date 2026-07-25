@@ -932,6 +932,7 @@ pub(crate) fn validate_integrity_config(mut config: IntegrityConfig) -> Result<I
     validate_tee_requirements(&config)?;
     validate_enrollment_config(&config.enrollment)?;
     validate_kv_caches(&config)?;
+    validate_scheduler_config(&config)?;
     let route_registry = RouteRegistry::build(&config)?;
     config.resources = normalize_resources(config.resources, &config.routes, &route_registry)?;
     config.layer4 = normalize_layer4_config(config.layer4, &route_registry)?;
@@ -1026,6 +1027,66 @@ pub(crate) fn validate_kv_caches(config: &IntegrityConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validates manifest-declared scheduler policy without hard-coding tenant
+/// fairness in the runtime.
+pub(crate) fn validate_scheduler_config(config: &IntegrityConfig) -> Result<()> {
+    let mut known_tenants = BTreeSet::from(["default".to_owned()]);
+    for route in &config.routes {
+        if let Some(adapter_id) = route.adapter_id.as_deref().map(str::trim) {
+            if !adapter_id.is_empty() {
+                known_tenants.insert(adapter_id.to_owned());
+            }
+        }
+    }
+
+    for (tenant, weight) in &config.scheduler.tenant_weights {
+        let trimmed = tenant.trim();
+        if trimmed.is_empty() || !is_scheduler_tenant_id_valid(trimmed) {
+            anyhow::bail!(
+                "Integrity Validation Failed: scheduler.tenant_weights key `{tenant}` must be a non-empty tenant identifier without path separators"
+            );
+        }
+        if trimmed != tenant {
+            anyhow::bail!(
+                "Integrity Validation Failed: scheduler.tenant_weights key `{tenant}` must not contain leading or trailing whitespace"
+            );
+        }
+        if *weight == 0 {
+            anyhow::bail!(
+                "Integrity Validation Failed: scheduler.tenant_weights.`{tenant}` must be greater than zero"
+            );
+        }
+        if !known_tenants.contains(tenant) {
+            anyhow::bail!(
+                "Integrity Validation Failed: scheduler.tenant_weights references unknown tenant `{tenant}`; declare the tenant as a route `adapter_id` or use `default`"
+            );
+        }
+    }
+
+    if config.scheduler.spill_budget_bytes > 0
+        && config.scheduler.spill_tier_max == SchedulerSpillTier::Ram
+        && config.scheduler.pinned_ram_pool_bytes > 0
+        && config.scheduler.spill_budget_bytes > config.scheduler.pinned_ram_pool_bytes
+    {
+        tracing::warn!(
+            spill_budget_bytes = config.scheduler.spill_budget_bytes,
+            pinned_ram_pool_bytes = config.scheduler.pinned_ram_pool_bytes,
+            "scheduler spill budget exceeds the configured pinned RAM pool"
+        );
+    }
+
+    Ok(())
+}
+
+fn is_scheduler_tenant_id_valid(tenant: &str) -> bool {
+    !tenant.contains("..")
+        && !tenant.contains('/')
+        && !tenant.contains('\\')
+        && tenant
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '@'))
 }
 
 /// Enforces `require_scopes: true` — every route must have an explicit,

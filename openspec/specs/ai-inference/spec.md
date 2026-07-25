@@ -75,6 +75,20 @@ processing only the first request in the batch.
 - **AND** a backend that cannot produce a distinct output per request in the batch fails the batch
   with an error rather than silently returning fewer outputs than requests
 
+### Requirement: AI scheduler MUST apply declarative tenant fairness within QoS tiers
+The AI inference scheduler SHALL consume `IntegrityConfig.scheduler.tenant_weights` when selecting the next sequence to admit or advance on an accelerator. Tenant identity SHALL come from the request adapter/tenant id when present and SHALL fall back to `default`; the scheduler SHALL keep QoS ordering first, then apply weighted tenant fairness within the currently eligible QoS tier. With no declared tenant weights, every tenant SHALL behave as weight `1`, preserving the previous QoS-only behavior.
+
+#### Scenario: Weighted tenants share saturated decode capacity
+- **GIVEN** two saturated tenants in the same QoS tier with weights `3` and `1`
+- **WHEN** the scheduler repeatedly selects decode work for a compatible accelerator
+- **THEN** the higher-weight tenant receives approximately three quarters of the selected work over the scheduling window
+- **AND** the lower-weight tenant continues to receive work rather than being starved
+
+#### Scenario: QoS priority remains stronger than tenant weight
+- **GIVEN** a `RealTime` sequence and a `Batch` sequence are both eligible
+- **WHEN** the scheduler chooses the next step
+- **THEN** the `RealTime` sequence is selected before the `Batch` sequence even if the batch tenant has a higher declared tenant weight
+
 ### Requirement: Candle LLM prefill is chunked and configurable
 The Candle LLM runtime SHALL split prompt prefill into bounded token chunks before entering
 autoregressive decode. The default chunk size SHALL be 8192 tokens, model bindings MAY configure
@@ -163,6 +177,36 @@ The `wasi-nn-candle` execution engine SHALL dynamically inject and remove `.safe
 - **AND** the swap operation occurs without reloading the foundation model into VRAM
 - **AND** the engine enforces the configured maximum adapter-switch rate to keep aggregate latency within target SLOs
 
+### Requirement: Continuous batching MUST group Multi-LoRA requests by base model before adapter execution
+The AI inference scheduler SHALL treat requests for the same base model alias as compatible within a continuous-batching step even when their `adapter_id` values differ. The execution layer SHALL first attempt a backend-native mixed-adapter batch that passes one adapter assignment per selected row and routes every output back to the originating request. When the backend or request shape cannot execute a native mixed-adapter batch, the execution layer SHALL fall back to adapter-specific sub-batches. Requests without an `adapter_id` SHALL preserve the existing no-adapter behavior in either path.
+
+#### Scenario: Distinct adapters share one scheduler step
+- **GIVEN** multiple active requests target the same model alias
+- **AND** those requests use different `adapter_id` values
+- **WHEN** the scheduler selects the next compatible decode or prefill step
+- **THEN** the selected step includes all compatible requests for that base model
+- **AND** the execution layer passes one adapter assignment per selected row to a backend-native batch when supported
+- **AND** each response is routed back to the request that produced it
+
+#### Scenario: No-adapter requests remain isolated in mixed adapter batches
+- **GIVEN** one request targets the base model without `adapter_id`
+- **AND** another request targets the same model with an adapter
+- **WHEN** both requests are selected in one scheduler step
+- **THEN** the base request is assigned `None`
+- **AND** the adapted request is assigned its resolved adapter
+- **AND** the base output is not generated with the adapter active
+
+#### Scenario: Heterogeneous LoRA batch-native decode uses Candle runtime seams
+- **GIVEN** the host can group distinct adapters into one scheduler step
+- **AND** the Candle fork provides S-LoRA, Punica, or equivalent SGMV adapter kernels through `Llama::forward_with_adapters`
+- **AND** the Candle fork provides a batch-native decode loop through `Llama::generate_with_adapters`
+- **WHEN** the selected request rows have compatible rectangular prompt tokens for a no-paged-attention Llama safetensors runtime
+- **THEN** Tachyon executes prefill/decode with `forward_with_adapters` calls over rectangular rows
+- **AND** batched prefill honors `hardware_strategy.prefill_chunk_tokens` before entering token decode
+- **AND** each row's sampled output is routed back to its originating request
+- **AND** unsupported backend or request shapes fall back to sequential adapter sub-batches
+- **AND** an adapter-specific sub-batch failure is reported only to rows using that adapter assignment
+
 ### Requirement: Inference workloads MUST support declarative LoRA Multiplexing
 The `system-faas-model-broker` SHALL allow the sharing of a single base model in VRAM across multiple tenants by dynamically loading LoRA (Low-Rank Adaptation) weights based on Layer 7 routing conditions defined in the GitOps configuration.
 
@@ -173,13 +217,21 @@ The `system-faas-model-broker` SHALL allow the sharing of a single base model in
 - **AND** processes the prompt without reloading the base model weights, achieving zero-overhead multi-tenancy.
 
 ### Requirement: Large Models MUST support declarative Tensor Parallelism
-The orchestration configuration SHALL allow operators to define a `tensor_parallelism` strategy, forcing the underlying `wasi-nn` backend to partition model layers across multiple available GPUs to prevent OOM errors on large models.
+The orchestration configuration SHALL allow operators to define a `tensor_parallelism` strategy, forcing the underlying `wasi-nn` backend to partition model layers across multiple available GPUs on one node to prevent OOM errors on large models. Placement of one model across multiple machines is out of the active target unless a roadmap model exceeds the aggregate VRAM capacity of a single target node.
 
 #### Scenario: Partitioning a model across GPUs
 - **GIVEN** an AI deployment configured with `tensor_parallelism`
 - **WHEN** the model broker loads a model that exceeds a single GPU's available VRAM
 - **THEN** the runtime partitions model layers across the configured GPU set
 - **AND** rejects startup with a typed configuration error if the requested GPU topology is unavailable.
+
+#### Scenario: Cross-machine model placement remains a watchlist item
+- **GIVEN** no roadmap model exceeds the aggregate VRAM capacity of a single target node
+- **WHEN** an operator evaluates placing one live model across multiple machines
+- **THEN** Tachyon treats that work as deferred rather than an active implementation requirement
+- **AND** request-level overflow to peer nodes remains the horizontal scaling path for models that fit on one node
+- **AND** existing TCP/NCCL bootstrap and `StageTransport` primitives remain groundwork, not a requirement to orchestrate production cross-machine forwards
+- **AND** reactivation starts by reassessing `discover_cluster_topology()`, `core-host/src/ai_inference/parallel.rs`, and the TCP stage transport before estimating placement, NUMA binding, and peer-failure handling work
 
 ### Requirement: AI inference bindings MUST classify ModelOpt/NVFP4 directories without mock execution
 
@@ -446,12 +498,13 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 - **THEN** the runtime issues a real NCCL `AllReduce` collective across the participating devices' communicators
 - **AND** the reduced result matches the existing host-staged-sum reference within `1e-4` tolerance
 
-#### Scenario: Inter-node tensor parallelism bootstraps NCCL over TCP
-- **GIVEN** the runtime is built with the `candle-cuda` feature and a tensor-parallel shard group spans more than one host process
-- **WHEN** rank 0 starts an NCCL TCP bootstrap rendezvous
-- **THEN** it generates one NCCL unique id and broadcasts the 128-byte rendezvous payload to each remote process over TCP
-- **AND** every process initializes its local CUDA devices with `ncclCommInitRank` using non-overlapping global ranks and the shared world size
+#### Scenario: NCCL TCP bootstrap remains groundwork for deferred cross-machine placement
+- **GIVEN** the runtime's NCCL bootstrap primitive is exercised as groundwork for future cross-machine placement
+- **WHEN** rank 0 starts an NCCL TCP bootstrap rendezvous in a focused bootstrap test or reactivation spike
+- **THEN** it generates one NCCL unique id and broadcasts the 128-byte rendezvous payload to each peer process over TCP
+- **AND** participating CUDA processes can initialize local devices with `ncclCommInitRank` using non-overlapping global ranks and the shared world size
 - **AND** CPU-only builds can still validate the TCP framing without linking CUDA or NCCL
+- **AND** this primitive does not make production tensor-parallel placement across multiple host machines an active requirement before the cross-machine watchlist trigger is met
 
 #### Scenario: A CUDA worker may be pinned to a NUMA node before NCCL initialization
 - **GIVEN** the runtime is built with the `candle-cuda` feature on Linux
@@ -482,16 +535,16 @@ When the runtime is built with the `candle-cuda` Cargo feature, tensor-, pipelin
 - **THEN** the runtime uses the existing matmul, causal-mask, softmax, and value-projection path
 - **AND** CPU/F32 parallel Llama tests remain numerically equivalent to the dense reference path
 
-### Requirement: The runtime MUST execute pipeline-parallel inference across multiple nodes
-When a model deployment is configured with `hardware_strategy.distribution_mode: pipeline_parallelism`, the runtime SHALL assign contiguous layer ranges to distinct nodes/GPUs, SHALL stream activations between pipeline stages over a point-to-point transport implementing `StageTransport`, and SHALL support full autoregressive generation (prefill followed by an arbitrary number of decode steps), not prefill alone.
+### Requirement: The runtime MUST execute pipeline-parallel inference across local stages
+When a model deployment is configured with `hardware_strategy.distribution_mode: pipeline_parallelism`, the runtime SHALL assign contiguous layer ranges to local pipeline stages on the target node's configured GPU/device set, SHALL hand off activations between stages through a point-to-point transport implementing `StageTransport`, and SHALL support full autoregressive generation with persistent per-stage KV caches. Cross-machine placement of one live model remains deferred per the cross-machine watchlist scenario.
 
 #### Scenario: Layers are split across pipeline stages
-- **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` across N nodes
+- **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` across N local stages
 - **WHEN** the model broker loads the model
-- **THEN** each node is assigned a contiguous, non-overlapping range of layers
-- **AND** each node executes its layer range with a real transformer-block forward pass
+- **THEN** each stage is assigned a contiguous, non-overlapping range of layers
+- **AND** each stage executes its layer range with a real transformer-block forward pass
 
-#### Scenario: A pipeline-parallel deployment generates more than one token
+#### Scenario: A pipeline-parallel deployment generates more than one token locally
 - **GIVEN** a model deployment configured with `distribution_mode: pipeline_parallelism` and successfully loaded
 - **WHEN** a generation request is submitted with `max_tokens > 1`
 - **THEN** the runtime completes an initial prefill pass across all stages
@@ -505,7 +558,7 @@ When a model deployment is configured with `hardware_strategy.distribution_mode:
 - **AND** additional requests queue rather than unboundedly growing per-stage memory usage
 
 ### Requirement: The runtime MUST execute expert-parallel inference for Mixture-of-Experts checkpoints
-For checkpoints declaring expert tensors (e.g. Mixtral-style `model_type: mixtral` checkpoints), the runtime SHALL load the checkpoint, partition experts across the configured GPU/node set, and SHALL route each token only to the device(s) hosting its selected expert, rather than rejecting expert-parallel deployments outright or replicating all experts on every device.
+For checkpoints declaring expert tensors (e.g. Mixtral-style `model_type: mixtral` checkpoints), the runtime SHALL load the checkpoint, partition experts across the configured local GPU/device set, and SHALL route each token only to the device(s) hosting its selected expert, rather than rejecting expert-parallel deployments outright or replicating all experts on every device.
 
 #### Scenario: An MoE checkpoint is loaded and partitioned across devices
 - **GIVEN** a model deployment configured with `distribution_mode: expert_parallelism` and a checkpoint whose `config.json` declares `model_type: mixtral`
@@ -539,7 +592,7 @@ For checkpoints declaring expert tensors (e.g. Mixtral-style `model_type: mixtra
 - **AND** does not silently truncate routing to top-1
 
 ### Requirement: Parallel execution plans MUST be validated against discovered hardware topology before deployment
-The runtime SHALL reject, with a typed topology error, any `tensor_parallelism`, `pipeline_parallelism`, or `expert_parallelism` deployment whose GPU/node count, interconnect class, or per-shard VRAM requirement cannot be satisfied by the cluster's discovered hardware topology. On CUDA builds, per-device free VRAM SHALL be sourced from real NVML telemetry rather than a hardcoded placeholder value, so the VRAM check can actually reject an oversized deployment in production.
+The runtime SHALL reject, with a typed topology error, any `tensor_parallelism`, `pipeline_parallelism`, or `expert_parallelism` deployment whose requested local GPU/device count, interconnect class, or per-shard VRAM requirement cannot be satisfied by the target node's discovered hardware topology. On CUDA builds, per-device free VRAM SHALL be sourced from real NVML telemetry rather than a hardcoded placeholder value, so the VRAM check can actually reject an oversized deployment in production.
 
 #### Scenario: Insufficient GPU count is rejected at deploy time
 - **WHEN** a deployment requests `tensor_parallelism` across more GPUs than are available on the target node
@@ -653,7 +706,7 @@ When a model deployment declares `hardware_strategy.distribution_mode` other tha
 - **WHEN** the runtime loads the model
 - **THEN** the model is loaded as a pipeline-parallel engine with the configured stage ranges
 - **AND** a prefill request returns prompt logits equivalent to the dense reference
-- **AND** a token-streaming (decode) request returns a typed "decode not yet supported for pipeline parallelism" error rather than incorrect output
+- **AND** a token-streaming (decode) request reuses per-stage KV caches and returns output equivalent to the dense reference
 
 #### Scenario: An expert-parallel deployment is validated but refused until a MoE loader exists
 - **GIVEN** a model binding whose `distribution_mode` is `expert_parallelism`
@@ -721,6 +774,48 @@ When a model deployment sets `hardware_strategy.paged_attention: true`, the runt
 - **WHEN** the Candle LLM runtime loads the binding
 - **THEN** loading fails with a typed `UnsupportedModel` error naming the sizing shortfall
 - **AND** no paged KV block pool or per-layer tensors are left allocated
+
+### Requirement: PagedAttention KV blocks MUST tier through pinned RAM before encrypted NVMe spill
+When local VRAM pressure requires paging, the host SHALL evict paged-attention KV blocks only at request preemption boundaries and only for scheduler tiers marked preemptible. `RealTime` requests SHALL remain non-preemptible by default. Eviction SHALL move blocks from VRAM to pinned host RAM first and then to tenant-isolated encrypted NVMe spill files when the pinned RAM budget is exhausted. The host SHALL choose recompute for short contexts when prefill cost is lower than swap transfer cost, choose swap for longer contexts, and expose block-residency, preemption-mode, spill-throughput, and resume-latency metrics. Spill files are cache material only: a slow, full, or lost NVMe tier SHALL degrade into recompute/cache-miss behavior rather than corrupting generation correctness.
+
+#### Scenario: RealTime KV blocks are never paged
+- **GIVEN** a paged-attention request runs in the `RealTime` QoS tier
+- **WHEN** the local pager considers evicting one of its KV blocks
+- **THEN** the pager rejects the eviction as a non-preemptible tier
+- **AND** no RAM or NVMe spill record is created
+
+#### Scenario: Standard and Batch blocks spill through RAM before NVMe
+- **GIVEN** a `Standard` or `Batch` request is preemptible
+- **AND** pinned host RAM has enough budget for the selected KV block
+- **WHEN** the pager chooses swap over recompute
+- **THEN** the block is recorded in the pinned RAM tier
+- **AND** the NVMe spill file is not used
+- **AND** spill records are keyed by stable logical sequence/block identity rather than by reusable physical KV slot id
+- **AND** a duplicate spill for an unreclaimed logical key is rejected before charging additional spill capacity
+
+#### Scenario: NVMe spill is encrypted and isolated by tenant
+- **GIVEN** the pinned RAM budget is exhausted
+- **AND** the configured maximum spill tier is `nvme`
+- **WHEN** two tenants spill KV blocks
+- **THEN** each tenant writes to a distinct spill pool path
+- **AND** the bytes persisted on disk are AES-GCM ciphertext, not plaintext KV contents
+- **AND** restoring or evicting an NVMe-spilled block reclaims the physical spill file before the budget is reused
+
+#### Scenario: Spill failure remains reconstructible
+- **GIVEN** pinned RAM and NVMe capacity cannot accept a selected block
+- **WHEN** the pager attempts to swap that block
+- **THEN** the operation fails with a typed capacity error
+- **AND** the block is not counted as spilled
+- **AND** the scheduler may recover by recomputing the KV context from the prompt
+
+#### Scenario: Five and ten agent paging scenarios expose spill and resume metrics
+- **GIVEN** local paging is disabled for a five-agent scheduling window
+- **WHEN** the scheduler completes the window without KV eviction
+- **THEN** spilled bytes and resume latency metrics remain zero
+- **GIVEN** local paging is enabled for a ten-agent scheduling window
+- **WHEN** each agent spills one preemptible KV block
+- **THEN** the first blocks occupy pinned RAM before later blocks use encrypted NVMe
+- **AND** restoring every block records restored bytes and monotonic resume p50/p99 metrics
 
 ### Requirement: CUDA Graph and FlashInfer decode acceleration MUST be explicit and fail-closed
 The AI inference build SHALL consume the pinned `astorise/candle` fork tag that
