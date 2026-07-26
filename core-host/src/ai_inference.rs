@@ -1766,21 +1766,15 @@ impl BackendModel for CandleBackendModel {
 
     fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
         match &self.kind {
-            CandleBackendModelKind::Upstream(runtime) => {
-                validate_u8_prompts(&self.source.alias, inputs)?;
-                // One HTTP round trip per input: the OpenAI chat-completions
-                // route has no batch form, and folding several prompts into one
-                // request would break the one-output-per-input contract.
-                let result = inputs
-                    .iter()
-                    .map(|input| {
-                        runtime
-                            .generate(&[input.data.as_ref()])
-                            .map_err(anyhow::Error::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>();
-                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
-                return result;
+            CandleBackendModelKind::Upstream(_) => {
+                // Delegate to the per-input path so both share one
+                // implementation. `execute`'s all-or-nothing signature is what
+                // its caller asked for, not a property of the backend.
+                let adapters = vec![None; inputs.len()];
+                return self
+                    .execute_with_adapter_results(inputs, &adapters)
+                    .into_iter()
+                    .collect();
             }
             CandleBackendModelKind::Qwen35Moe(runtime) => {
                 if inputs
@@ -2001,6 +1995,60 @@ impl BackendModel for CandleBackendModel {
             return repeat_batch_error(inputs.len().max(adapters.len()), message);
         }
         match &self.kind {
+            CandleBackendModelKind::Upstream(runtime) => {
+                if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
+                    return repeat_batch_error(inputs.len(), error.to_string());
+                }
+                let alias = self.source.alias.as_str();
+                // Two properties the trait default cannot give this backend:
+                //
+                // 1. Per-input isolation. An upstream failure is usually about
+                //    one request (a rejected prompt, a 400), and collecting
+                //    into a single `Result` would fail every co-batched caller
+                //    with it, discarding responses already received.
+                // 2. Concurrency. These are independent network round trips on
+                //    the accelerator dispatcher thread, which is shared by
+                //    every CPU-resident model on the node. Run sequentially, a
+                //    batch of 32 would make the last caller wait for the sum of
+                //    all preceding upstream latencies — and block unrelated
+                //    local inference meanwhile. One scoped thread per input is
+                //    coarse but bounded: the scheduler already caps a batch at
+                //    `DEFAULT_BATCH_SIZE`.
+                let results: Vec<Result<Vec<u8>>> = thread::scope(|scope| {
+                    let handles = inputs
+                        .iter()
+                        .zip(adapters)
+                        .map(|(input, adapter)| match adapter {
+                            // Adapter injection has no wire representation
+                            // upstream — but only this caller fails for it.
+                            Some(adapter) => Err(adapter.id.clone()),
+                            None => {
+                                Ok(scope.spawn(move || runtime.generate(&[input.data.as_ref()])))
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|handle| match handle {
+                            Err(adapter_id) => Err(anyhow!(
+                                "LoRA adapter `{adapter_id}` was resolved for model `{alias}`, but upstream bindings do not support adapter injection"
+                            )),
+                            Ok(handle) => match handle.join() {
+                                Ok(result) => result.map_err(anyhow::Error::from),
+                                Err(_) => Err(anyhow!(
+                                    "upstream request thread for model `{alias}` panicked"
+                                )),
+                            },
+                        })
+                        .collect()
+                });
+                record_execution(
+                    &self.source.alias,
+                    runtime.executed_on(),
+                    results.iter().all(Result::is_ok),
+                );
+                results
+            }
             CandleBackendModelKind::TextGeneration {
                 target,
                 speculative: None,
@@ -3132,6 +3180,55 @@ mod tests {
         // No local weights, so no local residency claim.
         assert_eq!(backend.residency(), AcceleratorMemoryResidency::HostRam);
         assert_eq!(backend.source.model_size_bytes, 0);
+    }
+
+    #[test]
+    fn one_bad_upstream_request_does_not_poison_its_co_batched_neighbours() {
+        let upstream = upstream_openai::FakeUpstream::start_many(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+            2,
+        );
+        let backend = CandleBackendModel::load(&IntegrityModelBinding {
+            alias: "remote-coder".to_owned(),
+            path: upstream.binding(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        })
+        .expect("upstream binding should load");
+
+        // Middle request is rejected before it ever leaves the host
+        // (`max_new_tokens: 0`); the other two are valid and must still get
+        // their own answers rather than inherit the failure.
+        let inputs = [
+            &br#"{"prompt":"a"}"#[..],
+            &br#"{"prompt":"b","max_new_tokens":0}"#[..],
+            &br#"{"prompt":"c"}"#[..],
+        ]
+        .map(|data| SharedInputTensor {
+            dimensions: vec![data.len() as u32],
+            ty: TensorType::U8,
+            data: Arc::from(data),
+        });
+        let adapters = vec![None, None, None];
+
+        let results = backend.execute_with_adapter_results(&inputs, &adapters);
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].as_ref().expect("first request should succeed"),
+            b"ok"
+        );
+        assert!(
+            results[1].is_err(),
+            "the malformed request should fail on its own"
+        );
+        assert_eq!(
+            results[2].as_ref().expect("third request should succeed"),
+            b"ok"
+        );
     }
 
     #[test]

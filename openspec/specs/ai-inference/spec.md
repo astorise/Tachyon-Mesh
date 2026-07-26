@@ -314,11 +314,26 @@ with VRAM already claimed.
 
 #### Scenario: A block type without a CUDA kernel is refused before load
 
-- **WHEN** a GGUF checkpoint bound to a non-`cpu` device contains a tensor whose
-  block type has no CUDA quantized-matmul kernel
+- **GIVEN** the binding's device resolves to a real CUDA device
+- **WHEN** a GGUF checkpoint contains a tensor whose block type has no CUDA
+  quantized-matmul kernel
 - **THEN** the runtime returns a typed unsupported-model error naming the tensor
   and its block type
 - **AND** no weights are uploaded to the device
+
+#### Scenario: The block-type rule does not apply to the CPU fallback
+
+- **GIVEN** a host built with the `candle-cuda` feature but no physical GPU
+- **WHEN** a non-`cpu` GGUF binding resolves to the `Device::Cpu` fallback
+- **THEN** the runtime loads it regardless of its block types, because no CUDA
+  kernel will execute
+
+#### Scenario: Attention optimizations are refused for GGUF
+
+- **WHEN** a GGUF binding requests `paged_attention`, `cuda_graph_decode`, or
+  `flashinfer_attention`
+- **THEN** the runtime returns a typed unsupported-model error
+- **AND** it does not accept the flag while running ordinary quantized attention
 
 #### Scenario: A CUDA-less build refuses a GPU GGUF binding
 
@@ -376,6 +391,49 @@ accelerator residency regardless of the `device` its binding declares.
 - **THEN** the runtime returns a typed error carrying the endpoint, status, and
   a bounded excerpt of the upstream's own explanation
 - **AND** the failing response body is never returned as generated text
+
+#### Scenario: Host generation limits apply across the process boundary
+
+- **WHEN** a request reaching an upstream binding carries `max_new_tokens`
+  outside `1..=HOST_MAX_NEW_TOKENS`
+- **THEN** the runtime rejects it before any round trip, exactly as the native
+  runtime does
+- **AND** when the field is absent the host default is sent, so the upstream's
+  own default never governs the generation budget
+
+#### Scenario: One failing request does not fail its co-batched neighbours
+
+- **WHEN** a batch of independent requests reaches one upstream binding and some
+  of them fail
+- **THEN** each caller receives its own result
+- **AND** a failure is not propagated to requests that succeeded
+
+#### Scenario: Independent upstream requests are dispatched concurrently
+
+- **WHEN** a batch of independent requests reaches one upstream binding
+- **THEN** their network round trips run concurrently
+- **AND** a caller does not wait for the sum of the preceding requests' upstream
+  latencies
+
+#### Scenario: A truncated stream is not reported as a completed generation
+
+- **WHEN** an upstream stream ends without its `[DONE]` sentinel
+- **THEN** the runtime returns a typed malformed-response error
+- **AND** the request is not recorded as a successful execution
+
+#### Scenario: Every upstream read is bounded
+
+- **WHEN** an upstream returns an oversized response body, error body, stream, or
+  individual SSE frame
+- **THEN** the runtime bounds the read itself rather than only truncating the
+  result afterwards
+
+#### Scenario: Embedding components must narrow to finite f32
+
+- **WHEN** an upstream embedding contains a value that does not narrow to a
+  finite `f32`
+- **THEN** the runtime returns a typed malformed-response error instead of
+  returning an infinity
 
 #### Scenario: An invalid upstream URL fails at load
 

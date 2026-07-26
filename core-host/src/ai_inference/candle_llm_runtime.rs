@@ -104,7 +104,7 @@ const GGUF_EXTENSION: &str = "gguf";
 const GGUF_LLAMA_ARCHITECTURE: &str = "llama";
 /// Error component label for GGUF load failures.
 const GGUF_COMPONENT: &str = "model.gguf";
-const DEFAULT_MAX_NEW_TOKENS: usize = 64;
+pub(crate) const DEFAULT_MAX_NEW_TOKENS: usize = 64;
 pub(crate) const DEFAULT_SPECULATIVE_DRAFT_TOKENS: usize = 4;
 /// Hard upper bound on `max_new_tokens` for any single request, regardless of
 /// what the caller asks for. Protects the host from unbounded decode loops.
@@ -1696,8 +1696,16 @@ impl CandleLlmRuntime {
         // build lacking `candle-flashinfer` would report this as supported and
         // then panic at decode time (`unimplemented!("compile with
         // '--features flashinfer-kernels'")`).
+        //
+        // The Safetensors requirement is the same one paged_attention carries:
+        // only `load_safetensors` builds the decode path FlashInfer hooks into.
+        // GGUF now also runs on CUDA, so without this the loader would accept
+        // `flashinfer_attention: true` on a GGUF binding and then run ordinary
+        // quantized attention — `QuantizedLlama` owns its own decode path and
+        // never sees `strategy` at all.
         let flashinfer_attention_supported = single_device_cuda_supported
             && cfg!(feature = "candle-flashinfer")
+            && format == ModelFormat::Safetensors
             && requested_device != "cpu";
         if strategy.flashinfer_attention {
             if !flashinfer_attention_supported {
@@ -1705,7 +1713,7 @@ impl CandleLlmRuntime {
                     alias: alias.to_owned(),
                     path: root.to_path_buf(),
                     detail:
-                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Llama checkpoint on a CUDA device with the candle-flashinfer feature compiled in"
+                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Safetensors Llama checkpoint on a CUDA device with the candle-flashinfer feature compiled in"
                             .to_owned(),
                 });
             }
@@ -4450,11 +4458,18 @@ fn unsupported_gguf_cuda_dtypes(content: &gguf_file::Content) -> Option<Unsuppor
 /// Pick the device a GGUF checkpoint's weights are uploaded to.
 ///
 /// `cpu` (the default) keeps the historical host-side quantized path. Any other
-/// request resolves a real CUDA device, but only after every tensor's block
-/// type has been checked against [`gguf_dtype_has_cuda_matmul_kernel`] — a
-/// mixed-quant checkpoint that names even one unsupported block type is
-/// rejected with a typed error naming the tensor and its dtype, instead of
-/// half-loading onto the GPU.
+/// request resolves a device first and only *then* checks block types, because
+/// the block-type restriction is a property of the CUDA kernels, not of the
+/// checkpoint: `Device::cuda_if_available` follows the runtime's existing
+/// convention of falling back to `Device::Cpu` when no physical GPU is present,
+/// and a checkpoint that lands on that fallback runs through the host kernels,
+/// which support every block type. Scanning before resolving would reject a
+/// perfectly runnable model on a `candle-cuda` build that happens to have no
+/// GPU attached.
+///
+/// The scan still runs before any weights are uploaded, so a checkpoint CUDA
+/// cannot execute fails at load rather than at the first decode step with VRAM
+/// already claimed.
 fn resolve_gguf_device(
     alias: &str,
     root: &Path,
@@ -4475,6 +4490,19 @@ fn resolve_gguf_device(
         });
     }
 
+    let device =
+        Device::cuda_if_available(0).map_err(|error| CandleLlmError::InvalidComponent {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            component: GGUF_COMPONENT,
+            detail: error.to_string(),
+        })?;
+    if !device.is_cuda() {
+        // Silent CPU fallback: no CUDA kernel will run, so the block-type
+        // restriction does not apply.
+        return Ok(device);
+    }
+
     if let Some(report) = unsupported_gguf_cuda_dtypes(content) {
         return Err(CandleLlmError::UnsupportedModel {
             alias: alias.to_owned(),
@@ -4486,12 +4514,7 @@ fn resolve_gguf_device(
         });
     }
 
-    Device::cuda_if_available(0).map_err(|error| CandleLlmError::InvalidComponent {
-        alias: alias.to_owned(),
-        path: root.to_path_buf(),
-        component: GGUF_COMPONENT,
-        detail: error.to_string(),
-    })
+    Ok(device)
 }
 
 /// Collect the model's end-of-sequence token id(s), if any, into a flat list.
@@ -7019,6 +7042,12 @@ mod tests {
     #[cfg(feature = "candle-cuda")]
     #[test]
     fn gguf_rejects_a_gpu_binding_whose_blocks_have_no_cuda_kernel() {
+        // The block-type rule only applies once a real CUDA device is resolved:
+        // on a `candle-cuda` build with no GPU attached the loader falls back to
+        // the host, where every block type runs.
+        if !Device::cuda_if_available(0).is_ok_and(|device| device.is_cuda()) {
+            return;
+        }
         let content = gguf_header_with_dtypes(&[
             ("blk.0.attn_q.weight", GgmlDType::Q4K),
             ("blk.0.ffn_down.weight", GgmlDType::Q8K),

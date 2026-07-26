@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::candle_llm_runtime::ChatTurn;
+use super::candle_llm_runtime::{ChatTurn, DEFAULT_MAX_NEW_TOKENS, HOST_MAX_NEW_TOKENS};
 
 /// Binding `path` prefix that selects this backend.
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
@@ -49,6 +49,15 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 /// Cap on a single upstream response body. Matches the intent of the native
 /// runtime's `max_prompt_bytes`: a runaway upstream must not exhaust host RAM.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+/// Cap on the error excerpt echoed back to the operator. Read as a byte limit
+/// so the allocation is bounded, not just the resulting string.
+const MAX_ERROR_BODY_BYTES: u64 = 2048;
+/// Cap on a whole SSE stream. Generous — 64 MiB of text is millions of tokens —
+/// but finite, so a stream that never terminates cannot grow without bound.
+const MAX_STREAM_BYTES: u64 = MAX_RESPONSE_BYTES;
+/// Cap on one SSE frame. `BufRead::read_line` grows its buffer until a newline,
+/// so a single unterminated line is the tighter of the two risks.
+const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum UpstreamError {
@@ -104,21 +113,38 @@ impl UpstreamEndpoint {
             None => (remainder, None),
         };
         let url = url.trim_end_matches('/');
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(invalid(format!(
-                "expected `{UPSTREAM_SCHEME}http://…` or `{UPSTREAM_SCHEME}https://…`, got `{remainder}`"
-            )));
+        // Parse structurally rather than matching on the prefix: a textual
+        // check accepts authority-less forms like `http:///v1`, which reqwest
+        // only rejects when the first request is sent — far too late for a
+        // load-time validation contract.
+        //
+        // A structural failure and an empty authority share one message: both
+        // mean "this is not an absolute http(s) URL with a host", and the
+        // url crate's own wording ("relative URL without a base", "empty host")
+        // does not tell an operator what to write instead.
+        let malformed = |detail: &str| {
+            invalid(format!(
+                "`{url}` is not usable as an upstream URL ({detail}); expected `{UPSTREAM_SCHEME}http://…` or `{UPSTREAM_SCHEME}https://…` with a host, e.g. `{UPSTREAM_SCHEME}http://127.0.0.1:8080/v1`"
+            ))
+        };
+        let parsed = reqwest::Url::parse(url).map_err(|error| malformed(&error.to_string()))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(malformed(&format!("scheme `{}`", parsed.scheme())));
         }
-        // Reject a bare scheme (`openai:http://`), which would otherwise build
-        // request URLs against an empty authority.
-        if url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .is_empty()
-        {
-            return Err(invalid(
-                "upstream URL is missing a host after the scheme".to_owned(),
-            ));
+        if parsed.host_str().is_none_or(str::is_empty) {
+            return Err(malformed("no host"));
+        }
+        // `Url::parse` is lenient about an extra slash: it reads `http:///v1`
+        // as host `v1` with an empty path, so `host_str()` alone accepts it —
+        // and the `/v1` the operator meant as a path prefix is then silently
+        // dropped from every request URL. Require the authority to be written
+        // explicitly instead of inferred.
+        let authority = url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        if authority.is_empty() || authority.starts_with('/') {
+            return Err(malformed("no host between `://` and the path"));
         }
 
         let mut model = None;
@@ -311,13 +337,27 @@ impl UpstreamOpenAiRuntime {
             }
         };
 
+        // The host's bounded-generation contract does not stop at the process
+        // boundary: an alias switched from a native runtime to an upstream must
+        // not silently gain an unbounded generation budget. Validate exactly as
+        // `CandleLlmRuntime::parse_request` does, and always send a cap so an
+        // absent field cannot leave the upstream's own (possibly unlimited)
+        // default in charge.
+        let max_new_tokens = request.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS);
+        if max_new_tokens == 0 || max_new_tokens > HOST_MAX_NEW_TOKENS {
+            return Err(UpstreamError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "max_new_tokens {max_new_tokens} must be between 1 and {HOST_MAX_NEW_TOKENS}"
+                ),
+            });
+        }
+
         let mut body = Map::new();
         body.insert("model".to_owned(), json!(self.endpoint.model));
         body.insert("messages".to_owned(), Value::Array(messages));
         body.insert("stream".to_owned(), json!(stream));
-        if let Some(max_new_tokens) = request.max_new_tokens {
-            body.insert("max_tokens".to_owned(), json!(max_new_tokens));
-        }
+        body.insert("max_tokens".to_owned(), json!(max_new_tokens));
         if let Some(temperature) = request.temperature {
             body.insert("temperature".to_owned(), json!(temperature));
         }
@@ -373,10 +413,16 @@ impl UpstreamOpenAiRuntime {
 
         let status = response.status();
         if !status.is_success() {
-            // Bound the echoed body: an upstream error page can be arbitrarily
-            // large, and this string ends up in a request error.
-            let body = response.text().unwrap_or_default();
-            let body = body.chars().take(2048).collect::<String>();
+            // Bound the read itself, not just the excerpt: `Response::text()`
+            // would allocate the whole error page first, so a broken upstream
+            // returning a huge body could exhaust host memory before the
+            // truncation below ever ran.
+            let mut raw = Vec::new();
+            let _ = std::io::copy(
+                &mut std::io::Read::take(response, MAX_ERROR_BODY_BYTES),
+                &mut raw,
+            );
+            let body = String::from_utf8_lossy(&raw).chars().collect::<String>();
             return Err(UpstreamError::Status {
                 alias: self.alias.clone(),
                 endpoint: url,
@@ -435,8 +481,11 @@ impl UpstreamOpenAiRuntime {
         let body = self.chat_body(prompt, true)?;
         let response = self.post("/chat/completions", &body)?;
 
-        let mut reader = std::io::BufReader::new(response);
+        // Bound the whole stream, so an upstream that never terminates cannot
+        // grow the reader without limit.
+        let mut reader = std::io::BufReader::new(std::io::Read::take(response, MAX_STREAM_BYTES));
         let mut line = String::new();
+        let mut saw_done = false;
         loop {
             line.clear();
             let read = reader
@@ -449,12 +498,25 @@ impl UpstreamOpenAiRuntime {
             if read == 0 {
                 break;
             }
+            // `read_line` has already grown the buffer to the newline, so this
+            // catches the frame *after* one allocation bounded by
+            // `MAX_STREAM_BYTES` — it exists to stop a stream of oversized
+            // frames, not the first one.
+            if line.len() > MAX_SSE_FRAME_BYTES {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "upstream SSE frame exceeds the {MAX_SSE_FRAME_BYTES}-byte limit"
+                    ),
+                });
+            }
             let Some(payload) = line.trim().strip_prefix("data:") else {
                 // Blank separator lines and SSE comments carry no delta.
                 continue;
             };
             let payload = payload.trim();
             if payload == "[DONE]" {
+                saw_done = true;
                 break;
             }
             // A malformed frame mid-stream must not discard the tokens already
@@ -473,6 +535,17 @@ impl UpstreamOpenAiRuntime {
             {
                 on_token(delta);
             }
+        }
+
+        // A clean EOF without `[DONE]` is a truncated generation, not a
+        // completed one — the upstream restarted mid-stream, or returned a
+        // non-SSE success body. Reporting success here would hand the caller
+        // silently truncated code and record the request as healthy.
+        if !saw_done {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
+            });
         }
         Ok(())
     }
@@ -495,12 +568,25 @@ impl UpstreamOpenAiRuntime {
         embedding
             .iter()
             .map(|value| {
-                value.as_f64().map(|value| value as f32).ok_or_else(|| {
-                    UpstreamError::MalformedResponse {
+                let value = value
+                    .as_f64()
+                    .ok_or_else(|| UpstreamError::MalformedResponse {
                         alias: self.alias.clone(),
                         detail: "`data[0].embedding` contains a non-numeric entry".to_owned(),
-                    }
-                })
+                    })?;
+                // `1e39 as f32` is `inf`, and an infinite component turns every
+                // downstream cosine similarity into NaN, silently corrupting
+                // result ordering. Reject rather than narrow.
+                let narrowed = value as f32;
+                if !narrowed.is_finite() {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "`data[0].embedding` contains {value}, which is not a finite f32"
+                        ),
+                    });
+                }
+                Ok(narrowed)
             })
             .collect()
     }
@@ -528,6 +614,109 @@ fn read_json(alias: &str, response: reqwest::blocking::Response) -> Result<Value
         alias: alias.to_owned(),
         detail: format!("response was not JSON: {error}"),
     })
+}
+
+/// A canned HTTP/1.1 server that records the requests it received and replies
+/// with a fixed response. Real sockets rather than a mocked client, so tests
+/// exercise the actual reqwest round trip and SSE framing.
+///
+/// Lives at module scope (not inside `mod tests`) so `ai_inference`'s own tests
+/// can drive the backend end to end through `BackendModel`.
+#[cfg(test)]
+pub(crate) struct FakeUpstream {
+    base_url: String,
+    requests: std::sync::mpsc::Receiver<(String, String)>,
+}
+
+#[cfg(test)]
+impl FakeUpstream {
+    pub(crate) fn start(status_line: &str, content_type: &str, body: &str) -> Self {
+        Self::start_many(status_line, content_type, body, 1)
+    }
+
+    /// `connections` bounds how many requests the server answers before it
+    /// stops accepting, so a concurrent batch can be served from one fixture.
+    pub(crate) fn start_many(
+        status_line: &str,
+        content_type: &str,
+        body: &str,
+        connections: usize,
+    ) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (tx, requests) = std::sync::mpsc::channel();
+        let response = format!(
+            "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        // Detached: the accept loop parks on `accept()` if a test makes fewer
+        // requests than it allowed for, so joining it on drop would hang.
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Read, Write};
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let tx = tx.clone();
+                let response = response.clone();
+                // One thread per connection: a concurrent batch would otherwise
+                // serialise against this accept loop and hide the very
+                // parallelism the test is checking.
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream);
+
+                    // Request line plus headers, stopping at the blank separator.
+                    let mut target = String::new();
+                    let mut content_length = 0usize;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if target.is_empty() {
+                            target = line.trim().to_owned();
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                        line.clear();
+                    }
+
+                    let mut body = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut body);
+                    let _ = tx.send((target, String::from_utf8_lossy(&body).into_owned()));
+
+                    let mut stream = reader.into_inner();
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+
+        Self { base_url, requests }
+    }
+
+    pub(crate) fn binding(&self) -> String {
+        format!("{UPSTREAM_SCHEME}{}", self.base_url)
+    }
+
+    /// The (request-line, parsed body) pair of the next request received.
+    pub(crate) fn received(&self) -> (String, Value) {
+        let (target, body) = self
+            .requests
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the upstream should have received a request");
+        let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+        (target, body)
+    }
 }
 
 #[cfg(test)]
@@ -581,6 +770,45 @@ mod tests {
     #[test]
     fn upstream_rejects_a_missing_host() {
         assert!(UpstreamEndpoint::parse("m", "openai:http://").is_err());
+        // Authority-less but textually non-empty after the scheme: a prefix
+        // check would let this through and reqwest would only complain on the
+        // first request.
+        let error = UpstreamEndpoint::parse("m", "openai:http:///v1")
+            .expect_err("an authority-less URL must be rejected at load");
+        assert!(
+            error.to_string().contains("no host"),
+            "the error should say the host is missing, got: {error}"
+        );
+    }
+
+    #[test]
+    fn max_new_tokens_is_bounded_by_the_same_host_limits_as_the_native_runtime() {
+        let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
+
+        // Absent: the host default is sent, never an omitted cap that would
+        // leave the upstream's own (possibly unlimited) default in charge.
+        let body = backend
+            .chat_body(br#"{"prompt":"p"}"#, false)
+            .expect("request should map");
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_NEW_TOKENS);
+
+        // Out of range in either direction is rejected before any round trip,
+        // exactly as `CandleLlmRuntime::parse_request` does.
+        for max_new_tokens in [0, HOST_MAX_NEW_TOKENS + 1] {
+            let request = format!(r#"{{"prompt":"p","max_new_tokens":{max_new_tokens}}}"#);
+            let error = backend
+                .chat_body(request.as_bytes(), false)
+                .expect_err("an out-of-range max_new_tokens must be rejected");
+            assert!(matches!(error, UpstreamError::InvalidRequest { .. }));
+        }
+
+        let body = backend
+            .chat_body(
+                format!(r#"{{"prompt":"p","max_new_tokens":{HOST_MAX_NEW_TOKENS}}}"#).as_bytes(),
+                false,
+            )
+            .expect("the ceiling itself is valid");
+        assert_eq!(body["max_tokens"], HOST_MAX_NEW_TOKENS);
     }
 
     #[test]
@@ -676,94 +904,6 @@ mod tests {
     fn telemetry_names_the_upstream_rather_than_a_local_accelerator() {
         let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
         assert_eq!(backend.executed_on(), "upstream:http://127.0.0.1:8080/v1");
-    }
-
-    /// A single-shot HTTP/1.1 server that records the request it received and
-    /// replies with a canned response. Real sockets rather than a mocked
-    /// client, so the tests exercise the actual reqwest round trip and SSE
-    /// framing.
-    struct FakeUpstream {
-        base_url: String,
-        request: std::sync::mpsc::Receiver<(String, String)>,
-        handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl FakeUpstream {
-        fn start(status_line: &str, content_type: &str, body: &str) -> Self {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
-            let base_url = format!(
-                "http://{}/v1",
-                listener
-                    .local_addr()
-                    .expect("listener should have an address")
-            );
-            let (tx, request) = std::sync::mpsc::channel();
-            let response = format!(
-                "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-
-            let handle = std::thread::spawn(move || {
-                use std::io::{BufRead, Read, Write};
-                let Ok((stream, _)) = listener.accept() else {
-                    return;
-                };
-                let mut reader = std::io::BufReader::new(stream);
-
-                // Request line plus headers, stopping at the blank separator.
-                let mut target = String::new();
-                let mut content_length = 0usize;
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if target.is_empty() {
-                        target = line.trim().to_owned();
-                    }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        content_length = value.trim().parse().unwrap_or(0);
-                    }
-                    line.clear();
-                }
-
-                let mut body = vec![0u8; content_length];
-                let _ = reader.read_exact(&mut body);
-                let _ = tx.send((target, String::from_utf8_lossy(&body).into_owned()));
-
-                let mut stream = reader.into_inner();
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-            });
-
-            Self {
-                base_url,
-                request,
-                handle: Some(handle),
-            }
-        }
-
-        fn binding(&self) -> String {
-            format!("{UPSTREAM_SCHEME}{}", self.base_url)
-        }
-
-        /// The (request-line, body) pair the upstream actually received.
-        fn received(&self) -> (String, Value) {
-            let (target, body) = self
-                .request
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the upstream should have received a request");
-            let body = serde_json::from_str(&body).unwrap_or(Value::Null);
-            (target, body)
-        }
-    }
-
-    impl Drop for FakeUpstream {
-        fn drop(&mut self) {
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
     }
 
     #[test]
@@ -862,6 +1002,71 @@ mod tests {
             "unexpected request line: {target}"
         );
         assert_eq!(body["input"], "hello");
+    }
+
+    #[test]
+    fn a_stream_that_ends_before_done_is_reported_as_truncated() {
+        // Two real deltas, then a clean EOF: an upstream restart mid-generation
+        // looks exactly like this, and calling it success would hand the caller
+        // silently truncated code.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fn \"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"main\"}}]}\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut tokens = Vec::new();
+        let error = backend
+            .generate_streaming(&[b"write main"], &mut |token| tokens.push(token.to_owned()))
+            .expect_err("a stream without [DONE] is truncated, not complete");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("[DONE]"),
+            "the error should name the missing sentinel, got: {error}"
+        );
+        // Tokens already forwarded are not retracted; only the outcome changes.
+        assert_eq!(tokens, vec!["fn ", "main"]);
+    }
+
+    #[test]
+    fn a_non_finite_embedding_component_is_rejected() {
+        // `1e39 as f32` is `inf`, which would turn every downstream cosine
+        // similarity into NaN.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"data":[{"embedding":[0.5,1e39]}]}"#,
+        );
+        let backend = runtime("embed", &upstream.binding());
+
+        let error = backend
+            .embed("hello")
+            .expect_err("an infinite component is not a usable embedding");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
+    #[test]
+    fn an_oversized_error_body_is_truncated_to_the_read_limit() {
+        let body = "x".repeat(4 * MAX_ERROR_BODY_BYTES as usize);
+        let upstream =
+            FakeUpstream::start("HTTP/1.1 500 Internal Server Error", "text/html", &body);
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"hello"])
+            .expect_err("a 500 must not be reported as generated text");
+        match error {
+            UpstreamError::Status { body, .. } => assert!(
+                body.len() as u64 <= MAX_ERROR_BODY_BYTES,
+                "the error excerpt should be bounded by the read limit, got {} bytes",
+                body.len()
+            ),
+            other => panic!("expected a status error, got: {other}"),
+        }
     }
 
     #[test]

@@ -110,8 +110,16 @@ failing at the first decode step with VRAM already claimed. A `cpu` binding
 skips the check entirely and keeps the historical host path.
 
 `paged_attention`, `cuda_graph_decode`, and `flashinfer_attention` remain
-safetensors-only: `QuantizedLlama` owns its KV cache internally and exposes no
-block-table seam.
+safetensors-only and are rejected for a GGUF binding: `QuantizedLlama` owns its
+KV cache and decode path internally, never sees `hardware_strategy`, and exposes
+no block-table seam. Accepting any of them for GGUF would silently run ordinary
+quantized attention while reporting the optimization as enabled.
+
+One subtlety: the block-type check runs *after* the device is resolved, not
+before. `Device::cuda_if_available` falls back to `Device::Cpu` when no physical
+GPU is present, and a checkpoint that lands on that fallback executes through the
+host kernels, which support every block type — scanning first would reject a
+perfectly runnable model on a `candle-cuda` build with no GPU attached.
 
 ## OpenAI-Compatible Upstream Bindings
 
@@ -145,6 +153,31 @@ since the model lives there), `prompt` becomes a single user turn,
 `response_format`. Streaming is real SSE passthrough — one token per content
 delta — so time-to-first-token survives the extra hop. LoRA adapters are
 rejected: adapter injection has no wire representation here.
+
+The host's bounded-generation contract does not stop at the process boundary.
+`max_new_tokens` is validated against the same `1..=HOST_MAX_NEW_TOKENS` range
+the native runtime enforces, and `DEFAULT_MAX_NEW_TOKENS` is applied when the
+field is absent, so an alias switched from a local runtime to an upstream cannot
+silently gain an unbounded generation budget. **`HOST_MAX_NEW_TOKENS` is
+currently 256**, which is the effective ceiling on an upstream response; raising
+it for agentic workloads is a deliberate config change, not something this
+backend widens on its own.
+
+A batch is dispatched concurrently, one scoped thread per request, and results
+are returned per input. Both matter here and not for local runtimes: these are
+independent network round trips on the accelerator dispatcher thread shared by
+every CPU-resident model, so running them sequentially would make the last
+caller wait for the sum of all preceding upstream latencies and block unrelated
+local inference meanwhile; and an upstream failure is usually about one request
+(a rejected prompt, a 400), so collapsing the batch into a single `Result` would
+fail every co-batched caller and discard responses already received.
+
+Every read is bounded — response bodies, error excerpts, whole SSE streams, and
+individual SSE frames — and a stream that ends before its `[DONE]` sentinel is
+reported as a truncated generation rather than a successful one, so an upstream
+that restarts mid-response cannot hand the caller silently truncated code.
+Embedding components that do not narrow to a finite `f32` are rejected instead
+of becoming infinities that turn downstream cosine similarities into NaN.
 
 Binding validation is offline, so a node still boots when its upstream is down;
 an unreachable server is a per-request error naming the endpoint and status, and
