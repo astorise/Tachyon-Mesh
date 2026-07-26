@@ -54,6 +54,40 @@ JSON request:
 Default generation is deterministic. Requests are bounded by prompt byte count,
 prompt token count, batch size, and the host max-new-token cap.
 
+## Incremental Detokenization
+
+Every decode step needs the text generated so far — to test stop sequences, and
+to emit the streaming delta. Decoding the whole token sequence on each step is
+the obvious way to get it and is what the loops used to do, but it is O(n²) in
+the generated length: at 256 tokens that is invisible, at several thousand it is
+millions of redundant per-token decodes.
+
+A naive fix does not work. A BPE/SentencePiece decode is not the concatenation
+of its tokens' decodes: a multi-byte character can span several tokens (the
+prefix decodes to a replacement character that a later token retroactively
+replaces), and decoding a sub-sequence can gain or lose a leading space.
+
+`IncrementalDecoder` keeps a bounded trailing *window* of tokens
+(`DETOKENIZE_WINDOW_TOKENS`), re-decodes only that window, and appends the
+difference against the previous window decode — so any sub-sequence artifact is
+present in both decodes and cancels. When the new token revises text inside the
+window, the decoder replaces that suffix wholesale instead of appending. The
+window is re-anchored only when the shorter decode is *verifiably* a suffix of
+the current one, so a tokenizer that never offers a clean split keeps a growing
+window and degrades to the old whole-sequence behaviour rather than corrupting
+output; a failed re-anchor backs off so it is not retried every step.
+
+The invariant — that the incremental text equals what decoding the whole
+sequence would produce — is asserted step by step in
+`incremental_detokenization_matches_the_model_tokenizer` against the real
+fixture tokenizer, and against a synthetic byte-level tokenizer for the
+split-character case.
+
+Stop-sequence scanning is deliberately left as a full-text search per step: it
+is also O(n²), but it is a `memchr`-backed substring search over bytes, orders of
+magnitude cheaper per byte than tokenizer work, and keeping it whole-text avoids
+any question about missing an earlier match.
+
 ## Mock and Unsupported Bindings
 
 Mock output is only available through explicit mock bindings such as:
@@ -140,6 +174,8 @@ or a non-Llama GGUF under `llama-server`.
 - The upstream model name defaults to the binding alias; `model` overrides it,
   so a mesh alias need not match the upstream's own name.
 - `timeout_ms` bounds each request (default 5 minutes, ceiling 1 hour).
+- `max_new_tokens` sets this binding's generation budget (default 2048, ceiling
+  `UPSTREAM_MAX_NEW_TOKENS` = 8192).
 - Credentials never appear in the binding. The runtime reads a bearer token from
   `TACHYON_UPSTREAM_API_KEY_<ALIAS>` (alias upper-cased, non-alphanumerics
   folded to `_`), falling back to `TACHYON_UPSTREAM_API_KEY`. With neither set,
@@ -154,14 +190,20 @@ since the model lives there), `prompt` becomes a single user turn,
 delta — so time-to-first-token survives the extra hop. LoRA adapters are
 rejected: adapter injection has no wire representation here.
 
-The host's bounded-generation contract does not stop at the process boundary.
-`max_new_tokens` is validated against the same `1..=HOST_MAX_NEW_TOKENS` range
-the native runtime enforces, and `DEFAULT_MAX_NEW_TOKENS` is applied when the
-field is absent, so an alias switched from a local runtime to an upstream cannot
-silently gain an unbounded generation budget. **`HOST_MAX_NEW_TOKENS` is
-currently 256**, which is the effective ceiling on an upstream response; raising
-it for agentic workloads is a deliberate config change, not something this
-backend widens on its own.
+A generation budget is always sent, so an absent `max_new_tokens` cannot leave
+the upstream's own (possibly unlimited) default in charge. The bound is the
+binding's own, **not** the native runtime's `HOST_MAX_NEW_TOKENS`, because the
+two limits protect different resources: the native cap bounds this host's decode
+loop, where every extra token is a forward pass and more KV cache in local VRAM,
+while an upstream generation costs this node one open HTTP connection and spends
+the *remote* server's resources, which enforces its own context window and
+queueing. Applying the 256-token native cap here would truncate an agentic
+completion mid-function for no local benefit.
+
+So upstream bindings default to 2048 tokens, are capped at
+`UPSTREAM_MAX_NEW_TOKENS` (8192), and can be tuned per alias with
+`?max_new_tokens=`. The per-binding override is itself bounded, so a typo cannot
+make a request effectively unlimited.
 
 A batch is dispatched concurrently, one scoped thread per request, and results
 are returned per input. Both matter here and not for local runtimes: these are

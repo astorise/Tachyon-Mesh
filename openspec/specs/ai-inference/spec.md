@@ -290,6 +290,38 @@ The AI inference runtime SHALL execute supported local Candle text-generation mo
 - **THEN** the runtime validates the request against configured prompt and generation limits
 - **AND** returns UTF-8 generated text bytes through the existing inference response path
 
+### Requirement: Decode loops MUST detokenize incrementally
+
+Every decode step needs the text generated so far, for stop-sequence matching
+and for the streaming delta. The runtime SHALL obtain it without re-decoding the
+whole token sequence on each step, which is quadratic in the generated length.
+
+Because a BPE/SentencePiece decode is not the concatenation of its tokens'
+decodes, the incremental result SHALL be identical to what decoding the whole
+sequence would produce, and the runtime SHALL verify rather than assume the
+conditions under which it advances its decode window.
+
+#### Scenario: Incremental text matches a whole-sequence decode
+
+- **WHEN** a decode loop generates any number of tokens
+- **THEN** the text it exposes at every step equals the whole-sequence decode of
+  the tokens generated so far
+
+#### Scenario: A character split across tokens is not corrupted
+
+- **WHEN** a multi-byte character spans several generated tokens
+- **THEN** the runtime replaces the provisional text once the character
+  completes, rather than appending each token's partial decode
+
+#### Scenario: The re-decoded window stays bounded
+
+- **WHEN** a generation runs well past the window budget
+- **THEN** the window is re-anchored so per-step decode cost does not grow with
+  the generated length
+- **AND** re-anchoring happens only when the shorter decode is verifiably a
+  suffix of the current window, so a tokenizer that offers no clean split
+  degrades to whole-sequence behaviour instead of corrupting output
+
 ### Requirement: GGUF checkpoints MUST execute on CUDA when the binding asks for it
 
 The quantized GGUF loader SHALL upload weights to the device its binding
@@ -392,14 +424,24 @@ accelerator residency regardless of the `device` its binding declares.
   a bounded excerpt of the upstream's own explanation
 - **AND** the failing response body is never returned as generated text
 
-#### Scenario: Host generation limits apply across the process boundary
+#### Scenario: A generation budget is always bounded and always sent
 
 - **WHEN** a request reaching an upstream binding carries `max_new_tokens`
-  outside `1..=HOST_MAX_NEW_TOKENS`
-- **THEN** the runtime rejects it before any round trip, exactly as the native
-  runtime does
-- **AND** when the field is absent the host default is sent, so the upstream's
-  own default never governs the generation budget
+  outside the binding's `1..=max_new_tokens` range
+- **THEN** the runtime rejects it before any round trip
+- **AND** when the field is absent the binding's budget is sent, so the
+  upstream's own default never governs the generation budget
+
+#### Scenario: An upstream binding carries its own generation ceiling
+
+The upstream ceiling SHALL be independent of the native runtime's
+`HOST_MAX_NEW_TOKENS`, because the two bound different resources: the native cap
+bounds this host's decode loop and local VRAM, while an upstream generation
+spends the remote server's resources and costs this node one open connection.
+
+- **WHEN** a binding path sets `max_new_tokens`
+- **THEN** that value becomes the binding's default and ceiling
+- **AND** it is itself rejected when outside `1..=UPSTREAM_MAX_NEW_TOKENS`
 
 #### Scenario: One failing request does not fail its co-batched neighbours
 

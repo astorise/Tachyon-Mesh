@@ -2972,6 +2972,8 @@ impl CandleLlmRuntime {
             .unwrap_or(0)
             .saturating_sub(1);
         let mut emitted = 0usize;
+        let mut decode = |ids: &[u32]| self.decode_generated(ids);
+        let mut decoder = IncrementalDecoder::default();
 
         while generated.len() < request.max_new_tokens
             && context_ids.len() < self.limits.max_position_embeddings
@@ -2993,17 +2995,18 @@ impl CandleLlmRuntime {
                 context_ids.push(target_token);
                 generated.push(target_token);
 
-                let text = self.decode_generated(&generated)?;
-                if let Some(stop_at) = find_earliest_stop(&text, &request.stop) {
-                    emit_delta(on_token, &text, &mut emitted, stop_at);
+                decoder.push(&mut decode, &generated)?;
+                let text = decoder.text();
+                if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
+                    emit_delta(on_token, text, &mut emitted, stop_at);
                     return Ok(());
                 }
                 if self.is_eos_token(target_token) {
-                    emit_delta(on_token, &text, &mut emitted, text.len());
+                    emit_delta(on_token, text, &mut emitted, text.len());
                     return Ok(());
                 }
-                let safe = floor_char_boundary(&text, text.len().saturating_sub(hold));
-                emit_delta(on_token, &text, &mut emitted, safe);
+                let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
+                emit_delta(on_token, text, &mut emitted, safe);
 
                 if target_token != proposed_token
                     || generated.len() == request.max_new_tokens
@@ -3014,9 +3017,9 @@ impl CandleLlmRuntime {
             }
         }
 
-        let text = self.decode_generated(&generated)?;
-        let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
-        emit_delta(on_token, &text, &mut emitted, end);
+        let text = decoder.text();
+        let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+        emit_delta(on_token, text, &mut emitted, end);
         Ok(())
     }
 
@@ -3432,6 +3435,14 @@ impl CandleLlmRuntime {
             .iter()
             .map(|request| Vec::with_capacity(request.max_new_tokens))
             .collect::<Vec<_>>();
+        // One incremental detokenizer per row, for the same reason the
+        // single-sequence loops carry one: the stop check needs the decoded
+        // text on every step, and re-decoding each row in full would be O(n²)
+        // per row.
+        let mut decode = |ids: &[u32]| self.decode_generated(ids);
+        let mut decoders = (0..batch)
+            .map(|_| IncrementalDecoder::default())
+            .collect::<Vec<_>>();
         let mut done = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
         let max_new_tokens = requests
@@ -3470,9 +3481,9 @@ impl CandleLlmRuntime {
                 }
                 generated[row].push(next);
                 next_tokens[row] = next;
-                let text = self.decode_generated(&generated[row])?;
+                decoders[row].push(&mut decode, &generated[row])?;
                 if eos_tokens.contains(&next)
-                    || find_earliest_stop(&text, &requests[row].stop).is_some()
+                    || find_earliest_stop(decoders[row].text(), &requests[row].stop).is_some()
                 {
                     done[row] = true;
                 }
@@ -3506,12 +3517,12 @@ impl CandleLlmRuntime {
                 })?;
         }
 
-        generated
+        decoders
             .iter()
             .zip(requests)
-            .map(|(tokens, request)| {
-                let text = self.decode_generated(tokens)?;
-                let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
+            .map(|(decoder, request)| {
+                let text = decoder.text();
+                let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
                 Ok(text.as_bytes()[..end].to_vec())
             })
             .collect()
@@ -3549,6 +3560,11 @@ impl CandleLlmRuntime {
             .unwrap_or(0)
             .saturating_sub(1);
         let mut emitted = 0usize;
+        // Detokenize incrementally: re-decoding `generated` in full on every
+        // step is O(n²) in the generated length, which only became worth fixing
+        // once generation budgets moved past a few hundred tokens.
+        let mut decode = |ids: &[u32]| self.decode_generated(ids);
+        let mut decoder = IncrementalDecoder::default();
         for step in 0..request.max_new_tokens {
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
@@ -3570,19 +3586,20 @@ impl CandleLlmRuntime {
             }
             generated.push(next);
 
-            let text = self.decode_generated(&generated)?;
+            decoder.push(&mut decode, &generated)?;
+            let text = decoder.text();
             // A matched stop ends the decode: emit up to (not including) it.
-            if let Some(stop_at) = find_earliest_stop(&text, &request.stop) {
-                emit_delta(on_token, &text, &mut emitted, stop_at);
+            if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
+                emit_delta(on_token, text, &mut emitted, stop_at);
                 return Ok(());
             }
             if eos_tokens.contains(&next) {
-                emit_delta(on_token, &text, &mut emitted, text.len());
+                emit_delta(on_token, text, &mut emitted, text.len());
                 return Ok(());
             }
             // No stop yet: emit everything except the held-back tail.
-            let safe = floor_char_boundary(&text, text.len().saturating_sub(hold));
-            emit_delta(on_token, &text, &mut emitted, safe);
+            let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
+            emit_delta(on_token, text, &mut emitted, safe);
 
             if step + 1 == request.max_new_tokens {
                 break;
@@ -3601,9 +3618,9 @@ impl CandleLlmRuntime {
             index_pos += 1;
         }
         // Token budget exhausted: flush the held-back tail, trimming any stop.
-        let text = self.decode_generated(&generated)?;
-        let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
-        emit_delta(on_token, &text, &mut emitted, end);
+        let text = decoder.text();
+        let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+        emit_delta(on_token, text, &mut emitted, end);
         Ok(())
     }
 
@@ -3963,6 +3980,86 @@ fn sanitize_stop(stop: Option<Vec<String>>) -> Vec<String> {
 
 /// Byte offset of the earliest stop sequence in `text`, or `None`. The offset
 /// is a substring-match start, so it always lands on a UTF-8 codepoint boundary.
+/// Tokens the re-decoded window may reach before the decoder tries to
+/// re-anchor, and how many it keeps afterwards. Both are token counts: a
+/// handful is far more than any single multi-token character needs, and keeping
+/// the window bounded is what makes the per-step decode O(1) instead of O(n).
+const DETOKENIZE_WINDOW_TOKENS: usize = 32;
+const DETOKENIZE_KEEP_TOKENS: usize = 16;
+
+/// Streaming detokenizer that keeps a decode loop linear in the number of
+/// generated tokens.
+///
+/// A BPE/SentencePiece decode is not the concatenation of its tokens' decodes:
+/// a multi-byte character can span several tokens, and decoding a sub-sequence
+/// can gain or lose a leading space. Re-decoding the whole sequence on every
+/// step is therefore the correct-but-quadratic thing to do — at 256 tokens it
+/// is invisible, at several thousand it is thousands of redundant decodes.
+///
+/// This keeps a bounded trailing *window* of tokens, re-decodes only that, and
+/// appends the difference against the previous window decode — so a
+/// sub-sequence artifact appears in both decodes and cancels out. The window is
+/// re-anchored only when the shorter decode is verifiably a suffix of the
+/// current one, so a tokenizer that never offers a clean split simply keeps a
+/// growing window and degrades to the old whole-sequence behaviour rather than
+/// corrupting output.
+///
+/// Invariant: `text` always ends with `window_text`, and `text` equals what
+/// decoding the whole token sequence would produce.
+#[derive(Default)]
+struct IncrementalDecoder {
+    text: String,
+    /// Index into the caller's generated-token vector where the window starts.
+    window_start: usize,
+    /// Cached decode of `generated[window_start..]`.
+    window_text: String,
+    /// Token count at which re-anchoring may be attempted again. Without this,
+    /// a sequence that never admits a clean split would pay a second decode on
+    /// every single step — worse than the behaviour being replaced.
+    anchor_retry_at: usize,
+}
+
+impl IncrementalDecoder {
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Absorb the token that was just pushed onto `generated`.
+    fn push(
+        &mut self,
+        decode: &mut impl FnMut(&[u32]) -> Result<String, CandleLlmError>,
+        generated: &[u32],
+    ) -> Result<(), CandleLlmError> {
+        let window = decode(&generated[self.window_start..])?;
+        match window.strip_prefix(self.window_text.as_str()) {
+            Some(delta) => self.text.push_str(delta),
+            None => {
+                // The new token revised text already inside the window — a
+                // byte-level BPE completing a multi-byte character, say. `text`
+                // ends with the old window by construction, so replacing that
+                // suffix restores the invariant exactly.
+                let prefix_len = self.text.len() - self.window_text.len();
+                self.text.truncate(prefix_len);
+                self.text.push_str(&window);
+            }
+        }
+        self.window_text = window;
+
+        let window_tokens = generated.len() - self.window_start;
+        if window_tokens > DETOKENIZE_WINDOW_TOKENS && generated.len() >= self.anchor_retry_at {
+            let next_start = generated.len() - DETOKENIZE_KEEP_TOKENS;
+            let tail = decode(&generated[next_start..])?;
+            if self.window_text.ends_with(&tail) {
+                self.window_start = next_start;
+                self.window_text = tail;
+            } else {
+                self.anchor_retry_at = generated.len() + DETOKENIZE_KEEP_TOKENS;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn find_earliest_stop(text: &str, stop: &[String]) -> Option<usize> {
     stop.iter()
         .filter_map(|needle| text.find(needle.as_str()))
@@ -6267,6 +6364,83 @@ mod tests {
 
     fn load_fixture(tag: &str) -> (CandleLlmRuntime, PathBuf) {
         load_fixture_with_strategy(tag, &HardwareStrategy::default())
+    }
+
+    /// Drive an [`IncrementalDecoder`] over `tokens`, asserting after every step
+    /// that it agrees with decoding the whole prefix in one go. Returns the
+    /// finished decoder so a caller can inspect its window state.
+    fn assert_incremental_matches_whole(
+        tokens: &[u32],
+        mut decode: impl FnMut(&[u32]) -> Result<String, CandleLlmError>,
+    ) -> IncrementalDecoder {
+        let mut decoder = IncrementalDecoder::default();
+        let mut generated = Vec::new();
+        let mut decode_for_push = |ids: &[u32]| decode(ids);
+        for token in tokens {
+            generated.push(*token);
+            decoder
+                .push(&mut decode_for_push, &generated)
+                .expect("incremental push should succeed");
+            let whole = decode_for_push(&generated).expect("whole-sequence decode should succeed");
+            assert_eq!(
+                decoder.text(),
+                whole,
+                "incremental text diverged from the whole-sequence decode at {} token(s)",
+                generated.len()
+            );
+        }
+        decoder
+    }
+
+    /// Decode a slice of "byte tokens" the way a byte-level BPE would: bytes are
+    /// concatenated and interpreted as UTF-8, so a character split across
+    /// several tokens only materialises once its last byte arrives.
+    fn decode_byte_tokens(ids: &[u32]) -> Result<String, CandleLlmError> {
+        let bytes = ids.iter().map(|id| *id as u8).collect::<Vec<_>>();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[test]
+    fn incremental_detokenization_survives_a_character_split_across_tokens() {
+        // U+2705 as three separate byte tokens: the first two decode to a
+        // replacement character that the third retroactively replaces, which is
+        // exactly the case a naive append-the-new-token decoder corrupts.
+        let tokens = [0xE2, 0x9C, 0x85, b'k' as u32, b'!' as u32];
+        let decoder = assert_incremental_matches_whole(&tokens, decode_byte_tokens);
+        assert_eq!(decoder.text(), "✅k!");
+    }
+
+    #[test]
+    fn incremental_detokenization_re_anchors_its_window_on_a_long_run() {
+        // Long enough to cross the re-anchor threshold several times.
+        let tokens = (0..200).map(|i| b'a' as u32 + (i % 26)).collect::<Vec<_>>();
+        let decoder = assert_incremental_matches_whole(&tokens, decode_byte_tokens);
+        assert!(
+            decoder.window_start > 0,
+            "the window should have re-anchored instead of growing with the sequence"
+        );
+        assert!(
+            tokens.len() - decoder.window_start <= DETOKENIZE_WINDOW_TOKENS,
+            "the re-decoded window should stay bounded, got {} tokens",
+            tokens.len() - decoder.window_start
+        );
+    }
+
+    #[test]
+    fn incremental_detokenization_matches_the_model_tokenizer() {
+        let (runtime, dir) = load_fixture("incremental-detok");
+        // Long enough that the window has to re-anchor at least once.
+        let prompt = "hello mesh ".repeat(24);
+        let ids = runtime
+            .encode_ids(&prompt)
+            .expect("fixture prompt should tokenize");
+        assert!(
+            ids.len() > DETOKENIZE_WINDOW_TOKENS,
+            "the fixture prompt must exceed the window budget to be meaningful, got {} tokens",
+            ids.len()
+        );
+        assert_incremental_matches_whole(&ids, |tokens| runtime.decode_generated(tokens));
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn load_fixture_with_strategy(

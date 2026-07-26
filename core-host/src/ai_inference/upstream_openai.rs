@@ -12,12 +12,13 @@
 //!
 //! ```text
 //! openai:http://127.0.0.1:8080/v1
-//! openai:https://gpu-node.lan:8000/v1?model=qwen3-coder-30b&timeout_ms=180000
+//! openai:https://gpu-node.lan:8000/v1?model=qwen3-coder-30b&timeout_ms=180000&max_new_tokens=4096
 //! ```
 //!
 //! The upstream model name defaults to the binding alias and can be overridden
 //! with the `model` query parameter, so a mesh alias never has to match the
-//! name the upstream server happens to use.
+//! name the upstream server happens to use. `timeout_ms` bounds each request
+//! and `max_new_tokens` sets this binding's generation budget.
 //!
 //! Credentials are never written in the binding. The backend reads a bearer
 //! token from `TACHYON_UPSTREAM_API_KEY_<ALIAS>` (alias upper-cased, every
@@ -31,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::candle_llm_runtime::{ChatTurn, DEFAULT_MAX_NEW_TOKENS, HOST_MAX_NEW_TOKENS};
+use super::candle_llm_runtime::ChatTurn;
 
 /// Binding `path` prefix that selects this backend.
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
@@ -58,6 +59,22 @@ const MAX_STREAM_BYTES: u64 = MAX_RESPONSE_BYTES;
 /// Cap on one SSE frame. `BufRead::read_line` grows its buffer until a newline,
 /// so a single unterminated line is the tighter of the two risks.
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+/// Hard ceiling on `max_new_tokens` for an upstream request.
+///
+/// Deliberately far above the native runtime's `HOST_MAX_NEW_TOKENS`, because
+/// the two limits protect different things. The native cap bounds *this host's*
+/// decode loop, where every extra token costs a forward pass and grows a KV
+/// cache in local VRAM. An upstream generation costs this node one open HTTP
+/// connection: the resources it consumes belong to the remote server, which
+/// enforces its own context window and queueing.
+///
+/// So the cap here exists only to keep a request finite — the real bound is
+/// `timeout_ms` — and is set high enough for the agentic coding workloads this
+/// backend exists to serve, where 256 tokens truncates mid-function.
+pub(crate) const UPSTREAM_MAX_NEW_TOKENS: usize = 8192;
+/// Applied when a request omits `max_new_tokens`, so the upstream's own default
+/// (possibly unlimited) never governs the budget.
+pub(crate) const UPSTREAM_DEFAULT_MAX_NEW_TOKENS: usize = 2048;
 
 #[derive(Debug, Error)]
 pub(crate) enum UpstreamError {
@@ -91,6 +108,11 @@ pub(crate) struct UpstreamEndpoint {
     /// Model name sent upstream. Defaults to the binding alias.
     pub(crate) model: String,
     pub(crate) timeout: Duration,
+    /// Budget applied when a request omits `max_new_tokens`, and the ceiling
+    /// every request is validated against. Per-binding so one alias can serve
+    /// long agentic completions while another stays short, without moving a
+    /// global constant.
+    pub(crate) max_new_tokens: usize,
 }
 
 impl UpstreamEndpoint {
@@ -149,6 +171,7 @@ impl UpstreamEndpoint {
 
         let mut model = None;
         let mut timeout = DEFAULT_TIMEOUT;
+        let mut max_new_tokens = UPSTREAM_DEFAULT_MAX_NEW_TOKENS;
         for pair in query.into_iter().flat_map(|query| query.split('&')) {
             if pair.is_empty() {
                 continue;
@@ -176,9 +199,22 @@ impl UpstreamEndpoint {
                     }
                     timeout = requested;
                 }
+                "max_new_tokens" => {
+                    let requested: usize = value.parse().map_err(|_| {
+                        invalid(format!(
+                            "`max_new_tokens` must be an integer, got `{value}`"
+                        ))
+                    })?;
+                    if requested == 0 || requested > UPSTREAM_MAX_NEW_TOKENS {
+                        return Err(invalid(format!(
+                            "`max_new_tokens` must be between 1 and {UPSTREAM_MAX_NEW_TOKENS}, got {requested}"
+                        )));
+                    }
+                    max_new_tokens = requested;
+                }
                 other => {
                     return Err(invalid(format!(
-                        "unknown query parameter `{other}`; supported: `model`, `timeout_ms`"
+                        "unknown query parameter `{other}`; supported: `model`, `timeout_ms`, `max_new_tokens`"
                     )))
                 }
             }
@@ -188,6 +224,7 @@ impl UpstreamEndpoint {
             base_url: url.to_owned(),
             model: model.unwrap_or_else(|| alias.to_owned()),
             timeout,
+            max_new_tokens,
         }))
     }
 
@@ -337,18 +374,17 @@ impl UpstreamOpenAiRuntime {
             }
         };
 
-        // The host's bounded-generation contract does not stop at the process
-        // boundary: an alias switched from a native runtime to an upstream must
-        // not silently gain an unbounded generation budget. Validate exactly as
-        // `CandleLlmRuntime::parse_request` does, and always send a cap so an
-        // absent field cannot leave the upstream's own (possibly unlimited)
-        // default in charge.
-        let max_new_tokens = request.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS);
-        if max_new_tokens == 0 || max_new_tokens > HOST_MAX_NEW_TOKENS {
+        // A generation budget is always sent, so an absent field cannot leave
+        // the upstream's own (possibly unlimited) default in charge. The bound
+        // is this binding's, not the native runtime's: see
+        // `UPSTREAM_MAX_NEW_TOKENS` for why the two differ.
+        let ceiling = self.endpoint.max_new_tokens;
+        let max_new_tokens = request.max_new_tokens.unwrap_or(ceiling);
+        if max_new_tokens == 0 || max_new_tokens > ceiling {
             return Err(UpstreamError::InvalidRequest {
                 alias: self.alias.clone(),
                 detail: format!(
-                    "max_new_tokens {max_new_tokens} must be between 1 and {HOST_MAX_NEW_TOKENS}"
+                    "max_new_tokens {max_new_tokens} must be between 1 and {ceiling} for this upstream binding (raise it with `?max_new_tokens=` on the binding path, up to {UPSTREAM_MAX_NEW_TOKENS})"
                 ),
             });
         }
@@ -782,19 +818,19 @@ mod tests {
     }
 
     #[test]
-    fn max_new_tokens_is_bounded_by_the_same_host_limits_as_the_native_runtime() {
+    fn max_new_tokens_is_bounded_by_the_bindings_own_ceiling() {
         let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
 
-        // Absent: the host default is sent, never an omitted cap that would
-        // leave the upstream's own (possibly unlimited) default in charge.
+        // Absent: a budget is always sent, never omitted — and it is the
+        // upstream default, not the native runtime's 256-token cap, which would
+        // truncate an agentic completion mid-function.
         let body = backend
             .chat_body(br#"{"prompt":"p"}"#, false)
             .expect("request should map");
-        assert_eq!(body["max_tokens"], DEFAULT_MAX_NEW_TOKENS);
+        assert_eq!(body["max_tokens"], UPSTREAM_DEFAULT_MAX_NEW_TOKENS);
 
-        // Out of range in either direction is rejected before any round trip,
-        // exactly as `CandleLlmRuntime::parse_request` does.
-        for max_new_tokens in [0, HOST_MAX_NEW_TOKENS + 1] {
+        // Out of range in either direction is rejected before any round trip.
+        for max_new_tokens in [0, UPSTREAM_DEFAULT_MAX_NEW_TOKENS + 1] {
             let request = format!(r#"{{"prompt":"p","max_new_tokens":{max_new_tokens}}}"#);
             let error = backend
                 .chat_body(request.as_bytes(), false)
@@ -804,11 +840,46 @@ mod tests {
 
         let body = backend
             .chat_body(
-                format!(r#"{{"prompt":"p","max_new_tokens":{HOST_MAX_NEW_TOKENS}}}"#).as_bytes(),
+                format!(r#"{{"prompt":"p","max_new_tokens":{UPSTREAM_DEFAULT_MAX_NEW_TOKENS}}}"#)
+                    .as_bytes(),
                 false,
             )
             .expect("the ceiling itself is valid");
-        assert_eq!(body["max_tokens"], HOST_MAX_NEW_TOKENS);
+        assert_eq!(body["max_tokens"], UPSTREAM_DEFAULT_MAX_NEW_TOKENS);
+    }
+
+    #[test]
+    fn a_binding_can_raise_its_own_generation_ceiling() {
+        let backend = runtime(
+            "coder",
+            "openai:http://127.0.0.1:8080/v1?max_new_tokens=6000",
+        );
+
+        let body = backend
+            .chat_body(br#"{"prompt":"p"}"#, false)
+            .expect("request should map");
+        assert_eq!(body["max_tokens"], 6000);
+
+        let body = backend
+            .chat_body(br#"{"prompt":"p","max_new_tokens":5000}"#, false)
+            .expect("a request under the binding ceiling is valid");
+        assert_eq!(body["max_tokens"], 5000);
+
+        assert!(backend
+            .chat_body(br#"{"prompt":"p","max_new_tokens":6001}"#, false)
+            .is_err());
+
+        // The per-binding override is itself bounded, so a typo cannot make a
+        // request effectively unlimited.
+        assert!(UpstreamEndpoint::parse(
+            "coder",
+            &format!(
+                "openai:http://h:1/v1?max_new_tokens={}",
+                UPSTREAM_MAX_NEW_TOKENS + 1
+            )
+        )
+        .is_err());
+        assert!(UpstreamEndpoint::parse("coder", "openai:http://h:1/v1?max_new_tokens=0").is_err());
     }
 
     #[test]
