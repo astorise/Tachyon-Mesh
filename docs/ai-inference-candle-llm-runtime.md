@@ -315,11 +315,13 @@ into the envelope `guest-openai`'s `json` parser reads back:
 ```
 
 That envelope is the only channel available — the host contract is "generation
-returns text", with tool-call recovery done downstream. **Set
-`tool_call_parser: "json"`** (directly or via `extra_body`) on requests to an
-upstream binding; the alias-derived default picks a Qwen/Mistral *text* parser
-from the model name, which would not recognise the envelope and would hand the
-raw JSON back as assistant content.
+returns text", with tool-call recovery done downstream. It carries a marker
+field (`__tachyon_upstream_tool_calls`) so `guest-openai` recognises it *before*
+and independently of parser selection. That matters: parser selection comes from
+a nonstandard request option or a guess at the model name, so a standard OpenAI
+client offering tools would otherwise get no parser at all — or a tagged one
+that cannot read JSON — and the structured call would come back as literal
+assistant prose. **No client-side configuration is required.**
 
 Streamed tool calls arrive as `delta.tool_calls` fragments with no content at
 all — name first, `arguments` in pieces after it. They are reassembled by

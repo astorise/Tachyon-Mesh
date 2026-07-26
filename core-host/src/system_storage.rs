@@ -469,12 +469,21 @@ pub(crate) fn publish_configured_model_bindings(
             // a hot reload that changes an alias from `openai:` to a GGUF
             // checkpoint must stop advertising `openai/<alias>`, while an
             // upload-published row keeps its real path and VRAM figure.
-            if !row_is_config_owned(core_store, &binding.alias) {
-                continue;
-            }
-            if let Err(error) =
-                core_store.kv_partition_set(AI_MODELS_REGISTRY_TABLE, &binding.alias, &value)
-            {
+            //
+            // Ownership is re-read inside the write transaction. Checking in a
+            // separate read would let an upload land in between, and the
+            // refresh would then overwrite the row the check was protecting.
+            if let Err(error) = core_store.kv_partition_update(
+                AI_MODELS_REGISTRY_TABLE,
+                &binding.alias,
+                |current| {
+                    if row_is_config_owned(current) {
+                        crate::store::KvPartitionUpdate::Set(value)
+                    } else {
+                        crate::store::KvPartitionUpdate::Keep
+                    }
+                },
+            ) {
                 tracing::warn!(
                     alias = %binding.alias,
                     "failed to refresh configured model binding in the registry: {error:#}"
@@ -490,7 +499,17 @@ pub(crate) fn publish_configured_model_bindings(
         if configured.contains(alias.as_str()) {
             continue;
         }
-        if let Err(error) = core_store.kv_partition_delete(AI_MODELS_REGISTRY_TABLE, &alias) {
+        // Same race: an upload may have replaced this row since the scan, so
+        // ownership is re-checked inside the deleting transaction.
+        if let Err(error) =
+            core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
+                if row_is_config_owned(current) {
+                    crate::store::KvPartitionUpdate::Delete
+                } else {
+                    crate::store::KvPartitionUpdate::Keep
+                }
+            })
+        {
             tracing::warn!(
                 %alias,
                 "failed to drop a stale configured model binding from the registry: {error:#}"
@@ -501,14 +520,11 @@ pub(crate) fn publish_configured_model_bindings(
     }
 }
 
-/// Whether the registry row for `alias` was written by this publisher.
+/// Whether a registry row's raw bytes say this publisher wrote it. Takes the
+/// value rather than the key so the caller can decide inside a transaction.
 #[cfg(feature = "ai-inference")]
-fn row_is_config_owned(core_store: &crate::store::CoreStore, alias: &str) -> bool {
-    core_store
-        .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+fn row_is_config_owned(row: Option<&[u8]>) -> bool {
+    row.and_then(|raw| serde_json::from_slice::<serde_json::Value>(raw).ok())
         .and_then(|row| {
             row.get("source")
                 .and_then(serde_json::Value::as_str)

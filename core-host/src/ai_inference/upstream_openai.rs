@@ -56,6 +56,17 @@ const MAX_ERROR_BODY_BYTES: u64 = 2048;
 /// Cap on a whole SSE stream. Generous — 64 MiB of text is millions of tokens —
 /// but finite, so a stream that never terminates cannot grow without bound.
 const MAX_STREAM_BYTES: u64 = MAX_RESPONSE_BYTES;
+/// Marker on a tool-call envelope produced by *this* backend.
+///
+/// The envelope has to survive a hop through a host contract whose only channel
+/// is text. Relying on `guest-openai`'s parser selection to decode it does not
+/// work: that selection comes from a nonstandard request option or a guess from
+/// the model name, so a standard OpenAI client offering tools gets no parser at
+/// all — or a tagged one that cannot read JSON — and the structured call comes
+/// back as literal assistant prose. This marker lets the reader recognise the
+/// envelope on its own, whatever parser the request implies.
+pub(crate) const UPSTREAM_TOOL_ENVELOPE_MARKER: &str = "__tachyon_upstream_tool_calls";
+
 /// Cap on one SSE frame. `BufRead::read_line` grows its buffer until a newline,
 /// so a single unterminated line is the tighter of the two risks.
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
@@ -570,6 +581,7 @@ impl UpstreamOpenAiRuntime {
             .filter(|tool_calls| !is_empty_json(tool_calls))
         {
             let envelope = json!({
+                UPSTREAM_TOOL_ENVELOPE_MARKER: true,
                 "content": content.unwrap_or_default(),
                 "tool_calls": tool_calls.clone(),
             });
@@ -619,20 +631,24 @@ impl UpstreamOpenAiRuntime {
         let mut streamed_tool_calls = StreamedToolCalls::default();
         loop {
             line.clear();
-            let read = reader
-                .read_line(&mut line)
-                .map_err(|error| UpstreamError::Transport {
-                    alias: self.alias.clone(),
-                    endpoint: self.endpoint.url("/chat/completions"),
-                    detail: format!("failed to read the upstream stream: {error}"),
-                })?;
+            // Bound the *read*, not just the result. A plain `read_line` grows
+            // its buffer until a newline, so an upstream that never sends one
+            // could force allocation all the way to `MAX_STREAM_BYTES` before
+            // any size check ran — and several concurrent streams would
+            // multiply that.
+            let read = std::io::Read::take(
+                std::io::Read::by_ref(&mut reader),
+                MAX_SSE_FRAME_BYTES as u64 + 1,
+            )
+            .read_line(&mut line)
+            .map_err(|error| UpstreamError::Transport {
+                alias: self.alias.clone(),
+                endpoint: self.endpoint.url("/chat/completions"),
+                detail: format!("failed to read the upstream stream: {error}"),
+            })?;
             if read == 0 {
                 break;
             }
-            // `read_line` has already grown the buffer to the newline, so this
-            // catches the frame *after* one allocation bounded by
-            // `MAX_STREAM_BYTES` — it exists to stop a stream of oversized
-            // frames, not the first one.
             if line.len() > MAX_SSE_FRAME_BYTES {
                 return Err(UpstreamError::MalformedResponse {
                     alias: self.alias.clone(),
@@ -713,7 +729,12 @@ impl UpstreamOpenAiRuntime {
         match streamed_tool_calls.finish() {
             Some(tool_calls) => {
                 on_token(
-                    &json!({"content": buffered_content, "tool_calls": tool_calls}).to_string(),
+                    &json!({
+                        UPSTREAM_TOOL_ENVELOPE_MARKER: true,
+                        "content": buffered_content,
+                        "tool_calls": tool_calls,
+                    })
+                    .to_string(),
                 );
             }
             None if !buffered_content.is_empty() => on_token(&buffered_content),
@@ -1311,6 +1332,39 @@ mod tests {
             "unexpected request line: {target}"
         );
         assert_eq!(body["input"], "hello");
+    }
+
+    #[test]
+    fn a_buffered_tool_envelope_carries_its_marker() {
+        // Without the marker the envelope decodes only when the client happens
+        // to pass the nonstandard parser option, so a standard OpenAI client
+        // would receive the JSON as literal assistant prose.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let output = backend.generate(&[b"go"]).expect("tool call round trip");
+        let envelope: Value = serde_json::from_slice(&output).expect("envelope");
+        assert_eq!(envelope[UPSTREAM_TOOL_ENVELOPE_MARKER], true);
+        assert_eq!(envelope["tool_calls"][0]["function"]["name"], "f");
+    }
+
+    #[test]
+    fn an_oversized_sse_frame_is_refused_during_the_read() {
+        // One frame with no newline at all: the read itself must stop at the
+        // frame limit rather than growing to the whole-stream limit.
+        let mut body = String::from("data: {\"choices\":[{\"delta\":{\"content\":\"");
+        body.push_str(&"x".repeat(MAX_SSE_FRAME_BYTES + 16));
+        let upstream = FakeUpstream::start("HTTP/1.1 200 OK", "text/event-stream", &body);
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate_streaming(&[b"hi"], &mut |_| {})
+            .expect_err("an oversized frame must be refused");
+        assert!(error.to_string().contains("limit"), "got: {error}");
     }
 
     #[test]

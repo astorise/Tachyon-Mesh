@@ -582,11 +582,19 @@ fn handle_chat_completions_streaming(
     write_sse_chunk(&writer, &first_chunk)?;
 
     // Tool intent turns this into a gated stream: content flows until an opener
-    // appears, then the rest is held back for the buffered parser. Without a
-    // parser the stream is a plain content passthrough, exactly as before.
-    let mut gate = request
-        .resolved_tool_call_parser()
-        .map(StreamingContentGate::new);
+    // appears, then the rest is held back for the buffered parser.
+    //
+    // The gate is always present, defaulting to the anchored `Json` opener when
+    // the request implies no parser: the host's upstream backend emits its
+    // tool-call envelope as one whole-output JSON object, and without a gate
+    // that envelope would stream out as prose before finalization could turn it
+    // into a structured call. For a response that is not a tool call the
+    // anchored gate is a passthrough — a `{` only counts at the very start.
+    let mut gate = Some(StreamingContentGate::new(
+        request
+            .resolved_tool_call_parser()
+            .unwrap_or(ToolCallParser::Json),
+    ));
 
     let generation = build_generation_request(&request)?;
     let token_stream = bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation)
@@ -858,7 +866,41 @@ fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
     idx
 }
 
+/// Marker the host's upstream backend stamps on a tool-call envelope. Kept in
+/// step with `core-host`'s `UPSTREAM_TOOL_ENVELOPE_MARKER`.
+const UPSTREAM_TOOL_ENVELOPE_MARKER: &str = "__tachyon_upstream_tool_calls";
+
+/// Decode a tool-call envelope produced by the host's upstream backend.
+///
+/// Checked before parser selection and independently of it. The upstream
+/// already returned a *structured* call; the parser heuristics — a nonstandard
+/// request option, else a guess from the model name — would otherwise hand a
+/// standard OpenAI client the envelope as literal prose, or try a tagged parser
+/// that cannot read JSON. The marker is what makes the envelope
+/// self-identifying, so a model answering in plain JSON is never mistaken for
+/// one.
+fn parse_upstream_tool_envelope(output: &str) -> Option<ParsedAssistantOutput> {
+    let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
+    if value.get(UPSTREAM_TOOL_ENVELOPE_MARKER) != Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    let tool_calls = tool_calls_from_value(&value, 0)?;
+    Some(ParsedAssistantOutput {
+        content: value
+            .get("content")
+            .and_then(|content| content.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        tool_calls,
+    })
+}
+
 fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> ParsedAssistantOutput {
+    // The host marks its own envelopes, so they decode whatever the request
+    // says about parsers — including saying nothing at all.
+    if let Some(parsed) = parse_upstream_tool_envelope(output) {
+        return parsed;
+    }
     let Some(parser) = request.resolved_tool_call_parser() else {
         return ParsedAssistantOutput {
             content: output.to_owned(),
@@ -1313,6 +1355,51 @@ mod tests {
         }
         let (whole, emitted) = gate.finish();
         (streamed, whole, emitted)
+    }
+
+    #[test]
+    fn an_upstream_envelope_decodes_without_any_parser_selection() {
+        // A standard OpenAI client offers tools and passes no parser option;
+        // the model name implies none either. The marker is what makes the
+        // structured call survive instead of arriving as literal prose.
+        let request = ChatCompletionRequest {
+            model: "remote-coder".to_owned(),
+            messages: vec![ChatMessage::text("user", "go")],
+            tools: vec![serde_json::json!({"type": "function"})],
+            tool_choice: None,
+            tool_call_parser: None,
+            extra_body: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: None,
+            stream: None,
+        };
+        assert!(
+            request.resolved_tool_call_parser().is_none(),
+            "this request must imply no parser for the test to mean anything"
+        );
+
+        let envelope = serde_json::json!({
+            "__tachyon_upstream_tool_calls": true,
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"}}],
+        })
+        .to_string();
+        let parsed = parse_assistant_output(&request, &envelope);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].function.name, "read_file");
+        assert!(parsed.content.is_empty());
+    }
+
+    #[test]
+    fn an_unmarked_json_object_is_not_treated_as_an_upstream_envelope() {
+        // A model that happens to answer with JSON must not be mistaken for the
+        // host's envelope.
+        assert!(parse_upstream_tool_envelope(r#"{"tool_calls":[{"name":"f"}]}"#).is_none());
+        assert!(parse_upstream_tool_envelope("plain prose").is_none());
     }
 
     #[test]
