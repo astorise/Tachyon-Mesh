@@ -182,6 +182,39 @@ or a non-Llama GGUF under `llama-server`.
   the request goes out unauthenticated — the usual case for a `llama-server` on
   a trusted mesh link.
 
+### Tool calling through an upstream
+
+This is the one place the upstream path is meaningfully *better* than the native
+one, and it matters for agentic clients like OpenCode.
+
+The native runtime has no tool-aware chat template: `tools` never reach the
+model, and `guest-openai` recovers tool calls by parsing the model's text output
+with a `tool_call_parser`. An upstream server does have one, so `tools` and
+`tool_choice` are forwarded verbatim and the upstream applies its own template
+(and, with vLLM, constrained tool-call generation).
+
+A tool-call response carries `content: null`, so the backend re-serializes it
+into the envelope `guest-openai`'s `json` parser reads back:
+
+```json
+{"content": "", "tool_calls": [{"id": "…", "type": "function",
+                                "function": {"name": "…", "arguments": "…"}}]}
+```
+
+That envelope is the only channel available — the host contract is "generation
+returns text", with tool-call recovery done downstream. **Set
+`tool_call_parser: "json"`** (directly or via `extra_body`) on requests to an
+upstream binding; the alias-derived default picks a Qwen/Mistral *text* parser
+from the model name, which would not recognise the envelope and would hand the
+raw JSON back as assistant content.
+
+Streamed tool calls arrive as `delta.tool_calls` fragments with no content at
+all — name first, `arguments` in pieces after it. They are reassembled by
+fragment `index` and emitted as one envelope at the end of the stream, because
+dropping them would make the request look like a model that answered with
+silence. Note that `guest-openai` only *parses* tool calls on the buffered path,
+so end-to-end streamed tool calling still surfaces the envelope as content.
+
 The host's JSON generation request maps onto the chat-completions body:
 `messages` is forwarded verbatim (the upstream applies its own chat template,
 since the model lives there), `prompt` becomes a single user turn,

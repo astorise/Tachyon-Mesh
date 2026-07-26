@@ -410,6 +410,30 @@ accelerator residency regardless of the `device` its binding declares.
 - **AND** a `json_schema` is forwarded as an OpenAI `response_format`
 - **AND** the assistant message content is returned as the generated text bytes
 
+#### Scenario: Tool schemas reach the upstream
+
+- **WHEN** a request reaching an upstream binding carries `tools` or
+  `tool_choice`
+- **THEN** they are forwarded verbatim, so the upstream applies its own
+  tool-aware chat template
+- **AND** an explicitly empty `tools` array is omitted rather than sent
+
+#### Scenario: A tool call is a successful generation, not a malformed response
+
+- **WHEN** an upstream returns `choices[0].message.tool_calls` with
+  `content: null`
+- **THEN** the runtime returns a `{"content", "tool_calls"}` envelope as the
+  generated text
+- **AND** it does not report the response as malformed for lacking a content
+  string
+
+#### Scenario: Streamed tool-call fragments are reassembled
+
+- **WHEN** an upstream streams `delta.tool_calls` fragments carrying a function
+  name and its arguments in pieces
+- **THEN** the runtime reassembles them by fragment index and emits one envelope
+- **AND** a stream carrying no tool calls emits no envelope
+
 #### Scenario: Streaming passes the upstream's own SSE deltas through
 
 - **WHEN** a streaming request reaches an upstream binding

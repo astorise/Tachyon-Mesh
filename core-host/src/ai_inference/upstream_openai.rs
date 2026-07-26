@@ -284,6 +284,15 @@ struct HostGenerationRequest {
     stop: Option<Vec<String>>,
     #[serde(default)]
     json_schema: Option<String>,
+    /// Tool schemas, forwarded verbatim. The native runtime ignores these — it
+    /// has no tool-aware chat template, so `guest-openai` recovers tool calls by
+    /// parsing the model's text output. An upstream server does have one, and
+    /// telling it about the tools is what makes it emit real `tool_calls`
+    /// instead of hoping the prompt described them.
+    #[serde(default)]
+    tools: Option<Value>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
 }
 
 /// An OpenAI-compatible upstream bound to one mesh alias.
@@ -406,6 +415,12 @@ impl UpstreamOpenAiRuntime {
         if let Some(stop) = request.stop.filter(|stop| !stop.is_empty()) {
             body.insert("stop".to_owned(), json!(stop));
         }
+        if let Some(tools) = request.tools.filter(|tools| !is_empty_json(tools)) {
+            body.insert("tools".to_owned(), tools);
+        }
+        if let Some(tool_choice) = request.tool_choice {
+            body.insert("tool_choice".to_owned(), tool_choice);
+        }
         if let Some(schema) = request.json_schema {
             // The host's `json_schema` constrains decoding. Locally that
             // compiles to an FSM; upstream the equivalent lever is
@@ -484,17 +499,39 @@ impl UpstreamOpenAiRuntime {
         let body = self.chat_body(prompt, false)?;
         let response = self.post("/chat/completions", &body)?;
         let payload: Value = read_json(&self.alias, response)?;
-        let text = payload
+        let message = payload
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
             .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
             .ok_or_else(|| UpstreamError::MalformedResponse {
                 alias: self.alias.clone(),
-                detail: "response has no `choices[0].message.content` string".to_owned(),
+                detail: "response has no `choices[0].message` object".to_owned(),
             })?;
+        let content = message.get("content").and_then(Value::as_str);
+
+        // A tool call carries `content: null`, so requiring a content string
+        // would turn every successful tool call into a malformed-response
+        // error. Re-serialize it into the envelope `guest-openai`'s `json`
+        // tool-call parser reads back (`{"content": …, "tool_calls": […]}`),
+        // which is the only channel this backend has: the host contract is
+        // "generation returns text", with tool-call recovery done downstream.
+        if let Some(tool_calls) = message
+            .get("tool_calls")
+            .filter(|tool_calls| !is_empty_json(tool_calls))
+        {
+            let envelope = json!({
+                "content": content.unwrap_or_default(),
+                "tool_calls": tool_calls.clone(),
+            });
+            return Ok(envelope.to_string().into_bytes());
+        }
+
+        let text = content.ok_or_else(|| UpstreamError::MalformedResponse {
+            alias: self.alias.clone(),
+            detail: "response has no `choices[0].message.content` string and no `tool_calls`"
+                .to_owned(),
+        })?;
         Ok(text.as_bytes().to_vec())
     }
 
@@ -522,6 +559,7 @@ impl UpstreamOpenAiRuntime {
         let mut reader = std::io::BufReader::new(std::io::Read::take(response, MAX_STREAM_BYTES));
         let mut line = String::new();
         let mut saw_done = false;
+        let mut streamed_tool_calls = StreamedToolCalls::default();
         loop {
             line.clear();
             let read = reader
@@ -560,17 +598,34 @@ impl UpstreamOpenAiRuntime {
             let Ok(frame) = serde_json::from_str::<Value>(payload) else {
                 continue;
             };
-            if let Some(delta) = frame
+            let Some(delta) = frame
                 .get("choices")
                 .and_then(Value::as_array)
                 .and_then(|choices| choices.first())
                 .and_then(|choice| choice.get("delta"))
-                .and_then(|delta| delta.get("content"))
+            else {
+                continue;
+            };
+            if let Some(content) = delta
+                .get("content")
                 .and_then(Value::as_str)
-                .filter(|delta| !delta.is_empty())
+                .filter(|content| !content.is_empty())
             {
-                on_token(delta);
+                on_token(content);
             }
+            // A streamed tool call arrives as `delta.tool_calls` fragments with
+            // no content at all. Dropping them would make the whole request
+            // look like a model that answered with silence, so accumulate and
+            // emit them as the same envelope the buffered path returns.
+            if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
+                for fragment in fragments {
+                    streamed_tool_calls.absorb(fragment);
+                }
+            }
+        }
+
+        if let Some(tool_calls) = streamed_tool_calls.finish() {
+            on_token(&json!({"content": "", "tool_calls": tool_calls}).to_string());
         }
 
         // A clean EOF without `[DONE]` is a truncated generation, not a
@@ -625,6 +680,89 @@ impl UpstreamOpenAiRuntime {
                 Ok(narrowed)
             })
             .collect()
+    }
+}
+
+/// `true` for JSON that carries nothing worth forwarding: absent, null, or an
+/// empty array. Lets an explicitly-empty `tools: []` be dropped rather than
+/// sent, which some upstreams reject.
+fn is_empty_json(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
+}
+
+/// Reassembles tool calls streamed as OpenAI SSE fragments.
+///
+/// A streamed tool call is spread across frames: the first carries `id`/`type`
+/// and the function name, later ones append `function.arguments` in pieces.
+/// Fragments are keyed by their `index`, which is the only field guaranteed to
+/// identify which call a fragment belongs to.
+#[derive(Default)]
+struct StreamedToolCalls {
+    /// `(index, id, name, accumulated arguments)`, in first-seen order so the
+    /// emitted array preserves the upstream's own ordering.
+    calls: Vec<(u64, String, String, String)>,
+}
+
+impl StreamedToolCalls {
+    fn absorb(&mut self, fragment: &Value) {
+        let index = fragment.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let slot = match self.calls.iter_mut().find(|(known, ..)| *known == index) {
+            Some(slot) => slot,
+            None => {
+                self.calls
+                    .push((index, String::new(), String::new(), String::new()));
+                self.calls.last_mut().expect("just pushed")
+            }
+        };
+        if let Some(id) = fragment.get("id").and_then(Value::as_str) {
+            slot.1 = id.to_owned();
+        }
+        let function = fragment.get("function");
+        if let Some(name) = function
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+        {
+            slot.2 = name.to_owned();
+        }
+        if let Some(arguments) = function
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+        {
+            slot.3.push_str(arguments);
+        }
+    }
+
+    /// The reassembled calls, or `None` when the stream carried none. Calls
+    /// without a function name are dropped: a fragment stream that never
+    /// named its function is not a call anyone can dispatch.
+    fn finish(self) -> Option<Value> {
+        let calls = self
+            .calls
+            .into_iter()
+            .filter(|(_, _, name, _)| !name.is_empty())
+            .map(|(_, id, name, arguments)| {
+                let arguments = if arguments.is_empty() {
+                    "{}".to_owned()
+                } else {
+                    arguments
+                };
+                let mut call = Map::new();
+                if !id.is_empty() {
+                    call.insert("id".to_owned(), json!(id));
+                }
+                call.insert("type".to_owned(), json!("function"));
+                call.insert(
+                    "function".to_owned(),
+                    json!({"name": name, "arguments": arguments}),
+                );
+                Value::Object(call)
+            })
+            .collect::<Vec<_>>();
+        (!calls.is_empty()).then_some(Value::Array(calls))
     }
 }
 
@@ -1138,6 +1276,109 @@ mod tests {
             ),
             other => panic!("expected a status error, got: {other}"),
         }
+    }
+
+    #[test]
+    fn tool_schemas_are_forwarded_so_the_upstream_can_apply_its_own_template() {
+        let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
+        let body = backend
+            .chat_body(
+                br#"{"prompt":"weather?",
+                     "tools":[{"type":"function","function":{"name":"get_weather"}}],
+                     "tool_choice":"auto"}"#,
+                false,
+            )
+            .expect("request should map");
+        assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(body["tool_choice"], "auto");
+
+        // An explicitly empty tools array is dropped rather than sent: some
+        // upstreams reject `tools: []`.
+        let body = backend
+            .chat_body(br#"{"prompt":"hi","tools":[]}"#, false)
+            .expect("request should map");
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn a_buffered_tool_call_is_returned_instead_of_failing_on_null_content() {
+        // A real tool-call response carries `content: null`; requiring a content
+        // string would turn every successful tool call into an error.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_1","type":"function",
+                 "function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},
+                "finish_reason":"tool_calls"}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let output = backend
+            .generate(&[b"read a.rs"])
+            .expect("a tool call is a successful generation");
+        let envelope: Value =
+            serde_json::from_slice(&output).expect("output should be the JSON envelope");
+        assert_eq!(envelope["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            envelope["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a.rs\"}"
+        );
+        assert_eq!(envelope["content"], "");
+    }
+
+    #[test]
+    fn streamed_tool_call_fragments_are_reassembled() {
+        // Name arrives in the first fragment, arguments in pieces after it —
+        // and no content frame ever arrives, so dropping these would look like
+        // a model that answered with silence.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut tokens = Vec::new();
+        backend
+            .generate_streaming(&[b"read a.rs"], &mut |token| tokens.push(token.to_owned()))
+            .expect("streaming should complete");
+        assert_eq!(tokens.len(), 1, "expected one envelope, got {tokens:?}");
+        let envelope: Value =
+            serde_json::from_str(&tokens[0]).expect("the emitted token should be the envelope");
+        assert_eq!(envelope["tool_calls"][0]["id"], "call_1");
+        assert_eq!(envelope["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            envelope["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a.rs\"}"
+        );
+    }
+
+    #[test]
+    fn a_stream_without_tool_calls_emits_no_envelope() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut tokens = Vec::new();
+        backend
+            .generate_streaming(&[b"hi"], &mut |token| tokens.push(token.to_owned()))
+            .expect("streaming should complete");
+        assert_eq!(tokens, vec!["ok"]);
     }
 
     #[test]
