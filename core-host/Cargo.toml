@@ -52,6 +52,22 @@ candle-cuda = [
     "dep:cudarc",
     "dep:nvml-wrapper",
 ]
+# Apple GPU execution for quantized GGUF checkpoints. Deliberately narrower than
+# `candle-cuda`: it activates candle's Metal backend and nothing else, because
+# the CUDA-only extras that feature pulls in (flash-attn, paged attention,
+# cudarc, NVML) have no Metal counterpart here. Only the GGUF loader resolves a
+# Metal device — safetensors families still build against `Device::Cpu`, so
+# enabling this does not silently move them.
+#
+# Mutually exclusive with `candle-cuda` in practice: candle can compile both
+# backends, but a host would then have two GPU paths competing for the same
+# non-`cpu` binding, and `resolve_gguf_device` deliberately picks CUDA first.
+candle-metal = [
+    "ai-inference",
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+]
 # `nvfp4-cuda` stays CPU-buildable (no `candle-core/cuda`) so it remains in the
 # standard non-CUDA feature matrix. The candle CUDA backend is activated by the
 # separate `candle-cuda` feature (which enables `candle-core/cuda` et al.) and is

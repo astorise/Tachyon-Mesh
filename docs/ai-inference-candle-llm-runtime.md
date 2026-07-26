@@ -165,6 +165,56 @@ already had its own real CUDA path via `distribution_mode:
 tensor_parallelism`/`pipeline_parallelism`/`expert_parallelism`, unaffected
 by this.
 
+## Generation Deadline
+
+`max_new_tokens` is a poor proxy for how long a request occupies a scheduler
+slot: the same 4096 tokens are ~100 s on a GPU and a quarter of an hour on a
+CPU, and throughput varies as much between two models on one device as it does
+between devices. Sizing the token cap per hardware class would still be wrong by
+an order of magnitude in both directions.
+
+So every generation carries a wall-clock deadline. `DEFAULT_GENERATION_DEADLINE`
+is 300 s — matching the upstream backend's request timeout, so local and remote
+bindings look the same to a caller — overridable per request with
+`max_generation_ms` and clamped to `HOST_MAX_GENERATION_DEADLINE` (1 hour).
+
+The deadline is anchored at parse time, not at the first decode step, so
+tokenizing and prefilling a long prompt count against it: that work holds the
+same slot. When it expires the loop stops the way an exhausted token budget
+does — flushing what was generated — rather than erroring: a partial answer is
+worth more than a failure, and freeing the slot is the point. A batch takes the
+earliest deadline among its rows, since rows share a forward pass and cannot
+stop independently.
+
+`HOST_MAX_NEW_TOKENS` stays at 4096 as the coarse safety valve against an
+unbounded loop; it is no longer the de-facto regulator of slot occupancy.
+
+## GGUF Families
+
+The loader dispatches on `general.architecture` to the fork's `quantized_*`
+modules, not just `quantized_llama`:
+
+| `general.architecture` | Module |
+|---|---|
+| `llama` | `quantized_llama` |
+| `qwen2` | `quantized_qwen2` |
+| `qwen3` | `quantized_qwen3` |
+| `qwen3moe` / `qwen3_moe` | `quantized_qwen3_moe` |
+| `gemma3` | `quantized_gemma3` |
+| `phi3` | `quantized_phi3` |
+
+Every module exposes the same `from_gguf(content, reader, device)` /
+`forward(input, index_pos)` pair, so `QuantizedModel` wraps them behind one
+`forward` and the decode loops never learn which family they are driving.
+Adding a family is a `GgufFamily` table entry plus a `QuantizedModel` arm — and
+an `ArchitectureCapabilities` flag, which stays `gguf: false` for families the
+fork has no quantized module for (Gemma2, Phi4), so an unsupported checkpoint
+fails at validation rather than at load.
+
+Metadata keys are architecture-prefixed, so the context-length lookup reads
+`{prefix}.context_length` — hardcoding `llama.` would have silently fallen back
+to the default window for every other family.
+
 ### Quantized GGUF on CUDA
 
 GGUF follows the same rule. `load_gguf` resolves the binding's device rather
@@ -183,6 +233,28 @@ dequantize on CUDA but have no matmul kernel, so a checkpoint carrying them is
 rejected at load — with the offending tensor and block type named — instead of
 failing at the first decode step with VRAM already claimed. A `cpu` binding
 skips the check entirely and keeps the historical host path.
+
+### Quantized GGUF on Metal
+
+The `candle-metal` feature wires Apple GPU execution for GGUF bindings
+(`device: metal`). It is deliberately narrower than `candle-cuda`: it activates
+candle's Metal backend and nothing else, because the CUDA-only extras that
+feature pulls in — flash-attn, paged attention, cudarc, NVML — have no Metal
+counterpart here. Only `load_gguf` resolves a Metal device; safetensors families
+still build against `Device::Cpu`, so enabling the feature does not silently
+move them.
+
+Two differences from the CUDA path are worth knowing. First, candle's Metal
+quantized backend covers **every** GGML block type, including `Q8_1` and `Q8K`
+which CUDA can dequantize but not multiply — so the block-type scan does not
+apply to Metal. Second, `metal` does not fall back to the host: an operator
+asking for a device the machine does not have has a configuration error, and
+running on CPU instead would hide it behind a mysterious slowdown. (The CUDA
+path keeps its fallback because that convention predates this loader and the
+parallel engines rely on it.)
+
+Metal is tracked as a separate gate from CUDA rather than folded into one "GPU"
+flag, so a Metal binding cannot accept a CUDA-only optimization.
 
 `paged_attention`, `cuda_graph_decode`, and `flashinfer_attention` remain
 safetensors-only and are rejected for a GGUF binding: `QuantizedLlama` owns its

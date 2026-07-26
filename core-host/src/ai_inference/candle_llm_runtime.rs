@@ -4,6 +4,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use candle_core::{
@@ -22,11 +23,17 @@ use candle_transformers::models::llama::{
     Cache, Config, Llama, LlamaConfig, LlamaEosToks, LoraConfig, PagedKvCache,
 };
 use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
-use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlama;
 use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
 use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
 use candle_transformers::models::qwen3_moe::{
     Config as Qwen3MoeConfig, ModelForCausalLM as Qwen3MoeModel,
+};
+use candle_transformers::models::{
+    quantized_gemma3::ModelWeights as QuantizedGemma3,
+    quantized_llama::ModelWeights as QuantizedLlama, quantized_phi3::ModelWeights as QuantizedPhi3,
+    quantized_qwen2::ModelWeights as QuantizedQwen2,
+    quantized_qwen3::ModelWeights as QuantizedQwen3,
+    quantized_qwen3_moe::GGUFQWenMoE as QuantizedQwen3Moe,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -102,6 +109,78 @@ const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const GGUF_EXTENSION: &str = "gguf";
 /// GGUF `general.architecture` value for the Llama family.
 const GGUF_LLAMA_ARCHITECTURE: &str = "llama";
+
+/// A GGUF family with a verified quantized loader in the pinned candle fork.
+///
+/// Adding one is a table entry here plus an arm in [`QuantizedModel`]: every
+/// `quantized_*` module in the fork exposes the same
+/// `from_gguf(content, reader, device)` / `forward(input, index_pos)` pair, so
+/// the decode loop never has to know which family it is driving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GgufFamily {
+    Llama,
+    Qwen2,
+    Qwen3,
+    Qwen3Moe,
+    Gemma3,
+    Phi3,
+}
+
+impl GgufFamily {
+    /// Map a GGUF `general.architecture` string. The values are llama.cpp's,
+    /// not Hugging Face's — `qwen3moe`, not `qwen3_moe` — though both spellings
+    /// are accepted because converters disagree.
+    fn from_gguf_architecture(architecture: &str) -> Option<Self> {
+        match architecture {
+            GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
+            "qwen2" => Some(Self::Qwen2),
+            "qwen3" => Some(Self::Qwen3),
+            "qwen3moe" | "qwen3_moe" => Some(Self::Qwen3Moe),
+            "gemma3" => Some(Self::Gemma3),
+            "phi3" => Some(Self::Phi3),
+            _ => None,
+        }
+    }
+
+    /// Every family prefixes its own metadata keys with its architecture name,
+    /// so the context-length lookup cannot be hardcoded to `llama.`.
+    fn metadata_prefix(self) -> &'static str {
+        match self {
+            Self::Llama => "llama",
+            Self::Qwen2 => "qwen2",
+            Self::Qwen3 => "qwen3",
+            Self::Qwen3Moe => "qwen3moe",
+            Self::Gemma3 => "gemma3",
+            Self::Phi3 => "phi3",
+        }
+    }
+}
+
+/// A loaded quantized checkpoint, whichever family it came from.
+///
+/// The wrapper exists so `LoadedModel::Gguf` stays one variant and the decode
+/// loops keep calling a single `forward`.
+enum QuantizedModel {
+    Llama(QuantizedLlama),
+    Qwen2(QuantizedQwen2),
+    Qwen3(QuantizedQwen3),
+    Qwen3Moe(QuantizedQwen3Moe),
+    Gemma3(QuantizedGemma3),
+    Phi3(QuantizedPhi3),
+}
+
+impl QuantizedModel {
+    fn forward(&mut self, input: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Llama(model) => model.forward(input, index_pos),
+            Self::Qwen2(model) => model.forward(input, index_pos),
+            Self::Qwen3(model) => model.forward(input, index_pos),
+            Self::Qwen3Moe(model) => model.forward(input, index_pos),
+            Self::Gemma3(model) => model.forward(input, index_pos),
+            Self::Phi3(model) => model.forward(input, index_pos),
+        }
+    }
+}
 /// Error component label for GGUF load failures.
 const GGUF_COMPONENT: &str = "model.gguf";
 /// Generation budget applied when a request omits `max_new_tokens`.
@@ -127,6 +206,21 @@ pub(crate) const DEFAULT_SPECULATIVE_DRAFT_TOKENS: usize = 4;
 /// purpose: this cap bounds work done *here*, on local VRAM, whereas an
 /// upstream generation spends the remote server's resources.
 pub(crate) const HOST_MAX_NEW_TOKENS: usize = 4_096;
+/// Wall-clock budget for one generation when the request does not set
+/// `max_generation_ms`.
+///
+/// This, not [`HOST_MAX_NEW_TOKENS`], is what actually bounds how long a
+/// request holds a scheduler slot. The token cap is a coarse safety valve
+/// against an unbounded loop; it cannot bound *time*, because throughput spans
+/// more than an order of magnitude across model size, quantization and device —
+/// and varies as much between two models on one device as between devices.
+///
+/// Matches the upstream backend's default request timeout, so a local and a
+/// remote binding behave alike from a caller's point of view.
+pub(crate) const DEFAULT_GENERATION_DEADLINE: Duration = Duration::from_secs(300);
+/// Hard ceiling on a request's `max_generation_ms`, mirroring the upstream
+/// backend's `MAX_TIMEOUT` so no single request can wedge a lane indefinitely.
+pub(crate) const HOST_MAX_GENERATION_DEADLINE: Duration = Duration::from_secs(3_600);
 /// Seed used when a generation request samples (temperature > 0) but does not
 /// pin a `seed`. Fixed so that an un-seeded sampled request is still reproducible
 /// for a given prompt — callers that want variation pass their own `seed`.
@@ -258,6 +352,7 @@ impl ModelArchitecture {
             GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
             "qwen2" => Some(Self::Qwen2),
             "qwen3" => Some(Self::Qwen3),
+            "qwen3moe" | "qwen3_moe" => Some(Self::Qwen35Moe),
             "gemma2" => Some(Self::Gemma2),
             "gemma3" => Some(Self::Gemma3),
             "phi3" => Some(Self::Phi3),
@@ -290,7 +385,7 @@ impl ModelArchitecture {
             },
             Self::Qwen35Moe => ArchitectureCapabilities {
                 safetensors: true,
-                gguf: false,
+                gguf: true,
                 single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
@@ -299,23 +394,25 @@ impl ModelArchitecture {
             },
             Self::Qwen2 | Self::Qwen3 => ArchitectureCapabilities {
                 safetensors: true,
-                gguf: false,
+                gguf: true,
                 single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
                 expert_parallel: false,
                 specialized_runtime: false,
             },
-            Self::Gemma2 | Self::Gemma3 => ArchitectureCapabilities {
+            // Only families the fork ships a `quantized_*` module for get
+            // `gguf: true`; Gemma2 and Phi4 have safetensors loaders only.
+            Self::Gemma3 | Self::Phi3 => ArchitectureCapabilities {
                 safetensors: true,
-                gguf: false,
+                gguf: true,
                 single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
                 expert_parallel: false,
                 specialized_runtime: false,
             },
-            Self::Phi3 | Self::Phi4 | Self::DeepSeekV2 => ArchitectureCapabilities {
+            Self::Gemma2 | Self::Phi4 | Self::DeepSeekV2 => ArchitectureCapabilities {
                 safetensors: true,
                 gguf: false,
                 single: true,
@@ -394,7 +491,7 @@ enum LoadedModel {
     /// `index_pos == 0`), so it is guarded by a `Mutex`; the QoS scheduler
     /// already serialises execution per accelerator, so contention is minimal.
     Gguf {
-        model: Mutex<QuantizedLlama>,
+        model: Mutex<QuantizedModel>,
         eos_tokens: Vec<u32>,
         /// Device the quantized weights were uploaded to. `Device::Cpu` for a
         /// `cpu` binding (the historical path); a real CUDA device once the
@@ -1342,6 +1439,8 @@ struct GenerationLimits {
     /// `None` disables chunking; `Some(n)` bounds each prefill forward to at
     /// most `n` tokens. The default is `Some(8192)` to match candle-vllm.
     prefill_chunk_tokens: Option<usize>,
+    /// Applied when a request does not set `max_generation_ms`.
+    default_generation_deadline: Duration,
 }
 
 /// Derive `(max_prompt_tokens, max_prompt_bytes)` from a checkpoint's context
@@ -1386,6 +1485,7 @@ impl GenerationLimits {
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_position_embeddings,
             prefill_chunk_tokens: Some(DEFAULT_PREFILL_CHUNK_TOKENS),
+            default_generation_deadline: DEFAULT_GENERATION_DEADLINE,
         }
     }
 
@@ -1620,6 +1720,10 @@ struct GenerationRequest {
     /// the supported subset.
     #[serde(default)]
     json_schema: Option<String>,
+    /// Wall-clock budget for this generation, in milliseconds. Absent uses the
+    /// binding's default; the host clamps it to `HOST_MAX_GENERATION_DEADLINE`.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
 }
 
 /// Token-selection policy resolved from a request's `temperature`/`top_p`/`seed`.
@@ -1658,6 +1762,15 @@ struct ParsedGenerationRequest {
     /// Compiled grammar for constrained decoding, when the request supplied
     /// `json_schema`.
     fsm: Option<Arc<super::samplers::CompiledFsm>>,
+    /// Wall-clock point past which decoding stops, whatever the token budget
+    /// still allows.
+    ///
+    /// A token budget is a poor proxy for how long a request occupies a
+    /// scheduler slot: the same 4096 tokens are ~100 s on a GPU and a quarter
+    /// of an hour on a CPU, and throughput varies as much between two models on
+    /// one device as it does between devices. A deadline bounds the thing that
+    /// actually matters and needs no per-hardware table to do it.
+    deadline: Instant,
 }
 
 impl CandleLlmRuntime {
@@ -1753,9 +1866,30 @@ impl CandleLlmRuntime {
         // request setting one of those flags would pass this gate and then
         // silently dispatch to `load_parallel`, which ignores the flag
         // entirely — accepted but not actually wired.
+        // Metal is tracked separately rather than folded into one "GPU" flag:
+        // `paged_attention`, `cuda_graph_decode` and `flashinfer_attention` all
+        // key off the CUDA flag, and a shared one would let a Metal binding
+        // accept a CUDA-only optimization.
+        let requests_metal = requested_device == "metal";
+        let single_device_metal_supported = cfg!(feature = "candle-metal")
+            && requests_metal
+            && strategy.distribution_mode == GpuDistribution::Single
+            // Only `load_gguf` resolves a Metal device; the safetensors loaders
+            // are still built against `Device::Cpu`.
+            && format == ModelFormat::Gguf;
         let single_device_cuda_supported = cfg!(feature = "candle-cuda")
-            && architecture == ModelArchitecture::Llama
-            && strategy.distribution_mode == GpuDistribution::Single;
+            && !requests_metal
+            && strategy.distribution_mode == GpuDistribution::Single
+            && match format {
+                // Safetensors: `load_safetensors` only resolves a non-CPU
+                // device for a Llama checkpoint; every other family is still
+                // built against `Device::Cpu` unconditionally.
+                ModelFormat::Safetensors => architecture == ModelArchitecture::Llama,
+                // GGUF: `load_gguf` uploads to whatever device it is handed,
+                // and every wired family's `from_gguf` takes that device, so
+                // the family does not restrict the choice.
+                ModelFormat::Gguf => true,
+            };
 
         // paged_attention needs that same Llama+CUDA baseline — the paged
         // flash-attn kernel is CUDA-only — plus a Safetensors checkpoint and
@@ -1859,6 +1993,7 @@ impl CandleLlmRuntime {
         if strategy.distribution_mode == GpuDistribution::Single
             && requested_device != "cpu"
             && !single_device_cuda_supported
+            && !single_device_metal_supported
         {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
@@ -2371,19 +2506,19 @@ impl CandleLlmRuntime {
             .and_then(|value| value.to_string().ok())
             .map(|value| value.to_owned())
             .unwrap_or_default();
-        if architecture != GGUF_LLAMA_ARCHITECTURE {
+        let Some(family) = GgufFamily::from_gguf_architecture(&architecture) else {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
                 detail: format!(
-                    "expected a Llama-family GGUF (`general.architecture` = `{GGUF_LLAMA_ARCHITECTURE}`), got `{architecture}`"
+                    "GGUF `general.architecture` = `{architecture}` has no verified quantized loader; supported: llama, qwen2, qwen3, qwen3moe, gemma3, phi3"
                 ),
             });
-        }
+        };
 
         let context_length = content
             .metadata
-            .get("llama.context_length")
+            .get(&format!("{}.context_length", family.metadata_prefix()))
             .and_then(|value| value.to_u32().ok())
             .map(|value| value as usize)
             .unwrap_or(DEFAULT_MAX_PROMPT_TOKENS);
@@ -2400,14 +2535,38 @@ impl CandleLlmRuntime {
         // when the model already occupies VRAM.
         let device = resolve_gguf_device(alias, root, &content, requested_device)?;
 
-        let model = QuantizedLlama::from_gguf(content, &mut reader, &device).map_err(|error| {
-            CandleLlmError::InvalidComponent {
-                alias: alias.to_owned(),
-                path: root.to_path_buf(),
-                component: GGUF_COMPONENT,
-                detail: error.to_string(),
-            }
-        })?;
+        let invalid = |error: candle_core::Error| CandleLlmError::InvalidComponent {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            component: GGUF_COMPONENT,
+            detail: error.to_string(),
+        };
+        let model = match family {
+            GgufFamily::Llama => QuantizedModel::Llama(
+                QuantizedLlama::from_gguf(content, &mut reader, &device).map_err(invalid)?,
+            ),
+            GgufFamily::Qwen2 => QuantizedModel::Qwen2(
+                QuantizedQwen2::from_gguf(content, &mut reader, &device).map_err(invalid)?,
+            ),
+            GgufFamily::Qwen3 => QuantizedModel::Qwen3(
+                QuantizedQwen3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
+            ),
+            // The only family taking a working dtype: its expert routing runs
+            // dense. F32 matches every other CPU path in this runtime.
+            GgufFamily::Qwen3Moe => QuantizedModel::Qwen3Moe(
+                QuantizedQwen3Moe::from_gguf(content, &mut reader, &device, DType::F32)
+                    .map_err(invalid)?,
+            ),
+            GgufFamily::Gemma3 => QuantizedModel::Gemma3(
+                QuantizedGemma3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
+            ),
+            // `use_flash_attn: false` — flash attention is CUDA-only and is
+            // gated separately by `hardware_strategy`, which this loader never
+            // receives.
+            GgufFamily::Phi3 => QuantizedModel::Phi3(
+                QuantizedPhi3::from_gguf(false, content, &mut reader, &device).map_err(invalid)?,
+            ),
+        };
 
         Ok((
             LoadedModel::Gguf {
@@ -3070,6 +3229,7 @@ impl CandleLlmRuntime {
 
         while generated.len() < request.max_new_tokens
             && context_ids.len() < self.limits.max_position_embeddings
+            && Instant::now() < request.deadline
         {
             let remaining = request.max_new_tokens - generated.len();
             let proposed = draft.greedy_token_ids_from_context(
@@ -3543,6 +3703,15 @@ impl CandleLlmRuntime {
             .map(|request| request.max_new_tokens)
             .max()
             .unwrap_or(0);
+        // The earliest deadline in the batch wins. Rows share a forward pass,
+        // so honouring a later one would keep a caller waiting past the budget
+        // it asked for; stopping at the earliest is the only bound that holds
+        // for every row.
+        let batch_deadline = requests
+            .iter()
+            .map(|request| request.deadline)
+            .min()
+            .unwrap_or_else(|| Instant::now() + DEFAULT_GENERATION_DEADLINE);
 
         for step in 0..max_new_tokens {
             for row in 0..batch {
@@ -3582,7 +3751,12 @@ impl CandleLlmRuntime {
                 }
             }
 
-            if done.iter().all(|done| *done) || step + 1 == max_new_tokens {
+            // One deadline governs the whole batch: the rows share a forward
+            // pass, so they cannot stop independently on time.
+            if done.iter().all(|done| *done)
+                || step + 1 == max_new_tokens
+                || Instant::now() >= batch_deadline
+            {
                 break;
             }
             if prompt_len + step + 1 > self.limits.max_position_embeddings {
@@ -3700,6 +3874,13 @@ impl CandleLlmRuntime {
             if index_pos + 1 > self.limits.max_position_embeddings {
                 break;
             }
+            // Out of time. Stop like an exhausted token budget does — flushing
+            // what was generated — rather than erroring: a partial answer is
+            // worth more to the caller than a failure, and the point is to free
+            // the scheduler slot.
+            if Instant::now() >= request.deadline {
+                break;
+            }
             let input = Tensor::new(&[next], device)
                 .and_then(|tensor| tensor.unsqueeze(0))
                 .map_err(|error| {
@@ -3799,6 +3980,31 @@ impl CandleLlmRuntime {
     /// Decode the full generated token sequence to UTF-8 text (special tokens
     /// skipped). Always valid UTF-8, so byte offsets into it land on codepoint
     /// boundaries that grow monotonically as tokens are appended.
+    /// Turn a request's optional `max_generation_ms` into an absolute deadline.
+    ///
+    /// Anchored at parse time rather than at the first decode step, so time
+    /// spent tokenizing and prefilling a long prompt counts against the budget
+    /// — that work occupies the same scheduler slot.
+    fn resolve_deadline(&self, max_generation_ms: Option<u64>) -> Result<Instant, CandleLlmError> {
+        let budget = match max_generation_ms {
+            None => self.limits.default_generation_deadline,
+            Some(millis) => {
+                let requested = Duration::from_millis(millis);
+                if requested.is_zero() || requested > HOST_MAX_GENERATION_DEADLINE {
+                    return Err(CandleLlmError::InvalidRequest {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "max_generation_ms {millis} must be between 1 and {}",
+                            HOST_MAX_GENERATION_DEADLINE.as_millis()
+                        ),
+                    });
+                }
+                requested
+            }
+        };
+        Ok(Instant::now() + budget)
+    }
+
     fn decode_generated(&self, generated: &[u32]) -> Result<String, CandleLlmError> {
         self.tokenizer
             .decode(generated, true)
@@ -3994,6 +4200,7 @@ impl CandleLlmRuntime {
                 sampling: resolve_sampling(request.temperature, request.top_p, request.seed),
                 stop: sanitize_stop(request.stop),
                 fsm,
+                deadline: self.resolve_deadline(request.max_generation_ms)?,
             }
         } else {
             ParsedGenerationRequest {
@@ -4002,6 +4209,7 @@ impl CandleLlmRuntime {
                 sampling: resolve_sampling(None, None, None),
                 stop: Vec::new(),
                 fsm: None,
+                deadline: self.resolve_deadline(None)?,
             }
         };
 
@@ -4707,6 +4915,32 @@ fn unsupported_gguf_cuda_dtypes(content: &gguf_file::Content) -> Option<Unsuppor
     })
 }
 
+/// Open Metal device 0 for a GGUF binding.
+///
+/// Unlike `Device::cuda_if_available`, this does *not* fall back to the host:
+/// an operator asking for `metal` on a machine without one has a configuration
+/// error, and silently running on CPU would hide it behind a mysterious
+/// slowdown. The CUDA path keeps its fallback because that convention predates
+/// this loader and the parallel engines rely on it.
+#[cfg(feature = "candle-metal")]
+fn new_metal_device(alias: &str, root: &Path) -> Result<Device, CandleLlmError> {
+    Device::new_metal(0).map_err(|error| CandleLlmError::InvalidComponent {
+        alias: alias.to_owned(),
+        path: root.to_path_buf(),
+        component: GGUF_COMPONENT,
+        detail: format!("failed to open Metal device 0: {error}"),
+    })
+}
+
+#[cfg(not(feature = "candle-metal"))]
+fn new_metal_device(alias: &str, root: &Path) -> Result<Device, CandleLlmError> {
+    Err(CandleLlmError::UnsupportedModel {
+        alias: alias.to_owned(),
+        path: root.to_path_buf(),
+        detail: "this host was not built with the `candle-metal` feature".to_owned(),
+    })
+}
+
 /// Pick the device a GGUF checkpoint's weights are uploaded to.
 ///
 /// `cpu` (the default) keeps the historical host-side quantized path. Any other
@@ -4732,16 +4966,31 @@ fn resolve_gguf_device(
         return Ok(Device::Cpu);
     }
 
-    // Only CUDA has a quantized GGUF path here. `metal` is a valid
-    // `ModelDevice`, so without this it would fall through and be uploaded to
-    // CUDA device 0 (or the CPU fallback) — running on hardware the operator
-    // did not ask for, and mis-reporting device accounting.
+    // Metal takes its own path: candle's Metal quantized backend covers *every*
+    // GGML block type — including `Q8_1` and `Q8K`, which CUDA can dequantize
+    // but not multiply — so the block-type scan below does not apply to it.
+    if requested_device == "metal" {
+        if !cfg!(feature = "candle-metal") {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail:
+                    "GGUF execution on `metal` requires a host built with the `candle-metal` feature; rebuild with it or bind this model to `cpu`"
+                        .to_owned(),
+            });
+        }
+        return new_metal_device(alias, root);
+    }
+
+    // Anything else is not a device this loader knows how to reach. Falling
+    // through would upload the weights to CUDA device 0 regardless of what the
+    // operator asked for.
     if requested_device != "cuda" && requested_device != "gpu" {
         return Err(CandleLlmError::UnsupportedModel {
             alias: alias.to_owned(),
             path: root.to_path_buf(),
             detail: format!(
-                "GGUF execution on `{requested_device}` is not wired; bind this model to `cpu` or `cuda`"
+                "GGUF execution on `{requested_device}` is not wired; bind this model to `cpu`, `cuda` or `metal`"
             ),
         });
     }
@@ -6111,8 +6360,61 @@ mod tests {
         assert!(ModelArchitecture::Qwen3.supports_format(ModelFormat::Safetensors));
         assert!(ModelArchitecture::Qwen35Moe.supports_format(ModelFormat::Safetensors));
         assert!(!ModelArchitecture::DeepSeekV3.supports_format(ModelFormat::Safetensors));
-        assert!(!ModelArchitecture::Gemma3.supports_format(ModelFormat::Gguf));
         assert!(ModelArchitecture::Gemma3.supports_format(ModelFormat::Safetensors));
+
+        // GGUF support tracks the fork's `quantized_*` modules, one per family.
+        for architecture in [
+            ModelArchitecture::Qwen2,
+            ModelArchitecture::Qwen3,
+            ModelArchitecture::Qwen35Moe,
+            ModelArchitecture::Gemma3,
+            ModelArchitecture::Phi3,
+        ] {
+            assert!(
+                architecture.supports_format(ModelFormat::Gguf),
+                "{architecture:?} has a quantized loader and must accept GGUF"
+            );
+        }
+        // No `quantized_gemma2` or `quantized_phi4` in the fork, so claiming
+        // GGUF here would fail at load instead of at validation.
+        for architecture in [
+            ModelArchitecture::Gemma2,
+            ModelArchitecture::Phi4,
+            ModelArchitecture::DeepSeekV2,
+            ModelArchitecture::Mixtral,
+        ] {
+            assert!(
+                !architecture.supports_format(ModelFormat::Gguf),
+                "{architecture:?} has no quantized loader and must reject GGUF"
+            );
+        }
+    }
+
+    #[test]
+    fn gguf_families_map_llama_cpp_architecture_strings() {
+        assert_eq!(
+            GgufFamily::from_gguf_architecture("llama"),
+            Some(GgufFamily::Llama)
+        );
+        assert_eq!(
+            GgufFamily::from_gguf_architecture("qwen3"),
+            Some(GgufFamily::Qwen3)
+        );
+        // llama.cpp writes `qwen3moe`; some converters write the HF spelling.
+        assert_eq!(
+            GgufFamily::from_gguf_architecture("qwen3moe"),
+            Some(GgufFamily::Qwen3Moe)
+        );
+        assert_eq!(
+            GgufFamily::from_gguf_architecture("qwen3_moe"),
+            Some(GgufFamily::Qwen3Moe)
+        );
+        assert_eq!(GgufFamily::from_gguf_architecture("mamba"), None);
+
+        // Each family reads its own metadata namespace; hardcoding `llama.`
+        // would silently fall back to the default context window.
+        assert_eq!(GgufFamily::Qwen3Moe.metadata_prefix(), "qwen3moe");
+        assert_eq!(GgufFamily::Phi3.metadata_prefix(), "phi3");
     }
 
     #[test]
@@ -6567,6 +6869,63 @@ mod tests {
     fn decode_byte_tokens(ids: &[u32]) -> Result<String, CandleLlmError> {
         let bytes = ids.iter().map(|id| *id as u8).collect::<Vec<_>>();
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[test]
+    fn a_zero_deadline_stops_generation_without_erroring() {
+        let (runtime, dir) = load_fixture("deadline-expired");
+        // Already elapsed by the time the loop runs: generation must stop the
+        // way an exhausted token budget does, not fail. Freeing the scheduler
+        // slot is the point; a partial answer still beats an error.
+        let bytes = runtime
+            .generate(&[br#"{"prompt":"hello","max_new_tokens":64,"max_generation_ms":1}"#])
+            .expect("an expired deadline is not a request error");
+        assert!(
+            String::from_utf8(bytes).expect("utf-8").len() < 1024,
+            "an expired deadline must cut generation short"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_generous_deadline_does_not_truncate() {
+        let (runtime, dir) = load_fixture("deadline-generous");
+        let deadlined = runtime
+            .generate(&[br#"{"prompt":"hello","max_new_tokens":4,"max_generation_ms":600000}"#])
+            .expect("generation should run");
+        let plain = runtime
+            .generate(&[br#"{"prompt":"hello","max_new_tokens":4}"#])
+            .expect("generation should run");
+        // A deadline far beyond the work must not change the output at all.
+        assert_eq!(deadlined, plain);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_out_of_range_deadline_is_rejected() {
+        let (runtime, dir) = load_fixture("deadline-range");
+        for millis in [0u64, HOST_MAX_GENERATION_DEADLINE.as_millis() as u64 + 1] {
+            let request = format!(r#"{{"prompt":"hello","max_generation_ms":{millis}}}"#);
+            let error = runtime
+                .generate(&[request.as_bytes()])
+                .expect_err("an out-of-range deadline must be rejected");
+            assert!(
+                error.to_string().contains("max_generation_ms"),
+                "the error should name the field, got: {error}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_default_deadline_matches_the_upstream_request_timeout() {
+        // A local and a remote binding should look the same to a caller.
+        assert_eq!(
+            DEFAULT_GENERATION_DEADLINE,
+            Duration::from_secs(300),
+            "keep this in step with the upstream backend's DEFAULT_TIMEOUT"
+        );
+        assert!(HOST_MAX_GENERATION_DEADLINE > DEFAULT_GENERATION_DEADLINE);
     }
 
     #[test]
@@ -7505,6 +7864,45 @@ mod tests {
         let device = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "cpu")
             .expect("a cpu binding must always resolve");
         assert!(device.is_cpu());
+    }
+
+    #[cfg(not(feature = "candle-metal"))]
+    #[test]
+    fn gguf_rejects_a_metal_binding_without_the_metal_feature() {
+        let content = gguf_header_with_dtypes(&[("blk.0.attn_q.weight", GgmlDType::Q4K)]);
+        let error = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "metal")
+            .expect_err("a Metal-less build must refuse a metal binding");
+        assert!(
+            error.to_string().contains("candle-metal"),
+            "the error must name the missing build feature, got: {error}"
+        );
+    }
+
+    #[test]
+    fn gguf_rejects_devices_it_cannot_reach() {
+        // `npu`/`tpu` are valid `ModelDevice` values, so without an explicit
+        // rejection they would fall through to the CUDA branch.
+        let content = gguf_header_with_dtypes(&[("blk.0.attn_q.weight", GgmlDType::Q4K)]);
+        for device in ["npu", "tpu", "vulkan"] {
+            let error =
+                resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, device)
+                    .expect_err("an unreachable device must be refused");
+            assert!(
+                error.to_string().contains("not wired"),
+                "unexpected error for `{device}`: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "candle-metal")]
+    #[test]
+    fn metal_accepts_block_types_cuda_cannot_multiply() {
+        // Metal's quantized backend covers every GGML type, so the CUDA-only
+        // block-type scan must not be applied to it.
+        let content = gguf_header_with_dtypes(&[("blk.0.ffn_down.weight", GgmlDType::Q8K)]);
+        assert!(
+            resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "metal").is_ok()
+        );
     }
 
     #[cfg(not(feature = "candle-cuda"))]

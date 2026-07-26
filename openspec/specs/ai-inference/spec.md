@@ -380,6 +380,81 @@ stream until a tool-call opener appears.
   output, and the generation merely contains that opener character mid-text
 - **THEN** content keeps streaming
 
+### Requirement: Generation MUST be bounded by wall-clock time
+
+A token budget cannot bound how long a request occupies a scheduler slot:
+throughput spans more than an order of magnitude across model size,
+quantization and device, and varies as much between two models on one device as
+between devices. The runtime SHALL therefore carry a wall-clock deadline per
+generation, defaulted per binding, overridable per request, and clamped to a
+host maximum.
+
+#### Scenario: An expired deadline stops generation without erroring
+
+- **WHEN** a generation's deadline elapses before its token budget
+- **THEN** decoding stops and the text generated so far is returned
+- **AND** the request is not reported as an error
+
+#### Scenario: A deadline beyond the work changes nothing
+
+- **WHEN** a request sets a deadline far larger than the generation needs
+- **THEN** its output is identical to the same request without one
+
+#### Scenario: An out-of-range deadline is rejected
+
+- **WHEN** a request sets a deadline of zero or beyond the host maximum
+- **THEN** the request is rejected with an error naming the field
+
+#### Scenario: A batch stops at its earliest deadline
+
+- **WHEN** batched rows carry different deadlines
+- **THEN** decoding stops at the earliest, because rows share a forward pass
+
+### Requirement: GGUF loading MUST dispatch by architecture
+
+The GGUF loader SHALL select a quantized backend from the checkpoint's
+`general.architecture`, not assume Llama, and SHALL read architecture-prefixed
+metadata keys. A family without a verified quantized loader SHALL be rejected at
+validation rather than at load.
+
+#### Scenario: A non-Llama GGUF family loads
+
+- **WHEN** a GGUF checkpoint declares a family with a verified quantized loader
+  (Qwen2, Qwen3, Qwen3-MoE, Gemma3, Phi3)
+- **THEN** the runtime constructs that family's backend
+- **AND** reads its context length from that family's metadata namespace
+
+#### Scenario: A family without a quantized loader is refused
+
+- **WHEN** a GGUF checkpoint declares a family the runtime has no quantized
+  backend for
+- **THEN** format validation rejects it before any weights are read
+
+### Requirement: GGUF checkpoints MUST be executable on Metal
+
+The runtime SHALL support Apple GPU execution for GGUF bindings behind a
+dedicated build feature, tracked separately from CUDA so a Metal binding cannot
+accept a CUDA-only optimization.
+
+#### Scenario: A Metal binding runs any block type
+
+- **GIVEN** a host built with the Metal feature
+- **WHEN** a GGUF binding declares `metal`
+- **THEN** the runtime resolves a Metal device
+- **AND** does not apply the CUDA block-type restriction, because the Metal
+  backend covers every GGML block type
+
+#### Scenario: A Metal request on a build without the feature is refused
+
+- **WHEN** a GGUF binding declares `metal` on a host built without it
+- **THEN** the runtime returns a typed error naming the missing build feature
+
+#### Scenario: A device the loader cannot reach is refused
+
+- **WHEN** a GGUF binding declares a device that is neither `cpu`, `cuda` nor
+  `metal`
+- **THEN** the runtime rejects it rather than falling through to another device
+
 ### Requirement: Decode loops MUST detokenize incrementally
 
 Every decode step needs the text generated so far, for stop-sequence matching
