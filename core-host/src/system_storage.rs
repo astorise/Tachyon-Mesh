@@ -358,21 +358,29 @@ fn binding_engine_label(path: &str) -> &'static str {
         "openai"
     } else if path == "mock" || path.starts_with("mock:") {
         "mock"
-    } else if std::path::Path::new(path)
-        .read_dir()
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-            })
-        })
-        .unwrap_or(false)
-    {
-        "gguf"
     } else {
-        "safetensors"
+        // Probe the directory once and classify by what is actually in it. The
+        // label is part of the public model id (`{engine}/{alias}`), so an
+        // ONNX embedding directory advertised as `safetensors` gives clients
+        // wrong format metadata.
+        let mut has_gguf = false;
+        let mut has_onnx = false;
+        if let Ok(entries) = std::path::Path::new(path).read_dir() {
+            for entry in entries.flatten() {
+                match entry.path().extension().and_then(|ext| ext.to_str()) {
+                    Some(ext) if ext.eq_ignore_ascii_case("gguf") => has_gguf = true,
+                    Some(ext) if ext.eq_ignore_ascii_case("onnx") => has_onnx = true,
+                    _ => {}
+                }
+            }
+        }
+        match (has_gguf, has_onnx) {
+            // A GGUF file wins: a directory carrying both is a quantized
+            // checkpoint that happens to ship an ONNX sidecar.
+            (true, _) => "gguf",
+            (false, true) => "onnx",
+            (false, false) => "safetensors",
+        }
     }
 }
 

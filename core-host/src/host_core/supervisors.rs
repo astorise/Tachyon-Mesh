@@ -687,6 +687,11 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         Arc::clone(&state.host_identity),
         Arc::clone(&state.storage_broker),
     )?;
+    // A model added through the manifest must show up in `GET /ai/v1/models`
+    // now, not after the next full restart. Best-effort, like the boot-time
+    // publication: the reload itself must not fail on a registry write.
+    #[cfg(feature = "ai-inference")]
+    crate::system_storage::publish_configured_model_bindings(&state.core_store, &runtime.config);
     let previous_runtime = state.runtime.load_full();
     let draining_since = Instant::now();
     previous_runtime.mark_draining(draining_since);

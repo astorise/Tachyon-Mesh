@@ -104,11 +104,29 @@ const GGUF_EXTENSION: &str = "gguf";
 const GGUF_LLAMA_ARCHITECTURE: &str = "llama";
 /// Error component label for GGUF load failures.
 const GGUF_COMPONENT: &str = "model.gguf";
-pub(crate) const DEFAULT_MAX_NEW_TOKENS: usize = 64;
+/// Generation budget applied when a request omits `max_new_tokens`.
+///
+/// Raised from 64, which predated this runtime serving agentic coding clients:
+/// 64 tokens is a sentence, not an edit. The value is a *default*, not a cap —
+/// a caller that knows what it wants still names its own budget, bounded by
+/// [`HOST_MAX_NEW_TOKENS`].
+pub(crate) const DEFAULT_MAX_NEW_TOKENS: usize = 1_024;
 pub(crate) const DEFAULT_SPECULATIVE_DRAFT_TOKENS: usize = 4;
 /// Hard upper bound on `max_new_tokens` for any single request, regardless of
 /// what the caller asks for. Protects the host from unbounded decode loops.
-pub(crate) const HOST_MAX_NEW_TOKENS: usize = 256;
+///
+/// Raised from 256, which truncated an agentic coding response mid-function.
+/// 4096 is the point where the two costs that actually scale stay reasonable on
+/// the hardware this runtime targets: the KV cache grows linearly with
+/// generated length and is bounded anyway by the checkpoint's context window
+/// (see [`prompt_limits_for`], which reserves this much headroom), while the
+/// contiguous cache path pays a quadratic memory-traffic term that is still
+/// small next to inherent decode cost at this length.
+///
+/// It stays far below [`super::upstream_openai::UPSTREAM_MAX_NEW_TOKENS`] on
+/// purpose: this cap bounds work done *here*, on local VRAM, whereas an
+/// upstream generation spends the remote server's resources.
+pub(crate) const HOST_MAX_NEW_TOKENS: usize = 4_096;
 /// Seed used when a generation request samples (temperature > 0) but does not
 /// pin a `seed`. Fixed so that an un-seeded sampled request is still reproducible
 /// for a given prompt — callers that want variation pass their own `seed`.
@@ -126,7 +144,7 @@ const DEFAULT_MAX_PROMPT_TOKENS: usize = 4_096;
 /// *before* the tokenizer can tell how many tokens it really is; the token cap
 /// below is the semantic limit. A 256k-context model would otherwise justify a
 /// byte budget large enough to be its own denial-of-service.
-const MAX_PROMPT_BYTES_CEILING: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PROMPT_BYTES_CEILING: usize = 4 * 1024 * 1024;
 /// Floor on the byte budget: the flat cap this derivation replaced. Keeping it
 /// as a minimum means the change can only ever *widen* what a checkpoint
 /// accepts. Without it, a short-context model would end up with a byte budget
@@ -1340,9 +1358,16 @@ struct GenerationLimits {
 /// skipped when the window is too small to afford it (tiny test checkpoints),
 /// and the floor never exceeds the real window.
 pub(crate) fn prompt_limits_for(max_position_embeddings: usize) -> (usize, usize) {
+    // Reserve proportionally, not absolutely. `HOST_MAX_NEW_TOKENS` is the
+    // largest generation the host will *allow*, not what every request needs;
+    // subtracting it outright would leave a 4k-context checkpoint with almost
+    // no prompt budget. A quarter of the window, capped at the host maximum,
+    // keeps generation headroom on small models without wasting it on large
+    // ones.
+    let reserved = HOST_MAX_NEW_TOKENS.min(max_position_embeddings / 4);
     let floor = MIN_PROMPT_TOKENS.min(max_position_embeddings);
     let max_prompt_tokens = max_position_embeddings
-        .saturating_sub(HOST_MAX_NEW_TOKENS)
+        .saturating_sub(reserved)
         .max(floor)
         .max(1);
     let max_prompt_bytes = max_prompt_tokens
@@ -1488,6 +1513,9 @@ pub(crate) struct CandleLlmRuntime {
     alias: String,
     root: PathBuf,
     tokenizer: Tokenizer,
+    /// Whether this checkpoint's decoder permits windowed detokenization.
+    /// Resolved once at load: see [`decoder_has_bounded_context`].
+    windowed_detokenization: bool,
     inner: Arc<LoadedModel>,
     limits: GenerationLimits,
     /// The model's own chat template, loaded once from `tokenizer_config.json`.
@@ -1552,7 +1580,22 @@ struct SafetensorsIndex {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub(crate) struct ChatTurn {
     pub(crate) role: String,
+    /// Absent or `null` on an assistant turn that carried only tool calls —
+    /// which is exactly what a client replays on the next turn of an agentic
+    /// conversation. Requiring a string here rejected the whole request, so the
+    /// second turn after any tool call failed outright. This runtime has no
+    /// tool-aware template, so the turn renders as empty content rather than
+    /// carrying the calls, but the conversation survives.
+    #[serde(default, deserialize_with = "nullable_string")]
     pub(crate) content: String,
+}
+
+/// Deserialize a missing or `null` string as empty rather than failing.
+fn nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1864,6 +1907,7 @@ impl CandleLlmRuntime {
         Ok(Some(Self {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
+            windowed_detokenization: decoder_has_bounded_context(&tokenizer),
             tokenizer,
             inner: Arc::new(inner),
             limits,
@@ -2272,6 +2316,7 @@ impl CandleLlmRuntime {
         Ok(Self {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
+            windowed_detokenization: decoder_has_bounded_context(&tokenizer),
             tokenizer,
             inner: Arc::new(inner),
             limits,
@@ -3021,7 +3066,7 @@ impl CandleLlmRuntime {
             .saturating_sub(1);
         let mut emitted = 0usize;
         let mut decode = |ids: &[u32]| self.decode_generated(ids);
-        let mut decoder = IncrementalDecoder::default();
+        let mut decoder = IncrementalDecoder::new(self.windowed_detokenization);
 
         while generated.len() < request.max_new_tokens
             && context_ids.len() < self.limits.max_position_embeddings
@@ -3489,7 +3534,7 @@ impl CandleLlmRuntime {
         // per row.
         let mut decode = |ids: &[u32]| self.decode_generated(ids);
         let mut decoders = (0..batch)
-            .map(|_| IncrementalDecoder::default())
+            .map(|_| IncrementalDecoder::new(self.windowed_detokenization))
             .collect::<Vec<_>>();
         let mut done = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
@@ -3612,7 +3657,7 @@ impl CandleLlmRuntime {
         // step is O(n²) in the generated length, which only became worth fixing
         // once generation budgets moved past a few hundred tokens.
         let mut decode = |ids: &[u32]| self.decode_generated(ids);
-        let mut decoder = IncrementalDecoder::default();
+        let mut decoder = IncrementalDecoder::new(self.windowed_detokenization);
         for step in 0..request.max_new_tokens {
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
@@ -4035,6 +4080,54 @@ fn sanitize_stop(stop: Option<Vec<String>>) -> Vec<String> {
 const DETOKENIZE_WINDOW_TOKENS: usize = 32;
 const DETOKENIZE_KEEP_TOKENS: usize = 16;
 
+/// Whether a tokenizer's decoder can be trusted to only revise text near the
+/// end of a sequence — the property [`IncrementalDecoder`]'s sliding window
+/// depends on.
+///
+/// The window's suffix check proves the shortened decode matches *now*; it does
+/// not prove a future token cannot rewrite text before the anchor. A decoder
+/// applying a regex replacement can do exactly that: with a pattern like `a+b`,
+/// a long run of `a` re-anchors happily and a later `b` rewrites the whole run,
+/// which the frozen prefix would never see. So decoders without a bounded
+/// context keep whole-sequence decoding and simply pay the quadratic cost.
+///
+/// The decoder is inspected through its serialized form rather than its Rust
+/// type, because `tokenizers` keeps the interesting fields private. Anything
+/// unrecognized is treated as unbounded: a wrong "safe" answer corrupts output,
+/// while a wrong "unsafe" one only costs speed.
+fn decoder_has_bounded_context(tokenizer: &Tokenizer) -> bool {
+    // No decoder at all means tokens map straight back to their strings.
+    let Some(decoder) = tokenizer.get_decoder() else {
+        return true;
+    };
+    serde_json::to_value(decoder).is_ok_and(|value| decoder_node_is_bounded(&value))
+}
+
+/// The serialized-decoder walk behind [`decoder_has_bounded_context`], split
+/// out so the rule can be tested against the shapes `tokenizers` emits without
+/// building a whole tokenizer for each one.
+fn decoder_node_is_bounded(node: &serde_json::Value) -> bool {
+    let Some(kind) = node.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    match kind {
+        // Composite: safe only if every stage is.
+        "Sequence" => node
+            .get("decoders")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|stages| stages.iter().all(decoder_node_is_bounded)),
+        // A literal pattern can only rewrite as far back as its own length;
+        // a regex is unbounded by construction.
+        "Replace" => node
+            .get("pattern")
+            .and_then(|pattern| pattern.get("String"))
+            .is_some(),
+        "ByteLevel" | "BPEDecoder" | "WordPiece" | "Metaspace" | "CTC" | "Fuse" | "Strip"
+        | "ByteFallback" => true,
+        _ => false,
+    }
+}
+
 /// Streaming detokenizer that keeps a decode loop linear in the number of
 /// generated tokens.
 ///
@@ -4056,6 +4149,10 @@ const DETOKENIZE_KEEP_TOKENS: usize = 16;
 /// decoding the whole token sequence would produce.
 #[derive(Default)]
 struct IncrementalDecoder {
+    /// `false` keeps the window anchored at zero, i.e. whole-sequence decoding
+    /// on every step — the correct fallback for a decoder whose context is not
+    /// provably bounded. See [`decoder_has_bounded_context`].
+    windowed: bool,
     text: String,
     /// Index into the caller's generated-token vector where the window starts.
     window_start: usize,
@@ -4068,6 +4165,13 @@ struct IncrementalDecoder {
 }
 
 impl IncrementalDecoder {
+    fn new(windowed: bool) -> Self {
+        Self {
+            windowed,
+            ..Self::default()
+        }
+    }
+
     fn text(&self) -> &str {
         &self.text
     }
@@ -4094,7 +4198,10 @@ impl IncrementalDecoder {
         self.window_text = window;
 
         let window_tokens = generated.len() - self.window_start;
-        if window_tokens > DETOKENIZE_WINDOW_TOKENS && generated.len() >= self.anchor_retry_at {
+        if self.windowed
+            && window_tokens > DETOKENIZE_WINDOW_TOKENS
+            && generated.len() >= self.anchor_retry_at
+        {
             let next_start = generated.len() - DETOKENIZE_KEEP_TOKENS;
             let tail = decode(&generated[next_start..])?;
             if self.window_text.ends_with(&tail) {
@@ -4623,6 +4730,20 @@ fn resolve_gguf_device(
 ) -> Result<Device, CandleLlmError> {
     if requested_device == "cpu" {
         return Ok(Device::Cpu);
+    }
+
+    // Only CUDA has a quantized GGUF path here. `metal` is a valid
+    // `ModelDevice`, so without this it would fall through and be uploaded to
+    // CUDA device 0 (or the CPU fallback) — running on hardware the operator
+    // did not ask for, and mis-reporting device accounting.
+    if requested_device != "cuda" && requested_device != "gpu" {
+        return Err(CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: format!(
+                "GGUF execution on `{requested_device}` is not wired; bind this model to `cpu` or `cuda`"
+            ),
+        });
     }
 
     if !cfg!(feature = "candle-cuda") {
@@ -6421,7 +6542,7 @@ mod tests {
         tokens: &[u32],
         mut decode: impl FnMut(&[u32]) -> Result<String, CandleLlmError>,
     ) -> IncrementalDecoder {
-        let mut decoder = IncrementalDecoder::default();
+        let mut decoder = IncrementalDecoder::new(true);
         let mut generated = Vec::new();
         let mut decode_for_push = |ids: &[u32]| decode(ids);
         for token in tokens {
@@ -6454,7 +6575,12 @@ mod tests {
         // headroom, not the old flat 4096 tokens / 16 KiB.
         let (tokens, bytes) = prompt_limits_for(32_768);
         assert_eq!(tokens, 32_768 - HOST_MAX_NEW_TOKENS);
-        assert_eq!(bytes, tokens * PROMPT_BYTES_PER_TOKEN);
+        assert_eq!(
+            bytes,
+            tokens
+                .saturating_mul(PROMPT_BYTES_PER_TOKEN)
+                .min(MAX_PROMPT_BYTES_CEILING)
+        );
         assert!(
             bytes > 16_384,
             "an agentic prompt must no longer be capped at the old 16 KiB"
@@ -6469,8 +6595,15 @@ mod tests {
         for window in [4_096usize, 32_768, 262_144] {
             let (tokens, _) = prompt_limits_for(window);
             assert!(
-                tokens + HOST_MAX_NEW_TOKENS <= window,
+                tokens < window,
                 "window {window} left no generation headroom (prompt budget {tokens})"
+            );
+            // Headroom is proportional: at least a quarter of the window, or the
+            // host maximum once the window is large enough to afford it.
+            let headroom = window - tokens;
+            assert!(
+                headroom >= HOST_MAX_NEW_TOKENS.min(window / 4),
+                "window {window} reserved only {headroom} tokens"
             );
         }
     }
@@ -6509,6 +6642,68 @@ mod tests {
         // large enough to be its own denial-of-service.
         let (_, bytes) = prompt_limits_for(2_000_000);
         assert_eq!(bytes, MAX_PROMPT_BYTES_CEILING);
+    }
+
+    #[test]
+    fn windowing_is_refused_for_decoders_without_bounded_context() {
+        // Exercises the shipped rule against the shapes `tokenizers` serializes.
+        let bounded = |json: serde_json::Value| decoder_node_is_bounded(&json);
+
+        assert!(bounded(serde_json::json!({"type": "ByteLevel"})));
+        // The SentencePiece-style stack real Llama/Qwen checkpoints ship.
+        assert!(bounded(serde_json::json!({
+            "type": "Sequence",
+            "decoders": [
+                {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+                {"type": "ByteFallback"},
+                {"type": "Fuse"},
+                {"type": "Strip", "content": " ", "start": 1, "stop": 0},
+            ]
+        })));
+        // A regex replacement can rewrite arbitrarily far back, which is
+        // exactly what the sliding window cannot survive.
+        assert!(!bounded(serde_json::json!({
+            "type": "Replace", "pattern": {"Regex": "a+b"}, "content": "X"
+        })));
+        // One unsafe stage poisons the whole sequence.
+        assert!(!bounded(serde_json::json!({
+            "type": "Sequence",
+            "decoders": [
+                {"type": "ByteLevel"},
+                {"type": "Replace", "pattern": {"Regex": "a+b"}, "content": "X"},
+            ]
+        })));
+        // Unknown decoders are treated as unsafe: a wrong "safe" answer
+        // corrupts output, a wrong "unsafe" one only costs speed.
+        assert!(!bounded(serde_json::json!({"type": "SomethingNew"})));
+    }
+
+    #[test]
+    fn an_unwindowed_decoder_still_matches_the_whole_sequence_decode() {
+        // The fallback must stay correct, just slower: the window never moves.
+        let tokens = (0..80).map(|i| b'a' as u32 + (i % 26)).collect::<Vec<_>>();
+        let mut decoder = IncrementalDecoder::new(false);
+        let mut generated = Vec::new();
+        let mut decode = |ids: &[u32]| decode_byte_tokens(ids);
+        for token in &tokens {
+            generated.push(*token);
+            decoder.push(&mut decode, &generated).expect("push");
+            assert_eq!(
+                decoder.text(),
+                decode_byte_tokens(&generated).expect("whole decode")
+            );
+        }
+        assert_eq!(
+            decoder.window_start, 0,
+            "an unwindowed decoder must never re-anchor"
+        );
+    }
+
+    #[test]
+    fn the_fixture_tokenizer_permits_windowing() {
+        let (runtime, dir) = load_fixture("decoder-bounded");
+        assert!(runtime.windowed_detokenization);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

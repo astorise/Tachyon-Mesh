@@ -44,9 +44,9 @@ const ROUTE_MODELS: &str = "/ai/v1/models";
 const ROUTE_CHAT_COMPLETIONS: &str = "/ai/v1/chat/completions";
 const ROUTE_EMBEDDINGS: &str = "/ai/v1/embeddings";
 
-/// Generation defaults when the request omits them. The host clamps these to its
-/// own hard caps (`HOST_MAX_NEW_TOKENS`, context window).
-const DEFAULT_MAX_TOKENS: u32 = 256;
+/// Sampling default when the request omits it, chosen so a bare request is
+/// reproducible. `max_tokens` deliberately has no guest-side default: omission
+/// is forwarded so the host applies the budget its backend advertises.
 const DEFAULT_TEMPERATURE: f32 = 0.0;
 
 struct Component;
@@ -626,12 +626,28 @@ fn handle_chat_completions_streaming(
         // offset is what keeps this safe: if the streamed text is not a prefix
         // of the parsed content, nothing more is emitted, because duplicating
         // text in the client's transcript is worse than omitting a tail.
-        let already_streamed = whole.get(..streamed).unwrap_or_default().trim();
-        if let Some(tail) = parsed
-            .content
-            .strip_prefix(already_streamed)
-            .filter(|tail| !tail.is_empty())
-        {
+        // Two different reconciliations, because the two cases differ.
+        //
+        // When parsing found no tool calls it fell back to returning the raw
+        // text unchanged, so the exact byte prefix already streamed is the
+        // right cut — trimming it there would drop the gate's held-back tail on
+        // a response starting with whitespace, or re-emit trailing whitespace.
+        //
+        // When parsing *did* extract calls, `parsed.content` is the text minus
+        // those regions and trimmed at both ends, so the comparison has to be
+        // trimmed too. Matching by prefix rather than by offset is what keeps
+        // this safe: no match means no tail is emitted, and duplicating text in
+        // the transcript is worse than omitting a trailing fragment.
+        let tail = if parsed.tool_calls.is_empty() {
+            parsed.content.get(streamed..).unwrap_or_default()
+        } else {
+            let already_streamed = whole.get(..streamed).unwrap_or_default().trim();
+            parsed
+                .content
+                .strip_prefix(already_streamed)
+                .unwrap_or_default()
+        };
+        if !tail.is_empty() {
             let chunk = ChatCompletionChunk {
                 id: "chatcmpl-tachyon",
                 object: "chat.completion.chunk",
@@ -712,7 +728,10 @@ fn write_sse_chunk<T: serde::Serialize>(
 /// anywhere, because those models routinely emit prose and then a call.
 fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) {
     match parser {
-        ToolCallParser::Json => (&["{", "```"], true),
+        // `[` matters as much as `{`: `tool_calls_from_value` accepts a bare
+        // top-level array of calls, so omitting it would stream the payload as
+        // content *and* emit it again as a structured call.
+        ToolCallParser::Json => (&["{", "[", "```"], true),
         ToolCallParser::Qwen | ToolCallParser::QwenCoder => {
             (&["<tool_call>", "<tool_calls>"], false)
         }
@@ -1004,12 +1023,18 @@ fn strip_markdown_json_fence(value: &str) -> &str {
 fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, String> {
     let mut payload = serde_json::json!({
         "messages": request.messages,
-        "max_new_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "temperature": request.temperature.unwrap_or(DEFAULT_TEMPERATURE),
     });
     let object = payload
         .as_object_mut()
         .ok_or("generation payload must be a JSON object")?;
+    // Omission is forwarded as omission. Substituting a default here would
+    // override whatever budget the *binding* advertises — an upstream binding
+    // configured for long agentic completions would silently truncate at this
+    // guest's number instead. The host applies its own default per backend.
+    if let Some(max_tokens) = request.max_tokens {
+        object.insert("max_new_tokens".to_owned(), serde_json::json!(max_tokens));
+    }
     if let Some(top_p) = request.top_p {
         object.insert("top_p".to_owned(), serde_json::json!(top_p));
     }
@@ -1167,7 +1192,10 @@ mod tests {
                 .expect("valid json");
         assert_eq!(payload["messages"][0]["role"], "system");
         assert_eq!(payload["messages"][1]["content"], "hello");
-        assert_eq!(payload["max_new_tokens"], DEFAULT_MAX_TOKENS);
+        // Omitted, not defaulted: substituting a number here would override the
+        // budget the binding advertises — an upstream binding configured for
+        // long completions would silently truncate at this guest's default.
+        assert!(payload.get("max_new_tokens").is_none());
         // Optional params are omitted when unset, so the host applies its own.
         assert!(payload.get("top_p").is_none());
         assert!(payload.get("seed").is_none());

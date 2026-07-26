@@ -64,11 +64,14 @@ whose context window had plenty of room.
 
 `prompt_limits_for(max_position_embeddings)` computes both:
 
-- **Tokens**: the context window minus `HOST_MAX_NEW_TOKENS` of reserved
-  headroom, floored at `MIN_PROMPT_TOKENS` (itself never allowed to exceed the
-  real window). The reservation matters: without it a prompt could pass
-  validation and still leave the decode loop with zero positions left, which
-  returns empty output rather than an error.
+- **Tokens**: the context window minus reserved generation headroom, floored at
+  `MIN_PROMPT_TOKENS` (itself never allowed to exceed the real window). The
+  reservation matters: without it a prompt could pass validation and still leave
+  the decode loop with zero positions left, which returns empty output rather
+  than an error. It is *proportional* — a quarter of the window, capped at
+  `HOST_MAX_NEW_TOKENS` — because that constant is the largest generation the
+  host will allow, not what every request needs; subtracting it outright would
+  leave a 4k-context checkpoint with almost no prompt budget.
 - **Bytes**: `tokens × PROMPT_BYTES_PER_TOKEN`, clamped between `MIN_PROMPT_BYTES`
   (16 KiB — the flat cap this replaced, kept as a floor so the change can only
   ever *widen* what a checkpoint accepts) and `MAX_PROMPT_BYTES_CEILING` (4 MiB,
@@ -81,7 +84,7 @@ deliberately generous — a tokenizer with long tokens fits far more text into a
 token than the per-token estimate assumes, and under-budgeting rejects valid
 prompts.
 
-A 32k-context checkpoint therefore accepts ~32.5k prompt tokens and ~130 KB,
+A 32k-context checkpoint therefore accepts ~28.7k prompt tokens and ~115 KB,
 against 4096 tokens and 16 KiB before.
 
 ## Incremental Detokenization
@@ -96,6 +99,14 @@ A naive fix does not work. A BPE/SentencePiece decode is not the concatenation
 of its tokens' decodes: a multi-byte character can span several tokens (the
 prefix decodes to a replacement character that a later token retroactively
 replaces), and decoding a sub-sequence can gain or lose a leading space.
+
+Windowing is only enabled for tokenizers whose decoder has a *bounded context*.
+The window's suffix check proves the shortened decode matches now; it does not
+prove a future token cannot rewrite text before the anchor, which a decoder
+applying a regex replacement can do. The decoder is inspected through its
+serialized form (its Rust fields are private) and anything unrecognized is
+treated as unbounded — a wrong "safe" answer corrupts output, a wrong "unsafe"
+one only costs speed. Unbounded decoders keep whole-sequence decoding.
 
 `IncrementalDecoder` keeps a bounded trailing *window* of tokens
 (`DETOKENIZE_WINDOW_TOKENS`), re-decodes only that window, and appends the
@@ -286,13 +297,34 @@ two limits protect different resources: the native cap bounds this host's decode
 loop, where every extra token is a forward pass and more KV cache in local VRAM,
 while an upstream generation costs this node one open HTTP connection and spends
 the *remote* server's resources, which enforces its own context window and
-queueing. Applying the 256-token native cap here would truncate an agentic
-completion mid-function for no local benefit.
+queueing.
+
+`guest-openai` forwards an omitted `max_tokens` as an omission rather than
+substituting its own default, so the budget a binding advertises is the one that
+actually applies on the public `/ai/v1` route.
 
 So upstream bindings default to 2048 tokens, are capped at
 `UPSTREAM_MAX_NEW_TOKENS` (8192), and can be tuned per alias with
 `?max_new_tokens=`. The per-binding override is itself bounded, so a typo cannot
 make a request effectively unlimited.
+
+The native cap is `HOST_MAX_NEW_TOKENS` = **4096**, raised from 256 (which
+truncated an agentic response mid-function) and `DEFAULT_MAX_NEW_TOKENS` = 1024,
+raised from 64. 4096 is where the costs that actually scale stay reasonable on
+the targeted hardware: KV cache grows linearly and is bounded by the context
+window anyway, while the contiguous cache path's quadratic memory-traffic term
+is still small next to inherent decode cost at that length.
+
+### URL constraints
+
+The base URL is validated structurally at load, not on first request. Rejected:
+a missing or inferred host, embedded credentials (`https://user:pass@host/v1` —
+reqwest would turn userinfo into a Basic auth header, bypassing the
+environment-only credential contract, and `base_url` is echoed in telemetry and
+errors), and `#fragments` (never sent on the wire, so the route suffix would be
+silently lost). Query values are percent-decoded through the URL API, so a
+`?model=Qwen%2FQwen3` written by any standard URL builder reaches the upstream
+as `Qwen/Qwen3`.
 
 A batch is dispatched concurrently, one scoped thread per request, and results
 are returned per input. Both matter here and not for local runtimes: these are

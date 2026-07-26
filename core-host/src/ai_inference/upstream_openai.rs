@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::candle_llm_runtime::ChatTurn;
+use super::candle_llm_runtime::MAX_PROMPT_BYTES_CEILING;
 
 /// Binding `path` prefix that selects this backend.
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
@@ -150,6 +150,24 @@ impl UpstreamEndpoint {
             ))
         };
         let parsed = reqwest::Url::parse(url).map_err(|error| malformed(&error.to_string()))?;
+        // Userinfo would be turned into a Basic `Authorization` header by
+        // reqwest, silently bypassing the environment-only credential contract
+        // — and `base_url` is echoed in telemetry and transport errors, so the
+        // secret would leak there too.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(invalid(
+                "upstream URL must not embed credentials; set the bearer token in `TACHYON_UPSTREAM_API_KEY_<ALIAS>` or `TACHYON_UPSTREAM_API_KEY`".to_owned(),
+            ));
+        }
+        // A fragment is never sent on the wire, and `base_url` is concatenated
+        // with the route suffix — `http://h/v1#x` + `/chat/completions` reaches
+        // the upstream as bare `/v1`, so the binding would load and then always
+        // hit the wrong path.
+        if parsed.fragment().is_some() {
+            return Err(invalid(format!(
+                "upstream URL `{url}` must not contain a `#` fragment: it is never sent on the wire, so request paths would silently lose their suffix"
+            )));
+        }
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(malformed(&format!("scheme `{}`", parsed.scheme())));
         }
@@ -172,13 +190,27 @@ impl UpstreamEndpoint {
         let mut model = None;
         let mut timeout = DEFAULT_TIMEOUT;
         let mut max_new_tokens = UPSTREAM_DEFAULT_MAX_NEW_TOKENS;
-        for pair in query.into_iter().flat_map(|query| query.split('&')) {
-            if pair.is_empty() {
+        // Percent-decode through the URL API rather than splitting the raw
+        // string: a model name written by any standard URL builder arrives
+        // encoded (`Qwen%2FQwen3`), and forwarding those bytes literally asks
+        // the upstream for a model it has never heard of.
+        let decoded_query = query
+            .map(|query| {
+                reqwest::Url::parse(&format!("http://q/?{query}"))
+                    .map(|url| {
+                        url.query_pairs()
+                            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|error| invalid(format!("invalid query string `{query}`: {error}")))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        for (key, value) in decoded_query {
+            if key.is_empty() {
                 continue;
             }
-            let (key, value) = pair
-                .split_once('=')
-                .ok_or_else(|| invalid(format!("query parameter `{pair}` is missing a value")))?;
+            let (key, value) = (key.as_str(), value.as_str());
             match key {
                 "model" => {
                     if value.is_empty() {
@@ -267,7 +299,13 @@ struct HostGenerationRequest {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
-    messages: Option<Vec<ChatTurn>>,
+    /// Forwarded verbatim rather than narrowed to the native runtime's
+    /// `ChatTurn`. An agentic conversation replays assistant turns that carry
+    /// `tool_calls` and no content, plus `tool` turns carrying
+    /// `tool_call_id` — narrowing drops exactly the history the upstream needs
+    /// to continue the conversation, so the turn after any tool call loses its
+    /// context.
+    messages: Option<Vec<Value>>,
     #[serde(default)]
     max_new_tokens: Option<usize>,
     /// `f64`, unlike the native runtime's `f32`. Narrowing is right there — the
@@ -345,6 +383,20 @@ impl UpstreamOpenAiRuntime {
 
     /// Translate one host request into an OpenAI chat-completions body.
     fn chat_body(&self, data: &[u8], stream: bool) -> Result<Value, UpstreamError> {
+        // Bounded-input contract, enforced before UTF-8 or JSON parsing so an
+        // oversized request cannot force a large allocation on every co-batched
+        // thread. The native runtime derives its byte cap from the checkpoint's
+        // context window; an upstream's window is not ours to know, so this
+        // uses the same absolute ceiling that bounds the derivation.
+        if data.len() > MAX_PROMPT_BYTES_CEILING {
+            return Err(UpstreamError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "prompt bytes {} exceed limit {MAX_PROMPT_BYTES_CEILING}",
+                    data.len()
+                ),
+            });
+        }
         let raw = std::str::from_utf8(data).map_err(|error| UpstreamError::InvalidRequest {
             alias: self.alias.clone(),
             detail: format!("prompt tensor must be valid UTF-8: {error}"),
@@ -370,10 +422,7 @@ impl UpstreamOpenAiRuntime {
             // `messages` wins over `prompt`, matching the native runtime, and
             // is forwarded verbatim so the upstream applies its own chat
             // template — the model lives over there, so its template does too.
-            (Some(messages), _) if !messages.is_empty() => messages
-                .into_iter()
-                .map(|turn| json!({"role": turn.role, "content": turn.content}))
-                .collect::<Vec<_>>(),
+            (Some(messages), _) if !messages.is_empty() => messages,
             (_, Some(prompt)) => vec![json!({"role": "user", "content": prompt})],
             _ => {
                 return Err(UpstreamError::InvalidRequest {
@@ -552,6 +601,14 @@ impl UpstreamOpenAiRuntime {
             });
         };
         let body = self.chat_body(prompt, true)?;
+        // When the request offered tools, content is accumulated rather than
+        // streamed. The downstream `json` parser is anchored to a whole-output
+        // JSON value, so streaming prose and *then* a tool-call envelope would
+        // produce `prose{"content":…}` — unparseable, and the structured call
+        // would be handed back as literal assistant text. Buffering costs
+        // time-to-first-token only on requests that can produce a call.
+        let buffer_content = body.get("tools").is_some();
+        let mut buffered_content = String::new();
         let response = self.post("/chat/completions", &body)?;
 
         // Bound the whole stream, so an upstream that never terminates cannot
@@ -598,6 +655,24 @@ impl UpstreamOpenAiRuntime {
             let Ok(frame) = serde_json::from_str::<Value>(payload) else {
                 continue;
             };
+            // An upstream that committed HTTP 200 and then failed reports it
+            // in-band. Without this the frame carries no delta, gets skipped,
+            // and `[DONE]` makes the whole request look successful — so the
+            // caller receives an empty generation and telemetry agrees.
+            if let Some(error) = frame.get("error").filter(|error| !error.is_null()) {
+                let detail = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| error.to_string());
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "upstream reported an error mid-stream: {}",
+                        detail.chars().take(512).collect::<String>()
+                    ),
+                });
+            }
             let Some(delta) = frame
                 .get("choices")
                 .and_then(Value::as_array)
@@ -611,7 +686,11 @@ impl UpstreamOpenAiRuntime {
                 .and_then(Value::as_str)
                 .filter(|content| !content.is_empty())
             {
-                on_token(content);
+                if buffer_content {
+                    buffered_content.push_str(content);
+                } else {
+                    on_token(content);
+                }
             }
             // A streamed tool call arrives as `delta.tool_calls` fragments with
             // no content at all. Dropping them would make the whole request
@@ -624,8 +703,17 @@ impl UpstreamOpenAiRuntime {
             }
         }
 
-        if let Some(tool_calls) = streamed_tool_calls.finish() {
-            on_token(&json!({"content": "", "tool_calls": tool_calls}).to_string());
+        // One envelope carrying both, so the downstream anchored parser sees a
+        // whole-output JSON value. When no call materialised, the buffered
+        // prose is emitted as ordinary text.
+        match streamed_tool_calls.finish() {
+            Some(tool_calls) => {
+                on_token(
+                    &json!({"content": buffered_content, "tool_calls": tool_calls}).to_string(),
+                );
+            }
+            None if !buffered_content.is_empty() => on_token(&buffered_content),
+            None => {}
         }
 
         // A clean EOF without `[DONE]` is a truncated generation, not a
@@ -656,6 +744,15 @@ impl UpstreamOpenAiRuntime {
                 alias: self.alias.clone(),
                 detail: "response has no `data[0].embedding` array".to_owned(),
             })?;
+        // A zero-dimensional embedding is not a usable answer: the route would
+        // return HTTP 200 and every vector-index consumer would reject it later
+        // as a dimension mismatch, far from the cause.
+        if embedding.is_empty() {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "`data[0].embedding` is empty".to_owned(),
+            });
+        }
         embedding
             .iter()
             .map(|value| {
@@ -1379,6 +1476,153 @@ mod tests {
             .generate_streaming(&[b"hi"], &mut |token| tokens.push(token.to_owned()))
             .expect("streaming should complete");
         assert_eq!(tokens, vec!["ok"]);
+    }
+
+    #[test]
+    fn upstream_rejects_credentials_and_fragments_in_the_url() {
+        // Userinfo becomes a Basic auth header inside reqwest, bypassing the
+        // environment-only credential contract, and `base_url` is echoed in
+        // telemetry and errors.
+        let error = UpstreamEndpoint::parse("m", "openai:https://user:secret@gpu.lan/v1")
+            .expect_err("embedded credentials must be rejected");
+        assert!(error.to_string().contains("TACHYON_UPSTREAM_API_KEY"));
+        assert!(
+            !error.to_string().contains("secret"),
+            "the rejection must not echo the secret: {error}"
+        );
+
+        // A fragment is never sent, so `#x` + `/chat/completions` would reach
+        // the upstream as bare `/v1`.
+        assert!(UpstreamEndpoint::parse("m", "openai:http://h:1/v1#proxy").is_err());
+    }
+
+    #[test]
+    fn upstream_percent_decodes_the_model_query_value() {
+        let endpoint = UpstreamEndpoint::parse("m", "openai:http://h:1/v1?model=Qwen%2FQwen3")
+            .expect("binding should parse")
+            .expect("binding should be claimed");
+        // Any standard URL builder encodes the slash; forwarding the raw bytes
+        // would ask the upstream for a model it has never heard of.
+        assert_eq!(endpoint.model, "Qwen/Qwen3");
+    }
+
+    #[test]
+    fn an_oversized_prompt_is_rejected_before_parsing() {
+        let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
+        let oversized = vec![b'x'; MAX_PROMPT_BYTES_CEILING + 1];
+        let error = backend
+            .chat_body(&oversized, false)
+            .expect_err("an oversized prompt must be rejected");
+        assert!(matches!(error, UpstreamError::InvalidRequest { .. }));
+        assert!(error.to_string().contains("prompt bytes"));
+    }
+
+    #[test]
+    fn multi_turn_tool_history_is_forwarded_unchanged() {
+        let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
+        // The exact replay a client sends on the turn after a tool call: an
+        // assistant turn with no content, then a `tool` turn.
+        let body = backend
+            .chat_body(
+                br#"{"messages":[
+                    {"role":"user","content":"read a.rs"},
+                    {"role":"assistant","tool_calls":[{"id":"call_1","type":"function",
+                        "function":{"name":"read_file","arguments":"{}"}}]},
+                    {"role":"tool","tool_call_id":"call_1","content":"fn main() {}"}
+                ]}"#,
+                false,
+            )
+            .expect("a multi-turn tool conversation must map");
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        // Narrowing to the native `ChatTurn` would have dropped exactly this.
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn an_empty_embedding_is_rejected() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"data":[{"embedding":[]}]}"#,
+        );
+        let backend = runtime("embed", &upstream.binding());
+        let error = backend
+            .embed("hello")
+            .expect_err("a zero-dimensional embedding is not usable");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
+    #[test]
+    fn a_mid_stream_error_event_fails_the_request() {
+        // HTTP 200 committed, then the upstream reports failure in-band and
+        // still sends [DONE]. Skipping the frame would report success.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"error\":{\"message\":\"context length exceeded\"}}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let error = backend
+            .generate_streaming(&[b"hi"], &mut |_| {})
+            .expect_err("an in-band error must not be reported as success");
+        assert!(error.to_string().contains("context length exceeded"));
+    }
+
+    #[test]
+    fn tool_enabled_streams_emit_one_parseable_envelope() {
+        // Content then tool calls: streaming the prose first and appending the
+        // envelope would yield `prose{...}`, which the anchored downstream
+        // parser cannot read, losing the call.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":"Let me look. "}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut tokens = Vec::new();
+        backend
+            .generate_streaming(
+                &[br#"{"prompt":"read","tools":[{"type":"function","function":{"name":"read_file"}}]}"#],
+                &mut |token| tokens.push(token.to_owned()),
+            )
+            .expect("streaming should complete");
+        assert_eq!(tokens.len(), 1, "expected one envelope, got {tokens:?}");
+        let envelope: Value = serde_json::from_str(&tokens[0]).expect("envelope should parse");
+        assert_eq!(envelope["content"], "Let me look. ");
+        assert_eq!(envelope["tool_calls"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn streams_without_tools_keep_streaming_content() {
+        // No tools offered: nothing can become a tool call, so time-to-first-
+        // token is preserved.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let mut tokens = Vec::new();
+        backend
+            .generate_streaming(&[b"hi"], &mut |token| tokens.push(token.to_owned()))
+            .expect("streaming should complete");
+        assert_eq!(tokens, vec!["a", "b"]);
     }
 
     #[test]

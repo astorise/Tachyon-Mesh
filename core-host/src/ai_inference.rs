@@ -110,11 +110,24 @@ pub(crate) enum AcceleratorKind {
     Gpu,
     Npu,
     Tpu,
+    /// Not a local accelerator: the queue for work executed by another process
+    /// entirely (an `openai:` upstream binding).
+    ///
+    /// It has its own scheduler because its cost profile is nothing like a
+    /// local lane's. An upstream request holds its dispatcher slot for a
+    /// network round trip — up to the binding's timeout — while consuming no
+    /// local compute. Sharing the CPU lane would let one slow remote server
+    /// stall every CPU-resident model on the node.
+    Network,
 }
 
 impl AcceleratorKind {
-    const ALL: [Self; 4] = [Self::Cpu, Self::Gpu, Self::Npu, Self::Tpu];
+    const ALL: [Self; 5] = [Self::Cpu, Self::Gpu, Self::Npu, Self::Tpu, Self::Network];
 
+    /// `Network` is deliberately unreachable here: it is chosen by the backend
+    /// that claimed a binding, never declared by an operator. `device` on an
+    /// upstream binding describes the *remote* server, which this node does not
+    /// schedule.
     pub(crate) fn from_model_device(device: &crate::ModelDevice) -> Self {
         match device {
             crate::ModelDevice::Cpu => Self::Cpu,
@@ -130,6 +143,7 @@ impl AcceleratorKind {
             Self::Gpu => "gpu",
             Self::Npu => "npu",
             Self::Tpu => "tpu",
+            Self::Network => "network",
         }
     }
 }
@@ -254,6 +268,15 @@ impl SharedInputTensor {
 
 trait BackendModel: Send + Sync {
     fn residency(&self) -> AcceleratorMemoryResidency;
+    /// Scheduler lane this backend must run on, overriding the lane implied by
+    /// the binding's `device`. `None` keeps the declared device's lane.
+    ///
+    /// Only the upstream backend overrides it: its `device` describes a remote
+    /// server, so honouring it would park network waits on a local accelerator
+    /// queue and stall unrelated local inference.
+    fn scheduling_lane(&self) -> Option<AcceleratorKind> {
+        None
+    }
     fn as_any(&self) -> &dyn Any;
     /// Executes one or more independent requests and returns exactly one
     /// output per input, in the same order — never a single shared output
@@ -1593,8 +1616,10 @@ impl CandleBackendModel {
                     // Local residency accounting only tracks memory this node
                     // actually holds. An upstream binding holds none, whatever
                     // `device` the operator wrote — that field describes the
-                    // remote server, which this node does not schedule.
-                    accelerator: AcceleratorKind::Cpu,
+                    // remote server, which this node does not schedule. The
+                    // matching `scheduling_lane` override keeps its queue off
+                    // the local accelerator lanes too.
+                    accelerator: AcceleratorKind::Network,
                     qos: binding.qos,
                     model_size_bytes: 0,
                 },
@@ -1755,11 +1780,17 @@ fn env_u64(name: &str) -> Option<u64> {
 impl BackendModel for CandleBackendModel {
     fn residency(&self) -> AcceleratorMemoryResidency {
         match self.source.accelerator {
-            AcceleratorKind::Cpu => AcceleratorMemoryResidency::HostRam,
+            // No local weights for an upstream binding, so nothing is resident
+            // anywhere; `HostRam` is the registry's zero-cost answer.
+            AcceleratorKind::Cpu | AcceleratorKind::Network => AcceleratorMemoryResidency::HostRam,
             AcceleratorKind::Gpu => AcceleratorMemoryResidency::Vram,
             AcceleratorKind::Npu => AcceleratorMemoryResidency::Sram,
             AcceleratorKind::Tpu => AcceleratorMemoryResidency::Sram,
         }
+    }
+
+    fn scheduling_lane(&self) -> Option<AcceleratorKind> {
+        matches!(self.kind, CandleBackendModelKind::Upstream(_)).then_some(AcceleratorKind::Network)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2345,9 +2376,15 @@ impl CandleModel {
             ));
         }
         let memory_residency = backend_model.residency();
+        // The backend gets the final say on its lane: an upstream binding runs
+        // on the network queue whatever `device` the manifest declared, because
+        // that field describes the remote server rather than this node.
+        let accelerator = backend_model
+            .scheduling_lane()
+            .unwrap_or_else(|| AcceleratorKind::from_model_device(&binding.device));
         Ok(Self {
             alias: binding.alias.clone(),
-            accelerator: AcceleratorKind::from_model_device(&binding.device),
+            accelerator,
             qos: binding.qos,
             memory_residency,
             backend_model,
