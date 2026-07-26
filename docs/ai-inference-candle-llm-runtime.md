@@ -54,6 +54,36 @@ JSON request:
 Default generation is deterministic. Requests are bounded by prompt byte count,
 prompt token count, batch size, and the host max-new-token cap.
 
+## Prompt Limits
+
+The prompt token and byte budgets are derived from the checkpoint's context
+window rather than being flat constants. They used to be 4096 tokens and 16 KiB
+— chosen when the runtime only served short prompts — so an agentic client
+sending a source file plus its tool definitions was rejected outright on a model
+whose context window had plenty of room.
+
+`prompt_limits_for(max_position_embeddings)` computes both:
+
+- **Tokens**: the context window minus `HOST_MAX_NEW_TOKENS` of reserved
+  headroom, floored at `MIN_PROMPT_TOKENS` (itself never allowed to exceed the
+  real window). The reservation matters: without it a prompt could pass
+  validation and still leave the decode loop with zero positions left, which
+  returns empty output rather than an error.
+- **Bytes**: `tokens × PROMPT_BYTES_PER_TOKEN`, clamped between `MIN_PROMPT_BYTES`
+  (16 KiB — the flat cap this replaced, kept as a floor so the change can only
+  ever *widen* what a checkpoint accepts) and `MAX_PROMPT_BYTES_CEILING` (4 MiB,
+  so a million-token context cannot justify a byte budget that is its own
+  denial-of-service).
+
+The byte cap is a pre-tokenization guard on what one request can pull into host
+memory; the token cap is the semantic limit. That is why the byte side is
+deliberately generous — a tokenizer with long tokens fits far more text into a
+token than the per-token estimate assumes, and under-budgeting rejects valid
+prompts.
+
+A 32k-context checkpoint therefore accepts ~32.5k prompt tokens and ~130 KB,
+against 4096 tokens and 16 KiB before.
+
 ## Incremental Detokenization
 
 Every decode step needs the text generated so far — to test stop sequences, and
@@ -212,8 +242,34 @@ Streamed tool calls arrive as `delta.tool_calls` fragments with no content at
 all — name first, `arguments` in pieces after it. They are reassembled by
 fragment `index` and emitted as one envelope at the end of the stream, because
 dropping them would make the request look like a model that answered with
-silence. Note that `guest-openai` only *parses* tool calls on the buffered path,
-so end-to-end streamed tool calling still surfaces the envelope as content.
+silence.
+
+### Streaming tool calls end to end
+
+`guest-openai` recovers tool calls on the streaming path too, not just the
+buffered one, so an agentic client receives real `delta.tool_calls` and
+`finish_reason: "tool_calls"` instead of envelope text in its transcript.
+
+Buffering the whole generation before parsing would be the simple way to do
+that, but it destroys time-to-first-token for every request that merely *offers*
+tools — which, for an agentic client, is every request. So `StreamingContentGate`
+forwards content as it arrives and stops the moment a tool-call opener appears;
+from there everything is held for the buffered parser, because the tool-call
+region is not content and must not leak into the transcript. Bytes near the tail
+are held back so an opener split across two fragments is still matched — the
+same trick the host decode loop uses for stop sequences.
+
+Openers are per-parser. The `json` parser is *anchored*: `parse_json_tool_calls`
+requires the whole output to be one JSON value, so a `{` anywhere but the start
+cannot begin a call and must not stop prose from streaming. The tagged parsers
+(`<tool_call>`, `[TOOL_CALLS]`) scan anywhere, because those models routinely
+emit prose and then a call.
+
+One deliberate asymmetry: the gate streams raw text, while the buffered parser
+trims its content. A streamed chunk cannot be un-sent, so the handler reconciles
+afterwards by prefix rather than by byte offset — if what was streamed is not a
+prefix of the parsed content, no tail is emitted at all, because duplicating
+text in the transcript is worse than omitting a trailing fragment.
 
 The host's JSON generation request maps onto the chat-completions body:
 `messages` is forwarded verbatim (the upstream applies its own chat template,

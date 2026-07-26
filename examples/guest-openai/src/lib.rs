@@ -222,6 +222,65 @@ struct ChunkDelta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<StreamToolCall>>,
+}
+
+impl ChunkDelta {
+    fn role(role: &'static str) -> Self {
+        Self {
+            role: Some(role),
+            content: None,
+            tool_calls: None,
+        }
+    }
+
+    fn content(content: String) -> Self {
+        Self {
+            role: None,
+            content: Some(content),
+            tool_calls: None,
+        }
+    }
+
+    fn tool_calls(tool_calls: Vec<StreamToolCall>) -> Self {
+        Self {
+            role: None,
+            content: None,
+            tool_calls: Some(tool_calls),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            role: None,
+            content: None,
+            tool_calls: None,
+        }
+    }
+}
+
+/// A tool call inside a streaming delta. Same shape as the buffered [`ToolCall`]
+/// plus the `index` that identifies which call a delta belongs to — required by
+/// the OpenAI streaming format even when, as here, each call is emitted whole.
+#[derive(Debug, Serialize)]
+struct StreamToolCall {
+    index: u32,
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: ToolCallFunction,
+}
+
+impl StreamToolCall {
+    fn from_tool_call(index: u32, call: ToolCall) -> Self {
+        Self {
+            index,
+            id: call.id,
+            kind: call.kind,
+            function: call.function,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,14 +560,18 @@ fn handle_chat_completions_streaming(
         model: request.model.clone(),
         choices: vec![ChunkChoice {
             index: 0,
-            delta: ChunkDelta {
-                role: Some("assistant"),
-                content: None,
-            },
+            delta: ChunkDelta::role("assistant"),
             finish_reason: None,
         }],
     };
     write_sse_chunk(&writer, &first_chunk)?;
+
+    // Tool intent turns this into a gated stream: content flows until an opener
+    // appears, then the rest is held back for the buffered parser. Without a
+    // parser the stream is a plain content passthrough, exactly as before.
+    let mut gate = request
+        .resolved_tool_call_parser()
+        .map(StreamingContentGate::new);
 
     let generation = build_generation_request(&request)?;
     let token_stream = bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation)
@@ -522,6 +585,13 @@ fn handle_chat_completions_streaming(
     loop {
         match token_stream.next() {
             Ok(Some(fragment)) => {
+                let content = match gate.as_mut() {
+                    Some(gate) => gate.push(&fragment),
+                    None => Some(fragment),
+                };
+                let Some(content) = content else {
+                    continue;
+                };
                 let chunk = ChatCompletionChunk {
                     id: "chatcmpl-tachyon",
                     object: "chat.completion.chunk",
@@ -529,10 +599,7 @@ fn handle_chat_completions_streaming(
                     model: request.model.clone(),
                     choices: vec![ChunkChoice {
                         index: 0,
-                        delta: ChunkDelta {
-                            role: None,
-                            content: Some(fragment),
-                        },
+                        delta: ChunkDelta::content(content),
                         finish_reason: None,
                     }],
                 };
@@ -543,7 +610,66 @@ fn handle_chat_completions_streaming(
         }
     }
 
-    // Final chunk signals stop.
+    // Whatever the gate held back is parsed exactly like a buffered response,
+    // so streamed and buffered requests recover the same tool calls.
+    let mut finish_reason = "stop";
+    if let Some(gate) = gate {
+        let (whole, streamed) = gate.finish();
+        let parsed = parse_assistant_output(&request, &whole);
+
+        // Content the gate held back that turned out not to be part of a tool
+        // call — text the model emitted *after* the call, typically.
+        //
+        // `parsed.content` is the whole text minus the tool-call regions and
+        // trimmed at both ends, while what was streamed is a raw prefix, so the
+        // two are compared trimmed. Matching by prefix rather than by byte
+        // offset is what keeps this safe: if the streamed text is not a prefix
+        // of the parsed content, nothing more is emitted, because duplicating
+        // text in the client's transcript is worse than omitting a tail.
+        let already_streamed = whole.get(..streamed).unwrap_or_default().trim();
+        if let Some(tail) = parsed
+            .content
+            .strip_prefix(already_streamed)
+            .filter(|tail| !tail.is_empty())
+        {
+            let chunk = ChatCompletionChunk {
+                id: "chatcmpl-tachyon",
+                object: "chat.completion.chunk",
+                created: 0,
+                model: request.model.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta::content(tail.to_owned()),
+                    finish_reason: None,
+                }],
+            };
+            write_sse_chunk(&writer, &chunk)?;
+        }
+
+        if !parsed.tool_calls.is_empty() {
+            finish_reason = "tool_calls";
+            let tool_calls = parsed
+                .tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(index, call)| StreamToolCall::from_tool_call(index as u32, call))
+                .collect();
+            let chunk = ChatCompletionChunk {
+                id: "chatcmpl-tachyon",
+                object: "chat.completion.chunk",
+                created: 0,
+                model: request.model.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta::tool_calls(tool_calls),
+                    finish_reason: None,
+                }],
+            };
+            write_sse_chunk(&writer, &chunk)?;
+        }
+    }
+
+    // Final chunk signals why generation ended.
     let stop_chunk = ChatCompletionChunk {
         id: "chatcmpl-tachyon",
         object: "chat.completion.chunk",
@@ -551,11 +677,8 @@ fn handle_chat_completions_streaming(
         model: request.model,
         choices: vec![ChunkChoice {
             index: 0,
-            delta: ChunkDelta {
-                role: None,
-                content: None,
-            },
-            finish_reason: Some("stop"),
+            delta: ChunkDelta::empty(),
+            finish_reason: Some(finish_reason),
         }],
     };
     write_sse_chunk(&writer, &stop_chunk)?;
@@ -578,6 +701,122 @@ fn write_sse_chunk<T: serde::Serialize>(
     writer
         .write(frame.as_bytes())
         .map_err(|e| format!("failed to write SSE frame: {e}"))
+}
+
+/// Openers that mark the start of a tool call for a given parser, and whether
+/// they can only appear at the very beginning of the output.
+///
+/// `Json` is anchored: `parse_json_tool_calls` requires the *whole* output to be
+/// one JSON value, so a `{` anywhere but the start cannot begin a tool call —
+/// parsing would fail and the text stays content. The tagged parsers scan
+/// anywhere, because those models routinely emit prose and then a call.
+fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) {
+    match parser {
+        ToolCallParser::Json => (&["{", "```"], true),
+        ToolCallParser::Qwen | ToolCallParser::QwenCoder => {
+            (&["<tool_call>", "<tool_calls>"], false)
+        }
+        ToolCallParser::Mistral => (&["[TOOL_CALLS]"], false),
+    }
+}
+
+/// Decides, as fragments arrive, how much of a streamed response can safely be
+/// forwarded as assistant content.
+///
+/// Buffering the whole generation before parsing would be simplest, but it
+/// destroys time-to-first-token for every request that merely *offers* tools —
+/// which, for an agentic client, is every request. So content is streamed until
+/// an opener appears; from there everything is held for the buffered parser,
+/// because the tool-call region is not content and must not leak into the
+/// client's transcript.
+///
+/// Bytes are held back near the tail so an opener split across two fragments is
+/// still matched, the same trick the host's decode loop uses for stop
+/// sequences.
+struct StreamingContentGate {
+    openers: &'static [&'static str],
+    anchored: bool,
+    hold: usize,
+    seen: String,
+    emitted: usize,
+    tripped: bool,
+}
+
+impl StreamingContentGate {
+    fn new(parser: ToolCallParser) -> Self {
+        let (openers, anchored) = tool_call_openers(parser);
+        let hold = openers
+            .iter()
+            .map(|opener| opener.len())
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        Self {
+            openers,
+            anchored,
+            hold,
+            seen: String::new(),
+            emitted: 0,
+            tripped: false,
+        }
+    }
+
+    /// Absorb a fragment, returning the content safe to stream right now.
+    fn push(&mut self, fragment: &str) -> Option<String> {
+        self.seen.push_str(fragment);
+        if self.tripped {
+            return None;
+        }
+        if let Some(at) = self.find_opener() {
+            self.tripped = true;
+            // Everything before the opener is genuine content.
+            let content = self.seen[self.emitted..at].to_owned();
+            self.emitted = at;
+            return (!content.is_empty()).then_some(content);
+        }
+        let safe = floor_char_boundary(&self.seen, self.seen.len().saturating_sub(self.hold));
+        if safe <= self.emitted {
+            return None;
+        }
+        let content = self.seen[self.emitted..safe].to_owned();
+        self.emitted = safe;
+        Some(content)
+    }
+
+    fn find_opener(&self) -> Option<usize> {
+        if self.anchored {
+            // Anchored openers only count at the start, ignoring leading
+            // whitespace the model may have emitted first.
+            let trimmed = self.seen.trim_start();
+            let offset = self.seen.len() - trimmed.len();
+            return self
+                .openers
+                .iter()
+                .any(|opener| trimmed.starts_with(opener))
+                .then_some(offset);
+        }
+        self.openers
+            .iter()
+            .filter_map(|opener| self.seen.find(opener))
+            .min()
+    }
+
+    /// The whole generation, for the buffered parser to work on.
+    fn finish(self) -> (String, usize) {
+        (self.seen, self.emitted)
+    }
+}
+
+/// Largest index `idx` that is a char boundary of `text`. Mirrors the host's own
+/// helper; `str::floor_char_boundary` is still unstable.
+fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> ParsedAssistantOutput {
@@ -1012,6 +1251,96 @@ mod tests {
         assert_eq!(parsed.content, "Let me check.");
         assert_eq!(parsed.tool_calls[0].function.name, "search");
         assert_eq!(parsed.tool_calls[0].id, "call_tachyon_0");
+    }
+
+    /// Drive a gate with fragments, returning what it streamed as content and
+    /// what it held back for the buffered parser.
+    fn run_gate(parser: ToolCallParser, fragments: &[&str]) -> (String, String, usize) {
+        let mut gate = StreamingContentGate::new(parser);
+        let mut streamed = String::new();
+        for fragment in fragments {
+            if let Some(content) = gate.push(fragment) {
+                streamed.push_str(&content);
+            }
+        }
+        let (whole, emitted) = gate.finish();
+        (streamed, whole, emitted)
+    }
+
+    #[test]
+    fn streaming_gate_forwards_prose_and_withholds_a_tagged_tool_call() {
+        // The prose before the call must reach the client as it is generated —
+        // buffering everything would cost time-to-first-token on every request
+        // that merely offers tools.
+        let (streamed, whole, emitted) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                "Let me check.",
+                "\n<tool_",
+                "call>{\"name\":\"search\",\"arguments\":{}}</tool_call>",
+            ],
+        );
+        // Everything up to the opener, verbatim — including the newline the
+        // buffered parser would have trimmed. A streamed chunk cannot be
+        // un-sent, so the gate forwards raw text and the handler reconciles
+        // against the trimmed parse afterwards.
+        assert_eq!(streamed, "Let me check.\n");
+        assert_eq!(emitted, streamed.len());
+        // The tag itself never leaks into the content stream.
+        assert!(!streamed.contains("<tool_call>"));
+        assert!(whole.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn streaming_gate_matches_an_opener_split_across_fragments() {
+        // `<tool_` / `call>` arriving separately must still be caught, or the
+        // opening tag leaks into the transcript.
+        let (streamed, _, _) = run_gate(
+            ToolCallParser::Qwen,
+            &["hi ", "<tool_", "call>{\"name\":\"f\"}</tool_call>"],
+        );
+        assert_eq!(streamed, "hi ");
+    }
+
+    #[test]
+    fn streaming_gate_streams_everything_when_no_tool_call_appears() {
+        let (streamed, whole, _) = run_gate(ToolCallParser::Qwen, &["all ", "plain ", "prose"]);
+        // The tail is held back until the stream ends; the handler flushes it
+        // from the parsed content afterwards.
+        assert!(whole.starts_with(&streamed));
+        assert_eq!(whole, "all plain prose");
+    }
+
+    #[test]
+    fn streaming_gate_withholds_an_anchored_json_call_entirely() {
+        // A `json` response is a tool call only when the *whole* output is one
+        // JSON value, so nothing may be streamed as content.
+        let (streamed, whole, emitted) = run_gate(
+            ToolCallParser::Json,
+            &["{\"tool_calls\":[{\"name\":", "\"search\"}]}"],
+        );
+        assert!(streamed.is_empty());
+        assert_eq!(emitted, 0);
+        assert!(whole.starts_with('{'));
+    }
+
+    #[test]
+    fn streaming_gate_does_not_anchor_on_a_brace_inside_prose() {
+        // A `{` mid-sentence cannot start a JSON tool call — the whole output
+        // would have to parse — so it must not stop content from streaming.
+        let (_, whole, _) = run_gate(ToolCallParser::Json, &["use ", "Vec<T> { .. } ", "here"]);
+        let mut gate = StreamingContentGate::new(ToolCallParser::Json);
+        gate.push(&whole);
+        assert!(!gate.tripped, "a brace inside prose must not trip the gate");
+    }
+
+    #[test]
+    fn streaming_gate_withholds_the_mistral_marker() {
+        let (streamed, _, _) = run_gate(
+            ToolCallParser::Mistral,
+            &["Checking\n", "[TOOL_CALLS] [{\"name\":\"fetch\"}]"],
+        );
+        assert_eq!(streamed, "Checking\n");
     }
 
     #[test]

@@ -290,6 +290,96 @@ The AI inference runtime SHALL execute supported local Candle text-generation mo
 - **THEN** the runtime validates the request against configured prompt and generation limits
 - **AND** returns UTF-8 generated text bytes through the existing inference response path
 
+### Requirement: Prompt limits MUST derive from the checkpoint's context window
+
+The runtime SHALL compute a binding's prompt token and byte budgets from the
+checkpoint's declared context window rather than from flat constants, so a
+long-context model is not held to a short-context model's ceiling.
+
+The token budget SHALL reserve generation headroom, so a prompt that passes
+validation can never leave the decode loop with no positions left. The byte
+budget is a pre-tokenization memory guard, not the semantic limit, and SHALL
+therefore be bounded below by the flat cap it replaces and above by an absolute
+ceiling.
+
+#### Scenario: A long-context checkpoint accepts a long prompt
+
+- **WHEN** a checkpoint declares a context window well above the previous flat
+  cap
+- **THEN** its prompt token and byte budgets scale with that window
+
+#### Scenario: Generation headroom is always reserved
+
+- **WHEN** prompt limits are derived for any context window large enough to
+  afford it
+- **THEN** the prompt budget plus the host's maximum generation fits inside the
+  window
+
+#### Scenario: A small context window is never exceeded, nor tightened
+
+- **WHEN** a checkpoint's context window is too small to afford the reservation
+  or the token floor
+- **THEN** the prompt token budget does not exceed the window
+- **AND** the byte budget is never lower than the flat cap this derivation
+  replaced
+
+#### Scenario: The byte budget is capped for very long contexts
+
+- **WHEN** a checkpoint declares a context window of millions of tokens
+- **THEN** the byte budget is clamped to an absolute ceiling
+
+### Requirement: Configured model bindings MUST be discoverable
+
+Model bindings declared in the manifest SHALL be published to the model registry
+so they appear in `GET /ai/v1/models`. Until now the registry was written only
+by the upload flow, so an `openai:` upstream — which has no upload — could never
+appear in a client's model list.
+
+Publishing SHALL NOT overwrite an existing registry row, and SHALL be
+idempotent across restarts.
+
+#### Scenario: A configured binding appears in the model list
+
+- **WHEN** the host boots with a manifest declaring a non-dynamic model binding
+- **THEN** a registry row is published for it with an engine label matching its
+  binding kind
+- **AND** the row uses the casing `guest-openai`'s reader expects
+
+#### Scenario: An uploaded entry wins over a configured one
+
+- **WHEN** a registry row already exists for an alias
+- **THEN** publishing configured bindings leaves it untouched
+
+#### Scenario: Dynamic bindings are left to the upload flow
+
+- **WHEN** a binding is marked `dynamic`
+- **THEN** no configured-binding row is published for it
+
+### Requirement: Tool calls MUST be recovered on the streaming path
+
+`guest-openai` SHALL recover tool calls when streaming, emitting
+`delta.tool_calls` and `finish_reason: "tool_calls"`, not only for buffered
+completions. It SHALL NOT buy that by buffering every generation: content SHALL
+stream until a tool-call opener appears.
+
+#### Scenario: Prose streams and the tool-call region does not
+
+- **WHEN** a streamed generation emits text and then a tool call
+- **THEN** the text is forwarded as content deltas as it arrives
+- **AND** the tool-call region is withheld and returned as `delta.tool_calls`
+- **AND** the choice's `finish_reason` is `tool_calls`
+
+#### Scenario: An opener split across fragments is still matched
+
+- **WHEN** a tool-call opener spans two streamed fragments
+- **THEN** it is detected and no part of it is forwarded as content
+
+#### Scenario: An anchored parser does not trip on prose
+
+- **WHEN** the active parser only recognises a tool call spanning the whole
+  output, and the generation merely contains that opener character mid-text
+- **THEN** content keeps streaming
+
 ### Requirement: Decode loops MUST detokenize incrementally
 
 Every decode step needs the text generated so far, for stop-sequence matching

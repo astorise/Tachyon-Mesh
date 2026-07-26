@@ -117,9 +117,31 @@ const DEFAULT_SAMPLING_SEED: u64 = 299_792_458;
 /// the length of each, so a caller cannot force unbounded substring scans.
 const MAX_STOP_SEQUENCES: usize = 8;
 const MAX_STOP_SEQUENCE_BYTES: usize = 256;
-/// Hard upper bound on the raw prompt size (bytes) accepted before tokenization.
-pub(crate) const DEFAULT_MAX_PROMPT_BYTES: usize = 16_384;
+/// Context window assumed when a checkpoint's config does not declare one.
 const DEFAULT_MAX_PROMPT_TOKENS: usize = 4_096;
+/// Absolute ceiling on the raw prompt size (bytes) accepted before
+/// tokenization, regardless of how long the checkpoint's context window is.
+///
+/// The byte cap exists to bound what a single request can pull into host memory
+/// *before* the tokenizer can tell how many tokens it really is; the token cap
+/// below is the semantic limit. A 256k-context model would otherwise justify a
+/// byte budget large enough to be its own denial-of-service.
+const MAX_PROMPT_BYTES_CEILING: usize = 4 * 1024 * 1024;
+/// Floor on the byte budget: the flat cap this derivation replaced. Keeping it
+/// as a minimum means the change can only ever *widen* what a checkpoint
+/// accepts. Without it, a short-context model would end up with a byte budget
+/// tighter than before — the token estimate below is a lower bound on bytes per
+/// token, and a tokenizer with long tokens fits far more text into a token than
+/// it assumes.
+const MIN_PROMPT_BYTES: usize = 16 * 1024;
+/// Bytes budgeted per prompt token when deriving the byte cap. Deliberately
+/// generous: under-budgeting rejects valid prompts, while over-budgeting only
+/// defers the rejection to the token check a moment later.
+const PROMPT_BYTES_PER_TOKEN: usize = 4;
+/// Floor on the prompt token budget, so a small or mis-declared context window
+/// cannot make the runtime reject ordinary prompts. Never allowed to exceed the
+/// checkpoint's actual context window.
+const MIN_PROMPT_TOKENS: usize = 512;
 const DEFAULT_MAX_BATCH_SIZE: usize = 32;
 const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 8_192;
 const PREFIX_CACHE_BLOCK_TOKENS: usize = 16;
@@ -1304,12 +1326,38 @@ struct GenerationLimits {
     prefill_chunk_tokens: Option<usize>,
 }
 
+/// Derive `(max_prompt_tokens, max_prompt_bytes)` from a checkpoint's context
+/// window.
+///
+/// These used to be flat constants — 4096 tokens and 16 KiB — chosen when the
+/// runtime only served short prompts. 16 KiB is roughly four thousand tokens of
+/// code, so an agentic client sending a file plus its tool definitions was
+/// rejected outright on a model whose context window had room to spare.
+///
+/// The token budget reserves `HOST_MAX_NEW_TOKENS` of headroom, so a prompt
+/// that passes validation can never leave the decode loop with zero positions
+/// left — which would return empty output rather than an error. Reserving is
+/// skipped when the window is too small to afford it (tiny test checkpoints),
+/// and the floor never exceeds the real window.
+pub(crate) fn prompt_limits_for(max_position_embeddings: usize) -> (usize, usize) {
+    let floor = MIN_PROMPT_TOKENS.min(max_position_embeddings);
+    let max_prompt_tokens = max_position_embeddings
+        .saturating_sub(HOST_MAX_NEW_TOKENS)
+        .max(floor)
+        .max(1);
+    let max_prompt_bytes = max_prompt_tokens
+        .saturating_mul(PROMPT_BYTES_PER_TOKEN)
+        .clamp(MIN_PROMPT_BYTES, MAX_PROMPT_BYTES_CEILING);
+    (max_prompt_tokens, max_prompt_bytes)
+}
+
 impl GenerationLimits {
     fn with_context(max_position_embeddings: usize) -> Self {
+        let (max_prompt_tokens, max_prompt_bytes) = prompt_limits_for(max_position_embeddings);
         Self {
             default_max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
-            max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
-            max_prompt_tokens: DEFAULT_MAX_PROMPT_TOKENS,
+            max_prompt_bytes,
+            max_prompt_tokens,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_position_embeddings,
             prefill_chunk_tokens: Some(DEFAULT_PREFILL_CHUNK_TOKENS),
@@ -6398,6 +6446,69 @@ mod tests {
     fn decode_byte_tokens(ids: &[u32]) -> Result<String, CandleLlmError> {
         let bytes = ids.iter().map(|id| *id as u8).collect::<Vec<_>>();
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[test]
+    fn prompt_limits_scale_with_a_real_context_window() {
+        // A 32k-context model: the budget is the window minus generation
+        // headroom, not the old flat 4096 tokens / 16 KiB.
+        let (tokens, bytes) = prompt_limits_for(32_768);
+        assert_eq!(tokens, 32_768 - HOST_MAX_NEW_TOKENS);
+        assert_eq!(bytes, tokens * PROMPT_BYTES_PER_TOKEN);
+        assert!(
+            bytes > 16_384,
+            "an agentic prompt must no longer be capped at the old 16 KiB"
+        );
+    }
+
+    #[test]
+    fn prompt_limits_reserve_room_for_generation() {
+        // A prompt that passes validation must never consume the whole window:
+        // the decode loop would then have zero positions left and return empty
+        // output instead of an error.
+        for window in [4_096usize, 32_768, 262_144] {
+            let (tokens, _) = prompt_limits_for(window);
+            assert!(
+                tokens + HOST_MAX_NEW_TOKENS <= window,
+                "window {window} left no generation headroom (prompt budget {tokens})"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_limits_never_exceed_a_tiny_context_window() {
+        // Fixture-sized checkpoints cannot afford the reservation or the floor;
+        // exceeding the window here would make the decode loop return empty.
+        let (tokens, bytes) = prompt_limits_for(FIXTURE_MAX_POSITION_EMBEDDINGS);
+        assert_eq!(tokens, FIXTURE_MAX_POSITION_EMBEDDINGS);
+        // The byte floor still applies: a token estimate is a lower bound, and
+        // a tokenizer with long tokens fits far more text into one token.
+        assert_eq!(bytes, MIN_PROMPT_BYTES);
+
+        let (tokens, _) = prompt_limits_for(1);
+        assert_eq!(tokens, 1);
+    }
+
+    #[test]
+    fn the_byte_budget_never_tightens_below_the_flat_cap_it_replaced() {
+        // Deriving the budget must only ever widen what a checkpoint accepts;
+        // a short-context model must not start rejecting prompts it used to
+        // take.
+        for window in [1usize, 32, 512, 4_096] {
+            let (_, bytes) = prompt_limits_for(window);
+            assert!(
+                bytes >= MIN_PROMPT_BYTES,
+                "window {window} tightened the byte budget to {bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_byte_budget_is_capped_for_very_long_contexts() {
+        // A multi-million-token context would otherwise justify a byte budget
+        // large enough to be its own denial-of-service.
+        let (_, bytes) = prompt_limits_for(2_000_000);
+        assert_eq!(bytes, MAX_PROMPT_BYTES_CEILING);
     }
 
     #[test]

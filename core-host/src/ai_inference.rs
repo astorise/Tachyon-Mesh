@@ -26,6 +26,8 @@ mod samplers;
 pub(crate) mod tensor_parallel_llama;
 #[path = "ai_inference/upstream_openai.rs"]
 mod upstream_openai;
+
+pub(crate) use upstream_openai::UPSTREAM_SCHEME;
 #[path = "ai_inference/vendor_accelerator.rs"]
 mod vendor_accelerator;
 #[path = "ai_inference/vram_manager.rs"]
@@ -3819,14 +3821,18 @@ mod tests {
             .expect_err("generation cap should reject oversized request");
         assert!(too_many_tokens.contains(&format!("max_new_tokens {over_cap}")));
 
-        let over_bytes = candle_llm_runtime::DEFAULT_MAX_PROMPT_BYTES + 1;
+        // The byte cap is derived from the checkpoint's context window, so the
+        // fixture's tiny window is what bounds this — not a flat constant.
+        let (_, max_prompt_bytes) = candle_llm_runtime::prompt_limits_for(
+            candle_llm_runtime::FIXTURE_MAX_POSITION_EMBEDDINGS,
+        );
+        let over_bytes = max_prompt_bytes + 1;
         let long_prompt = "x".repeat(over_bytes);
         let prompt_error = runtime
             .compute_component_prompt("tiny", &long_prompt)
             .expect_err("prompt byte limit should reject oversized prompt");
         assert!(prompt_error.contains(&format!(
-            "prompt bytes {over_bytes} exceed limit {}",
-            candle_llm_runtime::DEFAULT_MAX_PROMPT_BYTES
+            "prompt bytes {over_bytes} exceed limit {max_prompt_bytes}"
         )));
         let _ = fs::remove_dir_all(model_dir);
     }
