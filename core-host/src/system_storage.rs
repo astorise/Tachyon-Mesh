@@ -345,7 +345,19 @@ struct RegistryModelInfo<'a> {
     vram_required_mb: u64,
     status: &'a str,
     model_path: &'a str,
+    /// Who wrote this row. Absent on upload-published rows (they predate the
+    /// field), `"config"` on manifest-derived ones. Reconciliation needs the
+    /// distinction: a configured row must be refreshed or dropped when the
+    /// manifest changes, while an uploaded row — which carries a real on-disk
+    /// path and VRAM figure — must survive untouched. `guest-openai` ignores
+    /// unknown fields, so adding it does not disturb the reader.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a str>,
 }
+
+/// Marks a registry row as derived from the manifest rather than an upload.
+#[cfg(feature = "ai-inference")]
+const REGISTRY_SOURCE_CONFIG: &str = "config";
 
 /// Engine label recorded for a configured binding.
 ///
@@ -354,6 +366,10 @@ struct RegistryModelInfo<'a> {
 /// model id — not just metadata.
 #[cfg(feature = "ai-inference")]
 fn binding_engine_label(path: &str) -> &'static str {
+    // Classify the same trimmed value `UpstreamEndpoint::parse` accepts, or a
+    // path with leading whitespace loads as a working upstream while the
+    // registry advertises it as `safetensors/<alias>`.
+    let path = path.trim();
     if path.starts_with(crate::ai_inference::UPSTREAM_SCHEME) {
         "openai"
     } else if path == "mock" || path.starts_with("mock:") {
@@ -401,22 +417,13 @@ pub(crate) fn publish_configured_model_bindings(
     core_store: &crate::store::CoreStore,
     config: &crate::IntegrityConfig,
 ) {
+    let mut configured = std::collections::HashSet::new();
     for route in &config.routes {
         for binding in &route.models {
             if binding.dynamic || binding.path.trim().is_empty() {
                 continue;
             }
-            match core_store.kv_partition_get(AI_MODELS_REGISTRY_TABLE, &binding.alias) {
-                Ok(Some(_)) => continue,
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        alias = %binding.alias,
-                        "could not read the model registry while publishing a configured binding: {error:#}"
-                    );
-                    continue;
-                }
-            }
+            configured.insert(binding.alias.as_str());
             let info = RegistryModelInfo {
                 alias: &binding.alias,
                 engine: binding_engine_label(&binding.path),
@@ -426,26 +433,103 @@ pub(crate) fn publish_configured_model_bindings(
                 vram_required_mb: 0,
                 status: "available",
                 model_path: &binding.path,
+                source: Some(REGISTRY_SOURCE_CONFIG),
             };
             let Ok(value) = serde_json::to_vec(&info) else {
                 continue;
             };
+
+            // Insert-if-absent in one transaction. A read followed by a write
+            // cannot express "the existing row wins": an upload committing
+            // between the two would be overwritten by this zero-VRAM row.
+            match core_store.kv_partition_insert_if_absent(
+                AI_MODELS_REGISTRY_TABLE,
+                &binding.alias,
+                &value,
+            ) {
+                Ok(true) => {
+                    tracing::info!(
+                        alias = %binding.alias,
+                        engine = %info.engine,
+                        "published configured model binding to `{AI_MODELS_REGISTRY_TABLE}`"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        alias = %binding.alias,
+                        "failed to publish configured model binding to the registry: {error:#}"
+                    );
+                    continue;
+                }
+            }
+
+            // A row already exists. Refresh it only if this publisher owns it:
+            // a hot reload that changes an alias from `openai:` to a GGUF
+            // checkpoint must stop advertising `openai/<alias>`, while an
+            // upload-published row keeps its real path and VRAM figure.
+            if !row_is_config_owned(core_store, &binding.alias) {
+                continue;
+            }
             if let Err(error) =
                 core_store.kv_partition_set(AI_MODELS_REGISTRY_TABLE, &binding.alias, &value)
             {
                 tracing::warn!(
                     alias = %binding.alias,
-                    "failed to publish configured model binding to the registry: {error:#}"
-                );
-            } else {
-                tracing::info!(
-                    alias = %binding.alias,
-                    engine = %info.engine,
-                    "published configured model binding to `{AI_MODELS_REGISTRY_TABLE}`"
+                    "failed to refresh configured model binding in the registry: {error:#}"
                 );
             }
         }
     }
+
+    // Drop configured rows whose binding is gone, or a removed alias would stay
+    // listed in `GET /ai/v1/models` forever. Upload-owned rows are never swept:
+    // their model is still on disk and reachable.
+    for alias in config_owned_aliases(core_store) {
+        if configured.contains(alias.as_str()) {
+            continue;
+        }
+        if let Err(error) = core_store.kv_partition_delete(AI_MODELS_REGISTRY_TABLE, &alias) {
+            tracing::warn!(
+                %alias,
+                "failed to drop a stale configured model binding from the registry: {error:#}"
+            );
+        } else {
+            tracing::info!(%alias, "dropped a configured model binding that left the manifest");
+        }
+    }
+}
+
+/// Whether the registry row for `alias` was written by this publisher.
+#[cfg(feature = "ai-inference")]
+fn row_is_config_owned(core_store: &crate::store::CoreStore, alias: &str) -> bool {
+    core_store
+        .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|row| {
+            row.get("source")
+                .and_then(serde_json::Value::as_str)
+                .map(|source| source == REGISTRY_SOURCE_CONFIG)
+        })
+        .unwrap_or(false)
+}
+
+/// Every alias in the registry whose row this publisher owns.
+#[cfg(feature = "ai-inference")]
+fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
+    core_store
+        .kv_partition_get_range(AI_MODELS_REGISTRY_TABLE, "", "\u{10ffff}", 10_000, 0)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(alias, raw)| {
+            let row = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
+            (row.get("source").and_then(serde_json::Value::as_str) == Some(REGISTRY_SOURCE_CONFIG))
+                .then_some(alias)
+        })
+        .collect()
 }
 
 impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
@@ -465,6 +549,7 @@ impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
             vram_required_mb: 0,
             status: "available",
             model_path: &event.model_path,
+            source: None,
         };
         let value = serde_json::to_vec(&info)
             .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
@@ -766,6 +851,112 @@ mod configured_binding_registry_tests {
     }
 
     #[test]
+    fn a_configured_row_is_refreshed_when_its_binding_kind_changes() {
+        let (store, dir) = temp_store();
+        publish_configured_model_bindings(
+            &store,
+            &config_with(vec![binding(
+                "coder",
+                "openai:http://127.0.0.1:8080/v1",
+                false,
+            )]),
+        );
+        // Hot reload swaps the same alias to a local checkpoint: leaving the
+        // old row would keep advertising `openai/coder`.
+        publish_configured_model_bindings(
+            &store,
+            &config_with(vec![binding("coder", "/models/coder", false)]),
+        );
+
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "coder")
+            .expect("read")
+            .expect("row");
+        let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(entry["engine"], "safetensors");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_configured_row_is_dropped_when_its_binding_leaves_the_manifest() {
+        let (store, dir) = temp_store();
+        publish_configured_model_bindings(
+            &store,
+            &config_with(vec![
+                binding("keep", "openai:http://127.0.0.1:8080/v1", false),
+                binding("drop", "openai:http://127.0.0.1:8081/v1", false),
+            ]),
+        );
+        publish_configured_model_bindings(
+            &store,
+            &config_with(vec![binding(
+                "keep",
+                "openai:http://127.0.0.1:8080/v1",
+                false,
+            )]),
+        );
+
+        assert!(store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "keep")
+            .expect("read")
+            .is_some());
+        assert!(
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "drop")
+                .expect("read")
+                .is_none(),
+            "a removed binding must stop being advertised"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_uploaded_row_is_never_refreshed_or_swept() {
+        let (store, dir) = temp_store();
+        let uploaded = serde_json::json!({
+            "alias": "shared", "engine": "gguf", "vramRequiredMb": 4096,
+            "status": "available", "modelPath": "/data/models/shared",
+        });
+        store
+            .kv_partition_set(
+                AI_MODELS_REGISTRY_TABLE,
+                "shared",
+                &serde_json::to_vec(&uploaded).expect("serialize"),
+            )
+            .expect("seed");
+
+        // Present in the manifest, then absent: neither pass may touch it.
+        publish_configured_model_bindings(
+            &store,
+            &config_with(vec![binding(
+                "shared",
+                "openai:http://127.0.0.1:8080/v1",
+                false,
+            )]),
+        );
+        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "shared")
+            .expect("read")
+            .expect("an uploaded row must survive");
+        let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(entry["engine"], "gguf");
+        assert_eq!(entry["vramRequiredMb"], 4096);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn engine_label_classifies_the_trimmed_path() {
+        // `UpstreamEndpoint::parse` trims before matching the scheme, so a
+        // padded path loads as an upstream; the label must agree.
+        assert_eq!(
+            binding_engine_label("  openai:http://127.0.0.1:8080/v1 "),
+            "openai"
+        );
+    }
+
+    #[test]
     fn publishing_is_idempotent_across_restarts() {
         let (store, dir) = temp_store();
         let config = config_with(vec![binding(
@@ -842,6 +1033,7 @@ mod registry_casing_tests {
             vram_required_mb: 0,
             status: "available",
             model_path: "/data/tachyon_data/models/tinyllama",
+            source: None,
         };
         let bytes = serde_json::to_vec(&info).expect("serialize registry entry");
 

@@ -1193,6 +1193,48 @@ impl CoreStore {
             .context("kv_partition_set: failed to commit")
     }
 
+    /// Insert `value` only if `key` is absent, in a single write transaction.
+    /// Returns whether the insert happened.
+    ///
+    /// A separate `kv_partition_get` then `kv_partition_set` cannot express
+    /// "the existing row wins": another writer can commit between the two, and
+    /// the set then overwrites the row the check was meant to protect.
+    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    pub(crate) fn kv_partition_insert_if_absent(
+        &self,
+        table_name: &str,
+        key: &str,
+        value: &[u8],
+    ) -> Result<bool> {
+        let table_key = kv_partition_table_key(table_name);
+        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("kv_partition_insert_if_absent: failed to begin write transaction")?;
+        let inserted = {
+            let mut table = write_txn
+                .open_table(table_def)
+                .context("kv_partition_insert_if_absent: failed to open table")?;
+            if table
+                .get(key)
+                .context("kv_partition_insert_if_absent: get failed")?
+                .is_some()
+            {
+                false
+            } else {
+                table
+                    .insert(key, value)
+                    .context("kv_partition_insert_if_absent: insert failed")?;
+                true
+            }
+        };
+        write_txn
+            .commit()
+            .context("kv_partition_insert_if_absent: failed to commit")?;
+        Ok(inserted)
+    }
+
     pub(crate) fn kv_partition_delete(&self, table_name: &str, key: &str) -> Result<()> {
         let table_key = kv_partition_table_key(table_name);
         let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);

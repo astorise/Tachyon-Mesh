@@ -625,6 +625,15 @@ impl AiInferenceRuntime {
         let model = models
             .get(alias)
             .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
+        // An upstream model executes on no local device, so any component
+        // handle may open it: `Network` is a scheduling lane, not a hardware
+        // requirement. Without this, the public OpenAI routes — which always
+        // open aliases through the CPU accelerator — could never reach an
+        // upstream alias at all, failing on device mismatch before a single
+        // HTTP request went out.
+        if model.accelerator == AcceleratorKind::Network {
+            return Ok(());
+        }
         let resolved = if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
             accelerator_backend::resolve_with_fallback(
                 accelerator,

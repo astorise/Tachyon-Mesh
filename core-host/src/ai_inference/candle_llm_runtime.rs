@@ -33,7 +33,6 @@ use candle_transformers::models::{
     quantized_llama::ModelWeights as QuantizedLlama, quantized_phi3::ModelWeights as QuantizedPhi3,
     quantized_qwen2::ModelWeights as QuantizedQwen2,
     quantized_qwen3::ModelWeights as QuantizedQwen3,
-    quantized_qwen3_moe::GGUFQWenMoE as QuantizedQwen3Moe,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -121,7 +120,6 @@ enum GgufFamily {
     Llama,
     Qwen2,
     Qwen3,
-    Qwen3Moe,
     Gemma3,
     Phi3,
 }
@@ -135,7 +133,13 @@ impl GgufFamily {
             GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
             "qwen2" => Some(Self::Qwen2),
             "qwen3" => Some(Self::Qwen3),
-            "qwen3moe" | "qwen3_moe" => Some(Self::Qwen3Moe),
+            // `qwen3moe` is deliberately absent: the fork's fused expert path
+            // (`candle_nn::moe_gemm_gguf`) is CUDA-only and its prefill kernel
+            // accepts only F16/BF16, so a binding would load and then fail at
+            // the first expert layer. Wiring it needs a CUDA-only gate, a BF16
+            // working dtype, and expert-tensor dtype validation — none of which
+            // can be verified without a GPU. Adding the arm back is a one-line
+            // table entry once it can be proven.
             "gemma3" => Some(Self::Gemma3),
             "phi3" => Some(Self::Phi3),
             _ => None,
@@ -149,7 +153,6 @@ impl GgufFamily {
             Self::Llama => "llama",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
-            Self::Qwen3Moe => "qwen3moe",
             Self::Gemma3 => "gemma3",
             Self::Phi3 => "phi3",
         }
@@ -164,7 +167,6 @@ enum QuantizedModel {
     Llama(QuantizedLlama),
     Qwen2(QuantizedQwen2),
     Qwen3(QuantizedQwen3),
-    Qwen3Moe(QuantizedQwen3Moe),
     Gemma3(QuantizedGemma3),
     Phi3(QuantizedPhi3),
 }
@@ -175,7 +177,6 @@ impl QuantizedModel {
             Self::Llama(model) => model.forward(input, index_pos),
             Self::Qwen2(model) => model.forward(input, index_pos),
             Self::Qwen3(model) => model.forward(input, index_pos),
-            Self::Qwen3Moe(model) => model.forward(input, index_pos),
             Self::Gemma3(model) => model.forward(input, index_pos),
             Self::Phi3(model) => model.forward(input, index_pos),
         }
@@ -352,7 +353,6 @@ impl ModelArchitecture {
             GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
             "qwen2" => Some(Self::Qwen2),
             "qwen3" => Some(Self::Qwen3),
-            "qwen3moe" | "qwen3_moe" => Some(Self::Qwen35Moe),
             "gemma2" => Some(Self::Gemma2),
             "gemma3" => Some(Self::Gemma3),
             "phi3" => Some(Self::Phi3),
@@ -385,7 +385,7 @@ impl ModelArchitecture {
             },
             Self::Qwen35Moe => ArchitectureCapabilities {
                 safetensors: true,
-                gguf: true,
+                gguf: false,
                 single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
@@ -1616,6 +1616,8 @@ pub(crate) struct CandleLlmRuntime {
     /// Whether this checkpoint's decoder permits windowed detokenization.
     /// Resolved once at load: see [`decoder_has_bounded_context`].
     windowed_detokenization: bool,
+    /// Reach of the decoder's longest literal replacement, in bytes.
+    min_retained_detokenize_bytes: usize,
     inner: Arc<LoadedModel>,
     limits: GenerationLimits,
     /// The model's own chat template, loaded once from `tokenizer_config.json`.
@@ -2043,6 +2045,7 @@ impl CandleLlmRuntime {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
             windowed_detokenization: decoder_has_bounded_context(&tokenizer),
+            min_retained_detokenize_bytes: decoder_max_literal_replace_len(&tokenizer),
             tokenizer,
             inner: Arc::new(inner),
             limits,
@@ -2452,6 +2455,7 @@ impl CandleLlmRuntime {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
             windowed_detokenization: decoder_has_bounded_context(&tokenizer),
+            min_retained_detokenize_bytes: decoder_max_literal_replace_len(&tokenizer),
             tokenizer,
             inner: Arc::new(inner),
             limits,
@@ -2550,12 +2554,6 @@ impl CandleLlmRuntime {
             ),
             GgufFamily::Qwen3 => QuantizedModel::Qwen3(
                 QuantizedQwen3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            // The only family taking a working dtype: its expert routing runs
-            // dense. F32 matches every other CPU path in this runtime.
-            GgufFamily::Qwen3Moe => QuantizedModel::Qwen3Moe(
-                QuantizedQwen3Moe::from_gguf(content, &mut reader, &device, DType::F32)
-                    .map_err(invalid)?,
             ),
             GgufFamily::Gemma3 => QuantizedModel::Gemma3(
                 QuantizedGemma3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
@@ -3225,7 +3223,10 @@ impl CandleLlmRuntime {
             .saturating_sub(1);
         let mut emitted = 0usize;
         let mut decode = |ids: &[u32]| self.decode_generated(ids);
-        let mut decoder = IncrementalDecoder::new(self.windowed_detokenization);
+        let mut decoder = IncrementalDecoder::new(
+            self.windowed_detokenization,
+            self.min_retained_detokenize_bytes,
+        );
 
         while generated.len() < request.max_new_tokens
             && context_ids.len() < self.limits.max_position_embeddings
@@ -3584,7 +3585,8 @@ impl CandleLlmRuntime {
         if prompt_ids.len() > self.limits.max_position_embeddings {
             return Ok(());
         }
-        let (logits, index_pos) = self.run_prefill_chunks(prompt_ids, device, &mut forward)?;
+        let (logits, index_pos) =
+            self.run_prefill_chunks(prompt_ids, device, request.deadline, &mut forward)?;
         self.decode_loop_from_logits(
             logits,
             index_pos,
@@ -3599,15 +3601,33 @@ impl CandleLlmRuntime {
         )
     }
 
+    /// `deadline` bounds prefill as well as decode. Prefilling a long prompt on
+    /// a slow model can outlast the whole budget on its own, and it holds the
+    /// same scheduler lane while it does — checking only in the decode loop
+    /// would let a request blow through its stated wall-clock budget before
+    /// producing a single token.
     fn run_prefill_chunks(
         &self,
         prompt_ids: &[u32],
         device: &Device,
+        deadline: Instant,
         forward: &mut impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(Tensor, usize), CandleLlmError> {
         let mut index_pos = 0usize;
         let mut logits = None;
         while index_pos < prompt_ids.len() {
+            // Between chunks, not mid-chunk: a chunk is one forward pass and
+            // cannot be interrupted. `prefill_chunk_tokens` is what bounds how
+            // long the check can be delayed.
+            if logits.is_some() && Instant::now() >= deadline {
+                return Err(CandleLlmError::Execution {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "generation deadline elapsed after prefilling {index_pos} of {} prompt tokens",
+                        prompt_ids.len()
+                    ),
+                });
+            }
             let remaining = prompt_ids.len() - index_pos;
             let chunk_len = self.limits.next_prefill_chunk_len(remaining);
             let chunk = &prompt_ids[index_pos..index_pos + chunk_len];
@@ -3694,7 +3714,12 @@ impl CandleLlmRuntime {
         // per row.
         let mut decode = |ids: &[u32]| self.decode_generated(ids);
         let mut decoders = (0..batch)
-            .map(|_| IncrementalDecoder::new(self.windowed_detokenization))
+            .map(|_| {
+                IncrementalDecoder::new(
+                    self.windowed_detokenization,
+                    self.min_retained_detokenize_bytes,
+                )
+            })
             .collect::<Vec<_>>();
         let mut done = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
@@ -3831,7 +3856,10 @@ impl CandleLlmRuntime {
         // step is O(n²) in the generated length, which only became worth fixing
         // once generation budgets moved past a few hundred tokens.
         let mut decode = |ids: &[u32]| self.decode_generated(ids);
-        let mut decoder = IncrementalDecoder::new(self.windowed_detokenization);
+        let mut decoder = IncrementalDecoder::new(
+            self.windowed_detokenization,
+            self.min_retained_detokenize_bytes,
+        );
         for step in 0..request.max_new_tokens {
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
@@ -4311,6 +4339,33 @@ fn decoder_has_bounded_context(tokenizer: &Tokenizer) -> bool {
     serde_json::to_value(decoder).is_ok_and(|value| decoder_node_is_bounded(&value))
 }
 
+/// Longest literal `Replace` pattern anywhere in a tokenizer's decoder, in
+/// bytes. A replacement can only rewrite text within that reach, so it is the
+/// context the sliding window has to retain to stay correct.
+fn decoder_max_literal_replace_len(tokenizer: &Tokenizer) -> usize {
+    fn walk(node: &serde_json::Value) -> usize {
+        match node.get("type").and_then(serde_json::Value::as_str) {
+            Some("Sequence") => node
+                .get("decoders")
+                .and_then(serde_json::Value::as_array)
+                .map(|stages| stages.iter().map(walk).max().unwrap_or(0))
+                .unwrap_or(0),
+            Some("Replace") => node
+                .get("pattern")
+                .and_then(|pattern| pattern.get("String"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::len)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+    tokenizer
+        .get_decoder()
+        .and_then(|decoder| serde_json::to_value(decoder).ok())
+        .map(|value| walk(&value))
+        .unwrap_or(0)
+}
+
 /// The serialized-decoder walk behind [`decoder_has_bounded_context`], split
 /// out so the rule can be tested against the shapes `tokenizers` emits without
 /// building a whole tokenizer for each one.
@@ -4324,8 +4379,11 @@ fn decoder_node_is_bounded(node: &serde_json::Value) -> bool {
             .get("decoders")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|stages| stages.iter().all(decoder_node_is_bounded)),
-        // A literal pattern can only rewrite as far back as its own length;
-        // a regex is unbounded by construction.
+        // A literal pattern can only rewrite as far back as its own length; a
+        // regex is unbounded by construction. The length itself is checked at
+        // re-anchor time against the retained tail — classifying every literal
+        // as safe here would let a pattern longer than the tail complete a
+        // match that begins in the frozen prefix.
         "Replace" => node
             .get("pattern")
             .and_then(|pattern| pattern.get("String"))
@@ -4370,12 +4428,17 @@ struct IncrementalDecoder {
     /// a sequence that never admits a clean split would pay a second decode on
     /// every single step — worse than the behaviour being replaced.
     anchor_retry_at: usize,
+    /// Bytes of decoded text the retained tail must keep for a literal
+    /// replacement in the decoder to be unable to reach past it. Zero when the
+    /// decoder performs no literal replacement.
+    min_retained_bytes: usize,
 }
 
 impl IncrementalDecoder {
-    fn new(windowed: bool) -> Self {
+    fn new(windowed: bool, min_retained_bytes: usize) -> Self {
         Self {
             windowed,
+            min_retained_bytes,
             ..Self::default()
         }
     }
@@ -4412,7 +4475,10 @@ impl IncrementalDecoder {
         {
             let next_start = generated.len() - DETOKENIZE_KEEP_TOKENS;
             let tail = decode(&generated[next_start..])?;
-            if self.window_text.ends_with(&tail) {
+            // The tail must be long enough that a literal replacement starting
+            // inside the frozen prefix cannot complete within it — otherwise a
+            // later token triggers a rewrite the window can no longer see.
+            if tail.len() >= self.min_retained_bytes && self.window_text.ends_with(&tail) {
                 self.window_start = next_start;
                 self.window_text = tail;
             } else {
@@ -6366,7 +6432,6 @@ mod tests {
         for architecture in [
             ModelArchitecture::Qwen2,
             ModelArchitecture::Qwen3,
-            ModelArchitecture::Qwen35Moe,
             ModelArchitecture::Gemma3,
             ModelArchitecture::Phi3,
         ] {
@@ -6400,20 +6465,16 @@ mod tests {
             GgufFamily::from_gguf_architecture("qwen3"),
             Some(GgufFamily::Qwen3)
         );
-        // llama.cpp writes `qwen3moe`; some converters write the HF spelling.
-        assert_eq!(
-            GgufFamily::from_gguf_architecture("qwen3moe"),
-            Some(GgufFamily::Qwen3Moe)
-        );
-        assert_eq!(
-            GgufFamily::from_gguf_architecture("qwen3_moe"),
-            Some(GgufFamily::Qwen3Moe)
-        );
         assert_eq!(GgufFamily::from_gguf_architecture("mamba"), None);
+        // Deliberately unwired: the fused expert path is CUDA-only and wants a
+        // F16/BF16 working dtype, so accepting it would load a model that fails
+        // at its first expert layer.
+        assert_eq!(GgufFamily::from_gguf_architecture("qwen3moe"), None);
+        assert!(!ModelArchitecture::Qwen35Moe.supports_format(ModelFormat::Gguf));
 
         // Each family reads its own metadata namespace; hardcoding `llama.`
         // would silently fall back to the default context window.
-        assert_eq!(GgufFamily::Qwen3Moe.metadata_prefix(), "qwen3moe");
+        assert_eq!(GgufFamily::Qwen3.metadata_prefix(), "qwen3");
         assert_eq!(GgufFamily::Phi3.metadata_prefix(), "phi3");
     }
 
@@ -6844,7 +6905,7 @@ mod tests {
         tokens: &[u32],
         mut decode: impl FnMut(&[u32]) -> Result<String, CandleLlmError>,
     ) -> IncrementalDecoder {
-        let mut decoder = IncrementalDecoder::new(true);
+        let mut decoder = IncrementalDecoder::new(true, 0);
         let mut generated = Vec::new();
         let mut decode_for_push = |ids: &[u32]| decode(ids);
         for token in tokens {
@@ -7041,7 +7102,7 @@ mod tests {
     fn an_unwindowed_decoder_still_matches_the_whole_sequence_decode() {
         // The fallback must stay correct, just slower: the window never moves.
         let tokens = (0..80).map(|i| b'a' as u32 + (i % 26)).collect::<Vec<_>>();
-        let mut decoder = IncrementalDecoder::new(false);
+        let mut decoder = IncrementalDecoder::new(false, 0);
         let mut generated = Vec::new();
         let mut decode = |ids: &[u32]| decode_byte_tokens(ids);
         for token in &tokens {

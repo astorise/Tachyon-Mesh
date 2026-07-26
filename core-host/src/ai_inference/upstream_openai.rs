@@ -650,11 +650,15 @@ impl UpstreamOpenAiRuntime {
                 saw_done = true;
                 break;
             }
-            // A malformed frame mid-stream must not discard the tokens already
-            // delivered; skip it and keep reading.
-            let Ok(frame) = serde_json::from_str::<Value>(payload) else {
-                continue;
-            };
+            // A malformed data frame is not skippable: if it was carrying a
+            // content delta, skipping it truncates the answer and `[DONE]` then
+            // reports the whole request as successful.
+            let frame = serde_json::from_str::<Value>(payload).map_err(|error| {
+                UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: format!("upstream sent an SSE data frame that is not JSON: {error}"),
+                }
+            })?;
             // An upstream that committed HTTP 200 and then failed reports it
             // in-band. Without this the frame carries no delta, gets skipped,
             // and `[DONE]` makes the whole request look successful — so the
@@ -1246,10 +1250,9 @@ mod tests {
             concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"fn \"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"main\"}}]}\n\n",
-                // An empty delta (the usual role-only opening frame) must not
-                // emit a token, and a malformed frame must not abort the stream.
+                // An empty delta — the usual role-only opening frame — must not
+                // emit a token.
                 "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
-                "data: {not json}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"()\"}}]}\n\n",
                 "data: [DONE]\n\n",
             ),
@@ -1308,6 +1311,26 @@ mod tests {
             "unexpected request line: {target}"
         );
         assert_eq!(body["input"], "hello");
+    }
+
+    #[test]
+    fn a_malformed_sse_frame_fails_the_request() {
+        // Skipping the frame would truncate the answer while `[DONE]` reported
+        // the request as successful.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fn \"}}]}\n\n",
+                "data: {not json}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let error = backend
+            .generate_streaming(&[b"hi"], &mut |_| {})
+            .expect_err("a malformed data frame must not be skipped");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
     }
 
     #[test]

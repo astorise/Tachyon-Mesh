@@ -106,6 +106,16 @@ struct ChatMessage {
     content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<ToolCall>,
+    /// Set on a `role: "tool"` turn to associate the result with the call that
+    /// asked for it. Dropping it here would make the host's "messages are
+    /// forwarded verbatim" contract untrue for the one field an agentic loop
+    /// cannot do without: the upstream would receive a tool result tied to
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    /// Legacy function-call name on a tool turn; some upstreams still key on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 #[cfg(test)]
@@ -115,6 +125,8 @@ impl ChatMessage {
             role: role.into(),
             content: Some(content.into()),
             tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
         }
     }
 }
@@ -521,6 +533,9 @@ fn handle_chat_completions_buffered(
                     Some(parsed.content)
                 },
                 tool_calls: parsed.tool_calls,
+                // Response-side only: an assistant turn never carries these.
+                tool_call_id: None,
+                name: None,
             },
             finish_reason,
         }],
@@ -641,11 +656,16 @@ fn handle_chat_completions_streaming(
         let tail = if parsed.tool_calls.is_empty() {
             parsed.content.get(streamed..).unwrap_or_default()
         } else {
-            let already_streamed = whole.get(..streamed).unwrap_or_default().trim();
-            parsed
-                .content
-                .strip_prefix(already_streamed)
-                .unwrap_or_default()
+            // `parsed.content` is the text minus the tool-call regions, trimmed
+            // at both ends. Only its *leading* trim shifts the offset of what
+            // was already streamed, so the consumed length is the streamed
+            // prefix minus the whitespace the parser dropped from the front.
+            // Trimming the prefix at both ends instead would hand back its own
+            // trailing whitespace as new content — three newlines where the
+            // buffered parser produces two.
+            let already_streamed = whole.get(..streamed).unwrap_or_default();
+            let consumed = already_streamed.trim_start().len();
+            parsed.content.get(consumed..).unwrap_or_default()
         };
         if !tail.is_empty() {
             let chunk = ChatCompletionChunk {
