@@ -1,0 +1,876 @@
+//! Passthrough backend for an OpenAI-compatible upstream inference server.
+//!
+//! Tachyon's native Candle runtime only executes the checkpoint formats and
+//! architectures it has verified loaders for. This backend covers the rest of
+//! the ecosystem — llama.cpp's `llama-server`, vLLM, SGLang, or any other
+//! server speaking the OpenAI chat-completions wire format — by forwarding the
+//! host's own generation request to it and returning the generated text
+//! unchanged. The mesh keeps ownership of routing, QoS, authorisation, and the
+//! `/ai/v1` surface; only the tensor math moves out of process.
+//!
+//! A binding opts in through its `path`, exactly like the `mock:` scheme:
+//!
+//! ```text
+//! openai:http://127.0.0.1:8080/v1
+//! openai:https://gpu-node.lan:8000/v1?model=qwen3-coder-30b&timeout_ms=180000
+//! ```
+//!
+//! The upstream model name defaults to the binding alias and can be overridden
+//! with the `model` query parameter, so a mesh alias never has to match the
+//! name the upstream server happens to use.
+//!
+//! Credentials are never written in the binding. The backend reads a bearer
+//! token from `TACHYON_UPSTREAM_API_KEY_<ALIAS>` (alias upper-cased, every
+//! non-alphanumeric byte folded to `_`), falling back to
+//! `TACHYON_UPSTREAM_API_KEY`. Absent both, the request is sent unauthenticated
+//! — the common case for a llama.cpp server on a trusted mesh link.
+
+use std::{env, io::BufRead, time::Duration};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use thiserror::Error;
+
+use super::candle_llm_runtime::ChatTurn;
+
+/// Binding `path` prefix that selects this backend.
+pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
+/// Per-alias bearer token variable prefix.
+const API_KEY_ENV_PREFIX: &str = "TACHYON_UPSTREAM_API_KEY_";
+/// Fallback bearer token variable, shared by every upstream binding.
+const API_KEY_ENV_FALLBACK: &str = "TACHYON_UPSTREAM_API_KEY";
+/// Default per-request budget. Generous on purpose: an agentic coding request
+/// against a 30B model on a busy queue routinely runs into the minutes, and a
+/// timeout here surfaces as a failed request, not a retry.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Hard ceiling on a configured `timeout_ms`, so a typo cannot wedge a
+/// scheduler slot indefinitely.
+const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Cap on a single upstream response body. Matches the intent of the native
+/// runtime's `max_prompt_bytes`: a runaway upstream must not exhaust host RAM.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Error)]
+pub(crate) enum UpstreamError {
+    #[error("upstream binding `{alias}` is invalid: {detail}")]
+    InvalidBinding { alias: String, detail: String },
+    #[error("upstream request for model `{alias}` is invalid: {detail}")]
+    InvalidRequest { alias: String, detail: String },
+    #[error("upstream `{alias}` at `{endpoint}` failed: {detail}")]
+    Transport {
+        alias: String,
+        endpoint: String,
+        detail: String,
+    },
+    #[error("upstream `{alias}` at `{endpoint}` returned HTTP {status}: {body}")]
+    Status {
+        alias: String,
+        endpoint: String,
+        status: u16,
+        body: String,
+    },
+    #[error("upstream `{alias}` returned an unusable response: {detail}")]
+    MalformedResponse { alias: String, detail: String },
+}
+
+/// A parsed `openai:` binding. Split out from the runtime so binding validation
+/// is testable without constructing an HTTP client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UpstreamEndpoint {
+    /// Base URL with any trailing `/` removed, e.g. `http://127.0.0.1:8080/v1`.
+    pub(crate) base_url: String,
+    /// Model name sent upstream. Defaults to the binding alias.
+    pub(crate) model: String,
+    pub(crate) timeout: Duration,
+}
+
+impl UpstreamEndpoint {
+    /// Parse `openai:<url>[?model=…][&timeout_ms=…]`.
+    ///
+    /// Returns `Ok(None)` when the path does not use the `openai:` scheme, so
+    /// the caller can fall through to the on-disk loaders; `Err` only when the
+    /// scheme *is* claimed but the rest is unusable.
+    pub(crate) fn parse(alias: &str, path: &str) -> Result<Option<Self>, UpstreamError> {
+        let Some(remainder) = path.trim().strip_prefix(UPSTREAM_SCHEME) else {
+            return Ok(None);
+        };
+        let invalid = |detail: String| UpstreamError::InvalidBinding {
+            alias: alias.to_owned(),
+            detail,
+        };
+
+        let (url, query) = match remainder.split_once('?') {
+            Some((url, query)) => (url, Some(query)),
+            None => (remainder, None),
+        };
+        let url = url.trim_end_matches('/');
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(invalid(format!(
+                "expected `{UPSTREAM_SCHEME}http://…` or `{UPSTREAM_SCHEME}https://…`, got `{remainder}`"
+            )));
+        }
+        // Reject a bare scheme (`openai:http://`), which would otherwise build
+        // request URLs against an empty authority.
+        if url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .is_empty()
+        {
+            return Err(invalid(
+                "upstream URL is missing a host after the scheme".to_owned(),
+            ));
+        }
+
+        let mut model = None;
+        let mut timeout = DEFAULT_TIMEOUT;
+        for pair in query.into_iter().flat_map(|query| query.split('&')) {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or_else(|| invalid(format!("query parameter `{pair}` is missing a value")))?;
+            match key {
+                "model" => {
+                    if value.is_empty() {
+                        return Err(invalid("`model` must not be empty".to_owned()));
+                    }
+                    model = Some(value.to_owned());
+                }
+                "timeout_ms" => {
+                    let millis: u64 = value.parse().map_err(|_| {
+                        invalid(format!("`timeout_ms` must be an integer, got `{value}`"))
+                    })?;
+                    let requested = Duration::from_millis(millis);
+                    if requested.is_zero() || requested > MAX_TIMEOUT {
+                        return Err(invalid(format!(
+                            "`timeout_ms` must be between 1 and {}, got {millis}",
+                            MAX_TIMEOUT.as_millis()
+                        )));
+                    }
+                    timeout = requested;
+                }
+                other => {
+                    return Err(invalid(format!(
+                        "unknown query parameter `{other}`; supported: `model`, `timeout_ms`"
+                    )))
+                }
+            }
+        }
+
+        Ok(Some(Self {
+            base_url: url.to_owned(),
+            model: model.unwrap_or_else(|| alias.to_owned()),
+            timeout,
+        }))
+    }
+
+    fn url(&self, suffix: &str) -> String {
+        format!("{}{suffix}", self.base_url)
+    }
+}
+
+/// Resolve the bearer token for an alias, per-alias variable first.
+///
+/// The returned value is only ever placed in an `Authorization` header; it is
+/// never logged, and never round-trips into an error message.
+fn api_key_for(alias: &str) -> Option<String> {
+    let suffix = alias
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    env::var(format!("{API_KEY_ENV_PREFIX}{suffix}"))
+        .or_else(|_| env::var(API_KEY_ENV_FALLBACK))
+        .ok()
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
+}
+
+/// The host generation request, mirroring `candle_llm_runtime`'s private
+/// `GenerationRequest` field for field.
+///
+/// It is deliberately a separate type rather than a shared one: this backend
+/// must accept exactly the same request envelope the native runtime accepts, and
+/// keeping its own copy means a future native-only field cannot silently change
+/// what gets forwarded to a third-party server.
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct HostGenerationRequest {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    messages: Option<Vec<ChatTurn>>,
+    #[serde(default)]
+    max_new_tokens: Option<usize>,
+    /// `f64`, unlike the native runtime's `f32`. Narrowing is right there — the
+    /// sampler works in `f32` — but here the value is only ever re-serialized
+    /// into an outbound JSON body, and a round trip through `f32` turns a
+    /// client's `0.9` into `0.8999999761581421`.
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    top_p: Option<f64>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stop: Option<Vec<String>>,
+    #[serde(default)]
+    json_schema: Option<String>,
+}
+
+/// An OpenAI-compatible upstream bound to one mesh alias.
+pub(crate) struct UpstreamOpenAiRuntime {
+    alias: String,
+    endpoint: UpstreamEndpoint,
+    api_key: Option<String>,
+    client: reqwest::blocking::Client,
+}
+
+impl UpstreamOpenAiRuntime {
+    /// Claim a binding whose `path` uses the `openai:` scheme.
+    ///
+    /// `Ok(None)` means "not mine" — the caller keeps probing the on-disk
+    /// loaders. Nothing here touches the network: an unreachable upstream is a
+    /// per-request failure, not a boot failure, so a node still starts when a
+    /// peer inference server is temporarily down.
+    pub(crate) fn try_load(alias: &str, path: &str) -> Result<Option<Self>, UpstreamError> {
+        let Some(endpoint) = UpstreamEndpoint::parse(alias, path)? else {
+            return Ok(None);
+        };
+        // `reqwest::blocking` spins its own runtime on a private thread. That is
+        // safe here because inference executes on the scheduler's dedicated OS
+        // thread (`AcceleratorScheduler::new`'s `tachyon-*-dispatcher`), never
+        // inside a tokio worker.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(endpoint.timeout)
+            .build()
+            .map_err(|error| UpstreamError::InvalidBinding {
+                alias: alias.to_owned(),
+                detail: format!("could not build the upstream HTTP client: {error}"),
+            })?;
+        Ok(Some(Self {
+            alias: alias.to_owned(),
+            api_key: api_key_for(alias),
+            endpoint,
+            client,
+        }))
+    }
+
+    pub(crate) fn endpoint(&self) -> &UpstreamEndpoint {
+        &self.endpoint
+    }
+
+    /// Human-readable execution target for telemetry: the upstream is remote
+    /// compute, so it must never be recorded as local `cpu`/`gpu` execution.
+    pub(crate) fn executed_on(&self) -> String {
+        format!("upstream:{}", self.endpoint.base_url)
+    }
+
+    /// Translate one host request into an OpenAI chat-completions body.
+    fn chat_body(&self, data: &[u8], stream: bool) -> Result<Value, UpstreamError> {
+        let raw = std::str::from_utf8(data).map_err(|error| UpstreamError::InvalidRequest {
+            alias: self.alias.clone(),
+            detail: format!("prompt tensor must be valid UTF-8: {error}"),
+        })?;
+
+        // Same envelope rule as the native runtime: a JSON object is a
+        // structured request, anything else is a raw prompt string.
+        let request = if raw.trim_start().starts_with('{') {
+            serde_json::from_str::<HostGenerationRequest>(raw).map_err(|error| {
+                UpstreamError::InvalidRequest {
+                    alias: self.alias.clone(),
+                    detail: format!("invalid JSON generation request: {error}"),
+                }
+            })?
+        } else {
+            HostGenerationRequest {
+                prompt: Some(raw.to_owned()),
+                ..HostGenerationRequest::default()
+            }
+        };
+
+        let messages = match (request.messages, request.prompt) {
+            // `messages` wins over `prompt`, matching the native runtime, and
+            // is forwarded verbatim so the upstream applies its own chat
+            // template — the model lives over there, so its template does too.
+            (Some(messages), _) if !messages.is_empty() => messages
+                .into_iter()
+                .map(|turn| json!({"role": turn.role, "content": turn.content}))
+                .collect::<Vec<_>>(),
+            (_, Some(prompt)) => vec![json!({"role": "user", "content": prompt})],
+            _ => {
+                return Err(UpstreamError::InvalidRequest {
+                    alias: self.alias.clone(),
+                    detail: "generation request must carry `messages` or `prompt`".to_owned(),
+                })
+            }
+        };
+
+        let mut body = Map::new();
+        body.insert("model".to_owned(), json!(self.endpoint.model));
+        body.insert("messages".to_owned(), Value::Array(messages));
+        body.insert("stream".to_owned(), json!(stream));
+        if let Some(max_new_tokens) = request.max_new_tokens {
+            body.insert("max_tokens".to_owned(), json!(max_new_tokens));
+        }
+        if let Some(temperature) = request.temperature {
+            body.insert("temperature".to_owned(), json!(temperature));
+        }
+        if let Some(top_p) = request.top_p {
+            body.insert("top_p".to_owned(), json!(top_p));
+        }
+        if let Some(seed) = request.seed {
+            body.insert("seed".to_owned(), json!(seed));
+        }
+        if let Some(stop) = request.stop.filter(|stop| !stop.is_empty()) {
+            body.insert("stop".to_owned(), json!(stop));
+        }
+        if let Some(schema) = request.json_schema {
+            // The host's `json_schema` constrains decoding. Locally that
+            // compiles to an FSM; upstream the equivalent lever is
+            // `response_format`, which vLLM and llama.cpp both implement.
+            let schema: Value =
+                serde_json::from_str(&schema).map_err(|error| UpstreamError::InvalidRequest {
+                    alias: self.alias.clone(),
+                    detail: format!("invalid `json_schema`: {error}"),
+                })?;
+            body.insert(
+                "response_format".to_owned(),
+                json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "tachyon_response",
+                        "schema": schema,
+                        "strict": true,
+                    }
+                }),
+            );
+        }
+
+        Ok(Value::Object(body))
+    }
+
+    fn post(
+        &self,
+        suffix: &str,
+        body: &Value,
+    ) -> Result<reqwest::blocking::Response, UpstreamError> {
+        let url = self.endpoint.url(suffix);
+        let mut request = self.client.post(&url).json(body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().map_err(|error| UpstreamError::Transport {
+            alias: self.alias.clone(),
+            endpoint: url.clone(),
+            detail: error.to_string(),
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // Bound the echoed body: an upstream error page can be arbitrarily
+            // large, and this string ends up in a request error.
+            let body = response.text().unwrap_or_default();
+            let body = body.chars().take(2048).collect::<String>();
+            return Err(UpstreamError::Status {
+                alias: self.alias.clone(),
+                endpoint: url,
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(response)
+    }
+
+    /// Run one buffered generation and return the assistant text as bytes,
+    /// matching the native runtime's output contract exactly.
+    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>, UpstreamError> {
+        let [prompt] = prompts else {
+            return Err(UpstreamError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "upstream generation takes exactly one prompt, got {}",
+                    prompts.len()
+                ),
+            });
+        };
+        let body = self.chat_body(prompt, false)?;
+        let response = self.post("/chat/completions", &body)?;
+        let payload: Value = read_json(&self.alias, response)?;
+        let text = payload
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "response has no `choices[0].message.content` string".to_owned(),
+            })?;
+        Ok(text.as_bytes().to_vec())
+    }
+
+    /// Stream one generation, invoking `on_token` per SSE delta so the mesh's
+    /// own `/ai/v1` stream keeps a real time-to-first-token.
+    pub(crate) fn generate_streaming(
+        &self,
+        prompts: &[&[u8]],
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), UpstreamError> {
+        let [prompt] = prompts else {
+            return Err(UpstreamError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "upstream streaming takes exactly one prompt, got {}",
+                    prompts.len()
+                ),
+            });
+        };
+        let body = self.chat_body(prompt, true)?;
+        let response = self.post("/chat/completions", &body)?;
+
+        let mut reader = std::io::BufReader::new(response);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .map_err(|error| UpstreamError::Transport {
+                    alias: self.alias.clone(),
+                    endpoint: self.endpoint.url("/chat/completions"),
+                    detail: format!("failed to read the upstream stream: {error}"),
+                })?;
+            if read == 0 {
+                break;
+            }
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                // Blank separator lines and SSE comments carry no delta.
+                continue;
+            };
+            let payload = payload.trim();
+            if payload == "[DONE]" {
+                break;
+            }
+            // A malformed frame mid-stream must not discard the tokens already
+            // delivered; skip it and keep reading.
+            let Ok(frame) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            if let Some(delta) = frame
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("delta"))
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            {
+                on_token(delta);
+            }
+        }
+        Ok(())
+    }
+
+    /// Forward a single embedding request to the upstream `/embeddings` route.
+    pub(crate) fn embed(&self, input: &str) -> Result<Vec<f32>, UpstreamError> {
+        let body = json!({"model": self.endpoint.model, "input": input});
+        let response = self.post("/embeddings", &body)?;
+        let payload: Value = read_json(&self.alias, response)?;
+        let embedding = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|data| data.first())
+            .and_then(|entry| entry.get("embedding"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "response has no `data[0].embedding` array".to_owned(),
+            })?;
+        embedding
+            .iter()
+            .map(|value| {
+                value.as_f64().map(|value| value as f32).ok_or_else(|| {
+                    UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: "`data[0].embedding` contains a non-numeric entry".to_owned(),
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+/// Read a bounded JSON body, so a hostile or broken upstream cannot pull the
+/// host into an unbounded allocation.
+fn read_json(alias: &str, response: reqwest::blocking::Response) -> Result<Value, UpstreamError> {
+    let mut body = Vec::new();
+    std::io::copy(
+        &mut std::io::Read::take(response, MAX_RESPONSE_BYTES + 1),
+        &mut body,
+    )
+    .map_err(|error| UpstreamError::MalformedResponse {
+        alias: alias.to_owned(),
+        detail: format!("failed to read the upstream response body: {error}"),
+    })?;
+    if body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(UpstreamError::MalformedResponse {
+            alias: alias.to_owned(),
+            detail: format!("response body exceeds the {MAX_RESPONSE_BYTES}-byte limit"),
+        });
+    }
+    serde_json::from_slice(&body).map_err(|error| UpstreamError::MalformedResponse {
+        alias: alias.to_owned(),
+        detail: format!("response was not JSON: {error}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_upstream_paths_are_not_claimed() {
+        assert!(UpstreamEndpoint::parse("m", "/models/llama")
+            .expect("a filesystem path is not an error")
+            .is_none());
+        assert!(UpstreamEndpoint::parse("m", "mock:demo")
+            .expect("a mock path is not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn upstream_defaults_the_model_to_the_alias() {
+        let endpoint = UpstreamEndpoint::parse("qwen-coder", "openai:http://127.0.0.1:8080/v1")
+            .expect("binding should parse")
+            .expect("binding should be claimed");
+        assert_eq!(endpoint.base_url, "http://127.0.0.1:8080/v1");
+        assert_eq!(endpoint.model, "qwen-coder");
+        assert_eq!(endpoint.timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn upstream_reads_model_and_timeout_overrides() {
+        let endpoint = UpstreamEndpoint::parse(
+            "coder",
+            "openai:https://gpu.lan:8000/v1/?model=qwen3-coder-30b&timeout_ms=120000",
+        )
+        .expect("binding should parse")
+        .expect("binding should be claimed");
+        // The trailing slash is stripped so request URLs never double up.
+        assert_eq!(endpoint.base_url, "https://gpu.lan:8000/v1");
+        assert_eq!(endpoint.model, "qwen3-coder-30b");
+        assert_eq!(endpoint.timeout, Duration::from_millis(120_000));
+    }
+
+    #[test]
+    fn upstream_rejects_a_non_http_url() {
+        let error = UpstreamEndpoint::parse("m", "openai:127.0.0.1:8080")
+            .expect_err("a scheme-less URL must be rejected");
+        assert!(
+            error.to_string().contains("http://"),
+            "error should name the accepted schemes, got: {error}"
+        );
+    }
+
+    #[test]
+    fn upstream_rejects_a_missing_host() {
+        assert!(UpstreamEndpoint::parse("m", "openai:http://").is_err());
+    }
+
+    #[test]
+    fn upstream_rejects_unknown_and_out_of_range_query_parameters() {
+        assert!(UpstreamEndpoint::parse("m", "openai:http://h:1/v1?temperature=0.2").is_err());
+        assert!(UpstreamEndpoint::parse("m", "openai:http://h:1/v1?timeout_ms=0").is_err());
+        assert!(UpstreamEndpoint::parse("m", "openai:http://h:1/v1?timeout_ms=nope").is_err());
+        assert!(UpstreamEndpoint::parse(
+            "m",
+            &format!(
+                "openai:http://h:1/v1?timeout_ms={}",
+                MAX_TIMEOUT.as_millis() + 1
+            )
+        )
+        .is_err());
+    }
+
+    fn runtime(alias: &str, path: &str) -> UpstreamOpenAiRuntime {
+        UpstreamOpenAiRuntime::try_load(alias, path)
+            .expect("binding should load")
+            .expect("binding should be claimed")
+    }
+
+    #[test]
+    fn structured_requests_map_onto_the_openai_schema() {
+        let backend = runtime(
+            "coder",
+            "openai:http://127.0.0.1:8080/v1?model=upstream-name",
+        );
+        let body = backend
+            .chat_body(
+                br#"{"messages":[{"role":"user","content":"hi"}],"max_new_tokens":32,
+                     "temperature":0.2,"top_p":0.9,"seed":7,"stop":["</s>"]}"#,
+                false,
+            )
+            .expect("request should map");
+
+        assert_eq!(body["model"], "upstream-name");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hi");
+        // `max_new_tokens` is the host's name for it; upstream expects
+        // `max_tokens`, and forwarding the host name would silently uncap.
+        assert_eq!(body["max_tokens"], 32);
+        assert!(body.get("max_new_tokens").is_none());
+        assert_eq!(body["top_p"], 0.9);
+        assert_eq!(body["seed"], 7);
+        assert_eq!(body["stop"][0], "</s>");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn raw_prompts_become_a_single_user_turn() {
+        let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
+        let body = backend
+            .chat_body(b"write a haiku", true)
+            .expect("request should map");
+        assert_eq!(body["messages"].as_array().expect("array").len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "write a haiku");
+        assert_eq!(body["stream"], true);
+        // Absent sampling knobs must stay absent rather than be sent as
+        // nulls: some upstreams reject an explicit null temperature.
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("stop").is_none());
+    }
+
+    #[test]
+    fn json_schema_becomes_a_response_format() {
+        let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
+        let body = backend
+            .chat_body(
+                br#"{"prompt":"p","json_schema":"{\"type\":\"object\"}"}"#,
+                false,
+            )
+            .expect("request should map");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
+    fn a_request_without_prompt_or_messages_is_rejected() {
+        let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
+        let error = backend
+            .chat_body(br#"{"max_new_tokens":8}"#, false)
+            .expect_err("an empty request must be rejected");
+        assert!(matches!(error, UpstreamError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn telemetry_names_the_upstream_rather_than_a_local_accelerator() {
+        let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
+        assert_eq!(backend.executed_on(), "upstream:http://127.0.0.1:8080/v1");
+    }
+
+    /// A single-shot HTTP/1.1 server that records the request it received and
+    /// replies with a canned response. Real sockets rather than a mocked
+    /// client, so the tests exercise the actual reqwest round trip and SSE
+    /// framing.
+    struct FakeUpstream {
+        base_url: String,
+        request: std::sync::mpsc::Receiver<(String, String)>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeUpstream {
+        fn start(status_line: &str, content_type: &str, body: &str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
+            let base_url = format!(
+                "http://{}/v1",
+                listener
+                    .local_addr()
+                    .expect("listener should have an address")
+            );
+            let (tx, request) = std::sync::mpsc::channel();
+            let response = format!(
+                "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+
+            let handle = std::thread::spawn(move || {
+                use std::io::{BufRead, Read, Write};
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = std::io::BufReader::new(stream);
+
+                // Request line plus headers, stopping at the blank separator.
+                let mut target = String::new();
+                let mut content_length = 0usize;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if target.is_empty() {
+                        target = line.trim().to_owned();
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                    line.clear();
+                }
+
+                let mut body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                let _ = tx.send((target, String::from_utf8_lossy(&body).into_owned()));
+
+                let mut stream = reader.into_inner();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            });
+
+            Self {
+                base_url,
+                request,
+                handle: Some(handle),
+            }
+        }
+
+        fn binding(&self) -> String {
+            format!("{UPSTREAM_SCHEME}{}", self.base_url)
+        }
+
+        /// The (request-line, body) pair the upstream actually received.
+        fn received(&self) -> (String, Value) {
+            let (target, body) = self
+                .request
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the upstream should have received a request");
+            let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+            (target, body)
+        }
+    }
+
+    impl Drop for FakeUpstream {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_generation_round_trips_through_a_real_upstream() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"role":"assistant","content":"fn main() {}"},
+                "finish_reason":"stop"}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let output = backend
+            .generate(&[br#"{"messages":[{"role":"user","content":"write main"}]}"#])
+            .expect("generation should round trip");
+        assert_eq!(output, b"fn main() {}".to_vec());
+
+        let (target, body) = upstream.received();
+        assert!(
+            target.starts_with("POST /v1/chat/completions "),
+            "unexpected request line: {target}"
+        );
+        // The alias is the default upstream model name.
+        assert_eq!(body["model"], "coder");
+        assert_eq!(body["messages"][0]["content"], "write main");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn streaming_generation_emits_one_token_per_sse_delta() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fn \"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"main\"}}]}\n\n",
+                // An empty delta (the usual role-only opening frame) must not
+                // emit a token, and a malformed frame must not abort the stream.
+                "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
+                "data: {not json}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"()\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut tokens = Vec::new();
+        backend
+            .generate_streaming(&[b"write main"], &mut |token| tokens.push(token.to_owned()))
+            .expect("streaming should complete");
+        assert_eq!(tokens, vec!["fn ", "main", "()"]);
+
+        let (_, body) = upstream.received();
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn an_upstream_error_status_surfaces_with_its_body() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 503 Service Unavailable",
+            "application/json",
+            r#"{"error":{"message":"model is loading"}}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"hello"])
+            .expect_err("a 503 must not be reported as generated text");
+        match error {
+            UpstreamError::Status { status, body, .. } => {
+                assert_eq!(status, 503);
+                assert!(
+                    body.contains("model is loading"),
+                    "the upstream's own explanation must reach the operator, got: {body}"
+                );
+            }
+            other => panic!("expected a status error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn embeddings_are_forwarded_to_the_upstream_route() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"data":[{"embedding":[0.25,-0.5,1.0]}]}"#,
+        );
+        let backend = runtime("embed", &upstream.binding());
+
+        let vector = backend.embed("hello").expect("embedding should round trip");
+        assert_eq!(vector, vec![0.25, -0.5, 1.0]);
+
+        let (target, body) = upstream.received();
+        assert!(
+            target.starts_with("POST /v1/embeddings "),
+            "unexpected request line: {target}"
+        );
+        assert_eq!(body["input"], "hello");
+    }
+
+    #[test]
+    fn a_response_without_choices_is_rejected_rather_than_returned_empty() {
+        let upstream = FakeUpstream::start("HTTP/1.1 200 OK", "application/json", r#"{"id":"x"}"#);
+        let backend = runtime("coder", &upstream.binding());
+        let error = backend
+            .generate(&[b"hello"])
+            .expect_err("a choice-less response is not a valid generation");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+}

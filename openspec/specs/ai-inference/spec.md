@@ -290,8 +290,102 @@ The AI inference runtime SHALL execute supported local Candle text-generation mo
 - **THEN** the runtime validates the request against configured prompt and generation limits
 - **AND** returns UTF-8 generated text bytes through the existing inference response path
 
+### Requirement: GGUF checkpoints MUST execute on CUDA when the binding asks for it
+
+The quantized GGUF loader SHALL upload weights to the device its binding
+requests, not unconditionally to the host. On a `candle-cuda` build, a
+single-device Llama GGUF binding whose `device` is not `cpu` SHALL load onto a
+real CUDA device through the pinned fork's quantized CUDA kernels, and its
+decode loop SHALL build input tensors on that same device. A `cpu` binding
+SHALL keep the existing host-side quantized path unchanged.
+
+Because only a subset of GGML block types has a CUDA quantized-matmul kernel,
+the loader SHALL validate every tensor's block type *before* uploading any
+weights, so an unrunnable checkpoint fails at load rather than at first decode
+with VRAM already claimed.
+
+#### Scenario: A K-quant GGUF binding runs on the GPU
+
+- **GIVEN** a host built with the `candle-cuda` feature
+- **WHEN** a `single`-distribution Llama GGUF binding declares a non-`cpu` device
+- **AND** every tensor uses a block type with a CUDA quantized-matmul kernel
+- **THEN** the runtime loads the quantized weights onto a CUDA device
+- **AND** prefill and decode build their input tensors on that device
+
+#### Scenario: A block type without a CUDA kernel is refused before load
+
+- **WHEN** a GGUF checkpoint bound to a non-`cpu` device contains a tensor whose
+  block type has no CUDA quantized-matmul kernel
+- **THEN** the runtime returns a typed unsupported-model error naming the tensor
+  and its block type
+- **AND** no weights are uploaded to the device
+
+#### Scenario: A CUDA-less build refuses a GPU GGUF binding
+
+- **GIVEN** a host built without the `candle-cuda` feature
+- **WHEN** a GGUF binding declares a non-`cpu` device
+- **THEN** the runtime returns a typed error naming the missing build feature
+- **AND** it does not silently load the checkpoint on the host
+
+#### Scenario: A CPU GGUF binding is unaffected by the block-type rule
+
+- **WHEN** a GGUF binding declares `cpu`
+- **THEN** the runtime loads it on the host regardless of its block types
+
+### Requirement: OpenAI-compatible upstreams MUST be bindable as mesh models
+
+The AI inference runtime SHALL support model bindings whose `path` uses the
+`openai:<base-url>` scheme, forwarding generation to an external
+OpenAI-compatible server (llama.cpp, vLLM, or a peer node) instead of executing
+locally. The upstream model name SHALL default to the binding alias and be
+overridable with a `model` query parameter; a `timeout_ms` query parameter SHALL
+bound each request. Credentials SHALL NOT be carried in the binding: the runtime
+SHALL read a bearer token from `TACHYON_UPSTREAM_API_KEY_<ALIAS>`, falling back
+to `TACHYON_UPSTREAM_API_KEY`.
+
+An upstream binding holds no local weights, so it SHALL report no local
+accelerator residency regardless of the `device` its binding declares.
+
+#### Scenario: An upstream binding is claimed before any filesystem probe
+
+- **WHEN** a model binding's `path` starts with `openai:`
+- **THEN** the runtime claims it as an upstream binding
+- **AND** it does not probe the ModelOpt/NVFP4, embedding, or Candle LLM loaders
+- **AND** loading performs no network I/O, so an unreachable upstream does not
+  block host startup
+
+#### Scenario: A host generation request is translated to chat completions
+
+- **WHEN** a request reaches an upstream binding as a JSON generation request
+- **THEN** the runtime POSTs `<base-url>/chat/completions` with the request's
+  `messages` (or its `prompt` as a single user turn), mapping `max_new_tokens`
+  to `max_tokens` and forwarding `temperature`, `top_p`, `seed`, and `stop`
+- **AND** a `json_schema` is forwarded as an OpenAI `response_format`
+- **AND** the assistant message content is returned as the generated text bytes
+
+#### Scenario: Streaming passes the upstream's own SSE deltas through
+
+- **WHEN** a streaming request reaches an upstream binding
+- **THEN** the runtime requests `stream: true` and emits one token per SSE
+  content delta as it arrives, terminating on `[DONE]`
+- **AND** it does not buffer the whole generation first
+
+#### Scenario: An upstream failure surfaces instead of becoming output
+
+- **WHEN** the upstream returns a non-success HTTP status or an unusable body
+- **THEN** the runtime returns a typed error carrying the endpoint, status, and
+  a bounded excerpt of the upstream's own explanation
+- **AND** the failing response body is never returned as generated text
+
+#### Scenario: An invalid upstream URL fails at load
+
+- **WHEN** an `openai:` binding's remainder is not an `http://` or `https://`
+  URL with a host, or carries an unknown query parameter
+- **THEN** model initialization fails with a typed binding error
+- **AND** inference for that alias is not registered
+
 ### Requirement: Non-mock model bindings MUST NOT fall back to mock output
-The AI inference runtime SHALL classify model bindings as explicit mock, ModelOpt/NVFP4, supported Candle LLM, ONNX/WASI-NN, or unsupported, and SHALL NOT return `MOCK_LLM_RESPONSE` for any non-mock binding.
+The AI inference runtime SHALL classify model bindings as explicit mock, upstream OpenAI-compatible, ModelOpt/NVFP4, supported Candle LLM, ONNX/WASI-NN, or unsupported, and SHALL NOT return `MOCK_LLM_RESPONSE` for any non-mock binding.
 
 #### Scenario: Unsupported safetensors directory fails before registration
 - **WHEN** a model binding points at a safetensors directory that is neither ModelOpt/NVFP4 nor a supported Candle LLM

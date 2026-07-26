@@ -6,7 +6,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use candle_core::{quantized::gguf_file, safetensors::MmapedSafetensors, DType, Device, Tensor};
+use candle_core::{
+    quantized::{gguf_file, GgmlDType},
+    safetensors::MmapedSafetensors,
+    DType, Device, Tensor,
+};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::deepseek2::{
@@ -352,6 +356,12 @@ enum LoadedModel {
     Gguf {
         model: Mutex<QuantizedLlama>,
         eos_tokens: Vec<u32>,
+        /// Device the quantized weights were uploaded to. `Device::Cpu` for a
+        /// `cpu` binding (the historical path); a real CUDA device once the
+        /// binding asks for one on a `candle-cuda` build. Input tensors must be
+        /// built here — `QuantizedLlama::forward` has no device coercion, so a
+        /// CPU input against CUDA weights fails the matmul outright.
+        device: Device,
     },
     /// A multi-device parallel engine, selected when the deployment's
     /// `hardware_strategy.distribution_mode` is not `single`. The engines
@@ -1659,9 +1669,11 @@ impl CandleLlmRuntime {
         // paged_attention needs that same Llama+CUDA baseline — the paged
         // flash-attn kernel is CUDA-only — plus a Safetensors checkpoint and
         // an actual non-`cpu` request. `load_safetensors` is the only loader
-        // that wires `cache.set_paged_kv`; GGUF uses its quantized CPU loader.
-        // Every other architecture/format/build/device combination therefore
-        // fails closed here instead of silently running the contiguous path.
+        // that wires `cache.set_paged_kv`: GGUF now runs on CUDA too, but
+        // `QuantizedLlama` owns its own KV cache internally and exposes no
+        // block-table seam. Every other architecture/format/build/device
+        // combination therefore fails closed here instead of silently running
+        // the contiguous path.
         let paged_attention_supported = single_device_cuda_supported
             && format == ModelFormat::Safetensors
             && requested_device != "cpu";
@@ -1786,7 +1798,7 @@ impl CandleLlmRuntime {
                 ModelFormat::Safetensors => {
                     Self::load_safetensors(alias, root, requested_device, strategy)?
                 }
-                ModelFormat::Gguf => Self::load_gguf(alias, root)?,
+                ModelFormat::Gguf => Self::load_gguf(alias, root, requested_device)?,
             }
         } else {
             Self::load_parallel(alias, root, format, strategy, topology)?
@@ -2217,12 +2229,23 @@ impl CandleLlmRuntime {
     /// from GGUF metadata (there is no `config.json`); the quantised tensors are
     /// read from the file. The same reader feeds the header parse and the tensor
     /// reads (candle seeks via `tensor_data_offset`).
+    /// Load a quantized GGUF Llama checkpoint.
+    ///
+    /// `requested_device` selects a real CUDA device on a `candle-cuda` build:
+    /// the pinned fork carries quantized CUDA kernels
+    /// (`candle-core/src/quantized/cuda.rs`), and
+    /// `QuantizedLlama::from_gguf` uploads every block-quantized tensor to the
+    /// device it is handed. `try_load_with_topology`'s single-device gate has
+    /// already rejected a non-`cpu` request on a build or architecture that
+    /// cannot honour it, so reaching here with `requested_device != "cpu"`
+    /// guarantees a `candle-cuda` build, a Llama checkpoint, and `single`
+    /// distribution.
     fn load_gguf(
         alias: &str,
         root: &Path,
+        requested_device: &str,
     ) -> Result<(LoadedModel, GenerationLimits), CandleLlmError> {
         let gguf_path = gguf_file_path(alias, root)?;
-        let device = Device::Cpu;
         let mut reader =
             fs::File::open(&gguf_path).map_err(|error| CandleLlmError::InvalidComponent {
                 alias: alias.to_owned(),
@@ -2271,6 +2294,11 @@ impl CandleLlmRuntime {
             .unwrap_or_default();
         let limits = GenerationLimits::with_context(context_length);
 
+        // Resolve the device *before* uploading weights: an unsupported block
+        // type must fail closed here rather than at the first decode step,
+        // when the model already occupies VRAM.
+        let device = resolve_gguf_device(alias, root, &content, requested_device)?;
+
         let model = QuantizedLlama::from_gguf(content, &mut reader, &device).map_err(|error| {
             CandleLlmError::InvalidComponent {
                 alias: alias.to_owned(),
@@ -2284,6 +2312,7 @@ impl CandleLlmRuntime {
             LoadedModel::Gguf {
                 model: Mutex::new(model),
                 eos_tokens,
+                device,
             },
             limits,
         ))
@@ -3074,7 +3103,14 @@ impl CandleLlmRuntime {
                 })?;
                 Ok(backend.last_logits(&input, &backend_device))
             }
-            LoadedModel::Gguf { model, .. } => {
+            LoadedModel::Gguf {
+                model,
+                device: model_device,
+                ..
+            } => {
+                let input = input.to_device(model_device).map_err(|error| {
+                    self.execution_error(format!("failed to move input to device: {error}"))
+                })?;
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
                 })?;
@@ -3152,7 +3188,9 @@ impl CandleLlmRuntime {
         request: &ParsedGenerationRequest,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<(), CandleLlmError> {
-        let device = Device::Cpu;
+        // Every arm resolves its own device from the loaded weights: there is
+        // no longer a CPU default to fall back on now that GGUF can live on a
+        // CUDA device too.
         match &*self.inner {
             LoadedModel::Safetensors {
                 backend,
@@ -3161,7 +3199,11 @@ impl CandleLlmRuntime {
                 let device = backend.device();
                 backend.decode(self, prompt_ids, request, eos_tokens, &device, on_token)
             }
-            LoadedModel::Gguf { model, eos_tokens } => {
+            LoadedModel::Gguf {
+                model,
+                eos_tokens,
+                device,
+            } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
                 })?;
@@ -3169,7 +3211,7 @@ impl CandleLlmRuntime {
                     prompt_ids,
                     request,
                     eos_tokens,
-                    &device,
+                    device,
                     on_token,
                     |input, index_pos| guard.forward(input, index_pos),
                 )
@@ -3693,6 +3735,7 @@ impl CandleLlmRuntime {
         let ids = self.encode_ids(prompt).expect("prompt should tokenize");
         let device = match &*self.inner {
             LoadedModel::Safetensors { backend, .. } => backend.device(),
+            LoadedModel::Gguf { device, .. } => device.clone(),
             _ => Device::Cpu,
         };
         let input = Tensor::new(ids.as_slice(), &device)
@@ -4336,6 +4379,119 @@ fn gguf_file_path(alias: &str, root: &Path) -> Result<PathBuf, CandleLlmError> {
         });
     }
     Ok(path)
+}
+
+/// GGML block types the pinned candle fork can actually multiply on a CUDA
+/// device.
+///
+/// The list mirrors the `dtype` matches in
+/// `candle-core/src/quantized/cuda.rs` (`dequantize_mul_mat_vec`,
+/// `mul_mat_vec_via_q8_1`, `mul_mat_via_q8_1`), which is where a GGUF weight
+/// ends up once `QMatMul::from_arc` keeps it as a `QTensor`. `F32`/`F16`/`BF16`
+/// are included for a different reason: `from_arc` dequantizes those into a
+/// dense `Tensor` instead, so they never reach a quantized kernel at all.
+///
+/// `Q8_1` and `Q8K` are deliberately absent. Both parse and both have CUDA
+/// *dequantize* kernels, but neither has a CUDA quantized-matmul kernel, so a
+/// checkpoint carrying them would load onto the GPU and then fail at the first
+/// decode step with candle's generic "unsupported dtype for quantized matmul".
+const fn gguf_dtype_has_cuda_matmul_kernel(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::BF16
+            | GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+    )
+}
+
+/// The first tensor in a checkpoint that CUDA cannot multiply, plus how
+/// widespread the problem is.
+struct UnsupportedGgufDtypes {
+    tensor: String,
+    dtype: GgmlDType,
+    affected: usize,
+    total: usize,
+}
+
+/// Scan a GGUF checkpoint for block types with no CUDA quantized-matmul kernel.
+///
+/// Kept separate from device selection so the rule is unit-testable on a
+/// CUDA-less build, which is where the default CI matrix runs.
+fn unsupported_gguf_cuda_dtypes(content: &gguf_file::Content) -> Option<UnsupportedGgufDtypes> {
+    // Sorted so a mixed-quant checkpoint always reports the same offending
+    // tensor: `tensor_infos` is a hash map, and an arbitrary pick would make
+    // the error message differ run to run for the same file.
+    let mut unsupported = content
+        .tensor_infos
+        .iter()
+        .filter(|(_, info)| !gguf_dtype_has_cuda_matmul_kernel(info.ggml_dtype))
+        .map(|(name, info)| (name.as_str(), info.ggml_dtype))
+        .collect::<Vec<_>>();
+    unsupported.sort_unstable_by_key(|(name, _)| *name);
+    let (tensor, dtype) = unsupported.first()?;
+    Some(UnsupportedGgufDtypes {
+        tensor: (*tensor).to_owned(),
+        dtype: *dtype,
+        affected: unsupported.len(),
+        total: content.tensor_infos.len(),
+    })
+}
+
+/// Pick the device a GGUF checkpoint's weights are uploaded to.
+///
+/// `cpu` (the default) keeps the historical host-side quantized path. Any other
+/// request resolves a real CUDA device, but only after every tensor's block
+/// type has been checked against [`gguf_dtype_has_cuda_matmul_kernel`] — a
+/// mixed-quant checkpoint that names even one unsupported block type is
+/// rejected with a typed error naming the tensor and its dtype, instead of
+/// half-loading onto the GPU.
+fn resolve_gguf_device(
+    alias: &str,
+    root: &Path,
+    content: &gguf_file::Content,
+    requested_device: &str,
+) -> Result<Device, CandleLlmError> {
+    if requested_device == "cpu" {
+        return Ok(Device::Cpu);
+    }
+
+    if !cfg!(feature = "candle-cuda") {
+        return Err(CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: format!(
+                "GGUF execution on `{requested_device}` requires a host built with the `candle-cuda` feature; rebuild with it or bind this model to `cpu`"
+            ),
+        });
+    }
+
+    if let Some(report) = unsupported_gguf_cuda_dtypes(content) {
+        return Err(CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: format!(
+                "GGUF tensor `{}` uses block type `{:?}`, which has no CUDA quantized-matmul kernel ({} of {} tensors affected); requantize to a K-quant or legacy Q4/Q5/Q8 type, or bind this model to `cpu`",
+                report.tensor, report.dtype, report.affected, report.total
+            ),
+        });
+    }
+
+    Device::cuda_if_available(0).map_err(|error| CandleLlmError::InvalidComponent {
+        alias: alias.to_owned(),
+        path: root.to_path_buf(),
+        component: GGUF_COMPONENT,
+        detail: error.to_string(),
+    })
 }
 
 /// Collect the model's end-of-sequence token id(s), if any, into a flat list.
@@ -6750,6 +6906,130 @@ mod tests {
                 .expect("gguf fixture should load without error")
                 .expect("gguf fixture is a supported Llama model");
         (runtime, dir)
+    }
+
+    /// Build an in-memory GGUF header carrying the given tensor block types.
+    /// No file is written: only `tensor_infos` matters to the CUDA dtype scan.
+    fn gguf_header_with_dtypes(tensors: &[(&str, GgmlDType)]) -> gguf_file::Content {
+        gguf_file::Content {
+            magic: gguf_file::VersionedMagic::GgufV3,
+            metadata: std::collections::HashMap::new(),
+            tensor_infos: tensors
+                .iter()
+                .map(|(name, dtype)| {
+                    (
+                        (*name).to_owned(),
+                        gguf_file::TensorInfo {
+                            ggml_dtype: *dtype,
+                            shape: candle_core::Shape::from_dims(&[256]),
+                            offset: 0,
+                        },
+                    )
+                })
+                .collect(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn gguf_cuda_kernel_coverage_matches_the_pinned_candle_fork() {
+        // Every block type with a `mul_mat*` kernel in the fork's
+        // `quantized/cuda.rs`, plus the dense types `QMatMul` dequantizes.
+        for dtype in [
+            GgmlDType::F32,
+            GgmlDType::F16,
+            GgmlDType::BF16,
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            assert!(
+                gguf_dtype_has_cuda_matmul_kernel(dtype),
+                "{dtype:?} has a CUDA quantized-matmul kernel and must be accepted"
+            );
+        }
+        // Both dequantize on CUDA but neither has a quantized-matmul kernel,
+        // so accepting them would move the failure to the first decode step.
+        for dtype in [GgmlDType::Q8_1, GgmlDType::Q8K] {
+            assert!(
+                !gguf_dtype_has_cuda_matmul_kernel(dtype),
+                "{dtype:?} has no CUDA quantized-matmul kernel and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn gguf_cuda_dtype_scan_reports_the_first_offending_tensor() {
+        let content = gguf_header_with_dtypes(&[
+            ("blk.1.ffn_down.weight", GgmlDType::Q8K),
+            ("blk.0.attn_q.weight", GgmlDType::Q4K),
+            ("blk.0.attn_k.weight", GgmlDType::Q8K),
+        ]);
+        let report = unsupported_gguf_cuda_dtypes(&content)
+            .expect("a Q8K tensor must be reported as unsupported");
+        // Name-sorted, so the same file always names the same tensor.
+        assert_eq!(report.tensor, "blk.0.attn_k.weight");
+        assert_eq!(report.dtype, GgmlDType::Q8K);
+        assert_eq!(report.affected, 2);
+        assert_eq!(report.total, 3);
+    }
+
+    #[test]
+    fn gguf_cuda_dtype_scan_accepts_a_k_quant_checkpoint() {
+        let content = gguf_header_with_dtypes(&[
+            ("token_embd.weight", GgmlDType::Q6K),
+            ("blk.0.attn_q.weight", GgmlDType::Q4K),
+            ("output_norm.weight", GgmlDType::F32),
+        ]);
+        assert!(
+            unsupported_gguf_cuda_dtypes(&content).is_none(),
+            "a Q4_K_M-style checkpoint must be accepted for CUDA"
+        );
+    }
+
+    #[test]
+    fn gguf_cpu_bindings_stay_on_the_host() {
+        // Even a checkpoint CUDA could never run stays loadable on `cpu`: the
+        // dtype scan must not gate the host path.
+        let content = gguf_header_with_dtypes(&[("blk.0.attn_q.weight", GgmlDType::Q8K)]);
+        let device = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "cpu")
+            .expect("a cpu binding must always resolve");
+        assert!(device.is_cpu());
+    }
+
+    #[cfg(not(feature = "candle-cuda"))]
+    #[test]
+    fn gguf_rejects_a_gpu_binding_without_the_cuda_feature() {
+        let content = gguf_header_with_dtypes(&[("blk.0.attn_q.weight", GgmlDType::Q4K)]);
+        let error = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "cuda")
+            .expect_err("a CUDA-less build must refuse a gpu binding");
+        assert!(
+            error.to_string().contains("candle-cuda"),
+            "the error must name the missing build feature, got: {error}"
+        );
+    }
+
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn gguf_rejects_a_gpu_binding_whose_blocks_have_no_cuda_kernel() {
+        let content = gguf_header_with_dtypes(&[
+            ("blk.0.attn_q.weight", GgmlDType::Q4K),
+            ("blk.0.ffn_down.weight", GgmlDType::Q8K),
+        ]);
+        let error = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "cuda")
+            .expect_err("a Q8K tensor must be refused before any VRAM is claimed");
+        let message = error.to_string();
+        assert!(
+            message.contains("blk.0.ffn_down.weight") && message.contains("Q8K"),
+            "the error must name the tensor and its block type, got: {message}"
+        );
     }
 
     #[test]

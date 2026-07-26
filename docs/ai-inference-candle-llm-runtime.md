@@ -90,6 +90,68 @@ already had its own real CUDA path via `distribution_mode:
 tensor_parallelism`/`pipeline_parallelism`/`expert_parallelism`, unaffected
 by this.
 
+### Quantized GGUF on CUDA
+
+GGUF follows the same rule. `load_gguf` resolves the binding's device rather
+than pinning `Device::Cpu`, so a Llama GGUF bound to a non-`cpu` device on a
+`candle-cuda` build uploads its quantized weights to the GPU and decodes there;
+`LoadedModel::Gguf` carries that device so prefill and decode build their input
+tensors on it. This is what makes a 4-bit checkpoint usable on a consumer GPU:
+the safetensors path loads F32 (or BF16 under `paged_attention`), which costs
+4 (or 2) bytes per parameter, while a Q4_K_M GGUF costs roughly half a byte.
+
+Only block types with a CUDA quantized-matmul kernel in the pinned fork are
+accepted: `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2K`, `Q3K`, `Q4K`, `Q5K`,
+`Q6K`, plus `F32`/`F16`/`BF16` (which `QMatMul::from_arc` dequantizes into a
+dense tensor rather than dispatching to a quantized kernel). `Q8_1` and `Q8K`
+dequantize on CUDA but have no matmul kernel, so a checkpoint carrying them is
+rejected at load — with the offending tensor and block type named — instead of
+failing at the first decode step with VRAM already claimed. A `cpu` binding
+skips the check entirely and keeps the historical host path.
+
+`paged_attention`, `cuda_graph_decode`, and `flashinfer_attention` remain
+safetensors-only: `QuantizedLlama` owns its KV cache internally and exposes no
+block-table seam.
+
+## OpenAI-Compatible Upstream Bindings
+
+A model binding whose `path` uses the `openai:` scheme is served by an external
+OpenAI-compatible server rather than by a local Candle runtime. The mesh keeps
+routing, QoS, authorisation, and the `/ai/v1` surface; only the tensor math runs
+out of process. This is the supported way to serve a model whose architecture or
+quantization Tachyon has no verified loader for — an AWQ checkpoint under vLLM,
+or a non-Llama GGUF under `llama-server`.
+
+```json
+{
+  "alias": "qwen3-coder",
+  "path": "openai:http://127.0.0.1:8080/v1?model=qwen3-coder-30b&timeout_ms=180000"
+}
+```
+
+- The upstream model name defaults to the binding alias; `model` overrides it,
+  so a mesh alias need not match the upstream's own name.
+- `timeout_ms` bounds each request (default 5 minutes, ceiling 1 hour).
+- Credentials never appear in the binding. The runtime reads a bearer token from
+  `TACHYON_UPSTREAM_API_KEY_<ALIAS>` (alias upper-cased, non-alphanumerics
+  folded to `_`), falling back to `TACHYON_UPSTREAM_API_KEY`. With neither set,
+  the request goes out unauthenticated — the usual case for a `llama-server` on
+  a trusted mesh link.
+
+The host's JSON generation request maps onto the chat-completions body:
+`messages` is forwarded verbatim (the upstream applies its own chat template,
+since the model lives there), `prompt` becomes a single user turn,
+`max_new_tokens` becomes `max_tokens`, and `json_schema` becomes an OpenAI
+`response_format`. Streaming is real SSE passthrough — one token per content
+delta — so time-to-first-token survives the extra hop. LoRA adapters are
+rejected: adapter injection has no wire representation here.
+
+Binding validation is offline, so a node still boots when its upstream is down;
+an unreachable server is a per-request error naming the endpoint and status, and
+an error body is never returned as generated text. Because no weights are
+resident locally, an upstream binding reports no local accelerator residency
+whatever `device` it declares.
+
 ## Cross-Node Model Placement Watchlist
 
 Tachyon currently optimizes for homelab/edge deployments where the target model

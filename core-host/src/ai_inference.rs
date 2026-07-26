@@ -24,6 +24,8 @@ mod qwen35_moe_runtime;
 mod samplers;
 #[path = "ai_inference/tensor_parallel_llama.rs"]
 pub(crate) mod tensor_parallel_llama;
+#[path = "ai_inference/upstream_openai.rs"]
+mod upstream_openai;
 #[path = "ai_inference/vendor_accelerator.rs"]
 mod vendor_accelerator;
 #[path = "ai_inference/vram_manager.rs"]
@@ -1535,6 +1537,11 @@ enum CandleBackendModelKind {
     TextEmbedding(Box<candle_embedding_runtime::CandleEmbeddingRuntime>),
     Qwen35Moe(Box<qwen35_moe_runtime::Qwen35MoeRuntime>),
     Vendor(vendor_accelerator::VendorAcceleratorRuntime),
+    /// An OpenAI-compatible server reached over the network. No weights are
+    /// resident on this node: the alias exists so the mesh can route, authorise,
+    /// and meter a model whose tensor math runs in another process (llama.cpp,
+    /// vLLM, or a peer Tachyon node).
+    Upstream(Box<upstream_openai::UpstreamOpenAiRuntime>),
 }
 
 struct SpeculativeDraftRuntime {
@@ -1570,6 +1577,29 @@ impl CandleBackendModel {
                 binding.alias
             ));
         }
+        // The upstream scheme is checked before any on-disk probe: an
+        // `openai:` path is a URL, not a directory, so every filesystem loader
+        // below would reject it.
+        if let Some(runtime) =
+            upstream_openai::UpstreamOpenAiRuntime::try_load(&binding.alias, &binding.path)?
+        {
+            return Ok(Self {
+                source: BackendModelSource {
+                    alias: binding.alias.clone(),
+                    path: binding.path.clone(),
+                    requested_target: binding.device.as_str().to_owned(),
+                    // Local residency accounting only tracks memory this node
+                    // actually holds. An upstream binding holds none, whatever
+                    // `device` the operator wrote — that field describes the
+                    // remote server, which this node does not schedule.
+                    accelerator: AcceleratorKind::Cpu,
+                    qos: binding.qos,
+                    model_size_bytes: 0,
+                },
+                kind: CandleBackendModelKind::Upstream(Box::new(runtime)),
+            });
+        }
+
         let kind = if is_explicit_mock_binding(binding) {
             CandleBackendModelKind::Mock
         } else if matches!(
@@ -1736,6 +1766,22 @@ impl BackendModel for CandleBackendModel {
 
     fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
         match &self.kind {
+            CandleBackendModelKind::Upstream(runtime) => {
+                validate_u8_prompts(&self.source.alias, inputs)?;
+                // One HTTP round trip per input: the OpenAI chat-completions
+                // route has no batch form, and folding several prompts into one
+                // request would break the one-output-per-input contract.
+                let result = inputs
+                    .iter()
+                    .map(|input| {
+                        runtime
+                            .generate(&[input.data.as_ref()])
+                            .map_err(anyhow::Error::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
+                return result;
+            }
             CandleBackendModelKind::Qwen35Moe(runtime) => {
                 if inputs
                     .iter()
@@ -1916,7 +1962,9 @@ impl BackendModel for CandleBackendModel {
                         )
                     })
             }
-            CandleBackendModelKind::Qwen35Moe(_) | CandleBackendModelKind::Vendor(_) => bail!(
+            CandleBackendModelKind::Qwen35Moe(_)
+            | CandleBackendModelKind::Vendor(_)
+            | CandleBackendModelKind::Upstream(_) => bail!(
                 "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
                 adapter.id,
                 self.source.alias
@@ -2029,6 +2077,17 @@ impl BackendModel for CandleBackendModel {
                 "model `{}` is a generation runtime and does not expose hidden-state pooling yet",
                 self.source.alias
             ),
+            CandleBackendModelKind::Upstream(runtime) => {
+                let input = std::str::from_utf8(input.data.as_ref()).map_err(|error| {
+                    anyhow!(
+                        "embedding input for model `{}` was not UTF-8: {error}",
+                        self.source.alias
+                    )
+                })?;
+                let result = runtime.embed(input).map_err(anyhow::Error::from);
+                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
+                result
+            }
             CandleBackendModelKind::TextEmbedding(runtime) => {
                 let input = std::str::from_utf8(input.data.as_ref()).map_err(|error| {
                     anyhow!(
@@ -2063,6 +2122,21 @@ impl BackendModel for CandleBackendModel {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<()> {
         match &self.kind {
+            CandleBackendModelKind::Upstream(runtime) => {
+                validate_u8_prompts(&self.source.alias, inputs)?;
+                let prompts = inputs
+                    .iter()
+                    .map(|input| input.data.as_ref())
+                    .collect::<Vec<_>>();
+                // Real SSE passthrough rather than the trait's
+                // generate-then-emit default: the upstream already streams, and
+                // buffering here would throw away time-to-first-token.
+                let result = runtime
+                    .generate_streaming(&prompts, on_token)
+                    .map_err(anyhow::Error::from);
+                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
+                result
+            }
             CandleBackendModelKind::ModelOptNvfp4(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
                 let prompts = inputs
@@ -3037,6 +3111,46 @@ impl CandleBackendModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_openai_binding_loads_as_an_upstream_without_touching_the_filesystem() {
+        let backend = CandleBackendModel::load(&IntegrityModelBinding {
+            alias: "remote-coder".to_owned(),
+            // Deliberately not a directory: the upstream scheme must be claimed
+            // before any on-disk loader is probed.
+            path: "openai:http://127.0.0.1:8080/v1?model=qwen3-coder-30b".to_owned(),
+            // Deliberately `Cuda`: the remote server's device is not this
+            // node's to account for.
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        })
+        .expect("an upstream binding should load without reaching the network");
+
+        assert!(matches!(backend.kind, CandleBackendModelKind::Upstream(_),));
+        // No local weights, so no local residency claim.
+        assert_eq!(backend.residency(), AcceleratorMemoryResidency::HostRam);
+        assert_eq!(backend.source.model_size_bytes, 0);
+    }
+
+    #[test]
+    fn an_invalid_openai_binding_fails_at_load_rather_than_at_first_request() {
+        let error = CandleBackendModel::load(&IntegrityModelBinding {
+            alias: "remote-coder".to_owned(),
+            path: "openai:ftp://nope".to_owned(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        })
+        .err()
+        .expect("a malformed upstream URL must fail closed at load");
+        assert!(
+            error.to_string().contains("http://"),
+            "the error should name the accepted schemes, got: {error}"
+        );
+    }
 
     fn model_broker_env_guard() -> std::sync::MutexGuard<'static, ()> {
         static MODEL_BROKER_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
