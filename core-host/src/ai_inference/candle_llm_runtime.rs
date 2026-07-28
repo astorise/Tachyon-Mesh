@@ -13,6 +13,7 @@ use candle_core::{
     DType, Device, Tensor,
 };
 use candle_nn::VarBuilder;
+use candle_transformers::generation::IncrementalDecoder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::deepseek2::{
     DeepSeekV2 as DeepSeekModel, DeepSeekV2Config as DeepSeekConfig,
@@ -23,6 +24,7 @@ use candle_transformers::models::llama::{
     Cache, Config, Llama, LlamaConfig, LlamaEosToks, LoraConfig, PagedKvCache,
 };
 use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
+use candle_transformers::models::quantized_lm::{self, Architecture as GgufArchitecture};
 use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
 use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
 use candle_transformers::models::qwen3_moe::{
@@ -30,9 +32,11 @@ use candle_transformers::models::qwen3_moe::{
 };
 use candle_transformers::models::{
     quantized_gemma3::ModelWeights as QuantizedGemma3,
-    quantized_llama::ModelWeights as QuantizedLlama, quantized_phi3::ModelWeights as QuantizedPhi3,
-    quantized_qwen2::ModelWeights as QuantizedQwen2,
+    quantized_glm4::ModelWeights as QuantizedGlm4, quantized_lfm2::ModelWeights as QuantizedLfm2,
+    quantized_llama::ModelWeights as QuantizedLlama, quantized_phi::ModelWeights as QuantizedPhi2,
+    quantized_phi3::ModelWeights as QuantizedPhi3, quantized_qwen2::ModelWeights as QuantizedQwen2,
     quantized_qwen3::ModelWeights as QuantizedQwen3,
+    quantized_qwen3_moe::GGUFQWenMoE as QuantizedQwen3Moe,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -109,79 +113,45 @@ const GGUF_EXTENSION: &str = "gguf";
 /// GGUF `general.architecture` value for the Llama family.
 const GGUF_LLAMA_ARCHITECTURE: &str = "llama";
 
-/// A GGUF family with a verified quantized loader in the pinned candle fork.
+/// A loaded quantized checkpoint, held as a concrete type rather than
+/// `quantized_lm`'s `Box<dyn QuantizedLm>`.
 ///
-/// Adding one is a table entry here plus an arm in [`QuantizedModel`]: every
-/// `quantized_*` module in the fork exposes the same
-/// `from_gguf(content, reader, device)` / `forward(input, index_pos)` pair, so
-/// the decode loop never has to know which family it is driving.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GgufFamily {
-    Llama,
-    Qwen2,
-    Qwen3,
-    Gemma3,
-    Phi3,
-}
-
-impl GgufFamily {
-    /// Map a GGUF `general.architecture` string. The values are llama.cpp's,
-    /// not Hugging Face's — `qwen3moe`, not `qwen3_moe` — though both spellings
-    /// are accepted because converters disagree.
-    fn from_gguf_architecture(architecture: &str) -> Option<Self> {
-        match architecture {
-            GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
-            "qwen2" => Some(Self::Qwen2),
-            "qwen3" => Some(Self::Qwen3),
-            // `qwen3moe` is deliberately absent: the fork's fused expert path
-            // (`candle_nn::moe_gemm_gguf`) is CUDA-only and its prefill kernel
-            // accepts only F16/BF16, so a binding would load and then fail at
-            // the first expert layer. Wiring it needs a CUDA-only gate, a BF16
-            // working dtype, and expert-tensor dtype validation — none of which
-            // can be verified without a GPU. Adding the arm back is a one-line
-            // table entry once it can be proven.
-            "gemma3" => Some(Self::Gemma3),
-            "phi3" => Some(Self::Phi3),
-            _ => None,
-        }
-    }
-
-    /// Every family prefixes its own metadata keys with its architecture name,
-    /// so the context-length lookup cannot be hardcoded to `llama.`.
-    fn metadata_prefix(self) -> &'static str {
-        match self {
-            Self::Llama => "llama",
-            Self::Qwen2 => "qwen2",
-            Self::Qwen3 => "qwen3",
-            Self::Gemma3 => "gemma3",
-            Self::Phi3 => "phi3",
-        }
-    }
-}
-
-/// A loaded quantized checkpoint, whichever family it came from.
-///
-/// The wrapper exists so `LoadedModel::Gguf` stays one variant and the decode
-/// loops keep calling a single `forward`.
+/// The trait has no `Send` bound, so the boxed form cannot live in the `Mutex`
+/// inside this crate's shared model registry — even though every concrete
+/// backend behind it *is* `Send`. Erasing the type is what drops the auto
+/// trait. Reported upstream; until `from_gguf` returns
+/// `Box<dyn QuantizedLm + Send>` this enum stays, and it is deliberately thin:
+/// the architecture registry, the device/dtype admission check and the
+/// metadata namespace all come from `quantized_lm`, so none of the
+/// drift-prone tables live here any more.
 enum QuantizedModel {
     Llama(QuantizedLlama),
+    Gemma3(QuantizedGemma3),
+    Glm4(QuantizedGlm4),
+    Lfm2(QuantizedLfm2),
+    Phi2(QuantizedPhi2),
+    Phi3(QuantizedPhi3),
     Qwen2(QuantizedQwen2),
     Qwen3(QuantizedQwen3),
-    Gemma3(QuantizedGemma3),
-    Phi3(QuantizedPhi3),
+    Qwen3Moe(QuantizedQwen3Moe),
 }
 
 impl QuantizedModel {
     fn forward(&mut self, input: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
         match self {
             Self::Llama(model) => model.forward(input, index_pos),
+            Self::Gemma3(model) => model.forward(input, index_pos),
+            Self::Glm4(model) => model.forward(input, index_pos),
+            Self::Lfm2(model) => model.forward(input, index_pos),
+            Self::Phi2(model) => model.forward(input, index_pos),
+            Self::Phi3(model) => model.forward(input, index_pos),
             Self::Qwen2(model) => model.forward(input, index_pos),
             Self::Qwen3(model) => model.forward(input, index_pos),
-            Self::Gemma3(model) => model.forward(input, index_pos),
-            Self::Phi3(model) => model.forward(input, index_pos),
+            Self::Qwen3Moe(model) => model.forward(input, index_pos),
         }
     }
 }
+
 /// Error component label for GGUF load failures.
 const GGUF_COMPONENT: &str = "model.gguf";
 /// Generation budget applied when a request omits `max_new_tokens`.
@@ -383,9 +353,15 @@ impl ModelArchitecture {
                 expert_parallel: true,
                 specialized_runtime: false,
             },
+            // `gguf: true` even though the fused expert path is CUDA-only and
+            // wants an F16/BF16 working dtype: `load_gguf` runs candle's
+            // `Architecture::check_device_support` before reading a tensor, so
+            // a CPU or Metal binding fails at load with the backend's own
+            // message. Refusing the format outright here would also refuse the
+            // CUDA binding, which does work.
             Self::Qwen35Moe => ArchitectureCapabilities {
                 safetensors: true,
-                gguf: false,
+                gguf: true,
                 single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
@@ -1613,11 +1589,6 @@ pub(crate) struct CandleLlmRuntime {
     alias: String,
     root: PathBuf,
     tokenizer: Tokenizer,
-    /// Whether this checkpoint's decoder permits windowed detokenization.
-    /// Resolved once at load: see [`decoder_has_bounded_context`].
-    windowed_detokenization: bool,
-    /// Reach of the decoder's longest literal replacement, in bytes.
-    min_retained_detokenize_bytes: usize,
     inner: Arc<LoadedModel>,
     limits: GenerationLimits,
     /// The model's own chat template, loaded once from `tokenizer_config.json`.
@@ -2044,8 +2015,6 @@ impl CandleLlmRuntime {
         Ok(Some(Self {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
-            windowed_detokenization: decoder_has_bounded_context(&tokenizer),
-            min_retained_detokenize_bytes: decoder_max_literal_replace_len(&tokenizer),
             tokenizer,
             inner: Arc::new(inner),
             limits,
@@ -2454,8 +2423,6 @@ impl CandleLlmRuntime {
         Ok(Self {
             alias: alias.to_owned(),
             root: root.to_path_buf(),
-            windowed_detokenization: decoder_has_bounded_context(&tokenizer),
-            min_retained_detokenize_bytes: decoder_max_literal_replace_len(&tokenizer),
             tokenizer,
             inner: Arc::new(inner),
             limits,
@@ -2502,30 +2469,23 @@ impl CandleLlmRuntime {
             }
         })?;
 
-        // Validate the architecture up front so a non-Llama GGUF fails with a
-        // clear message rather than a missing-key error inside the loader.
-        let architecture = content
-            .metadata
-            .get("general.architecture")
-            .and_then(|value| value.to_string().ok())
-            .map(|value| value.to_owned())
-            .unwrap_or_default();
-        let Some(family) = GgufFamily::from_gguf_architecture(&architecture) else {
-            return Err(CandleLlmError::UnsupportedModel {
+        // Validate the architecture up front, so an unsupported family fails
+        // with a clear message rather than a missing-key error inside a loader.
+        // `Architecture::from_content` is the fork's own registry, so this
+        // cannot drift from the set of backends it can actually build.
+        let architecture = GgufArchitecture::from_content(&content).map_err(|error| {
+            CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
-                detail: format!(
-                    "GGUF `general.architecture` = `{architecture}` has no verified quantized loader; supported: llama, qwen2, qwen3, qwen3moe, gemma3, phi3"
-                ),
-            });
-        };
+                detail: error.to_string(),
+            }
+        })?;
 
-        let context_length = content
-            .metadata
-            .get(&format!("{}.context_length", family.metadata_prefix()))
-            .and_then(|value| value.to_u32().ok())
-            .map(|value| value as usize)
-            .unwrap_or(DEFAULT_MAX_PROMPT_TOKENS);
+        // Read the context window from the file's *own* architecture namespace
+        // rather than a hardcoded `llama.` prefix, which would silently fall
+        // back to the default window for every other family.
+        let context_length =
+            quantized_lm::context_length(&content).unwrap_or(DEFAULT_MAX_PROMPT_TOKENS);
         let eos_tokens = content
             .metadata
             .get("tokenizer.ggml.eos_token_id")
@@ -2539,30 +2499,65 @@ impl CandleLlmRuntime {
         // when the model already occupies VRAM.
         let device = resolve_gguf_device(alias, root, &content, requested_device)?;
 
+        // The admission check `quantized_lm::from_gguf_with` runs before reading
+        // a tensor, applied here because this crate constructs the concrete
+        // backend itself (see `QuantizedModel`). It is what makes the
+        // CUDA-only, F16/BF16-only `qwen3moe` backend fail at load instead of
+        // at its first expert layer, and it is why that family can stay wired
+        // in the capability table rather than being blanket-refused.
+        //
+        // `use_flash_attn` stays at its default: flash attention is gated
+        // separately by `hardware_strategy`, which this loader never receives,
+        // so `check_flash_attn_support` has nothing to reject.
+        let options = quantized_lm::Options::default();
+        let dtype = options.dtype_for(&device);
+        architecture
+            .check_device_support(&device, dtype)
+            .map_err(|error| CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!("{architecture:?} GGUF backend rejected this checkpoint: {error}"),
+            })?;
         let invalid = |error: candle_core::Error| CandleLlmError::InvalidComponent {
             alias: alias.to_owned(),
             path: root.to_path_buf(),
             component: GGUF_COMPONENT,
             detail: error.to_string(),
         };
-        let model = match family {
-            GgufFamily::Llama => QuantizedModel::Llama(
+        // Mirrors `quantized_lm::from_gguf_with`'s dispatch arm for arm. The
+        // duplication buys exactly one thing — a `Send` model — so it is
+        // deliberately exhaustive rather than a subset with a catch-all: a new
+        // family added upstream must fail the build here instead of silently
+        // becoming "unsupported" at runtime.
+        let model = match architecture {
+            GgufArchitecture::Llama => QuantizedModel::Llama(
                 QuantizedLlama::from_gguf(content, &mut reader, &device).map_err(invalid)?,
             ),
-            GgufFamily::Qwen2 => QuantizedModel::Qwen2(
-                QuantizedQwen2::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            GgufFamily::Qwen3 => QuantizedModel::Qwen3(
-                QuantizedQwen3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            GgufFamily::Gemma3 => QuantizedModel::Gemma3(
+            GgufArchitecture::Gemma3 => QuantizedModel::Gemma3(
                 QuantizedGemma3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
             ),
-            // `use_flash_attn: false` — flash attention is CUDA-only and is
-            // gated separately by `hardware_strategy`, which this loader never
-            // receives.
-            GgufFamily::Phi3 => QuantizedModel::Phi3(
-                QuantizedPhi3::from_gguf(false, content, &mut reader, &device).map_err(invalid)?,
+            GgufArchitecture::Glm4 => QuantizedModel::Glm4(
+                QuantizedGlm4::from_gguf(content, &mut reader, &device, dtype).map_err(invalid)?,
+            ),
+            GgufArchitecture::Lfm2 => QuantizedModel::Lfm2(
+                QuantizedLfm2::from_gguf(content, &mut reader, &device).map_err(invalid)?,
+            ),
+            GgufArchitecture::Phi2 => QuantizedModel::Phi2(
+                QuantizedPhi2::from_gguf(content, &mut reader, &device).map_err(invalid)?,
+            ),
+            GgufArchitecture::Phi3 => QuantizedModel::Phi3(
+                QuantizedPhi3::from_gguf(options.use_flash_attn, content, &mut reader, &device)
+                    .map_err(invalid)?,
+            ),
+            GgufArchitecture::Qwen2 => QuantizedModel::Qwen2(
+                QuantizedQwen2::from_gguf(content, &mut reader, &device).map_err(invalid)?,
+            ),
+            GgufArchitecture::Qwen3 => QuantizedModel::Qwen3(
+                QuantizedQwen3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
+            ),
+            GgufArchitecture::Qwen3Moe => QuantizedModel::Qwen3Moe(
+                QuantizedQwen3Moe::from_gguf(content, &mut reader, &device, dtype)
+                    .map_err(invalid)?,
             ),
         };
 
@@ -3222,11 +3217,7 @@ impl CandleLlmRuntime {
             .unwrap_or(0)
             .saturating_sub(1);
         let mut emitted = 0usize;
-        let mut decode = |ids: &[u32]| self.decode_generated(ids);
-        let mut decoder = IncrementalDecoder::new(
-            self.windowed_detokenization,
-            self.min_retained_detokenize_bytes,
-        );
+        let mut decoder = IncrementalDecoder::new(&self.tokenizer);
 
         while generated.len() < request.max_new_tokens
             && context_ids.len() < self.limits.max_position_embeddings
@@ -3249,7 +3240,9 @@ impl CandleLlmRuntime {
                 context_ids.push(target_token);
                 generated.push(target_token);
 
-                decoder.push(&mut decode, &generated)?;
+                decoder.push(target_token).map_err(|error| {
+                    self.execution_error(format!("failed to decode token: {error}"))
+                })?;
                 let text = decoder.text();
                 if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
                     emit_delta(on_token, text, &mut emitted, stop_at);
@@ -3712,14 +3705,14 @@ impl CandleLlmRuntime {
         // single-sequence loops carry one: the stop check needs the decoded
         // text on every step, and re-decoding each row in full would be O(n²)
         // per row.
-        let mut decode = |ids: &[u32]| self.decode_generated(ids);
+        //
+        // `IncrementalDecoder::new` clones the tokenizer and re-resolves its
+        // decoder context, so this is `batch` clones of the vocabulary per
+        // call. Reported upstream — the constructor has no borrowing or
+        // `Arc`-sharing form — and accepted for now: it is a fixed cost at the
+        // head of a generation that then runs hundreds of forward passes.
         let mut decoders = (0..batch)
-            .map(|_| {
-                IncrementalDecoder::new(
-                    self.windowed_detokenization,
-                    self.min_retained_detokenize_bytes,
-                )
-            })
+            .map(|_| IncrementalDecoder::new(&self.tokenizer))
             .collect::<Vec<_>>();
         let mut done = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
@@ -3768,7 +3761,9 @@ impl CandleLlmRuntime {
                 }
                 generated[row].push(next);
                 next_tokens[row] = next;
-                decoders[row].push(&mut decode, &generated[row])?;
+                decoders[row].push(next).map_err(|error| {
+                    self.execution_error(format!("failed to decode token for row {row}: {error}"))
+                })?;
                 if eos_tokens.contains(&next)
                     || find_earliest_stop(decoders[row].text(), &requests[row].stop).is_some()
                 {
@@ -3855,11 +3850,7 @@ impl CandleLlmRuntime {
         // Detokenize incrementally: re-decoding `generated` in full on every
         // step is O(n²) in the generated length, which only became worth fixing
         // once generation budgets moved past a few hundred tokens.
-        let mut decode = |ids: &[u32]| self.decode_generated(ids);
-        let mut decoder = IncrementalDecoder::new(
-            self.windowed_detokenization,
-            self.min_retained_detokenize_bytes,
-        );
+        let mut decoder = IncrementalDecoder::new(&self.tokenizer);
         for step in 0..request.max_new_tokens {
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
@@ -3881,7 +3872,9 @@ impl CandleLlmRuntime {
             }
             generated.push(next);
 
-            decoder.push(&mut decode, &generated)?;
+            decoder.push(next).map_err(|error| {
+                self.execution_error(format!("failed to decode token: {error}"))
+            })?;
             let text = decoder.text();
             // A matched stop ends the decode: emit up to (not including) it.
             if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
@@ -4309,186 +4302,6 @@ fn sanitize_stop(stop: Option<Vec<String>>) -> Vec<String> {
 
 /// Byte offset of the earliest stop sequence in `text`, or `None`. The offset
 /// is a substring-match start, so it always lands on a UTF-8 codepoint boundary.
-/// Tokens the re-decoded window may reach before the decoder tries to
-/// re-anchor, and how many it keeps afterwards. Both are token counts: a
-/// handful is far more than any single multi-token character needs, and keeping
-/// the window bounded is what makes the per-step decode O(1) instead of O(n).
-const DETOKENIZE_WINDOW_TOKENS: usize = 32;
-const DETOKENIZE_KEEP_TOKENS: usize = 16;
-
-/// Whether a tokenizer's decoder can be trusted to only revise text near the
-/// end of a sequence — the property [`IncrementalDecoder`]'s sliding window
-/// depends on.
-///
-/// The window's suffix check proves the shortened decode matches *now*; it does
-/// not prove a future token cannot rewrite text before the anchor. A decoder
-/// applying a regex replacement can do exactly that: with a pattern like `a+b`,
-/// a long run of `a` re-anchors happily and a later `b` rewrites the whole run,
-/// which the frozen prefix would never see. So decoders without a bounded
-/// context keep whole-sequence decoding and simply pay the quadratic cost.
-///
-/// The decoder is inspected through its serialized form rather than its Rust
-/// type, because `tokenizers` keeps the interesting fields private. Anything
-/// unrecognized is treated as unbounded: a wrong "safe" answer corrupts output,
-/// while a wrong "unsafe" one only costs speed.
-fn decoder_has_bounded_context(tokenizer: &Tokenizer) -> bool {
-    // No decoder at all means tokens map straight back to their strings.
-    let Some(decoder) = tokenizer.get_decoder() else {
-        return true;
-    };
-    serde_json::to_value(decoder).is_ok_and(|value| decoder_node_is_bounded(&value))
-}
-
-/// Longest literal `Replace` pattern anywhere in a tokenizer's decoder, in
-/// bytes. A replacement can only rewrite text within that reach, so it is the
-/// context the sliding window has to retain to stay correct.
-fn decoder_max_literal_replace_len(tokenizer: &Tokenizer) -> usize {
-    fn walk(node: &serde_json::Value) -> usize {
-        match node.get("type").and_then(serde_json::Value::as_str) {
-            Some("Sequence") => node
-                .get("decoders")
-                .and_then(serde_json::Value::as_array)
-                .map(|stages| stages.iter().map(walk).max().unwrap_or(0))
-                .unwrap_or(0),
-            Some("Replace") => node
-                .get("pattern")
-                .and_then(|pattern| pattern.get("String"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::len)
-                .unwrap_or(0),
-            _ => 0,
-        }
-    }
-    tokenizer
-        .get_decoder()
-        .and_then(|decoder| serde_json::to_value(decoder).ok())
-        .map(|value| walk(&value))
-        .unwrap_or(0)
-}
-
-/// The serialized-decoder walk behind [`decoder_has_bounded_context`], split
-/// out so the rule can be tested against the shapes `tokenizers` emits without
-/// building a whole tokenizer for each one.
-fn decoder_node_is_bounded(node: &serde_json::Value) -> bool {
-    let Some(kind) = node.get("type").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    match kind {
-        // Composite: safe only if every stage is.
-        "Sequence" => node
-            .get("decoders")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|stages| stages.iter().all(decoder_node_is_bounded)),
-        // A literal pattern can only rewrite as far back as its own length; a
-        // regex is unbounded by construction. The length itself is checked at
-        // re-anchor time against the retained tail — classifying every literal
-        // as safe here would let a pattern longer than the tail complete a
-        // match that begins in the frozen prefix.
-        "Replace" => node
-            .get("pattern")
-            .and_then(|pattern| pattern.get("String"))
-            .is_some(),
-        "ByteLevel" | "BPEDecoder" | "WordPiece" | "Metaspace" | "CTC" | "Fuse" | "Strip"
-        | "ByteFallback" => true,
-        _ => false,
-    }
-}
-
-/// Streaming detokenizer that keeps a decode loop linear in the number of
-/// generated tokens.
-///
-/// A BPE/SentencePiece decode is not the concatenation of its tokens' decodes:
-/// a multi-byte character can span several tokens, and decoding a sub-sequence
-/// can gain or lose a leading space. Re-decoding the whole sequence on every
-/// step is therefore the correct-but-quadratic thing to do — at 256 tokens it
-/// is invisible, at several thousand it is thousands of redundant decodes.
-///
-/// This keeps a bounded trailing *window* of tokens, re-decodes only that, and
-/// appends the difference against the previous window decode — so a
-/// sub-sequence artifact appears in both decodes and cancels out. The window is
-/// re-anchored only when the shorter decode is verifiably a suffix of the
-/// current one, so a tokenizer that never offers a clean split simply keeps a
-/// growing window and degrades to the old whole-sequence behaviour rather than
-/// corrupting output.
-///
-/// Invariant: `text` always ends with `window_text`, and `text` equals what
-/// decoding the whole token sequence would produce.
-#[derive(Default)]
-struct IncrementalDecoder {
-    /// `false` keeps the window anchored at zero, i.e. whole-sequence decoding
-    /// on every step — the correct fallback for a decoder whose context is not
-    /// provably bounded. See [`decoder_has_bounded_context`].
-    windowed: bool,
-    text: String,
-    /// Index into the caller's generated-token vector where the window starts.
-    window_start: usize,
-    /// Cached decode of `generated[window_start..]`.
-    window_text: String,
-    /// Token count at which re-anchoring may be attempted again. Without this,
-    /// a sequence that never admits a clean split would pay a second decode on
-    /// every single step — worse than the behaviour being replaced.
-    anchor_retry_at: usize,
-    /// Bytes of decoded text the retained tail must keep for a literal
-    /// replacement in the decoder to be unable to reach past it. Zero when the
-    /// decoder performs no literal replacement.
-    min_retained_bytes: usize,
-}
-
-impl IncrementalDecoder {
-    fn new(windowed: bool, min_retained_bytes: usize) -> Self {
-        Self {
-            windowed,
-            min_retained_bytes,
-            ..Self::default()
-        }
-    }
-
-    fn text(&self) -> &str {
-        &self.text
-    }
-
-    /// Absorb the token that was just pushed onto `generated`.
-    fn push(
-        &mut self,
-        decode: &mut impl FnMut(&[u32]) -> Result<String, CandleLlmError>,
-        generated: &[u32],
-    ) -> Result<(), CandleLlmError> {
-        let window = decode(&generated[self.window_start..])?;
-        match window.strip_prefix(self.window_text.as_str()) {
-            Some(delta) => self.text.push_str(delta),
-            None => {
-                // The new token revised text already inside the window — a
-                // byte-level BPE completing a multi-byte character, say. `text`
-                // ends with the old window by construction, so replacing that
-                // suffix restores the invariant exactly.
-                let prefix_len = self.text.len() - self.window_text.len();
-                self.text.truncate(prefix_len);
-                self.text.push_str(&window);
-            }
-        }
-        self.window_text = window;
-
-        let window_tokens = generated.len() - self.window_start;
-        if self.windowed
-            && window_tokens > DETOKENIZE_WINDOW_TOKENS
-            && generated.len() >= self.anchor_retry_at
-        {
-            let next_start = generated.len() - DETOKENIZE_KEEP_TOKENS;
-            let tail = decode(&generated[next_start..])?;
-            // The tail must be long enough that a literal replacement starting
-            // inside the frozen prefix cannot complete within it — otherwise a
-            // later token triggers a rewrite the window can no longer see.
-            if tail.len() >= self.min_retained_bytes && self.window_text.ends_with(&tail) {
-                self.window_start = next_start;
-                self.window_text = tail;
-            } else {
-                self.anchor_retry_at = generated.len() + DETOKENIZE_KEEP_TOKENS;
-            }
-        }
-        Ok(())
-    }
-}
-
 fn find_earliest_stop(text: &str, stop: &[String]) -> Option<usize> {
     stop.iter()
         .filter_map(|needle| text.find(needle.as_str()))
@@ -4915,40 +4728,7 @@ fn gguf_file_path(alias: &str, root: &Path) -> Result<PathBuf, CandleLlmError> {
     Ok(path)
 }
 
-/// GGML block types the pinned candle fork can actually multiply on a CUDA
-/// device.
-///
-/// The list mirrors the `dtype` matches in
-/// `candle-core/src/quantized/cuda.rs` (`dequantize_mul_mat_vec`,
-/// `mul_mat_vec_via_q8_1`, `mul_mat_via_q8_1`), which is where a GGUF weight
-/// ends up once `QMatMul::from_arc` keeps it as a `QTensor`. `F32`/`F16`/`BF16`
-/// are included for a different reason: `from_arc` dequantizes those into a
-/// dense `Tensor` instead, so they never reach a quantized kernel at all.
-///
-/// `Q8_1` and `Q8K` are deliberately absent. Both parse and both have CUDA
-/// *dequantize* kernels, but neither has a CUDA quantized-matmul kernel, so a
-/// checkpoint carrying them would load onto the GPU and then fail at the first
-/// decode step with candle's generic "unsupported dtype for quantized matmul".
-const fn gguf_dtype_has_cuda_matmul_kernel(dtype: GgmlDType) -> bool {
-    matches!(
-        dtype,
-        GgmlDType::F32
-            | GgmlDType::F16
-            | GgmlDType::BF16
-            | GgmlDType::Q4_0
-            | GgmlDType::Q4_1
-            | GgmlDType::Q5_0
-            | GgmlDType::Q5_1
-            | GgmlDType::Q8_0
-            | GgmlDType::Q2K
-            | GgmlDType::Q3K
-            | GgmlDType::Q4K
-            | GgmlDType::Q5K
-            | GgmlDType::Q6K
-    )
-}
-
-/// The first tensor in a checkpoint that CUDA cannot multiply, plus how
+/// The first tensor in a checkpoint the target device cannot multiply, plus how
 /// widespread the problem is.
 struct UnsupportedGgufDtypes {
     tensor: String,
@@ -4957,18 +4737,27 @@ struct UnsupportedGgufDtypes {
     total: usize,
 }
 
-/// Scan a GGUF checkpoint for block types with no CUDA quantized-matmul kernel.
+/// Scan a GGUF checkpoint for block types the target device has no
+/// quantized-matmul kernel for.
 ///
-/// Kept separate from device selection so the rule is unit-testable on a
-/// CUDA-less build, which is where the default CI matrix runs.
-fn unsupported_gguf_cuda_dtypes(content: &gguf_file::Content) -> Option<UnsupportedGgufDtypes> {
+/// The per-dtype rule lives in candle (`GgmlDType::supports_matmul`), not here:
+/// an earlier revision of this loader carried a hand-copied table of the CUDA
+/// kernel coverage, which is exactly the kind of thing that rots silently when
+/// the backend gains or loses a kernel. Today the only gap on an accelerator is
+/// `Q8_1`/`Q8K` — both parse and both have dequantize kernels, but neither has a
+/// CUDA or Metal matmul kernel, so a checkpoint carrying them would upload to
+/// the GPU and then fail at the first decode step.
+fn unsupported_gguf_matmul_dtypes(
+    content: &gguf_file::Content,
+    device: &Device,
+) -> Option<UnsupportedGgufDtypes> {
     // Sorted so a mixed-quant checkpoint always reports the same offending
     // tensor: `tensor_infos` is a hash map, and an arbitrary pick would make
     // the error message differ run to run for the same file.
     let mut unsupported = content
         .tensor_infos
         .iter()
-        .filter(|(_, info)| !gguf_dtype_has_cuda_matmul_kernel(info.ggml_dtype))
+        .filter(|(_, info)| !info.ggml_dtype.supports_matmul(device))
         .map(|(name, info)| (name.as_str(), info.ggml_dtype))
         .collect::<Vec<_>>();
     unsupported.sort_unstable_by_key(|(name, _)| *name);
@@ -5011,17 +4800,16 @@ fn new_metal_device(alias: &str, root: &Path) -> Result<Device, CandleLlmError> 
 ///
 /// `cpu` (the default) keeps the historical host-side quantized path. Any other
 /// request resolves a device first and only *then* checks block types, because
-/// the block-type restriction is a property of the CUDA kernels, not of the
-/// checkpoint: `Device::cuda_if_available` follows the runtime's existing
-/// convention of falling back to `Device::Cpu` when no physical GPU is present,
-/// and a checkpoint that lands on that fallback runs through the host kernels,
-/// which support every block type. Scanning before resolving would reject a
-/// perfectly runnable model on a `candle-cuda` build that happens to have no
-/// GPU attached.
+/// matmul coverage is a property of the resolved backend, not of the checkpoint:
+/// `Device::cuda_if_available` follows the runtime's existing convention of
+/// falling back to `Device::Cpu` when no physical GPU is present, and the CPU
+/// backend implements `vec_dot` for every block type. Scanning before resolving
+/// would reject a perfectly runnable model on a `candle-cuda` build that happens
+/// to have no GPU attached.
 ///
-/// The scan still runs before any weights are uploaded, so a checkpoint CUDA
-/// cannot execute fails at load rather than at the first decode step with VRAM
-/// already claimed.
+/// The scan still runs before any weights are uploaded, so a checkpoint the
+/// device cannot execute fails at load rather than at the first decode step with
+/// VRAM already claimed.
 fn resolve_gguf_device(
     alias: &str,
     root: &Path,
@@ -5032,64 +4820,56 @@ fn resolve_gguf_device(
         return Ok(Device::Cpu);
     }
 
-    // Metal takes its own path: candle's Metal quantized backend covers *every*
-    // GGML block type — including `Q8_1` and `Q8K`, which CUDA can dequantize
-    // but not multiply — so the block-type scan below does not apply to it.
-    if requested_device == "metal" {
-        if !cfg!(feature = "candle-metal") {
+    let device = match requested_device {
+        "metal" => {
+            if !cfg!(feature = "candle-metal") {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail:
+                        "GGUF execution on `metal` requires a host built with the `candle-metal` feature; rebuild with it or bind this model to `cpu`"
+                            .to_owned(),
+                });
+            }
+            new_metal_device(alias, root)?
+        }
+        "cuda" | "gpu" => {
+            if !cfg!(feature = "candle-cuda") {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail: format!(
+                        "GGUF execution on `{requested_device}` requires a host built with the `candle-cuda` feature; rebuild with it or bind this model to `cpu`"
+                    ),
+                });
+            }
+            Device::cuda_if_available(0).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: GGUF_COMPONENT,
+                detail: error.to_string(),
+            })?
+        }
+        // Anything else is not a device this loader knows how to reach. Falling
+        // through would upload the weights to CUDA device 0 regardless of what
+        // the operator asked for.
+        other => {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
-                detail:
-                    "GGUF execution on `metal` requires a host built with the `candle-metal` feature; rebuild with it or bind this model to `cpu`"
-                        .to_owned(),
+                detail: format!(
+                    "GGUF execution on `{other}` is not wired; bind this model to `cpu`, `cuda` or `metal`"
+                ),
             });
         }
-        return new_metal_device(alias, root);
-    }
+    };
 
-    // Anything else is not a device this loader knows how to reach. Falling
-    // through would upload the weights to CUDA device 0 regardless of what the
-    // operator asked for.
-    if requested_device != "cuda" && requested_device != "gpu" {
+    if let Some(report) = unsupported_gguf_matmul_dtypes(content, &device) {
         return Err(CandleLlmError::UnsupportedModel {
             alias: alias.to_owned(),
             path: root.to_path_buf(),
             detail: format!(
-                "GGUF execution on `{requested_device}` is not wired; bind this model to `cpu`, `cuda` or `metal`"
-            ),
-        });
-    }
-
-    if !cfg!(feature = "candle-cuda") {
-        return Err(CandleLlmError::UnsupportedModel {
-            alias: alias.to_owned(),
-            path: root.to_path_buf(),
-            detail: format!(
-                "GGUF execution on `{requested_device}` requires a host built with the `candle-cuda` feature; rebuild with it or bind this model to `cpu`"
-            ),
-        });
-    }
-
-    let device =
-        Device::cuda_if_available(0).map_err(|error| CandleLlmError::InvalidComponent {
-            alias: alias.to_owned(),
-            path: root.to_path_buf(),
-            component: GGUF_COMPONENT,
-            detail: error.to_string(),
-        })?;
-    if !device.is_cuda() {
-        // Silent CPU fallback: no CUDA kernel will run, so the block-type
-        // restriction does not apply.
-        return Ok(device);
-    }
-
-    if let Some(report) = unsupported_gguf_cuda_dtypes(content) {
-        return Err(CandleLlmError::UnsupportedModel {
-            alias: alias.to_owned(),
-            path: root.to_path_buf(),
-            detail: format!(
-                "GGUF tensor `{}` uses block type `{:?}`, which has no CUDA quantized-matmul kernel ({} of {} tensors affected); requantize to a K-quant or legacy Q4/Q5/Q8 type, or bind this model to `cpu`",
+                "GGUF tensor `{}` uses block type `{:?}`, which has no quantized-matmul kernel on `{requested_device}` ({} of {} tensors affected); requantize to a K-quant or legacy Q4/Q5/Q8 type, or bind this model to `cpu`",
                 report.tensor, report.dtype, report.affected, report.total
             ),
         });
@@ -6456,26 +6236,82 @@ mod tests {
     }
 
     #[test]
-    fn gguf_families_map_llama_cpp_architecture_strings() {
-        assert_eq!(
-            GgufFamily::from_gguf_architecture("llama"),
-            Some(GgufFamily::Llama)
-        );
-        assert_eq!(
-            GgufFamily::from_gguf_architecture("qwen3"),
-            Some(GgufFamily::Qwen3)
-        );
-        assert_eq!(GgufFamily::from_gguf_architecture("mamba"), None);
-        // Deliberately unwired: the fused expert path is CUDA-only and wants a
-        // F16/BF16 working dtype, so accepting it would load a model that fails
-        // at its first expert layer.
-        assert_eq!(GgufFamily::from_gguf_architecture("qwen3moe"), None);
-        assert!(!ModelArchitecture::Qwen35Moe.supports_format(ModelFormat::Gguf));
+    fn gguf_capability_table_matches_candles_architecture_registry() {
+        // Every architecture this host advertises as GGUF-loadable must resolve
+        // to a backend in candle's registry. The `general.architecture` string
+        // is the join key between the two tables, and it is not always the
+        // host's display name (`qwen3-moe` vs `qwen3moe`), so it is spelled out.
+        for (architecture, gguf_name) in [
+            (ModelArchitecture::Llama, "llama"),
+            (ModelArchitecture::Qwen2, "qwen2"),
+            (ModelArchitecture::Qwen3, "qwen3"),
+            (ModelArchitecture::Qwen35Moe, "qwen3moe"),
+            (ModelArchitecture::Gemma3, "gemma3"),
+            (ModelArchitecture::Phi3, "phi3"),
+        ] {
+            assert!(
+                architecture.supports_format(ModelFormat::Gguf),
+                "{architecture:?} maps to the `{gguf_name}` quantized backend and must accept GGUF"
+            );
+            assert!(
+                GgufArchitecture::from_name(gguf_name).is_some(),
+                "candle no longer registers `{gguf_name}`; {architecture:?} must drop `gguf: true`"
+            );
+        }
 
-        // Each family reads its own metadata namespace; hardcoding `llama.`
-        // would silently fall back to the default context window.
-        assert_eq!(GgufFamily::Qwen3.metadata_prefix(), "qwen3");
-        assert_eq!(GgufFamily::Phi3.metadata_prefix(), "phi3");
+        // Architectures the host knows but candle has no quantized backend for.
+        // Claiming GGUF here would defer the failure to load time.
+        for (architecture, gguf_name) in [
+            (ModelArchitecture::Gemma2, "gemma2"),
+            (ModelArchitecture::Phi4, "phi4"),
+            (ModelArchitecture::DeepSeekV2, "deepseek2"),
+            (ModelArchitecture::Mixtral, "mixtral"),
+        ] {
+            if GgufArchitecture::from_name(gguf_name).is_some() {
+                // `gemma2` aliases onto the gemma3 backend upstream; the host
+                // still declines it because its safetensors config is what
+                // selects the architecture, and it has no quantized loader of
+                // its own here. Nothing to assert beyond "not advertised".
+                continue;
+            }
+            assert!(
+                !architecture.supports_format(ModelFormat::Gguf),
+                "candle has no quantized `{gguf_name}` backend; {architecture:?} must reject GGUF"
+            );
+        }
+
+        // A checkpoint whose `general.architecture` is in neither table.
+        assert!(GgufArchitecture::from_name("mamba").is_none());
+    }
+
+    #[test]
+    fn qwen3_moe_gguf_is_rejected_on_devices_without_a_fused_expert_kernel() {
+        // The host advertises `qwen3moe` for GGUF (see `capabilities`) and
+        // relies on candle's load-time admission check to refuse the bindings
+        // that cannot run it, rather than refusing the format outright and
+        // losing the CUDA binding too.
+        let options = quantized_lm::Options::default();
+        let cpu = Device::Cpu;
+        assert!(
+            GgufArchitecture::Qwen3Moe
+                .check_device_support(&cpu, options.dtype_for(&cpu))
+                .is_err(),
+            "qwen3moe has no CPU expert kernel and must fail at load"
+        );
+        // Families without a fused expert path stay loadable on the host.
+        for architecture in [
+            GgufArchitecture::Llama,
+            GgufArchitecture::Qwen3,
+            GgufArchitecture::Gemma3,
+            GgufArchitecture::Phi3,
+        ] {
+            assert!(
+                architecture
+                    .check_device_support(&cpu, options.dtype_for(&cpu))
+                    .is_ok(),
+                "{architecture:?} must stay loadable on cpu"
+            );
+        }
     }
 
     #[test]
@@ -6901,19 +6737,26 @@ mod tests {
     /// Drive an [`IncrementalDecoder`] over `tokens`, asserting after every step
     /// that it agrees with decoding the whole prefix in one go. Returns the
     /// finished decoder so a caller can inspect its window state.
+    ///
+    /// The decoder itself lives in `candle-transformers` and is tested there;
+    /// what this pins down is the seam — that this runtime's tokenizer and its
+    /// `decode_generated` (which skips special tokens, as the decoder does by
+    /// default) stay interchangeable with the incremental path the generation
+    /// loops actually stream from.
     fn assert_incremental_matches_whole(
+        runtime: &CandleLlmRuntime,
         tokens: &[u32],
-        mut decode: impl FnMut(&[u32]) -> Result<String, CandleLlmError>,
     ) -> IncrementalDecoder {
-        let mut decoder = IncrementalDecoder::new(true, 0);
+        let mut decoder = IncrementalDecoder::new(&runtime.tokenizer);
         let mut generated = Vec::new();
-        let mut decode_for_push = |ids: &[u32]| decode(ids);
         for token in tokens {
             generated.push(*token);
             decoder
-                .push(&mut decode_for_push, &generated)
+                .push(*token)
                 .expect("incremental push should succeed");
-            let whole = decode_for_push(&generated).expect("whole-sequence decode should succeed");
+            let whole = runtime
+                .decode_generated(&generated)
+                .expect("whole-sequence decode should succeed");
             assert_eq!(
                 decoder.text(),
                 whole,
@@ -6922,14 +6765,6 @@ mod tests {
             );
         }
         decoder
-    }
-
-    /// Decode a slice of "byte tokens" the way a byte-level BPE would: bytes are
-    /// concatenated and interpreted as UTF-8, so a character split across
-    /// several tokens only materialises once its last byte arrives.
-    fn decode_byte_tokens(ids: &[u32]) -> Result<String, CandleLlmError> {
-        let bytes = ids.iter().map(|id| *id as u8).collect::<Vec<_>>();
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     #[test]
@@ -7065,107 +6900,44 @@ mod tests {
     }
 
     #[test]
-    fn windowing_is_refused_for_decoders_without_bounded_context() {
-        // Exercises the shipped rule against the shapes `tokenizers` serializes.
-        let bounded = |json: serde_json::Value| decoder_node_is_bounded(&json);
-
-        assert!(bounded(serde_json::json!({"type": "ByteLevel"})));
-        // The SentencePiece-style stack real Llama/Qwen checkpoints ship.
-        assert!(bounded(serde_json::json!({
-            "type": "Sequence",
-            "decoders": [
-                {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
-                {"type": "ByteFallback"},
-                {"type": "Fuse"},
-                {"type": "Strip", "content": " ", "start": 1, "stop": 0},
-            ]
-        })));
-        // A regex replacement can rewrite arbitrarily far back, which is
-        // exactly what the sliding window cannot survive.
-        assert!(!bounded(serde_json::json!({
-            "type": "Replace", "pattern": {"Regex": "a+b"}, "content": "X"
-        })));
-        // One unsafe stage poisons the whole sequence.
-        assert!(!bounded(serde_json::json!({
-            "type": "Sequence",
-            "decoders": [
-                {"type": "ByteLevel"},
-                {"type": "Replace", "pattern": {"Regex": "a+b"}, "content": "X"},
-            ]
-        })));
-        // Unknown decoders are treated as unsafe: a wrong "safe" answer
-        // corrupts output, a wrong "unsafe" one only costs speed.
-        assert!(!bounded(serde_json::json!({"type": "SomethingNew"})));
-    }
-
-    #[test]
-    fn an_unwindowed_decoder_still_matches_the_whole_sequence_decode() {
-        // The fallback must stay correct, just slower: the window never moves.
-        let tokens = (0..80).map(|i| b'a' as u32 + (i % 26)).collect::<Vec<_>>();
-        let mut decoder = IncrementalDecoder::new(false, 0);
-        let mut generated = Vec::new();
-        let mut decode = |ids: &[u32]| decode_byte_tokens(ids);
-        for token in &tokens {
-            generated.push(*token);
-            decoder.push(&mut decode, &generated).expect("push");
-            assert_eq!(
-                decoder.text(),
-                decode_byte_tokens(&generated).expect("whole decode")
-            );
-        }
-        assert_eq!(
-            decoder.window_start, 0,
-            "an unwindowed decoder must never re-anchor"
-        );
-    }
-
-    #[test]
     fn the_fixture_tokenizer_permits_windowing() {
+        // Whole-sequence re-decoding is quadratic in the generated length, and
+        // at a 4096-token budget that is the difference between a linear and a
+        // visibly stalling stream. The decoder falls back to it silently when it
+        // cannot prove the tokenizer's decoder has bounded context, so the
+        // fast path is worth asserting rather than assuming.
         let (runtime, dir) = load_fixture("decoder-bounded");
-        assert!(runtime.windowed_detokenization);
+        assert!(
+            IncrementalDecoder::new(&runtime.tokenizer).is_windowed(),
+            "the fixture tokenizer should take the windowed path"
+        );
         let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn incremental_detokenization_survives_a_character_split_across_tokens() {
-        // U+2705 as three separate byte tokens: the first two decode to a
-        // replacement character that the third retroactively replaces, which is
-        // exactly the case a naive append-the-new-token decoder corrupts.
-        let tokens = [0xE2, 0x9C, 0x85, b'k' as u32, b'!' as u32];
-        let decoder = assert_incremental_matches_whole(&tokens, decode_byte_tokens);
-        assert_eq!(decoder.text(), "✅k!");
-    }
-
-    #[test]
-    fn incremental_detokenization_re_anchors_its_window_on_a_long_run() {
-        // Long enough to cross the re-anchor threshold several times.
-        let tokens = (0..200).map(|i| b'a' as u32 + (i % 26)).collect::<Vec<_>>();
-        let decoder = assert_incremental_matches_whole(&tokens, decode_byte_tokens);
-        assert!(
-            decoder.window_start > 0,
-            "the window should have re-anchored instead of growing with the sequence"
-        );
-        assert!(
-            tokens.len() - decoder.window_start <= DETOKENIZE_WINDOW_TOKENS,
-            "the re-decoded window should stay bounded, got {} tokens",
-            tokens.len() - decoder.window_start
-        );
     }
 
     #[test]
     fn incremental_detokenization_matches_the_model_tokenizer() {
         let (runtime, dir) = load_fixture("incremental-detok");
-        // Long enough that the window has to re-anchor at least once.
-        let prompt = "hello mesh ".repeat(24);
+        // Long enough that the window has to re-anchor several times: the
+        // decoder only attempts one once the window reaches its own threshold,
+        // so a short prompt would pass this test without ever exercising the
+        // step that can lose text.
+        let prompt = "hello mesh ".repeat(96);
         let ids = runtime
             .encode_ids(&prompt)
             .expect("fixture prompt should tokenize");
+        let decoder = assert_incremental_matches_whole(&runtime, &ids);
         assert!(
-            ids.len() > DETOKENIZE_WINDOW_TOKENS,
-            "the fixture prompt must exceed the window budget to be meaningful, got {} tokens",
+            decoder.window_len() < ids.len(),
+            "the re-decoded window should stay bounded instead of growing with the sequence, \
+             got {} of {} tokens",
+            decoder.window_len(),
             ids.len()
         );
-        assert_incremental_matches_whole(&ids, |tokens| runtime.decode_generated(tokens));
+        assert_eq!(
+            decoder.retracted(),
+            0,
+            "text must only ever be emitted once it is settled"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7855,66 +7627,68 @@ mod tests {
     }
 
     #[test]
-    fn gguf_cuda_kernel_coverage_matches_the_pinned_candle_fork() {
-        // Every block type with a `mul_mat*` kernel in the fork's
-        // `quantized/cuda.rs`, plus the dense types `QMatMul` dequantizes.
-        for dtype in [
-            GgmlDType::F32,
-            GgmlDType::F16,
-            GgmlDType::BF16,
-            GgmlDType::Q4_0,
-            GgmlDType::Q4_1,
-            GgmlDType::Q5_0,
-            GgmlDType::Q5_1,
-            GgmlDType::Q8_0,
-            GgmlDType::Q2K,
-            GgmlDType::Q3K,
-            GgmlDType::Q4K,
-            GgmlDType::Q5K,
-            GgmlDType::Q6K,
-        ] {
-            assert!(
-                gguf_dtype_has_cuda_matmul_kernel(dtype),
-                "{dtype:?} has a CUDA quantized-matmul kernel and must be accepted"
-            );
-        }
-        // Both dequantize on CUDA but neither has a quantized-matmul kernel,
-        // so accepting them would move the failure to the first decode step.
-        for dtype in [GgmlDType::Q8_1, GgmlDType::Q8K] {
-            assert!(
-                !gguf_dtype_has_cuda_matmul_kernel(dtype),
-                "{dtype:?} has no CUDA quantized-matmul kernel and must be rejected"
-            );
-        }
+    fn gguf_matmul_scan_never_gates_the_host_path() {
+        // The CPU backend implements `vec_dot` generically for every block
+        // type, so no checkpoint is unrunnable on it — including the two dtypes
+        // an accelerator rejects. This is what lets `resolve_gguf_device` run
+        // one scan against whichever device it resolved, including the silent
+        // `cuda_if_available` fallback to `Device::Cpu`.
+        let content = gguf_header_with_dtypes(&[
+            ("blk.0.attn_q.weight", GgmlDType::Q8K),
+            ("blk.0.attn_k.weight", GgmlDType::Q8_1),
+            ("output_norm.weight", GgmlDType::F32),
+        ]);
+        assert!(
+            unsupported_gguf_matmul_dtypes(&content, &Device::Cpu).is_none(),
+            "the cpu backend multiplies every block type and must never be gated"
+        );
     }
 
+    /// The rejection path needs a real accelerator, so it only runs where one
+    /// exists. The per-dtype rule itself is candle's
+    /// (`GgmlDType::supports_matmul`) rather than a table copied into this
+    /// crate, which is what makes the untested half safe: it cannot drift.
     #[test]
-    fn gguf_cuda_dtype_scan_reports_the_first_offending_tensor() {
+    #[cfg(any(feature = "candle-cuda", feature = "candle-metal"))]
+    fn gguf_matmul_scan_reports_the_first_offending_tensor_on_an_accelerator() {
+        let Some(device) = test_accelerator_device() else {
+            return;
+        };
         let content = gguf_header_with_dtypes(&[
             ("blk.1.ffn_down.weight", GgmlDType::Q8K),
             ("blk.0.attn_q.weight", GgmlDType::Q4K),
             ("blk.0.attn_k.weight", GgmlDType::Q8K),
         ]);
-        let report = unsupported_gguf_cuda_dtypes(&content)
+        let report = unsupported_gguf_matmul_dtypes(&content, &device)
             .expect("a Q8K tensor must be reported as unsupported");
         // Name-sorted, so the same file always names the same tensor.
         assert_eq!(report.tensor, "blk.0.attn_k.weight");
         assert_eq!(report.dtype, GgmlDType::Q8K);
         assert_eq!(report.affected, 2);
         assert_eq!(report.total, 3);
-    }
 
-    #[test]
-    fn gguf_cuda_dtype_scan_accepts_a_k_quant_checkpoint() {
-        let content = gguf_header_with_dtypes(&[
+        let k_quant = gguf_header_with_dtypes(&[
             ("token_embd.weight", GgmlDType::Q6K),
             ("blk.0.attn_q.weight", GgmlDType::Q4K),
             ("output_norm.weight", GgmlDType::F32),
         ]);
         assert!(
-            unsupported_gguf_cuda_dtypes(&content).is_none(),
-            "a Q4_K_M-style checkpoint must be accepted for CUDA"
+            unsupported_gguf_matmul_dtypes(&k_quant, &device).is_none(),
+            "a Q4_K_M-style checkpoint must be accepted on an accelerator"
         );
+    }
+
+    #[cfg(any(feature = "candle-cuda", feature = "candle-metal"))]
+    fn test_accelerator_device() -> Option<Device> {
+        #[cfg(feature = "candle-cuda")]
+        if let Ok(device) = Device::new_cuda(0) {
+            return Some(device);
+        }
+        #[cfg(feature = "candle-metal")]
+        if let Ok(device) = Device::new_metal(0) {
+            return Some(device);
+        }
+        None
     }
 
     #[test]

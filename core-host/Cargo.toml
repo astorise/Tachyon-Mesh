@@ -93,15 +93,15 @@ arc-swap = "1.7"
 axum = "0.8"
 blake3 = "1.5"
 bytes = "1.5"
-candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true, default-features = false }
-candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
+candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-14", version = "0.11.0", optional = true }
+candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-14", version = "0.11.0", optional = true }
+candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-14", version = "0.11.0", optional = true, default-features = false }
+candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-14", version = "0.11.0", optional = true }
+candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-14", version = "0.11.0", optional = true }
 # Standard transformer architectures (Llama family) for running real, uploaded
 # checkpoints. Weights are mmapped from the model directory at runtime — never
 # compiled into the Tachyon artifact.
-candle-transformers = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true, default-features = false }
+candle-transformers = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-14", version = "0.11.0", optional = true, default-features = false }
 parallel-topology = { path = "../crates/parallel-topology", optional = true }
 # Same cudarc version `candle-core`'s CUDA backend already vendors (see
 # Cargo.lock), so this reuses one NCCL binding instead of introducing a
@@ -154,7 +154,13 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 tokio-stream = { version = "0.1", optional = true }
-tokenizers = { version = "0.23.0", optional = true, default-features = false, features = ["fancy-regex"] }
+# Pinned to the same major line the candle fork's workspace uses (0.22). Sharing
+# one `tokenizers` crate version is a hard requirement, not a preference:
+# `candle_transformers::generation::IncrementalDecoder::new` takes a
+# `&tokenizers::Tokenizer`, and a 0.23 copy of that type is a *different* type to
+# the compiler. Bumping this ahead of the fork silently splits the dependency
+# graph in two and breaks the detokenizer seam.
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["fancy-regex"] }
 tower = { version = "0.5", optional = true, features = ["retry", "timeout", "util"] }
 tracing = "0.1"
 utoipa = { version = "5", features = ["axum_extras"] }

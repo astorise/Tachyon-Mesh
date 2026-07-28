@@ -100,29 +100,30 @@ of its tokens' decodes: a multi-byte character can span several tokens (the
 prefix decodes to a replacement character that a later token retroactively
 replaces), and decoding a sub-sequence can gain or lose a leading space.
 
-Windowing is only enabled for tokenizers whose decoder has a *bounded context*.
-The window's suffix check proves the shortened decode matches now; it does not
-prove a future token cannot rewrite text before the anchor, which a decoder
-applying a regex replacement can do. The decoder is inspected through its
-serialized form (its Rust fields are private) and anything unrecognized is
-treated as unbounded — a wrong "safe" answer corrupts output, a wrong "unsafe"
-one only costs speed. Unbounded decoders keep whole-sequence decoding.
+The decoder that solves this is
+`candle_transformers::generation::IncrementalDecoder`, not a local one. It keeps
+a bounded trailing *window* of tokens, re-decodes only that window, and appends
+the difference against the previous window decode — so any sub-sequence artifact
+is present in both decodes and cancels. Windowing is only enabled for tokenizers
+whose decoder has a *bounded context*: the suffix check proves the shortened
+decode matches now, not that a future token cannot rewrite text before the
+anchor, which a decoder applying a regex replacement can do. Unbounded decoders
+degrade to whole-sequence decoding rather than corrupting output.
 
-`IncrementalDecoder` keeps a bounded trailing *window* of tokens
-(`DETOKENIZE_WINDOW_TOKENS`), re-decodes only that window, and appends the
-difference against the previous window decode — so any sub-sequence artifact is
-present in both decodes and cancels. When the new token revises text inside the
-window, the decoder replaces that suffix wholesale instead of appending. The
-window is re-anchored only when the shorter decode is *verifiably* a suffix of
-the current one, so a tokenizer that never offers a clean split keeps a growing
-window and degrades to the old whole-sequence behaviour rather than corrupting
-output; a failed re-anchor backs off so it is not retried every step.
+This runtime shipped that implementation first and then upstreamed it, so what
+remains here is the seam: `IncrementalDecoder::new(&self.tokenizer)` in each of
+the three generation loops, `push(token)` per step, and `text()` — which is
+always equal to a whole-sequence decode — fed to the stop-sequence scan and the
+delta emitter. Emission accounting stays local because the loops hold back a
+`hold` suffix of their own, sized by the longest stop sequence.
 
 The invariant — that the incremental text equals what decoding the whole
 sequence would produce — is asserted step by step in
 `incremental_detokenization_matches_the_model_tokenizer` against the real
-fixture tokenizer, and against a synthetic byte-level tokenizer for the
-split-character case.
+fixture tokenizer. The decoder's own edge cases (characters split across
+tokens, unbounded decoder detection, re-anchoring) are covered upstream in
+candle; what is tested here is that this runtime's tokenizer and its
+`decode_generated` stay interchangeable with the incremental path.
 
 Stop-sequence scanning is deliberately left as a full-text search per step: it
 is also O(n²), but it is a `memchr`-backed substring search over bytes, orders of
@@ -191,29 +192,38 @@ unbounded loop; it is no longer the de-facto regulator of slot occupancy.
 
 ## GGUF Families
 
-The loader dispatches on `general.architecture` to the fork's `quantized_*`
-modules, not just `quantized_llama`:
+Architecture dispatch is candle's, not this crate's:
+`candle_transformers::models::quantized_lm` owns the
+`general.architecture` → backend registry, the per-family metadata namespace,
+and the `(architecture, device, dtype)` admission check. `load_gguf` calls
+`Architecture::from_content`, `quantized_lm::context_length` and
+`Architecture::check_device_support`, so an unsupported family fails with the
+registry's own message and the supported set cannot drift from what candle can
+actually build. Every family in `SUPPORTED_ARCHITECTURES` is reachable —
+`llama`, `gemma`/`gemma2`/`gemma3`/`gemma-embedding`, `glm4`, `lfm2`, `phi2`,
+`phi3`, `qwen2`, `qwen3`, `qwen3moe`.
 
-| `general.architecture` | Module |
-|---|---|
-| `llama` | `quantized_llama` |
-| `qwen2` | `quantized_qwen2` |
-| `qwen3` | `quantized_qwen3` |
-| `qwen3moe` / `qwen3_moe` | `quantized_qwen3_moe` |
-| `gemma3` | `quantized_gemma3` |
-| `phi3` | `quantized_phi3` |
-
-Every module exposes the same `from_gguf(content, reader, device)` /
-`forward(input, index_pos)` pair, so `QuantizedModel` wraps them behind one
-`forward` and the decode loops never learn which family they are driving.
-Adding a family is a `GgufFamily` table entry plus a `QuantizedModel` arm — and
-an `ArchitectureCapabilities` flag, which stays `gguf: false` for families the
-fork has no quantized module for (Gemma2, Phi4), so an unsupported checkpoint
-fails at validation rather than at load.
+What is still local is `QuantizedModel`, an enum over the concrete backends
+rather than the registry's `Box<dyn QuantizedLm>`. The trait has no `Send`
+bound, so the boxed form cannot live in the `Mutex` inside the shared model
+registry even though every concrete backend behind it *is* `Send` — erasing the
+type is what drops the auto trait. Its `match` mirrors
+`quantized_lm::from_gguf_with` arm for arm and is deliberately exhaustive with
+no catch-all, so a family added upstream fails the build here instead of
+silently becoming "unsupported" at runtime. Once `from_gguf` returns
+`Box<dyn QuantizedLm + Send>` the enum goes away.
 
 Metadata keys are architecture-prefixed, so the context-length lookup reads
-`{prefix}.context_length` — hardcoding `llama.` would have silently fallen back
-to the default window for every other family.
+`{architecture}.context_length` through `quantized_lm::arch_metadata` —
+hardcoding `llama.` would have silently fallen back to the default window for
+every other family.
+
+`ArchitectureCapabilities.gguf` stays `false` for families candle has no
+quantized module for (Gemma2, Phi4), so an unsupported checkpoint fails at
+validation rather than at load. `qwen3moe` is `true` despite its fused expert
+path being CUDA-only with an F16/BF16 working dtype: `check_device_support`
+refuses the CPU and Metal bindings at load, whereas refusing the format outright
+would also refuse the CUDA binding, which works.
 
 ### Quantized GGUF on CUDA
 
@@ -225,14 +235,16 @@ tensors on it. This is what makes a 4-bit checkpoint usable on a consumer GPU:
 the safetensors path loads F32 (or BF16 under `paged_attention`), which costs
 4 (or 2) bytes per parameter, while a Q4_K_M GGUF costs roughly half a byte.
 
-Only block types with a CUDA quantized-matmul kernel in the pinned fork are
-accepted: `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2K`, `Q3K`, `Q4K`, `Q5K`,
-`Q6K`, plus `F32`/`F16`/`BF16` (which `QMatMul::from_arc` dequantizes into a
-dense tensor rather than dispatching to a quantized kernel). `Q8_1` and `Q8K`
-dequantize on CUDA but have no matmul kernel, so a checkpoint carrying them is
+Only block types the target device can actually multiply are accepted. The rule
+is `GgmlDType::supports_matmul(&device)` in candle, not a table copied into this
+crate: `Q8_1` and `Q8K` are activation/accumulator formats with dequantize
+kernels but no CUDA or Metal matmul kernel, so a checkpoint carrying them is
 rejected at load — with the offending tensor and block type named — instead of
-failing at the first decode step with VRAM already claimed. A `cpu` binding
-skips the check entirely and keeps the historical host path.
+failing at the first decode step with VRAM already claimed. Everything else
+passes, including `F32`/`F16`/`BF16`, which `QMatMul::from_arc` dequantizes into
+a dense tensor rather than dispatching to a quantized kernel. The CPU backend
+implements `vec_dot` generically for every dtype, so a `cpu` binding is never
+gated.
 
 ### Quantized GGUF on Metal
 
@@ -244,14 +256,17 @@ counterpart here. Only `load_gguf` resolves a Metal device; safetensors families
 still build against `Device::Cpu`, so enabling the feature does not silently
 move them.
 
-Two differences from the CUDA path are worth knowing. First, candle's Metal
-quantized backend covers **every** GGML block type, including `Q8_1` and `Q8K`
-which CUDA can dequantize but not multiply — so the block-type scan does not
-apply to Metal. Second, `metal` does not fall back to the host: an operator
-asking for a device the machine does not have has a configuration error, and
-running on CPU instead would hide it behind a mysterious slowdown. (The CUDA
-path keeps its fallback because that convention predates this loader and the
-parallel engines rely on it.)
+One difference from the CUDA path is worth knowing: `metal` does not fall back
+to the host. An operator asking for a device the machine does not have has a
+configuration error, and running on CPU instead would hide it behind a
+mysterious slowdown. (The CUDA path keeps its fallback because that convention
+predates this loader and the parallel engines rely on it.)
+
+The block-type scan *does* apply to Metal. Metal's quantized backend parses
+every GGML block type and can dequantize all of them, but its matmul kernel
+names cover neither `Q8_1` nor `Q8K` — the mat-vec path reaches them as an
+internal activation format, the mat-mat path used for prefill does not — which
+is why `supports_matmul` gates them on both accelerators alike.
 
 Metal is tracked as a separate gate from CUDA rather than folded into one "GPU"
 flag, so a Metal binding cannot accept a CUDA-only optimization.
@@ -263,9 +278,10 @@ no block-table seam. Accepting any of them for GGUF would silently run ordinary
 quantized attention while reporting the optimization as enabled.
 
 One subtlety: the block-type check runs *after* the device is resolved, not
-before. `Device::cuda_if_available` falls back to `Device::Cpu` when no physical
-GPU is present, and a checkpoint that lands on that fallback executes through the
-host kernels, which support every block type — scanning first would reject a
+before, and against whichever device was resolved.
+`Device::cuda_if_available` falls back to `Device::Cpu` when no physical GPU is
+present, and a checkpoint that lands on that fallback executes through the host
+kernels, which support every block type — scanning first would reject a
 perfectly runnable model on a `candle-cuda` build with no GPU attached.
 
 ## OpenAI-Compatible Upstream Bindings
