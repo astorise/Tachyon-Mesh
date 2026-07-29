@@ -111,11 +111,17 @@ anchor, which a decoder applying a regex replacement can do. Unbounded decoders
 degrade to whole-sequence decoding rather than corrupting output.
 
 This runtime shipped that implementation first and then upstreamed it, so what
-remains here is the seam: `IncrementalDecoder::new(&self.tokenizer)` in each of
-the three generation loops, `push(token)` per step, and `text()` — which is
-always equal to a whole-sequence decode — fed to the stop-sequence scan and the
-delta emitter. Emission accounting stays local because the loops hold back a
-`hold` suffix of their own, sized by the longest stop sequence.
+remains here is the seam: `IncrementalDecoder::from_tokenizer(&self.tokenizer)`
+in each of the three generation loops, `push(token)` per step, and `text()` —
+which is always equal to a whole-sequence decode — fed to the stop-sequence scan
+and the delta emitter. Emission accounting stays local because the loops hold
+back a `hold` suffix of their own, sized by the longest stop sequence.
+
+`from_tokenizer` rather than `new` because `new` clones the tokenizer, and the
+continuous-batching loop needs one decoder per row. Holding the tokenizer by
+reference costs nothing, and the batch loop builds a single decoder and clones
+it per row, so neither the vocabulary copy nor the decoder-context resolution
+is paid `batch` times.
 
 The invariant — that the incremental text equals what decoding the whole
 sequence would produce — is asserted step by step in
@@ -203,15 +209,18 @@ actually build. Every family in `SUPPORTED_ARCHITECTURES` is reachable —
 `llama`, `gemma`/`gemma2`/`gemma3`/`gemma-embedding`, `glm4`, `lfm2`, `phi2`,
 `phi3`, `qwen2`, `qwen3`, `qwen3moe`.
 
-What is still local is `QuantizedModel`, an enum over the concrete backends
-rather than the registry's `Box<dyn QuantizedLm>`. The trait has no `Send`
-bound, so the boxed form cannot live in the `Mutex` inside the shared model
-registry even though every concrete backend behind it *is* `Send` — erasing the
-type is what drops the auto trait. Its `match` mirrors
-`quantized_lm::from_gguf_with` arm for arm and is deliberately exhaustive with
-no catch-all, so a family added upstream fails the build here instead of
-silently becoming "unsupported" at runtime. Once `from_gguf` returns
-`Box<dyn QuantizedLm + Send>` the enum goes away.
+Construction goes through `quantized_lm::from_gguf_with` as well, so no
+per-family dispatch remains in this crate at all — `LoadedModel::Gguf` holds a
+`Mutex<Box<dyn QuantizedLm>>`. An earlier revision could not do this: the trait
+had no `Send` bound, so the boxed form could not live in the shared registry's
+`Mutex` even though every concrete backend behind it is `Send`, and this crate
+carried an enum over the concrete types purely to keep the auto trait. `Send`
+is now on the trait and the enum is gone.
+
+The architecture is still resolved once up front, before handing the file to
+`from_gguf_with`, for one reason: an unrecognized family is a property of the
+checkpoint and has to surface as `UnsupportedModel`, not the `InvalidComponent`
+that every other load failure maps to.
 
 Metadata keys are architecture-prefixed, so the context-length lookup reads
 `{architecture}.context_length` through `quantized_lm::arch_metadata` —
@@ -236,10 +245,10 @@ the safetensors path loads F32 (or BF16 under `paged_attention`), which costs
 4 (or 2) bytes per parameter, while a Q4_K_M GGUF costs roughly half a byte.
 
 Only block types the target device can actually multiply are accepted. The rule
-is `GgmlDType::supports_matmul(&device)` in candle, not a table copied into this
-crate: `Q8_1` and `Q8K` are activation/accumulator formats with dequantize
-kernels but no CUDA or Metal matmul kernel, so a checkpoint carrying them is
-rejected at load — with the offending tensor and block type named — instead of
+is `Device::supports_qmatmul(dtype)` in candle, not a table copied into this
+crate: `Q8_1` and `Q8K` are activation formats rather than weight formats —
+CUDA has no matmul kernel for them at all, and Metal handles them only on the
+mat-vec path — so a checkpoint carrying them is rejected at load — with the offending tensor and block type named — instead of
 failing at the first decode step with VRAM already claimed. Everything else
 passes, including `F32`/`F16`/`BF16`, which `QMatMul::from_arc` dequantizes into
 a dense tensor rather than dispatching to a quantized kernel. The CPU backend
@@ -263,10 +272,12 @@ mysterious slowdown. (The CUDA path keeps its fallback because that convention
 predates this loader and the parallel engines rely on it.)
 
 The block-type scan *does* apply to Metal. Metal's quantized backend parses
-every GGML block type and can dequantize all of them, but its matmul kernel
-names cover neither `Q8_1` nor `Q8K` — the mat-vec path reaches them as an
-internal activation format, the mat-mat path used for prefill does not — which
-is why `supports_matmul` gates them on both accelerators alike.
+every GGML block type and can dequantize all of them, and it even has
+`kernel_mul_mv_q8_1_f32` / `kernel_mul_mv_q8_K_f32` for the mat-vec path. What
+it does not have is the mat-mat equivalent used for prefill, or `get_rows` for
+embedding lookup — both return `UnsupportedDTypeForOp`. A checkpoint stored in
+those dtypes would therefore decode at batch 1 and fail at prefill, which is why
+`supports_qmatmul` gates them on both accelerators alike.
 
 Metal is tracked as a separate gate from CUDA rather than folded into one "GPU"
 flag, so a Metal binding cannot accept a CUDA-only optimization.

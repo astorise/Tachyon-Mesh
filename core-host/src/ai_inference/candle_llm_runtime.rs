@@ -24,19 +24,13 @@ use candle_transformers::models::llama::{
     Cache, Config, Llama, LlamaConfig, LlamaEosToks, LoraConfig, PagedKvCache,
 };
 use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
-use candle_transformers::models::quantized_lm::{self, Architecture as GgufArchitecture};
+use candle_transformers::models::quantized_lm::{
+    self, Architecture as GgufArchitecture, QuantizedLm,
+};
 use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
 use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
 use candle_transformers::models::qwen3_moe::{
     Config as Qwen3MoeConfig, ModelForCausalLM as Qwen3MoeModel,
-};
-use candle_transformers::models::{
-    quantized_gemma3::ModelWeights as QuantizedGemma3,
-    quantized_glm4::ModelWeights as QuantizedGlm4, quantized_lfm2::ModelWeights as QuantizedLfm2,
-    quantized_llama::ModelWeights as QuantizedLlama, quantized_phi::ModelWeights as QuantizedPhi2,
-    quantized_phi3::ModelWeights as QuantizedPhi3, quantized_qwen2::ModelWeights as QuantizedQwen2,
-    quantized_qwen3::ModelWeights as QuantizedQwen3,
-    quantized_qwen3_moe::GGUFQWenMoE as QuantizedQwen3Moe,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -112,45 +106,6 @@ const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const GGUF_EXTENSION: &str = "gguf";
 /// GGUF `general.architecture` value for the Llama family.
 const GGUF_LLAMA_ARCHITECTURE: &str = "llama";
-
-/// A loaded quantized checkpoint, held as a concrete type rather than
-/// `quantized_lm`'s `Box<dyn QuantizedLm>`.
-///
-/// The trait has no `Send` bound, so the boxed form cannot live in the `Mutex`
-/// inside this crate's shared model registry — even though every concrete
-/// backend behind it *is* `Send`. Erasing the type is what drops the auto
-/// trait. Reported upstream; until `from_gguf` returns
-/// `Box<dyn QuantizedLm + Send>` this enum stays, and it is deliberately thin:
-/// the architecture registry, the device/dtype admission check and the
-/// metadata namespace all come from `quantized_lm`, so none of the
-/// drift-prone tables live here any more.
-enum QuantizedModel {
-    Llama(QuantizedLlama),
-    Gemma3(QuantizedGemma3),
-    Glm4(QuantizedGlm4),
-    Lfm2(QuantizedLfm2),
-    Phi2(QuantizedPhi2),
-    Phi3(QuantizedPhi3),
-    Qwen2(QuantizedQwen2),
-    Qwen3(QuantizedQwen3),
-    Qwen3Moe(QuantizedQwen3Moe),
-}
-
-impl QuantizedModel {
-    fn forward(&mut self, input: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
-        match self {
-            Self::Llama(model) => model.forward(input, index_pos),
-            Self::Gemma3(model) => model.forward(input, index_pos),
-            Self::Glm4(model) => model.forward(input, index_pos),
-            Self::Lfm2(model) => model.forward(input, index_pos),
-            Self::Phi2(model) => model.forward(input, index_pos),
-            Self::Phi3(model) => model.forward(input, index_pos),
-            Self::Qwen2(model) => model.forward(input, index_pos),
-            Self::Qwen3(model) => model.forward(input, index_pos),
-            Self::Qwen3Moe(model) => model.forward(input, index_pos),
-        }
-    }
-}
 
 /// Error component label for GGUF load failures.
 const GGUF_COMPONENT: &str = "model.gguf";
@@ -455,6 +410,14 @@ fn is_multimodal_hf_model_type(model_type: &str) -> bool {
 /// A loaded, ready-to-run Llama-family model. Weights are mmapped (safetensors)
 /// or read (GGUF) from the model directory — never copied into the Tachyon
 /// artifact. Shared behind an `Arc` so the runtime stays cheap to clone.
+// The variants are deliberately unbalanced in size: `Safetensors` owns a whole
+// model struct inline while `Gguf` now holds a boxed trait object (it stopped
+// carrying the concrete backend inline when `QuantizedLm` gained `Send`).
+// Boxing the large one, as clippy suggests, would buy nothing here — a
+// `LoadedModel` is built once per loaded model and lives behind an `Arc`, never
+// in an array or a hot copy, so the only effect would be an extra indirection
+// on every forward pass.
+#[allow(clippy::large_enum_variant)]
 enum LoadedModel {
     /// Full-precision safetensors model behind a family-neutral dispatch
     /// boundary. Each family owns its Candle-specific cache semantics here.
@@ -467,7 +430,7 @@ enum LoadedModel {
     /// `index_pos == 0`), so it is guarded by a `Mutex`; the QoS scheduler
     /// already serialises execution per accelerator, so contention is minimal.
     Gguf {
-        model: Mutex<QuantizedModel>,
+        model: Mutex<Box<dyn QuantizedLm>>,
         eos_tokens: Vec<u32>,
         /// Device the quantized weights were uploaded to. `Device::Cpu` for a
         /// `cpu` binding (the historical path); a real CUDA device once the
@@ -2469,10 +2432,13 @@ impl CandleLlmRuntime {
             }
         })?;
 
-        // Validate the architecture up front, so an unsupported family fails
-        // with a clear message rather than a missing-key error inside a loader.
-        // `Architecture::from_content` is the fork's own registry, so this
-        // cannot drift from the set of backends it can actually build.
+        // Resolve the architecture up front even though `from_gguf_with` does it
+        // again internally: an unrecognized family is a property of the
+        // *checkpoint*, so it has to surface as `UnsupportedModel` rather than
+        // the `InvalidComponent` every other load failure maps to. It also
+        // names the backend in the load error below. `Architecture::from_content`
+        // is candle's own registry, so this cannot drift from the set of
+        // backends it can actually build.
         let architecture = GgufArchitecture::from_content(&content).map_err(|error| {
             CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
@@ -2499,67 +2465,25 @@ impl CandleLlmRuntime {
         // when the model already occupies VRAM.
         let device = resolve_gguf_device(alias, root, &content, requested_device)?;
 
-        // The admission check `quantized_lm::from_gguf_with` runs before reading
-        // a tensor, applied here because this crate constructs the concrete
-        // backend itself (see `QuantizedModel`). It is what makes the
-        // CUDA-only, F16/BF16-only `qwen3moe` backend fail at load instead of
-        // at its first expert layer, and it is why that family can stay wired
-        // in the capability table rather than being blanket-refused.
+        // `from_gguf_with` re-reads the architecture and runs the
+        // (architecture, device, dtype) admission check before touching a
+        // tensor. That check is what makes the CUDA-only, F16/BF16-only
+        // `qwen3moe` backend fail at load instead of at its first expert layer,
+        // and it is why that family can stay wired in the capability table
+        // rather than being blanket-refused.
         //
         // `use_flash_attn` stays at its default: flash attention is gated
         // separately by `hardware_strategy`, which this loader never receives,
         // so `check_flash_attn_support` has nothing to reject.
         let options = quantized_lm::Options::default();
-        let dtype = options.dtype_for(&device);
-        architecture
-            .check_device_support(&device, dtype)
-            .map_err(|error| CandleLlmError::UnsupportedModel {
+        let model = quantized_lm::from_gguf_with(content, &mut reader, &device, &options).map_err(
+            |error| CandleLlmError::InvalidComponent {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
-                detail: format!("{architecture:?} GGUF backend rejected this checkpoint: {error}"),
-            })?;
-        let invalid = |error: candle_core::Error| CandleLlmError::InvalidComponent {
-            alias: alias.to_owned(),
-            path: root.to_path_buf(),
-            component: GGUF_COMPONENT,
-            detail: error.to_string(),
-        };
-        // Mirrors `quantized_lm::from_gguf_with`'s dispatch arm for arm. The
-        // duplication buys exactly one thing — a `Send` model — so it is
-        // deliberately exhaustive rather than a subset with a catch-all: a new
-        // family added upstream must fail the build here instead of silently
-        // becoming "unsupported" at runtime.
-        let model = match architecture {
-            GgufArchitecture::Llama => QuantizedModel::Llama(
-                QuantizedLlama::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            GgufArchitecture::Gemma3 => QuantizedModel::Gemma3(
-                QuantizedGemma3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            GgufArchitecture::Glm4 => QuantizedModel::Glm4(
-                QuantizedGlm4::from_gguf(content, &mut reader, &device, dtype).map_err(invalid)?,
-            ),
-            GgufArchitecture::Lfm2 => QuantizedModel::Lfm2(
-                QuantizedLfm2::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            GgufArchitecture::Phi2 => QuantizedModel::Phi2(
-                QuantizedPhi2::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            GgufArchitecture::Phi3 => QuantizedModel::Phi3(
-                QuantizedPhi3::from_gguf(options.use_flash_attn, content, &mut reader, &device)
-                    .map_err(invalid)?,
-            ),
-            GgufArchitecture::Qwen2 => QuantizedModel::Qwen2(
-                QuantizedQwen2::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            GgufArchitecture::Qwen3 => QuantizedModel::Qwen3(
-                QuantizedQwen3::from_gguf(content, &mut reader, &device).map_err(invalid)?,
-            ),
-            GgufArchitecture::Qwen3Moe => QuantizedModel::Qwen3Moe(
-                QuantizedQwen3Moe::from_gguf(content, &mut reader, &device, dtype)
-                    .map_err(invalid)?,
-            ),
-        };
+                component: GGUF_COMPONENT,
+                detail: format!("`{}` backend: {error}", architecture.name()),
+            },
+        )?;
 
         Ok((
             LoadedModel::Gguf {
@@ -3217,7 +3141,7 @@ impl CandleLlmRuntime {
             .unwrap_or(0)
             .saturating_sub(1);
         let mut emitted = 0usize;
-        let mut decoder = IncrementalDecoder::new(&self.tokenizer);
+        let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
 
         while generated.len() < request.max_new_tokens
             && context_ids.len() < self.limits.max_position_embeddings
@@ -3706,14 +3630,11 @@ impl CandleLlmRuntime {
         // text on every step, and re-decoding each row in full would be O(n²)
         // per row.
         //
-        // `IncrementalDecoder::new` clones the tokenizer and re-resolves its
-        // decoder context, so this is `batch` clones of the vocabulary per
-        // call. Reported upstream — the constructor has no borrowing or
-        // `Arc`-sharing form — and accepted for now: it is a fixed cost at the
-        // head of a generation that then runs hundreds of forward passes.
-        let mut decoders = (0..batch)
-            .map(|_| IncrementalDecoder::new(&self.tokenizer))
-            .collect::<Vec<_>>();
+        // Built once and cloned per row: `from_tokenizer` holds the tokenizer
+        // by reference rather than cloning the vocabulary, and cloning a
+        // decoder carries over its resolved decoder context, so neither the
+        // vocabulary copy nor the context resolution is paid `batch` times.
+        let mut decoders = vec![IncrementalDecoder::from_tokenizer(&self.tokenizer); batch];
         let mut done = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
         let max_new_tokens = requests
@@ -3850,7 +3771,7 @@ impl CandleLlmRuntime {
         // Detokenize incrementally: re-decoding `generated` in full on every
         // step is O(n²) in the generated length, which only became worth fixing
         // once generation budgets moved past a few hundred tokens.
-        let mut decoder = IncrementalDecoder::new(&self.tokenizer);
+        let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
         for step in 0..request.max_new_tokens {
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
@@ -4740,7 +4661,7 @@ struct UnsupportedGgufDtypes {
 /// Scan a GGUF checkpoint for block types the target device has no
 /// quantized-matmul kernel for.
 ///
-/// The per-dtype rule lives in candle (`GgmlDType::supports_matmul`), not here:
+/// The per-dtype rule lives in candle (`Device::supports_qmatmul`), not here:
 /// an earlier revision of this loader carried a hand-copied table of the CUDA
 /// kernel coverage, which is exactly the kind of thing that rots silently when
 /// the backend gains or loses a kernel. Today the only gap on an accelerator is
@@ -4757,7 +4678,7 @@ fn unsupported_gguf_matmul_dtypes(
     let mut unsupported = content
         .tensor_infos
         .iter()
-        .filter(|(_, info)| !info.ggml_dtype.supports_matmul(device))
+        .filter(|(_, info)| !device.supports_qmatmul(info.ggml_dtype))
         .map(|(name, info)| (name.as_str(), info.ggml_dtype))
         .collect::<Vec<_>>();
     unsupported.sort_unstable_by_key(|(name, _)| *name);
@@ -6743,11 +6664,11 @@ mod tests {
     /// `decode_generated` (which skips special tokens, as the decoder does by
     /// default) stay interchangeable with the incremental path the generation
     /// loops actually stream from.
-    fn assert_incremental_matches_whole(
-        runtime: &CandleLlmRuntime,
+    fn assert_incremental_matches_whole<'a>(
+        runtime: &'a CandleLlmRuntime,
         tokens: &[u32],
-    ) -> IncrementalDecoder {
-        let mut decoder = IncrementalDecoder::new(&runtime.tokenizer);
+    ) -> IncrementalDecoder<&'a Tokenizer> {
+        let mut decoder = IncrementalDecoder::from_tokenizer(&runtime.tokenizer);
         let mut generated = Vec::new();
         for token in tokens {
             generated.push(*token);
@@ -6908,7 +6829,7 @@ mod tests {
         // fast path is worth asserting rather than assuming.
         let (runtime, dir) = load_fixture("decoder-bounded");
         assert!(
-            IncrementalDecoder::new(&runtime.tokenizer).is_windowed(),
+            IncrementalDecoder::from_tokenizer(&runtime.tokenizer).is_windowed(),
             "the fixture tokenizer should take the windowed path"
         );
         let _ = fs::remove_dir_all(dir);
