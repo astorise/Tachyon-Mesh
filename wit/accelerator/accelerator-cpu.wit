@@ -1,6 +1,15 @@
 package tachyon:accelerator@1.1.0;
 
 interface cpu {
+    /// Token counts for one generation, in the shape OpenAI's `usage` object
+    /// reports them. Both are exact counts from the tokenizer and the decode
+    /// loop — never a re-tokenization of the output text, which would differ
+    /// from the sequence the model actually produced.
+    record token-usage {
+        prompt-tokens: u32,
+        completion-tokens: u32,
+    }
+
     /// A handle to an in-progress streaming generation. The caller pulls decoded
     /// text fragments with `next` until it returns `none`, which signals that
     /// generation is complete. Dropping the handle abandons the generation.
@@ -8,6 +17,14 @@ interface cpu {
         /// Block until the next decoded text fragment is available. Returns
         /// `none` once generation finishes, or an error string if it failed.
         next: func() -> result<option<string>, string>;
+        /// Token counts for this generation, available only after `next` has
+        /// returned `none`: the totals are not known until decoding ends, and
+        /// the last fragment has gone down the stream by then. Returns `none`
+        /// while the generation is still running, and for backends that cannot
+        /// count tokens (a mock, a vendor runner returning text over a pipe) —
+        /// so a caller omits `usage` rather than publishing zeros as if they
+        /// were measured.
+        usage: func() -> option<token-usage>;
     }
 
     load-model: func(name: string) -> result<u32, string>;

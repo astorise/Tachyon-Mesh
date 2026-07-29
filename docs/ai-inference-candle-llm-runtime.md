@@ -196,6 +196,52 @@ stop independently.
 `HOST_MAX_NEW_TOKENS` stays at 4096 as the coarse safety valve against an
 unbounded loop; it is no longer the de-facto regulator of slot occupancy.
 
+## Token Usage
+
+`usage` is reported from the decode loop, never estimated. `prompt_tokens` is
+the tokenizer's own encoding of the prompt; `completion_tokens` is what the loop
+actually appended. Re-tokenizing the output text would have been far easier and
+would have been wrong — a decode of *n* tokens does not re-encode to *n* tokens,
+so the number would have looked plausible and been unfalsifiable.
+
+Getting the count out of the loop is the whole design problem. A decode loop has
+roughly a dozen exits — stop sequence matched, EOS, deadline elapsed, budget
+exhausted, context window full — spread across three loops and fifteen dispatch
+arms, several of them behind `candle-cuda`. Returning the count would have made
+correctness depend on remembering every one. Instead the loops write through a
+`TokenSink`, which carries the emit callback *and* the counters, so the count is
+right at every exit by construction. `record_token` sits beside the one
+`generated.push` in each loop.
+
+The count is not the number of `emit` calls: a token can produce no text (its
+bytes complete a character only once a later token arrives), and text is held
+back while a stop sequence might still match.
+
+### Where usage reaches the client
+
+| Path | Reported | Why |
+|---|---|---|
+| `stream: true` + `stream_options.include_usage` | yes | dedicated channel beside the fragment stream |
+| `stream: true` alone | no | matches OpenAI, whose extra trailing chunk breaks clients that index `choices[0]` |
+| non-streaming | no | runs through the batch scheduler, whose response channel carries decoded bytes only |
+| upstream (`openai:`) binding | when volunteered | read opportunistically from the upstream's own `usage` |
+| mock, vendor | no | nothing to count; `usage` is omitted rather than zeroed |
+
+Counts travel *beside* the token stream, not through it: they are only known
+once decoding ends, by which point the last fragment has already gone down the
+channel. `token-stream.usage()` returns `none` until then. Sending them as a
+final fragment would have made them indistinguishable from model output.
+
+An absent `usage` always means "not measured". Zeros are never published as if
+they were measured — a zero `usage` is a claim that the generation cost nothing,
+and for context-window accounting that is worse than saying nothing.
+
+For upstream bindings the counts are read opportunistically rather than
+requested. OpenAI only emits `usage` on a stream when
+`stream_options.include_usage` is set, but sending that field to an upstream
+that does not recognize it risks a 400 that breaks streaming outright — a bad
+trade for a reporting field.
+
 ## GGUF Families
 
 Architecture dispatch is candle's, not this crate's:

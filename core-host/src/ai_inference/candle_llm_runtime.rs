@@ -482,11 +482,72 @@ enum SingleDeviceBackend {
     DeepSeek(Mutex<DeepSeekModel>),
 }
 
-struct DecodeLoopContext<'a> {
+/// Token counts for one generation, as OpenAI's `usage` object reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub(crate) prompt_tokens: u32,
+    pub(crate) completion_tokens: u32,
+}
+
+/// Where a decode loop sends its text, and what it records about what it sent.
+///
+/// The count lives here rather than in the loops' return type because a decode
+/// loop has a dozen exits — stop sequence matched, EOS, deadline elapsed,
+/// budget exhausted, context window full — spread across three loops and
+/// fifteen dispatch arms. Carrying it on the sink makes the count correct at
+/// every one of them by construction, instead of correct at whichever ones
+/// were remembered.
+struct TokenSink<'a> {
+    emit: &'a mut dyn FnMut(&str),
+    /// Tokens appended to the sequence so far. Not the number of `emit` calls:
+    /// a token can produce no text (its bytes complete a character only once a
+    /// later token arrives), and text is held back while a stop sequence might
+    /// still match.
+    completion_tokens: usize,
+    /// Tokens the prompt encoded to, recorded by whichever entry point
+    /// tokenized it — a fallback (speculative decode declining its draft, say)
+    /// re-enters a different loop with the same prompt.
+    prompt_tokens: usize,
+}
+
+impl<'a> TokenSink<'a> {
+    fn new(emit: &'a mut dyn FnMut(&str)) -> Self {
+        Self {
+            emit,
+            completion_tokens: 0,
+            prompt_tokens: 0,
+        }
+    }
+
+    fn record_prompt_tokens(&mut self, tokens: usize) {
+        self.prompt_tokens = tokens;
+    }
+
+    fn usage(&self) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: self.prompt_tokens as u32,
+            completion_tokens: self.completion_tokens as u32,
+        }
+    }
+
+    fn emit(&mut self, text: &str) {
+        (self.emit)(text);
+    }
+
+    /// Record one token appended to the generated sequence.
+    fn record_token(&mut self) {
+        self.completion_tokens += 1;
+    }
+}
+
+struct DecodeLoopContext<'a, 'sink> {
     request: &'a ParsedGenerationRequest,
     eos_tokens: &'a [u32],
     input_device: &'a Device,
-    on_token: &'a mut dyn FnMut(&str),
+    /// Second lifetime because the sink outlives the borrow of it: the emit
+    /// callback belongs to the caller of the whole generation, not to one
+    /// decode loop.
+    sink: &'a mut TokenSink<'sink>,
 }
 
 /// Model-level `hardware_strategy.paged_attention` state for a Llama
@@ -944,7 +1005,7 @@ impl SingleDeviceBackend {
         request: &ParsedGenerationRequest,
         eos_tokens: &[u32],
         device: &Device,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         match self {
             Self::Llama {
@@ -973,7 +1034,7 @@ impl SingleDeviceBackend {
                                 request,
                                 eos_tokens,
                                 device,
-                                on_token,
+                                sink,
                                 |input, index_pos| {
                                     let seq_len = input.dims2()?.1;
                                     if seq_len != 1 {
@@ -1064,7 +1125,7 @@ impl SingleDeviceBackend {
                             request,
                             eos_tokens,
                             device,
-                            on_token,
+                            sink,
                             |input, index_pos| {
                                 paged_llama_forward(
                                     &model,
@@ -1090,7 +1151,7 @@ impl SingleDeviceBackend {
                                 request,
                                 eos_tokens,
                                 input_device: device,
-                                on_token,
+                                sink,
                             },
                             |input, index_pos| model.forward(input, index_pos, &mut cache),
                         )
@@ -1107,7 +1168,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1121,7 +1182,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1135,7 +1196,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1149,7 +1210,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1163,7 +1224,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1177,7 +1238,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1191,7 +1252,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos),
                 )
             }
@@ -2975,12 +3036,12 @@ impl CandleLlmRuntime {
         .map(Some)
     }
 
-    fn generate_with_adapter_streaming(
+    fn stream_with_adapter_into(
         &self,
         prompts: &[&[u8]],
         adapter_id: &str,
         adapter_path: &Path,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         if prompts.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
@@ -3015,6 +3076,7 @@ impl CandleLlmRuntime {
                 detail: "prompt produced no tokens to condition on".to_owned(),
             });
         }
+        sink.record_prompt_tokens(prompt_ids.len());
 
         let LoadedModel::Safetensors {
             backend,
@@ -3090,7 +3152,7 @@ impl CandleLlmRuntime {
             request,
             eos_tokens,
             device,
-            on_token,
+            sink,
             |input, index_pos| model.forward(input, index_pos, &mut cache),
         );
         let reset =
@@ -3119,14 +3181,56 @@ impl CandleLlmRuntime {
     }
 
     /// Streaming generation: identical decoding to [`generate`], but each newly
-    /// decoded, stop-trimmed text fragment is handed to `on_token` as it is
-    /// produced. The concatenation of every `on_token` fragment equals the
+    /// decoded, stop-trimmed text fragment is handed to `sink` as it is
+    /// produced. The concatenation of every `sink` fragment equals the
     /// buffered `generate` output. Used by the streaming accelerator path so a
     /// caller can forward tokens to the client as they arrive.
+    /// Stream a prompt's decoded output, invoking `on_token` for each text
+    /// fragment, and report what the generation cost in tokens.
+    ///
+    /// The counts are exact: `prompt_tokens` is the tokenizer's own encoding of
+    /// the prompt and `completion_tokens` is what the decode loop actually
+    /// appended — not a re-tokenization of the output text, which would differ
+    /// from the sequence the model produced and would be wrong to publish as
+    /// `usage`.
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
         on_token: &mut dyn FnMut(&str),
+    ) -> Result<TokenUsage, CandleLlmError> {
+        let mut sink = TokenSink::new(on_token);
+        self.stream_into(prompts, &mut sink)?;
+        Ok(sink.usage())
+    }
+
+    pub(crate) fn generate_speculative_streaming(
+        &self,
+        prompts: &[&[u8]],
+        draft: &Self,
+        draft_tokens: usize,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<TokenUsage, CandleLlmError> {
+        let mut sink = TokenSink::new(on_token);
+        self.stream_speculative_into(prompts, draft, draft_tokens, &mut sink)?;
+        Ok(sink.usage())
+    }
+
+    fn generate_with_adapter_streaming(
+        &self,
+        prompts: &[&[u8]],
+        adapter_id: &str,
+        adapter_path: &Path,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<TokenUsage, CandleLlmError> {
+        let mut sink = TokenSink::new(on_token);
+        self.stream_with_adapter_into(prompts, adapter_id, adapter_path, &mut sink)?;
+        Ok(sink.usage())
+    }
+
+    fn stream_into(
+        &self,
+        prompts: &[&[u8]],
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         if prompts.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
@@ -3163,19 +3267,20 @@ impl CandleLlmRuntime {
                 detail: "prompt produced no tokens to condition on".to_owned(),
             });
         }
+        sink.record_prompt_tokens(prompt_ids.len());
 
-        self.decode(&prompt_ids, request, on_token)
+        self.decode(&prompt_ids, request, sink)
     }
 
-    pub(crate) fn generate_speculative_streaming(
+    fn stream_speculative_into(
         &self,
         prompts: &[&[u8]],
         draft: &Self,
         draft_tokens: usize,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         if prompts.len() != 1 || !self.has_compatible_tokenizer(draft) {
-            return self.generate_streaming(prompts, on_token);
+            return self.stream_into(prompts, sink);
         }
         // Verification (`greedy_next_token_id`/`last_logits`) always builds a
         // fresh contiguous `Cache` from `self`'s already-loaded model, which
@@ -3185,11 +3290,11 @@ impl CandleLlmRuntime {
         // yet, so fall back to plain generation for either side — the same
         // pattern this function already uses for an incompatible tokenizer.
         if self.is_paged_attention_enabled() || draft.is_paged_attention_enabled() {
-            return self.generate_streaming(prompts, on_token);
+            return self.stream_into(prompts, sink);
         }
         let request = self.parse_request(prompts[0])?;
         if !request.sampling.is_greedy() || request.fsm.is_some() {
-            return self.generate_streaming(prompts, on_token);
+            return self.stream_into(prompts, sink);
         }
         let prompt_ids = self.encode_ids(&request.prompt)?;
         if prompt_ids.is_empty() {
@@ -3198,6 +3303,7 @@ impl CandleLlmRuntime {
                 detail: "prompt produced no tokens to condition on".to_owned(),
             });
         }
+        sink.record_prompt_tokens(prompt_ids.len());
 
         let draft_tokens = draft_tokens.max(1);
         let mut context_ids = prompt_ids.clone();
@@ -3232,21 +3338,22 @@ impl CandleLlmRuntime {
                 };
                 context_ids.push(target_token);
                 generated.push(target_token);
+                sink.record_token();
 
                 decoder.push(target_token).map_err(|error| {
                     self.execution_error(format!("failed to decode token: {error}"))
                 })?;
                 let text = decoder.text();
                 if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
-                    emit_delta(on_token, text, &mut emitted, stop_at);
+                    emit_delta(sink, text, &mut emitted, stop_at);
                     return Ok(());
                 }
                 if self.is_eos_token(target_token) {
-                    emit_delta(on_token, text, &mut emitted, text.len());
+                    emit_delta(sink, text, &mut emitted, text.len());
                     return Ok(());
                 }
                 let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
-                emit_delta(on_token, text, &mut emitted, safe);
+                emit_delta(sink, text, &mut emitted, safe);
 
                 if target_token != proposed_token
                     || generated.len() == request.max_new_tokens
@@ -3259,7 +3366,7 @@ impl CandleLlmRuntime {
 
         let text = decoder.text();
         let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
-        emit_delta(on_token, text, &mut emitted, end);
+        emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
 
@@ -3437,7 +3544,7 @@ impl CandleLlmRuntime {
         &self,
         prompt_ids: &[u32],
         request: &ParsedGenerationRequest,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         // Every arm resolves its own device from the loaded weights: there is
         // no longer a CPU default to fall back on now that GGUF can live on a
@@ -3448,7 +3555,7 @@ impl CandleLlmRuntime {
                 eos_tokens,
             } => {
                 let device = backend.device();
-                backend.decode(self, prompt_ids, request, eos_tokens, &device, on_token)
+                backend.decode(self, prompt_ids, request, eos_tokens, &device, sink)
             }
             LoadedModel::Gguf {
                 model,
@@ -3463,7 +3570,7 @@ impl CandleLlmRuntime {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| guard.forward(input, index_pos),
                 )
             }
@@ -3488,7 +3595,7 @@ impl CandleLlmRuntime {
                         request,
                         eos_tokens,
                         primary,
-                        on_token,
+                        sink,
                         |input, index_pos| model.forward(input, index_pos, &mut cache),
                     )
                 }
@@ -3513,7 +3620,7 @@ impl CandleLlmRuntime {
                         request,
                         eos_tokens,
                         primary,
-                        on_token,
+                        sink,
                         |input, index_pos| {
                             model.forward_at(index_pos, input, &transports, &mut caches)
                         },
@@ -3540,7 +3647,7 @@ impl CandleLlmRuntime {
                         request,
                         eos_tokens,
                         primary,
-                        on_token,
+                        sink,
                         |input, index_pos| model.forward(input, index_pos, &mut cache),
                     )
                 }
@@ -3554,7 +3661,7 @@ impl CandleLlmRuntime {
     /// token is drawn by the request's `LogitsProcessor`; decoding halts on EOS,
     /// the token budget, the context window, or a matched stop sequence.
     ///
-    /// Decoded text is streamed through `on_token` as it is produced. To honour
+    /// Decoded text is streamed through `sink` as it is produced. To honour
     /// stop sequences without leaking a partial match, the tail of the decoded
     /// text within one stop-length of the end is held back until a further token
     /// confirms it is safe to emit (or the decode ends).
@@ -3564,7 +3671,7 @@ impl CandleLlmRuntime {
         request: &ParsedGenerationRequest,
         eos_tokens: &[u32],
         input_device: &Device,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(), CandleLlmError> {
         let device = input_device;
@@ -3581,7 +3688,7 @@ impl CandleLlmRuntime {
                 request,
                 eos_tokens,
                 input_device,
-                on_token,
+                sink,
             },
             forward,
         )
@@ -3811,14 +3918,14 @@ impl CandleLlmRuntime {
         mut logits: Tensor,
         mut index_pos: usize,
         _prompt_ids: &[u32],
-        context: DecodeLoopContext<'_>,
+        context: DecodeLoopContext<'_, '_>,
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(), CandleLlmError> {
         let DecodeLoopContext {
             request,
             eos_tokens,
             input_device: device,
-            on_token,
+            sink,
         } = context;
         let mut processor = request.sampling.processor();
         let mut fsm_processor = request
@@ -3861,6 +3968,7 @@ impl CandleLlmRuntime {
                 }
             }
             generated.push(next);
+            sink.record_token();
 
             decoder.push(next).map_err(|error| {
                 self.execution_error(format!("failed to decode token: {error}"))
@@ -3868,16 +3976,16 @@ impl CandleLlmRuntime {
             let text = decoder.text();
             // A matched stop ends the decode: emit up to (not including) it.
             if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
-                emit_delta(on_token, text, &mut emitted, stop_at);
+                emit_delta(sink, text, &mut emitted, stop_at);
                 return Ok(());
             }
             if eos_tokens.contains(&next) {
-                emit_delta(on_token, text, &mut emitted, text.len());
+                emit_delta(sink, text, &mut emitted, text.len());
                 return Ok(());
             }
             // No stop yet: emit everything except the held-back tail.
             let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
-            emit_delta(on_token, text, &mut emitted, safe);
+            emit_delta(sink, text, &mut emitted, safe);
 
             if step + 1 == request.max_new_tokens {
                 break;
@@ -3905,7 +4013,7 @@ impl CandleLlmRuntime {
         // Token budget exhausted: flush the held-back tail, trimming any stop.
         let text = decoder.text();
         let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
-        emit_delta(on_token, text, &mut emitted, end);
+        emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
 
@@ -4298,11 +4406,11 @@ fn find_earliest_stop(text: &str, stop: &[String]) -> Option<usize> {
         .min()
 }
 
-/// Emit `text[*emitted..end]` through `on_token` (when non-empty) and advance
+/// Emit `text[*emitted..end]` through `sink` (when non-empty) and advance
 /// `*emitted`. `end` and `*emitted` must be codepoint boundaries.
-fn emit_delta(on_token: &mut dyn FnMut(&str), text: &str, emitted: &mut usize, end: usize) {
+fn emit_delta(sink: &mut TokenSink<'_>, text: &str, emitted: &mut usize, end: usize) {
     if *emitted < end && end <= text.len() {
-        on_token(&text[*emitted..end]);
+        sink.emit(&text[*emitted..end]);
         *emitted = end;
     }
 }
@@ -7013,6 +7121,55 @@ mod tests {
     }
 
     #[test]
+    fn generation_reports_the_tokens_it_actually_used() {
+        let (runtime, dir) = load_fixture("usage-counts");
+        let prompt = "hello mesh";
+        let request = format!(r#"{{"prompt":"{prompt}","max_new_tokens":6}}"#);
+        let mut streamed = String::new();
+        let usage = runtime
+            .generate_streaming(&[request.as_bytes()], &mut |delta| streamed.push_str(delta))
+            .expect("generation should run");
+
+        // `prompt_tokens` is the tokenizer's own encoding, not an estimate.
+        let expected_prompt = runtime
+            .encode_ids(prompt)
+            .expect("fixture prompt should tokenize")
+            .len();
+        assert_eq!(usage.prompt_tokens as usize, expected_prompt);
+        assert!(usage.prompt_tokens > 0);
+
+        // `completion_tokens` is what the decode loop appended — bounded by the
+        // request's budget, and not a re-tokenization of the emitted text,
+        // which can differ from the sequence the model produced.
+        assert!(
+            usage.completion_tokens > 0,
+            "a generation that produced text must report tokens"
+        );
+        assert!(
+            usage.completion_tokens <= 6,
+            "reported {} tokens for a 6-token budget",
+            usage.completion_tokens
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A budget of one token must report exactly one, which is the assertion
+    /// that fails if the counter is wired to the wrong place — an off-by-one in
+    /// the decode loop hides inside a larger budget.
+    #[test]
+    fn a_single_token_generation_reports_one_completion_token() {
+        let (runtime, dir) = load_fixture("usage-single");
+        let usage = runtime
+            .generate_streaming(
+                &[br#"{"prompt":"hello","max_new_tokens":1}"#],
+                &mut |_delta| {},
+            )
+            .expect("generation should run");
+        assert_eq!(usage.completion_tokens, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn the_fixture_tokenizer_permits_windowing() {
         // Whole-sequence re-decoding is quadratic in the generated length, and
         // at a 4096-token budget that is the difference between a linear and a
@@ -8320,6 +8477,24 @@ mod tests {
         assert!(
             !output.is_empty(),
             "cuda-resident Llama generation must not be empty/mocked"
+        );
+
+        // Token counts come from the decode loop, so they are only exercised
+        // on whichever device actually ran it. The CPU tests cover the same
+        // counters; this proves the CUDA-gated dispatch arms forward the sink
+        // rather than dropping it — they are compiled only in this build.
+        let mut streamed = String::new();
+        let usage = runtime
+            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .expect("streaming generation must run on the cuda device");
+        assert_eq!(
+            usage.prompt_tokens as usize,
+            runtime.encode_ids("hello mesh").expect("tokenize").len()
+        );
+        assert!(
+            usage.completion_tokens > 0 && usage.completion_tokens <= 4,
+            "cuda decode reported {} tokens for a 4-token budget",
+            usage.completion_tokens
         );
         let _ = fs::remove_dir_all(dir);
     }

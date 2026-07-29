@@ -27,7 +27,7 @@ pub(crate) mod tensor_parallel_llama;
 #[path = "ai_inference/upstream_openai.rs"]
 mod upstream_openai;
 
-pub(crate) use candle_llm_runtime::detect_tool_call_parser;
+pub(crate) use candle_llm_runtime::{detect_tool_call_parser, TokenUsage};
 pub(crate) use upstream_openai::UPSTREAM_SCHEME;
 #[path = "ai_inference/vendor_accelerator.rs"]
 mod vendor_accelerator;
@@ -370,7 +370,7 @@ trait BackendModel: Send + Sync {
         &self,
         inputs: &[SharedInputTensor],
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<()> {
+    ) -> Result<TokenUsage> {
         let mut outputs = self.execute(inputs)?;
         if outputs.len() != 1 {
             bail!(
@@ -384,7 +384,10 @@ trait BackendModel: Send + Sync {
         if !text.is_empty() {
             on_token(&text);
         }
-        Ok(())
+        // A backend that cannot decode token-by-token cannot count tokens
+        // either. Zero here means "not reported", and the caller omits `usage`
+        // rather than publishing a fabricated count.
+        Ok(TokenUsage::default())
     }
 
     fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
@@ -746,7 +749,7 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<(), String> {
+    ) -> Result<TokenUsage, String> {
         self.ensure_model_loaded(alias)?;
         let model = {
             let models = self.models.read().expect("model registry lock poisoned");
@@ -2211,7 +2214,7 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<()> {
+    ) -> Result<TokenUsage> {
         match &self.kind {
             CandleBackendModelKind::Upstream(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
@@ -2312,7 +2315,12 @@ impl BackendModel for CandleBackendModel {
                 if !text.is_empty() {
                     on_token(&text);
                 }
-                Ok(())
+                // The mock has no tokenizer, so it reports the only counts it
+                // can defend: whitespace-separated words. Deterministic and
+                // obviously synthetic — enough for the end-to-end test to prove
+                // the numbers reach the client, without pretending to be a real
+                // tokenization.
+                Ok(mock_token_usage(inputs, &text))
             }
             CandleBackendModelKind::Vendor(_) => {
                 let outputs = self.execute(inputs)?;
@@ -2326,9 +2334,27 @@ impl BackendModel for CandleBackendModel {
                 let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default())
                     .map_err(|error| anyhow!("vendor output was not UTF-8: {error}"))?;
                 on_token(&text);
-                Ok(())
+                // A vendor runner returns text over a pipe and never reports
+                // token counts, so there is nothing honest to publish.
+                Ok(TokenUsage::default())
             }
         }
+    }
+}
+
+/// Word counts for the mock backend, which has no tokenizer.
+fn mock_token_usage(inputs: &[SharedInputTensor], output: &str) -> TokenUsage {
+    let prompt_tokens = inputs
+        .first()
+        .map(|input| {
+            String::from_utf8_lossy(&input.data)
+                .split_whitespace()
+                .count()
+        })
+        .unwrap_or(0);
+    TokenUsage {
+        prompt_tokens: prompt_tokens as u32,
+        completion_tokens: output.split_whitespace().count() as u32,
     }
 }
 

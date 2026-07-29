@@ -376,8 +376,7 @@ impl ComponentHostState {
         expected_accelerator: ai_inference::AcceleratorKind,
         model_id: u32,
         prompt: String,
-    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<String, String>>, String>
-    {
+    ) -> std::result::Result<StreamedGeneration, String> {
         let loaded = self
             .accelerator_models
             .get(&model_id)
@@ -395,6 +394,12 @@ impl ComponentHostState {
                 "AI inference runtime is unavailable for this component".to_owned()
             })?);
         let (sender, receiver) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
+        // Token counts are only known once generation ends, which is after the
+        // last fragment has already gone down the channel. They therefore come
+        // back beside the channel rather than through it: sending them as a
+        // final fragment would make them indistinguishable from model output.
+        let usage = Arc::new(Mutex::new(None));
+        let generation_usage = Arc::clone(&usage);
         std::thread::Builder::new()
             .name("tachyon-stream-gen".to_owned())
             .spawn(move || {
@@ -404,14 +409,21 @@ impl ComponentHostState {
                 let mut sink = |fragment: &str| {
                     let _ = sender.send(Ok(fragment.to_owned()));
                 };
-                if let Err(error) = ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
-                    let _ = sender.send(Err(error));
+                match ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
+                    Ok(reported) => {
+                        if let Ok(mut slot) = generation_usage.lock() {
+                            *slot = Some(reported);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                    }
                 }
                 // `sender` drops here: the channel closes and `next` reports the
                 // end of the stream.
             })
             .map_err(|error| format!("failed to spawn streaming generation thread: {error}"))?;
-        Ok(receiver)
+        Ok(StreamedGeneration { receiver, usage })
     }
 }
 
@@ -1936,9 +1948,20 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
 /// Host state behind a `tachyon:accelerator/cpu` `token-stream` resource: the
 /// receiving end of the channel the generation thread writes decoded fragments
 /// into. `next` drains it; a closed channel marks the end of the stream.
+/// A streaming generation in flight: the channel its decoded fragments arrive
+/// on, and the slot its token counts land in when it finishes.
+#[cfg(feature = "ai-inference")]
+pub(crate) struct StreamedGeneration {
+    receiver: std::sync::mpsc::Receiver<std::result::Result<String, String>>,
+    usage: Arc<Mutex<Option<ai_inference::TokenUsage>>>,
+}
+
 #[cfg(feature = "ai-inference")]
 pub(crate) struct HostTokenStream {
     receiver: std::sync::mpsc::Receiver<std::result::Result<String, String>>,
+    /// Filled by the generation thread once decoding ends, so it only reads
+    /// back as `Some` after `next` has returned `none`.
+    usage: Arc<Mutex<Option<ai_inference::TokenUsage>>>,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -1965,11 +1988,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         >,
         String,
     > {
-        let receiver =
+        let StreamedGeneration { receiver, usage } =
             self.stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)?;
         let handle = self
             .table
-            .push(HostTokenStream { receiver })
+            .push(HostTokenStream { receiver, usage })
             .map_err(|error| format!("failed to register token stream resource: {error}"))?;
         Ok(wasmtime::component::Resource::new_own(handle.rep()))
     }
@@ -1997,6 +2020,23 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
             Ok(Err(error)) => Err(error),
             Err(_) => Ok(None),
         }
+    }
+
+    fn usage(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+        >,
+    ) -> Option<accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage> {
+        let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
+        let stream = self.table.get(&handle).ok()?;
+        let reported = (*stream.usage.lock().ok()?)?;
+        Some(
+            accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
+                prompt_tokens: reported.prompt_tokens,
+                completion_tokens: reported.completion_tokens,
+            },
+        )
     }
 
     fn drop(

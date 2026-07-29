@@ -13,7 +13,7 @@ use tokenizers::Tokenizer;
 
 use super::{
     architecture_registry::{ArchitectureDescriptor, ArchitectureKind, ArchitectureMatch},
-    candle_llm_runtime::{ChatTemplate, ChatTurn, HOST_MAX_NEW_TOKENS},
+    candle_llm_runtime::{ChatTemplate, ChatTurn, TokenUsage, HOST_MAX_NEW_TOKENS},
     modelopt_nvfp4::{
         ModelOptLinearTensors, ModelOptNvfp4Directory, Nvfp4AcceleratorCapabilities,
         Nvfp4ExecutionPlan, Nvfp4FallbackMemoryLimits, Nvfp4FallbackScope,
@@ -566,7 +566,7 @@ impl Qwen35MoeRuntime {
         &self,
         prompts: &[&[u8]],
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<()> {
+    ) -> Result<TokenUsage> {
         if prompts.len() != 1 {
             bail!("Qwen 3.5 MoE runtime currently accepts exactly one prompt per decode");
         }
@@ -625,7 +625,10 @@ impl Qwen35MoeRuntime {
             }
             logits = self.forward_token(token, encoded.len() + step, &mut state)?;
         }
-        Ok(())
+        Ok(TokenUsage {
+            prompt_tokens: encoded.len() as u32,
+            completion_tokens: generated.len() as u32,
+        })
     }
 
     fn parse_request(&self, bytes: &[u8]) -> Result<ParsedRequest> {

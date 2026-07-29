@@ -75,6 +75,38 @@ struct ChatCompletionRequest {
     stop: Option<StopField>,
     #[serde(default)]
     stream: Option<bool>,
+    /// OpenAI gates usage reporting on a stream behind this, because the extra
+    /// final chunk breaks naive clients that assume every chunk has a choice.
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
+
+/// OpenAI's `usage` object. Omitted entirely when the backend cannot count
+/// tokens — publishing zeros would be indistinguishable from a real empty
+/// generation.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+impl Usage {
+    fn from_host(reported: bindings::tachyon::accelerator::cpu::TokenUsage) -> Self {
+        Self {
+            prompt_tokens: reported.prompt_tokens,
+            completion_tokens: reported.completion_tokens,
+            total_tokens: reported
+                .prompt_tokens
+                .saturating_add(reported.completion_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +250,8 @@ struct ChatCompletionResponse {
     created: u64,
     model: String,
     choices: Vec<ChatChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,6 +269,8 @@ struct ChatCompletionChunk {
     created: u64,
     model: String,
     choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -547,6 +583,12 @@ fn handle_chat_completions_buffered(
     };
 
     let response = ChatCompletionResponse {
+        // The buffered path runs through the host's batch scheduler, whose
+        // response channel carries decoded bytes and nothing else, so there are
+        // no counts to report here. Streaming has its own channel and does
+        // report them. Omitted rather than zeroed: a zero `usage` is a claim
+        // that the generation cost nothing.
+        usage: None,
         id: completion_id(),
         object: "chat.completion",
         created: unix_seconds(),
@@ -603,6 +645,7 @@ fn handle_chat_completions_streaming(
 
     // First chunk carries the role.
     let first_chunk = ChatCompletionChunk {
+                usage: None,
         id: id.clone(),
         object: "chat.completion.chunk",
         created,
@@ -650,6 +693,7 @@ fn handle_chat_completions_streaming(
                     continue;
                 };
                 let chunk = ChatCompletionChunk {
+                usage: None,
                     id: id.clone(),
                     object: "chat.completion.chunk",
                     created,
@@ -711,6 +755,7 @@ fn handle_chat_completions_streaming(
         };
         if !tail.is_empty() {
             let chunk = ChatCompletionChunk {
+                usage: None,
                 id: id.clone(),
                 object: "chat.completion.chunk",
                 created,
@@ -733,6 +778,7 @@ fn handle_chat_completions_streaming(
                 .map(|(index, call)| StreamToolCall::from_tool_call(index as u32, call))
                 .collect();
             let chunk = ChatCompletionChunk {
+                usage: None,
                 id: id.clone(),
                 object: "chat.completion.chunk",
                 created,
@@ -749,17 +795,41 @@ fn handle_chat_completions_streaming(
 
     // Final chunk signals why generation ended.
     let stop_chunk = ChatCompletionChunk {
-        id,
+        id: id.clone(),
         object: "chat.completion.chunk",
         created,
-        model: request.model,
+        model: request.model.clone(),
         choices: vec![ChunkChoice {
             index: 0,
             delta: ChunkDelta::empty(),
             finish_reason: Some(finish_reason),
         }],
+        usage: None,
     };
     write_sse_chunk(&writer, &stop_chunk)?;
+
+    // Usage rides in its own trailing chunk with no choices, which is where
+    // OpenAI puts it — and why it is gated behind `stream_options.include_usage`
+    // there: a client that assumes every chunk has a `choices[0]` breaks on it.
+    // Read only now, because the counts are not known until decoding ends.
+    if request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage)
+    {
+        if let Some(reported) = token_stream.usage() {
+            let usage_chunk = ChatCompletionChunk {
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: request.model,
+                choices: Vec::new(),
+                usage: Some(Usage::from_host(reported)),
+            };
+            write_sse_chunk(&writer, &usage_chunk)?;
+        }
+    }
+
     writer
         .write(b"data: [DONE]\n\n")
         .map_err(|e| format!("failed to write [DONE] frame: {e}"))?;
@@ -1318,6 +1388,7 @@ mod tests {
             seed: None,
             stop: None,
             stream: None,
+            stream_options: None,
         }
     }
 
@@ -1474,6 +1545,7 @@ mod tests {
             seed: None,
             stop: None,
             stream: None,
+            stream_options: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -1505,6 +1577,7 @@ mod tests {
             seed: Some(7),
             stop: Some(StopField::One("\n\n".to_owned())),
             stream: None,
+            stream_options: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -1533,6 +1606,7 @@ mod tests {
             seed: None,
             stop: None,
             stream: None,
+            stream_options: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -1601,6 +1675,7 @@ mod tests {
             seed: None,
             stop: None,
             stream: None,
+            stream_options: None,
         };
         assert!(
             request.resolved_tool_call_parser().is_none(),
@@ -1730,6 +1805,7 @@ mod tests {
             seed: None,
             stop: None,
             stream: None,
+            stream_options: None,
         };
         let parsed = parse_assistant_output(&request, r#"{"name":"search","arguments":{}}"#);
 

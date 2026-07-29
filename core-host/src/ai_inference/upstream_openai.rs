@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::candle_llm_runtime::MAX_PROMPT_BYTES_CEILING;
+use super::candle_llm_runtime::{TokenUsage, MAX_PROMPT_BYTES_CEILING};
 
 /// Binding `path` prefix that selects this backend.
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
@@ -546,6 +546,29 @@ impl UpstreamOpenAiRuntime {
 
     /// Run one buffered generation and return the assistant text as bytes,
     /// matching the native runtime's output contract exactly.
+    /// Read an OpenAI `usage` object out of a response or an SSE frame.
+    ///
+    /// Read opportunistically rather than requested: OpenAI only emits `usage`
+    /// on a stream when `stream_options.include_usage` is set, but sending that
+    /// field to an upstream that does not know it risks a 400 that would break
+    /// streaming outright — a bad trade for a reporting field. Upstreams that
+    /// volunteer it (and every upstream on the buffered path) are reported;
+    /// the rest report nothing, which the caller renders as an absent `usage`
+    /// rather than as zeros.
+    fn read_usage(payload: &Value) -> Option<TokenUsage> {
+        let usage = payload.get("usage").filter(|usage| !usage.is_null())?;
+        let field = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0) as u32;
+        let prompt_tokens = field("prompt_tokens");
+        let completion_tokens = field("completion_tokens");
+        if prompt_tokens == 0 && completion_tokens == 0 {
+            return None;
+        }
+        Some(TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+        })
+    }
+
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>, UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
@@ -602,7 +625,7 @@ impl UpstreamOpenAiRuntime {
         &self,
         prompts: &[&[u8]],
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<(), UpstreamError> {
+    ) -> Result<TokenUsage, UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -628,6 +651,7 @@ impl UpstreamOpenAiRuntime {
         let mut reader = std::io::BufReader::new(std::io::Read::take(response, MAX_STREAM_BYTES));
         let mut line = String::new();
         let mut saw_done = false;
+        let mut usage = None;
         let mut streamed_tool_calls = StreamedToolCalls::default();
         loop {
             line.clear();
@@ -693,6 +717,9 @@ impl UpstreamOpenAiRuntime {
                     ),
                 });
             }
+            if let Some(reported) = Self::read_usage(&frame) {
+                usage = Some(reported);
+            }
             let Some(delta) = frame
                 .get("choices")
                 .and_then(Value::as_array)
@@ -751,7 +778,7 @@ impl UpstreamOpenAiRuntime {
                 detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
             });
         }
-        Ok(())
+        Ok(usage.unwrap_or_default())
     }
 
     /// Forward a single embedding request to the upstream `/embeddings` route.
