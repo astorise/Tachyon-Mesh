@@ -239,6 +239,12 @@ enum ModelArchitecture {
     DeepSeekV3,
     DeepSeekR1,
     Qwen35Moe,
+    /// GGUF-only families: candle ships a `quantized_*` backend for each, but
+    /// no safetensors loader this runtime uses, so they are reachable through
+    /// a `.gguf` checkpoint and refused for safetensors.
+    Glm4,
+    Lfm2,
+    Phi2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,13 +279,28 @@ impl ModelArchitecture {
         }
     }
 
+    /// Map a GGUF `general.architecture` string onto the host's registry.
+    ///
+    /// This gate runs *before* `load_gguf`, so anything missing here is
+    /// refused as an unrecognized architecture no matter what the capability
+    /// table or the quantized loader would accept. Keep it in step with
+    /// `quantized_lm::SUPPORTED_ARCHITECTURES`: a family present in the loader
+    /// but absent here is dead code, which is exactly what happened to `glm4`,
+    /// `lfm2`, `phi2` and `qwen3moe`.
+    ///
+    /// The gemma spellings collapse the way candle's registry collapses them —
+    /// one backend reads all of them — so a `gemma2` GGUF resolves to the
+    /// gemma3 backend rather than to the safetensors-only `Gemma2`.
     fn from_gguf_architecture(architecture: &str) -> Option<Self> {
         match architecture {
             GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
             "qwen2" => Some(Self::Qwen2),
             "qwen3" => Some(Self::Qwen3),
-            "gemma2" => Some(Self::Gemma2),
-            "gemma3" => Some(Self::Gemma3),
+            "qwen3moe" => Some(Self::Qwen35Moe),
+            "gemma" | "gemma2" | "gemma3" | "gemma-embedding" => Some(Self::Gemma3),
+            "glm4" => Some(Self::Glm4),
+            "lfm2" => Some(Self::Lfm2),
+            "phi2" => Some(Self::Phi2),
             "phi3" => Some(Self::Phi3),
             "phi4" => Some(Self::Phi4),
             "deepseek2" => Some(Self::DeepSeekV2),
@@ -343,6 +364,17 @@ impl ModelArchitecture {
                 expert_parallel: false,
                 specialized_runtime: false,
             },
+            // GGUF-only: candle ships a quantized backend for each, and this
+            // runtime has no safetensors loader for them.
+            Self::Glm4 | Self::Lfm2 | Self::Phi2 => ArchitectureCapabilities {
+                safetensors: false,
+                gguf: true,
+                single: true,
+                tensor_parallel: false,
+                pipeline_parallel: false,
+                expert_parallel: false,
+                specialized_runtime: false,
+            },
             Self::Gemma2 | Self::Phi4 | Self::DeepSeekV2 => ArchitectureCapabilities {
                 safetensors: true,
                 gguf: false,
@@ -378,6 +410,9 @@ impl ModelArchitecture {
             Self::DeepSeekV3 => "deepseek-v3",
             Self::DeepSeekR1 => "deepseek-r1",
             Self::Qwen35Moe => "qwen3-moe",
+            Self::Glm4 => "glm4",
+            Self::Lfm2 => "lfm2",
+            Self::Phi2 => "phi2",
         }
     }
 
@@ -1144,7 +1179,11 @@ impl SingleDeviceBackend {
                     }
                     None => {
                         let (logits, index_pos) = runtime.llama_prefill_with_prefix_cache(
-                            &model, prompt_ids, &mut cache, device,
+                            &model,
+                            prompt_ids,
+                            &mut cache,
+                            device,
+                            request.deadline,
                         )?;
                         runtime.decode_loop_from_logits(
                             logits,
@@ -4045,6 +4084,7 @@ impl CandleLlmRuntime {
         prompt_ids: &[u32],
         cache: &mut Cache,
         device: &Device,
+        deadline: Instant,
     ) -> Result<(Tensor, usize), CandleLlmError> {
         let mut index_pos = 0usize;
         let mut logits = None;
@@ -4060,6 +4100,21 @@ impl CandleLlmRuntime {
         }
 
         while index_pos < prompt_ids.len() {
+            // Same rule as `run_prefill_chunks`: between chunks, and never
+            // before the first one has produced logits, so a request always
+            // makes progress before it can be refused. This is the common
+            // safetensors Llama path — without the check here a long CPU prompt
+            // held its scheduler lane well past `max_generation_ms`, since the
+            // decode loop's check is only reached once prefill finishes.
+            if logits.is_some() && Instant::now() >= deadline {
+                return Err(CandleLlmError::Execution {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "generation deadline elapsed after prefilling {index_pos} of {} prompt tokens",
+                        prompt_ids.len()
+                    ),
+                });
+            }
             let remaining = prompt_ids.len() - index_pos;
             let chunk_len = self.limits.next_prefill_chunk_len(remaining);
             if index_pos + chunk_len > self.limits.max_position_embeddings {
@@ -6478,6 +6533,25 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// The gate that runs *before* `load_gguf`. A family the quantized loader
+    /// can build but this map refuses never reaches it — which is how `glm4`,
+    /// `lfm2`, `phi2` and `qwen3moe` came to be advertised and unloadable.
+    #[test]
+    fn every_loadable_gguf_family_passes_the_architecture_gate() {
+        for name in quantized_lm::SUPPORTED_ARCHITECTURES {
+            let architecture = ModelArchitecture::from_gguf_architecture(name)
+                .unwrap_or_else(|| panic!("`{name}` is loadable but the gate rejects it"));
+            assert!(
+                architecture.supports_format(ModelFormat::Gguf),
+                "`{name}` passes the gate as {architecture:?}, which refuses GGUF"
+            );
+        }
+        // The converse is not required — the host knows safetensors-only
+        // architectures candle has no quantized backend for — but an
+        // unrecognized value must still be refused rather than guessed.
+        assert_eq!(ModelArchitecture::from_gguf_architecture("mamba"), None);
+    }
+
     #[test]
     fn gguf_capability_table_matches_candles_architecture_registry() {
         // Every architecture this host advertises as GGUF-loadable must resolve
@@ -7023,6 +7097,37 @@ mod tests {
         assert!(
             String::from_utf8(bytes).expect("utf-8").len() < 1024,
             "an expired deadline must cut generation short"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The prefix-cached prefill is the common safetensors Llama path, and it
+    /// used to be the one prefill that never consulted the deadline — so a long
+    /// CPU prompt held its scheduler lane past `max_generation_ms` before the
+    /// decode loop's check was ever reached.
+    #[test]
+    fn an_expired_deadline_stops_prefix_cached_prefill() {
+        // A two-token chunk makes the fixture's short prompt span several
+        // prefill passes, so the between-chunk check is actually reached.
+        // At the default 8192-token chunk the fixture always prefills in one
+        // pass and this path could never be exercised.
+        let strategy = HardwareStrategy {
+            prefill_chunk_tokens: Some(2),
+            ..HardwareStrategy::default()
+        };
+        let (runtime, dir) = load_fixture_with_strategy("deadline-prefill", &strategy);
+        let request =
+            br#"{"prompt":"hello mesh from tachyon","max_new_tokens":4,"max_generation_ms":1}"#;
+        let error = runtime
+            .generate(&[&request[..]])
+            .expect_err("an elapsed budget must stop prefill rather than run to completion");
+        assert!(
+            error.to_string().contains("deadline elapsed"),
+            "prefill should name the elapsed deadline, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("prompt tokens"),
+            "the error should say how far prefill got, got: {error}"
         );
         let _ = fs::remove_dir_all(dir);
     }

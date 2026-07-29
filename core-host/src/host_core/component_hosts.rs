@@ -410,9 +410,13 @@ impl ComponentHostState {
                     let _ = sender.send(Ok(fragment.to_owned()));
                 };
                 match ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
+                    // `None` means the backend could not measure, and stays
+                    // `None` in the slot: `usage()` then reports nothing rather
+                    // than zeros, which a client would read as a generation
+                    // that cost nothing.
                     Ok(reported) => {
                         if let Ok(mut slot) = generation_usage.lock() {
-                            *slot = Some(reported);
+                            *slot = reported;
                         }
                     }
                     Err(error) => {

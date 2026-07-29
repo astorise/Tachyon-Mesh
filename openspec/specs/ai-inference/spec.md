@@ -420,9 +420,16 @@ validation rather than at load.
 #### Scenario: A non-Llama GGUF family loads
 
 - **WHEN** a GGUF checkpoint declares a family with a verified quantized loader
-  (Qwen2, Qwen3, Qwen3-MoE, Gemma3, Phi3)
+  (Qwen2, Qwen3, Qwen3-MoE, Gemma, GLM4, LFM2, Phi2, Phi3)
 - **THEN** the runtime constructs that family's backend
 - **AND** reads its context length from that family's metadata namespace
+
+#### Scenario: A family reaches the loader it is advertised for
+
+- **WHEN** a GGUF checkpoint declares any architecture the quantized loader can
+  build
+- **THEN** the host's architecture gate accepts it rather than refusing it as
+  unrecognized before the loader runs
 
 #### Scenario: A family without a quantized loader is refused
 
@@ -436,13 +443,15 @@ The runtime SHALL support Apple GPU execution for GGUF bindings behind a
 dedicated build feature, tracked separately from CUDA so a Metal binding cannot
 accept a CUDA-only optimization.
 
-#### Scenario: A Metal binding runs any block type
+#### Scenario: A Metal binding runs the block types Metal can execute
 
 - **GIVEN** a host built with the Metal feature
 - **WHEN** a GGUF binding declares `metal`
 - **THEN** the runtime resolves a Metal device
-- **AND** does not apply the CUDA block-type restriction, because the Metal
-  backend covers every GGML block type
+- **AND** applies the same per-device block-type check it applies to CUDA,
+  because Metal's matmul coverage is partial: it has mat-vec kernels for
+  `Q8_1`/`Q8K` but neither the mat-mat kernel used for prefill nor `get_rows`,
+  so a checkpoint stored in those types is unusable there
 
 #### Scenario: A Metal request on a build without the feature is refused
 

@@ -28,7 +28,7 @@ pub(crate) mod tensor_parallel_llama;
 mod upstream_openai;
 
 pub(crate) use candle_llm_runtime::{detect_tool_call_parser, TokenUsage};
-pub(crate) use upstream_openai::UPSTREAM_SCHEME;
+pub(crate) use upstream_openai::{assert_no_credential_collisions, UPSTREAM_SCHEME};
 #[path = "ai_inference/vendor_accelerator.rs"]
 mod vendor_accelerator;
 #[path = "ai_inference/vram_manager.rs"]
@@ -401,7 +401,7 @@ trait BackendModel: Send + Sync {
         &self,
         inputs: &[SharedInputTensor],
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<TokenUsage> {
+    ) -> Result<Option<TokenUsage>> {
         let mut outputs = self.execute(inputs)?;
         if outputs.len() != 1 {
             bail!(
@@ -411,7 +411,7 @@ trait BackendModel: Send + Sync {
             );
         }
         let output = outputs.remove(0);
-        let usage = output.usage.unwrap_or_default();
+        let usage = output.usage;
         let text = String::from_utf8(output.bytes)
             .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
         if !text.is_empty() {
@@ -480,6 +480,20 @@ impl AiInferenceRuntime {
                 )
             })
             .collect::<HashMap<_, _>>();
+        // Before any binding is built: two upstream aliases whose credential
+        // variables collide would each send the other's API key to a
+        // third-party server. Nothing at request time can see the collision,
+        // so this fails the boot instead.
+        assert_no_credential_collisions(
+            config
+                .routes
+                .iter()
+                .flat_map(|route| route.models.iter())
+                .filter(|binding| binding.path.trim().starts_with(UPSTREAM_SCHEME))
+                .map(|binding| binding.alias.as_str()),
+        )
+        .map_err(|detail| anyhow!("Integrity Validation Failed: {detail}"))?;
+
         let mut models = HashMap::new();
         let mut sealed_aliases = std::collections::HashSet::new();
 
@@ -659,31 +673,37 @@ impl AiInferenceRuntime {
         let model = models
             .get(alias)
             .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
-        // An upstream model executes on no local device, so any component
-        // handle may open it: `Network` is a scheduling lane, not a hardware
-        // requirement. Without this, the public OpenAI routes — which always
-        // open aliases through the CPU accelerator — could never reach an
-        // upstream alias at all, failing on device mismatch before a single
-        // HTTP request went out.
-        if model.accelerator == AcceleratorKind::Network {
-            return Ok(());
-        }
-        let resolved = if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
-            accelerator_backend::resolve_with_fallback(
+        // Which host interface a component imported is not a hardware claim.
+        // A binding's device is fixed by the manifest, `ensure_model_loaded`
+        // has already put the weights there, and the scheduler dispatches on
+        // `model.accelerator` regardless of how the alias was opened — so an
+        // alias that loaded successfully runs where it is pinned either way.
+        //
+        // This matters because the public OpenAI routes open every alias
+        // through the CPU accelerator, that being the only interface
+        // `guest-openai` imports. Requiring the interface to match the binding
+        // made every `device: cuda`/`metal` alias — the whole point of the GGUF
+        // GPU path — advertise itself in `GET /ai/v1/models` and then fail with
+        // "model unavailable" before any inference ran.
+        //
+        // `Npu`/`Tpu` stay strict, because there the *requested* lane can
+        // silently degrade: `resolve_with_fallback` drops to CPU when no vendor
+        // runner is wired, and a model pinned to an accelerator that is not
+        // actually present must fail rather than quietly execute elsewhere.
+        if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
+            let resolved = accelerator_backend::resolve_with_fallback(
                 accelerator,
                 AcceleratorKind::Cpu,
                 accelerator_backend::probe,
-            )
-        } else {
-            accelerator
-        };
-        if model.accelerator != resolved {
-            return Err(format!(
-                "model alias `{alias}` requires `{}` but `{}` resolved to `{}`",
-                model.accelerator.as_str(),
-                accelerator.as_str(),
-                resolved.as_str()
-            ));
+            );
+            if model.accelerator != resolved {
+                return Err(format!(
+                    "model alias `{alias}` requires `{}` but `{}` resolved to `{}`",
+                    model.accelerator.as_str(),
+                    accelerator.as_str(),
+                    resolved.as_str()
+                ));
+            }
         }
         Ok(())
     }
@@ -781,7 +801,7 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<TokenUsage, String> {
+    ) -> Result<Option<TokenUsage>, String> {
         self.ensure_model_loaded(alias)?;
         let model = {
             let models = self.models.read().expect("model registry lock poisoned");
@@ -2137,7 +2157,7 @@ impl BackendModel for CandleBackendModel {
                             )),
                             Ok(handle) => match handle.join() {
                                 Ok(result) => result
-                                    .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
+                                    .map(|(bytes, usage)| InferenceOutput { bytes, usage })
                                     .map_err(anyhow::Error::from),
                                 Err(_) => Err(anyhow!(
                                     "upstream request thread for model `{alias}` panicked"
@@ -2275,7 +2295,7 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<TokenUsage> {
+    ) -> Result<Option<TokenUsage>> {
         match &self.kind {
             CandleBackendModelKind::Upstream(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
@@ -2300,6 +2320,7 @@ impl BackendModel for CandleBackendModel {
                     .collect::<Vec<_>>();
                 runtime
                     .generate_streaming(&prompts, on_token)
+                    .map(Some)
                     .map_err(|error| {
                         anyhow!(
                             "Candle LLM model `{}` loaded from `{}` failed: {error}",
@@ -2326,6 +2347,7 @@ impl BackendModel for CandleBackendModel {
                     ),
                     None => target.generate_streaming(&prompts, on_token),
                 }
+                .map(Some)
                 .map_err(|error| {
                     anyhow!(
                         "Candle LLM model `{}` loaded from `{}` failed: {error}",
@@ -2342,6 +2364,7 @@ impl BackendModel for CandleBackendModel {
                     .collect::<Vec<_>>();
                 runtime
                     .generate_streaming(&prompts, on_token)
+                    .map(Some)
                     .map_err(|error| {
                         anyhow!(
                             "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
@@ -2381,7 +2404,7 @@ impl BackendModel for CandleBackendModel {
                 // obviously synthetic — enough for the end-to-end test to prove
                 // the numbers reach the client, without pretending to be a real
                 // tokenization.
-                Ok(mock_token_usage(inputs, &text))
+                Ok(Some(mock_token_usage(inputs, &text)))
             }
             CandleBackendModelKind::Vendor(_) => {
                 let outputs = self.execute(inputs)?;
@@ -2397,7 +2420,7 @@ impl BackendModel for CandleBackendModel {
                 on_token(&text);
                 // A vendor runner returns text over a pipe and never reports
                 // token counts, so there is nothing honest to publish.
-                Ok(TokenUsage::default())
+                Ok(None)
             }
         }
     }
@@ -4683,7 +4706,7 @@ mod tests {
     }
 
     #[test]
-    fn component_accelerator_runtime_rejects_mismatched_devices() {
+    fn a_binding_opens_from_any_interface_and_runs_on_its_own_device() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![
             IntegrityModelBinding {
@@ -4716,9 +4739,16 @@ mod tests {
         assert!(runtime
             .load_component_model("llama3", AcceleratorKind::Gpu)
             .is_ok());
+        // A GPU-bound alias opens through the CPU interface too. This used to
+        // be refused, which made every `device: cuda`/`metal` binding
+        // unreachable from `/ai/v1/chat/completions` — `guest-openai` imports
+        // only `tachyon:accelerator/cpu`, so that is the one interface the
+        // public route can open an alias with. The binding still executes on
+        // its own device: the scheduler dispatches on `model.accelerator`, not
+        // on how the handle was obtained.
         assert!(runtime
             .load_component_model("llama3", AcceleratorKind::Cpu)
-            .is_err());
+            .is_ok());
         assert!(runtime
             .load_component_model("tiny", AcceleratorKind::Tpu)
             .is_ok());
@@ -4727,6 +4757,17 @@ mod tests {
                 .compute_component_prompt("llama3", "hello")
                 .expect("component compute should succeed"),
             MOCK_INFERENCE_RESPONSE
+        );
+        // The binding is still recorded on its own lane: opening it from the
+        // CPU interface must not move where it executes, only permit the
+        // handle. Scheduling reads this, not the interface.
+        let models = runtime.models.read().expect("model registry lock");
+        assert_eq!(
+            models
+                .get("llama3")
+                .expect("llama3 should be loaded")
+                .accelerator,
+            AcceleratorKind::Gpu
         );
     }
 

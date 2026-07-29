@@ -281,7 +281,33 @@ impl UpstreamEndpoint {
 /// The returned value is only ever placed in an `Authorization` header; it is
 /// never logged, and never round-trips into an error message.
 fn api_key_for(alias: &str) -> Option<String> {
-    let suffix = alias
+    // A set-but-empty per-alias variable is not an answer, it is an absent
+    // secret — which is what optional secret injection produces when the
+    // secret is missing. Treating `Ok("")` as a hit skipped the global
+    // fallback and sent the request unauthenticated, so each candidate is
+    // normalized before it is accepted.
+    [
+        format!("{API_KEY_ENV_PREFIX}{}", api_key_env_suffix(alias)),
+        API_KEY_ENV_FALLBACK.to_owned(),
+    ]
+    .into_iter()
+    .find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty())
+    })
+}
+
+/// The per-alias half of `TACHYON_UPSTREAM_API_KEY_<SUFFIX>`.
+///
+/// Not injective: every character outside `[A-Za-z0-9]` collapses to `_`, so
+/// `vendor-a`, `vendor_a` and `vendor.a` all name the same variable. That is
+/// deliberate — an operator types these by hand and should not have to encode
+/// punctuation — and it is why [`assert_no_credential_collisions`] refuses a
+/// manifest where two upstream aliases would share one.
+pub(crate) fn api_key_env_suffix(alias: &str) -> String {
+    alias
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -290,12 +316,29 @@ fn api_key_for(alias: &str) -> Option<String> {
                 '_'
             }
         })
-        .collect::<String>();
-    env::var(format!("{API_KEY_ENV_PREFIX}{suffix}"))
-        .or_else(|_| env::var(API_KEY_ENV_FALLBACK))
-        .ok()
-        .map(|key| key.trim().to_owned())
-        .filter(|key| !key.is_empty())
+        .collect()
+}
+
+/// Refuse a set of upstream aliases whose credential variables collide.
+///
+/// Two aliases sharing one `TACHYON_UPSTREAM_API_KEY_<SUFFIX>` means the bearer
+/// token an operator provisioned for one third party is also sent to the other.
+/// Nothing at request time can detect that — `api_key_for` sees one alias — so
+/// it is caught where the whole manifest is visible, and it fails the boot
+/// rather than the request.
+pub(crate) fn assert_no_credential_collisions<'a>(
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut claimed: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for alias in aliases {
+        let suffix = api_key_env_suffix(alias);
+        if let Some(previous) = claimed.insert(suffix.clone(), alias) {
+            return Err(format!(
+                "upstream aliases `{previous}` and `{alias}` both read                  `{API_KEY_ENV_PREFIX}{suffix}`, so one binding's API key would be                  sent to the other's server; rename one of them"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The host generation request, mirroring `candle_llm_runtime`'s private
@@ -572,7 +615,7 @@ impl UpstreamOpenAiRuntime {
     pub(crate) fn generate(
         &self,
         prompts: &[&[u8]],
-    ) -> Result<(Vec<u8>, TokenUsage), UpstreamError> {
+    ) -> Result<(Vec<u8>, Option<TokenUsage>), UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -587,7 +630,7 @@ impl UpstreamOpenAiRuntime {
         let payload: Value = read_json(&self.alias, response)?;
         // Every OpenAI-shaped upstream returns `usage` on the buffered route,
         // so unlike the streaming path this is reliably populated.
-        let usage = Self::read_usage(&payload).unwrap_or_default();
+        let usage = Self::read_usage(&payload);
         let message = payload
             .get("choices")
             .and_then(Value::as_array)
@@ -631,7 +674,7 @@ impl UpstreamOpenAiRuntime {
         &self,
         prompts: &[&[u8]],
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<TokenUsage, UpstreamError> {
+    ) -> Result<Option<TokenUsage>, UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -784,7 +827,10 @@ impl UpstreamOpenAiRuntime {
                 detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
             });
         }
-        Ok(usage.unwrap_or_default())
+        // Absence stays absence: an upstream that volunteers no usage frame
+        // has told us nothing, and zeros would read to the client as a
+        // generation that cost nothing.
+        Ok(usage)
     }
 
     /// Forward a single embedding request to the upstream `/embeddings` route.
@@ -1712,6 +1758,98 @@ mod tests {
         let envelope: Value = serde_json::from_str(&tokens[0]).expect("envelope should parse");
         assert_eq!(envelope["content"], "Let me look. ");
         assert_eq!(envelope["tool_calls"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn colliding_credential_variables_are_refused() {
+        // `-`, `_` and `.` all collapse to `_`, so these three name one
+        // variable. Allowing them would send one third party's bearer token to
+        // another's server.
+        for pair in [
+            ["vendor-a", "vendor_a"],
+            ["vendor.a", "vendor-a"],
+            ["Vendor-A", "vendor_a"],
+        ] {
+            let error = assert_no_credential_collisions(pair)
+                .expect_err("colliding aliases must fail validation");
+            assert!(
+                error.contains(API_KEY_ENV_PREFIX),
+                "the error should name the shared variable, got: {error}"
+            );
+        }
+
+        // Distinct suffixes are fine, including aliases that differ only after
+        // normalization.
+        assert!(assert_no_credential_collisions(["vendor-a", "vendor-b", "other"]).is_ok());
+        assert!(assert_no_credential_collisions(std::iter::empty()).is_ok());
+    }
+
+    #[test]
+    fn an_empty_per_alias_key_falls_back_to_the_global_one() {
+        // What optional secret injection produces when the secret is missing:
+        // the variable exists and is empty. Treating that as a hit skipped the
+        // global fallback and sent the request unauthenticated.
+        let alias = "empty-key-probe";
+        let per_alias = format!("{API_KEY_ENV_PREFIX}{}", api_key_env_suffix(alias));
+        // SAFETY: single-threaded test process section; both variables are
+        // removed before returning.
+        unsafe {
+            env::set_var(&per_alias, "   ");
+            env::set_var(API_KEY_ENV_FALLBACK, "global-secret");
+        }
+        let resolved = api_key_for(alias);
+        unsafe {
+            env::remove_var(&per_alias);
+            env::remove_var(API_KEY_ENV_FALLBACK);
+        }
+        assert_eq!(resolved.as_deref(), Some("global-secret"));
+    }
+
+    #[test]
+    fn an_upstream_that_reports_no_usage_reports_none_rather_than_zero() {
+        // The distinction the whole `Option` exists for. Most upstreams only
+        // emit a usage frame when asked, and this backend deliberately does not
+        // ask — so absence is the common case, and collapsing it to zeros would
+        // tell every client that these generations cost nothing.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let usage = backend
+            .generate_streaming(&[b"hi"], &mut |_token| {})
+            .expect("streaming should complete");
+        assert_eq!(usage, None);
+    }
+
+    #[test]
+    fn an_upstream_usage_frame_is_reported_verbatim() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                // The usage frame carries no choices, so it must be read before
+                // the delta lookup skips it.
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let usage = backend
+            .generate_streaming(&[b"hi"], &mut |_token| {})
+            .expect("streaming should complete");
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                prompt_tokens: 11,
+                completion_tokens: 4,
+            })
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,7 +14,10 @@ use tokenizers::Tokenizer;
 
 use super::{
     architecture_registry::{ArchitectureDescriptor, ArchitectureKind, ArchitectureMatch},
-    candle_llm_runtime::{ChatTemplate, ChatTurn, TokenUsage, HOST_MAX_NEW_TOKENS},
+    candle_llm_runtime::{
+        ChatTemplate, ChatTurn, TokenUsage, DEFAULT_GENERATION_DEADLINE,
+        HOST_MAX_GENERATION_DEADLINE, HOST_MAX_NEW_TOKENS,
+    },
     modelopt_nvfp4::{
         ModelOptLinearTensors, ModelOptNvfp4Directory, Nvfp4AcceleratorCapabilities,
         Nvfp4ExecutionPlan, Nvfp4FallbackMemoryLimits, Nvfp4FallbackScope,
@@ -454,6 +458,12 @@ struct GenerationRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Vec<String>,
+    /// Wall-clock budget, in milliseconds. This runtime parses its own request
+    /// shape rather than reusing `candle_llm_runtime`'s, so the field has to be
+    /// declared here too — omitting it silently ignored the caller's budget and
+    /// let a slow CPU generation hold its scheduler lane indefinitely.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -588,6 +598,16 @@ impl Qwen35MoeRuntime {
         let mut state = HybridDecodeState::new(&self.config.layer_types);
         let mut logits = Vec::new();
         for (position, token) in encoded.get_ids().iter().copied().enumerate() {
+            // Prefill is per token here, so the budget is checked before each
+            // one rather than between chunks. A long prompt on this CPU-bound
+            // runtime is exactly the case that used to outlast the budget
+            // before a single token was produced.
+            if position > 0 && Instant::now() >= request.deadline {
+                bail!(
+                    "generation deadline elapsed after prefilling {position} of {} prompt tokens",
+                    encoded.len()
+                );
+            }
             logits = self.forward_token(token, position, &mut state)?;
         }
         let sampling = resolve_sampling(
@@ -600,6 +620,12 @@ impl Qwen35MoeRuntime {
         let mut generated = Vec::<u32>::new();
         let mut emitted = 0usize;
         for step in 0..request.max_new_tokens {
+            // Elapsed budget stops generation the way an exhausted token budget
+            // does, rather than failing: freeing the scheduler slot is the
+            // point, and a partial answer beats an error.
+            if Instant::now() >= request.deadline {
+                break;
+            }
             let tensor = Tensor::from_vec(logits, self.config.vocab_size, &Device::Cpu)?;
             let token = processor.sample(&tensor)?;
             if token == self.config.eos_token_id {
@@ -648,11 +674,28 @@ impl Qwen35MoeRuntime {
                 top_p: None,
                 seed: None,
                 stop: Vec::new(),
+                max_generation_ms: None,
             }
         };
         if request.max_new_tokens == 0 || request.max_new_tokens > HOST_MAX_NEW_TOKENS {
             bail!("max_new_tokens must be between 1 and {HOST_MAX_NEW_TOKENS}");
         }
+        // Same bounds and same default as the Candle runtime, so a caller sees
+        // one wall-clock contract whichever backend serves its alias.
+        let budget = match request.max_generation_ms {
+            None => DEFAULT_GENERATION_DEADLINE,
+            Some(millis) => {
+                let requested = Duration::from_millis(millis);
+                if requested.is_zero() || requested > HOST_MAX_GENERATION_DEADLINE {
+                    bail!(
+                        "max_generation_ms {millis} must be between 1 and {}",
+                        HOST_MAX_GENERATION_DEADLINE.as_millis()
+                    );
+                }
+                requested
+            }
+        };
+        let deadline = Instant::now() + budget;
         let prompt = match (request.messages, request.prompt) {
             (Some(messages), _) if messages.is_empty() => {
                 bail!("chat request must contain at least one message")
@@ -704,6 +747,7 @@ impl Qwen35MoeRuntime {
                 .filter(|stop| !stop.is_empty() && stop.len() <= 256)
                 .take(8)
                 .collect(),
+            deadline,
         })
     }
 
@@ -882,6 +926,9 @@ struct ParsedRequest {
     top_p: Option<f32>,
     seed: Option<u64>,
     stop: Vec<String>,
+    /// Absolute, anchored at parse time so tokenizing and prefilling count
+    /// against the budget — that work holds the same scheduler slot.
+    deadline: Instant,
 }
 
 fn resolve_sampling(temperature: Option<f32>, top_p: Option<f32>, _seed: u64) -> Sampling {
@@ -1156,6 +1203,33 @@ mod tests {
         assert_eq!(cache.stats.hits, 1);
         assert!(cache.stats.transfers >= 2);
         assert!(cache.stats.evictions >= 1);
+    }
+
+    /// This runtime parses its own request shape instead of reusing
+    /// `candle_llm_runtime`'s, so a field missing from *this* struct is
+    /// silently dropped by serde rather than rejected. That is how
+    /// `max_generation_ms` came to be accepted by the API, documented as a
+    /// wall-clock budget, and ignored by this backend entirely.
+    #[test]
+    fn the_request_shape_carries_the_wall_clock_budget() {
+        let request: GenerationRequest =
+            serde_json::from_str(r#"{"prompt":"hi","max_new_tokens":4,"max_generation_ms":1500}"#)
+                .expect("request should parse");
+        assert_eq!(request.max_generation_ms, Some(1500));
+
+        // Omitting it is still valid; the default applies at parse time.
+        let defaulted: GenerationRequest =
+            serde_json::from_str(r#"{"prompt":"hi"}"#).expect("request should parse");
+        assert_eq!(defaulted.max_generation_ms, None);
+    }
+
+    /// One wall-clock contract across backends: a caller must not have to know
+    /// which runtime serves its alias to know what budget it gets.
+    #[test]
+    fn the_deadline_bounds_match_the_candle_runtime() {
+        assert_eq!(DEFAULT_GENERATION_DEADLINE, Duration::from_secs(300));
+        assert_eq!(HOST_MAX_GENERATION_DEADLINE, Duration::from_secs(3_600));
+        assert!(HOST_MAX_GENERATION_DEADLINE > DEFAULT_GENERATION_DEADLINE);
     }
 
     #[test]

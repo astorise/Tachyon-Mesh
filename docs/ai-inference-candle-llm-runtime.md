@@ -288,9 +288,18 @@ Metadata keys are architecture-prefixed, so the context-length lookup reads
 hardcoding `llama.` would have silently fallen back to the default window for
 every other family.
 
-`ArchitectureCapabilities.gguf` stays `false` for families candle has no
-quantized module for (Gemma2, Phi4), so an unsupported checkpoint fails at
-validation rather than at load. `qwen3moe` is `true` despite its fused expert
+Two gates decide whether a checkpoint loads, and they must agree.
+`ModelArchitecture::from_gguf_architecture` runs first and refuses anything it
+does not recognize; `ArchitectureCapabilities.gguf` then decides whether that
+architecture accepts the format. A family present in candle's loader but absent
+from the first gate is dead code — which is exactly what happened to `glm4`,
+`lfm2`, `phi2` and `qwen3moe`, advertised in this document and refused before
+the loader ran. `every_loadable_gguf_family_passes_the_architecture_gate` now
+walks `quantized_lm::SUPPORTED_ARCHITECTURES` and fails if the two drift again.
+
+`gguf` stays `false` for families candle has no quantized module for (Phi4,
+DeepSeek), so an unsupported checkpoint fails at validation rather than at
+load. `qwen3moe` is `true` despite its fused expert
 path being CUDA-only with an F16/BF16 working dtype: `check_device_support`
 refuses the CPU and Metal bindings at load, whereas refusing the format outright
 would also refuse the CUDA binding, which works.
