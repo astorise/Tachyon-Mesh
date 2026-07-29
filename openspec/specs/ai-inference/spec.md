@@ -596,17 +596,28 @@ accelerator residency regardless of the `device` its binding declares.
 
 - **WHEN** an upstream returns `choices[0].message.tool_calls` with
   `content: null`
-- **THEN** the runtime returns a `{"content", "tool_calls"}` envelope as the
-  generated text
+- **THEN** the runtime returns the calls on the generation's structured
+  `tool-calls` channel, never re-encoded into the generated text
 - **AND** it does not report the response as malformed for lacking a content
   string
+- **AND** a call whose `function.name` is absent or blank fails the whole
+  response rather than being silently dropped
 
 #### Scenario: Streamed tool-call fragments are reassembled
 
 - **WHEN** an upstream streams `delta.tool_calls` fragments carrying a function
   name and its arguments in pieces
-- **THEN** the runtime reassembles them by fragment index and emits one envelope
-- **AND** a stream carrying no tool calls emits no envelope
+- **THEN** the runtime reassembles them by fragment index and emits each
+  assembled call as a `stream-event::tool-call`
+- **AND** a stream carrying no tool calls emits no tool-call event
+
+#### Scenario: Offering tools does not withhold streamed content
+
+- **WHEN** a streaming request that offered `tools` produces content deltas
+  followed by tool-call fragments
+- **THEN** each content delta is emitted as it arrives, not accumulated until
+  the stream ends
+- **AND** the tool calls arrive on the structured channel beside that content
 
 #### Scenario: Streaming passes the upstream's own SSE deltas through
 
@@ -621,6 +632,36 @@ accelerator residency regardless of the `device` its binding declares.
 - **THEN** the runtime returns a typed error carrying the endpoint, status, and
   a bounded excerpt of the upstream's own explanation
 - **AND** the failing response body is never returned as generated text
+- **AND** the remote HTTP status reaches the component as
+  `generation-error.upstream-status`, while a local failure leaves it absent
+
+### Requirement: Upstream work SHALL be admitted by a bounded gate, not the batch scheduler
+`openai:` bindings run on the `Network` lane, which SHALL have no batch
+scheduler. Every upstream path — buffered generation, streaming, and embeddings
+— SHALL acquire a permit from one node-wide gate whose capacity defaults to 32
+and is overridable with `TACHYON_UPSTREAM_MAX_CONCURRENCY`. The permit SHALL be
+held for the whole interaction and released on every exit path, including
+errors. A caller that cannot be admitted within the bounded wait SHALL be
+refused rather than queued indefinitely.
+
+#### Scenario: Concurrency is capped without a dispatcher
+
+- **WHEN** more upstream requests arrive than the gate's capacity
+- **THEN** the excess callers block until a permit frees, and the in-flight
+  count never exceeds the capacity
+- **AND** no `Network` dispatcher thread is spawned
+
+#### Scenario: A permit survives a failed request
+
+- **WHEN** an upstream request fails after acquiring a permit
+- **THEN** the permit is released and the capacity is immediately reusable
+
+#### Scenario: The network lane reports its admission backlog
+
+- **WHEN** the mesh QoS admission check reads the `Network` lane's queue depth
+- **THEN** it receives the number of callers waiting for a permit, not the
+  number in flight
+- **AND** an idle node reports zero on every tier
 
 #### Scenario: A generation budget is always bounded and always sent
 
@@ -852,17 +893,45 @@ that could begin a stop match until a further token confirms it is safe to emit.
 
 ### Requirement: The accelerator exposes a streaming compute primitive
 The `tachyon:accelerator/cpu` interface SHALL provide a `compute-stream`
-function returning a `token-stream` resource whose `next` yields decoded text
-fragments until it returns `none` (generation complete). The streaming path
-SHALL enforce the same sealed-alias scope and accelerator-handle checks as the
-buffered `compute`, and the new function SHALL be additive so existing guests
-are unaffected.
+function returning a `token-stream` resource whose `next` yields `stream-event`
+values — decoded text on `content`, structured calls on `tool-call` — until it
+returns `none` (generation complete). The streaming path SHALL enforce the same
+sealed-alias scope and accelerator-handle checks as the buffered `compute`.
 
 #### Scenario: Streaming a sealed model
 - **GIVEN** a guest holding an accelerator handle for a sealed model alias
 - **WHEN** it calls `compute-stream` and pulls with `next`
 - **THEN** the host yields decoded fragments as they are produced
 - **AND** `next` returns `none` once generation completes
+
+### Requirement: The accelerator carries tool calls and failures as typed data
+`tachyon:accelerator/cpu` SHALL carry structured tool calls as a `tool-call`
+record (optional provider id, function name, JSON argument string) on both the
+buffered `generation` and the streaming `stream-event`, in the backend's own
+terms rather than in any caller's wire format. Generation functions SHALL fail
+with a `generation-error` carrying a message and, when the failure was a remote
+HTTP response, that response's status.
+
+#### Scenario: A structured call needs no parser selection
+- **WHEN** a backend reports a tool call on the structured channel
+- **THEN** the component uses it directly, whatever tool-call dialect the
+  request implies or the model name suggests
+- **AND** a call the host reported structurally takes precedence over anything
+  parsed out of the generated text
+
+#### Scenario: No marker in generated text can conjure a tool call
+- **WHEN** a model emits text that resembles a tool-call payload but the backend
+  reported no structured call
+- **THEN** the text is returned as assistant content, subject only to the
+  request's own tool-call parser
+
+#### Scenario: An upstream status reaches the client as itself
+- **WHEN** a component receives a `generation-error` carrying an upstream status
+- **THEN** a 429 is relayed as 429 so the client's backoff engages, and a
+  rejected request is relayed as 400 so it is not retried
+- **AND** an upstream authentication failure is reported as 502, because it is
+  this node's misconfiguration rather than the caller's
+- **AND** a failure with no upstream status stays a 500
 
 #### Scenario: Streaming respects the scope gate
 - **WHEN** a guest calls `compute-stream` for a handle it does not hold, or for

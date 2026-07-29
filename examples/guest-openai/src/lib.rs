@@ -492,8 +492,10 @@ fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
 
     let mut data = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.into_iter().enumerate() {
-        let embedding = bindings::tachyon::accelerator::cpu::embed(model_id, &input)
-            .map_err(|e| format!("embedding failed for model `{}`: {e}", request.model))?;
+        let embedding = match bindings::tachyon::accelerator::cpu::embed(model_id, &input) {
+            Ok(embedding) => embedding,
+            Err(error) => return Ok(generation_error_payload(&request.model, error)),
+        };
         data.push(EmbeddingData {
             object: "embedding",
             embedding,
@@ -576,10 +578,21 @@ fn handle_chat_completions_buffered(
     // `compute_detailed` rather than `compute`: same generation, but it also
     // carries the token counts. Unlike a stream, a buffered response has no
     // trailing frame to put them in, so they have to come back with the text.
-    let completed = bindings::tachyon::accelerator::cpu::compute_detailed(model_id, &generation)
-        .map_err(|e| format!("inference failed for model `{}`: {e}", request.model))?;
-    let output = completed.text;
-    let parsed = parse_assistant_output(&request, &output);
+    let completed =
+        match bindings::tachyon::accelerator::cpu::compute_detailed(model_id, &generation) {
+            Ok(completed) => completed,
+            Err(error) => return Ok(generation_error_payload(&request.model, error)),
+        };
+    // Structured calls win outright: the backend received them as fields, so
+    // re-reading the text for calls could only ever guess worse.
+    let parsed = if completed.tool_calls.is_empty() {
+        parse_assistant_output(&request, &completed.text)
+    } else {
+        ParsedAssistantOutput {
+            content: completed.text.clone(),
+            tool_calls: adopt_host_tool_calls(completed.tool_calls),
+        }
+    };
     // A parsed tool call always wins — the caller must act on it — but
     // otherwise the host's own reason takes precedence over the assumption
     // that generation ended naturally. `length` in particular means the answer
@@ -660,7 +673,7 @@ fn handle_chat_completions_streaming(
 
     // First chunk carries the role.
     let first_chunk = ChatCompletionChunk {
-                usage: None,
+        usage: None,
         id: id.clone(),
         object: "chat.completion.chunk",
         created,
@@ -699,17 +712,25 @@ fn handle_chat_completions_streaming(
     });
 
     let generation = build_generation_request(&request)?;
-    let token_stream = bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation)
-        .map_err(|e| {
-        format!(
-            "failed to start streaming inference for `{}`: {e}",
-            request.model
-        )
-    })?;
+    let token_stream =
+        match bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation) {
+            Ok(token_stream) => token_stream,
+            // The headers are already on the wire, so the status can no longer
+            // be changed — the failure is reported as an SSE error frame, which
+            // is what an OpenAI client reads mid-stream anyway.
+            Err(error) => {
+                write_sse_error(&writer, &request.model, error)?;
+                return Ok((200, Vec::new()));
+            }
+        };
 
+    // Tool calls the host recognised as structured data, kept aside until the
+    // stream ends: they are emitted as one `tool_calls` delta after the content,
+    // which is where an OpenAI client expects them.
+    let mut host_tool_calls = Vec::new();
     loop {
         match token_stream.next() {
-            Ok(Some(fragment)) => {
+            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::Content(fragment))) => {
                 let content = match gate.as_mut() {
                     Some(gate) => gate.push(&fragment),
                     None => Some(fragment),
@@ -718,7 +739,7 @@ fn handle_chat_completions_streaming(
                     continue;
                 };
                 let chunk = ChatCompletionChunk {
-                usage: None,
+                    usage: None,
                     id: id.clone(),
                     object: "chat.completion.chunk",
                     created,
@@ -731,14 +752,23 @@ fn handle_chat_completions_streaming(
                 };
                 write_sse_chunk(&writer, &chunk)?;
             }
+            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::ToolCall(call))) => {
+                host_tool_calls.push(call);
+            }
             Ok(None) => break,
-            Err(e) => return Err(format!("streaming inference error: {e}")),
+            Err(error) => {
+                write_sse_error(&writer, &request.model, error)?;
+                return Ok((200, Vec::new()));
+            }
         }
     }
 
     // Whatever the gate held back is parsed exactly like a buffered response,
     // so streamed and buffered requests recover the same tool calls.
     let mut finish_reason = "stop";
+    // Structured calls win over anything parsed out of the text, for the same
+    // reason as on the buffered path: the backend received them as fields.
+    let mut tool_calls = adopt_host_tool_calls(host_tool_calls);
     if let Some(gate) = gate {
         let (whole, streamed) = gate.finish();
         let parsed = parse_assistant_output(&request, &whole);
@@ -794,28 +824,31 @@ fn handle_chat_completions_streaming(
             write_sse_chunk(&writer, &chunk)?;
         }
 
-        if !parsed.tool_calls.is_empty() {
-            finish_reason = "tool_calls";
-            let tool_calls = parsed
-                .tool_calls
-                .into_iter()
-                .enumerate()
-                .map(|(index, call)| StreamToolCall::from_tool_call(index as u32, call))
-                .collect();
-            let chunk = ChatCompletionChunk {
-                usage: None,
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: request.model.clone(),
-                choices: vec![ChunkChoice {
-                    index: 0,
-                    delta: ChunkDelta::tool_calls(tool_calls),
-                    finish_reason: None,
-                }],
-            };
-            write_sse_chunk(&writer, &chunk)?;
+        if tool_calls.is_empty() {
+            tool_calls = parsed.tool_calls;
         }
+    }
+
+    if !tool_calls.is_empty() {
+        finish_reason = "tool_calls";
+        let deltas = tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| StreamToolCall::from_tool_call(index as u32, call))
+            .collect();
+        let chunk = ChatCompletionChunk {
+            usage: None,
+            id: id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: request.model.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::tool_calls(deltas),
+                finish_reason: None,
+            }],
+        };
+        write_sse_chunk(&writer, &chunk)?;
     }
 
     // Final chunk signals why generation ended.
@@ -995,48 +1028,35 @@ fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
     idx
 }
 
-/// Marker the host's upstream backend stamps on a tool-call envelope. Kept in
-/// step with `core-host`'s `UPSTREAM_TOOL_ENVELOPE_MARKER`.
-const UPSTREAM_TOOL_ENVELOPE_MARKER: &str = "__tachyon_upstream_tool_calls";
-
-/// Decode a tool-call envelope produced by the host's upstream backend.
+/// Adopt the tool calls the host recognised as structured data.
 ///
-/// Checked before parser selection and independently of it. The upstream
-/// already returned a *structured* call; the parser heuristics — a nonstandard
-/// request option, else a guess from the model name — would otherwise hand a
-/// standard OpenAI client the envelope as literal prose, or try a tagged parser
-/// that cannot read JSON. The marker is what makes the envelope
-/// self-identifying, so a model answering in plain JSON is never mistaken for
-/// one.
-fn parse_upstream_tool_envelope(output: &str) -> Option<ParsedAssistantOutput> {
-    let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
-    if value.get(UPSTREAM_TOOL_ENVELOPE_MARKER) != Some(&serde_json::Value::Bool(true)) {
-        return None;
-    }
-    let tool_calls = tool_calls_from_value(&value, 0)?;
-    Some(ParsedAssistantOutput {
-        content: value
-            .get("content")
-            .and_then(|content| content.as_str())
-            .unwrap_or_default()
-            .to_owned(),
-        tool_calls,
-    })
+/// These need no parsing and no dialect guess: the backend received them as
+/// fields, not as text. That is the whole reason the accelerator interface has
+/// a `tool-call` channel — smuggled through the text channel, a call decodes
+/// only when the request happens to carry the nonstandard parser option, so a
+/// standard OpenAI client offering tools would get the raw JSON back as literal
+/// assistant prose.
+fn adopt_host_tool_calls(
+    calls: Vec<bindings::tachyon::accelerator::cpu::ToolCall>,
+) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| ToolCall {
+            // A provider that assigned no id gets one minted here, matching the
+            // parser's own scheme: the id is what a client echoes back on the
+            // tool result turn, so it cannot be left empty.
+            id: call.id.unwrap_or_else(|| format!("call_tachyon_{index}")),
+            kind: "function".to_owned(),
+            function: ToolCallFunction {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        })
+        .collect()
 }
 
 fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> ParsedAssistantOutput {
-    // The host marks its own envelopes, so they decode whatever the request
-    // says about *parsers* — but still only when the request asked for tools at
-    // all. The marker travels through the ordinary text channel and is neither
-    // secret nor proof of provenance, so without this a local model asked to
-    // reproduce that JSON would come back as `finish_reason: "tool_calls"`
-    // instead of as its own answer. An upstream cannot emit the envelope
-    // unless tools were offered, so nothing legitimate is lost.
-    if request.has_tool_intent() {
-        if let Some(parsed) = parse_upstream_tool_envelope(output) {
-            return parsed;
-        }
-    }
     let Some(parser) = request.resolved_tool_call_parser() else {
         return ParsedAssistantOutput {
             content: output.to_owned(),
@@ -1381,6 +1401,56 @@ fn openai_error_payload(status: u16, message: String, kind: &'static str) -> (u1
     (status, body)
 }
 
+/// Turn a host generation failure into the OpenAI error the client should see.
+///
+/// The point of relaying the upstream's status is that the client's own
+/// behaviour depends on it: a 429 must engage its backoff, and a rejected
+/// request must not be retried at all. Reporting every provider failure as a
+/// 500 leaves it with one response — retry blindly — which is wrong for both.
+///
+/// Two classes are deliberately *not* relayed. An upstream auth failure is this
+/// node's misconfigured credential, not the caller's, and a 401 would send it
+/// chasing its own key; and an unclassified status becomes 502, because this
+/// node is the gateway and the failure is the gateway's to explain.
+fn generation_error_payload(
+    model: &str,
+    error: bindings::tachyon::accelerator::cpu::GenerationError,
+) -> (u16, Vec<u8>) {
+    let message = format!("inference failed for model `{model}`: {}", error.message);
+    let (status, kind) = match error.upstream_status {
+        Some(429) => (429, "rate_limit_error"),
+        // The provider rejected the request we forwarded, which almost always
+        // reflects the caller's own parameters — an unknown model, a tool
+        // schema it will not accept, a context overflow.
+        Some(400 | 404 | 405 | 409 | 413 | 422) => (400, "invalid_request_error"),
+        Some(status @ 502..=504) => (status, "server_error"),
+        Some(_) => (502, "server_error"),
+        None => (500, "server_error"),
+    };
+    openai_error_payload(status, message, kind)
+}
+
+/// Report a failure that arrived after the response headers were already
+/// flushed. The status line is spent by then, so the only honest channel left
+/// is an SSE frame carrying the same error body a buffered request would get.
+fn write_sse_error(
+    writer: &bindings::tachyon::mesh::response_body::StreamingResponse,
+    model: &str,
+    error: bindings::tachyon::accelerator::cpu::GenerationError,
+) -> Result<(), String> {
+    let (_status, body) = generation_error_payload(model, error);
+    let frame = format!(
+        "data: {}\n\n",
+        String::from_utf8(body).unwrap_or_else(|_| "{}".to_owned())
+    );
+    writer
+        .write(frame.as_bytes())
+        .map_err(|e| format!("failed to write the streaming error frame: {e}"))?;
+    writer
+        .write(b"data: [DONE]\n\n")
+        .map_err(|e| format!("failed to write [DONE] frame: {e}"))
+}
+
 fn openai_error(
     status: u16,
     message: String,
@@ -1440,10 +1510,11 @@ mod tests {
     }
 
     #[test]
-    fn the_upstream_envelope_is_ignored_without_tool_intent() {
-        // The marker rides the ordinary text channel, so a model that emits it
-        // — asked to, or by accident — must not be turned into a tool call the
-        // caller never offered.
+    fn no_marker_in_model_text_can_conjure_a_tool_call() {
+        // Structured calls now arrive on their own channel, so the text channel
+        // carries no privileged marker at all. A model that emits the JSON the
+        // host used to smuggle calls through — asked to, or by accident — is
+        // answering with text, and must be reported as text.
         let envelope = serde_json::json!({
             "__tachyon_upstream_tool_calls": true,
             "content": "",
@@ -1460,11 +1531,6 @@ mod tests {
             "a request offering no tools must not produce one"
         );
         assert_eq!(parsed.content, envelope, "the text is returned unchanged");
-
-        // With tools offered it decodes as before, whatever the parser says.
-        let parsed = parse_assistant_output(&tool_request_named("local"), &envelope);
-        assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].function.name, "rm_rf");
     }
 
     #[test]
@@ -1723,49 +1789,77 @@ mod tests {
     }
 
     #[test]
-    fn an_upstream_envelope_decodes_without_any_parser_selection() {
+    fn host_reported_tool_calls_need_no_parser_selection() {
         // A standard OpenAI client offers tools and passes no parser option;
-        // the model name implies none either. The marker is what makes the
-        // structured call survive instead of arriving as literal prose.
-        let request = ChatCompletionRequest {
-            model: "remote-coder".to_owned(),
-            messages: vec![ChatMessage::text("user", "go")],
-            tools: vec![serde_json::json!({"type": "function"})],
-            tool_choice: None,
-            tool_call_parser: None,
-            extra_body: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            seed: None,
-            stop: None,
-            stream: None,
-            stream_options: None,
-        };
-        assert!(
-            request.resolved_tool_call_parser().is_none(),
-            "this request must imply no parser for the test to mean anything"
-        );
-
-        let envelope = serde_json::json!({
-            "__tachyon_upstream_tool_calls": true,
-            "content": "",
-            "tool_calls": [{"id": "c1", "type": "function",
-                            "function": {"name": "read_file", "arguments": "{}"}}],
-        })
-        .to_string();
-        let parsed = parse_assistant_output(&request, &envelope);
-        assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].function.name, "read_file");
-        assert!(parsed.content.is_empty());
+        // the model name implies none either. Structured calls arrive on their
+        // own channel, so no dialect has to be guessed for them to survive —
+        // which is what previously decided whether a call reached the client at
+        // all or arrived as literal prose.
+        let calls = adopt_host_tool_calls(vec![bindings::tachyon::accelerator::cpu::ToolCall {
+            id: Some("c1".to_owned()),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"a.rs"}"#.to_owned(),
+        }]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
     }
 
     #[test]
-    fn an_unmarked_json_object_is_not_treated_as_an_upstream_envelope() {
-        // A model that happens to answer with JSON must not be mistaken for the
-        // host's envelope.
-        assert!(parse_upstream_tool_envelope(r#"{"tool_calls":[{"name":"f"}]}"#).is_none());
-        assert!(parse_upstream_tool_envelope("plain prose").is_none());
+    fn a_host_tool_call_without_an_id_is_given_one() {
+        // The id is what a client echoes back on the tool-result turn, so an
+        // empty one makes the call impossible to answer.
+        let calls = adopt_host_tool_calls(vec![bindings::tachyon::accelerator::cpu::ToolCall {
+            id: None,
+            name: "f".to_owned(),
+            arguments: "{}".to_owned(),
+        }]);
+        assert_eq!(calls[0].id, "call_tachyon_0");
+    }
+
+    #[test]
+    fn an_upstream_status_is_relayed_rather_than_flattened_into_a_500() {
+        let rate_limited = bindings::tachyon::accelerator::cpu::GenerationError {
+            message: "upstream returned HTTP 429".to_owned(),
+            upstream_status: Some(429),
+        };
+        let (status, body) = generation_error_payload("coder", rate_limited);
+        assert_eq!(status, 429, "a client's backoff depends on seeing the 429");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error body");
+        assert_eq!(payload["error"]["type"], "rate_limit_error");
+
+        // A rejected request is the caller's to fix, not to retry.
+        let (status, _) = generation_error_payload(
+            "coder",
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: "upstream returned HTTP 400".to_owned(),
+                upstream_status: Some(400),
+            },
+        );
+        assert_eq!(status, 400);
+
+        // An upstream credential failure is this node's misconfiguration, so it
+        // must not reach the caller as its own authentication problem.
+        let (status, _) = generation_error_payload(
+            "coder",
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: "upstream returned HTTP 401".to_owned(),
+                upstream_status: Some(401),
+            },
+        );
+        assert_eq!(status, 502);
+
+        // A local failure has no remote status to relay and stays a 500.
+        let (status, _) = generation_error_payload(
+            "coder",
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: "model alias `coder` is not loaded".to_owned(),
+                upstream_status: None,
+            },
+        );
+        assert_eq!(status, 500);
     }
 
     #[test]

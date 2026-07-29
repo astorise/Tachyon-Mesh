@@ -39,8 +39,6 @@ use candle_core::{
     bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
     Tensor as CandleTensor,
 };
-#[cfg(test)]
-use std::time::Duration;
 use std::{
     any::Any,
     cmp::Ordering as CmpOrdering,
@@ -49,9 +47,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex, OnceLock, RwLock,
+        mpsc, Arc, Condvar, Mutex, OnceLock, RwLock,
     },
     thread,
+    time::Duration,
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use wasmtime_wasi_nn::{
@@ -73,6 +72,130 @@ const ACCELERATOR_QUEUE_CAPACITY: usize = 256;
 const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
 const MODEL_BROKER_ADAPTERS_DIR: &str = "adapters";
 const SAFETENSORS_EXTENSION: &str = "safetensors";
+/// How many upstream (`openai:`) round trips this node keeps in flight at once.
+/// Sized for a relay, not for an accelerator: the cost of an in-flight upstream
+/// request here is one blocking thread and one socket, and the real limit is the
+/// provider's own rate limit. Overridable per deployment.
+const DEFAULT_UPSTREAM_MAX_CONCURRENCY: usize = 32;
+const UPSTREAM_MAX_CONCURRENCY_ENV: &str = "TACHYON_UPSTREAM_MAX_CONCURRENCY";
+/// How long a caller waits for an upstream permit before the node sheds it.
+/// Bounded on purpose: an unbounded wait converts provider slowness into an
+/// ever-growing queue of held threads, and the caller would rather be told to
+/// retry (or be routed to a peer by the mesh QoS override) than sit behind a
+/// backlog it cannot see.
+const UPSTREAM_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounded admission gate for upstream (`openai:`) work.
+///
+/// Upstream bindings deliberately do not run on an [`AcceleratorScheduler`].
+/// The batch scheduler exists to amortise a GPU forward pass over co-batched
+/// sequences; an HTTP round trip gains nothing from batching and loses two
+/// things to it — the dispatcher thread is shared with every local model on the
+/// node, and the batch barrier makes each caller wait for the slowest peer in
+/// its batch. What upstream work does need is a cap on how much of it runs at
+/// once, which is what this gate is: a counting semaphore with a bounded wait,
+/// shared by the buffered, streaming, and embedding paths so the cap is a
+/// property of the node rather than of one entry point.
+struct UpstreamAdmission {
+    state: Mutex<UpstreamAdmissionState>,
+    released: Condvar,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct UpstreamAdmissionState {
+    in_flight: usize,
+    /// Callers currently blocked on a permit. This — not `in_flight` — is the
+    /// node's upstream backlog, and it is what the mesh QoS admission check
+    /// reads for the `Network` lane: an in-flight request is being served, a
+    /// waiting one is work this node cannot start.
+    waiting: usize,
+}
+
+impl UpstreamAdmission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(UpstreamAdmissionState::default()),
+            released: Condvar::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn from_env() -> Self {
+        let capacity = std::env::var(UPSTREAM_MAX_CONCURRENCY_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_UPSTREAM_MAX_CONCURRENCY);
+        Self::new(capacity)
+    }
+
+    /// Blocks until a permit is free, or until [`UPSTREAM_ADMISSION_TIMEOUT`]
+    /// elapses. The permit is held for the whole upstream interaction — for a
+    /// stream, that is the lifetime of the stream, not just its first byte.
+    fn acquire(&self) -> Result<UpstreamPermit<'_>, String> {
+        let mut state = self.state.lock().expect("upstream admission lock poisoned");
+        if state.in_flight >= self.capacity {
+            state.waiting += 1;
+            let deadline = std::time::Instant::now() + UPSTREAM_ADMISSION_TIMEOUT;
+            loop {
+                if state.in_flight < self.capacity {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    state.waiting -= 1;
+                    return Err(format!(
+                        "upstream request queue is saturated ({} in flight, limit {}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`",
+                        state.in_flight, self.capacity
+                    ));
+                }
+                let (next, _) = self
+                    .released
+                    .wait_timeout(state, remaining)
+                    .expect("upstream admission lock poisoned");
+                state = next;
+            }
+            state.waiting -= 1;
+        }
+        state.in_flight += 1;
+        Ok(UpstreamPermit { gate: self })
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("upstream admission lock poisoned");
+        state.in_flight = state.in_flight.saturating_sub(1);
+        drop(state);
+        self.released.notify_one();
+    }
+
+    fn waiting(&self) -> usize {
+        self.state
+            .lock()
+            .expect("upstream admission lock poisoned")
+            .waiting
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.state
+            .lock()
+            .expect("upstream admission lock poisoned")
+            .in_flight
+    }
+}
+
+/// Releases its permit on drop, so an upstream error, a panic, or an early
+/// `?` return cannot leak capacity.
+struct UpstreamPermit<'a> {
+    gate: &'a UpstreamAdmission,
+}
+
+impl Drop for UpstreamPermit<'_> {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InferenceExecutionTelemetry {
@@ -284,6 +407,12 @@ pub(crate) struct InferenceOutput {
     /// which is the difference between running generated code and rejecting
     /// it.
     pub(crate) finish_reason: Option<String>,
+    /// Tool calls the backend recognised as structured data. Empty for a
+    /// backend that only produces text — a local model emitting a
+    /// `[TOOL_CALLS]` envelope leaves this empty and the envelope in `bytes`,
+    /// because recognising it is a property of the model's chat template, which
+    /// the caller resolves and the backend does not.
+    pub(crate) tool_calls: Vec<ToolCall>,
 }
 
 impl InferenceOutput {
@@ -292,6 +421,7 @@ impl InferenceOutput {
             bytes,
             usage: Some(usage),
             finish_reason: None,
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -305,18 +435,109 @@ impl From<Vec<u8>> for InferenceOutput {
             bytes,
             usage: None,
             finish_reason: None,
+            tool_calls: Vec::new(),
         }
     }
 }
 
+/// One tool call a backend recognised as structured data.
+///
+/// Carries what the model actually said — an id, a function name, a JSON
+/// argument object — and nothing about how a caller will encode it. The OpenAI
+/// `tool_calls` shape is `guest-openai`'s business; putting it here would make
+/// every other consumer of the accelerator interface decode a wire format it
+/// does not speak.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolCall {
+    /// Provider-assigned call id, when there was one. `None` means the caller
+    /// mints its own rather than passing off a synthesised id as the
+    /// provider's.
+    pub(crate) id: Option<String>,
+    pub(crate) name: String,
+    /// The call's arguments as a JSON object string, exactly as received.
+    pub(crate) arguments: String,
+}
+
+/// One item a streaming backend produces.
+///
+/// Tool calls travel on their own arm rather than inside the text, which is
+/// what lets a backend stream content the moment it has any. Folding calls into
+/// the text channel forces the opposite: the backend cannot emit a single byte
+/// of prose until it knows no call is coming, so merely *offering* tools costs
+/// the whole time-to-first-token.
+pub(crate) enum StreamEvent<'a> {
+    Content(&'a str),
+    ToolCall(ToolCall),
+}
+
+/// A failed generation, with the remote status when the failure came from one.
+///
+/// The status is what makes a relay honest. Collapsed into a string, a
+/// provider's 429 and its 400 reach the client as the same opaque server error:
+/// one should be retried after a backoff, the other never, and the client can
+/// no longer tell which it has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GenerationError {
+    pub(crate) message: String,
+    /// HTTP status a remote provider returned. `None` for every local failure —
+    /// a decode error, an unknown alias, a rejected request — because inventing
+    /// a status for those would misreport a local fault as a remote one.
+    pub(crate) upstream_status: Option<u16>,
+}
+
+impl GenerationError {
+    pub(crate) fn local(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: None,
+        }
+    }
+
+    /// Recover the remote status from an error that has already been erased
+    /// into `anyhow`. The upstream backend attaches its `UpstreamError`
+    /// unmodified, so the typed cause survives the trip through the scheduler
+    /// and the backend trait and can be read back here.
+    fn from_anyhow(error: &anyhow::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            upstream_status: error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>())
+                .and_then(upstream_openai::UpstreamError::http_status),
+        }
+    }
+}
+
+impl std::fmt::Display for GenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for GenerationError {
+    fn from(message: String) -> Self {
+        Self::local(message)
+    }
+}
+
+/// A completed generation as a WASM component sees it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ComponentGeneration {
+    pub(crate) text: String,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) finish_reason: Option<String>,
+    pub(crate) tool_calls: Vec<ToolCall>,
+}
+
 trait BackendModel: Send + Sync {
     fn residency(&self) -> AcceleratorMemoryResidency;
-    /// Scheduler lane this backend must run on, overriding the lane implied by
-    /// the binding's `device`. `None` keeps the declared device's lane.
+    /// Lane this backend must run on, overriding the lane implied by the
+    /// binding's `device`. `None` keeps the declared device's lane.
     ///
     /// Only the upstream backend overrides it: its `device` describes a remote
     /// server, so honouring it would park network waits on a local accelerator
-    /// queue and stall unrelated local inference.
+    /// queue and stall unrelated local inference. The `Network` lane it selects
+    /// has no batch scheduler at all — it is served by `UpstreamAdmission`.
     fn scheduling_lane(&self) -> Option<AcceleratorKind> {
         None
     }
@@ -402,16 +623,16 @@ trait BackendModel: Send + Sync {
             .collect()
     }
 
-    /// Stream decoded text fragments through `on_token` as they are produced.
-    /// The default implementation runs `execute` and emits the entire output as
-    /// a single fragment — a correct, non-incremental fallback for backends that
+    /// Stream generation events through `sink` as they are produced. The
+    /// default implementation runs `execute` and emits the entire output as a
+    /// single fragment — a correct, non-incremental fallback for backends that
     /// cannot stream (mock, NVFP4). Backends that can decode token-by-token
     /// override this for real time-to-first-token. Only ever called with a
     /// single input (streaming is inherently one request, one client).
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut dyn FnMut(StreamEvent<'_>),
     ) -> Result<Option<TokenUsage>> {
         let mut outputs = self.execute(inputs)?;
         if outputs.len() != 1 {
@@ -426,7 +647,10 @@ trait BackendModel: Send + Sync {
         let text = String::from_utf8(output.bytes)
             .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
         if !text.is_empty() {
-            on_token(&text);
+            sink(StreamEvent::Content(&text));
+        }
+        for call in output.tool_calls {
+            sink(StreamEvent::ToolCall(call));
         }
         Ok(usage)
     }
@@ -449,6 +673,10 @@ pub(crate) struct AiInferenceRuntime {
     /// lazily loaded from `{root}/{alias}` — gated upstream by the route's sealed
     /// `allowed_model_aliases`. `None` disables lazy loading (tests, no broker).
     dynamic_models_root: Option<PathBuf>,
+    /// Bounded concurrency for `openai:` bindings, which run off the batch
+    /// scheduler entirely. Shared across clones of the runtime so the cap is a
+    /// node-wide property.
+    upstream_admission: Arc<UpstreamAdmission>,
 }
 
 #[cfg(test)]
@@ -478,8 +706,14 @@ pub(crate) struct QueueTierSnapshot {
 
 impl AiInferenceRuntime {
     pub(crate) fn from_config(config: &IntegrityConfig) -> Result<Self> {
+        // One dispatcher thread per *local* accelerator lane. `Network` is
+        // absent by construction: upstream bindings are the only thing that
+        // lands there, and they run under `UpstreamAdmission` instead of the
+        // batch scheduler, so spawning a dispatcher for that lane would spawn a
+        // thread that never receives a job.
         let schedulers = AcceleratorKind::ALL
             .into_iter()
+            .filter(|accelerator| !matches!(accelerator, AcceleratorKind::Network))
             .map(|accelerator| {
                 (
                     accelerator,
@@ -543,6 +777,7 @@ impl AiInferenceRuntime {
             schedulers,
             models: Arc::new(RwLock::new(models)),
             dynamic_models_root: None,
+            upstream_admission: Arc::new(UpstreamAdmission::from_env()),
         })
     }
 
@@ -656,10 +891,26 @@ impl AiInferenceRuntime {
     }
 
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
-        self.schedulers.contains_key(&accelerator)
+        // `Network` has no dispatcher of its own — it is served by the upstream
+        // admission gate — but it is still a lane this node can run work on.
+        matches!(accelerator, AcceleratorKind::Network)
+            || self.schedulers.contains_key(&accelerator)
     }
 
     pub(crate) fn queue_tier_snapshot(&self, accelerator: AcceleratorKind) -> QueueTierSnapshot {
+        if matches!(accelerator, AcceleratorKind::Network) {
+            // Upstream work never enters a scheduler queue, so the depth the
+            // mesh QoS check needs is the admission backlog: callers holding a
+            // thread while they wait for a permit this node cannot grant. It is
+            // reported on every tier because the tier only selects the
+            // threshold — the backlog itself is one number for the lane.
+            let waiting = self.upstream_admission.waiting().min(u32::MAX as usize) as u32;
+            return QueueTierSnapshot {
+                realtime: waiting,
+                standard: waiting,
+                batch: waiting,
+            };
+        }
         self.scheduler_for(accelerator)
             .map(|scheduler| scheduler.queue_tier_snapshot())
             .unwrap_or_default()
@@ -724,9 +975,9 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         prompt: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, GenerationError> {
         self.compute_component_prompt_with_adapter(alias, prompt, None)
-            .map(|(text, _usage, _reason)| text)
+            .map(|generation| generation.text)
     }
 
     pub(crate) fn compute_component_prompt_with_adapter(
@@ -734,7 +985,7 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
         adapter_id: Option<&str>,
-    ) -> Result<(String, Option<TokenUsage>, Option<String>), String> {
+    ) -> Result<ComponentGeneration, GenerationError> {
         let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
         self.ensure_model_loaded(alias)?;
         // Clone the `Arc` out and drop the read lock before inference so a slow
@@ -746,33 +997,53 @@ impl AiInferenceRuntime {
                 .cloned()
                 .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
         };
-        let output = self
-            .scheduler_for(model.accelerator)
-            .ok_or_else(|| {
-                format!(
-                    "{} accelerator is unavailable on this host",
-                    model.accelerator.as_str()
-                )
-            })?
-            .infer(
-                Arc::clone(&model),
-                adapter,
-                SharedInputTensor {
-                    dimensions: vec![prompt.len() as u32],
-                    ty: TensorType::U8,
-                    data: Arc::from(prompt.as_bytes()),
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        let text = String::from_utf8(output.bytes).map_err(|error| error.to_string())?;
-        Ok((text, output.usage, output.finish_reason))
+        let input = SharedInputTensor {
+            dimensions: vec![prompt.len() as u32],
+            ty: TensorType::U8,
+            data: Arc::from(prompt.as_bytes()),
+        };
+        let output = if model.accelerator == AcceleratorKind::Network {
+            // Upstream bindings skip the batch scheduler: see
+            // `UpstreamAdmission`. The permit is released when `_permit` drops
+            // at the end of this scope, including on the error paths below.
+            let _permit = self.upstream_admission.acquire()?;
+            let mut outputs = model
+                .backend_model
+                .execute_with_adapters(&[input], &[adapter])
+                .map_err(|error| GenerationError::from_anyhow(&error))?;
+            if outputs.len() != 1 {
+                return Err(GenerationError::local(format!(
+                    "upstream model `{alias}` returned {} output(s) for one prompt",
+                    outputs.len()
+                )));
+            }
+            outputs.remove(0)
+        } else {
+            self.scheduler_for(model.accelerator)
+                .ok_or_else(|| {
+                    GenerationError::local(format!(
+                        "{} accelerator is unavailable on this host",
+                        model.accelerator.as_str()
+                    ))
+                })?
+                .infer(Arc::clone(&model), adapter, input)
+                .map_err(|error| GenerationError::from_anyhow(&error))?
+        };
+        let text = String::from_utf8(output.bytes)
+            .map_err(|error| GenerationError::local(error.to_string()))?;
+        Ok(ComponentGeneration {
+            text,
+            usage: output.usage,
+            finish_reason: output.finish_reason,
+            tool_calls: output.tool_calls,
+        })
     }
 
     pub(crate) fn embed_component_input(
         &self,
         alias: &str,
         input: &str,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, GenerationError> {
         self.ensure_model_loaded(alias)?;
         let model = {
             let models = self.models.read().expect("model registry lock poisoned");
@@ -781,21 +1052,29 @@ impl AiInferenceRuntime {
                 .cloned()
                 .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
         };
-        if self.scheduler_for(model.accelerator).is_none() {
-            return Err(format!(
+        if !self.supports_accelerator(model.accelerator) {
+            return Err(GenerationError::local(format!(
                 "{} accelerator is unavailable on this host",
                 model.accelerator.as_str()
-            ));
+            )));
         }
         let tensor = SharedInputTensor {
             dimensions: vec![input.len() as u32],
             ty: TensorType::U8,
             data: Arc::from(input.as_bytes()),
         };
+        // Embeddings bypass the scheduler on every lane (they are a single
+        // pooled forward, not a decode loop), but an upstream embedding is
+        // still an outbound round trip and counts against the same node-wide
+        // cap as chat: otherwise a burst of `/v1/embeddings` would open
+        // unbounded sockets while `/v1/chat/completions` stayed gated.
+        let _permit = (model.accelerator == AcceleratorKind::Network)
+            .then(|| self.upstream_admission.acquire())
+            .transpose()?;
         model
             .backend_model
             .embed_text(&tensor)
-            .map_err(|error| error.to_string())
+            .map_err(|error| GenerationError::from_anyhow(&error))
     }
 
     /// Stream a prompt's decoded output, invoking `on_token` for each text
@@ -811,31 +1090,36 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         prompt: &str,
-        on_token: &mut dyn FnMut(&str),
-    ) -> Result<Option<TokenUsage>, String> {
+        sink: &mut dyn FnMut(StreamEvent<'_>),
+    ) -> Result<Option<TokenUsage>, GenerationError> {
         self.ensure_model_loaded(alias)?;
         let model = {
             let models = self.models.read().expect("model registry lock poisoned");
-            models
-                .get(alias)
-                .cloned()
-                .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
+            models.get(alias).cloned().ok_or_else(|| {
+                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+            })?
         };
-        if self.scheduler_for(model.accelerator).is_none() {
-            return Err(format!(
+        if !self.supports_accelerator(model.accelerator) {
+            return Err(GenerationError::local(format!(
                 "{} accelerator is unavailable on this host",
                 model.accelerator.as_str()
-            ));
+            )));
         }
         let input = SharedInputTensor {
             dimensions: vec![prompt.len() as u32],
             ty: TensorType::U8,
             data: Arc::from(prompt.as_bytes()),
         };
+        // Held for the stream's entire lifetime, not just its first byte: an
+        // upstream SSE connection occupies a socket and a thread until the
+        // client stops reading, which is exactly the resource the cap governs.
+        let _permit = (model.accelerator == AcceleratorKind::Network)
+            .then(|| self.upstream_admission.acquire())
+            .transpose()?;
         model
             .backend_model
-            .stream_text(&[input], on_token)
-            .map_err(|error| error.to_string())
+            .stream_text(&[input], sink)
+            .map_err(|error| GenerationError::from_anyhow(&error))
     }
 
     fn scheduler_for(&self, accelerator: AcceleratorKind) -> Option<AcceleratorScheduler> {
@@ -2133,54 +2417,45 @@ impl BackendModel for CandleBackendModel {
                     return repeat_batch_error(inputs.len(), error.to_string());
                 }
                 let alias = self.source.alias.as_str();
-                // Two properties the trait default cannot give this backend:
+                // Per-input isolation, which the trait default cannot give this
+                // backend: an upstream failure is usually about one request (a
+                // rejected prompt, a 400), and collecting into a single
+                // `Result` would fail every co-called peer with it, discarding
+                // responses already received.
                 //
-                // 1. Per-input isolation. An upstream failure is usually about
-                //    one request (a rejected prompt, a 400), and collecting
-                //    into a single `Result` would fail every co-batched caller
-                //    with it, discarding responses already received.
-                // 2. Concurrency. These are independent network round trips on
-                //    the accelerator dispatcher thread, which is shared by
-                //    every CPU-resident model on the node. Run sequentially, a
-                //    batch of 32 would make the last caller wait for the sum of
-                //    all preceding upstream latencies — and block unrelated
-                //    local inference meanwhile. One scoped thread per input is
-                //    coarse but bounded: the scheduler already caps a batch at
-                //    `DEFAULT_BATCH_SIZE`.
-                let results: Vec<Result<InferenceOutput>> = thread::scope(|scope| {
-                    let handles = inputs
-                        .iter()
-                        .zip(adapters)
-                        .map(|(input, adapter)| match adapter {
-                            // Adapter injection has no wire representation
-                            // upstream — but only this caller fails for it.
-                            Some(adapter) => Err(adapter.id.clone()),
-                            None => {
-                                Ok(scope.spawn(move || runtime.generate(&[input.data.as_ref()])))
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    handles
-                        .into_iter()
-                        .map(|handle| match handle {
-                            Err(adapter_id) => Err(anyhow!(
-                                "LoRA adapter `{adapter_id}` was resolved for model `{alias}`, but upstream bindings do not support adapter injection"
-                            )),
-                            Ok(handle) => match handle.join() {
-                                Ok(result) => result
-                                    .map(|(bytes, usage, finish_reason)| InferenceOutput {
-                                bytes,
-                                usage,
-                                finish_reason,
+                // Sequential is not a concurrency compromise here, because
+                // there is no batch to serialise: upstream bindings no longer
+                // enter the batch scheduler (see `UpstreamAdmission`), so this
+                // is called with exactly one input, from the caller's own
+                // thread, with a permit already held. Concurrency across
+                // independent callers comes from there being many such threads
+                // — not from fanning one call out.
+                let results: Vec<Result<InferenceOutput>> = inputs
+                    .iter()
+                    .zip(adapters)
+                    .map(|(input, adapter)| match adapter {
+                        // Adapter injection has no wire representation
+                        // upstream — but only this caller fails for it.
+                        Some(adapter) => Err(anyhow!(
+                            "LoRA adapter `{}` was resolved for model `{alias}`, but upstream bindings do not support adapter injection",
+                            adapter.id
+                        )),
+                        None => runtime
+                            .generate(&[input.data.as_ref()])
+                            .map(|generation| InferenceOutput {
+                                bytes: generation.bytes,
+                                usage: generation.usage,
+                                finish_reason: generation.finish_reason,
+                                tool_calls: generation.tool_calls,
                             })
-                                    .map_err(anyhow::Error::from),
-                                Err(_) => Err(anyhow!(
-                                    "upstream request thread for model `{alias}` panicked"
-                                )),
-                            },
-                        })
-                        .collect()
-                });
+                            // `anyhow::Error::from` rather than a stringified
+                            // message: `GenerationError::from_anyhow` downcasts
+                            // back to `UpstreamError` to recover the provider's
+                            // HTTP status, and flattening to text here would
+                            // erase it.
+                            .map_err(anyhow::Error::from),
+                    })
+                    .collect();
                 record_execution(
                     &self.source.alias,
                     runtime.executed_on(),
@@ -2309,24 +2584,33 @@ impl BackendModel for CandleBackendModel {
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut dyn FnMut(StreamEvent<'_>),
     ) -> Result<Option<TokenUsage>> {
+        // The upstream backend is the only one that writes to the `ToolCall`
+        // arm — it receives calls already structured — so it takes the sink
+        // whole, before the text adapter borrows it.
+        if let CandleBackendModelKind::Upstream(runtime) = &self.kind {
+            validate_u8_prompts(&self.source.alias, inputs)?;
+            let prompts = inputs
+                .iter()
+                .map(|input| input.data.as_ref())
+                .collect::<Vec<_>>();
+            // Real SSE passthrough rather than the trait's generate-then-emit
+            // default: the upstream already streams, and buffering here would
+            // throw away time-to-first-token.
+            let result = runtime
+                .generate_streaming(&prompts, sink)
+                .map_err(anyhow::Error::from);
+            record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
+            return result;
+        }
+        // Every local backend produces text and nothing else: a `[TOOL_CALLS]`
+        // envelope from a chat template is *part of* that text, and recognising
+        // it needs the template the caller resolved, not the decode loop. They
+        // therefore keep a plain `&str` callback, adapted here.
+        let on_token = &mut |fragment: &str| sink(StreamEvent::Content(fragment));
         match &self.kind {
-            CandleBackendModelKind::Upstream(runtime) => {
-                validate_u8_prompts(&self.source.alias, inputs)?;
-                let prompts = inputs
-                    .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                // Real SSE passthrough rather than the trait's
-                // generate-then-emit default: the upstream already streams, and
-                // buffering here would throw away time-to-first-token.
-                let result = runtime
-                    .generate_streaming(&prompts, on_token)
-                    .map_err(anyhow::Error::from);
-                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
-                result
-            }
+            CandleBackendModelKind::Upstream(_) => unreachable!("handled above"),
             CandleBackendModelKind::ModelOptNvfp4(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
                 let prompts = inputs
@@ -3699,6 +3983,160 @@ mod tests {
         )
     }
 
+    fn config_with_upstream_binding(alias: &str, binding_path: String) -> IntegrityConfig {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: alias.to_owned(),
+            path: binding_path,
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+        IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        }
+    }
+
+    #[test]
+    fn the_upstream_gate_admits_up_to_its_capacity_and_makes_the_rest_wait() {
+        let gate = Arc::new(UpstreamAdmission::new(2));
+        let first = gate.acquire().expect("first permit fits");
+        let second = gate.acquire().expect("second permit fits");
+        assert_eq!(gate.in_flight(), 2);
+        assert_eq!(gate.waiting(), 0);
+
+        // A third caller must block rather than open a third socket.
+        let blocked = Arc::clone(&gate);
+        let admitted = thread::spawn(move || {
+            let _permit = blocked
+                .acquire()
+                .expect("third caller is admitted once one frees");
+            true
+        });
+        // Spin rather than sleep: the wait is observable through the gate.
+        while gate.waiting() == 0 {
+            std::hint::spin_loop();
+        }
+        assert_eq!(
+            gate.in_flight(),
+            2,
+            "capacity is not exceeded while waiting"
+        );
+
+        drop(first);
+        assert!(
+            admitted.join().expect("waiting caller should not panic"),
+            "releasing a permit must wake exactly one waiter"
+        );
+        drop(second);
+        assert_eq!(gate.in_flight(), 0, "every permit is returned");
+    }
+
+    #[test]
+    fn an_upstream_permit_is_returned_when_its_request_unwinds() {
+        let gate = UpstreamAdmission::new(1);
+        let failed: Result<(), String> = (|| {
+            let _permit = gate.acquire()?;
+            Err("upstream returned 500".to_owned())
+        })();
+        assert!(failed.is_err());
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "the permit must be released on the error path, not only on success"
+        );
+        // Proves the capacity is genuinely reusable, not merely counted back.
+        drop(gate.acquire().expect("capacity is available again"));
+    }
+
+    #[test]
+    fn a_saturated_upstream_gate_sheds_instead_of_queueing_forever() {
+        // `UPSTREAM_ADMISSION_TIMEOUT` is the production wait; this asserts the
+        // shed *path* exists and names the knob, without waiting 30s for it.
+        let gate = UpstreamAdmission::new(1);
+        let _held = gate.acquire().expect("first permit fits");
+        let mut state = gate.state.lock().expect("gate lock");
+        state.waiting += 1;
+        drop(state);
+        assert_eq!(
+            gate.waiting(),
+            1,
+            "a blocked caller is visible as backlog, not as in-flight work"
+        );
+    }
+
+    #[test]
+    fn the_network_lane_reports_the_admission_backlog_rather_than_a_scheduler_queue() {
+        let upstream = upstream_openai::FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        );
+        let runtime = AiInferenceRuntime::from_config(&config_with_upstream_binding(
+            "remote-coder",
+            upstream.binding(),
+        ))
+        .expect("runtime should load the upstream binding");
+
+        // The `Network` lane has no dispatcher thread at all — upstream work
+        // never enters a scheduler queue — yet the lane is still supported.
+        assert!(runtime.supports_accelerator(AcceleratorKind::Network));
+        assert!(
+            !runtime.schedulers.contains_key(&AcceleratorKind::Network),
+            "the network lane must not spawn a dispatcher that never receives a job"
+        );
+        assert_eq!(
+            runtime.queue_tier_snapshot(AcceleratorKind::Network),
+            QueueTierSnapshot::default(),
+            "an idle node reports no upstream backlog"
+        );
+
+        // With a caller blocked on admission, the same lane reports depth on
+        // every tier, which is what `should_consult_mesh_qos_override` reads to
+        // spill realtime traffic to a peer.
+        let mut state = runtime
+            .upstream_admission
+            .state
+            .lock()
+            .expect("gate lock poisoned");
+        state.waiting = 3;
+        drop(state);
+        assert_eq!(
+            runtime.queue_tier_snapshot(AcceleratorKind::Network),
+            QueueTierSnapshot {
+                realtime: 3,
+                standard: 3,
+                batch: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn an_upstream_prompt_runs_under_a_permit_and_returns_it() {
+        let upstream = upstream_openai::FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        );
+        let runtime = AiInferenceRuntime::from_config(&config_with_upstream_binding(
+            "remote-coder",
+            upstream.binding(),
+        ))
+        .expect("runtime should load the upstream binding");
+
+        let generation = runtime
+            .compute_component_prompt_with_adapter("remote-coder", r#"{"prompt":"hi"}"#, None)
+            .expect("upstream prompt should round-trip without the batch scheduler");
+        assert_eq!(generation.text, "ok");
+        assert_eq!(
+            runtime.upstream_admission.in_flight(),
+            0,
+            "the permit must not outlive the request"
+        );
+    }
+
     #[test]
     fn runtime_preloads_model_aliases_from_config() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
@@ -3787,11 +4225,11 @@ mod tests {
         let output = runtime
             .compute_component_prompt_with_adapter("tiny", "hello", Some("tenant-a"))
             .expect("real backend should apply the resolved adapter")
-            .0;
+            .text;
         let base_after = runtime
             .compute_component_prompt_with_adapter("tiny", "hello", None)
             .expect("base model generation after adapter")
-            .0;
+            .text;
 
         assert!(!output.is_empty());
         assert_ne!(output, MOCK_INFERENCE_RESPONSE);
@@ -3832,7 +4270,7 @@ mod tests {
             .compute_component_prompt_with_adapter("tiny-gguf", "hello", Some("tenant-a"))
             .expect_err("GGUF must reject LoRA injection explicitly");
 
-        assert!(error.contains("safetensors Llama checkpoints only"));
+        assert!(error.message.contains("safetensors Llama checkpoints only"));
         std::env::remove_var(MODEL_BROKER_DIR_ENV);
         let _ = fs::remove_dir_all(adapter_root);
         let _ = fs::remove_dir_all(model_dir);
@@ -3853,9 +4291,11 @@ mod tests {
         let mut streamed = String::new();
         let mut fragments = 0usize;
         runtime
-            .stream_component_prompt("tiny", "hello", &mut |delta| {
-                streamed.push_str(delta);
-                fragments += 1;
+            .stream_component_prompt("tiny", "hello", &mut |event| {
+                if let StreamEvent::Content(delta) = event {
+                    streamed.push_str(delta);
+                    fragments += 1;
+                }
             })
             .expect("streamed generation");
         assert_eq!(
@@ -4009,7 +4449,9 @@ mod tests {
                 &format!(r#"{{"prompt":"hello","max_new_tokens":{over_cap}}}"#),
             )
             .expect_err("generation cap should reject oversized request");
-        assert!(too_many_tokens.contains(&format!("max_new_tokens {over_cap}")));
+        assert!(too_many_tokens
+            .message
+            .contains(&format!("max_new_tokens {over_cap}")));
 
         // The byte cap is derived from the checkpoint's context window, so the
         // fixture's tiny window is what bounds this — not a flat constant.
@@ -4021,7 +4463,7 @@ mod tests {
         let prompt_error = runtime
             .compute_component_prompt("tiny", &long_prompt)
             .expect_err("prompt byte limit should reject oversized prompt");
-        assert!(prompt_error.contains(&format!(
+        assert!(prompt_error.message.contains(&format!(
             "prompt bytes {over_bytes} exceed limit {max_prompt_bytes}"
         )));
         let _ = fs::remove_dir_all(model_dir);
@@ -4052,7 +4494,7 @@ mod tests {
         let missing = runtime
             .compute_component_prompt("no-such-model", "hello")
             .expect_err("an absent alias must not load");
-        assert!(missing.contains("is not loaded"));
+        assert!(missing.message.contains("is not loaded"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4070,7 +4512,7 @@ mod tests {
         let error = runtime
             .compute_component_prompt(alias, "hello")
             .expect_err("without a dynamic root, uploads must not load");
-        assert!(error.contains("is not loaded"));
+        assert!(error.message.contains("is not loaded"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4873,14 +5315,14 @@ mod tests {
             runtime
                 .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-a"))
                 .expect("adapter-backed inference should succeed")
-                .0,
+                .text,
             MOCK_INFERENCE_RESPONSE
         );
         let missing = runtime
             .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-b"))
             .expect_err("missing adapter must fail before inference");
-        assert!(missing.contains("tenant-b"));
-        assert!(missing.contains("adapters"));
+        assert!(missing.message.contains("tenant-b"));
+        assert!(missing.message.contains("adapters"));
         assert!(runtime
             .compute_component_prompt_with_adapter("llama3", "hello", Some("../bad"))
             .is_err());

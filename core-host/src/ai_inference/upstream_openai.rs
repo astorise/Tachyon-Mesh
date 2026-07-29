@@ -35,6 +35,7 @@ use thiserror::Error;
 use super::candle_llm_runtime::{
     TokenUsage, HOST_MAX_GENERATION_DEADLINE, MAX_PROMPT_BYTES_CEILING,
 };
+use super::{StreamEvent, ToolCall};
 
 /// Binding `path` prefix that selects this backend.
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
@@ -58,17 +59,6 @@ const MAX_ERROR_BODY_BYTES: u64 = 2048;
 /// Cap on a whole SSE stream. Generous — 64 MiB of text is millions of tokens —
 /// but finite, so a stream that never terminates cannot grow without bound.
 const MAX_STREAM_BYTES: u64 = MAX_RESPONSE_BYTES;
-/// Marker on a tool-call envelope produced by *this* backend.
-///
-/// The envelope has to survive a hop through a host contract whose only channel
-/// is text. Relying on `guest-openai`'s parser selection to decode it does not
-/// work: that selection comes from a nonstandard request option or a guess from
-/// the model name, so a standard OpenAI client offering tools gets no parser at
-/// all — or a tagged one that cannot read JSON — and the structured call comes
-/// back as literal assistant prose. This marker lets the reader recognise the
-/// envelope on its own, whatever parser the request implies.
-pub(crate) const UPSTREAM_TOOL_ENVELOPE_MARKER: &str = "__tachyon_upstream_tool_calls";
-
 /// Cap on one SSE frame. `BufRead::read_line` grows its buffer until a newline,
 /// so a single unterminated line is the tighter of the two risks.
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
@@ -110,6 +100,23 @@ pub(crate) enum UpstreamError {
     },
     #[error("upstream `{alias}` returned an unusable response: {detail}")]
     MalformedResponse { alias: String, detail: String },
+}
+
+impl UpstreamError {
+    /// The HTTP status the remote provider returned, when the failure *was* a
+    /// remote response. Every other variant yields `None`: a transport failure
+    /// never reached a server, and a rejected request never left this node, so
+    /// attributing a status to either would report a local fault as the
+    /// provider's.
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Status { status, .. } => Some(*status),
+            Self::InvalidBinding { .. }
+            | Self::InvalidRequest { .. }
+            | Self::Transport { .. }
+            | Self::MalformedResponse { .. } => None,
+        }
+    }
 }
 
 /// A parsed `openai:` binding. Split out from the runtime so binding validation
@@ -409,7 +416,15 @@ struct HostGenerationRequest {
 /// A completed upstream generation: its bytes, the counts the upstream
 /// reported, and why it stopped. The last two are `Option` because "not
 /// reported" is a distinct answer from zero or `stop`.
-type UpstreamGeneration = (Vec<u8>, Option<TokenUsage>, Option<String>);
+/// One completed upstream generation. Mirrors `InferenceOutput` field for
+/// field, so the backend adapter is a move rather than a re-encoding.
+#[derive(Debug)]
+pub(crate) struct UpstreamGeneration {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) finish_reason: Option<String>,
+    pub(crate) tool_calls: Vec<ToolCall>,
+}
 
 /// An OpenAI-compatible upstream bound to one mesh alias.
 pub(crate) struct UpstreamOpenAiRuntime {
@@ -703,26 +718,20 @@ impl UpstreamOpenAiRuntime {
 
         // A tool call carries `content: null`, so requiring a content string
         // would turn every successful tool call into a malformed-response
-        // error. Re-serialize it into the envelope `guest-openai`'s `json`
-        // tool-call parser reads back (`{"content": …, "tool_calls": […]}`),
-        // which is the only channel this backend has: the host contract is
-        // "generation returns text", with tool-call recovery done downstream.
+        // error. The calls travel on `tool_calls`, structured, rather than
+        // re-encoded into the text: the accelerator interface has a channel for
+        // them, so the caller never has to recognise a smuggled envelope and
+        // never mistakes a model answering in plain JSON for one.
         if let Some(tool_calls) = message
             .get("tool_calls")
             .filter(|tool_calls| !is_empty_json(tool_calls))
         {
-            // Forwarding an unusable array is worse than failing: the guest
-            // cannot decode it, falls back to returning the internal marker
-            // envelope as ordinary assistant content, and the caller gets that
-            // JSON as its answer with HTTP 200. A mixed array is the same
-            // problem one entry at a time — the invalid calls vanish.
-            validate_tool_calls(&self.alias, tool_calls)?;
-            let envelope = json!({
-                UPSTREAM_TOOL_ENVELOPE_MARKER: true,
-                "content": content.unwrap_or_default(),
-                "tool_calls": tool_calls.clone(),
+            return Ok(UpstreamGeneration {
+                bytes: content.unwrap_or_default().as_bytes().to_vec(),
+                usage,
+                finish_reason,
+                tool_calls: tool_calls_from_value(&self.alias, tool_calls)?,
             });
-            return Ok((envelope.to_string().into_bytes(), usage, finish_reason));
         }
 
         let text = content.ok_or_else(|| UpstreamError::MalformedResponse {
@@ -730,15 +739,20 @@ impl UpstreamOpenAiRuntime {
             detail: "response has no `choices[0].message.content` string and no `tool_calls`"
                 .to_owned(),
         })?;
-        Ok((text.as_bytes().to_vec(), usage, finish_reason))
+        Ok(UpstreamGeneration {
+            bytes: text.as_bytes().to_vec(),
+            usage,
+            finish_reason,
+            tool_calls: Vec::new(),
+        })
     }
 
-    /// Stream one generation, invoking `on_token` per SSE delta so the mesh's
-    /// own `/ai/v1` stream keeps a real time-to-first-token.
+    /// Stream one generation, invoking `sink` per SSE delta so the mesh's own
+    /// `/ai/v1` stream keeps a real time-to-first-token.
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut dyn FnMut(StreamEvent<'_>),
     ) -> Result<Option<TokenUsage>, UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
@@ -750,14 +764,13 @@ impl UpstreamOpenAiRuntime {
             });
         };
         let (body, timeout) = self.chat_body(prompt, true)?;
-        // When the request offered tools, content is accumulated rather than
-        // streamed. The downstream `json` parser is anchored to a whole-output
-        // JSON value, so streaming prose and *then* a tool-call envelope would
-        // produce `prose{"content":…}` — unparseable, and the structured call
-        // would be handed back as literal assistant text. Buffering costs
-        // time-to-first-token only on requests that can produce a call.
-        let buffer_content = body.get("tools").is_some();
-        let mut buffered_content = String::new();
+        // Content is streamed unconditionally, including when the request
+        // offered tools. That is what the structured `StreamEvent::ToolCall`
+        // arm buys: with calls confined to the text channel, prose had to be
+        // accumulated until the stream ended, because a tool-call envelope
+        // emitted after streamed prose is unparseable — so offering tools cost
+        // the whole time-to-first-token even on the requests that never
+        // produced a call.
         let response = self.post("/chat/completions", &body, timeout)?;
 
         // Bound the whole stream, so an upstream that never terminates cannot
@@ -847,16 +860,13 @@ impl UpstreamOpenAiRuntime {
                 .and_then(Value::as_str)
                 .filter(|content| !content.is_empty())
             {
-                if buffer_content {
-                    buffered_content.push_str(content);
-                } else {
-                    on_token(content);
-                }
+                sink(StreamEvent::Content(content));
             }
             // A streamed tool call arrives as `delta.tool_calls` fragments with
             // no content at all. Dropping them would make the whole request
-            // look like a model that answered with silence, so accumulate and
-            // emit them as the same envelope the buffered path returns.
+            // look like a model that answered with silence, so accumulate them
+            // and emit each assembled call once the stream ends — a call is
+            // only dispatchable complete, and its arguments arrive in pieces.
             if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
                 for fragment in fragments {
                     streamed_tool_calls.absorb(fragment);
@@ -864,29 +874,15 @@ impl UpstreamOpenAiRuntime {
             }
         }
 
-        // One envelope carrying both, so the downstream anchored parser sees a
-        // whole-output JSON value. When no call materialised, the buffered
-        // prose is emitted as ordinary text.
-        let assembled =
+        for call in
             streamed_tool_calls
                 .finish()
                 .map_err(|detail| UpstreamError::MalformedResponse {
                     alias: self.alias.clone(),
                     detail,
-                })?;
-        match assembled {
-            Some(tool_calls) => {
-                on_token(
-                    &json!({
-                        UPSTREAM_TOOL_ENVELOPE_MARKER: true,
-                        "content": buffered_content,
-                        "tool_calls": tool_calls,
-                    })
-                    .to_string(),
-                );
-            }
-            None if !buffered_content.is_empty() => on_token(&buffered_content),
-            None => {}
+                })?
+        {
+            sink(StreamEvent::ToolCall(call));
         }
 
         // A clean EOF without `[DONE]` is a truncated generation, not a
@@ -965,7 +961,13 @@ impl UpstreamOpenAiRuntime {
 /// response is still typed: by the time it reaches `guest-openai` it is text,
 /// and an unusable call is indistinguishable from a model that answered in
 /// JSON.
-fn validate_tool_calls(alias: &str, tool_calls: &Value) -> Result<(), UpstreamError> {
+/// Validate and convert an upstream `message.tool_calls` array.
+///
+/// Forwarding an unusable array is worse than failing: the caller cannot
+/// dispatch a call with no function name, and a mixed array is the same problem
+/// one entry at a time — the invalid calls would simply vanish while the
+/// response still reported success.
+fn tool_calls_from_value(alias: &str, tool_calls: &Value) -> Result<Vec<ToolCall>, UpstreamError> {
     let malformed = |detail: String| UpstreamError::MalformedResponse {
         alias: alias.to_owned(),
         detail,
@@ -976,19 +978,36 @@ fn validate_tool_calls(alias: &str, tool_calls: &Value) -> Result<(), UpstreamEr
             json_type_name(tool_calls)
         ))
     })?;
-    for (index, call) in calls.iter().enumerate() {
-        let name = call
-            .get("function")
-            .and_then(|function| function.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if name.trim().is_empty() {
-            return Err(malformed(format!(
-                "`choices[0].message.tool_calls[{index}]` has no `function.name`"
-            )));
-        }
-    }
-    Ok(())
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let function = call.get("function");
+            let name = function
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if name.trim().is_empty() {
+                return Err(malformed(format!(
+                    "`choices[0].message.tool_calls[{index}]` has no `function.name`"
+                )));
+            }
+            let arguments = function
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str)
+                .filter(|arguments| !arguments.is_empty())
+                .unwrap_or("{}");
+            Ok(ToolCall {
+                id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned),
+                name: name.to_owned(),
+                arguments: arguments.to_owned(),
+            })
+        })
+        .collect()
 }
 
 fn json_type_name(value: &Value) -> &'static str {
@@ -1063,7 +1082,7 @@ impl StreamedToolCalls {
     /// recorded a healthy generation, so an agent simply saw the model decline
     /// to act. Once fragments have been observed the upstream has committed to
     /// a call, and an incomplete one means the stream was truncated.
-    fn finish(self) -> Result<Option<Value>, String> {
+    fn finish(self) -> Result<Vec<ToolCall>, String> {
         if let Some((index, _, _, _)) = self
             .calls
             .iter()
@@ -1073,28 +1092,22 @@ impl StreamedToolCalls {
                 "upstream streamed tool-call fragments for index {index} but never sent a function name"
             ));
         }
-        let calls = self
+        Ok(self
             .calls
             .into_iter()
-            .map(|(_, id, name, arguments)| {
-                let arguments = if arguments.is_empty() {
+            .map(|(_, id, name, arguments)| ToolCall {
+                id: (!id.is_empty()).then_some(id),
+                name,
+                // An empty argument string is not valid JSON, and a caller that
+                // parses it would report a broken call for a function that
+                // simply takes none.
+                arguments: if arguments.is_empty() {
                     "{}".to_owned()
                 } else {
                     arguments
-                };
-                let mut call = Map::new();
-                if !id.is_empty() {
-                    call.insert("id".to_owned(), json!(id));
-                }
-                call.insert("type".to_owned(), json!("function"));
-                call.insert(
-                    "function".to_owned(),
-                    json!({"name": name, "arguments": arguments}),
-                );
-                Value::Object(call)
+                },
             })
-            .collect::<Vec<_>>();
-        Ok((!calls.is_empty()).then_some(Value::Array(calls)))
+            .collect())
     }
 }
 
@@ -1228,6 +1241,25 @@ impl FakeUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stream split into the two things the contract now separates: assistant
+    /// text, and structured calls. Assertions on the pair are what prove the
+    /// separation holds — that content is not withheld waiting for a call, and
+    /// that a call is not re-encoded into the text.
+    #[derive(Default)]
+    struct CapturedStream {
+        content: Vec<String>,
+        tool_calls: Vec<ToolCall>,
+    }
+
+    impl CapturedStream {
+        fn sink(&mut self) -> impl FnMut(StreamEvent<'_>) + '_ {
+            move |event| match event {
+                StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                StreamEvent::ToolCall(call) => self.tool_calls.push(call),
+            }
+        }
+    }
 
     #[test]
     fn non_upstream_paths_are_not_claimed() {
@@ -1457,10 +1489,11 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let (output, _usage, _reason) = backend
+        let generation = backend
             .generate(&[br#"{"messages":[{"role":"user","content":"write main"}]}"#])
             .expect("generation should round trip");
-        assert_eq!(output, b"fn main() {}".to_vec());
+        assert_eq!(generation.bytes, b"fn main() {}".to_vec());
+        assert!(generation.tool_calls.is_empty());
 
         let (target, body) = upstream.received();
         assert!(
@@ -1490,11 +1523,12 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let mut tokens = Vec::new();
+        let mut captured = CapturedStream::default();
         backend
-            .generate_streaming(&[b"write main"], &mut |token| tokens.push(token.to_owned()))
+            .generate_streaming(&[b"write main"], &mut captured.sink())
             .expect("streaming should complete");
-        assert_eq!(tokens, vec!["fn ", "main", "()"]);
+        assert_eq!(captured.content, vec!["fn ", "main", "()"]);
+        assert!(captured.tool_calls.is_empty());
 
         let (_, body) = upstream.received();
         assert_eq!(body["stream"], true);
@@ -1545,10 +1579,10 @@ mod tests {
     }
 
     #[test]
-    fn a_buffered_tool_envelope_carries_its_marker() {
-        // Without the marker the envelope decodes only when the client happens
-        // to pass the nonstandard parser option, so a standard OpenAI client
-        // would receive the JSON as literal assistant prose.
+    fn a_buffered_tool_call_arrives_structured_rather_than_encoded_into_the_text() {
+        // Smuggled through the text channel, a call decodes only when the
+        // client happens to pass the nonstandard parser option, so a standard
+        // OpenAI client would receive the JSON as literal assistant prose.
         let upstream = FakeUpstream::start(
             "HTTP/1.1 200 OK",
             "application/json",
@@ -1556,10 +1590,19 @@ mod tests {
                 {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
         );
         let backend = runtime("coder", &upstream.binding());
-        let (output, _usage, _reason) = backend.generate(&[b"go"]).expect("tool call round trip");
-        let envelope: Value = serde_json::from_slice(&output).expect("envelope");
-        assert_eq!(envelope[UPSTREAM_TOOL_ENVELOPE_MARKER], true);
-        assert_eq!(envelope["tool_calls"][0]["function"]["name"], "f");
+        let generation = backend.generate(&[b"go"]).expect("tool call round trip");
+        assert!(
+            generation.bytes.is_empty(),
+            "a call carries no assistant text, and none must be invented"
+        );
+        assert_eq!(
+            generation.tool_calls,
+            vec![ToolCall {
+                id: Some("c1".to_owned()),
+                name: "f".to_owned(),
+                arguments: "{}".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -1612,9 +1655,9 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let mut tokens = Vec::new();
+        let mut captured = CapturedStream::default();
         let error = backend
-            .generate_streaming(&[b"write main"], &mut |token| tokens.push(token.to_owned()))
+            .generate_streaming(&[b"write main"], &mut captured.sink())
             .expect_err("a stream without [DONE] is truncated, not complete");
         assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
         assert!(
@@ -1622,7 +1665,7 @@ mod tests {
             "the error should name the missing sentinel, got: {error}"
         );
         // Tokens already forwarded are not retracted; only the outcome changes.
-        assert_eq!(tokens, vec!["fn ", "main"]);
+        assert_eq!(captured.content, vec!["fn ", "main"]);
     }
 
     #[test]
@@ -1698,17 +1741,18 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let (output, _usage, _reason) = backend
+        let generation = backend
             .generate(&[b"read a.rs"])
             .expect("a tool call is a successful generation");
-        let envelope: Value =
-            serde_json::from_slice(&output).expect("output should be the JSON envelope");
-        assert_eq!(envelope["tool_calls"][0]["function"]["name"], "read_file");
         assert_eq!(
-            envelope["tool_calls"][0]["function"]["arguments"],
-            "{\"path\":\"a.rs\"}"
+            generation.tool_calls,
+            vec![ToolCall {
+                id: Some("call_1".to_owned()),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"a.rs\"}".to_owned(),
+            }]
         );
-        assert_eq!(envelope["content"], "");
+        assert!(generation.bytes.is_empty());
     }
 
     #[test]
@@ -1731,23 +1775,26 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let mut tokens = Vec::new();
+        let mut captured = CapturedStream::default();
         backend
-            .generate_streaming(&[b"read a.rs"], &mut |token| tokens.push(token.to_owned()))
+            .generate_streaming(&[b"read a.rs"], &mut captured.sink())
             .expect("streaming should complete");
-        assert_eq!(tokens.len(), 1, "expected one envelope, got {tokens:?}");
-        let envelope: Value =
-            serde_json::from_str(&tokens[0]).expect("the emitted token should be the envelope");
-        assert_eq!(envelope["tool_calls"][0]["id"], "call_1");
-        assert_eq!(envelope["tool_calls"][0]["function"]["name"], "read_file");
+        assert!(
+            captured.content.is_empty(),
+            "a tool-call-only stream carries no assistant text"
+        );
         assert_eq!(
-            envelope["tool_calls"][0]["function"]["arguments"],
-            "{\"path\":\"a.rs\"}"
+            captured.tool_calls,
+            vec![ToolCall {
+                id: Some("call_1".to_owned()),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"a.rs\"}".to_owned(),
+            }]
         );
     }
 
     #[test]
-    fn a_stream_without_tool_calls_emits_no_envelope() {
+    fn a_stream_without_tool_calls_reports_none() {
         let upstream = FakeUpstream::start(
             "HTTP/1.1 200 OK",
             "text/event-stream",
@@ -1758,11 +1805,12 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let mut tokens = Vec::new();
+        let mut captured = CapturedStream::default();
         backend
-            .generate_streaming(&[b"hi"], &mut |token| tokens.push(token.to_owned()))
+            .generate_streaming(&[b"hi"], &mut captured.sink())
             .expect("streaming should complete");
-        assert_eq!(tokens, vec!["ok"]);
+        assert_eq!(captured.content, vec!["ok"]);
+        assert!(captured.tool_calls.is_empty());
     }
 
     #[test]
@@ -1861,10 +1909,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_enabled_streams_emit_one_parseable_envelope() {
-        // Content then tool calls: streaming the prose first and appending the
-        // envelope would yield `prose{...}`, which the anchored downstream
-        // parser cannot read, losing the call.
+    fn offering_tools_no_longer_withholds_streamed_content() {
+        // Content then tool calls in the same stream. With calls confined to
+        // the text channel this had to be answered with a single envelope
+        // emitted at `[DONE]`, so every tool-enabled request paid the whole
+        // generation in time-to-first-token — including the ones that never
+        // called anything. The prose must now arrive as it is produced, and the
+        // call beside it.
         let upstream = FakeUpstream::start(
             "HTTP/1.1 200 OK",
             "text/event-stream",
@@ -1878,17 +1929,26 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let mut tokens = Vec::new();
+        let mut captured = CapturedStream::default();
         backend
             .generate_streaming(
                 &[br#"{"prompt":"read","tools":[{"type":"function","function":{"name":"read_file"}}]}"#],
-                &mut |token| tokens.push(token.to_owned()),
+                &mut captured.sink(),
             )
             .expect("streaming should complete");
-        assert_eq!(tokens.len(), 1, "expected one envelope, got {tokens:?}");
-        let envelope: Value = serde_json::from_str(&tokens[0]).expect("envelope should parse");
-        assert_eq!(envelope["content"], "Let me look. ");
-        assert_eq!(envelope["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            captured.content,
+            vec!["Let me look. "],
+            "prose must reach the caller as a content event, not buffered into a trailing envelope"
+        );
+        assert_eq!(
+            captured.tool_calls,
+            vec![ToolCall {
+                id: Some("c1".to_owned()),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -1944,10 +2004,9 @@ mod tests {
             r#"{"choices":[{"finish_reason":"length","message":{"content":"fn main() {"}}]}"#,
         );
         let backend = runtime("coder", &upstream.binding());
-        let (_bytes, _usage, finish_reason) =
-            backend.generate(&[b"write main"]).expect("generation");
+        let generation = backend.generate(&[b"write main"]).expect("generation");
         assert_eq!(
-            finish_reason.as_deref(),
+            generation.finish_reason.as_deref(),
             Some("length"),
             "a truncated completion must not look complete"
         );
@@ -2072,11 +2131,11 @@ mod tests {
             ),
         );
         let backend = runtime("coder", &upstream.binding());
-        let mut tokens = Vec::new();
+        let mut captured = CapturedStream::default();
         backend
-            .generate_streaming(&[b"hi"], &mut |token| tokens.push(token.to_owned()))
+            .generate_streaming(&[b"hi"], &mut captured.sink())
             .expect("streaming should complete");
-        assert_eq!(tokens, vec!["a", "b"]);
+        assert_eq!(captured.content, vec!["a", "b"]);
     }
 
     #[test]

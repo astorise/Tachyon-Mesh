@@ -399,6 +399,39 @@ or a non-Llama GGUF under `llama-server`.
   the request goes out unauthenticated — the usual case for a `llama-server` on
   a trusted mesh link.
 
+### Upstream work does not enter the batch scheduler
+
+Upstream bindings run on the `Network` lane, which has no dispatcher thread at
+all. They are admitted by a counting semaphore instead — `UpstreamAdmission`,
+default 32 concurrent round trips, overridable with
+`TACHYON_UPSTREAM_MAX_CONCURRENCY`, with a bounded 30-second wait after which
+the node sheds the request rather than growing an invisible backlog.
+
+The batch scheduler exists to amortise one GPU forward pass over co-batched
+sequences. An HTTP round trip gains nothing from that and loses two things to
+it. The dispatcher thread is shared with every local model on the node, so a
+slow provider stalls unrelated local inference; and the batch barrier makes each
+caller wait for the slowest peer in its batch, so a batch of 32 charged the last
+caller the sum of all preceding upstream latencies. What upstream work actually
+needs is a cap on how much runs at once — which is what the gate is, held for
+the whole interaction (for a stream, its entire lifetime, not just its first
+byte) and shared by the buffered, streaming, and embedding paths so the cap is a
+property of the node rather than of one entry point. A burst of
+`/v1/embeddings` cannot open unbounded sockets while `/v1/chat/completions`
+stays gated.
+
+Concurrency comes from there being many caller threads, each holding one permit
+— not from fanning one call out, which is why the backend now runs its inputs
+sequentially and the scoped-thread fan-out is gone.
+
+One consequence is worth stating because it is easy to get wrong: with nothing
+enqueued on the `Network` lane, its scheduler queue depth would be permanently
+zero, and the mesh QoS admission check reads exactly that number to decide
+whether to spill traffic to a peer. So `queue_tier_snapshot(Network)` reports
+the gate's **waiting** count — callers blocked on a permit — not its in-flight
+count. An in-flight request is being served; a waiting one is work this node
+cannot start, which is what queue depth meant on the local lanes.
+
 ### Tool calling through an upstream
 
 This is the one place the upstream path is meaningfully *better* than the native
@@ -410,34 +443,66 @@ with a `tool_call_parser`. An upstream server does have one, so `tools` and
 `tool_choice` are forwarded verbatim and the upstream applies its own template
 (and, with vLLM, constrained tool-call generation).
 
-A tool-call response carries `content: null`, so the backend re-serializes it
-into the envelope `guest-openai`'s `json` parser reads back:
+A tool-call response carries `content: null`, and the calls travel on their own
+channel rather than inside the text. The accelerator interface carries a
+`tool-call` record — an optional provider id, a function name, a JSON argument
+string — on both the buffered `generation` and the streaming `stream-event`, so
+`guest-openai` receives them as fields and does the OpenAI encoding itself.
 
-```json
-{"content": "", "tool_calls": [{"id": "…", "type": "function",
-                                "function": {"name": "…", "arguments": "…"}}]}
-```
-
-That envelope is the only channel available — the host contract is "generation
-returns text", with tool-call recovery done downstream. It carries a marker
-field (`__tachyon_upstream_tool_calls`) so `guest-openai` recognises it *before*
-and independently of parser selection. That matters: parser selection comes from
-a nonstandard request option or a guess at the model name, so a standard OpenAI
-client offering tools would otherwise get no parser at all — or a tagged one
-that cannot read JSON — and the structured call would come back as literal
-assistant prose. **No client-side configuration is required.**
+That the host does *not* encode them is the point. What the WIT carries is what
+the model said; what OpenAI's `tool_calls` array looks like is the gateway's
+business, and a consumer speaking a different wire format never has to undo an
+OpenAI encoding first. **No client-side configuration is required either**:
+recovering a structured call no longer depends on parser selection, which comes
+from a nonstandard request option or a guess at the model name — so a standard
+client offering tools would previously get no parser at all, or a tagged one
+that cannot read JSON, and the call would come back as literal assistant prose.
 
 Streamed tool calls arrive as `delta.tool_calls` fragments with no content at
 all — name first, `arguments` in pieces after it. They are reassembled by
-fragment `index` and emitted as one envelope at the end of the stream, because
-dropping them would make the request look like a model that answered with
-silence.
+fragment `index` and emitted as `stream-event::tool-call` once the stream ends,
+because a call is only dispatchable complete; dropping them would make the
+request look like a model that answered with silence.
+
+The structured channel is also what keeps time-to-first-token on tool-enabled
+requests. With calls confined to the text channel, prose had to be accumulated
+until the stream finished — a whole-output JSON envelope emitted *after* streamed
+prose is unparseable — so merely offering tools cost the entire generation in
+latency, including on the requests that never called anything. Content now
+streams unconditionally.
+
+### Failures carry the upstream's status
+
+`compute`, `compute-detailed`, `embed`, `compute-stream` and `token-stream.next`
+fail with a `generation-error`: a message, plus `upstream-status` when the
+failure *was* a remote HTTP response. Local failures — a decode error, an
+unknown alias, a rejected request — leave it absent rather than inventing a
+status.
+
+The status is what makes the relay honest, because the client's own behaviour
+depends on it. `guest-openai` maps it:
+
+| upstream status | relayed as | why |
+|---|---|---|
+| 429 | 429 `rate_limit_error` | the client's backoff has to engage |
+| 400/404/405/409/413/422 | 400 `invalid_request_error` | the provider rejected what we forwarded, which reflects the caller's own parameters |
+| 502/503/504 | relayed unchanged | a transient gateway failure, retryable as itself |
+| 401/403, anything else | 502 `server_error` | an upstream credential failure is *this node's* misconfiguration; relaying a 401 would send the client chasing its own key |
+| absent | 500 `server_error` | nothing remote to attribute |
+
+Collapsed into one opaque string, a 429 the client should back off from and a
+400 it must never retry reach it identically — and typically as a server fault
+it can only retry blindly.
 
 ### Streaming tool calls end to end
 
 `guest-openai` recovers tool calls on the streaming path too, not just the
 buffered one, so an agentic client receives real `delta.tool_calls` and
-`finish_reason: "tool_calls"` instead of envelope text in its transcript.
+`finish_reason: "tool_calls"` instead of raw text in its transcript. A call the
+*host* reported structurally is adopted as-is and always wins over anything
+parsed out of the text — the backend received it as fields, so re-reading the
+text could only guess worse. The gate below is for the other case: a local model
+whose chat template emits calls as text.
 
 Buffering the whole generation before parsing would be the simple way to do
 that, but it destroys time-to-first-token for every request that merely *offers*

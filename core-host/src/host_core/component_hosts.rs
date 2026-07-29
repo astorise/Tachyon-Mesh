@@ -319,27 +319,46 @@ impl ComponentHostState {
         expected_accelerator: ai_inference::AcceleratorKind,
         model_id: u32,
         prompt: String,
-    ) -> std::result::Result<(String, Option<ai_inference::TokenUsage>, Option<String>), String>
-    {
-        let loaded = self
-            .accelerator_models
-            .get(&model_id)
-            .ok_or_else(|| format!("accelerator model handle `{model_id}` is unknown"))?;
-        if loaded.accelerator != expected_accelerator {
-            return Err(format!(
-                "accelerator model handle `{model_id}` was loaded for `{}` not `{}`",
-                loaded.accelerator.as_str(),
-                expected_accelerator.as_str()
-            ));
-        }
+    ) -> std::result::Result<ai_inference::ComponentGeneration, ai_inference::GenerationError> {
+        let loaded = self.resolve_accelerator_model(expected_accelerator, model_id)?;
         self.ai_runtime
             .as_ref()
-            .ok_or_else(|| "AI inference runtime is unavailable for this component".to_owned())?
+            .ok_or_else(|| {
+                ai_inference::GenerationError::local(
+                    "AI inference runtime is unavailable for this component",
+                )
+            })?
             .compute_component_prompt_with_adapter(
                 &loaded.alias,
                 &prompt,
                 self.adapter_id.as_deref(),
             )
+    }
+
+    /// Resolve a guest-held model handle to the alias it was opened for.
+    ///
+    /// Shared by every accelerator entry point so the handle check — the gate
+    /// that stops a component reaching a model it never loaded, or reaching a
+    /// CPU-bound alias through the GPU interface — cannot drift between them.
+    #[cfg(feature = "ai-inference")]
+    fn resolve_accelerator_model(
+        &self,
+        expected_accelerator: ai_inference::AcceleratorKind,
+        model_id: u32,
+    ) -> std::result::Result<&LoadedAcceleratorModel, ai_inference::GenerationError> {
+        let loaded = self.accelerator_models.get(&model_id).ok_or_else(|| {
+            ai_inference::GenerationError::local(format!(
+                "accelerator model handle `{model_id}` is unknown"
+            ))
+        })?;
+        if loaded.accelerator != expected_accelerator {
+            return Err(ai_inference::GenerationError::local(format!(
+                "accelerator model handle `{model_id}` was loaded for `{}` not `{}`",
+                loaded.accelerator.as_str(),
+                expected_accelerator.as_str()
+            )));
+        }
+        Ok(loaded)
     }
 
     #[cfg(feature = "ai-inference")]
@@ -348,21 +367,15 @@ impl ComponentHostState {
         expected_accelerator: ai_inference::AcceleratorKind,
         model_id: u32,
         input: String,
-    ) -> std::result::Result<Vec<f32>, String> {
-        let loaded = self
-            .accelerator_models
-            .get(&model_id)
-            .ok_or_else(|| format!("accelerator model handle `{model_id}` is unknown"))?;
-        if loaded.accelerator != expected_accelerator {
-            return Err(format!(
-                "accelerator model handle `{model_id}` was loaded for `{}` not `{}`",
-                loaded.accelerator.as_str(),
-                expected_accelerator.as_str()
-            ));
-        }
+    ) -> std::result::Result<Vec<f32>, ai_inference::GenerationError> {
+        let loaded = self.resolve_accelerator_model(expected_accelerator, model_id)?;
         self.ai_runtime
             .as_ref()
-            .ok_or_else(|| "AI inference runtime is unavailable for this component".to_owned())?
+            .ok_or_else(|| {
+                ai_inference::GenerationError::local(
+                    "AI inference runtime is unavailable for this component",
+                )
+            })?
             .embed_component_input(&loaded.alias, &input)
     }
 
@@ -377,24 +390,17 @@ impl ComponentHostState {
         expected_accelerator: ai_inference::AcceleratorKind,
         model_id: u32,
         prompt: String,
-    ) -> std::result::Result<StreamedGeneration, String> {
-        let loaded = self
-            .accelerator_models
-            .get(&model_id)
-            .ok_or_else(|| format!("accelerator model handle `{model_id}` is unknown"))?;
-        if loaded.accelerator != expected_accelerator {
-            return Err(format!(
-                "accelerator model handle `{model_id}` was loaded for `{}` not `{}`",
-                loaded.accelerator.as_str(),
-                expected_accelerator.as_str()
-            ));
-        }
+    ) -> std::result::Result<StreamedGeneration, ai_inference::GenerationError> {
+        let loaded = self.resolve_accelerator_model(expected_accelerator, model_id)?;
         let alias = loaded.alias.clone();
-        let ai_runtime =
-            Arc::clone(self.ai_runtime.as_ref().ok_or_else(|| {
-                "AI inference runtime is unavailable for this component".to_owned()
-            })?);
-        let (sender, receiver) = std::sync::mpsc::channel::<std::result::Result<String, String>>();
+        let ai_runtime = Arc::clone(self.ai_runtime.as_ref().ok_or_else(|| {
+            ai_inference::GenerationError::local(
+                "AI inference runtime is unavailable for this component",
+            )
+        })?);
+        let (sender, receiver) = std::sync::mpsc::channel::<
+            std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        >();
         // Token counts are only known once generation ends, which is after the
         // last fragment has already gone down the channel. They therefore come
         // back beside the channel rather than through it: sending them as a
@@ -404,11 +410,16 @@ impl ComponentHostState {
         std::thread::Builder::new()
             .name("tachyon-stream-gen".to_owned())
             .spawn(move || {
-                // The closure forwards each fragment; a closed receiver (the
+                // The closure forwards each event; a closed receiver (the
                 // guest dropped the stream) just makes `send` fail, which we
                 // ignore — the bounded decode finishes on its own.
-                let mut sink = |fragment: &str| {
-                    let _ = sender.send(Ok(fragment.to_owned()));
+                let mut sink = |event: ai_inference::StreamEvent<'_>| {
+                    let _ = sender.send(Ok(match event {
+                        ai_inference::StreamEvent::Content(text) => {
+                            StreamPayload::Content(text.to_owned())
+                        }
+                        ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
+                    }));
                 };
                 match ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
                     // `None` means the backend could not measure, and stays
@@ -427,7 +438,11 @@ impl ComponentHostState {
                 // `sender` drops here: the channel closes and `next` reports the
                 // end of the stream.
             })
-            .map_err(|error| format!("failed to spawn streaming generation thread: {error}"))?;
+            .map_err(|error| {
+                ai_inference::GenerationError::local(format!(
+                    "failed to spawn streaming generation thread: {error}"
+                ))
+            })?;
         Ok(StreamedGeneration { receiver, usage })
     }
 }
@@ -1955,15 +1970,55 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
 /// into. `next` drains it; a closed channel marks the end of the stream.
 /// A streaming generation in flight: the channel its decoded fragments arrive
 /// on, and the slot its token counts land in when it finishes.
+/// The WIT error every `tachyon:accelerator/cpu` generation function returns.
+#[cfg(feature = "ai-inference")]
+type WitGenerationError =
+    accelerator_component_bindings::tachyon::accelerator::cpu::GenerationError;
+
+/// Cross the host/guest boundary, keeping the upstream status intact. The
+/// status is the whole point of the typed error: flattening to a message here
+/// would put the guest back to guessing whether a failure is retryable.
+#[cfg(feature = "ai-inference")]
+fn wit_generation_error(error: ai_inference::GenerationError) -> WitGenerationError {
+    WitGenerationError {
+        message: error.message,
+        upstream_status: error.upstream_status,
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+fn wit_tool_call(
+    call: ai_inference::ToolCall,
+) -> accelerator_component_bindings::tachyon::accelerator::cpu::ToolCall {
+    accelerator_component_bindings::tachyon::accelerator::cpu::ToolCall {
+        id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+    }
+}
+
+/// One item the generation thread pushes down the stream channel. The owned
+/// mirror of `ai_inference::StreamEvent`, which borrows its content so a
+/// backend can emit a fragment without allocating when nobody needs to keep it.
+#[cfg(feature = "ai-inference")]
+enum StreamPayload {
+    Content(String),
+    ToolCall(ai_inference::ToolCall),
+}
+
 #[cfg(feature = "ai-inference")]
 pub(crate) struct StreamedGeneration {
-    receiver: std::sync::mpsc::Receiver<std::result::Result<String, String>>,
+    receiver: std::sync::mpsc::Receiver<
+        std::result::Result<StreamPayload, ai_inference::GenerationError>,
+    >,
     usage: Arc<Mutex<Option<ai_inference::TokenUsage>>>,
 }
 
 #[cfg(feature = "ai-inference")]
 pub(crate) struct HostTokenStream {
-    receiver: std::sync::mpsc::Receiver<std::result::Result<String, String>>,
+    receiver: std::sync::mpsc::Receiver<
+        std::result::Result<StreamPayload, ai_inference::GenerationError>,
+    >,
     usage: Arc<Mutex<Option<ai_inference::TokenUsage>>>,
     /// Whether `next` has reported the end of the stream to this caller.
     ///
@@ -1981,9 +2036,14 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         self.load_accelerator_model(ai_inference::AcceleratorKind::Cpu, name)
     }
 
-    fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
+    fn compute(
+        &mut self,
+        model_id: u32,
+        prompt: String,
+    ) -> std::result::Result<String, WitGenerationError> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
-            .map(|(text, _usage, _reason)| text)
+            .map(|generation| generation.text)
+            .map_err(wit_generation_error)
     }
 
     fn compute_detailed(
@@ -1992,26 +2052,37 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         prompt: String,
     ) -> std::result::Result<
         accelerator_component_bindings::tachyon::accelerator::cpu::Generation,
-        String,
+        WitGenerationError,
     > {
-        let (text, usage, finish_reason) =
-            self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)?;
+        let generation = self
+            .compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
+            .map_err(wit_generation_error)?;
         Ok(
             accelerator_component_bindings::tachyon::accelerator::cpu::Generation {
-                text,
-                finish_reason,
-                usage: usage.map(|usage| {
+                text: generation.text,
+                finish_reason: generation.finish_reason,
+                usage: generation.usage.map(|usage| {
                     accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
                     }
                 }),
+                tool_calls: generation
+                    .tool_calls
+                    .into_iter()
+                    .map(wit_tool_call)
+                    .collect(),
             },
         )
     }
 
-    fn embed(&mut self, model_id: u32, input: String) -> std::result::Result<Vec<f32>, String> {
+    fn embed(
+        &mut self,
+        model_id: u32,
+        input: String,
+    ) -> std::result::Result<Vec<f32>, WitGenerationError> {
         self.embed_accelerator_input(ai_inference::AcceleratorKind::Cpu, model_id, input)
+            .map_err(wit_generation_error)
     }
 
     fn compute_stream(
@@ -2022,10 +2093,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         wasmtime::component::Resource<
             accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
         >,
-        String,
+        WitGenerationError,
     > {
-        let StreamedGeneration { receiver, usage } =
-            self.stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)?;
+        let StreamedGeneration { receiver, usage } = self
+            .stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
+            .map_err(wit_generation_error)?;
         let handle = self
             .table
             .push(HostTokenStream {
@@ -2033,7 +2105,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
                 usage,
                 saw_eof: false,
             })
-            .map_err(|error| format!("failed to register token stream resource: {error}"))?;
+            .map_err(|error| {
+                wit_generation_error(ai_inference::GenerationError::local(format!(
+                    "failed to register token stream resource: {error}"
+                )))
+            })?;
         Ok(wasmtime::component::Resource::new_own(handle.rep()))
     }
 }
@@ -2047,17 +2123,30 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         self_: wasmtime::component::Resource<
             accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
         >,
-    ) -> std::result::Result<Option<String>, String> {
+    ) -> std::result::Result<
+        Option<accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent>,
+        WitGenerationError,
+    > {
         let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
-        let stream = self
-            .table
-            .get_mut(&handle)
-            .map_err(|error| format!("failed to access token stream resource: {error}"))?;
-        // `recv` blocks until the next fragment; a disconnected channel means the
+        let stream = self.table.get_mut(&handle).map_err(|error| {
+            wit_generation_error(ai_inference::GenerationError::local(format!(
+                "failed to access token stream resource: {error}"
+            )))
+        })?;
+        // `recv` blocks until the next event; a disconnected channel means the
         // generation thread finished, so the stream is complete.
         match stream.receiver.recv() {
-            Ok(Ok(fragment)) => Ok(Some(fragment)),
-            Ok(Err(error)) => Err(error),
+            Ok(Ok(StreamPayload::Content(text))) => Ok(Some(
+                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Content(
+                    text,
+                ),
+            )),
+            Ok(Ok(StreamPayload::ToolCall(call))) => Ok(Some(
+                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::ToolCall(
+                    wit_tool_call(call),
+                ),
+            )),
+            Ok(Err(error)) => Err(wit_generation_error(error)),
             Err(_) => {
                 stream.saw_eof = true;
                 Ok(None)
@@ -2107,7 +2196,8 @@ impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Gpu, model_id, prompt)
-            .map(|(text, _usage, _reason)| text)
+            .map(|generation| generation.text)
+            .map_err(|error| error.message)
     }
 }
 
@@ -2119,7 +2209,8 @@ impl accelerator_component_bindings::tachyon::accelerator::npu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Npu, model_id, prompt)
-            .map(|(text, _usage, _reason)| text)
+            .map(|generation| generation.text)
+            .map_err(|error| error.message)
     }
 }
 
@@ -2131,7 +2222,8 @@ impl accelerator_component_bindings::tachyon::accelerator::tpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Tpu, model_id, prompt)
-            .map(|(text, _usage, _reason)| text)
+            .map(|generation| generation.text)
+            .map_err(|error| error.message)
     }
 }
 
