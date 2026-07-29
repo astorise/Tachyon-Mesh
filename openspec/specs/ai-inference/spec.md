@@ -335,8 +335,12 @@ so they appear in `GET /ai/v1/models`. Until now the registry was written only
 by the upload flow, so an `openai:` upstream — which has no upload — could never
 appear in a client's model list.
 
-Publishing SHALL NOT overwrite an existing registry row, and SHALL be
-idempotent across restarts.
+Publishing SHALL be idempotent across restarts. It SHALL NOT overwrite a
+registry row for an alias no configured binding names. Where a **non-dynamic**
+binding does name the alias, the configured row SHALL win even over an uploaded
+one: that binding is loaded eagerly at boot and is what a request for the alias
+actually executes, so a row describing anything else would send a client's
+prompt somewhere it did not choose.
 
 #### Scenario: A configured binding appears in the model list
 
@@ -345,10 +349,19 @@ idempotent across restarts.
   binding kind
 - **AND** the row uses the casing `guest-openai`'s reader expects
 
-#### Scenario: An uploaded entry wins over a configured one
+#### Scenario: An uploaded row for an unclaimed alias is left untouched
 
-- **WHEN** a registry row already exists for an alias
-- **THEN** publishing configured bindings leaves it untouched
+- **WHEN** a registry row exists for an alias no configured binding names
+- **THEN** publishing configured bindings leaves it untouched, and the sweep
+  never removes it
+
+#### Scenario: A non-dynamic binding owns the row for the alias it executes
+
+- **WHEN** an uploaded row and a non-dynamic configured binding share an alias
+- **THEN** the row is replaced by one describing the configured binding, because
+  the runtime loaded it eagerly and every request for that alias runs it
+- **AND** the collision is logged, since the uploaded checkpoint's own figures
+  are lost
 
 #### Scenario: Dynamic bindings are left to the upload flow
 
