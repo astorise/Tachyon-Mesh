@@ -1073,6 +1073,10 @@ mod requested_model_alias_tests {
         );
     }
 
+    // `route_mesh_qos_profile` and `AcceleratorKind` only exist on an
+    // `ai-inference` build; the alias resolution above is general, so only this
+    // half of the pair is gated.
+    #[cfg(feature = "ai-inference")]
     #[test]
     fn the_qos_lane_follows_the_engine_qualified_model_a_client_asked_for() {
         let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
