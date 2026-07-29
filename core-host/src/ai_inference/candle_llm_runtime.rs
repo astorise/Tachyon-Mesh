@@ -1597,12 +1597,81 @@ fn default_max_position_embeddings() -> usize {
     DEFAULT_MAX_PROMPT_TOKENS
 }
 
-/// Parsed `.tachyon-model.json` sidecar. Only the declared format is consumed;
-/// unknown fields are ignored so the broker can extend it freely.
+/// Parsed `.tachyon-model.json` sidecar. Unknown fields are ignored so the
+/// broker can extend it freely.
 #[derive(Debug, Deserialize)]
 struct ModelMeta {
     #[serde(default)]
     format: String,
+    /// Declared tool-call dialect, overriding what the chat template implies.
+    /// The escape hatch for a checkpoint whose template does not match how it
+    /// was actually fine-tuned to emit calls.
+    #[serde(default)]
+    tool_call_parser: Option<String>,
+}
+
+/// The tool-call dialect a checkpoint emits, resolved from what the model *is*
+/// rather than from what it was named.
+///
+/// The alias is not evidence: a Qwen checkpoint registered as `local-coder`
+/// tells a name-matching heuristic nothing, and the result — tool calls
+/// arriving as literal `<tool_call>` text in `content` — is indistinguishable
+/// from a model that simply chose not to call a tool. For an agentic client
+/// that is a silent, total failure.
+///
+/// Resolution order, most authoritative first:
+///
+/// 1. An explicit `tool_call_parser` in the `.tachyon-model.json` sidecar.
+/// 2. The marker the model's own `chat_template` renders around a call.
+///
+/// Returns `None` when neither speaks, leaving the caller free to fall back to
+/// whatever guess it was making before — this narrows the guessing, it does not
+/// replace it with a different one. Every answer is positive evidence: a
+/// template that never mentions tools yields `None` rather than a default.
+pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
+    if let Some(declared) = read_declared_tool_call_parser(root) {
+        return Some(declared);
+    }
+    let source = ChatTemplate::read_source(root)?;
+    // Ordered by specificity: a template carrying a tag convention names its
+    // dialect outright, so those are checked before the generic JSON case.
+    if source.contains("[TOOL_CALLS]") {
+        Some("mistral")
+    } else if source.contains("<tool_call>") {
+        Some("qwen")
+    } else if source.contains("tools") {
+        // Tool-aware, but with no tag convention: the call is rendered as a
+        // bare JSON object, which is what the `json` parser reads. Gated on the
+        // template actually handling tools so a plain chat template does not
+        // acquire a parser it has no use for.
+        Some("json")
+    } else {
+        None
+    }
+}
+
+/// The sidecar's declared parser, validated against the dialects
+/// `guest-openai` implements. An unrecognized value is ignored rather than
+/// propagated: publishing it would make the guest drop the row on a
+/// deserialize miss and take the model out of `GET /ai/v1/models` entirely.
+fn read_declared_tool_call_parser(root: &Path) -> Option<&'static str> {
+    let raw = fs::read(root.join(MODEL_META_JSON)).ok()?;
+    let meta: ModelMeta = serde_json::from_slice(&raw).ok()?;
+    let declared = meta.tool_call_parser?;
+    match declared.trim().to_ascii_lowercase().as_str() {
+        "json" => Some("json"),
+        "qwen" => Some("qwen"),
+        "qwen_coder" => Some("qwen_coder"),
+        "mistral" => Some("mistral"),
+        other => {
+            tracing::warn!(
+                parser = %other,
+                path = %root.display(),
+                "ignoring unrecognized tool_call_parser in {MODEL_META_JSON}"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4334,6 +4403,20 @@ impl ChatTemplateField {
 }
 
 impl ChatTemplate {
+    /// The raw Jinja source of the model's chat template, or `None` when the
+    /// file, its `chat_template` field, or either one's parse is missing.
+    ///
+    /// Unlike [`ChatTemplate::load`] this never errors: its callers are
+    /// classifying a model, not preparing to run it, so an unreadable
+    /// `tokenizer_config.json` means "cannot tell" rather than "refuse".
+    fn read_source(root: &Path) -> Option<String> {
+        let raw = fs::read(root.join(TOKENIZER_CONFIG_JSON)).ok()?;
+        let config: TokenizerConfig = serde_json::from_slice(&raw).ok()?;
+        config
+            .chat_template
+            .and_then(ChatTemplateField::into_source)
+    }
+
     /// Load the model's chat template from `tokenizer_config.json`, or `None`
     /// when the file or the `chat_template` field is absent.
     pub(crate) fn load(alias: &str, root: &Path) -> Result<Option<Self>, CandleLlmError> {
@@ -6154,6 +6237,115 @@ mod tests {
                 "{architecture:?} has no quantized loader and must reject GGUF"
             );
         }
+    }
+
+    /// Build a bare model directory carrying just the files the parser
+    /// detector reads.
+    fn tool_parser_fixture(
+        tag: &str,
+        tokenizer_config: Option<&str>,
+        sidecar: Option<&str>,
+    ) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-parser-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("fixture dir");
+        if let Some(config) = tokenizer_config {
+            fs::write(dir.join(TOKENIZER_CONFIG_JSON), config).expect("tokenizer config");
+        }
+        if let Some(meta) = sidecar {
+            fs::write(dir.join(MODEL_META_JSON), meta).expect("sidecar");
+        }
+        dir
+    }
+
+    #[test]
+    fn the_tool_call_parser_is_read_from_the_chat_template() {
+        // Each dialect is identified by the marker its own template renders
+        // around a call — not by anything in the model's name.
+        for (tag, template, expected) in [
+            (
+                "qwen",
+                r#"{"chat_template": "{% for m in messages %}<tool_call>{{ m }}</tool_call>{% endfor %}"}"#,
+                Some("qwen"),
+            ),
+            (
+                "mistral",
+                r#"{"chat_template": "{% if tools %}[TOOL_CALLS]{% endif %}"}"#,
+                Some("mistral"),
+            ),
+            // Tool-aware with no tag convention: the call is a bare JSON
+            // object, which is what the `json` parser reads.
+            (
+                "json",
+                r#"{"chat_template": "{% for tool in tools %}{{ tool.name }}{% endfor %}"}"#,
+                Some("json"),
+            ),
+            // Not tool-aware at all: claiming a parser here would be a guess,
+            // and the point of this seam is to stop guessing.
+            (
+                "plain",
+                r#"{"chat_template": "{% for m in messages %}{{ m.content }}{% endfor %}"}"#,
+                None,
+            ),
+        ] {
+            let dir = tool_parser_fixture(tag, Some(template), None);
+            assert_eq!(
+                detect_tool_call_parser(&dir),
+                expected,
+                "{tag} template classified wrongly"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_declared_tool_call_parser_overrides_the_chat_template() {
+        // The escape hatch: a checkpoint fine-tuned to emit a dialect its
+        // stock template does not describe.
+        let dir = tool_parser_fixture(
+            "override",
+            Some(r#"{"chat_template": "<tool_call>{{ x }}</tool_call>"}"#),
+            Some(r#"{"format": "gguf", "tool_call_parser": "json"}"#),
+        );
+        assert_eq!(detect_tool_call_parser(&dir), Some("json"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unreadable_model_directory_yields_no_parser_rather_than_an_error() {
+        // Classification, not loading: a missing or malformed file means
+        // "cannot tell", which leaves the guest's own fallback in charge.
+        let empty = tool_parser_fixture("empty", None, None);
+        assert_eq!(detect_tool_call_parser(&empty), None);
+        let _ = fs::remove_dir_all(empty);
+
+        let malformed = tool_parser_fixture("malformed", Some("{not json"), Some("{also not"));
+        assert_eq!(detect_tool_call_parser(&malformed), None);
+        let _ = fs::remove_dir_all(malformed);
+
+        assert_eq!(
+            detect_tool_call_parser(Path::new("/nonexistent/tachyon/model")),
+            None
+        );
+    }
+
+    /// An unrecognized declared dialect must not propagate: publishing it would
+    /// make `guest-openai` see a value it cannot map, and the row it rides on
+    /// carries the model's existence in `GET /ai/v1/models`.
+    #[test]
+    fn an_unknown_declared_parser_is_dropped() {
+        let dir = tool_parser_fixture(
+            "unknown-declared",
+            None,
+            Some(r#"{"format": "gguf", "tool_call_parser": "some-future-dialect"}"#),
+        );
+        assert_eq!(detect_tool_call_parser(&dir), None);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

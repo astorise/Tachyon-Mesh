@@ -2525,6 +2525,11 @@ struct ModelRegistryRecord<'a> {
     vram_required_mb: u64,
     status: &'a str,
     model_path: &'a str,
+    /// See the matching field on `RegistryModelInfo` in `system_storage.rs`:
+    /// `guest-openai` reads this to pick a tool-call parser instead of
+    /// pattern-matching the alias.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_parser: Option<&'a str>,
 }
 
 impl system_component_bindings::tachyon::mesh::model_events::Host for ComponentHostState {
@@ -2544,6 +2549,7 @@ impl system_component_bindings::tachyon::mesh::model_events::Host for ComponentH
             vram_required_mb: 0,
             status: "available",
             model_path: &event.model_path,
+            tool_call_parser: crate::system_storage::binding_tool_call_parser(&event.model_path),
         };
         let value = serde_json::to_vec(&record)
             .map_err(|error| format!("failed to encode model registry entry: {error}"))?;

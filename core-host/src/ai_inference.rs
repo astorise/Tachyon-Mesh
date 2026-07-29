@@ -27,6 +27,7 @@ pub(crate) mod tensor_parallel_llama;
 #[path = "ai_inference/upstream_openai.rs"]
 mod upstream_openai;
 
+pub(crate) use candle_llm_runtime::detect_tool_call_parser;
 pub(crate) use upstream_openai::UPSTREAM_SCHEME;
 #[path = "ai_inference/vendor_accelerator.rs"]
 mod vendor_accelerator;

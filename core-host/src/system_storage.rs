@@ -353,6 +353,43 @@ struct RegistryModelInfo<'a> {
     /// unknown fields, so adding it does not disturb the reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
+    /// Tool-call dialect this checkpoint emits, resolved from its sidecar or
+    /// its chat template. `guest-openai` reads it to pick a parser instead of
+    /// pattern-matching the alias, which is what made tool calling depend on
+    /// how a model happened to be named. Absent when the model does not
+    /// declare one, or is an upstream binding (which applies its own template
+    /// and returns already-structured calls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_parser: Option<&'a str>,
+}
+
+/// The tool-call dialect to advertise for a configured binding.
+///
+/// Only local checkpoints are probed: an `openai:` upstream returns structured
+/// `tool_calls` of its own and never needs its text parsed, and `mock` has no
+/// checkpoint to read.
+///
+/// Present in every build, not just `ai-inference` ones: the upload path that
+/// calls it is not feature-gated. Without the detector there is nothing to
+/// classify a checkpoint with, so the field stays absent and `guest-openai`
+/// falls back to its own resolution — the same behaviour as a model that
+/// declares nothing.
+pub(crate) fn binding_tool_call_parser(path: &str) -> Option<&'static str> {
+    let path = path.trim();
+    if path == "mock" || path.starts_with("mock:") {
+        return None;
+    }
+    #[cfg(feature = "ai-inference")]
+    {
+        if path.starts_with(crate::ai_inference::UPSTREAM_SCHEME) {
+            return None;
+        }
+        crate::ai_inference::detect_tool_call_parser(std::path::Path::new(path))
+    }
+    #[cfg(not(feature = "ai-inference"))]
+    {
+        None
+    }
 }
 
 /// Marks a registry row as derived from the manifest rather than an upload.
@@ -434,6 +471,7 @@ pub(crate) fn publish_configured_model_bindings(
                 status: "available",
                 model_path: &binding.path,
                 source: Some(REGISTRY_SOURCE_CONFIG),
+                tool_call_parser: binding_tool_call_parser(&binding.path),
             };
             let Ok(value) = serde_json::to_vec(&info) else {
                 continue;
@@ -566,6 +604,7 @@ impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
             status: "available",
             model_path: &event.model_path,
             source: None,
+            tool_call_parser: binding_tool_call_parser(&event.model_path),
         };
         let value = serde_json::to_vec(&info)
             .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
@@ -1039,6 +1078,8 @@ mod registry_casing_tests {
         engine: String,
         vram_required_mb: u64,
         status: String,
+        #[serde(default)]
+        tool_call_parser: Option<String>,
     }
 
     #[test]
@@ -1050,6 +1091,7 @@ mod registry_casing_tests {
             status: "available",
             model_path: "/data/tachyon_data/models/tinyllama",
             source: None,
+            tool_call_parser: Some("qwen"),
         };
         let bytes = serde_json::to_vec(&info).expect("serialize registry entry");
 
@@ -1061,6 +1103,7 @@ mod registry_casing_tests {
         assert_eq!(parsed.engine, "gguf");
         assert_eq!(parsed.vram_required_mb, 0);
         assert_eq!(parsed.status, "available");
+        assert_eq!(parsed.tool_call_parser.as_deref(), Some("qwen"));
 
         // Lock the on-the-wire key casing too, so the contract is explicit.
         let value: serde_json::Value =
@@ -1074,8 +1117,51 @@ mod registry_casing_tests {
             "registry entry must serialize camelCase `modelPath`"
         );
         assert!(
+            value.get("toolCallParser").is_some(),
+            "registry entry must serialize camelCase `toolCallParser`"
+        );
+        assert!(
             value.get("vram_required_mb").is_none(),
             "registry entry must not emit snake_case keys"
         );
+    }
+
+    /// The field is optional on the wire: a model that declares no dialect
+    /// must produce a row with the key absent, not `null`. `guest-openai`
+    /// reads it as `Option<String>` either way, but an absent key is what lets
+    /// a reader predating the field ignore it entirely.
+    #[test]
+    fn a_model_without_a_declared_parser_omits_the_key() {
+        let info = RegistryModelInfo {
+            alias: "tinyllama",
+            engine: "gguf",
+            vram_required_mb: 0,
+            status: "available",
+            model_path: "/data/tachyon_data/models/tinyllama",
+            source: None,
+            tool_call_parser: None,
+        };
+        let value: serde_json::Value =
+            serde_json::to_value(&info).expect("serialize registry entry");
+        assert!(value.get("toolCallParser").is_none());
+    }
+
+    /// Upstream bindings never need their text parsed — they return structured
+    /// `tool_calls` — so probing them would be both pointless and a filesystem
+    /// read against a URL.
+    #[test]
+    fn upstream_and_mock_bindings_declare_no_parser() {
+        for path in [
+            "openai:https://api.example.com/v1/chat/completions",
+            "  openai:https://api.example.com/v1/chat/completions",
+            "mock",
+            "mock:tiny",
+        ] {
+            assert_eq!(
+                binding_tool_call_parser(path),
+                None,
+                "`{path}` must not be probed for a tool-call dialect"
+            );
+        }
     }
 }

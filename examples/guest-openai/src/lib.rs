@@ -141,6 +141,22 @@ enum ToolCallParser {
 }
 
 impl ToolCallParser {
+    /// Parse a dialect name, returning `None` for anything unrecognized.
+    ///
+    /// Deliberately not `Deserialize`: the registry row this reads from is
+    /// written by the host, and an unknown value there must not fail the row's
+    /// deserialization — that would drop the model out of `GET /ai/v1/models`
+    /// entirely over a field that is only an optimization.
+    fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "qwen" => Some(Self::Qwen),
+            "qwen_coder" => Some(Self::QwenCoder),
+            "mistral" => Some(Self::Mistral),
+            _ => None,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             ToolCallParser::Json => "json",
@@ -197,7 +213,7 @@ impl StopField {
 
 #[derive(Debug, Serialize)]
 struct ChatCompletionResponse {
-    id: &'static str,
+    id: String,
     object: &'static str,
     created: u64,
     model: String,
@@ -214,7 +230,7 @@ struct ChatChoice {
 /// Sent for each SSE chunk when `stream: true`.
 #[derive(Debug, Serialize)]
 struct ChatCompletionChunk {
-    id: &'static str,
+    id: String,
     object: &'static str,
     created: u64,
     model: String,
@@ -302,6 +318,12 @@ struct ModelInfo {
     engine: String,
     vram_required_mb: u64,
     status: String,
+    /// Tool-call dialect the host resolved for this checkpoint, from its
+    /// `.tachyon-model.json` sidecar or its chat template. Held as a string
+    /// rather than a `ToolCallParser` so an unrecognized value cannot fail the
+    /// row and take the model out of the listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_parser: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -408,8 +430,9 @@ fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     }
 
     let models = list_models()?;
-    let alias = match resolve_model_alias(&request.model, &models) {
-        Some(alias) => alias,
+    let registered = resolve_registered_model(&request.model, &models);
+    let alias = match registered {
+        Some(model) => model.alias.as_str(),
         None if !request.model.contains('/') => request.model.as_str(),
         None => {
             return Ok(openai_error_payload(
@@ -455,7 +478,7 @@ fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
 /// Run `/ai/v1/chat/completions` against the host CPU accelerator.
 /// Routes to the streaming SSE path when `stream: true`, buffered otherwise.
 fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
-    let request: ChatCompletionRequest = serde_json::from_slice(body)
+    let mut request: ChatCompletionRequest = serde_json::from_slice(body)
         .map_err(|e| format!("invalid chat completion request: {e}"))?;
     if request.model.trim().is_empty() {
         return Err("chat completion request must name a model".to_owned());
@@ -465,9 +488,10 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     }
 
     let models = list_models()?;
-    let alias = match resolve_model_alias(&request.model, &models) {
-        Some(alias) => alias,
-        None if !request.model.contains('/') => request.model.as_str(),
+    let registered = resolve_registered_model(&request.model, &models);
+    let alias = match registered {
+        Some(model) => model.alias.clone(),
+        None if !request.model.contains('/') => request.model.clone(),
         None => {
             return Ok(openai_error_payload(
                 404,
@@ -476,8 +500,13 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
             ));
         }
     };
+    // Before either handler runs: every downstream use of the parser — the
+    // streaming gate, the host-side generation request, and the final parse —
+    // goes through `resolved_tool_call_parser`, so filling it in once here
+    // covers all three.
+    request.adopt_registry_parser(registered);
 
-    let model_id = match bindings::tachyon::accelerator::cpu::load_model(alias) {
+    let model_id = match bindings::tachyon::accelerator::cpu::load_model(&alias) {
         Ok(model_id) => model_id,
         Err(error) => {
             return Ok(openai_error_payload(
@@ -495,13 +524,12 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     }
 }
 
-fn resolve_model_alias<'a>(requested: &str, models: &'a [ModelInfo]) -> Option<&'a str> {
-    models
-        .iter()
-        .find(|model| {
-            model.alias == requested || format!("{}/{}", model.engine, model.alias) == requested
-        })
-        .map(|model| model.alias.as_str())
+/// Find the registry row a request's `model` names, by bare alias or by the
+/// `{engine}/{alias}` id `GET /ai/v1/models` advertises.
+fn resolve_registered_model<'a>(requested: &str, models: &'a [ModelInfo]) -> Option<&'a ModelInfo> {
+    models.iter().find(|model| {
+        model.alias == requested || format!("{}/{}", model.engine, model.alias) == requested
+    })
 }
 
 fn handle_chat_completions_buffered(
@@ -519,9 +547,9 @@ fn handle_chat_completions_buffered(
     };
 
     let response = ChatCompletionResponse {
-        id: "chatcmpl-tachyon",
+        id: completion_id(),
         object: "chat.completion",
-        created: 0,
+        created: unix_seconds(),
         model: request.model,
         choices: vec![ChatChoice {
             index: 0,
@@ -567,11 +595,17 @@ fn handle_chat_completions_streaming(
         )
         .map_err(|e| format!("failed to begin streaming response: {e}"))?;
 
+    // Resolved once: every chunk of one response must carry the same id and
+    // timestamp, or a client reassembling the stream sees each delta as a
+    // separate completion.
+    let id = completion_id();
+    let created = unix_seconds();
+
     // First chunk carries the role.
     let first_chunk = ChatCompletionChunk {
-        id: "chatcmpl-tachyon",
+        id: id.clone(),
         object: "chat.completion.chunk",
-        created: 0,
+        created,
         model: request.model.clone(),
         choices: vec![ChunkChoice {
             index: 0,
@@ -616,9 +650,9 @@ fn handle_chat_completions_streaming(
                     continue;
                 };
                 let chunk = ChatCompletionChunk {
-                    id: "chatcmpl-tachyon",
+                    id: id.clone(),
                     object: "chat.completion.chunk",
-                    created: 0,
+                    created,
                     model: request.model.clone(),
                     choices: vec![ChunkChoice {
                         index: 0,
@@ -677,9 +711,9 @@ fn handle_chat_completions_streaming(
         };
         if !tail.is_empty() {
             let chunk = ChatCompletionChunk {
-                id: "chatcmpl-tachyon",
+                id: id.clone(),
                 object: "chat.completion.chunk",
-                created: 0,
+                created,
                 model: request.model.clone(),
                 choices: vec![ChunkChoice {
                     index: 0,
@@ -699,9 +733,9 @@ fn handle_chat_completions_streaming(
                 .map(|(index, call)| StreamToolCall::from_tool_call(index as u32, call))
                 .collect();
             let chunk = ChatCompletionChunk {
-                id: "chatcmpl-tachyon",
+                id: id.clone(),
                 object: "chat.completion.chunk",
-                created: 0,
+                created,
                 model: request.model.clone(),
                 choices: vec![ChunkChoice {
                     index: 0,
@@ -715,9 +749,9 @@ fn handle_chat_completions_streaming(
 
     // Final chunk signals why generation ended.
     let stop_chunk = ChatCompletionChunk {
-        id: "chatcmpl-tachyon",
+        id,
         object: "chat.completion.chunk",
-        created: 0,
+        created,
         model: request.model,
         choices: vec![ChunkChoice {
             index: 0,
@@ -926,6 +960,31 @@ fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> Pars
 }
 
 impl ChatCompletionRequest {
+    /// Adopt the dialect the host resolved for this model, unless the caller
+    /// named one explicitly.
+    ///
+    /// This is what makes tool calling a property of the *checkpoint* rather
+    /// than of its alias. Without it the only automatic source is
+    /// [`parser_from_model`], which matches on the alias string — so a Qwen
+    /// checkpoint registered as `local-coder` got no parser at all and emitted
+    /// its `<tool_call>` blocks as literal assistant text. For an agentic
+    /// client that reads as "the model declined to call a tool", which is
+    /// indistinguishable from success and impossible to debug from outside.
+    fn adopt_registry_parser(&mut self, model: Option<&ModelInfo>) {
+        if self.tool_call_parser.is_some()
+            || self
+                .extra_body
+                .as_ref()
+                .is_some_and(|body| body.tool_call_parser.is_some())
+        {
+            // The caller was explicit; the registry does not get to override.
+            return;
+        }
+        self.tool_call_parser = model
+            .and_then(|model| model.tool_call_parser.as_deref())
+            .and_then(ToolCallParser::from_name);
+    }
+
     fn resolved_tool_call_parser(&self) -> Option<ToolCallParser> {
         self.tool_call_parser
             .or_else(|| {
@@ -1153,6 +1212,40 @@ fn list_models() -> Result<Vec<ModelInfo>, String> {
         .collect())
 }
 
+/// Seconds since the Unix epoch, or `0` when the host denies a clock.
+///
+/// OpenAI clients display `created`; it was hardcoded to `0`, which reads as
+/// January 1970 in every one of them.
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// A per-response completion id.
+///
+/// Every response used to carry the literal `chatcmpl-tachyon`, so nothing
+/// downstream — a proxy log, a client cache, a trace — could tell two
+/// completions apart. The value only has to be unique, not unguessable: it
+/// identifies a response, it does not authorize anything.
+///
+/// Built from the wall clock in nanoseconds plus a per-instance counter, so
+/// two responses collide only if the host reports the same nanosecond *and*
+/// the counter wrapped — and the counter alone keeps ids distinct within an
+/// instance even if the clock is denied and reads zero.
+fn completion_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("chatcmpl-{nanos:016x}{seq:08x}")
+}
+
 fn models_table() -> bindings::tachyon::mesh::kv_partition::Table {
     bindings::tachyon::mesh::kv_partition::Table::new(MODELS_TABLE)
 }
@@ -1208,24 +1301,157 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn resolves_openai_model_id_to_registry_alias() {
-        let models = vec![ModelInfo {
-            alias: "nvidia--Qwen3.6-35B-A3B-NVFP4".to_owned(),
+    /// A tool-offering request naming `model`, with nothing else set — so the
+    /// only thing that can resolve a parser is the alias heuristic or the
+    /// registry.
+    fn tool_request_named(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_owned(),
+            messages: vec![ChatMessage::text("user", "hello")],
+            tools: vec![serde_json::json!({"type": "function"})],
+            tool_choice: None,
+            tool_call_parser: None,
+            extra_body: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: None,
+            stream: None,
+        }
+    }
+
+    fn registry_model(alias: &str, parser: Option<&str>) -> ModelInfo {
+        ModelInfo {
+            alias: alias.to_owned(),
             engine: "safetensors".to_owned(),
             vram_required_mb: 0,
             status: "available".to_owned(),
-        }];
+            tool_call_parser: parser.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn completion_ids_are_unique_and_openai_shaped() {
+        let ids: Vec<String> = (0..1_000).map(|_| completion_id()).collect();
+        for id in &ids {
+            assert!(
+                id.starts_with("chatcmpl-"),
+                "clients match on the `chatcmpl-` prefix, got {id}"
+            );
+        }
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "two completions in the same instance shared an id"
+        );
+    }
+
+    /// The counter alone has to carry uniqueness: `SystemTime::now` traps to
+    /// the fallback `0` when the host denies a clock, which would otherwise
+    /// make every id in that instance identical.
+    #[test]
+    fn completion_ids_stay_distinct_without_a_usable_clock() {
+        let first = completion_id();
+        let second = completion_id();
+        let suffix = |id: &str| id.rsplit('-').next().unwrap_or_default()[16..].to_owned();
+        assert_ne!(
+            suffix(&first),
+            suffix(&second),
+            "the sequence half of the id must advance independently of the clock"
+        );
+    }
+
+    #[test]
+    fn resolves_openai_model_id_to_registry_alias() {
+        let models = vec![registry_model("nvidia--Qwen3.6-35B-A3B-NVFP4", None)];
 
         assert_eq!(
-            resolve_model_alias("safetensors/nvidia--Qwen3.6-35B-A3B-NVFP4", &models),
+            resolve_registered_model("safetensors/nvidia--Qwen3.6-35B-A3B-NVFP4", &models)
+                .map(|model| model.alias.as_str()),
             Some("nvidia--Qwen3.6-35B-A3B-NVFP4")
         );
         assert_eq!(
-            resolve_model_alias("nvidia--Qwen3.6-35B-A3B-NVFP4", &models),
+            resolve_registered_model("nvidia--Qwen3.6-35B-A3B-NVFP4", &models)
+                .map(|model| model.alias.as_str()),
             Some("nvidia--Qwen3.6-35B-A3B-NVFP4")
         );
-        assert_eq!(resolve_model_alias("unknown", &models), None);
+        assert!(resolve_registered_model("unknown", &models).is_none());
+    }
+
+    /// A registry row with an unknown dialect must not take the model out of
+    /// the listing: the field is an optimization, the row is the model's
+    /// existence.
+    #[test]
+    fn an_unknown_registry_parser_is_ignored_rather_than_fatal() {
+        let row = serde_json::json!({
+            "alias": "local-coder",
+            "engine": "gguf",
+            "vramRequiredMb": 0,
+            "status": "available",
+            "toolCallParser": "some-future-dialect",
+        });
+        let model: ModelInfo =
+            serde_json::from_value(row).expect("an unknown dialect must not fail the row");
+
+        let mut request = tool_request_named("local-coder");
+        request.adopt_registry_parser(Some(&model));
+        assert_eq!(request.resolved_tool_call_parser(), None);
+    }
+
+    /// The regression this whole seam exists for: a Qwen checkpoint whose alias
+    /// says nothing about it. Before, `parser_from_model` found no "qwen" in
+    /// `local-coder` and the model's `<tool_call>` blocks came back as prose.
+    #[test]
+    fn a_neutrally_named_model_still_gets_its_parser_from_the_registry() {
+        let mut request = tool_request_named("local-coder");
+        assert_eq!(
+            request.resolved_tool_call_parser(),
+            None,
+            "the alias heuristic cannot classify this name — that is the bug"
+        );
+
+        request.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
+        assert_eq!(
+            request.resolved_tool_call_parser(),
+            Some(ToolCallParser::Qwen)
+        );
+    }
+
+    /// Precedence: an explicit request field outranks the registry, so a client
+    /// that knows better than the checkpoint's own metadata keeps control.
+    #[test]
+    fn an_explicit_parser_outranks_the_registry() {
+        let mut request = tool_request_named("local-coder");
+        request.tool_call_parser = Some(ToolCallParser::Mistral);
+        request.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
+        assert_eq!(
+            request.resolved_tool_call_parser(),
+            Some(ToolCallParser::Mistral)
+        );
+
+        let mut via_extra_body = tool_request_named("local-coder");
+        via_extra_body.extra_body = Some(ExtraBody {
+            tool_call_parser: Some(ToolCallParser::Json),
+        });
+        via_extra_body.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
+        assert_eq!(
+            via_extra_body.resolved_tool_call_parser(),
+            Some(ToolCallParser::Json)
+        );
+    }
+
+    /// A request that offers no tools never needs a parser, whatever the
+    /// registry says — the filter in `resolved_tool_call_parser` still applies.
+    #[test]
+    fn a_registry_parser_does_not_apply_to_a_toolless_request() {
+        let mut request = tool_request_named("local-coder");
+        request.tools = Vec::new();
+        request.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
+        assert_eq!(request.resolved_tool_call_parser(), None);
     }
 
     #[test]
