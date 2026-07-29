@@ -969,12 +969,27 @@ impl StreamingContentGate {
         }
         if let Some(at) = self.find_opener() {
             self.tripped = true;
-            // Everything before the opener is genuine content.
-            let content = self.seen[self.emitted..at].to_owned();
+            // Everything before the opener is genuine content — minus the
+            // whitespace that separates it from the call. The buffered parser
+            // removes the call region and `trim()`s what is left, so emitting
+            // the newline in `Let me check.\n<tool_call>…` would leave the
+            // concatenated deltas differing from the buffered message by
+            // exactly that whitespace, and the streaming contract is that the
+            // two are equal.
+            //
+            // `emitted` still advances to the opener: the whitespace is
+            // accounted for, not pending, so the caller's tail reconciliation
+            // does not hand it back afterwards.
+            let content = self.seen[self.emitted..at].trim_end().to_owned();
             self.emitted = at;
             return (!content.is_empty()).then_some(content);
         }
-        let safe = floor_char_boundary(&self.seen, self.seen.len().saturating_sub(self.hold));
+        let ceiling = floor_char_boundary(&self.seen, self.seen.len().saturating_sub(self.hold));
+        // Trailing whitespace is withheld for the same reason, before we know
+        // whether an opener follows it. Nothing is lost when none does: the
+        // buffered parse then returns the text unchanged, and the caller emits
+        // whatever it kept beyond what was streamed.
+        let safe = self.seen[..ceiling].trim_end().len();
         if safe <= self.emitted {
             return None;
         }
@@ -1803,6 +1818,60 @@ mod tests {
     }
 
     #[test]
+    fn streamed_content_equals_the_buffered_message_across_a_tool_call() {
+        // The streaming contract is that concatenating the content deltas
+        // yields the buffered message. The whitespace between prose and an
+        // opener is where the two used to diverge: the buffered parser removes
+        // the call region and trims, while the gate had already streamed the
+        // newline.
+        let (streamed, whole, _emitted) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                "Let me check.",
+                "\n",
+                "<tool_call>",
+                r#"{"name":"read_file","arguments":{}}"#,
+                "</tool_call>",
+            ],
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(
+            parsed.tool_calls.len(),
+            1,
+            "the call must still be recovered"
+        );
+        assert_eq!(
+            streamed, parsed.content,
+            "streamed content must equal the buffered message, whitespace included"
+        );
+    }
+
+    #[test]
+    fn withheld_trailing_whitespace_is_released_when_no_call_follows() {
+        // The other side of the same rule: whitespace is only *deferred*, never
+        // dropped. With no call, the buffered parse returns the text unchanged
+        // and the caller's reconciliation emits whatever the gate still held.
+        let (streamed, whole, emitted) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                "Here it is, at some length so the opener hold is not the binding constraint.",
+                "\n\n",
+            ],
+        );
+        assert!(
+            !streamed.ends_with(char::is_whitespace),
+            "trailing whitespace is withheld while an opener could still follow, got {streamed:?}"
+        );
+        assert_eq!(
+            format!("{streamed}{}", whole.get(emitted..).unwrap_or_default()),
+            whole,
+            "streamed content plus the caller's tail must reconstruct the whole generation"
+        );
+    }
+
+    #[test]
     fn host_reported_tool_calls_need_no_parser_selection() {
         // A standard OpenAI client offers tools and passes no parser option;
         // the model name implies none either. Structured calls arrive on their
@@ -1913,12 +1982,14 @@ mod tests {
                 "call>{\"name\":\"search\",\"arguments\":{}}</tool_call>",
             ],
         );
-        // Everything up to the opener, verbatim — including the newline the
-        // buffered parser would have trimmed. A streamed chunk cannot be
-        // un-sent, so the gate forwards raw text and the handler reconciles
-        // against the trimmed parse afterwards.
-        assert_eq!(streamed, "Let me check.\n");
-        assert_eq!(emitted, streamed.len());
+        // Everything up to the opener except the whitespace separating the
+        // prose from it, which the buffered parser trims away — a streamed
+        // chunk cannot be un-sent, so it is withheld until the gate knows
+        // whether a call follows.
+        assert_eq!(streamed, "Let me check.");
+        // `emitted` still advances past the withheld newline to the opener, so
+        // the handler's tail reconciliation does not hand it back.
+        assert_eq!(emitted, streamed.len() + 1);
         // The tag itself never leaks into the content stream.
         assert!(!streamed.contains("<tool_call>"));
         assert!(whole.contains("<tool_call>"));
@@ -1932,7 +2003,9 @@ mod tests {
             ToolCallParser::Qwen,
             &["hi ", "<tool_", "call>{\"name\":\"f\"}</tool_call>"],
         );
-        assert_eq!(streamed, "hi ");
+        // The space before the opener is trimmed by the buffered parser, so it
+        // is not streamed either.
+        assert_eq!(streamed, "hi");
     }
 
     #[test]
@@ -1973,7 +2046,7 @@ mod tests {
             ToolCallParser::Mistral,
             &["Checking\n", "[TOOL_CALLS] [{\"name\":\"fetch\"}]"],
         );
-        assert_eq!(streamed, "Checking\n");
+        assert_eq!(streamed, "Checking");
     }
 
     #[test]

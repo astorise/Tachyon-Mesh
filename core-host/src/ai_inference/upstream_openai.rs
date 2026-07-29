@@ -885,7 +885,25 @@ impl UpstreamOpenAiRuntime {
             // look like a model that answered with silence, so accumulate them
             // and emit each assembled call once the stream ends — a call is
             // only dispatchable complete, and its arguments arrive in pieces.
-            if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
+            if let Some(fragments) = delta
+                .get("tool_calls")
+                .filter(|value| !is_empty_json(value))
+            {
+                // Validated rather than skipped, matching the buffered path. A
+                // non-array here used to read as "no tool calls at all", so a
+                // stream could finish successfully — with the upstream's own
+                // `finish_reason: "tool_calls"` — while emitting nothing, and
+                // the client would be told to dispatch a call it never got.
+                let fragments =
+                    fragments
+                        .as_array()
+                        .ok_or_else(|| UpstreamError::MalformedResponse {
+                            alias: self.alias.clone(),
+                            detail: format!(
+                                "`choices[0].delta.tool_calls` must be an array, got {}",
+                                json_type_name(fragments)
+                            ),
+                        })?;
                 for fragment in fragments {
                     streamed_tool_calls.absorb(fragment);
                 }
@@ -1842,6 +1860,34 @@ mod tests {
                 name: "read_file".to_owned(),
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             }]
+        );
+    }
+
+    #[test]
+    fn a_malformed_streamed_tool_call_payload_fails_the_stream() {
+        // An object where an array belongs used to read as "no tool calls",
+        // so the stream completed successfully — carrying the upstream's own
+        // `finish_reason: "tool_calls"` — with nothing for the client to
+        // dispatch. The buffered path already rejected this shape.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":{"name":"read_file"}},"finish_reason":"tool_calls"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a tool-call payload that cannot be read is not an empty one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("must be an array"),
+            "the error should name the shape problem, got: {error}"
         );
     }
 

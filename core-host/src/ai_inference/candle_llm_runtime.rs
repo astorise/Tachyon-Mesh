@@ -3402,6 +3402,11 @@ impl CandleLlmRuntime {
         while generated.len() < request.max_new_tokens
             && context_ids.len() < self.limits.max_position_embeddings
             && Instant::now() < request.deadline
+            // Same reasoning as the deadline, and the same check the ordinary
+            // decode loop makes: a speculative round runs a draft *and* a
+            // target forward pass, so continuing after the consumer left is
+            // the most expensive way to produce nothing.
+            && !sink.stopped()
         {
             let remaining = request.max_new_tokens - generated.len();
             let proposed = draft.greedy_token_ids_from_context(
@@ -3439,6 +3444,11 @@ impl CandleLlmRuntime {
                 if target_token != proposed_token
                     || generated.len() == request.max_new_tokens
                     || context_ids.len() >= self.limits.max_position_embeddings
+                    // Checked inside the acceptance loop too: one round can
+                    // verify up to `draft_tokens` proposals, so testing only at
+                    // the top would still run that many target forward passes
+                    // after the stream was abandoned.
+                    || sink.stopped()
                 {
                     break;
                 }

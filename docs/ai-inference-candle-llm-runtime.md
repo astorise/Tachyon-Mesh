@@ -438,6 +438,10 @@ until the binding's timeout — up to an hour — and a handful of them would sp
 the node's whole outbound capacity on readers that left. The local decode loops
 honour the same signal beside their deadline check, for the same reason a
 deadline exists: finishing an answer nobody will read only occupies the slot.
+Speculative decoding checks it twice — once per round and once inside the
+acceptance loop — because one round verifies up to `draft_tokens` proposals, so
+checking only at the top would still run that many target forward passes after
+the client had gone.
 
 One consequence is worth stating because it is easy to get wrong: with nothing
 enqueued on the `Network` lane, its scheduler queue depth would be permanently
@@ -480,6 +484,13 @@ at the end, and sending either as a final fragment would make them
 indistinguishable from model output. A truncated streamed completion was
 otherwise reported as `stop`, which is how a client comes to run half a
 function.
+
+The streaming and buffered paths must agree on the message, not just on the
+calls: concatenating the content deltas yields exactly what the buffered path
+returns. Whitespace is where that is easy to lose — the buffered parser removes
+the tool-call region and trims what is left, so the gate withholds whitespace at
+its tail until it knows whether an opener follows. If none does, the caller's
+reconciliation releases it; if one does, it was never the message.
 
 `length` outranks `tool_calls` when both apply. A model that exhausts its budget
 *while emitting a call* returns a partial `tool_calls` entry alongside

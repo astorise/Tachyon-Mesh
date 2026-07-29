@@ -363,6 +363,20 @@ prompt somewhere it did not choose.
 - **AND** the collision is logged, since the uploaded checkpoint's own figures
   are lost
 
+#### Scenario: A later upload cannot take a configured alias
+
+- **WHEN** an upload commits for an alias a configured binding already owns,
+  after reconciliation has run
+- **THEN** the upload is rejected rather than overwriting the row, because the
+  runtime would keep executing the configured backend whatever the listing said
+- **AND** the rejection names the alias, so the operator learns it is taken
+
+#### Scenario: A declared format outranks the files beside it
+
+- **WHEN** a model directory's sidecar declares a format and the directory also
+  holds a checkpoint of a different one
+- **THEN** the registry's engine label follows the sidecar, matching the loader
+
 #### Scenario: Dynamic bindings are left to the upload flow
 
 - **WHEN** a binding is marked `dynamic`
@@ -386,6 +400,14 @@ stream until a tool-call opener appears.
 
 - **WHEN** a tool-call opener spans two streamed fragments
 - **THEN** it is detected and no part of it is forwarded as content
+
+#### Scenario: Streamed content equals the buffered message
+
+- **WHEN** a generation emits prose, then whitespace, then a tool-call opener
+- **THEN** the whitespace is withheld, so concatenating the content deltas
+  yields exactly the message the buffered path would have returned
+- **AND** when no opener follows, the withheld whitespace is released rather
+  than dropped
 
 #### Scenario: An anchored parser does not trip on prose
 
@@ -618,6 +640,9 @@ accelerator residency regardless of the `device` its binding declares.
   string
 - **AND** a call whose `function.name` is absent or blank fails the whole
   response rather than being silently dropped
+- **AND** a `tool_calls` payload that is present but not an array fails the
+  response on the streaming path as well as the buffered one, rather than
+  reading as an absent one
 
 #### Scenario: Streamed tool-call fragments are reassembled
 
@@ -680,6 +705,12 @@ refused rather than queued indefinitely.
 
 - **WHEN** an upstream request fails after acquiring a permit
 - **THEN** the permit is released and the capacity is immediately reusable
+
+#### Scenario: Speculative decoding stops for a departed client
+
+- **WHEN** a streaming client disconnects while a speculative draft is running
+- **THEN** the decode loop stops at its next check rather than continuing draft
+  and target forward passes
 
 #### Scenario: An abandoned stream releases its permit at once
 
