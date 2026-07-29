@@ -319,7 +319,7 @@ impl ComponentHostState {
         expected_accelerator: ai_inference::AcceleratorKind,
         model_id: u32,
         prompt: String,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<(String, Option<ai_inference::TokenUsage>), String> {
         let loaded = self
             .accelerator_models
             .get(&model_id)
@@ -1972,6 +1972,30 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
+            .map(|(text, _usage)| text)
+    }
+
+    fn compute_detailed(
+        &mut self,
+        model_id: u32,
+        prompt: String,
+    ) -> std::result::Result<
+        accelerator_component_bindings::tachyon::accelerator::cpu::Generation,
+        String,
+    > {
+        let (text, usage) =
+            self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)?;
+        Ok(
+            accelerator_component_bindings::tachyon::accelerator::cpu::Generation {
+                text,
+                usage: usage.map(|usage| {
+                    accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                    }
+                }),
+            },
+        )
     }
 
     fn embed(&mut self, model_id: u32, input: String) -> std::result::Result<Vec<f32>, String> {
@@ -2061,6 +2085,7 @@ impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Gpu, model_id, prompt)
+            .map(|(text, _usage)| text)
     }
 }
 
@@ -2072,6 +2097,7 @@ impl accelerator_component_bindings::tachyon::accelerator::npu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Npu, model_id, prompt)
+            .map(|(text, _usage)| text)
     }
 }
 
@@ -2083,6 +2109,7 @@ impl accelerator_component_bindings::tachyon::accelerator::tpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Tpu, model_id, prompt)
+            .map(|(text, _usage)| text)
     }
 }
 

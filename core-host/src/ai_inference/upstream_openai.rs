@@ -569,7 +569,10 @@ impl UpstreamOpenAiRuntime {
         })
     }
 
-    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>, UpstreamError> {
+    pub(crate) fn generate(
+        &self,
+        prompts: &[&[u8]],
+    ) -> Result<(Vec<u8>, TokenUsage), UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -582,6 +585,9 @@ impl UpstreamOpenAiRuntime {
         let body = self.chat_body(prompt, false)?;
         let response = self.post("/chat/completions", &body)?;
         let payload: Value = read_json(&self.alias, response)?;
+        // Every OpenAI-shaped upstream returns `usage` on the buffered route,
+        // so unlike the streaming path this is reliably populated.
+        let usage = Self::read_usage(&payload).unwrap_or_default();
         let message = payload
             .get("choices")
             .and_then(Value::as_array)
@@ -608,7 +614,7 @@ impl UpstreamOpenAiRuntime {
                 "content": content.unwrap_or_default(),
                 "tool_calls": tool_calls.clone(),
             });
-            return Ok(envelope.to_string().into_bytes());
+            return Ok((envelope.to_string().into_bytes(), usage));
         }
 
         let text = content.ok_or_else(|| UpstreamError::MalformedResponse {
@@ -616,7 +622,7 @@ impl UpstreamOpenAiRuntime {
             detail: "response has no `choices[0].message.content` string and no `tool_calls`"
                 .to_owned(),
         })?;
-        Ok(text.as_bytes().to_vec())
+        Ok((text.as_bytes().to_vec(), usage))
     }
 
     /// Stream one generation, invoking `on_token` per SSE delta so the mesh's
@@ -1274,7 +1280,7 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let output = backend
+        let (output, _usage) = backend
             .generate(&[br#"{"messages":[{"role":"user","content":"write main"}]}"#])
             .expect("generation should round trip");
         assert_eq!(output, b"fn main() {}".to_vec());
@@ -1373,7 +1379,7 @@ mod tests {
                 {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
         );
         let backend = runtime("coder", &upstream.binding());
-        let output = backend.generate(&[b"go"]).expect("tool call round trip");
+        let (output, _usage) = backend.generate(&[b"go"]).expect("tool call round trip");
         let envelope: Value = serde_json::from_slice(&output).expect("envelope");
         assert_eq!(envelope[UPSTREAM_TOOL_ENVELOPE_MARKER], true);
         assert_eq!(envelope["tool_calls"][0]["function"]["name"], "f");
@@ -1515,7 +1521,7 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let output = backend
+        let (output, _usage) = backend
             .generate(&[b"read a.rs"])
             .expect("a tool call is a successful generation");
         let envelope: Value =

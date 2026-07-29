@@ -267,6 +267,37 @@ impl SharedInputTensor {
     }
 }
 
+/// One inference result: the decoded output bytes, plus the token counts when
+/// the backend could measure them.
+///
+/// `usage` is `None` rather than zero for a backend that cannot count (a mock,
+/// a vendor runner returning text over a pipe). The distinction is load-bearing
+/// downstream: a zero `usage` claims the generation cost nothing, which a
+/// client doing context-window accounting will believe.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InferenceOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) usage: Option<TokenUsage>,
+}
+
+impl InferenceOutput {
+    fn measured(bytes: Vec<u8>, usage: TokenUsage) -> Self {
+        Self {
+            bytes,
+            usage: Some(usage),
+        }
+    }
+}
+
+/// Output from a backend that reports no counts. Explicit rather than a blanket
+/// `From` so that "this backend cannot measure" is a decision at each call site
+/// instead of a silent default.
+impl From<Vec<u8>> for InferenceOutput {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self { bytes, usage: None }
+    }
+}
+
 trait BackendModel: Send + Sync {
     fn residency(&self) -> AcceleratorMemoryResidency;
     /// Scheduler lane this backend must run on, overriding the lane implied by
@@ -283,12 +314,12 @@ trait BackendModel: Send + Sync {
     /// output per input, in the same order — never a single shared output
     /// broadcast across the whole batch (see `process_batch`, which routes
     /// `outputs[i]` back to `inputs[i]`'s own caller).
-    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>>;
+    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>>;
     fn execute_with_adapter(
         &self,
         inputs: &[SharedInputTensor],
         adapter: &ResolvedLoraAdapter,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<InferenceOutput>> {
         let _ = inputs;
         bail!(
             "LoRA adapter `{}` was resolved, but this backend does not support adapter injection",
@@ -299,7 +330,7 @@ trait BackendModel: Send + Sync {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<InferenceOutput>> {
         self.execute_with_adapter_results(inputs, adapters)
             .into_iter()
             .collect()
@@ -309,7 +340,7 @@ trait BackendModel: Send + Sync {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<Vec<u8>>> {
+    ) -> Vec<Result<InferenceOutput>> {
         if inputs.len() != adapters.len() {
             let message = format!(
                 "adapter assignment count {} does not match input count {}",
@@ -379,15 +410,14 @@ trait BackendModel: Send + Sync {
                 inputs.len()
             );
         }
-        let text = String::from_utf8(outputs.remove(0))
+        let output = outputs.remove(0);
+        let usage = output.usage.unwrap_or_default();
+        let text = String::from_utf8(output.bytes)
             .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
         if !text.is_empty() {
             on_token(&text);
         }
-        // A backend that cannot decode token-by-token cannot count tokens
-        // either. Zero here means "not reported", and the caller omits `usage`
-        // rather than publishing a fabricated count.
-        Ok(TokenUsage::default())
+        Ok(usage)
     }
 
     fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
@@ -665,6 +695,7 @@ impl AiInferenceRuntime {
         prompt: &str,
     ) -> Result<String, String> {
         self.compute_component_prompt_with_adapter(alias, prompt, None)
+            .map(|(text, _usage)| text)
     }
 
     pub(crate) fn compute_component_prompt_with_adapter(
@@ -672,7 +703,7 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
         adapter_id: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Option<TokenUsage>), String> {
         let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
         self.ensure_model_loaded(alias)?;
         // Clone the `Arc` out and drop the read lock before inference so a slow
@@ -702,7 +733,8 @@ impl AiInferenceRuntime {
                 },
             )
             .map_err(|error| error.to_string())?;
-        String::from_utf8(output).map_err(|error| error.to_string())
+        let text = String::from_utf8(output.bytes).map_err(|error| error.to_string())?;
+        Ok((text, output.usage))
     }
 
     pub(crate) fn embed_component_input(
@@ -859,7 +891,7 @@ impl AcceleratorScheduler {
         model: Arc<CandleModel>,
         adapter: Option<ResolvedLoraAdapter>,
         input: SharedInputTensor,
-    ) -> Result<Vec<u8>, anyhow::Error> {
+    ) -> Result<InferenceOutput, anyhow::Error> {
         let response_rx = self.enqueue(model, adapter, input)?;
         response_rx
             .recv()
@@ -871,7 +903,7 @@ impl AcceleratorScheduler {
         model: Arc<CandleModel>,
         adapter: Option<ResolvedLoraAdapter>,
         input: SharedInputTensor,
-    ) -> Result<mpsc::Receiver<Result<Vec<u8>, anyhow::Error>>, anyhow::Error> {
+    ) -> Result<mpsc::Receiver<Result<InferenceOutput, anyhow::Error>>, anyhow::Error> {
         let (response_tx, response_rx) = mpsc::channel();
         let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
         self.metrics.queued_requests.fetch_add(1, Ordering::Relaxed);
@@ -1030,7 +1062,7 @@ struct InferenceJob {
     model: Arc<CandleModel>,
     qos: RouteQos,
     input: SharedInputTensor,
-    response_tx: mpsc::Sender<Result<Vec<u8>, anyhow::Error>>,
+    response_tx: mpsc::Sender<Result<InferenceOutput, anyhow::Error>>,
 }
 
 impl InferenceJob {
@@ -1483,7 +1515,7 @@ fn age_waiting_jobs(queued: &mut BinaryHeap<PrioritizedInferenceJob>) {
 fn process_batch(
     accelerator: AcceleratorKind,
     batch: &[InferenceJob],
-) -> Vec<Result<Vec<u8>, anyhow::Error>> {
+) -> Vec<Result<InferenceOutput, anyhow::Error>> {
     let model = Arc::clone(&batch[0].model);
     #[cfg(test)]
     if model.mock_latency > Duration::ZERO {
@@ -1505,7 +1537,7 @@ fn process_batch(
 
     match results
         .into_iter()
-        .collect::<Result<Vec<Vec<u8>>, anyhow::Error>>()
+        .collect::<Result<Vec<InferenceOutput>, anyhow::Error>>()
     {
         // Each job's own output is routed back to that job, never a shared
         // clone of one job's result broadcast to the whole batch.
@@ -1810,7 +1842,7 @@ impl BackendModel for CandleBackendModel {
         self
     }
 
-    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
         match &self.kind {
             CandleBackendModelKind::Upstream(_) => {
                 // Delegate to the per-input path so both share one
@@ -1838,7 +1870,11 @@ impl BackendModel for CandleBackendModel {
                 // its output to every other request in the batch.
                 let result = inputs
                     .iter()
-                    .map(|input| runtime.generate(&[input.data.as_ref()]))
+                    .map(|input| {
+                        runtime
+                            .generate(&[input.data.as_ref()])
+                            .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
+                    })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
                         anyhow!(
@@ -1862,7 +1898,11 @@ impl BackendModel for CandleBackendModel {
                 }
                 let result = inputs
                     .iter()
-                    .map(|input| runtime.generate(&[input.data.as_ref()]))
+                    .map(|input| {
+                        runtime
+                            .generate(&[input.data.as_ref()])
+                            .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
+                    })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
                         anyhow!(
@@ -1907,6 +1947,7 @@ impl BackendModel for CandleBackendModel {
                             ),
                             None => target.generate(&[prompt]),
                         }
+                        .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
@@ -1928,9 +1969,15 @@ impl BackendModel for CandleBackendModel {
                 if inputs.is_empty() {
                     return Err(anyhow!("vendor backend requires one input tensor"));
                 }
+                // A vendor runner hands back text over a pipe and reports no
+                // counts, so its outputs stay unmeasured.
                 let result = inputs
                     .iter()
-                    .map(|input| runtime.execute(input.data.as_ref()))
+                    .map(|input| {
+                        runtime
+                            .execute(input.data.as_ref())
+                            .map(InferenceOutput::from)
+                    })
                     .collect::<Result<Vec<_>, _>>();
                 record_execution(
                     &self.source.alias,
@@ -1969,7 +2016,14 @@ impl BackendModel for CandleBackendModel {
         record_execution(&self.source.alias, self.source.accelerator.as_str(), true);
         Ok(inputs
             .iter()
-            .map(|_| b"MOCK_LLM_RESPONSE".to_vec())
+            .map(|input| {
+                let bytes = b"MOCK_LLM_RESPONSE".to_vec();
+                let usage = mock_token_usage(
+                    std::slice::from_ref(input),
+                    &String::from_utf8_lossy(&bytes),
+                );
+                InferenceOutput::measured(bytes, usage)
+            })
             .collect())
     }
 
@@ -1977,7 +2031,7 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapter: &ResolvedLoraAdapter,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<InferenceOutput>> {
         match &self.kind {
             CandleBackendModelKind::Mock => self.execute(inputs),
             CandleBackendModelKind::TextGeneration { target, .. }
@@ -1986,11 +2040,13 @@ impl BackendModel for CandleBackendModel {
                 inputs
                     .iter()
                     .map(|input| {
-                        target.generate_with_adapter(
-                            &[input.data.as_ref()],
-                            &adapter.id,
-                            &adapter.path,
-                        )
+                        target
+                            .generate_with_adapter(
+                                &[input.data.as_ref()],
+                                &adapter.id,
+                                &adapter.path,
+                            )
+                            .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
@@ -2021,7 +2077,7 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<InferenceOutput>> {
         self.execute_with_adapter_results(inputs, adapters)
             .into_iter()
             .collect()
@@ -2031,7 +2087,7 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<Vec<u8>>> {
+    ) -> Vec<Result<InferenceOutput>> {
         if inputs.len() != adapters.len() {
             let message = format!(
                 "adapter assignment count {} does not match input count {}",
@@ -2060,7 +2116,7 @@ impl BackendModel for CandleBackendModel {
                 //    local inference meanwhile. One scoped thread per input is
                 //    coarse but bounded: the scheduler already caps a batch at
                 //    `DEFAULT_BATCH_SIZE`.
-                let results: Vec<Result<Vec<u8>>> = thread::scope(|scope| {
+                let results: Vec<Result<InferenceOutput>> = thread::scope(|scope| {
                     let handles = inputs
                         .iter()
                         .zip(adapters)
@@ -2080,7 +2136,9 @@ impl BackendModel for CandleBackendModel {
                                 "LoRA adapter `{adapter_id}` was resolved for model `{alias}`, but upstream bindings do not support adapter injection"
                             )),
                             Ok(handle) => match handle.join() {
-                                Ok(result) => result.map_err(anyhow::Error::from),
+                                Ok(result) => result
+                                    .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
+                                    .map_err(anyhow::Error::from),
                                 Err(_) => Err(anyhow!(
                                     "upstream request thread for model `{alias}` panicked"
                                 )),
@@ -2125,7 +2183,10 @@ impl BackendModel for CandleBackendModel {
                             "cpu"
                         };
                         record_execution(&self.source.alias, executed_on, true);
-                        outputs.into_iter().map(Ok).collect()
+                        outputs
+                            .into_iter()
+                            .map(|(bytes, usage)| Ok(InferenceOutput::measured(bytes, usage)))
+                            .collect()
                     }
                     Ok(None) => self.execute_with_adapters_sequential_results(inputs, adapters),
                     Err(error) => {
@@ -2310,7 +2371,7 @@ impl BackendModel for CandleBackendModel {
                         inputs.len()
                     );
                 }
-                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default())
+                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default().bytes)
                     .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
                 if !text.is_empty() {
                     on_token(&text);
@@ -2331,7 +2392,7 @@ impl BackendModel for CandleBackendModel {
                         inputs.len()
                     );
                 }
-                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default())
+                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default().bytes)
                     .map_err(|error| anyhow!("vendor output was not UTF-8: {error}"))?;
                 on_token(&text);
                 // A vendor runner returns text over a pipe and never reports
@@ -2444,7 +2505,7 @@ impl CandleModel {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<Vec<u8>>> {
+    ) -> Vec<Result<InferenceOutput>> {
         self.backend_model
             .execute_with_adapter_results(inputs, adapters)
     }
@@ -3169,7 +3230,7 @@ impl SemanticContextFlattener {
     }
 }
 
-fn repeat_batch_error(count: usize, message: impl Into<String>) -> Vec<Result<Vec<u8>>> {
+fn repeat_batch_error(count: usize, message: impl Into<String>) -> Vec<Result<InferenceOutput>> {
     let message = message.into();
     (0..count).map(|_| Err(anyhow!("{}", message))).collect()
 }
@@ -3179,7 +3240,7 @@ impl CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<Vec<u8>>> {
+    ) -> Vec<Result<InferenceOutput>> {
         if inputs.len() != adapters.len() {
             let message = format!(
                 "adapter assignment count {} does not match input count {}",
@@ -3293,7 +3354,10 @@ mod tests {
         let results = backend.execute_with_adapter_results(&inputs, &adapters);
         assert_eq!(results.len(), 3);
         assert_eq!(
-            results[0].as_ref().expect("first request should succeed"),
+            results[0]
+                .as_ref()
+                .expect("first request should succeed")
+                .bytes,
             b"ok"
         );
         assert!(
@@ -3301,7 +3365,10 @@ mod tests {
             "the malformed request should fail on its own"
         );
         assert_eq!(
-            results[2].as_ref().expect("third request should succeed"),
+            results[2]
+                .as_ref()
+                .expect("third request should succeed")
+                .bytes,
             b"ok"
         );
     }
@@ -3352,7 +3419,7 @@ mod tests {
     fn mock_inference_job(
         model: &Arc<CandleModel>,
         tenant: &str,
-        response_tx: mpsc::Sender<Result<Vec<u8>, anyhow::Error>>,
+        response_tx: mpsc::Sender<Result<InferenceOutput, anyhow::Error>>,
     ) -> InferenceJob {
         InferenceJob {
             alias: model.alias.clone(),
@@ -3382,11 +3449,13 @@ mod tests {
             self
         }
 
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
             Ok(inputs
                 .iter()
                 .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
+                        .into_bytes()
+                        .into()
                 })
                 .collect())
         }
@@ -3395,7 +3464,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<Vec<u8>>> {
+        ) -> Result<Vec<InferenceOutput>> {
             Ok(inputs
                 .iter()
                 .map(|input| {
@@ -3405,6 +3474,7 @@ mod tests {
                         String::from_utf8_lossy(input.data.as_ref())
                     )
                     .into_bytes()
+                    .into()
                 })
                 .collect())
         }
@@ -3421,11 +3491,13 @@ mod tests {
             self
         }
 
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
             Ok(inputs
                 .iter()
                 .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
+                        .into_bytes()
+                        .into()
                 })
                 .collect())
         }
@@ -3434,7 +3506,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<Vec<u8>>> {
+        ) -> Result<Vec<InferenceOutput>> {
             if adapter.id == "broken" {
                 bail!("adapter `{}` is malformed", adapter.id);
             }
@@ -3447,6 +3519,7 @@ mod tests {
                         String::from_utf8_lossy(input.data.as_ref())
                     )
                     .into_bytes()
+                    .into()
                 })
                 .collect())
         }
@@ -3467,12 +3540,14 @@ mod tests {
             self
         }
 
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
             self.sequential_adapter_calls.fetch_add(1, Ordering::SeqCst);
             Ok(inputs
                 .iter()
                 .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
+                        .into_bytes()
+                        .into()
                 })
                 .collect())
         }
@@ -3481,7 +3556,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<Vec<u8>>> {
+        ) -> Result<Vec<InferenceOutput>> {
             self.sequential_adapter_calls.fetch_add(1, Ordering::SeqCst);
             Ok(inputs
                 .iter()
@@ -3492,6 +3567,7 @@ mod tests {
                         String::from_utf8_lossy(input.data.as_ref())
                     )
                     .into_bytes()
+                    .into()
                 })
                 .collect())
         }
@@ -3500,7 +3576,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapters: &[Option<ResolvedLoraAdapter>],
-        ) -> Result<Vec<Vec<u8>>> {
+        ) -> Result<Vec<InferenceOutput>> {
             self.execute_with_adapter_results(inputs, adapters)
                 .into_iter()
                 .collect()
@@ -3510,7 +3586,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapters: &[Option<ResolvedLoraAdapter>],
-        ) -> Vec<Result<Vec<u8>>> {
+        ) -> Vec<Result<InferenceOutput>> {
             self.native_batches.fetch_add(1, Ordering::SeqCst);
             inputs
                 .iter()
@@ -3524,7 +3600,8 @@ mod tests {
                             .unwrap_or("base"),
                         String::from_utf8_lossy(input.data.as_ref())
                     )
-                    .into_bytes())
+                    .into_bytes()
+                    .into())
                 })
                 .collect()
         }
@@ -3671,10 +3748,12 @@ mod tests {
             .expect("base model generation before adapter");
         let output = runtime
             .compute_component_prompt_with_adapter("tiny", "hello", Some("tenant-a"))
-            .expect("real backend should apply the resolved adapter");
+            .expect("real backend should apply the resolved adapter")
+            .0;
         let base_after = runtime
             .compute_component_prompt_with_adapter("tiny", "hello", None)
-            .expect("base model generation after adapter");
+            .expect("base model generation after adapter")
+            .0;
 
         assert!(!output.is_empty());
         assert_ne!(output, MOCK_INFERENCE_RESPONSE);
@@ -4061,7 +4140,7 @@ mod tests {
 
         for handle in handles {
             let output = handle.join().expect("worker should join");
-            assert_eq!(output, MOCK_INFERENCE_RESPONSE.as_bytes());
+            assert_eq!(output.bytes, MOCK_INFERENCE_RESPONSE.as_bytes());
         }
 
         let snapshot = runtime.scheduler_snapshot(AcceleratorKind::Cpu);
@@ -4354,7 +4433,7 @@ mod tests {
             .collect::<Vec<_>>();
         let outputs = process_batch(AcceleratorKind::Gpu, &batch)
             .into_iter()
-            .map(|result| String::from_utf8(result.expect("sub-batch output")).expect("utf8"))
+            .map(|result| String::from_utf8(result.expect("sub-batch output").bytes).expect("utf8"))
             .collect::<Vec<_>>();
         assert_eq!(
             outputs,
@@ -4394,7 +4473,9 @@ mod tests {
 
         let outputs = process_batch(AcceleratorKind::Gpu, &batch)
             .into_iter()
-            .map(|result| String::from_utf8(result.expect("native batch output")).expect("utf8"))
+            .map(|result| {
+                String::from_utf8(result.expect("native batch output").bytes).expect("utf8")
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -4440,12 +4521,14 @@ mod tests {
                 results
                     .remove(0)
                     .expect("healthy adapter row should succeed")
+                    .bytes
             )
             .expect("utf8"),
             "tenant-ok:tenant-ok"
         );
         assert_eq!(
-            String::from_utf8(results.remove(0).expect("base row should succeed")).expect("utf8"),
+            String::from_utf8(results.remove(0).expect("base row should succeed").bytes)
+                .expect("utf8"),
             "base:plain"
         );
         let error = results
@@ -4733,7 +4816,8 @@ mod tests {
         assert_eq!(
             runtime
                 .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-a"))
-                .expect("adapter-backed inference should succeed"),
+                .expect("adapter-backed inference should succeed")
+                .0,
             MOCK_INFERENCE_RESPONSE
         );
         let missing = runtime

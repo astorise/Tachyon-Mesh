@@ -556,10 +556,10 @@ impl Qwen35MoeRuntime {
         self.executed_on
     }
 
-    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>> {
+    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<(Vec<u8>, TokenUsage)> {
         let mut output = String::new();
-        self.generate_streaming(prompts, &mut |delta| output.push_str(delta))?;
-        Ok(output.into_bytes())
+        let usage = self.generate_streaming(prompts, &mut |delta| output.push_str(delta))?;
+        Ok((output.into_bytes(), usage))
     }
 
     pub(crate) fn generate_streaming(
@@ -1173,18 +1173,22 @@ mod tests {
         let host_memory_before = current_process_memory_bytes();
         let gpu_memory_before = nvidia_memory_used_mib();
         let started = std::time::Instant::now();
-        let buffered = runtime.generate(&[request]).expect("buffered generation");
+        let (buffered, buffered_usage) = runtime.generate(&[request]).expect("buffered generation");
         let first_token_ms = started.elapsed().as_millis();
         let mut streamed = String::new();
         let decode_started = std::time::Instant::now();
-        runtime
+        let streamed_usage = runtime
             .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
             .expect("streaming generation");
         let decode_ms = decode_started.elapsed().as_millis();
 
         assert!(!buffered.is_empty());
-        assert_ne!(buffered, b"MOCK_LLM_RESPONSE");
+        assert_ne!(buffered.as_slice(), b"MOCK_LLM_RESPONSE");
         assert_eq!(String::from_utf8(buffered).expect("UTF-8"), streamed);
+        // The buffered wrapper is an accumulator over the streaming core, so
+        // the two must agree on what the generation cost as well as on its text.
+        assert_eq!(buffered_usage, streamed_usage);
+        assert!(buffered_usage.completion_tokens > 0);
         let working_set = runtime.working_set.lock().expect("working set");
         eprintln!(
             "{}",

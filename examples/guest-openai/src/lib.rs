@@ -573,8 +573,12 @@ fn handle_chat_completions_buffered(
     model_id: u32,
 ) -> Result<(u16, Vec<u8>), String> {
     let generation = build_generation_request(&request)?;
-    let output = bindings::tachyon::accelerator::cpu::compute(model_id, &generation)
+    // `compute_detailed` rather than `compute`: same generation, but it also
+    // carries the token counts. Unlike a stream, a buffered response has no
+    // trailing frame to put them in, so they have to come back with the text.
+    let completed = bindings::tachyon::accelerator::cpu::compute_detailed(model_id, &generation)
         .map_err(|e| format!("inference failed for model `{}`: {e}", request.model))?;
+    let output = completed.text;
     let parsed = parse_assistant_output(&request, &output);
     let finish_reason = if parsed.tool_calls.is_empty() {
         "stop"
@@ -583,12 +587,11 @@ fn handle_chat_completions_buffered(
     };
 
     let response = ChatCompletionResponse {
-        // The buffered path runs through the host's batch scheduler, whose
-        // response channel carries decoded bytes and nothing else, so there are
-        // no counts to report here. Streaming has its own channel and does
-        // report them. Omitted rather than zeroed: a zero `usage` is a claim
-        // that the generation cost nothing.
-        usage: None,
+        // Unconditional here, unlike the stream: a buffered response has no
+        // extra frame to break a client with, so OpenAI reports usage on it
+        // always. Still `None` when the backend could not measure — a zero
+        // `usage` claims the generation cost nothing.
+        usage: completed.usage.map(Usage::from_host),
         id: completion_id(),
         object: "chat.completion",
         created: unix_seconds(),

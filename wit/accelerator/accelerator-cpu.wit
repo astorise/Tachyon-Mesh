@@ -27,8 +27,19 @@ interface cpu {
         usage: func() -> option<token-usage>;
     }
 
+    /// A completed buffered generation: the decoded text, and the token counts
+    /// when the backend could measure them.
+    record generation {
+        text: string,
+        usage: option<token-usage>,
+    }
+
     load-model: func(name: string) -> result<u32, string>;
     compute: func(model-id: u32, prompt: string) -> result<string, string>;
+    /// `compute`, plus the token counts. Kept as a separate function rather
+    /// than changing `compute`'s return type, so every existing caller that
+    /// only wants the text is untouched.
+    compute-detailed: func(model-id: u32, prompt: string) -> result<generation, string>;
     /// Compute a dense L2-normalized embedding for one input string with a
     /// model previously loaded by `load-model`.
     embed: func(model-id: u32, input: string) -> result<list<f32>, string>;

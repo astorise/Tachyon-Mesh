@@ -564,6 +564,29 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         .expect("buffered reference must have content")
         .to_owned();
 
+    // Unlike a stream, a buffered response has no extra frame to break a naive
+    // client with, so usage is unconditional here — OpenAI reports it the same
+    // way. The counts come back beside the text through `compute-detailed`.
+    let buffered_usage = &ref_json["usage"];
+    assert!(
+        !buffered_usage.is_null(),
+        "a buffered response must report usage: {ref_json}"
+    );
+    let buffered_prompt_tokens = buffered_usage["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+    let buffered_completion_tokens = buffered_usage["completion_tokens"]
+        .as_u64()
+        .expect("completion_tokens");
+    assert!(
+        buffered_prompt_tokens > 0 && buffered_completion_tokens > 0,
+        "buffered usage must be measured, not defaulted: {buffered_usage}"
+    );
+    assert_eq!(
+        buffered_usage["total_tokens"].as_u64(),
+        Some(buffered_prompt_tokens + buffered_completion_tokens)
+    );
+
     // ── Streaming call: stream: true → SSE path ──────────────────────────
     let (hrx_s, mut crx_s) = run_streaming(
         serde_json::json!({"model": "llama3", "messages": messages, "stream": true}),
@@ -665,6 +688,10 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     // resource → guest → SSE. The mock backend reports word counts, so these
     // are synthetic but non-zero and internally consistent.
     let usage = &usage_frame["usage"];
+    assert_eq!(
+        usage, buffered_usage,
+        "the same prompt must cost the same whether streamed or buffered"
+    );
     let prompt_tokens = usage["prompt_tokens"].as_u64().expect("prompt_tokens");
     let completion_tokens = usage["completion_tokens"]
         .as_u64()

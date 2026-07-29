@@ -221,16 +221,31 @@ back while a stop sequence might still match.
 
 | Path | Reported | Why |
 |---|---|---|
+| non-streaming | always | no extra frame to break a client with, so nothing to gate on |
 | `stream: true` + `stream_options.include_usage` | yes | dedicated channel beside the fragment stream |
 | `stream: true` alone | no | matches OpenAI, whose extra trailing chunk breaks clients that index `choices[0]` |
-| non-streaming | no | runs through the batch scheduler, whose response channel carries decoded bytes only |
-| upstream (`openai:`) binding | when volunteered | read opportunistically from the upstream's own `usage` |
-| mock, vendor | no | nothing to count; `usage` is omitted rather than zeroed |
+| upstream (`openai:`) binding, buffered | always | every OpenAI-shaped upstream returns `usage` on this route |
+| upstream (`openai:`) binding, streamed | when volunteered | read opportunistically, never requested |
+| mock | word counts | no tokenizer; deterministic and obviously synthetic |
+| vendor | no | text over a pipe, nothing to count |
 
-Counts travel *beside* the token stream, not through it: they are only known
-once decoding ends, by which point the last fragment has already gone down the
-channel. `token-stream.usage()` returns `none` until then. Sending them as a
+The two paths reach the client differently. Streaming counts travel *beside* the
+token stream, not through it: they are only known once decoding ends, by which
+point the last fragment has already gone down the channel, and sending them as a
 final fragment would have made them indistinguishable from model output.
+`token-stream.usage()` returns `none` until then.
+
+The buffered path has no trailing frame, so the counts come back with the text:
+`compute-detailed` returns a `generation` record of both. It is a separate
+function rather than a change to `compute`'s return type, so every caller that
+only wants the text is untouched.
+
+Underneath, both share one seam. `InferenceOutput` — bytes plus
+`Option<TokenUsage>` — is what `BackendModel::execute` returns and what the
+scheduler's response channel carries, so a buffered request keeps its batching
+and still reports what it cost. `Option` rather than a zero default is the whole
+point: it makes "this backend cannot measure" a distinct answer from "this
+generation cost nothing", which the client would otherwise believe.
 
 An absent `usage` always means "not measured". Zeros are never published as if
 they were measured — a zero `usage` is a claim that the generation cost nothing,

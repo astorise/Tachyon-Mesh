@@ -482,6 +482,9 @@ enum SingleDeviceBackend {
     DeepSeek(Mutex<DeepSeekModel>),
 }
 
+/// One row of a native batch: its decoded output and what it cost.
+type BatchRowOutput = (Vec<u8>, TokenUsage);
+
 /// Token counts for one generation, as OpenAI's `usage` object reports them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TokenUsage {
@@ -2876,10 +2879,13 @@ impl CandleLlmRuntime {
     /// Buffered generation: run the decode and return the full UTF-8 output. A
     /// thin accumulator over [`generate_streaming`], so the two paths always
     /// agree byte-for-byte.
-    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>, CandleLlmError> {
+    pub(crate) fn generate(
+        &self,
+        prompts: &[&[u8]],
+    ) -> Result<(Vec<u8>, TokenUsage), CandleLlmError> {
         let mut out = String::new();
-        self.generate_streaming(prompts, &mut |delta| out.push_str(delta))?;
-        Ok(out.into_bytes())
+        let usage = self.generate_streaming(prompts, &mut |delta| out.push_str(delta))?;
+        Ok((out.into_bytes(), usage))
     }
 
     pub(crate) fn generate_with_adapter(
@@ -2887,19 +2893,22 @@ impl CandleLlmRuntime {
         prompts: &[&[u8]],
         adapter_id: &str,
         adapter_path: &Path,
-    ) -> Result<Vec<u8>, CandleLlmError> {
+    ) -> Result<(Vec<u8>, TokenUsage), CandleLlmError> {
         let mut out = String::new();
-        self.generate_with_adapter_streaming(prompts, adapter_id, adapter_path, &mut |delta| {
-            out.push_str(delta)
-        })?;
-        Ok(out.into_bytes())
+        let usage = self.generate_with_adapter_streaming(
+            prompts,
+            adapter_id,
+            adapter_path,
+            &mut |delta| out.push_str(delta),
+        )?;
+        Ok((out.into_bytes(), usage))
     }
 
     pub(crate) fn try_generate_batch_with_adapters(
         &self,
         prompts: &[&[u8]],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Option<Vec<Vec<u8>>>, CandleLlmError> {
+    ) -> Result<Option<Vec<BatchRowOutput>>, CandleLlmError> {
         if prompts.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -2946,7 +2955,11 @@ impl CandleLlmRuntime {
             return Ok(None);
         }
         if prompt_len > self.limits.max_position_embeddings {
-            return Ok(Some(vec![Vec::new(); prompts.len()]));
+            let refused = TokenUsage {
+                prompt_tokens: prompt_len as u32,
+                completion_tokens: 0,
+            };
+            return Ok(Some(vec![(Vec::new(), refused); prompts.len()]));
         }
 
         let LoadedModel::Safetensors {
@@ -3172,12 +3185,13 @@ impl CandleLlmRuntime {
         prompts: &[&[u8]],
         draft: &Self,
         draft_tokens: usize,
-    ) -> Result<Vec<u8>, CandleLlmError> {
+    ) -> Result<(Vec<u8>, TokenUsage), CandleLlmError> {
         let mut out = String::new();
-        self.generate_speculative_streaming(prompts, draft, draft_tokens, &mut |delta| {
-            out.push_str(delta)
-        })?;
-        Ok(out.into_bytes())
+        let usage =
+            self.generate_speculative_streaming(prompts, draft, draft_tokens, &mut |delta| {
+                out.push_str(delta)
+            })?;
+        Ok((out.into_bytes(), usage))
     }
 
     /// Streaming generation: identical decoding to [`generate`], but each newly
@@ -3751,7 +3765,7 @@ impl CandleLlmRuntime {
         eos_tokens: &[u32],
         device: &Device,
         adapter_assignments: &[Option<&str>],
-    ) -> Result<Vec<Vec<u8>>, CandleLlmError> {
+    ) -> Result<Vec<BatchRowOutput>, CandleLlmError> {
         let batch = prompt_ids.len();
         let prompt_len = prompt_ids
             .first()
@@ -3907,7 +3921,15 @@ impl CandleLlmRuntime {
             .map(|(decoder, request)| {
                 let text = decoder.text();
                 let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
-                Ok(text.as_bytes()[..end].to_vec())
+                let usage = TokenUsage {
+                    // Every row in a native batch shares one prompt length —
+                    // rows of unequal length are refused before this point.
+                    prompt_tokens: prompt_len as u32,
+                    // The decoder holds exactly the tokens it was pushed, which
+                    // is the row's generated sequence.
+                    completion_tokens: decoder.tokens().len() as u32,
+                };
+                Ok((text.as_bytes()[..end].to_vec(), usage))
             })
             .collect()
     }
@@ -6582,8 +6604,8 @@ mod tests {
         ] {
             let (runtime, dir) = load_qwen_fixture("generation", architecture);
             let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
-            let first = runtime.generate(&[request]).expect("first generation");
-            let second = runtime.generate(&[request]).expect("second generation");
+            let first = runtime.generate(&[request]).expect("first generation").0;
+            let second = runtime.generate(&[request]).expect("second generation").0;
             assert_eq!(
                 first,
                 second,
@@ -6604,8 +6626,8 @@ mod tests {
         ] {
             let (runtime, dir) = load_qwen_fixture("streaming", architecture);
             let request: &[u8] = br#"{"prompt":"hello","max_new_tokens":4}"#;
-            let buffered =
-                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let buffered = String::from_utf8(runtime.generate(&[request]).expect("buffered").0)
+                .expect("utf-8");
             let mut streamed = String::new();
             runtime
                 .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
@@ -6715,10 +6737,10 @@ mod tests {
         for architecture in [ModelArchitecture::Gemma2, ModelArchitecture::Gemma3] {
             let (runtime, dir) = load_gemma_fixture("generation", architecture);
             let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
-            let first =
-                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let first = String::from_utf8(runtime.generate(&[request]).expect("buffered").0)
+                .expect("utf-8");
             let second =
-                String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+                String::from_utf8(runtime.generate(&[request]).expect("repeat").0).expect("utf-8");
             assert_eq!(first, second, "internal KV cache must reset");
             let mut streamed = String::new();
             runtime
@@ -6882,10 +6904,10 @@ mod tests {
             let (runtime, dir) =
                 load_family_fixture("generation", architecture, write_tachyon_tiny_phi_fixture);
             let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
-            let buffered =
-                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let buffered = String::from_utf8(runtime.generate(&[request]).expect("buffered").0)
+                .expect("utf-8");
             let repeat =
-                String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+                String::from_utf8(runtime.generate(&[request]).expect("repeat").0).expect("utf-8");
             assert_eq!(buffered, repeat);
             let mut streamed = String::new();
             runtime
@@ -6906,9 +6928,9 @@ mod tests {
         );
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
         let buffered =
-            String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            String::from_utf8(runtime.generate(&[request]).expect("buffered").0).expect("utf-8");
         let repeat =
-            String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+            String::from_utf8(runtime.generate(&[request]).expect("repeat").0).expect("utf-8");
         assert_eq!(buffered, repeat);
         let mut streamed = String::new();
         runtime
@@ -6996,7 +7018,8 @@ mod tests {
         // slot is the point; a partial answer still beats an error.
         let bytes = runtime
             .generate(&[br#"{"prompt":"hello","max_new_tokens":64,"max_generation_ms":1}"#])
-            .expect("an expired deadline is not a request error");
+            .expect("an expired deadline is not a request error")
+            .0;
         assert!(
             String::from_utf8(bytes).expect("utf-8").len() < 1024,
             "an expired deadline must cut generation short"
@@ -7009,10 +7032,12 @@ mod tests {
         let (runtime, dir) = load_fixture("deadline-generous");
         let deadlined = runtime
             .generate(&[br#"{"prompt":"hello","max_new_tokens":4,"max_generation_ms":600000}"#])
-            .expect("generation should run");
+            .expect("generation should run")
+            .0;
         let plain = runtime
             .generate(&[br#"{"prompt":"hello","max_new_tokens":4}"#])
-            .expect("generation should run");
+            .expect("generation should run")
+            .0;
         // A deadline far beyond the work must not change the output at all.
         assert_eq!(deadlined, plain);
         let _ = fs::remove_dir_all(dir);
@@ -7153,6 +7178,26 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn buffered_and_streaming_generation_agree_on_usage() {
+        // The buffered wrapper is an accumulator over the streaming core, so
+        // the two must agree on what the generation cost as well as on the text
+        // it produced — the property that makes it safe for the guest's two
+        // paths to report the same numbers.
+        let (runtime, dir) = load_fixture("usage-parity");
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":5}"#;
+        let (buffered, buffered_usage) = runtime.generate(&[request]).expect("buffered");
+        let mut streamed = String::new();
+        let streamed_usage = runtime
+            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .expect("streaming");
+
+        assert_eq!(String::from_utf8(buffered).expect("utf-8"), streamed);
+        assert_eq!(buffered_usage, streamed_usage);
+        assert!(buffered_usage.completion_tokens > 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A budget of one token must report exactly one, which is the assertion
     /// that fails if the counter is wired to the wrong place — an off-by-one in
     /// the decode loop hides inside a larger budget.
@@ -7276,7 +7321,8 @@ mod tests {
         let (runtime, dir) = load_fixture("real-forward");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
-            .expect("generation should run the Llama forward");
+            .expect("generation should run the Llama forward")
+            .0;
         let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
         assert!(
             !text.is_empty(),
@@ -7331,11 +7377,13 @@ mod tests {
 
         let first = runtime
             .generate(&[request.as_bytes()])
-            .expect("first generation should run");
+            .expect("first generation should run")
+            .0;
         let hits_before = runtime.debug_prefix_cache_hits();
         let second = runtime
             .generate(&[request.as_bytes()])
-            .expect("second generation should reuse prefix cache");
+            .expect("second generation should reuse prefix cache")
+            .0;
 
         assert_eq!(first, second);
         assert!(
@@ -7382,7 +7430,8 @@ mod tests {
         .to_string();
         let bytes = runtime
             .generate(&[request.as_bytes()])
-            .expect("constrained generation should run");
+            .expect("constrained generation should run")
+            .0;
         let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
         assert_eq!(text, r#"{"ok":true}"#);
 
@@ -7585,7 +7634,8 @@ mod tests {
 
         let generated = nvfp4_runtime
             .generate(&[&b"hello"[..]])
-            .expect("nvfp4 checkpoint should run a real decode loop");
+            .expect("nvfp4 checkpoint should run a real decode loop")
+            .0;
         assert!(!generated.is_empty(), "decode output must not be empty");
 
         let _ = fs::remove_dir_all(dense_dir);
@@ -7596,8 +7646,8 @@ mod tests {
     fn greedy_decode_is_deterministic() {
         let (runtime, dir) = load_fixture("deterministic");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
-        let first = runtime.generate(&[request]).expect("first generation");
-        let second = runtime.generate(&[request]).expect("second generation");
+        let first = runtime.generate(&[request]).expect("first generation").0;
+        let second = runtime.generate(&[request]).expect("second generation").0;
         assert_eq!(
             first, second,
             "greedy decoding the same prompt must be reproducible"
@@ -7614,10 +7664,12 @@ mod tests {
             br#"{"prompt":"hello mesh","max_new_tokens":6,"temperature":0.9,"seed":42}"#;
         let first = runtime
             .generate(&[request])
-            .expect("first sampled generation");
+            .expect("first sampled generation")
+            .0;
         let second = runtime
             .generate(&[request])
-            .expect("second sampled generation");
+            .expect("second sampled generation")
+            .0;
         assert_eq!(
             first, second,
             "sampling with a pinned seed must be reproducible"
@@ -7630,7 +7682,7 @@ mod tests {
         let (runtime, dir) = load_fixture("stop-seq");
         // First, the un-stopped greedy output (deterministic on this fixture).
         let plain: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":8}"#;
-        let full = String::from_utf8(runtime.generate(&[plain]).expect("plain generation"))
+        let full = String::from_utf8(runtime.generate(&[plain]).expect("plain generation").0)
             .expect("utf-8 output");
 
         // Pick an interior character of that output as a stop sequence and assert
@@ -7645,7 +7697,7 @@ mod tests {
             })
             .to_string();
             let stopped =
-                String::from_utf8(runtime.generate(&[request.as_bytes()]).expect("stopped"))
+                String::from_utf8(runtime.generate(&[request.as_bytes()]).expect("stopped").0)
                     .expect("utf-8 output");
             assert!(
                 full.starts_with(&stopped),
@@ -7674,7 +7726,8 @@ mod tests {
         .to_string();
         let bytes = runtime
             .generate(&[request.as_bytes()])
-            .expect("a messages request must run on a checkpoint without a template");
+            .expect("a messages request must run on a checkpoint without a template")
+            .0;
         assert!(!bytes.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
@@ -7777,7 +7830,7 @@ mod tests {
         let (runtime, dir) = load_fixture("stream-concat");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
         let buffered =
-            String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            String::from_utf8(runtime.generate(&[request]).expect("buffered").0).expect("utf-8");
         let mut streamed = String::new();
         runtime
             .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
@@ -7794,10 +7847,11 @@ mod tests {
         let (target, target_dir) = load_fixture("spec-target");
         let (draft, draft_dir) = load_fixture("spec-draft");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
-        let greedy = target.generate(&[request]).expect("greedy generation");
+        let greedy = target.generate(&[request]).expect("greedy generation").0;
         let speculative = target
             .generate_speculative(&[request], &draft, 3)
-            .expect("speculative generation");
+            .expect("speculative generation")
+            .0;
         assert_eq!(
             speculative, greedy,
             "draft/verify must preserve target greedy output"
@@ -8049,7 +8103,8 @@ mod tests {
         let (runtime, dir) = load_gguf_fixture("real-forward");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
-            .expect("generation should run the quantized Llama forward");
+            .expect("generation should run the quantized Llama forward")
+            .0;
         let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
         assert!(
             !text.is_empty(),
@@ -8076,8 +8131,8 @@ mod tests {
     fn gguf_greedy_decode_is_deterministic() {
         let (runtime, dir) = load_gguf_fixture("deterministic");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
-        let first = runtime.generate(&[request]).expect("first generation");
-        let second = runtime.generate(&[request]).expect("second generation");
+        let first = runtime.generate(&[request]).expect("first generation").0;
+        let second = runtime.generate(&[request]).expect("second generation").0;
         assert_eq!(
             first, second,
             "greedy decoding the same GGUF prompt must be reproducible"
@@ -8097,7 +8152,8 @@ mod tests {
                 .expect("a directory with a .gguf file is a GGUF model");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
-            .expect("inferred GGUF model should still run");
+            .expect("inferred GGUF model should still run")
+            .0;
         assert!(!bytes.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
@@ -8208,7 +8264,8 @@ mod tests {
         // Tensor parallelism carries a KV cache, so full generation works.
         let generated = tp
             .generate(&[&b"hello"[..]])
-            .expect("tensor-parallel generation should run the decode loop");
+            .expect("tensor-parallel generation should run the decode loop")
+            .0;
         assert!(!generated.is_empty());
 
         let _ = fs::remove_dir_all(dir);
@@ -8257,7 +8314,8 @@ mod tests {
         // and dense paths.
         let generated = pipeline
             .generate(&[&b"hello"[..]])
-            .expect("pipeline-parallel generation should run the decode loop");
+            .expect("pipeline-parallel generation should run the decode loop")
+            .0;
         assert!(!generated.is_empty());
 
         let _ = fs::remove_dir_all(dir);
@@ -8320,7 +8378,8 @@ mod tests {
         // exactly like the tensor- and pipeline-parallel paths.
         let generated = expert
             .generate(&[&b"hello"[..]])
-            .expect("expert-parallel generation should run the decode loop");
+            .expect("expert-parallel generation should run the decode loop")
+            .0;
         assert!(!generated.is_empty());
 
         let _ = fs::remove_dir_all(dir);
@@ -8473,7 +8532,8 @@ mod tests {
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
         let output = runtime
             .generate(&[request])
-            .expect("generation must run a real decode on the cuda device");
+            .expect("generation must run a real decode on the cuda device")
+            .0;
         assert!(
             !output.is_empty(),
             "cuda-resident Llama generation must not be empty/mocked"
@@ -8659,14 +8719,16 @@ mod tests {
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4,"temperature":0.0}"#;
         let first = runtime
             .generate(&[request])
-            .expect("paged-attention generation must run a real decode on the cuda device");
+            .expect("paged-attention generation must run a real decode on the cuda device")
+            .0;
         assert!(
             !first.is_empty(),
             "paged-attention generation must not be empty/mocked"
         );
         let second = runtime
             .generate(&[request])
-            .expect("a second paged-attention request must reuse the block pool correctly");
+            .expect("a second paged-attention request must reuse the block pool correctly")
+            .0;
         assert_eq!(
             first, second,
             "greedy paged-attention generation must be deterministic across requests reusing the same shared block pool"
@@ -8771,7 +8833,8 @@ mod tests {
             .expect("tiny fixture should select the native Candle runtime");
         let captured_output = captured_runtime
             .generate(&[request])
-            .expect("cuda_graph_decode generation must run a real captured/replayed decode");
+            .expect("cuda_graph_decode generation must run a real captured/replayed decode")
+            .0;
         assert!(
             !captured_output.is_empty(),
             "cuda_graph_decode generation must not be empty/mocked"
@@ -8779,7 +8842,8 @@ mod tests {
 
         let captured_second_output = captured_runtime
             .generate(&[request])
-            .expect("cuda_graph_decode must support a second independent request");
+            .expect("cuda_graph_decode must support a second independent request")
+            .0;
         assert_eq!(
             captured_second_output, captured_output,
             "cuda_graph_decode's second request must match the first captured request's greedy output"
@@ -8796,7 +8860,8 @@ mod tests {
                 .expect("tiny fixture should select the native Candle runtime");
         let paged_only_output = paged_only_runtime
             .generate(&[request])
-            .expect("paged-attention generation must run a real decode on the cuda device");
+            .expect("paged-attention generation must run a real decode on the cuda device")
+            .0;
         assert_eq!(
             captured_output, paged_only_output,
             "cuda_graph_decode's captured/replayed decode must match the non-captured paged-attention path's greedy output for the same prompt"
@@ -8964,7 +9029,8 @@ mod tests {
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4,"temperature":0.0}"#;
         let flashinfer_output = runtime
             .generate(&[request])
-            .expect("flashinfer-attention generation must run a real decode on the cuda device");
+            .expect("flashinfer-attention generation must run a real decode on the cuda device")
+            .0;
         assert!(
             !flashinfer_output.is_empty(),
             "flashinfer-attention generation must not be empty/mocked"
@@ -8981,7 +9047,8 @@ mod tests {
                 .expect("tiny fixture should select the native Candle runtime");
         let dense_output = dense_runtime
             .generate(&[request])
-            .expect("dense generation must run a real decode on the cuda device");
+            .expect("dense generation must run a real decode on the cuda device")
+            .0;
         assert_eq!(
             flashinfer_output, dense_output,
             "flashinfer-attention decode must match the dense path's greedy output for the same prompt"
