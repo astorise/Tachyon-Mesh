@@ -14,7 +14,7 @@ tachyon-client = { path = "../tachyon-client" }
 tauri-plugin-dialog = "2"
 tauri-plugin-stronghold = "2"
 tokio = { version = "1", features = ["fs", "sync"] }
-wit-bindgen = "0.59"
+wit-bindgen = "0.60"
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 iota_stronghold = "2.1"
 
