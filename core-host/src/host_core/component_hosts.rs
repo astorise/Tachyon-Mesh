@@ -408,6 +408,12 @@ impl ComponentHostState {
         // final fragment would make them indistinguishable from model output.
         let outcome = Arc::new(Mutex::new(ai_inference::StreamOutcome::default()));
         let generation_outcome = Arc::clone(&outcome);
+        // Cleared when the guest drops its `token-stream`. A failed `send`
+        // already reports a departed consumer, but only when there is something
+        // to send; this is the same answer available *between* sends, which is
+        // what a backend needs while it is waiting on a slow upstream.
+        let consumer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let generation_alive = Arc::clone(&consumer_alive);
         std::thread::Builder::new()
             .name("tachyon-stream-gen".to_owned())
             .spawn(move || {
@@ -418,17 +424,9 @@ impl ComponentHostState {
                 // response nobody wants until `[DONE]` or the binding timeout,
                 // holding an admission permit the whole time, so a handful of
                 // abandoned streams would starve live requests.
-                let mut sink = |event: ai_inference::StreamEvent<'_>| {
-                    let payload = match event {
-                        ai_inference::StreamEvent::Content(text) => {
-                            StreamPayload::Content(text.to_owned())
-                        }
-                        ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
-                    };
-                    match sender.send(Ok(payload)) {
-                        Ok(()) => ai_inference::StreamControl::Continue,
-                        Err(_) => ai_inference::StreamControl::Stop,
-                    }
+                let mut sink = GuestStreamSink {
+                    sender: &sender,
+                    consumer_alive: &generation_alive,
                 };
                 match ai_runtime.stream_component_prompt(
                     &alias,
@@ -457,7 +455,11 @@ impl ComponentHostState {
                     "failed to spawn streaming generation thread: {error}"
                 ))
             })?;
-        Ok(StreamedGeneration { receiver, outcome })
+        Ok(StreamedGeneration {
+            receiver,
+            outcome,
+            consumer_alive,
+        })
     }
 }
 
@@ -2011,6 +2013,38 @@ fn wit_tool_call(
     }
 }
 
+/// The generation thread's end of a guest stream.
+///
+/// Owns both cancellation signals: a failed `send` (the receiver is gone) and
+/// the flag the resource's drop clears. They fire at the same moment — the
+/// difference is that only the flag can be read without emitting.
+#[cfg(feature = "ai-inference")]
+struct GuestStreamSink<'a> {
+    sender: &'a std::sync::mpsc::Sender<
+        std::result::Result<StreamPayload, ai_inference::GenerationError>,
+    >,
+    consumer_alive: &'a Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "ai-inference")]
+impl ai_inference::StreamSink for GuestStreamSink<'_> {
+    fn emit(&mut self, event: ai_inference::StreamEvent<'_>) -> ai_inference::StreamControl {
+        let payload = match event {
+            ai_inference::StreamEvent::Content(text) => StreamPayload::Content(text.to_owned()),
+            ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
+        };
+        match self.sender.send(Ok(payload)) {
+            Ok(()) => ai_inference::StreamControl::Continue,
+            Err(_) => ai_inference::StreamControl::Stop,
+        }
+    }
+
+    fn is_live(&mut self) -> bool {
+        self.consumer_alive
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// One item the generation thread pushes down the stream channel. The owned
 /// mirror of `ai_inference::StreamEvent`, which borrows its content so a
 /// backend can emit a fragment without allocating when nobody needs to keep it.
@@ -2026,6 +2060,7 @@ pub(crate) struct StreamedGeneration {
         std::result::Result<StreamPayload, ai_inference::GenerationError>,
     >,
     outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
+    consumer_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2034,6 +2069,9 @@ pub(crate) struct HostTokenStream {
         std::result::Result<StreamPayload, ai_inference::GenerationError>,
     >,
     outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
+    /// Cleared on drop, so a backend blocked between frames can see that this
+    /// caller has gone without having to emit something first.
+    consumer_alive: Arc<std::sync::atomic::AtomicBool>,
     /// Whether `next` has reported the end of the stream to this caller.
     ///
     /// The generation thread can finish while fragments are still queued, so
@@ -2109,7 +2147,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         >,
         WitGenerationError,
     > {
-        let StreamedGeneration { receiver, outcome } = self
+        let StreamedGeneration {
+            receiver,
+            outcome,
+            consumer_alive,
+        } = self
             .stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
             .map_err(wit_generation_error)?;
         let handle = self
@@ -2117,6 +2159,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
             .push(HostTokenStream {
                 receiver,
                 outcome,
+                consumer_alive,
                 saw_eof: false,
             })
             .map_err(|error| {
@@ -2212,10 +2255,18 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
             accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
         >,
     ) -> wasmtime::Result<()> {
-        self.table
-            .delete(wasmtime::component::Resource::<HostTokenStream>::new_own(
-                rep.rep(),
-            ))?;
+        let stream =
+            self.table
+                .delete(wasmtime::component::Resource::<HostTokenStream>::new_own(
+                    rep.rep(),
+                ))?;
+        // Deleting the entry drops the receiver, which already makes the next
+        // `send` fail. This says the same thing to a backend that is *waiting*
+        // rather than sending — the case a slow upstream leaves it in, holding
+        // an admission permit for a client that has gone.
+        stream
+            .consumer_alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -2775,10 +2826,14 @@ impl system_component_bindings::tachyon::mesh::model_events::Host for ComponentH
             model_path = %event.model_path,
             "publishing uploaded model to registry via ComponentHostState (no S3 flush on this path)"
         );
-        self.storage_broker
-            .core_store
-            .kv_partition_set("ai-models-registry", &event.alias, &value)
-            .map_err(|error| format!("failed to publish model upload event: {error:#}"))
+        // Through the shared writer, not a bare `set`: the alias-ownership rule
+        // has to hold on every path into the registry, and this one is reached
+        // by the ordinary component host rather than the storage proxy.
+        crate::system_storage::write_uploaded_model_row(
+            &self.storage_broker.core_store,
+            &event.alias,
+            value,
+        )
     }
 }
 

@@ -35,7 +35,11 @@ use thiserror::Error;
 use super::candle_llm_runtime::{
     TokenUsage, HOST_MAX_GENERATION_DEADLINE, MAX_PROMPT_BYTES_CEILING,
 };
-use super::{StreamControl, StreamEvent, StreamOutcome, ToolCall};
+use super::{StreamEvent, StreamOutcome, StreamSink, ToolCall};
+// Named only by the tests now: the backend reaches `StreamControl` through
+// `StreamSink::emit`'s return value rather than constructing one.
+#[cfg(test)]
+use super::StreamControl;
 
 /// Binding `path` prefix that selects this backend.
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
@@ -752,7 +756,7 @@ impl UpstreamOpenAiRuntime {
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
-        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+        sink: &mut dyn StreamSink,
     ) -> Result<StreamOutcome, UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
@@ -850,6 +854,15 @@ impl UpstreamOpenAiRuntime {
                     ),
                 });
             }
+            // Asked once per frame, before anything is emitted. `emit` only
+            // reports a departed consumer when there is something to emit, so a
+            // stream of role-only openings, usage frames or keep-alives would
+            // otherwise run to completion for a client that had already gone —
+            // holding a socket, a thread and an admission permit throughout.
+            if !sink.is_live() {
+                abandoned = true;
+                break;
+            }
             if let Some(reported) = Self::read_usage(&frame) {
                 usage = Some(reported);
             }
@@ -875,7 +888,7 @@ impl UpstreamOpenAiRuntime {
                 .and_then(Value::as_str)
                 .filter(|content| !content.is_empty())
             {
-                if sink(StreamEvent::Content(content)).is_stop() {
+                if sink.emit(StreamEvent::Content(content)).is_stop() {
                     abandoned = true;
                     break;
                 }
@@ -919,7 +932,7 @@ impl UpstreamOpenAiRuntime {
                         detail,
                     })?
             {
-                if sink(StreamEvent::ToolCall(call)).is_stop() {
+                if sink.emit(StreamEvent::ToolCall(call)).is_stop() {
                     abandoned = true;
                     break;
                 }
@@ -1685,7 +1698,7 @@ mod tests {
         let backend = runtime("coder", &upstream.binding());
 
         let error = backend
-            .generate_streaming(&[b"hi"], &mut |_| StreamControl::Continue)
+            .generate_streaming(&[b"hi"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
             .expect_err("an oversized frame must be refused");
         assert!(error.to_string().contains("limit"), "got: {error}");
     }
@@ -1705,7 +1718,7 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
         let error = backend
-            .generate_streaming(&[b"hi"], &mut |_| StreamControl::Continue)
+            .generate_streaming(&[b"hi"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
             .expect_err("a malformed data frame must not be skipped");
         assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
     }
@@ -1891,6 +1904,56 @@ mod tests {
         );
     }
 
+    /// A sink that emits nothing and reports the consumer gone from the start,
+    /// standing in for a client that disconnected before the first content
+    /// delta arrived.
+    #[derive(Default)]
+    struct DepartedSink {
+        emitted: usize,
+    }
+
+    impl StreamSink for DepartedSink {
+        fn emit(&mut self, _event: StreamEvent<'_>) -> StreamControl {
+            self.emitted += 1;
+            StreamControl::Stop
+        }
+
+        fn is_live(&mut self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_stream_carrying_no_content_still_notices_a_departed_client() {
+        // Role-only openings, usage frames and keep-alives produce no event, so
+        // `emit` is never called and cannot report the departure. Without a
+        // liveness probe per frame this ran to completion — holding a socket, a
+        // thread and an admission permit — for a client that had already gone.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":0}}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"content":"never read"}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut sink = DepartedSink::default();
+        backend
+            .generate_streaming(&[b"hi"], &mut sink)
+            .expect("an abandoned stream is not an error");
+        assert_eq!(
+            sink.emitted, 0,
+            "the read must stop on the first frame, before any content is produced"
+        );
+    }
+
     #[test]
     fn a_departed_client_stops_the_upstream_read() {
         // Three content frames and no `[DONE]`: a stream this backend would
@@ -2053,7 +2116,7 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
         let error = backend
-            .generate_streaming(&[b"hi"], &mut |_| StreamControl::Continue)
+            .generate_streaming(&[b"hi"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
             .expect_err("an in-band error must not be reported as success");
         assert!(error.to_string().contains("context length exceeded"));
     }
@@ -2199,7 +2262,7 @@ mod tests {
         let error = backend
             .generate_streaming(
                 &[br#"{"prompt":"go","tools":[{"type":"function"}]}"#],
-                &mut |_token| StreamControl::Continue,
+                &mut |_token: StreamEvent<'_>| StreamControl::Continue,
             )
             .expect_err("an unnamed streamed call must fail the response");
         assert!(
@@ -2236,7 +2299,9 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
         let outcome = backend
-            .generate_streaming(&[b"hi"], &mut |_token| StreamControl::Continue)
+            .generate_streaming(&[b"hi"], &mut |_token: StreamEvent<'_>| {
+                StreamControl::Continue
+            })
             .expect("streaming should complete");
         assert_eq!(outcome.usage, None);
     }
@@ -2256,7 +2321,9 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
         let outcome = backend
-            .generate_streaming(&[b"hi"], &mut |_token| StreamControl::Continue)
+            .generate_streaming(&[b"hi"], &mut |_token: StreamEvent<'_>| {
+                StreamControl::Continue
+            })
             .expect("streaming should complete");
         assert_eq!(
             outcome.usage,

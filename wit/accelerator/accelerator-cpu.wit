@@ -1,3 +1,5 @@
+package tachyon:accelerator@2.0.0;
+
 // Major, not minor, because `compute`, `embed`, `compute-stream` and
 // `token-stream.next` all changed shape: their error type became
 // `generation-error`, and `next` now yields a `stream-event` rather than a
@@ -5,7 +7,8 @@
 // this as 1.2.0 would have let a component built against 1.1.0 bind to it and
 // then fail instantiation with a structural type mismatch. A major bump makes
 // the break a clean unsatisfied import instead.
-package tachyon:accelerator@2.0.0;
+//
+// The declaration stays on line 1: `check-compat` reads it with `head -n 1`.
 
 interface cpu {
     /// Token counts for one generation, in the shape OpenAI's `usage` object

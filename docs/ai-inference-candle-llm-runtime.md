@@ -443,6 +443,18 @@ acceptance loop — because one round verifies up to `draft_tokens` proposals, s
 checking only at the top would still run that many target forward passes after
 the client had gone.
 
+A failed send is not the only signal, because it only fires when there is
+something to send. A sink also answers `is_live()` — backed by a flag the
+`token-stream` resource clears on drop — and the upstream reader asks it once
+per SSE frame, so a stream of role-only openings, usage frames or keep-alives
+cannot run to completion for a client that has already left.
+
+One window stays open: the read that waits for the upstream's *first* frame is
+uninterruptible, so a client that leaves before any frame arrives is noticed
+only when one does. Closing it needs a cancellable read, which the blocking HTTP
+client does not expose; until then the exposure is bounded by the binding's
+`timeout_ms` (and by a caller's `max_generation_ms`, which tightens it).
+
 One consequence is worth stating because it is easy to get wrong: with nothing
 enqueued on the `Network` lane, its scheduler queue depth would be permanently
 zero, and the mesh QoS admission check reads exactly that number to decide

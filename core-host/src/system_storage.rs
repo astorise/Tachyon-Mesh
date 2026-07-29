@@ -435,11 +435,15 @@ fn binding_engine_label(path: &str) -> &'static str {
                 }
             }
         }
-        match (has_gguf, has_onnx) {
-            // A GGUF file wins: a directory carrying both is a quantized
-            // checkpoint that happens to ship an ONNX sidecar.
-            (true, _) => "gguf",
-            (false, true) => "onnx",
+        // ONNX first, because that is the order `CandleBackendModel::load`
+        // probes in: `CandleEmbeddingRuntime::try_load` runs before the GGUF
+        // runtime and accepts a bare `.onnx` file with no sidecar. Preferring
+        // GGUF here labelled a directory `gguf/<alias>` while requests for it
+        // executed the ONNX embedding backend — and the label is half the
+        // public `{engine}/{alias}` id, not just metadata.
+        match (has_onnx, has_gguf) {
+            (true, _) => "onnx",
+            (false, true) => "gguf",
             (false, false) => "safetensors",
         }
     }
@@ -447,6 +451,11 @@ fn binding_engine_label(path: &str) -> &'static str {
 
 /// The format a model directory declares in its `.tachyon-model.json` sidecar,
 /// when it declares one this publisher can name.
+///
+/// Gated with its only caller: `binding_engine_label` classifies manifest
+/// bindings, which only exist on an `ai-inference` build, and CI compiles the
+/// default build with `-D dead_code`.
+#[cfg(feature = "ai-inference")]
 fn declared_model_format(path: &str) -> Option<&'static str> {
     #[derive(serde::Deserialize)]
     struct Sidecar {
@@ -606,6 +615,47 @@ pub(crate) fn publish_configured_model_bindings(
     }
 }
 
+/// Write an uploaded model's registry row, unless a configured binding owns
+/// the alias.
+///
+/// The single place this rule is enforced, because it has to hold for *every*
+/// writer: the storage-proxy host, the general component host, and any future
+/// one. A non-dynamic configured binding is loaded eagerly at boot, so
+/// `ensure_model_loaded` short-circuits for its alias and a request runs that
+/// backend no matter what the registry says — an `openai:` upstream included.
+/// A row claiming otherwise sends a client's prompt somewhere it did not
+/// choose.
+///
+/// Ownership is read inside the write transaction: checking first and writing
+/// after would let a concurrent reconciliation land in between.
+pub(crate) fn write_uploaded_model_row(
+    core_store: &crate::store::CoreStore,
+    alias: &str,
+    value: Vec<u8>,
+) -> std::result::Result<(), String> {
+    let mut alias_taken = false;
+    core_store
+        .kv_partition_update(AI_MODELS_REGISTRY_TABLE, alias, |current| {
+            if row_is_config_owned(current) {
+                alias_taken = true;
+                crate::store::KvPartitionUpdate::Keep
+            } else {
+                crate::store::KvPartitionUpdate::Set(value)
+            }
+        })
+        .map_err(|error| format!("failed to publish model upload event: {error:#}"))?;
+    if alias_taken {
+        // Failing beats silently keeping the configured row: the upload cannot
+        // be served under this alias whatever we write, and an error is the
+        // only thing that tells the operator so.
+        return Err(format!(
+            "model alias `{alias}` is claimed by a configured binding in the sealed manifest; \
+             uploaded models must use a free alias, or the binding must be declared `dynamic`"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a registry row's raw bytes say the manifest publisher wrote it.
 /// Takes the value rather than the key so the caller can decide inside a
 /// transaction.
@@ -695,23 +745,7 @@ impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
         // error is the only thing that tells the operator so. Ownership is read
         // inside the write transaction, so a concurrent reconciliation cannot
         // slip between a check and a set.
-        let mut alias_taken = false;
-        self.core_store
-            .kv_partition_update(AI_MODELS_REGISTRY_TABLE, &event.alias, |current| {
-                if row_is_config_owned(current) {
-                    alias_taken = true;
-                    crate::store::KvPartitionUpdate::Keep
-                } else {
-                    crate::store::KvPartitionUpdate::Set(value)
-                }
-            })
-            .map_err(|error| format!("failed to publish model upload event: {error:#}"))?;
-        if alias_taken {
-            return Err(format!(
-                "model alias `{}` is claimed by a configured binding in the sealed manifest;                  uploaded models must use a free alias, or the binding must be declared `dynamic`",
-                event.alias
-            ));
-        }
+        write_uploaded_model_row(&self.core_store, &event.alias, value)?;
         tracing::info!(alias = %event.alias, "model registry entry written; scheduling S3 flush");
         self.flush_uploaded_model_to_s3(&event.alias);
         Ok(())
@@ -1132,6 +1166,58 @@ mod configured_binding_registry_tests {
             binding_engine_label(model_dir.to_str().expect("utf-8 path")),
             "onnx"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sidecar_less_probing_follows_the_loaders_onnx_first_order() {
+        let (_store, dir) = temp_store();
+        let model_dir = dir.join("onnx-no-sidecar");
+        fs::create_dir_all(&model_dir).expect("model dir");
+        // No sidecar at all, and a leftover checkpoint beside the ONNX one.
+        // `CandleBackendModel::load` probes the embedding runtime first and it
+        // accepts a bare `.onnx`, so labelling this `gguf/<alias>` advertised a
+        // backend that would never run.
+        fs::write(model_dir.join("stale.gguf"), b"not read").expect("stale gguf");
+        fs::write(model_dir.join("model.onnx"), b"not read").expect("onnx");
+
+        assert_eq!(
+            binding_engine_label(model_dir.to_str().expect("utf-8 path")),
+            "onnx"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn every_uploaded_row_write_respects_configured_ownership() {
+        let (store, dir) = temp_store();
+        // The rule has to hold for callers other than the storage proxy — the
+        // general component host reaches the registry through the same shared
+        // writer, so this exercises it directly.
+        publish_configured_model_bindings(
+            &store,
+            &config_with(vec![binding(
+                "claimed",
+                "openai:http://127.0.0.1:8080/v1",
+                false,
+            )]),
+        );
+
+        let error = write_uploaded_model_row(&store, "claimed", b"{}".to_vec())
+            .expect_err("a configured alias must not be taken by an upload");
+        assert!(
+            error.contains("claimed") && error.contains("dynamic"),
+            "the rejection should name the alias and the way out, got: {error}"
+        );
+
+        // The configured row is intact, and a free alias still writes.
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "claimed")
+            .expect("read")
+            .expect("row");
+        let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(entry["engine"], "openai");
+        write_uploaded_model_row(&store, "free", b"{}".to_vec()).expect("a free alias is writable");
         let _ = fs::remove_dir_all(dir);
     }
 

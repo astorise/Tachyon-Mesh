@@ -490,6 +490,41 @@ impl StreamControl {
     }
 }
 
+/// Where a streaming backend sends its events, and how it asks whether anyone
+/// is still listening.
+///
+/// A trait rather than a bare callback because cancellation needs two distinct
+/// questions. `emit` answers "did that reach a consumer"; `is_live` answers
+/// "is there still a consumer" *without* producing anything — which is the only
+/// form available between frames that carry no content, and the only one a
+/// backend can ask while it is waiting rather than emitting.
+pub(crate) trait StreamSink {
+    fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl;
+
+    /// Whether the consumer is still there. The default answers "yes": only a
+    /// sink with a real consumer channel can know better, and a wrongly
+    /// pessimistic answer would truncate a healthy generation.
+    fn is_live(&mut self) -> bool {
+        true
+    }
+}
+
+/// Every plain callback is a sink, so a caller that has nothing to say about
+/// liveness — a test, a buffered adapter — keeps passing a closure.
+///
+/// `?Sized` so that `dyn FnMut(..)` is itself a sink: a closure written inline
+/// infers a single concrete lifetime for its argument and then fails the
+/// higher-ranked bound, while coercing it to `&mut dyn FnMut` first pins the
+/// `for<'a>` signature the trait needs.
+impl<F> StreamSink for F
+where
+    F: FnMut(StreamEvent<'_>) -> StreamControl + ?Sized,
+{
+    fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl {
+        self(event)
+    }
+}
+
 /// What a streaming generation reports once it ends.
 ///
 /// Both fields are known only at the end — the counts because decoding has to
@@ -676,7 +711,7 @@ trait BackendModel: Send + Sync {
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
-        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+        sink: &mut dyn StreamSink,
     ) -> Result<StreamOutcome> {
         let mut outputs = self.execute(inputs)?;
         if outputs.len() != 1 {
@@ -693,13 +728,13 @@ trait BackendModel: Send + Sync {
         // generation before the first event, so `Stop` only stops the emitting.
         let mut stopped = text.is_empty();
         if !stopped {
-            stopped = sink(StreamEvent::Content(&text)).is_stop();
+            stopped = sink.emit(StreamEvent::Content(&text)).is_stop();
         }
         for call in output.tool_calls {
             if stopped {
                 break;
             }
-            stopped = sink(StreamEvent::ToolCall(call)).is_stop();
+            stopped = sink.emit(StreamEvent::ToolCall(call)).is_stop();
         }
         Ok(StreamOutcome {
             usage: output.usage,
@@ -715,7 +750,7 @@ trait BackendModel: Send + Sync {
         &self,
         inputs: &[SharedInputTensor],
         adapter: &ResolvedLoraAdapter,
-        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+        sink: &mut dyn StreamSink,
     ) -> Result<StreamOutcome> {
         let _ = (inputs, sink);
         bail!(
@@ -1160,7 +1195,7 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
         adapter_id: Option<&str>,
-        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+        sink: &mut dyn StreamSink,
     ) -> Result<StreamOutcome, GenerationError> {
         // Resolved exactly as on the buffered path. Ignoring the route's
         // adapter here made `stream: true` silently run the *base* model while
@@ -2606,7 +2641,7 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapter: &ResolvedLoraAdapter,
-        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+        sink: &mut dyn StreamSink,
     ) -> Result<StreamOutcome> {
         // Only the safetensors text-generation runtime can inject an adapter.
         // Every other kind — GGUF, upstream, NVFP4, MoE, mock — refuses rather
@@ -2632,7 +2667,7 @@ impl BackendModel for CandleBackendModel {
             .map(|input| input.data.as_ref())
             .collect::<Vec<_>>();
         let on_token: &mut dyn FnMut(&str) -> StreamControl =
-            &mut |fragment: &str| sink(StreamEvent::Content(fragment));
+            &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
         target
             .generate_with_adapter_streaming(&prompts, &adapter.id, &adapter.path, on_token)
             .map(|usage| StreamOutcome::usage(Some(usage)))
@@ -2706,7 +2741,7 @@ impl BackendModel for CandleBackendModel {
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
-        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+        sink: &mut dyn StreamSink,
     ) -> Result<StreamOutcome> {
         // The upstream backend is the only one that writes to the `ToolCall`
         // arm — it receives calls already structured — so it takes the sink
@@ -2731,7 +2766,7 @@ impl BackendModel for CandleBackendModel {
         // it needs the template the caller resolved, not the decode loop. They
         // therefore keep a plain `&str` callback, adapted here.
         let on_token: &mut dyn FnMut(&str) -> StreamControl =
-            &mut |fragment: &str| sink(StreamEvent::Content(fragment));
+            &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
         // Local backends report no finish reason of their own: the decode loop
         // ends on EOS, a stop sequence, the token budget, or the deadline, and
         // which of those it was is the caller's to infer — exactly as on the
@@ -4419,7 +4454,7 @@ mod tests {
         let mut streamed = String::new();
         let mut fragments = 0usize;
         runtime
-            .stream_component_prompt("tiny", "hello", None, &mut |event| {
+            .stream_component_prompt("tiny", "hello", None, &mut |event: StreamEvent<'_>| {
                 if let StreamEvent::Content(delta) = event {
                     streamed.push_str(delta);
                     fragments += 1;

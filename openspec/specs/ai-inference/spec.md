@@ -370,12 +370,21 @@ prompt somewhere it did not choose.
 - **THEN** the upload is rejected rather than overwriting the row, because the
   runtime would keep executing the configured backend whatever the listing said
 - **AND** the rejection names the alias, so the operator learns it is taken
+- **AND** the rule holds on every path that writes an uploaded row, not only
+  the storage-proxy one
 
 #### Scenario: A declared format outranks the files beside it
 
 - **WHEN** a model directory's sidecar declares a format and the directory also
   holds a checkpoint of a different one
 - **THEN** the registry's engine label follows the sidecar, matching the loader
+
+#### Scenario: Format probing follows the loader's own order
+
+- **WHEN** a directory carries no sidecar and holds both an ONNX checkpoint and
+  a leftover checkpoint of another format
+- **THEN** the engine label is the one the loader's probe order would select,
+  because the label is half the public `{engine}/{alias}` id
 
 #### Scenario: Dynamic bindings are left to the upload flow
 
@@ -711,6 +720,13 @@ refused rather than queued indefinitely.
 - **WHEN** a streaming client disconnects while a speculative draft is running
 - **THEN** the decode loop stops at its next check rather than continuing draft
   and target forward passes
+
+#### Scenario: A stream carrying no content still notices a departed client
+
+- **WHEN** a streaming client disconnects and the upstream sends only frames
+  that produce no event — a role-only opening, a usage frame, a keep-alive
+- **THEN** the backend still observes the departure and abandons the response,
+  rather than running to completion because nothing was emitted to fail on
 
 #### Scenario: An abandoned stream releases its permit at once
 

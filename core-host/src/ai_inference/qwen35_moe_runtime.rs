@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{Device, Tensor};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::generation::{IncrementalDecoder, LogitsProcessor, Sampling};
 use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -625,6 +625,13 @@ impl Qwen35MoeRuntime {
         let mut generated = Vec::<u32>::new();
         let mut emitted = 0usize;
         let mut abandoned = false;
+        // Incremental, like every other production decode loop. Re-decoding the
+        // whole sequence after each token is quadratic in the generation
+        // length, and the stop check needs the decoded text on every step — so
+        // at the shared multi-thousand-token ceiling a long answer spent a
+        // large share of its wall-clock budget re-rendering text it had already
+        // rendered, while holding the lane.
+        let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
         for step in 0..request.max_new_tokens {
             // Elapsed budget stops generation the way an exhausted token budget
             // does, rather than failing: freeing the scheduler slot is the
@@ -643,10 +650,10 @@ impl Qwen35MoeRuntime {
                 break;
             }
             generated.push(token);
-            let text = self
-                .tokenizer
-                .decode(&generated, true)
+            decoder
+                .push(token)
                 .map_err(|error| anyhow!("failed to decode Qwen tokens: {error}"))?;
+            let text = decoder.text();
             let stop = request
                 .stop
                 .iter()
