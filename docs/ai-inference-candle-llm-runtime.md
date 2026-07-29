@@ -196,9 +196,14 @@ The deadline is anchored at parse time, not at the first decode step, so
 tokenizing and prefilling a long prompt count against it: that work holds the
 same slot. When it expires the loop stops the way an exhausted token budget
 does — flushing what was generated — rather than erroring: a partial answer is
-worth more than a failure, and freeing the slot is the point. A batch takes the
-earliest deadline among its rows, since rows share a forward pass and cannot
-stop independently.
+worth more than a failure, and freeing the slot is the point.
+
+A batch is per row: each row is retired at its own deadline while rows with time
+left keep decoding, rather than the whole batch stopping at the earliest — which
+truncated every co-batched answer to the shortest budget in the group. The one
+part rows genuinely cannot decide separately is the shared prefill forward pass,
+so that is abandoned only when *every* row has expired; it is checked between
+prefill chunks, as the single-sequence and prefix-cache paths are.
 
 `HOST_MAX_NEW_TOKENS` stays at 4096 as the coarse safety valve against an
 unbounded loop; it is no longer the de-facto regulator of slot occupancy.
@@ -424,6 +429,16 @@ Concurrency comes from there being many caller threads, each holding one permit
 — not from fanning one call out, which is why the backend now runs its inputs
 sequentially and the scoped-thread fan-out is gone.
 
+A permit is only as good as its release, so a disconnected client has to reach
+the backend. When the guest drops its `token-stream`, the host's channel send
+fails, and that is reported back down as `StreamControl::Stop` rather than
+ignored: the upstream reader abandons the response instead of draining it to
+`[DONE]`. Without that signal an abandoned SSE stream would hold its permit
+until the binding's timeout — up to an hour — and a handful of them would spend
+the node's whole outbound capacity on readers that left. The local decode loops
+honour the same signal beside their deadline check, for the same reason a
+deadline exists: finishing an answer nobody will read only occupies the slot.
+
 One consequence is worth stating because it is easy to get wrong: with nothing
 enqueued on the `Network` lane, its scheduler queue depth would be permanently
 zero, and the mesh QoS admission check reads exactly that number to decide
@@ -458,6 +473,19 @@ from a nonstandard request option or a guess at the model name — so a standard
 client offering tools would previously get no parser at all, or a tagged one
 that cannot read JSON, and the call would come back as literal assistant prose.
 
+`token-stream` reports the finish reason on the same terms as `usage`: known
+only once `next` has returned `none`, absent when the backend did not say. It
+is a separate accessor for the same reason the counts are — both are known only
+at the end, and sending either as a final fragment would make them
+indistinguishable from model output. A truncated streamed completion was
+otherwise reported as `stop`, which is how a client comes to run half a
+function.
+
+`length` outranks `tool_calls` when both apply. A model that exhausts its budget
+*while emitting a call* returns a partial `tool_calls` entry alongside
+`finish_reason: "length"`; reporting `tool_calls` there tells the client the call
+is ready and invites it to dispatch truncated arguments.
+
 Streamed tool calls arrive as `delta.tool_calls` fragments with no content at
 all — name first, `arguments` in pieces after it. They are reassembled by
 fragment `index` and emitted as `stream-event::tool-call` once the stream ends,
@@ -470,6 +498,23 @@ until the stream finished — a whole-output JSON envelope emitted *after* strea
 prose is unparseable — so merely offering tools cost the entire generation in
 latency, including on the requests that never called anything. Content now
 streams unconditionally.
+
+### Versioning the accelerator interface
+
+The interface is `tachyon:accelerator@2.0.0`. The bump is **major** rather than
+minor because `compute`, `embed`, `compute-stream` and `token-stream.next` all
+changed shape — their error type became `generation-error`, and `next` yields a
+`stream-event` instead of a string.
+
+That distinction is load-bearing, not bookkeeping. Wasmtime resolves a component
+import by semver-*compatible* name, so a component built against 1.1.0 would
+have bound to a 1.2.0 host and then failed instantiation with a structural type
+mismatch — an error pointing at the linker rather than at the version. Under a
+major bump the same component fails with an unsatisfied import, which says what
+actually happened. Preserving the 1.1 signatures was the alternative, but it
+means keeping a text-channel `next` alongside the structured one, and with it
+the whole-output tool-call envelope and the buffering it forced — paying in
+latency, permanently, for a compatibility nobody is currently using.
 
 ### Failures carry the upstream's status
 
@@ -489,6 +534,11 @@ depends on it. `guest-openai` maps it:
 | 502/503/504 | relayed unchanged | a transient gateway failure, retryable as itself |
 | 401/403, anything else | 502 `server_error` | an upstream credential failure is *this node's* misconfiguration; relaying a 401 would send the client chasing its own key |
 | absent | 500 `server_error` | nothing remote to attribute |
+
+A streamed request cannot use any of that directly: its status line is already
+on the wire by the time generation starts. The same error body is written as a
+final SSE frame instead, followed by `[DONE]`, which is where an OpenAI client
+reads a mid-stream failure anyway.
 
 Collapsed into one opaque string, a 429 the client should back off from and a
 400 it must never retry reach it identically — and typically as a server fault

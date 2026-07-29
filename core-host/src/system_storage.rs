@@ -533,23 +533,36 @@ pub(crate) fn publish_configured_model_bindings(
                 }
             }
 
-            // A row already exists. Refresh it only if this publisher owns it:
-            // a hot reload that changes an alias from `openai:` to a GGUF
-            // checkpoint must stop advertising `openai/<alias>`, while an
-            // upload-published row keeps its real path and VRAM figure.
+            // A row already exists, and this binding is non-dynamic — which
+            // means the runtime has *already* eagerly loaded it under this
+            // alias, and `ensure_model_loaded` will short-circuit for that key
+            // forever after. Whatever the row says, a request for this alias
+            // executes the configured backend.
             //
-            // Ownership is re-read inside the write transaction. Checking in a
-            // separate read would let an upload land in between, and the
-            // refresh would then overwrite the row the check was protecting.
+            // So the row is overwritten even when an upload owns it. Keeping
+            // the upload row would advertise (say) `gguf/shared` with the
+            // uploaded checkpoint's path while the alias actually runs the
+            // configured binding — and `guest-openai` strips the engine prefix
+            // back to the bare alias, so a client selecting the advertised
+            // upload would have its prompt answered by a different model, in
+            // the `openai:` case by a third-party server. A listing that lies
+            // about where a prompt goes is worse than one that loses an
+            // upload's VRAM figure.
+            //
+            // The write is still a single transaction: a read followed by a
+            // write would let an upload land in between and be reported as the
+            // winner when it is not.
             if let Err(error) = core_store.kv_partition_update(
                 AI_MODELS_REGISTRY_TABLE,
                 &binding.alias,
                 |current| {
-                    if row_is_config_owned(current) {
-                        crate::store::KvPartitionUpdate::Set(value)
-                    } else {
-                        crate::store::KvPartitionUpdate::Keep
+                    if !row_is_config_owned(current) {
+                        tracing::warn!(
+                            alias = %binding.alias,
+                            "an uploaded model shares an alias with a configured binding; the configured binding is what executes, so the registry row now describes it"
+                        );
                     }
+                    crate::store::KvPartitionUpdate::Set(value)
                 },
             ) {
                 tracing::warn!(
@@ -913,10 +926,19 @@ mod configured_binding_registry_tests {
     }
 
     #[test]
-    fn an_uploaded_entry_is_never_clobbered_by_a_configured_binding() {
+    fn a_configured_binding_owns_the_row_for_an_alias_it_already_executes() {
         let (store, dir) = temp_store();
-        // An upload-published row carries a real path and VRAM figure; the
-        // config-derived one knows neither, so it must not overwrite it.
+        // The collision that matters: an upload and a *non-dynamic* manifest
+        // binding claim the same alias. The runtime loaded the configured
+        // binding eagerly at boot, so `ensure_model_loaded("shared")`
+        // short-circuits and every request for `shared` reaches the upstream —
+        // whatever the registry says.
+        //
+        // Leaving the upload row would advertise `gguf/shared` with an on-disk
+        // path while `guest-openai` strips the prefix back to `shared`, so a
+        // client picking the advertised local checkpoint would have its prompt
+        // sent to a third-party server. Losing the upload's VRAM figure is the
+        // cheaper error by far.
         let uploaded = serde_json::json!({
             "alias": "shared", "engine": "gguf",
             "vramRequiredMb": 4096, "status": "available",
@@ -944,8 +966,11 @@ mod configured_binding_registry_tests {
             .expect("registry read should succeed")
             .expect("row should still exist");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("row should be JSON");
-        assert_eq!(entry["engine"], "gguf");
-        assert_eq!(entry["vramRequiredMb"], 4096);
+        assert_eq!(
+            entry["engine"], "openai",
+            "the listing must describe what a request for this alias actually runs"
+        );
+        assert_eq!(entry["modelPath"], "openai:http://127.0.0.1:8080/v1");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1010,8 +1035,50 @@ mod configured_binding_registry_tests {
     }
 
     #[test]
-    fn an_uploaded_row_is_never_refreshed_or_swept() {
+    fn an_uploaded_row_no_binding_claims_is_never_touched() {
         let (store, dir) = temp_store();
+        let uploaded = serde_json::json!({
+            "alias": "uploaded-only", "engine": "gguf", "vramRequiredMb": 4096,
+            "status": "available", "modelPath": "/data/models/uploaded-only",
+        });
+        store
+            .kv_partition_set(
+                AI_MODELS_REGISTRY_TABLE,
+                "uploaded-only",
+                &serde_json::to_vec(&uploaded).expect("serialize"),
+            )
+            .expect("seed");
+
+        // Neither the refresh pass nor the sweep may touch a row this publisher
+        // does not own: the model is on disk, reachable, and nothing in the
+        // manifest contradicts it. The sweep in particular only walks
+        // config-owned aliases, so an upload must never be collateral.
+        publish_configured_model_bindings(
+            &store,
+            &config_with(vec![binding(
+                "unrelated",
+                "openai:http://127.0.0.1:8080/v1",
+                false,
+            )]),
+        );
+        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "uploaded-only")
+            .expect("read")
+            .expect("an uploaded row must survive");
+        let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(entry["engine"], "gguf");
+        assert_eq!(entry["vramRequiredMb"], 4096);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_dynamic_binding_leaves_its_uploaded_row_alone() {
+        let (store, dir) = temp_store();
+        // The other half of the rule: a `dynamic` alias is *not* eagerly loaded,
+        // so the upload is what executes and the upload row is what should be
+        // advertised. Nothing is published for it at all.
         let uploaded = serde_json::json!({
             "alias": "shared", "engine": "gguf", "vramRequiredMb": 4096,
             "status": "available", "modelPath": "/data/models/shared",
@@ -1024,21 +1091,12 @@ mod configured_binding_registry_tests {
             )
             .expect("seed");
 
-        // Present in the manifest, then absent: neither pass may touch it.
-        publish_configured_model_bindings(
-            &store,
-            &config_with(vec![binding(
-                "shared",
-                "openai:http://127.0.0.1:8080/v1",
-                false,
-            )]),
-        );
-        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        publish_configured_model_bindings(&store, &config_with(vec![binding("shared", "", true)]));
 
         let raw = store
             .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "shared")
             .expect("read")
-            .expect("an uploaded row must survive");
+            .expect("row");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
         assert_eq!(entry["engine"], "gguf");
         assert_eq!(entry["vramRequiredMb"], 4096);

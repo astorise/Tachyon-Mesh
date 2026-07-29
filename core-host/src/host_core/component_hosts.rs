@@ -393,6 +393,7 @@ impl ComponentHostState {
     ) -> std::result::Result<StreamedGeneration, ai_inference::GenerationError> {
         let loaded = self.resolve_accelerator_model(expected_accelerator, model_id)?;
         let alias = loaded.alias.clone();
+        let adapter_id = self.adapter_id.clone();
         let ai_runtime = Arc::clone(self.ai_runtime.as_ref().ok_or_else(|| {
             ai_inference::GenerationError::local(
                 "AI inference runtime is unavailable for this component",
@@ -405,29 +406,42 @@ impl ComponentHostState {
         // last fragment has already gone down the channel. They therefore come
         // back beside the channel rather than through it: sending them as a
         // final fragment would make them indistinguishable from model output.
-        let usage = Arc::new(Mutex::new(None));
-        let generation_usage = Arc::clone(&usage);
+        let outcome = Arc::new(Mutex::new(ai_inference::StreamOutcome::default()));
+        let generation_outcome = Arc::clone(&outcome);
         std::thread::Builder::new()
             .name("tachyon-stream-gen".to_owned())
             .spawn(move || {
-                // The closure forwards each event; a closed receiver (the
-                // guest dropped the stream) just makes `send` fail, which we
-                // ignore — the bounded decode finishes on its own.
+                // A failed `send` means the receiver is gone — the SSE client
+                // disconnected and the guest dropped the stream. That is
+                // reported back to the backend as `Stop` rather than ignored:
+                // an ignored close leaves the upstream reader draining a
+                // response nobody wants until `[DONE]` or the binding timeout,
+                // holding an admission permit the whole time, so a handful of
+                // abandoned streams would starve live requests.
                 let mut sink = |event: ai_inference::StreamEvent<'_>| {
-                    let _ = sender.send(Ok(match event {
+                    let payload = match event {
                         ai_inference::StreamEvent::Content(text) => {
                             StreamPayload::Content(text.to_owned())
                         }
                         ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
-                    }));
+                    };
+                    match sender.send(Ok(payload)) {
+                        Ok(()) => ai_inference::StreamControl::Continue,
+                        Err(_) => ai_inference::StreamControl::Stop,
+                    }
                 };
-                match ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
-                    // `None` means the backend could not measure, and stays
-                    // `None` in the slot: `usage()` then reports nothing rather
-                    // than zeros, which a client would read as a generation
-                    // that cost nothing.
+                match ai_runtime.stream_component_prompt(
+                    &alias,
+                    &prompt,
+                    adapter_id.as_deref(),
+                    &mut sink,
+                ) {
+                    // An absent count means the backend could not measure, and
+                    // stays absent in the slot: `usage()` then reports nothing
+                    // rather than zeros, which a client would read as a
+                    // generation that cost nothing. Same for the finish reason.
                     Ok(reported) => {
-                        if let Ok(mut slot) = generation_usage.lock() {
+                        if let Ok(mut slot) = generation_outcome.lock() {
                             *slot = reported;
                         }
                     }
@@ -443,7 +457,7 @@ impl ComponentHostState {
                     "failed to spawn streaming generation thread: {error}"
                 ))
             })?;
-        Ok(StreamedGeneration { receiver, usage })
+        Ok(StreamedGeneration { receiver, outcome })
     }
 }
 
@@ -2011,7 +2025,7 @@ pub(crate) struct StreamedGeneration {
     receiver: std::sync::mpsc::Receiver<
         std::result::Result<StreamPayload, ai_inference::GenerationError>,
     >,
-    usage: Arc<Mutex<Option<ai_inference::TokenUsage>>>,
+    outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2019,7 +2033,7 @@ pub(crate) struct HostTokenStream {
     receiver: std::sync::mpsc::Receiver<
         std::result::Result<StreamPayload, ai_inference::GenerationError>,
     >,
-    usage: Arc<Mutex<Option<ai_inference::TokenUsage>>>,
+    outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
     /// Whether `next` has reported the end of the stream to this caller.
     ///
     /// The generation thread can finish while fragments are still queued, so
@@ -2095,14 +2109,14 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         >,
         WitGenerationError,
     > {
-        let StreamedGeneration { receiver, usage } = self
+        let StreamedGeneration { receiver, outcome } = self
             .stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
             .map_err(wit_generation_error)?;
         let handle = self
             .table
             .push(HostTokenStream {
                 receiver,
-                usage,
+                outcome,
                 saw_eof: false,
             })
             .map_err(|error| {
@@ -2165,13 +2179,31 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         if !stream.saw_eof {
             return None;
         }
-        let reported = (*stream.usage.lock().ok()?)?;
+        let reported = stream.outcome.lock().ok()?.usage?;
         Some(
             accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
                 prompt_tokens: reported.prompt_tokens,
                 completion_tokens: reported.completion_tokens,
             },
         )
+    }
+
+    fn finish_reason(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+        >,
+    ) -> Option<String> {
+        let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
+        let stream = self.table.get(&handle).ok()?;
+        // Withheld until the caller has observed EOF, for the same reason as
+        // `usage`: the generation thread can finish while fragments are still
+        // queued, and a caller polling this as its completion signal would stop
+        // reading and truncate the response.
+        if !stream.saw_eof {
+            return None;
+        }
+        stream.outcome.lock().ok()?.finish_reason.clone()
     }
 
     fn drop(

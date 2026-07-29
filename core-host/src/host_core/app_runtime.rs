@@ -987,14 +987,41 @@ pub(crate) fn requested_model_alias(
     resolve_requested_model_alias(route, body_alias)
 }
 
+/// The bare manifest alias a requested model id names, if any.
+///
+/// `GET /ai/v1/models` advertises `{engine}/{alias}` — `openai/qwen3-coder` —
+/// and `guest-openai` accepts either form, so a client that picked a model out
+/// of that listing sends the qualified id. Matching it against bare aliases
+/// alone therefore failed for exactly the clients doing the right thing, and on
+/// a multi-model route the caller fell back to the route's *first* binding:
+/// mesh QoS then watched an idle local queue while the upstream the request
+/// actually targeted was saturated.
+///
+/// Only the last segment is taken, and only when the prefix is a plain engine
+/// label, so an alias is never invented from an arbitrary slashed string.
+fn model_alias_candidates(requested: &str) -> [&str; 2] {
+    let tail = requested
+        .rsplit_once('/')
+        .map(|(_engine, alias)| alias)
+        .unwrap_or(requested);
+    [requested, tail]
+}
+
 fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) -> Option<String> {
     alias
-        .filter(|alias| {
-            route.models.is_empty()
-                || route
-                    .models
-                    .iter()
-                    .any(|binding| binding.alias.eq_ignore_ascii_case(alias))
+        .and_then(|alias| {
+            if route.models.is_empty() {
+                return Some(alias);
+            }
+            model_alias_candidates(&alias)
+                .into_iter()
+                .find_map(|candidate| {
+                    route
+                        .models
+                        .iter()
+                        .find(|binding| binding.alias.eq_ignore_ascii_case(candidate))
+                        .map(|binding| binding.alias.clone())
+                })
         })
         .or_else(|| {
             if route.models.len() == 1 {
@@ -1018,6 +1045,52 @@ mod requested_model_alias_tests {
             dynamic: true,
             hardware_strategy: HardwareStrategy::default(),
         }
+    }
+
+    #[test]
+    fn an_engine_qualified_model_id_resolves_to_its_manifest_alias() {
+        // `GET /ai/v1/models` advertises `{engine}/{alias}`, so a client that
+        // picked a model out of the listing sends the qualified form. Failing
+        // to match it made a multi-model route fall back to its *first*
+        // binding, and mesh QoS then watched the wrong lane entirely.
+        let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
+        route.models = vec![model_binding("local-llama"), model_binding("qwen3-coder")];
+
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("openai/qwen3-coder".to_owned())).as_deref(),
+            Some("qwen3-coder")
+        );
+        // The bare form still works, and casing is still ignored.
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("QWEN3-Coder".to_owned())).as_deref(),
+            Some("qwen3-coder")
+        );
+        // A qualified id naming no binding stays unresolved rather than
+        // silently selecting the first one.
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("openai/not-here".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    fn the_qos_lane_follows_the_engine_qualified_model_a_client_asked_for() {
+        let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
+        let mut local = model_binding("local-llama");
+        local.device = ModelDevice::Cuda;
+        let mut upstream = model_binding("qwen3-coder");
+        upstream.path = "openai:http://127.0.0.1:8080/v1".to_owned();
+        route.models = vec![local, upstream];
+
+        let requested =
+            resolve_requested_model_alias(&route, Some("openai/qwen3-coder".to_owned()));
+        let profile = route_mesh_qos_profile(&route, requested.as_deref())
+            .expect("a route with bindings has a profile");
+        assert_eq!(
+            profile.accelerator,
+            ai_inference::AcceleratorKind::Network,
+            "admission must watch the lane the request actually runs on, not the route's first binding"
+        );
     }
 
     #[test]

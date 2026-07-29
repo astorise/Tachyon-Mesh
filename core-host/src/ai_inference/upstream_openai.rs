@@ -35,7 +35,7 @@ use thiserror::Error;
 use super::candle_llm_runtime::{
     TokenUsage, HOST_MAX_GENERATION_DEADLINE, MAX_PROMPT_BYTES_CEILING,
 };
-use super::{StreamEvent, ToolCall};
+use super::{StreamControl, StreamEvent, StreamOutcome, ToolCall};
 
 /// Binding `path` prefix that selects this backend.
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
@@ -752,8 +752,8 @@ impl UpstreamOpenAiRuntime {
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
-        sink: &mut dyn FnMut(StreamEvent<'_>),
-    ) -> Result<Option<TokenUsage>, UpstreamError> {
+        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+    ) -> Result<StreamOutcome, UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -779,6 +779,12 @@ impl UpstreamOpenAiRuntime {
         let mut line = String::new();
         let mut saw_done = false;
         let mut usage = None;
+        let mut finish_reason = None;
+        // Set when the sink asks to stop — the client went away. The read loop
+        // then abandons the upstream response instead of draining it to
+        // `[DONE]`, which is what releases the socket, the thread and the
+        // admission permit for a live request.
+        let mut abandoned = false;
         let mut streamed_tool_calls = StreamedToolCalls::default();
         loop {
             line.clear();
@@ -847,12 +853,21 @@ impl UpstreamOpenAiRuntime {
             if let Some(reported) = Self::read_usage(&frame) {
                 usage = Some(reported);
             }
-            let Some(delta) = frame
+            let choice = frame
                 .get("choices")
                 .and_then(Value::as_array)
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("delta"))
-            else {
+                .and_then(|choices| choices.first());
+            // Sent on the last content-bearing frame, before `[DONE]`. Keeping
+            // it is what lets the caller tell a completion that finished from
+            // one the upstream truncated at its own token limit.
+            if let Some(reported) = choice
+                .and_then(|choice| choice.get("finish_reason"))
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+            {
+                finish_reason = Some(reported.to_owned());
+            }
+            let Some(delta) = choice.and_then(|choice| choice.get("delta")) else {
                 continue;
             };
             if let Some(content) = delta
@@ -860,7 +875,10 @@ impl UpstreamOpenAiRuntime {
                 .and_then(Value::as_str)
                 .filter(|content| !content.is_empty())
             {
-                sink(StreamEvent::Content(content));
+                if sink(StreamEvent::Content(content)).is_stop() {
+                    abandoned = true;
+                    break;
+                }
             }
             // A streamed tool call arrives as `delta.tool_calls` fragments with
             // no content at all. Dropping them would make the whole request
@@ -874,22 +892,31 @@ impl UpstreamOpenAiRuntime {
             }
         }
 
-        for call in
-            streamed_tool_calls
-                .finish()
-                .map_err(|detail| UpstreamError::MalformedResponse {
-                    alias: self.alias.clone(),
-                    detail,
-                })?
-        {
-            sink(StreamEvent::ToolCall(call));
+        if !abandoned {
+            for call in
+                streamed_tool_calls
+                    .finish()
+                    .map_err(|detail| UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail,
+                    })?
+            {
+                if sink(StreamEvent::ToolCall(call)).is_stop() {
+                    abandoned = true;
+                    break;
+                }
+            }
         }
 
         // A clean EOF without `[DONE]` is a truncated generation, not a
         // completed one — the upstream restarted mid-stream, or returned a
         // non-SSE success body. Reporting success here would hand the caller
         // silently truncated code and record the request as healthy.
-        if !saw_done {
+        //
+        // An abandoned stream is exempt: nobody is left to receive the answer,
+        // so stopping short is the intended outcome rather than a truncation to
+        // report.
+        if !saw_done && !abandoned {
             return Err(UpstreamError::MalformedResponse {
                 alias: self.alias.clone(),
                 detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
@@ -898,7 +925,10 @@ impl UpstreamOpenAiRuntime {
         // Absence stays absence: an upstream that volunteers no usage frame
         // has told us nothing, and zeros would read to the client as a
         // generation that cost nothing.
-        Ok(usage)
+        Ok(StreamOutcome {
+            usage,
+            finish_reason,
+        })
     }
 
     /// Forward a single embedding request to the upstream `/embeddings` route.
@@ -1253,10 +1283,32 @@ mod tests {
     }
 
     impl CapturedStream {
-        fn sink(&mut self) -> impl FnMut(StreamEvent<'_>) + '_ {
-            move |event| match event {
-                StreamEvent::Content(text) => self.content.push(text.to_owned()),
-                StreamEvent::ToolCall(call) => self.tool_calls.push(call),
+        fn sink(&mut self) -> impl FnMut(StreamEvent<'_>) -> StreamControl + '_ {
+            move |event| {
+                match event {
+                    StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::ToolCall(call) => self.tool_calls.push(call),
+                }
+                StreamControl::Continue
+            }
+        }
+
+        /// A sink that walks away after `after` content events, the way a
+        /// disconnected SSE client does.
+        fn sink_stopping_after(
+            &mut self,
+            after: usize,
+        ) -> impl FnMut(StreamEvent<'_>) -> StreamControl + '_ {
+            move |event| {
+                match event {
+                    StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::ToolCall(call) => self.tool_calls.push(call),
+                }
+                if self.content.len() >= after {
+                    StreamControl::Stop
+                } else {
+                    StreamControl::Continue
+                }
             }
         }
     }
@@ -1615,7 +1667,7 @@ mod tests {
         let backend = runtime("coder", &upstream.binding());
 
         let error = backend
-            .generate_streaming(&[b"hi"], &mut |_| {})
+            .generate_streaming(&[b"hi"], &mut |_| StreamControl::Continue)
             .expect_err("an oversized frame must be refused");
         assert!(error.to_string().contains("limit"), "got: {error}");
     }
@@ -1635,7 +1687,7 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
         let error = backend
-            .generate_streaming(&[b"hi"], &mut |_| {})
+            .generate_streaming(&[b"hi"], &mut |_| StreamControl::Continue)
             .expect_err("a malformed data frame must not be skipped");
         assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
     }
@@ -1794,6 +1846,58 @@ mod tests {
     }
 
     #[test]
+    fn a_departed_client_stops_the_upstream_read() {
+        // Three content frames and no `[DONE]`: a stream this backend would
+        // normally reject as truncated. With the consumer gone that is the
+        // intended outcome, and the point is that the read stops at the first
+        // frame instead of draining the rest — which is what releases the
+        // socket, the thread and the admission permit.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        backend
+            .generate_streaming(&[b"hi"], &mut captured.sink_stopping_after(1))
+            .expect("an abandoned stream is not an error");
+        assert_eq!(
+            captured.content,
+            vec!["a"],
+            "the read must stop at the frame the sink refused, not drain the rest"
+        );
+    }
+
+    #[test]
+    fn a_streamed_finish_reason_survives_to_the_caller() {
+        // `length` means the upstream truncated the answer at its own token
+        // limit. Discarding it on the streaming path reported the completion as
+        // `stop`, so a client ran half a function.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fn main() {\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(&[b"write main"], &mut captured.sink())
+            .expect("streaming should complete");
+        assert_eq!(outcome.finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
     fn a_stream_without_tool_calls_reports_none() {
         let upstream = FakeUpstream::start(
             "HTTP/1.1 200 OK",
@@ -1903,7 +2007,7 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
         let error = backend
-            .generate_streaming(&[b"hi"], &mut |_| {})
+            .generate_streaming(&[b"hi"], &mut |_| StreamControl::Continue)
             .expect_err("an in-band error must not be reported as success");
         assert!(error.to_string().contains("context length exceeded"));
     }
@@ -2049,7 +2153,7 @@ mod tests {
         let error = backend
             .generate_streaming(
                 &[br#"{"prompt":"go","tools":[{"type":"function"}]}"#],
-                &mut |_token| {},
+                &mut |_token| StreamControl::Continue,
             )
             .expect_err("an unnamed streamed call must fail the response");
         assert!(
@@ -2085,10 +2189,10 @@ mod tests {
             ),
         );
         let backend = runtime("coder", &upstream.binding());
-        let usage = backend
-            .generate_streaming(&[b"hi"], &mut |_token| {})
+        let outcome = backend
+            .generate_streaming(&[b"hi"], &mut |_token| StreamControl::Continue)
             .expect("streaming should complete");
-        assert_eq!(usage, None);
+        assert_eq!(outcome.usage, None);
     }
 
     #[test]
@@ -2105,11 +2209,11 @@ mod tests {
             ),
         );
         let backend = runtime("coder", &upstream.binding());
-        let usage = backend
-            .generate_streaming(&[b"hi"], &mut |_token| {})
+        let outcome = backend
+            .generate_streaming(&[b"hi"], &mut |_token| StreamControl::Continue)
             .expect("streaming should complete");
         assert_eq!(
-            usage,
+            outcome.usage,
             Some(TokenUsage {
                 prompt_tokens: 11,
                 completion_tokens: 4,

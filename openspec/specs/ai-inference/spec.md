@@ -405,10 +405,13 @@ host maximum.
 - **WHEN** a request sets a deadline of zero or beyond the host maximum
 - **THEN** the request is rejected with an error naming the field
 
-#### Scenario: A batch stops at its earliest deadline
+#### Scenario: Each batched row stops at its own deadline
 
 - **WHEN** batched rows carry different deadlines
-- **THEN** decoding stops at the earliest, because rows share a forward pass
+- **THEN** each row is retired at its own, and rows with time left keep decoding
+- **AND** the batch's shared prefill is abandoned only once *every* row is out
+  of time, because a prefill forward pass cannot be run for some rows and not
+  others
 
 ### Requirement: GGUF loading MUST dispatch by architecture
 
@@ -635,6 +638,15 @@ accelerator residency regardless of the `device` its binding declares.
 - **AND** the remote HTTP status reaches the component as
   `generation-error.upstream-status`, while a local failure leaves it absent
 
+### Requirement: A route's LoRA adapter applies to streaming as it does to buffering
+A streaming generation SHALL resolve and apply the same adapter a buffered
+generation would for that route, and SHALL fail where the buffered path fails.
+
+#### Scenario: Streaming does not silently answer from the base model
+- **WHEN** a route pins an adapter and the client sets `stream: true`
+- **THEN** the adapter is applied, or the request fails exactly as the buffered
+  request would — never answered by the unadapted model
+
 ### Requirement: Upstream work SHALL be admitted by a bounded gate, not the batch scheduler
 `openai:` bindings run on the `Network` lane, which SHALL have no batch
 scheduler. Every upstream path — buffered generation, streaming, and embeddings
@@ -655,6 +667,14 @@ refused rather than queued indefinitely.
 
 - **WHEN** an upstream request fails after acquiring a permit
 - **THEN** the permit is released and the capacity is immediately reusable
+
+#### Scenario: An abandoned stream releases its permit at once
+
+- **WHEN** a streaming client disconnects and the component drops its
+  `token-stream`
+- **THEN** the backend is told to stop and abandons the upstream response
+  instead of draining it to its terminator
+- **AND** the permit is released without waiting for the binding's timeout
 
 #### Scenario: The network lane reports its admission backlog
 
@@ -903,6 +923,21 @@ sealed-alias scope and accelerator-handle checks as the buffered `compute`.
 - **WHEN** it calls `compute-stream` and pulls with `next`
 - **THEN** the host yields decoded fragments as they are produced
 - **AND** `next` returns `none` once generation completes
+
+### Requirement: A streaming generation reports why it stopped
+`token-stream` SHALL expose the generation's finish reason on the same terms as
+its token counts: available only after `next` has returned `none`, and absent
+rather than synthesised when the backend did not report one. A component SHALL
+give `length` and `content_filter` precedence over `tool_calls`.
+
+#### Scenario: A truncated stream does not report `stop`
+- **WHEN** an upstream ends a streamed generation with `finish_reason: "length"`
+- **THEN** that reason reaches the component and the choice reports `length`
+
+#### Scenario: A tool call truncated at the token limit reports `length`
+- **WHEN** a generation returns both a tool call and a `length` finish reason
+- **THEN** the choice reports `length`, not `tool_calls`, so the client is not
+  invited to dispatch incomplete arguments
 
 ### Requirement: The accelerator carries tool calls and failures as typed data
 `tachyon:accelerator/cpu` SHALL carry structured tool calls as a `tool-call`

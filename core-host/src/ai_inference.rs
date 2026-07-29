@@ -470,6 +470,50 @@ pub(crate) enum StreamEvent<'a> {
     ToolCall(ToolCall),
 }
 
+/// What a sink tells the backend to do after an event.
+///
+/// `Stop` is how a disconnected client reaches the backend. Without it the sink
+/// can only drop what it is handed, and the generation runs to completion for
+/// nobody: on the upstream path that is a socket, a thread and — since upstream
+/// work is admitted by permit — a slice of the node's outbound capacity held
+/// for up to the binding's timeout. A handful of abandoned streams would then
+/// starve live requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamControl {
+    Continue,
+    Stop,
+}
+
+impl StreamControl {
+    fn is_stop(self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
+/// What a streaming generation reports once it ends.
+///
+/// Both fields are known only at the end — the counts because decoding has to
+/// finish, the reason because it is the *last* thing an upstream sends — so
+/// they come back beside the event stream rather than through it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamOutcome {
+    pub(crate) usage: Option<TokenUsage>,
+    /// Why generation stopped, when the backend knows. Absent means "not
+    /// reported"; it is never synthesised, because `stop` for a completion the
+    /// upstream truncated at its token limit is exactly the report that makes a
+    /// client run half a function.
+    pub(crate) finish_reason: Option<String>,
+}
+
+impl StreamOutcome {
+    fn usage(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            finish_reason: None,
+        }
+    }
+}
+
 /// A failed generation, with the remote status when the failure came from one.
 ///
 /// The status is what makes a relay honest. Collapsed into a string, a
@@ -632,8 +676,8 @@ trait BackendModel: Send + Sync {
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
-        sink: &mut dyn FnMut(StreamEvent<'_>),
-    ) -> Result<Option<TokenUsage>> {
+        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+    ) -> Result<StreamOutcome> {
         let mut outputs = self.execute(inputs)?;
         if outputs.len() != 1 {
             bail!(
@@ -643,16 +687,41 @@ trait BackendModel: Send + Sync {
             );
         }
         let output = outputs.remove(0);
-        let usage = output.usage;
         let text = String::from_utf8(output.bytes)
             .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
-        if !text.is_empty() {
-            sink(StreamEvent::Content(&text));
+        // Nothing to cancel: this fallback has already produced the whole
+        // generation before the first event, so `Stop` only stops the emitting.
+        let mut stopped = text.is_empty();
+        if !stopped {
+            stopped = sink(StreamEvent::Content(&text)).is_stop();
         }
         for call in output.tool_calls {
-            sink(StreamEvent::ToolCall(call));
+            if stopped {
+                break;
+            }
+            stopped = sink(StreamEvent::ToolCall(call)).is_stop();
         }
-        Ok(usage)
+        Ok(StreamOutcome {
+            usage: output.usage,
+            finish_reason: output.finish_reason,
+        })
+    }
+
+    /// `stream_text`, with a resolved LoRA adapter applied. The default refuses
+    /// rather than silently streaming the base model: a route that pins an
+    /// adapter is asking for a specific tenant's behaviour, and answering with
+    /// the unadapted model would be wrong in a way nothing downstream can see.
+    fn stream_text_with_adapter(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapter: &ResolvedLoraAdapter,
+        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+    ) -> Result<StreamOutcome> {
+        let _ = (inputs, sink);
+        bail!(
+            "LoRA adapter `{}` was resolved, but this backend does not support adapter injection",
+            adapter.id
+        )
     }
 
     fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
@@ -1090,8 +1159,15 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         prompt: &str,
-        sink: &mut dyn FnMut(StreamEvent<'_>),
-    ) -> Result<Option<TokenUsage>, GenerationError> {
+        adapter_id: Option<&str>,
+        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+    ) -> Result<StreamOutcome, GenerationError> {
+        // Resolved exactly as on the buffered path. Ignoring the route's
+        // adapter here made `stream: true` silently run the *base* model while
+        // the otherwise identical buffered request ran the tenant's — the same
+        // request answered by two different models depending on a transport
+        // flag, which is the one outcome a per-tenant adapter must never have.
+        let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
         self.ensure_model_loaded(alias)?;
         let model = {
             let models = self.models.read().expect("model registry lock poisoned");
@@ -1116,10 +1192,13 @@ impl AiInferenceRuntime {
         let _permit = (model.accelerator == AcceleratorKind::Network)
             .then(|| self.upstream_admission.acquire())
             .transpose()?;
-        model
-            .backend_model
-            .stream_text(&[input], sink)
-            .map_err(|error| GenerationError::from_anyhow(&error))
+        match adapter {
+            Some(adapter) => model
+                .backend_model
+                .stream_text_with_adapter(&[input], &adapter, sink),
+            None => model.backend_model.stream_text(&[input], sink),
+        }
+        .map_err(|error| GenerationError::from_anyhow(&error))
     }
 
     fn scheduler_for(&self, accelerator: AcceleratorKind) -> Option<AcceleratorScheduler> {
@@ -2523,6 +2602,49 @@ impl BackendModel for CandleBackendModel {
         }
     }
 
+    fn stream_text_with_adapter(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapter: &ResolvedLoraAdapter,
+        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+    ) -> Result<StreamOutcome> {
+        // Only the safetensors text-generation runtime can inject an adapter.
+        // Every other kind — GGUF, upstream, NVFP4, MoE, mock — refuses rather
+        // than quietly streaming the base model, which is exactly what the
+        // buffered path already does for them. Refusing is the point: a route
+        // that pins a tenant's adapter must never be answered by the base
+        // model, and a `stream: true` request that silently was would be
+        // invisible to the caller.
+        let CandleBackendModelKind::TextGeneration {
+            target,
+            speculative: None,
+        } = &self.kind
+        else {
+            bail!(
+                "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
+                adapter.id,
+                self.source.alias
+            );
+        };
+        validate_u8_prompts(&self.source.alias, inputs)?;
+        let prompts = inputs
+            .iter()
+            .map(|input| input.data.as_ref())
+            .collect::<Vec<_>>();
+        let on_token: &mut dyn FnMut(&str) -> StreamControl =
+            &mut |fragment: &str| sink(StreamEvent::Content(fragment));
+        target
+            .generate_with_adapter_streaming(&prompts, &adapter.id, &adapter.path, on_token)
+            .map(|usage| StreamOutcome::usage(Some(usage)))
+            .map_err(|error| {
+                anyhow!(
+                    "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                    self.source.alias,
+                    target.root().display()
+                )
+            })
+    }
+
     fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
         if !matches!(input.ty, TensorType::U8) {
             bail!(
@@ -2584,8 +2706,8 @@ impl BackendModel for CandleBackendModel {
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
-        sink: &mut dyn FnMut(StreamEvent<'_>),
-    ) -> Result<Option<TokenUsage>> {
+        sink: &mut dyn FnMut(StreamEvent<'_>) -> StreamControl,
+    ) -> Result<StreamOutcome> {
         // The upstream backend is the only one that writes to the `ToolCall`
         // arm — it receives calls already structured — so it takes the sink
         // whole, before the text adapter borrows it.
@@ -2608,7 +2730,13 @@ impl BackendModel for CandleBackendModel {
         // envelope from a chat template is *part of* that text, and recognising
         // it needs the template the caller resolved, not the decode loop. They
         // therefore keep a plain `&str` callback, adapted here.
-        let on_token = &mut |fragment: &str| sink(StreamEvent::Content(fragment));
+        let on_token: &mut dyn FnMut(&str) -> StreamControl =
+            &mut |fragment: &str| sink(StreamEvent::Content(fragment));
+        // Local backends report no finish reason of their own: the decode loop
+        // ends on EOS, a stop sequence, the token budget, or the deadline, and
+        // which of those it was is the caller's to infer — exactly as on the
+        // buffered path, where `InferenceOutput::finish_reason` is also `None`.
+        let outcome = |usage: TokenUsage| StreamOutcome::usage(Some(usage));
         match &self.kind {
             CandleBackendModelKind::Upstream(_) => unreachable!("handled above"),
             CandleBackendModelKind::ModelOptNvfp4(runtime) => {
@@ -2619,7 +2747,7 @@ impl BackendModel for CandleBackendModel {
                     .collect::<Vec<_>>();
                 runtime
                     .generate_streaming(&prompts, on_token)
-                    .map(Some)
+                    .map(outcome)
                     .map_err(|error| {
                         anyhow!(
                             "Candle LLM model `{}` loaded from `{}` failed: {error}",
@@ -2646,7 +2774,7 @@ impl BackendModel for CandleBackendModel {
                     ),
                     None => target.generate_streaming(&prompts, on_token),
                 }
-                .map(Some)
+                .map(outcome)
                 .map_err(|error| {
                     anyhow!(
                         "Candle LLM model `{}` loaded from `{}` failed: {error}",
@@ -2663,7 +2791,7 @@ impl BackendModel for CandleBackendModel {
                     .collect::<Vec<_>>();
                 runtime
                     .generate_streaming(&prompts, on_token)
-                    .map(Some)
+                    .map(outcome)
                     .map_err(|error| {
                         anyhow!(
                             "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
@@ -2703,7 +2831,7 @@ impl BackendModel for CandleBackendModel {
                 // obviously synthetic — enough for the end-to-end test to prove
                 // the numbers reach the client, without pretending to be a real
                 // tokenization.
-                Ok(Some(mock_token_usage(inputs, &text)))
+                Ok(StreamOutcome::usage(Some(mock_token_usage(inputs, &text))))
             }
             CandleBackendModelKind::Vendor(_) => {
                 let outputs = self.execute(inputs)?;
@@ -2719,7 +2847,7 @@ impl BackendModel for CandleBackendModel {
                 on_token(&text);
                 // A vendor runner returns text over a pipe and never reports
                 // token counts, so there is nothing honest to publish.
-                Ok(None)
+                Ok(StreamOutcome::default())
             }
         }
     }
@@ -4291,11 +4419,12 @@ mod tests {
         let mut streamed = String::new();
         let mut fragments = 0usize;
         runtime
-            .stream_component_prompt("tiny", "hello", &mut |event| {
+            .stream_component_prompt("tiny", "hello", None, &mut |event| {
                 if let StreamEvent::Content(delta) = event {
                     streamed.push_str(delta);
                     fragments += 1;
                 }
+                StreamControl::Continue
             })
             .expect("streamed generation");
         assert_eq!(

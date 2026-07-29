@@ -49,6 +49,7 @@ use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::samplers::{FsmCache, FsmLogitProcessor};
 use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
 use super::ResolvedLoraAdapter;
+use super::StreamControl;
 use parallel_topology::{
     validate_parallel_topology, ClusterTopology, ParallelExecutionPlan, ParallelStrategy,
 };
@@ -536,7 +537,7 @@ pub(crate) struct TokenUsage {
 /// every one of them by construction, instead of correct at whichever ones
 /// were remembered.
 struct TokenSink<'a> {
-    emit: &'a mut dyn FnMut(&str),
+    emit: &'a mut dyn FnMut(&str) -> StreamControl,
     /// Tokens appended to the sequence so far. Not the number of `emit` calls:
     /// a token can produce no text (its bytes complete a character only once a
     /// later token arrives), and text is held back while a stop sequence might
@@ -546,14 +547,19 @@ struct TokenSink<'a> {
     /// tokenized it — a fallback (speculative decode declining its draft, say)
     /// re-enters a different loop with the same prompt.
     prompt_tokens: usize,
+    /// Latched once the consumer asked to stop — a disconnected SSE client.
+    /// Latched rather than re-read because the answer cannot un-become "nobody
+    /// is listening", and the decode loops check it beside the deadline.
+    stopped: bool,
 }
 
 impl<'a> TokenSink<'a> {
-    fn new(emit: &'a mut dyn FnMut(&str)) -> Self {
+    fn new(emit: &'a mut dyn FnMut(&str) -> StreamControl) -> Self {
         Self {
             emit,
             completion_tokens: 0,
             prompt_tokens: 0,
+            stopped: false,
         }
     }
 
@@ -569,7 +575,17 @@ impl<'a> TokenSink<'a> {
     }
 
     fn emit(&mut self, text: &str) {
-        (self.emit)(text);
+        if (self.emit)(text).is_stop() {
+            self.stopped = true;
+        }
+    }
+
+    /// Whether the consumer has gone away. Checked where the deadline is, and
+    /// for the same reason: finishing a generation nobody will read spends a
+    /// scheduler slot, and on the upstream path an admission permit, for
+    /// nothing.
+    fn stopped(&self) -> bool {
+        self.stopped
     }
 
     /// Record one token appended to the generated sequence.
@@ -2926,7 +2942,12 @@ impl CandleLlmRuntime {
         prompts: &[&[u8]],
     ) -> Result<(Vec<u8>, TokenUsage), CandleLlmError> {
         let mut out = String::new();
-        let usage = self.generate_streaming(prompts, &mut |delta| out.push_str(delta))?;
+        // A buffered caller never goes away mid-generation: it is holding the
+        // call. `Continue` is the only honest answer here.
+        let usage = self.generate_streaming(prompts, &mut |delta| {
+            out.push_str(delta);
+            StreamControl::Continue
+        })?;
         Ok((out.into_bytes(), usage))
     }
 
@@ -2941,7 +2962,10 @@ impl CandleLlmRuntime {
             prompts,
             adapter_id,
             adapter_path,
-            &mut |delta| out.push_str(delta),
+            &mut |delta| {
+                out.push_str(delta);
+                StreamControl::Continue
+            },
         )?;
         Ok((out.into_bytes(), usage))
     }
@@ -3231,7 +3255,8 @@ impl CandleLlmRuntime {
         let mut out = String::new();
         let usage =
             self.generate_speculative_streaming(prompts, draft, draft_tokens, &mut |delta| {
-                out.push_str(delta)
+                out.push_str(delta);
+                StreamControl::Continue
             })?;
         Ok((out.into_bytes(), usage))
     }
@@ -3252,7 +3277,7 @@ impl CandleLlmRuntime {
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
     ) -> Result<TokenUsage, CandleLlmError> {
         let mut sink = TokenSink::new(on_token);
         self.stream_into(prompts, &mut sink)?;
@@ -3264,19 +3289,19 @@ impl CandleLlmRuntime {
         prompts: &[&[u8]],
         draft: &Self,
         draft_tokens: usize,
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
     ) -> Result<TokenUsage, CandleLlmError> {
         let mut sink = TokenSink::new(on_token);
         self.stream_speculative_into(prompts, draft, draft_tokens, &mut sink)?;
         Ok(sink.usage())
     }
 
-    fn generate_with_adapter_streaming(
+    pub(crate) fn generate_with_adapter_streaming(
         &self,
         prompts: &[&[u8]],
         adapter_id: &str,
         adapter_path: &Path,
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
     ) -> Result<TokenUsage, CandleLlmError> {
         let mut sink = TokenSink::new(on_token);
         self.stream_with_adapter_into(prompts, adapter_id, adapter_path, &mut sink)?;
@@ -3835,6 +3860,18 @@ impl CandleLlmRuntime {
                 })?;
             index_pos += chunk_len;
             logits = Some(next_logits);
+            // Between chunks, exactly as the single-sequence and prefix-cache
+            // prefills do. A batch shares one forward pass, so it can only be
+            // abandoned when *every* row is out of time — but without this
+            // check a batch whose rows all expired still ran the whole prompt
+            // forward pass for each of them before the per-row decode check
+            // could retire a single one.
+            let now = Instant::now();
+            if index_pos < prompt_len && requests.iter().all(|request| now >= request.deadline) {
+                return Err(self.execution_error(format!(
+                    "generation deadline elapsed after prefilling {index_pos} of {prompt_len} prompt tokens"
+                )));
+            }
         }
         let mut logits = logits.ok_or_else(|| {
             self.execution_error("batch-native LoRA prompt produced no prefill logits".to_owned())
@@ -4058,6 +4095,11 @@ impl CandleLlmRuntime {
             // worth more to the caller than a failure, and the point is to free
             // the scheduler slot.
             if Instant::now() >= request.deadline {
+                break;
+            }
+            // Nobody left to read it. Same reasoning as the deadline: the slot
+            // is worth more than the remainder of an abandoned answer.
+            if sink.stopped() {
                 break;
             }
             let input = Tensor::new(&[next], device)
@@ -6738,7 +6780,10 @@ mod tests {
                 .expect("utf-8");
             let mut streamed = String::new();
             runtime
-                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .generate_streaming(&[request], &mut |delta| {
+                    streamed.push_str(delta);
+                    StreamControl::Continue
+                })
                 .expect("streamed");
             assert_eq!(streamed, buffered);
             let _ = fs::remove_dir_all(dir);
@@ -6852,7 +6897,10 @@ mod tests {
             assert_eq!(first, second, "internal KV cache must reset");
             let mut streamed = String::new();
             runtime
-                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .generate_streaming(&[request], &mut |delta| {
+                    streamed.push_str(delta);
+                    StreamControl::Continue
+                })
                 .expect("streamed");
             assert_eq!(streamed, first);
             assert_ne!(first.as_bytes(), b"MOCK_LLM_RESPONSE");
@@ -7019,7 +7067,10 @@ mod tests {
             assert_eq!(buffered, repeat);
             let mut streamed = String::new();
             runtime
-                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .generate_streaming(&[request], &mut |delta| {
+                    streamed.push_str(delta);
+                    StreamControl::Continue
+                })
                 .expect("streamed");
             assert_eq!(streamed, buffered);
             assert_ne!(buffered.as_bytes(), b"MOCK_LLM_RESPONSE");
@@ -7042,7 +7093,10 @@ mod tests {
         assert_eq!(buffered, repeat);
         let mut streamed = String::new();
         runtime
-            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("streamed");
         assert_eq!(streamed, buffered);
         assert_ne!(buffered.as_bytes(), b"MOCK_LLM_RESPONSE");
@@ -7334,7 +7388,10 @@ mod tests {
         let request = format!(r#"{{"prompt":"{prompt}","max_new_tokens":6}}"#);
         let mut streamed = String::new();
         let usage = runtime
-            .generate_streaming(&[request.as_bytes()], &mut |delta| streamed.push_str(delta))
+            .generate_streaming(&[request.as_bytes()], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("generation should run");
 
         // `prompt_tokens` is the tokenizer's own encoding, not an estimate.
@@ -7371,7 +7428,10 @@ mod tests {
         let (buffered, buffered_usage) = runtime.generate(&[request]).expect("buffered");
         let mut streamed = String::new();
         let streamed_usage = runtime
-            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("streaming");
 
         assert_eq!(String::from_utf8(buffered).expect("utf-8"), streamed);
@@ -7389,7 +7449,7 @@ mod tests {
         let usage = runtime
             .generate_streaming(
                 &[br#"{"prompt":"hello","max_new_tokens":1}"#],
-                &mut |_delta| {},
+                &mut |_delta| StreamControl::Continue,
             )
             .expect("generation should run");
         assert_eq!(usage.completion_tokens, 1);
@@ -8019,7 +8079,10 @@ mod tests {
             String::from_utf8(runtime.generate(&[request]).expect("buffered").0).expect("utf-8");
         let mut streamed = String::new();
         runtime
-            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("streamed");
         assert_eq!(
             streamed, buffered,
@@ -8046,7 +8109,8 @@ mod tests {
         let mut streamed = String::new();
         target
             .generate_speculative_streaming(&[request], &draft, 3, &mut |delta| {
-                streamed.push_str(delta)
+                streamed.push_str(delta);
+                StreamControl::Continue
             })
             .expect("speculative streaming");
         assert_eq!(streamed.into_bytes(), greedy);
@@ -8241,10 +8305,28 @@ mod tests {
 
     #[cfg(feature = "candle-metal")]
     #[test]
-    fn metal_accepts_block_types_cuda_cannot_multiply() {
-        // Metal's quantized backend covers every GGML type, so the CUDA-only
-        // block-type scan must not be applied to it.
+    fn metal_rejects_block_types_it_cannot_multiply() {
+        // The scan is per device, not CUDA-only. Metal has mat-vec kernels for
+        // `Q8_1`/`Q8K` but no mat-mat and no `get_rows`, so prefill and the
+        // embedding lookup fail — which is why `supports_qmatmul` answers `true`
+        // for these two only on the host. Loading anyway would claim VRAM and
+        // then fail on the first forward pass.
         let content = gguf_header_with_dtypes(&[("blk.0.ffn_down.weight", GgmlDType::Q8K)]);
+        let error = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "metal")
+            .expect_err("a Q8K tensor must be refused before any VRAM is claimed");
+        let message = error.to_string();
+        assert!(
+            message.contains("blk.0.ffn_down.weight") && message.contains("Q8K"),
+            "the error must name the tensor and its block type, got: {message}"
+        );
+    }
+
+    #[cfg(feature = "candle-metal")]
+    #[test]
+    fn metal_accepts_the_k_quants_it_can_multiply() {
+        // The counterpart: the rejection is specific to the two block types
+        // Metal genuinely cannot run, not a blanket refusal of the lane.
+        let content = gguf_header_with_dtypes(&[("blk.0.ffn_down.weight", GgmlDType::Q4K)]);
         assert!(
             resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "metal").is_ok()
         );
@@ -8731,7 +8813,10 @@ mod tests {
         // rather than dropping it — they are compiled only in this build.
         let mut streamed = String::new();
         let usage = runtime
-            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("streaming generation must run on the cuda device");
         assert_eq!(
             usage.prompt_tokens as usize,

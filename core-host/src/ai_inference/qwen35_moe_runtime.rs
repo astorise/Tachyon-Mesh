@@ -24,6 +24,7 @@ use super::{
         Nvfp4KernelSelectionMode, Nvfp4OutputDType, PreparedLinear, SafetensorsDType,
         NVFP4_BLOCK_SIZE,
     },
+    StreamControl,
 };
 use primitives::{
     full_attention_step, gated_delta_step, rms_norm_qwen, sparse_moe_forward, HybridDecodeState,
@@ -568,14 +569,18 @@ impl Qwen35MoeRuntime {
 
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<(Vec<u8>, TokenUsage)> {
         let mut output = String::new();
-        let usage = self.generate_streaming(prompts, &mut |delta| output.push_str(delta))?;
+        // A buffered caller is holding the call and cannot go away mid-decode.
+        let usage = self.generate_streaming(prompts, &mut |delta| {
+            output.push_str(delta);
+            StreamControl::Continue
+        })?;
         Ok((output.into_bytes(), usage))
     }
 
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
     ) -> Result<TokenUsage> {
         if prompts.len() != 1 {
             bail!("Qwen 3.5 MoE runtime currently accepts exactly one prompt per decode");
@@ -619,11 +624,17 @@ impl Qwen35MoeRuntime {
             LogitsProcessor::from_sampling(request.seed.unwrap_or(299_792_458), sampling);
         let mut generated = Vec::<u32>::new();
         let mut emitted = 0usize;
+        let mut abandoned = false;
         for step in 0..request.max_new_tokens {
             // Elapsed budget stops generation the way an exhausted token budget
             // does, rather than failing: freeing the scheduler slot is the
             // point, and a partial answer beats an error.
             if Instant::now() >= request.deadline {
+                break;
+            }
+            // Same reasoning for a consumer that went away: finishing an
+            // answer nobody will read only occupies the slot.
+            if abandoned {
                 break;
             }
             let tensor = Tensor::from_vec(logits, self.config.vocab_size, &Device::Cpu)?;
@@ -643,7 +654,7 @@ impl Qwen35MoeRuntime {
                 .min();
             let safe_end = stop.unwrap_or(text.len());
             if emitted < safe_end {
-                on_token(&text[emitted..safe_end]);
+                abandoned = on_token(&text[emitted..safe_end]).is_stop();
                 emitted = safe_end;
             }
             if stop.is_some() {
@@ -1252,7 +1263,10 @@ mod tests {
         let mut streamed = String::new();
         let decode_started = std::time::Instant::now();
         let streamed_usage = runtime
-            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("streaming generation");
         let decode_ms = decode_started.elapsed().as_millis();
 

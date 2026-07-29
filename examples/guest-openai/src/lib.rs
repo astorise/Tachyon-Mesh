@@ -593,23 +593,10 @@ fn handle_chat_completions_buffered(
             tool_calls: adopt_host_tool_calls(completed.tool_calls),
         }
     };
-    // A parsed tool call always wins — the caller must act on it — but
-    // otherwise the host's own reason takes precedence over the assumption
-    // that generation ended naturally. `length` in particular means the answer
-    // is truncated, and reporting it as `stop` is how a client comes to run
-    // half a function.
-    let finish_reason = if !parsed.tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        match completed.finish_reason.as_deref() {
-            Some("length") => "length",
-            Some("content_filter") => "content_filter",
-            Some("tool_calls") => "tool_calls",
-            // Anything else, including an absent reason, is an ordinary
-            // completion as far as the OpenAI schema is concerned.
-            _ => "stop",
-        }
-    };
+    let finish_reason = resolve_finish_reason(
+        completed.finish_reason.as_deref(),
+        !parsed.tool_calls.is_empty(),
+    );
 
     let response = ChatCompletionResponse {
         // Unconditional here, unlike the stream: a buffered response has no
@@ -765,7 +752,7 @@ fn handle_chat_completions_streaming(
 
     // Whatever the gate held back is parsed exactly like a buffered response,
     // so streamed and buffered requests recover the same tool calls.
-    let mut finish_reason = "stop";
+    //
     // Structured calls win over anything parsed out of the text, for the same
     // reason as on the buffered path: the backend received them as fields.
     let mut tool_calls = adopt_host_tool_calls(host_tool_calls);
@@ -829,8 +816,12 @@ fn handle_chat_completions_streaming(
         }
     }
 
+    // Read now rather than at the top: like `usage`, it is only known once the
+    // stream has ended, which the loop above has just observed.
+    let host_finish_reason = token_stream.finish_reason();
+    let finish_reason =
+        resolve_finish_reason(host_finish_reason.as_deref(), !tool_calls.is_empty());
     if !tool_calls.is_empty() {
-        finish_reason = "tool_calls";
         let deltas = tool_calls
             .into_iter()
             .enumerate()
@@ -1054,6 +1045,29 @@ fn adopt_host_tool_calls(
             },
         })
         .collect()
+}
+
+/// The `finish_reason` a choice reports, given what the host said and whether
+/// any tool call was recovered.
+///
+/// `length` outranks `tool_calls`, which is the one ordering that is not
+/// obvious. A model that runs out of budget *while emitting a call* returns
+/// both a partial `tool_calls` entry and `length`; reporting `tool_calls` there
+/// tells the client the call is ready and invites it to dispatch truncated
+/// arguments — a half-written path, a half-written patch. `length` tells it the
+/// truth, and a client that checks the reason before dispatching is protected.
+/// `content_filter` outranks it for the same reason: the answer is not the
+/// model's own.
+fn resolve_finish_reason(host_reported: Option<&str>, has_tool_calls: bool) -> &'static str {
+    match host_reported {
+        Some("length") => "length",
+        Some("content_filter") => "content_filter",
+        _ if has_tool_calls => "tool_calls",
+        Some("tool_calls") => "tool_calls",
+        // Anything else, including an absent reason, is an ordinary completion
+        // as far as the OpenAI schema is concerned.
+        _ => "stop",
+    }
 }
 
 fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> ParsedAssistantOutput {
@@ -1817,6 +1831,30 @@ mod tests {
             arguments: "{}".to_owned(),
         }]);
         assert_eq!(calls[0].id, "call_tachyon_0");
+    }
+
+    #[test]
+    fn a_truncated_tool_call_reports_length_not_tool_calls() {
+        // The dangerous case: the upstream ran out of budget mid-call, so the
+        // arguments are incomplete. Reporting `tool_calls` tells the client the
+        // call is ready to dispatch.
+        assert_eq!(resolve_finish_reason(Some("length"), true), "length");
+        assert_eq!(
+            resolve_finish_reason(Some("content_filter"), true),
+            "content_filter"
+        );
+        // A complete call still reports `tool_calls`, whether the host named it
+        // or the parser recovered it from the text.
+        assert_eq!(resolve_finish_reason(Some("stop"), true), "tool_calls");
+        assert_eq!(resolve_finish_reason(None, true), "tool_calls");
+        assert_eq!(
+            resolve_finish_reason(Some("tool_calls"), false),
+            "tool_calls"
+        );
+        // And an ordinary completion is `stop`, including when nothing was
+        // reported at all.
+        assert_eq!(resolve_finish_reason(None, false), "stop");
+        assert_eq!(resolve_finish_reason(Some("length"), false), "length");
     }
 
     #[test]

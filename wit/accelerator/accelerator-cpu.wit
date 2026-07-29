@@ -1,4 +1,11 @@
-package tachyon:accelerator@1.2.0;
+// Major, not minor, because `compute`, `embed`, `compute-stream` and
+// `token-stream.next` all changed shape: their error type became
+// `generation-error`, and `next` now yields a `stream-event` rather than a
+// string. Wasmtime resolves an import by semver *compatible* name, so shipping
+// this as 1.2.0 would have let a component built against 1.1.0 bind to it and
+// then fail instantiation with a structural type mismatch. A major bump makes
+// the break a clean unsatisfied import instead.
+package tachyon:accelerator@2.0.0;
 
 interface cpu {
     /// Token counts for one generation, in the shape OpenAI's `usage` object
@@ -70,6 +77,12 @@ interface cpu {
         /// so a caller omits `usage` rather than publishing zeros as if they
         /// were measured.
         usage: func() -> option<token-usage>;
+        /// Why generation stopped, on the same terms as `generation.finish-reason`
+        /// and with the same availability rule as `usage`: known only once
+        /// `next` has returned `none`. Without it a streamed completion that hit
+        /// the upstream's token limit is indistinguishable from one that
+        /// finished, and a caller reports `stop` for truncated code.
+        finish-reason: func() -> option<string>;
     }
 
     /// A completed buffered generation: the decoded text, and the token counts
