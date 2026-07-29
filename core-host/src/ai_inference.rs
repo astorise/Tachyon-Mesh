@@ -278,6 +278,12 @@ impl SharedInputTensor {
 pub(crate) struct InferenceOutput {
     pub(crate) bytes: Vec<u8>,
     pub(crate) usage: Option<TokenUsage>,
+    /// Why generation stopped, when the backend knows. `None` means "not
+    /// reported": the caller then infers one rather than being handed `stop`
+    /// for a completion the upstream actually truncated at its token limit,
+    /// which is the difference between running generated code and rejecting
+    /// it.
+    pub(crate) finish_reason: Option<String>,
 }
 
 impl InferenceOutput {
@@ -285,6 +291,7 @@ impl InferenceOutput {
         Self {
             bytes,
             usage: Some(usage),
+            finish_reason: None,
         }
     }
 }
@@ -294,7 +301,11 @@ impl InferenceOutput {
 /// instead of a silent default.
 impl From<Vec<u8>> for InferenceOutput {
     fn from(bytes: Vec<u8>) -> Self {
-        Self { bytes, usage: None }
+        Self {
+            bytes,
+            usage: None,
+            finish_reason: None,
+        }
     }
 }
 
@@ -715,7 +726,7 @@ impl AiInferenceRuntime {
         prompt: &str,
     ) -> Result<String, String> {
         self.compute_component_prompt_with_adapter(alias, prompt, None)
-            .map(|(text, _usage)| text)
+            .map(|(text, _usage, _reason)| text)
     }
 
     pub(crate) fn compute_component_prompt_with_adapter(
@@ -723,7 +734,7 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
         adapter_id: Option<&str>,
-    ) -> Result<(String, Option<TokenUsage>), String> {
+    ) -> Result<(String, Option<TokenUsage>, Option<String>), String> {
         let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
         self.ensure_model_loaded(alias)?;
         // Clone the `Arc` out and drop the read lock before inference so a slow
@@ -754,7 +765,7 @@ impl AiInferenceRuntime {
             )
             .map_err(|error| error.to_string())?;
         let text = String::from_utf8(output.bytes).map_err(|error| error.to_string())?;
-        Ok((text, output.usage))
+        Ok((text, output.usage, output.finish_reason))
     }
 
     pub(crate) fn embed_component_input(
@@ -2157,7 +2168,11 @@ impl BackendModel for CandleBackendModel {
                             )),
                             Ok(handle) => match handle.join() {
                                 Ok(result) => result
-                                    .map(|(bytes, usage)| InferenceOutput { bytes, usage })
+                                    .map(|(bytes, usage, finish_reason)| InferenceOutput {
+                                bytes,
+                                usage,
+                                finish_reason,
+                            })
                                     .map_err(anyhow::Error::from),
                                 Err(_) => Err(anyhow!(
                                     "upstream request thread for model `{alias}` panicked"

@@ -319,7 +319,8 @@ impl ComponentHostState {
         expected_accelerator: ai_inference::AcceleratorKind,
         model_id: u32,
         prompt: String,
-    ) -> std::result::Result<(String, Option<ai_inference::TokenUsage>), String> {
+    ) -> std::result::Result<(String, Option<ai_inference::TokenUsage>, Option<String>), String>
+    {
         let loaded = self
             .accelerator_models
             .get(&model_id)
@@ -1963,9 +1964,15 @@ pub(crate) struct StreamedGeneration {
 #[cfg(feature = "ai-inference")]
 pub(crate) struct HostTokenStream {
     receiver: std::sync::mpsc::Receiver<std::result::Result<String, String>>,
-    /// Filled by the generation thread once decoding ends, so it only reads
-    /// back as `Some` after `next` has returned `none`.
     usage: Arc<Mutex<Option<ai_inference::TokenUsage>>>,
+    /// Whether `next` has reported the end of the stream to this caller.
+    ///
+    /// The generation thread can finish while fragments are still queued, so
+    /// the slot alone is not the contract the WIT promises: a caller polling
+    /// `usage()` as its completion signal would see `Some` with decoded text
+    /// still unread, stop reading, and truncate the response. Counts are
+    /// withheld until the caller has actually observed EOF.
+    saw_eof: bool,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -1976,7 +1983,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
-            .map(|(text, _usage)| text)
+            .map(|(text, _usage, _reason)| text)
     }
 
     fn compute_detailed(
@@ -1987,11 +1994,12 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         accelerator_component_bindings::tachyon::accelerator::cpu::Generation,
         String,
     > {
-        let (text, usage) =
+        let (text, usage, finish_reason) =
             self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)?;
         Ok(
             accelerator_component_bindings::tachyon::accelerator::cpu::Generation {
                 text,
+                finish_reason,
                 usage: usage.map(|usage| {
                     accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
                         prompt_tokens: usage.prompt_tokens,
@@ -2020,7 +2028,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
             self.stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)?;
         let handle = self
             .table
-            .push(HostTokenStream { receiver, usage })
+            .push(HostTokenStream {
+                receiver,
+                usage,
+                saw_eof: false,
+            })
             .map_err(|error| format!("failed to register token stream resource: {error}"))?;
         Ok(wasmtime::component::Resource::new_own(handle.rep()))
     }
@@ -2039,14 +2051,17 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
         let stream = self
             .table
-            .get(&handle)
+            .get_mut(&handle)
             .map_err(|error| format!("failed to access token stream resource: {error}"))?;
         // `recv` blocks until the next fragment; a disconnected channel means the
         // generation thread finished, so the stream is complete.
         match stream.receiver.recv() {
             Ok(Ok(fragment)) => Ok(Some(fragment)),
             Ok(Err(error)) => Err(error),
-            Err(_) => Ok(None),
+            Err(_) => {
+                stream.saw_eof = true;
+                Ok(None)
+            }
         }
     }
 
@@ -2058,6 +2073,9 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
     ) -> Option<accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage> {
         let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
         let stream = self.table.get(&handle).ok()?;
+        if !stream.saw_eof {
+            return None;
+        }
         let reported = (*stream.usage.lock().ok()?)?;
         Some(
             accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
@@ -2089,7 +2107,7 @@ impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Gpu, model_id, prompt)
-            .map(|(text, _usage)| text)
+            .map(|(text, _usage, _reason)| text)
     }
 }
 
@@ -2101,7 +2119,7 @@ impl accelerator_component_bindings::tachyon::accelerator::npu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Npu, model_id, prompt)
-            .map(|(text, _usage)| text)
+            .map(|(text, _usage, _reason)| text)
     }
 }
 
@@ -2113,7 +2131,7 @@ impl accelerator_component_bindings::tachyon::accelerator::tpu::Host for Compone
 
     fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
         self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Tpu, model_id, prompt)
-            .map(|(text, _usage)| text)
+            .map(|(text, _usage, _reason)| text)
     }
 }
 

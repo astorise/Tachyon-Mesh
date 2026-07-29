@@ -1865,6 +1865,9 @@ impl SamplingPolicy {
 struct ParsedGenerationRequest {
     prompt: String,
     max_new_tokens: usize,
+    /// What the caller actually asked for, or `None` when it named no budget.
+    /// Only an explicit request is refused when it cannot fit the window.
+    requested_max_new_tokens: Option<usize>,
     sampling: SamplingPolicy,
     stop: Vec<String>,
     /// Compiled grammar for constrained decoding, when the request supplied
@@ -3871,19 +3874,18 @@ impl CandleLlmRuntime {
             .map(|request| request.max_new_tokens)
             .max()
             .unwrap_or(0);
-        // The earliest deadline in the batch wins. Rows share a forward pass,
-        // so honouring a later one would keep a caller waiting past the budget
-        // it asked for; stopping at the earliest is the only bound that holds
-        // for every row.
-        let batch_deadline = requests
-            .iter()
-            .map(|request| request.deadline)
-            .min()
-            .unwrap_or_else(|| Instant::now() + DEFAULT_GENERATION_DEADLINE);
-
         for step in 0..max_new_tokens {
             for row in 0..batch {
                 if done[row] || generated[row].len() >= requests[row].max_new_tokens {
+                    done[row] = true;
+                    continue;
+                }
+                // Each row against its own budget. Taking the batch minimum
+                // let a 1 ms request truncate a 300 s one co-batched with it —
+                // and retiring a row early is already a solved problem here:
+                // `done` stops sampling it and feeds a placeholder token so the
+                // remaining rows keep their shared forward pass.
+                if Instant::now() >= requests[row].deadline {
                     done[row] = true;
                     continue;
                 }
@@ -3921,12 +3923,9 @@ impl CandleLlmRuntime {
                 }
             }
 
-            // One deadline governs the whole batch: the rows share a forward
-            // pass, so they cannot stop independently on time.
-            if done.iter().all(|done| *done)
-                || step + 1 == max_new_tokens
-                || Instant::now() >= batch_deadline
-            {
+            // The batch ends when every row has retired — on its own budget,
+            // its own stop sequence, or its own token limit.
+            if done.iter().all(|done| *done) || step + 1 == max_new_tokens {
                 break;
             }
             if prompt_len + step + 1 > self.limits.max_position_embeddings {
@@ -4360,7 +4359,7 @@ impl CandleLlmRuntime {
             detail: format!("prompt tensor must be valid UTF-8: {error}"),
         })?;
 
-        let request = if raw.trim_start().starts_with('{') {
+        let mut request = if raw.trim_start().starts_with('{') {
             let request = serde_json::from_str::<GenerationRequest>(raw).map_err(|error| {
                 CandleLlmError::InvalidRequest {
                     alias: self.alias.clone(),
@@ -4390,6 +4389,11 @@ impl CandleLlmRuntime {
             };
             ParsedGenerationRequest {
                 prompt,
+                // `None` is recorded, not resolved: the default is clamped to
+                // the context window once the prompt length is known, while an
+                // explicitly requested budget that cannot fit is an error the
+                // caller should hear about rather than a silent truncation.
+                requested_max_new_tokens: request.max_new_tokens,
                 max_new_tokens: request
                     .max_new_tokens
                     .unwrap_or(self.limits.default_max_new_tokens),
@@ -4401,6 +4405,7 @@ impl CandleLlmRuntime {
         } else {
             ParsedGenerationRequest {
                 prompt: raw.to_owned(),
+                requested_max_new_tokens: None,
                 max_new_tokens: self.limits.default_max_new_tokens,
                 sampling: resolve_sampling(None, None, None),
                 stop: Vec::new(),
@@ -4437,6 +4442,35 @@ impl CandleLlmRuntime {
                     self.limits.max_position_embeddings
                 ),
             });
+        }
+        // The prompt budget reserves generation headroom proportionally (see
+        // `prompt_limits_for`), which is the right default but is not the same
+        // as *this* request's budget: an 8k-context checkpoint reserves 2k and
+        // still admits a 6k prompt, so a request asking for the 4k maximum
+        // reaches the context boundary about halfway through and returns a
+        // silently truncated answer.
+        //
+        // The two cases differ. A caller that named a budget has an
+        // expectation to violate, so an impossible one is a request error. A
+        // caller that named none has no expectation, so the default is clamped
+        // to what the window can actually deliver.
+        let headroom = self
+            .limits
+            .max_position_embeddings
+            .saturating_sub(encoded.len());
+        match request.requested_max_new_tokens {
+            Some(requested) if requested > headroom => {
+                return Err(CandleLlmError::InvalidRequest {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "prompt tokens {} plus max_new_tokens {requested} exceed the {}-token context window; lower max_new_tokens to at most {headroom}",
+                        encoded.len(),
+                        self.limits.max_position_embeddings,
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => request.max_new_tokens = request.max_new_tokens.min(headroom.max(1)),
         }
 
         Ok(request)
@@ -7091,7 +7125,7 @@ mod tests {
         // way an exhausted token budget does, not fail. Freeing the scheduler
         // slot is the point; a partial answer still beats an error.
         let bytes = runtime
-            .generate(&[br#"{"prompt":"hello","max_new_tokens":64,"max_generation_ms":1}"#])
+            .generate(&[br#"{"prompt":"hello","max_new_tokens":16,"max_generation_ms":1}"#])
             .expect("an expired deadline is not a request error")
             .0;
         assert!(
@@ -7191,6 +7225,49 @@ mod tests {
             bytes > 16_384,
             "an agentic prompt must no longer be capped at the old 16 KiB"
         );
+    }
+
+    #[test]
+    fn a_generation_budget_that_cannot_fit_the_window_is_refused() {
+        // The prompt budget reserves headroom proportionally, so a prompt can
+        // pass the byte/token caps and still leave less room than *this*
+        // request asked for. Before, the decode loop hit the context boundary
+        // partway through and returned a truncated answer with no signal.
+        let (runtime, dir) = load_fixture("budget-overrun");
+        let prompt = std::iter::repeat_n("hello", 8)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let request = serde_json::json!({
+            "prompt": prompt,
+            "max_new_tokens": FIXTURE_MAX_POSITION_EMBEDDINGS,
+        })
+        .to_string();
+        let error = runtime
+            .generate(&[request.as_bytes()])
+            .expect_err("an unsatisfiable budget must be refused, not truncated");
+        let error = error.to_string();
+        assert!(
+            error.contains("exceed the") && error.contains("context window"),
+            "the error should name the window, got: {error}"
+        );
+        assert!(
+            error.contains("lower max_new_tokens to at most"),
+            "the error should say what would fit, got: {error}"
+        );
+
+        // A caller that named no budget has no expectation to violate, so the
+        // default is clamped to what the window can deliver rather than
+        // refused — otherwise every short-context checkpoint would reject
+        // every default request.
+        let defaulted = serde_json::json!({ "prompt": "hello" }).to_string();
+        let (_bytes, usage) = runtime
+            .generate(&[defaulted.as_bytes()])
+            .expect("an unstated budget must be clamped, not refused");
+        assert!(
+            usage.completion_tokens as usize <= FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "clamped generation overran the window: {usage:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -7444,7 +7521,11 @@ mod tests {
             ..HardwareStrategy::default()
         };
         let (runtime, dir) = load_fixture_with_strategy("prefix-cache-fill", &strategy);
-        let prompt = std::iter::repeat_n("hello", PREFIX_CACHE_BLOCK_TOKENS * 2)
+        // One token short of two full blocks: the cache is still exercised
+        // across a block boundary, but the prompt leaves the room the
+        // requested single token needs. A window-filling prompt is now
+        // refused, because there is nowhere for the generation to go.
+        let prompt = std::iter::repeat_n("hello", PREFIX_CACHE_BLOCK_TOKENS * 2 - 1)
             .collect::<Vec<_>>()
             .join(" ");
         let request = serde_json::json!({
@@ -7459,7 +7540,7 @@ mod tests {
 
         assert_eq!(
             runtime.debug_prefix_cache_token_lengths(),
-            vec![PREFIX_CACHE_BLOCK_TOKENS, PREFIX_CACHE_BLOCK_TOKENS * 2]
+            vec![PREFIX_CACHE_BLOCK_TOKENS]
         );
         let _ = fs::remove_dir_all(dir);
     }

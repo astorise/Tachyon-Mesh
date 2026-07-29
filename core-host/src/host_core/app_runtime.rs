@@ -1076,8 +1076,22 @@ pub(crate) fn route_mesh_qos_profile(
                 .find(|binding| binding.alias.eq_ignore_ascii_case(alias))
         })
         .or_else(|| route.models.first())?;
+    // The lane the work actually queues on, not the device the binding
+    // declares. An `openai:` upstream runs on no local accelerator and is
+    // scheduled on `Network`; reading its declared `cpu`/`cuda` here made mesh
+    // admission watch an idle local queue while the network queue filled, so a
+    // saturated upstream never redirected a request to a healthier peer.
+    let accelerator = if binding
+        .path
+        .trim()
+        .starts_with(ai_inference::UPSTREAM_SCHEME)
+    {
+        ai_inference::AcceleratorKind::Network
+    } else {
+        ai_inference::AcceleratorKind::from_model_device(&binding.device)
+    };
     Some(RouteMeshQosProfile {
-        accelerator: ai_inference::AcceleratorKind::from_model_device(&binding.device),
+        accelerator,
         qos: binding.qos,
     })
 }

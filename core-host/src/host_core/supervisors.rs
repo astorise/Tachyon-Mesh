@@ -687,11 +687,6 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         Arc::clone(&state.host_identity),
         Arc::clone(&state.storage_broker),
     )?;
-    // A model added through the manifest must show up in `GET /ai/v1/models`
-    // now, not after the next full restart. Best-effort, like the boot-time
-    // publication: the reload itself must not fail on a registry write.
-    #[cfg(feature = "ai-inference")]
-    crate::system_storage::publish_configured_model_bindings(&state.core_store, &runtime.config);
     let previous_runtime = state.runtime.load_full();
     let draining_since = Instant::now();
     previous_runtime.mark_draining(draining_since);
@@ -719,6 +714,17 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         .await;
     let runtime = Arc::new(runtime);
     state.runtime.store(Arc::clone(&runtime));
+    // After the swap, not before. `replace_with` above waits for every old
+    // worker to stop, and throughout that interval the still-active runtime is
+    // the previous one — so publishing first advertised aliases it could not
+    // load, and withdrew engine-qualified ids it was still serving. A client
+    // choosing from `GET /ai/v1/models` in that window got transient 404s from
+    // an otherwise successful reload.
+    //
+    // Best-effort, like the boot-time publication: the reload itself must not
+    // fail on a registry write.
+    #[cfg(feature = "ai-inference")]
+    crate::system_storage::publish_configured_model_bindings(&state.core_store, &runtime.config);
     state
         .host_identity
         .clear_route_token_cache()

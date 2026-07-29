@@ -87,6 +87,13 @@ prompts.
 A 32k-context checkpoint therefore accepts ~28.7k prompt tokens and ~115 KB,
 against 4096 tokens and 16 KiB before.
 
+The reservation is a *default*, not this request's budget, so the pair is
+checked too. A caller that names `max_new_tokens` it cannot fit beside its
+prompt gets a request error naming what would fit — the alternative is a decode
+loop that reaches the context boundary partway through and returns a truncated
+answer with no signal. A caller that names no budget has no expectation to
+violate, so the default is clamped to the window instead of refused.
+
 ## Incremental Detokenization
 
 Every decode step needs the text generated so far — to test stop sequences, and

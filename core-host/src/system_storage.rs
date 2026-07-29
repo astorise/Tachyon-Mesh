@@ -416,6 +416,15 @@ fn binding_engine_label(path: &str) -> &'static str {
         // label is part of the public model id (`{engine}/{alias}`), so an
         // ONNX embedding directory advertised as `safetensors` gives clients
         // wrong format metadata.
+        // The sidecar wins, because `resolve_model_format` treats it as
+        // authoritative when loading. Probing extensions first made the public
+        // `{engine}/{alias}` id disagree with the backend actually selected —
+        // a directory declaring `safetensors` while still holding a stale
+        // `.gguf` advertised itself as `gguf/<alias>` and then loaded
+        // safetensors.
+        if let Some(declared) = declared_model_format(path) {
+            return declared;
+        }
         let mut has_gguf = false;
         let mut has_onnx = false;
         if let Ok(entries) = std::path::Path::new(path).read_dir() {
@@ -434,6 +443,27 @@ fn binding_engine_label(path: &str) -> &'static str {
             (false, true) => "onnx",
             (false, false) => "safetensors",
         }
+    }
+}
+
+/// The format a model directory declares in its `.tachyon-model.json` sidecar,
+/// when it declares one this publisher can name.
+fn declared_model_format(path: &str) -> Option<&'static str> {
+    #[derive(serde::Deserialize)]
+    struct Sidecar {
+        #[serde(default)]
+        format: String,
+    }
+
+    let raw = fs::read(std::path::Path::new(path).join(".tachyon-model.json")).ok()?;
+    let sidecar: Sidecar = serde_json::from_slice(&raw).ok()?;
+    match sidecar.format.trim().to_ascii_lowercase().as_str() {
+        "gguf" => Some("gguf"),
+        "safetensors" => Some("safetensors"),
+        // Anything else — absent, empty, or a value the loader would itself
+        // reject — falls through to probing, which is what happened before the
+        // sidecar existed.
+        _ => None,
     }
 }
 
@@ -574,16 +604,30 @@ fn row_is_config_owned(row: Option<&[u8]>) -> bool {
 /// Every alias in the registry whose row this publisher owns.
 #[cfg(feature = "ai-inference")]
 fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
-    core_store
-        .kv_partition_get_range(AI_MODELS_REGISTRY_TABLE, "", "\u{10ffff}", 10_000, 0)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(alias, raw)| {
+    /// Rows per read. The page size is a transaction-size bound, not a limit
+    /// on how much of the table this sweep covers.
+    const PAGE: u32 = 10_000;
+
+    let mut owned = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        // A single page used to be the whole sweep, so once the table grew
+        // past it — uploaded rows count too — any configured alias beyond that
+        // page stayed advertised forever after leaving the manifest.
+        let page = core_store
+            .kv_partition_get_range(AI_MODELS_REGISTRY_TABLE, "", "\u{10ffff}", PAGE, offset)
+            .unwrap_or_default();
+        let read = page.len() as u32;
+        owned.extend(page.into_iter().filter_map(|(alias, raw)| {
             let row = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
             (row.get("source").and_then(serde_json::Value::as_str) == Some(REGISTRY_SOURCE_CONFIG))
                 .then_some(alias)
-        })
-        .collect()
+        }));
+        if read < PAGE {
+            return owned;
+        }
+        offset = offset.saturating_add(read);
+    }
 }
 
 impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {

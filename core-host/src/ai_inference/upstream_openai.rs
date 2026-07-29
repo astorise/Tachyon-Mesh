@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::candle_llm_runtime::{TokenUsage, MAX_PROMPT_BYTES_CEILING};
+use super::candle_llm_runtime::{
+    TokenUsage, HOST_MAX_GENERATION_DEADLINE, MAX_PROMPT_BYTES_CEILING,
+};
 
 /// Binding `path` prefix that selects this backend.
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
@@ -141,6 +143,16 @@ impl UpstreamEndpoint {
             detail,
         };
 
+        // Reject `#` before splitting, not after. Splitting at `?` first hides
+        // a fragment written in its normal position — `…/v1?model=foo#bar`
+        // leaves the fragment inside the *query* half, so the check below only
+        // ever saw `…/v1` and the binding loaded with `#bar` silently folded
+        // into the last parameter's value.
+        if remainder.contains('#') {
+            return Err(invalid(format!(
+                "upstream URL `{remainder}` must not contain a `#` fragment: it is never sent on the wire, so request paths and query parameters would silently lose their suffix"
+            )));
+        }
         let (url, query) = match remainder.split_once('?') {
             Some((url, query)) => (url, Some(query)),
             None => (remainder, None),
@@ -385,7 +397,19 @@ struct HostGenerationRequest {
     tools: Option<Value>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    /// Wall-clock budget in milliseconds, mirrored from the native runtime.
+    /// Not forwarded upstream — it is a *local* slot budget, and no
+    /// OpenAI-compatible server takes it — but it bounds this request's own
+    /// HTTP timeout. Without the field serde dropped it, so a caller asking
+    /// for 1 ms could hold a network slot for the binding's full timeout.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
 }
+
+/// A completed upstream generation: its bytes, the counts the upstream
+/// reported, and why it stopped. The last two are `Option` because "not
+/// reported" is a distinct answer from zero or `stop`.
+type UpstreamGeneration = (Vec<u8>, Option<TokenUsage>, Option<String>);
 
 /// An OpenAI-compatible upstream bound to one mesh alias.
 pub(crate) struct UpstreamOpenAiRuntime {
@@ -436,7 +460,15 @@ impl UpstreamOpenAiRuntime {
     }
 
     /// Translate one host request into an OpenAI chat-completions body.
-    fn chat_body(&self, data: &[u8], stream: bool) -> Result<Value, UpstreamError> {
+    /// Build the upstream request body, and the wall-clock bound this
+    /// particular call must respect.
+    ///
+    /// The caller's `max_generation_ms` is a *local* slot budget — no
+    /// OpenAI-compatible server takes such a field — so it never goes on the
+    /// wire; it tightens this request's own HTTP timeout instead. The binding's
+    /// configured `timeout_ms` remains the ceiling: a request may ask for less
+    /// time than the operator allowed, never more.
+    fn chat_body(&self, data: &[u8], stream: bool) -> Result<(Value, Duration), UpstreamError> {
         // Bounded-input contract, enforced before UTF-8 or JSON parsing so an
         // oversized request cannot force a large allocation on every co-batched
         // thread. The native runtime derives its byte cap from the checkpoint's
@@ -469,6 +501,23 @@ impl UpstreamOpenAiRuntime {
             HostGenerationRequest {
                 prompt: Some(raw.to_owned()),
                 ..HostGenerationRequest::default()
+            }
+        };
+
+        let timeout = match request.max_generation_ms {
+            None => self.endpoint.timeout,
+            Some(millis) => {
+                let requested = Duration::from_millis(millis);
+                if requested.is_zero() || requested > HOST_MAX_GENERATION_DEADLINE {
+                    return Err(UpstreamError::InvalidRequest {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "max_generation_ms {millis} must be between 1 and {}",
+                            HOST_MAX_GENERATION_DEADLINE.as_millis()
+                        ),
+                    });
+                }
+                requested.min(self.endpoint.timeout)
             }
         };
 
@@ -546,16 +595,20 @@ impl UpstreamOpenAiRuntime {
             );
         }
 
-        Ok(Value::Object(body))
+        Ok((Value::Object(body), timeout))
     }
 
     fn post(
         &self,
         suffix: &str,
         body: &Value,
+        timeout: Duration,
     ) -> Result<reqwest::blocking::Response, UpstreamError> {
         let url = self.endpoint.url(suffix);
-        let mut request = self.client.post(&url).json(body);
+        // Per request, not per client: the binding's `timeout_ms` is the
+        // ceiling, and a caller's `max_generation_ms` tightens it for this call
+        // alone.
+        let mut request = self.client.post(&url).timeout(timeout).json(body);
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
@@ -612,10 +665,7 @@ impl UpstreamOpenAiRuntime {
         })
     }
 
-    pub(crate) fn generate(
-        &self,
-        prompts: &[&[u8]],
-    ) -> Result<(Vec<u8>, Option<TokenUsage>), UpstreamError> {
+    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<UpstreamGeneration, UpstreamError> {
         let [prompt] = prompts else {
             return Err(UpstreamError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -625,12 +675,21 @@ impl UpstreamOpenAiRuntime {
                 ),
             });
         };
-        let body = self.chat_body(prompt, false)?;
-        let response = self.post("/chat/completions", &body)?;
+        let (body, timeout) = self.chat_body(prompt, false)?;
+        let response = self.post("/chat/completions", &body, timeout)?;
         let payload: Value = read_json(&self.alias, response)?;
         // Every OpenAI-shaped upstream returns `usage` on the buffered route,
         // so unlike the streaming path this is reliably populated.
         let usage = Self::read_usage(&payload);
+        // `length` means the upstream hit its own token limit, so the answer is
+        // truncated. Reporting it as `stop` let a client run half a function.
+        let finish_reason = payload
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let message = payload
             .get("choices")
             .and_then(Value::as_array)
@@ -652,12 +711,18 @@ impl UpstreamOpenAiRuntime {
             .get("tool_calls")
             .filter(|tool_calls| !is_empty_json(tool_calls))
         {
+            // Forwarding an unusable array is worse than failing: the guest
+            // cannot decode it, falls back to returning the internal marker
+            // envelope as ordinary assistant content, and the caller gets that
+            // JSON as its answer with HTTP 200. A mixed array is the same
+            // problem one entry at a time — the invalid calls vanish.
+            validate_tool_calls(&self.alias, tool_calls)?;
             let envelope = json!({
                 UPSTREAM_TOOL_ENVELOPE_MARKER: true,
                 "content": content.unwrap_or_default(),
                 "tool_calls": tool_calls.clone(),
             });
-            return Ok((envelope.to_string().into_bytes(), usage));
+            return Ok((envelope.to_string().into_bytes(), usage, finish_reason));
         }
 
         let text = content.ok_or_else(|| UpstreamError::MalformedResponse {
@@ -665,7 +730,7 @@ impl UpstreamOpenAiRuntime {
             detail: "response has no `choices[0].message.content` string and no `tool_calls`"
                 .to_owned(),
         })?;
-        Ok((text.as_bytes().to_vec(), usage))
+        Ok((text.as_bytes().to_vec(), usage, finish_reason))
     }
 
     /// Stream one generation, invoking `on_token` per SSE delta so the mesh's
@@ -684,7 +749,7 @@ impl UpstreamOpenAiRuntime {
                 ),
             });
         };
-        let body = self.chat_body(prompt, true)?;
+        let (body, timeout) = self.chat_body(prompt, true)?;
         // When the request offered tools, content is accumulated rather than
         // streamed. The downstream `json` parser is anchored to a whole-output
         // JSON value, so streaming prose and *then* a tool-call envelope would
@@ -693,7 +758,7 @@ impl UpstreamOpenAiRuntime {
         // time-to-first-token only on requests that can produce a call.
         let buffer_content = body.get("tools").is_some();
         let mut buffered_content = String::new();
-        let response = self.post("/chat/completions", &body)?;
+        let response = self.post("/chat/completions", &body, timeout)?;
 
         // Bound the whole stream, so an upstream that never terminates cannot
         // grow the reader without limit.
@@ -802,7 +867,14 @@ impl UpstreamOpenAiRuntime {
         // One envelope carrying both, so the downstream anchored parser sees a
         // whole-output JSON value. When no call materialised, the buffered
         // prose is emitted as ordinary text.
-        match streamed_tool_calls.finish() {
+        let assembled =
+            streamed_tool_calls
+                .finish()
+                .map_err(|detail| UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                })?;
+        match assembled {
             Some(tool_calls) => {
                 on_token(
                     &json!({
@@ -836,7 +908,7 @@ impl UpstreamOpenAiRuntime {
     /// Forward a single embedding request to the upstream `/embeddings` route.
     pub(crate) fn embed(&self, input: &str) -> Result<Vec<f32>, UpstreamError> {
         let body = json!({"model": self.endpoint.model, "input": input});
-        let response = self.post("/embeddings", &body)?;
+        let response = self.post("/embeddings", &body, self.endpoint.timeout)?;
         let payload: Value = read_json(&self.alias, response)?;
         let embedding = payload
             .get("data")
@@ -887,6 +959,49 @@ impl UpstreamOpenAiRuntime {
 /// `true` for JSON that carries nothing worth forwarding: absent, null, or an
 /// empty array. Lets an explicitly-empty `tools: []` be dropped rather than
 /// sent, which some upstreams reject.
+/// Reject a `tool_calls` payload the downstream parser could not use.
+///
+/// Checked here rather than in the guest because this is where the upstream's
+/// response is still typed: by the time it reaches `guest-openai` it is text,
+/// and an unusable call is indistinguishable from a model that answered in
+/// JSON.
+fn validate_tool_calls(alias: &str, tool_calls: &Value) -> Result<(), UpstreamError> {
+    let malformed = |detail: String| UpstreamError::MalformedResponse {
+        alias: alias.to_owned(),
+        detail,
+    };
+    let calls = tool_calls.as_array().ok_or_else(|| {
+        malformed(format!(
+            "`choices[0].message.tool_calls` must be an array, got {}",
+            json_type_name(tool_calls)
+        ))
+    })?;
+    for (index, call) in calls.iter().enumerate() {
+        let name = call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if name.trim().is_empty() {
+            return Err(malformed(format!(
+                "`choices[0].message.tool_calls[{index}]` has no `function.name`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 fn is_empty_json(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -940,11 +1055,27 @@ impl StreamedToolCalls {
     /// The reassembled calls, or `None` when the stream carried none. Calls
     /// without a function name are dropped: a fragment stream that never
     /// named its function is not a call anyone can dispatch.
-    fn finish(self) -> Option<Value> {
+    /// Assemble the accumulated fragments, or fail if any of them never named
+    /// its function.
+    ///
+    /// Dropping an unnamed call silently was the wrong shape of forgiveness:
+    /// the caller received an empty or short tool-call set while telemetry
+    /// recorded a healthy generation, so an agent simply saw the model decline
+    /// to act. Once fragments have been observed the upstream has committed to
+    /// a call, and an incomplete one means the stream was truncated.
+    fn finish(self) -> Result<Option<Value>, String> {
+        if let Some((index, _, _, _)) = self
+            .calls
+            .iter()
+            .find(|(_, _, name, _)| name.trim().is_empty())
+        {
+            return Err(format!(
+                "upstream streamed tool-call fragments for index {index} but never sent a function name"
+            ));
+        }
         let calls = self
             .calls
             .into_iter()
-            .filter(|(_, _, name, _)| !name.is_empty())
             .map(|(_, id, name, arguments)| {
                 let arguments = if arguments.is_empty() {
                     "{}".to_owned()
@@ -963,7 +1094,7 @@ impl StreamedToolCalls {
                 Value::Object(call)
             })
             .collect::<Vec<_>>();
-        (!calls.is_empty()).then_some(Value::Array(calls))
+        Ok((!calls.is_empty()).then_some(Value::Array(calls)))
     }
 }
 
@@ -1163,7 +1294,7 @@ mod tests {
         // Absent: a budget is always sent, never omitted — and it is the
         // upstream default, not the native runtime's 256-token cap, which would
         // truncate an agentic completion mid-function.
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(br#"{"prompt":"p"}"#, false)
             .expect("request should map");
         assert_eq!(body["max_tokens"], UPSTREAM_DEFAULT_MAX_NEW_TOKENS);
@@ -1177,7 +1308,7 @@ mod tests {
             assert!(matches!(error, UpstreamError::InvalidRequest { .. }));
         }
 
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(
                 format!(r#"{{"prompt":"p","max_new_tokens":{UPSTREAM_DEFAULT_MAX_NEW_TOKENS}}}"#)
                     .as_bytes(),
@@ -1194,12 +1325,12 @@ mod tests {
             "openai:http://127.0.0.1:8080/v1?max_new_tokens=6000",
         );
 
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(br#"{"prompt":"p"}"#, false)
             .expect("request should map");
         assert_eq!(body["max_tokens"], 6000);
 
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(br#"{"prompt":"p","max_new_tokens":5000}"#, false)
             .expect("a request under the binding ceiling is valid");
         assert_eq!(body["max_tokens"], 5000);
@@ -1248,7 +1379,7 @@ mod tests {
             "coder",
             "openai:http://127.0.0.1:8080/v1?model=upstream-name",
         );
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(
                 br#"{"messages":[{"role":"user","content":"hi"}],"max_new_tokens":32,
                      "temperature":0.2,"top_p":0.9,"seed":7,"stop":["</s>"]}"#,
@@ -1272,7 +1403,7 @@ mod tests {
     #[test]
     fn raw_prompts_become_a_single_user_turn() {
         let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(b"write a haiku", true)
             .expect("request should map");
         assert_eq!(body["messages"].as_array().expect("array").len(), 1);
@@ -1288,7 +1419,7 @@ mod tests {
     #[test]
     fn json_schema_becomes_a_response_format() {
         let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(
                 br#"{"prompt":"p","json_schema":"{\"type\":\"object\"}"}"#,
                 false,
@@ -1326,7 +1457,7 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let (output, _usage) = backend
+        let (output, _usage, _reason) = backend
             .generate(&[br#"{"messages":[{"role":"user","content":"write main"}]}"#])
             .expect("generation should round trip");
         assert_eq!(output, b"fn main() {}".to_vec());
@@ -1425,7 +1556,7 @@ mod tests {
                 {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
         );
         let backend = runtime("coder", &upstream.binding());
-        let (output, _usage) = backend.generate(&[b"go"]).expect("tool call round trip");
+        let (output, _usage, _reason) = backend.generate(&[b"go"]).expect("tool call round trip");
         let envelope: Value = serde_json::from_slice(&output).expect("envelope");
         assert_eq!(envelope[UPSTREAM_TOOL_ENVELOPE_MARKER], true);
         assert_eq!(envelope["tool_calls"][0]["function"]["name"], "f");
@@ -1534,7 +1665,7 @@ mod tests {
     #[test]
     fn tool_schemas_are_forwarded_so_the_upstream_can_apply_its_own_template() {
         let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(
                 br#"{"prompt":"weather?",
                      "tools":[{"type":"function","function":{"name":"get_weather"}}],
@@ -1547,7 +1678,7 @@ mod tests {
 
         // An explicitly empty tools array is dropped rather than sent: some
         // upstreams reject `tools: []`.
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(br#"{"prompt":"hi","tools":[]}"#, false)
             .expect("request should map");
         assert!(body.get("tools").is_none());
@@ -1567,7 +1698,7 @@ mod tests {
         );
         let backend = runtime("coder", &upstream.binding());
 
-        let (output, _usage) = backend
+        let (output, _usage, _reason) = backend
             .generate(&[b"read a.rs"])
             .expect("a tool call is a successful generation");
         let envelope: Value =
@@ -1678,7 +1809,7 @@ mod tests {
         let backend = runtime("coder", "openai:http://127.0.0.1:8080/v1");
         // The exact replay a client sends on the turn after a tool call: an
         // assistant turn with no content, then a `tool` turn.
-        let body = backend
+        let (body, _timeout) = backend
             .chat_body(
                 br#"{"messages":[
                     {"role":"user","content":"read a.rs"},
@@ -1803,6 +1934,81 @@ mod tests {
             env::remove_var(API_KEY_ENV_FALLBACK);
         }
         assert_eq!(resolved.as_deref(), Some("global-secret"));
+    }
+
+    #[test]
+    fn a_truncated_upstream_completion_reports_length() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"finish_reason":"length","message":{"content":"fn main() {"}}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let (_bytes, _usage, finish_reason) =
+            backend.generate(&[b"write main"]).expect("generation");
+        assert_eq!(
+            finish_reason.as_deref(),
+            Some("length"),
+            "a truncated completion must not look complete"
+        );
+    }
+
+    #[test]
+    fn a_malformed_tool_call_array_is_rejected() {
+        // Forwarding it would hand the caller the internal marker envelope as
+        // ordinary assistant content, with HTTP 200.
+        for payload in [
+            r#"{"choices":[{"message":{"content":null,"tool_calls":{"not":"an array"}}}]}"#,
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c1","type":"function"}]}}]}"#,
+        ] {
+            let upstream = FakeUpstream::start("HTTP/1.1 200 OK", "application/json", payload);
+            let backend = runtime("coder", &upstream.binding());
+            let error = backend
+                .generate(&[b"go"])
+                .expect_err("an unusable tool-call payload must fail");
+            assert!(
+                matches!(error, UpstreamError::MalformedResponse { .. }),
+                "expected MalformedResponse, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_streamed_tool_call_fails_the_response() {
+        // Fragments arrived, so the upstream committed to a call; one that
+        // never names its function is a truncated stream, not a call to drop.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"arguments":"{}"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let error = backend
+            .generate_streaming(
+                &[br#"{"prompt":"go","tools":[{"type":"function"}]}"#],
+                &mut |_token| {},
+            )
+            .expect_err("an unnamed streamed call must fail the response");
+        assert!(
+            error.to_string().contains("never sent a function name"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_fragment_after_the_query_is_rejected() {
+        // Written in its normal position, the fragment used to land inside the
+        // query half and silently become part of the last parameter's value.
+        let error = UpstreamEndpoint::parse("coder", "openai:http://host/v1?model=foo#bar")
+            .expect_err("a fragment must be refused wherever it appears");
+        assert!(
+            error.to_string().contains("fragment"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

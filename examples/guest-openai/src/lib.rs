@@ -580,10 +580,22 @@ fn handle_chat_completions_buffered(
         .map_err(|e| format!("inference failed for model `{}`: {e}", request.model))?;
     let output = completed.text;
     let parsed = parse_assistant_output(&request, &output);
-    let finish_reason = if parsed.tool_calls.is_empty() {
-        "stop"
-    } else {
+    // A parsed tool call always wins — the caller must act on it — but
+    // otherwise the host's own reason takes precedence over the assumption
+    // that generation ended naturally. `length` in particular means the answer
+    // is truncated, and reporting it as `stop` is how a client comes to run
+    // half a function.
+    let finish_reason = if !parsed.tool_calls.is_empty() {
         "tool_calls"
+    } else {
+        match completed.finish_reason.as_deref() {
+            Some("length") => "length",
+            Some("content_filter") => "content_filter",
+            Some("tool_calls") => "tool_calls",
+            // Anything else, including an absent reason, is an ordinary
+            // completion as far as the OpenAI schema is concerned.
+            _ => "stop",
+        }
     };
 
     let response = ChatCompletionResponse {
@@ -670,11 +682,21 @@ fn handle_chat_completions_streaming(
     // that envelope would stream out as prose before finalization could turn it
     // into a structured call. For a response that is not a tool call the
     // anchored gate is a passthrough — a `{` only counts at the very start.
-    let mut gate = Some(StreamingContentGate::new(
-        request
-            .resolved_tool_call_parser()
-            .unwrap_or(ToolCallParser::Json),
-    ));
+    // Only when the request actually offers tools. The gate exists to stop a
+    // tool call streaming out as prose before it can be turned into a
+    // structured call, and nothing can produce one when no tools were offered
+    // — while an unconditional gate trips at byte zero on any answer that
+    // starts with `{`, `[` or a fence, which is what ordinary JSON and code
+    // answers do. That withheld every fragment until generation finished,
+    // costing the streaming route exactly the time-to-first-token it exists
+    // for.
+    let mut gate = request.has_tool_intent().then(|| {
+        StreamingContentGate::new(
+            request
+                .resolved_tool_call_parser()
+                .unwrap_or(ToolCallParser::Json),
+        )
+    });
 
     let generation = build_generation_request(&request)?;
     let token_stream = bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation)
@@ -1004,9 +1026,16 @@ fn parse_upstream_tool_envelope(output: &str) -> Option<ParsedAssistantOutput> {
 
 fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> ParsedAssistantOutput {
     // The host marks its own envelopes, so they decode whatever the request
-    // says about parsers — including saying nothing at all.
-    if let Some(parsed) = parse_upstream_tool_envelope(output) {
-        return parsed;
+    // says about *parsers* — but still only when the request asked for tools at
+    // all. The marker travels through the ordinary text channel and is neither
+    // secret nor proof of provenance, so without this a local model asked to
+    // reproduce that JSON would come back as `finish_reason: "tool_calls"`
+    // instead of as its own answer. An upstream cannot emit the envelope
+    // unless tools were offered, so nothing legitimate is lost.
+    if request.has_tool_intent() {
+        if let Some(parsed) = parse_upstream_tool_envelope(output) {
+            return parsed;
+        }
     }
     let Some(parser) = request.resolved_tool_call_parser() else {
         return ParsedAssistantOutput {
@@ -1058,6 +1087,11 @@ impl ChatCompletionRequest {
             .and_then(ToolCallParser::from_name);
     }
 
+    /// Whether the caller offered the model any tool to call.
+    fn has_tool_intent(&self) -> bool {
+        !self.tools.is_empty() || self.tool_choice.is_some()
+    }
+
     fn resolved_tool_call_parser(&self) -> Option<ToolCallParser> {
         self.tool_call_parser
             .or_else(|| {
@@ -1066,7 +1100,7 @@ impl ChatCompletionRequest {
                     .and_then(|body| body.tool_call_parser)
             })
             .or_else(|| parser_from_model(&self.model))
-            .filter(|_| !self.tools.is_empty() || self.tool_choice.is_some())
+            .filter(|_| self.has_tool_intent())
     }
 }
 
@@ -1403,6 +1437,34 @@ mod tests {
             status: "available".to_owned(),
             tool_call_parser: parser.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn the_upstream_envelope_is_ignored_without_tool_intent() {
+        // The marker rides the ordinary text channel, so a model that emits it
+        // — asked to, or by accident — must not be turned into a tool call the
+        // caller never offered.
+        let envelope = serde_json::json!({
+            "__tachyon_upstream_tool_calls": true,
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "rm_rf", "arguments": "{}"}}],
+        })
+        .to_string();
+
+        let mut toolless = tool_request_named("local");
+        toolless.tools = Vec::new();
+        let parsed = parse_assistant_output(&toolless, &envelope);
+        assert!(
+            parsed.tool_calls.is_empty(),
+            "a request offering no tools must not produce one"
+        );
+        assert_eq!(parsed.content, envelope, "the text is returned unchanged");
+
+        // With tools offered it decodes as before, whatever the parser says.
+        let parsed = parse_assistant_output(&tool_request_named("local"), &envelope);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].function.name, "rm_rf");
     }
 
     #[test]
