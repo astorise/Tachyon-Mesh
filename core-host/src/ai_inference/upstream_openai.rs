@@ -1053,11 +1053,12 @@ fn tool_calls_from_value(alias: &str, tool_calls: &Value) -> Result<Vec<ToolCall
                     "`choices[0].message.tool_calls[{index}]` has no `function.name`"
                 )));
             }
-            let arguments = function
-                .and_then(|function| function.get("arguments"))
-                .and_then(Value::as_str)
-                .filter(|arguments| !arguments.is_empty())
-                .unwrap_or("{}");
+            let arguments = tool_call_arguments(function.and_then(|f| f.get("arguments")))
+                .ok_or_else(|| {
+                    malformed(format!(
+                        "`choices[0].message.tool_calls[{index}].function.arguments` is neither a JSON string nor a JSON object"
+                    ))
+                })?;
             Ok(ToolCall {
                 id: call
                     .get("id")
@@ -1069,6 +1070,27 @@ fn tool_calls_from_value(alias: &str, tool_calls: &Value) -> Result<Vec<ToolCall
             })
         })
         .collect()
+}
+
+/// The argument JSON for one tool call, whatever shape the upstream used.
+///
+/// OpenAI specifies `function.arguments` as a *string* of JSON, and most
+/// servers comply — but several emit the object itself. Reading only the string
+/// form treated a present object as absent, and the caller then dispatched the
+/// correct function with `{}`: the right tool, none of its arguments, and a
+/// generation reported as successful. An object is serialized rather than
+/// dropped; `None` means the value was neither, which the caller reports as
+/// malformed instead of inventing an empty argument set.
+fn tool_call_arguments(arguments: Option<&Value>) -> Option<String> {
+    match arguments {
+        // Absent or explicitly null: a function that takes no arguments.
+        None | Some(Value::Null) => Some("{}".to_owned()),
+        Some(Value::String(raw)) if raw.trim().is_empty() => Some("{}".to_owned()),
+        Some(Value::String(raw)) => Some(raw.clone()),
+        Some(value @ (Value::Object(_) | Value::Array(_))) => Some(value.to_string()),
+        // A bare number or boolean is not an argument set under either reading.
+        Some(_) => None,
+    }
 }
 
 fn json_type_name(value: &Value) -> &'static str {
@@ -1096,47 +1118,70 @@ fn is_empty_json(value: &Value) -> bool {
 /// and the function name, later ones append `function.arguments` in pieces.
 /// Fragments are keyed by their `index`, which is the only field guaranteed to
 /// identify which call a fragment belongs to.
+/// One call being reassembled. A named struct rather than a tuple because it
+/// now carries a validity flag as well as the three accumulating fields.
+#[derive(Default)]
+struct StreamedToolCall {
+    index: u64,
+    id: String,
+    name: String,
+    /// Concatenated argument text, or one whole object's rendering.
+    arguments: String,
+    /// Set when a fragment's `arguments` was neither a string nor an object.
+    /// Reported by `finish` rather than silently reduced to `{}`.
+    unusable_arguments: bool,
+}
+
 #[derive(Default)]
 struct StreamedToolCalls {
-    /// `(index, id, name, accumulated arguments)`, in first-seen order so the
-    /// emitted array preserves the upstream's own ordering.
-    calls: Vec<(u64, String, String, String)>,
+    /// In first-seen order, so the emitted list preserves the upstream's own
+    /// ordering.
+    calls: Vec<StreamedToolCall>,
 }
 
 impl StreamedToolCalls {
     fn absorb(&mut self, fragment: &Value) {
         let index = fragment.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let slot = match self.calls.iter_mut().find(|(known, ..)| *known == index) {
+        let slot = match self.calls.iter_mut().find(|call| call.index == index) {
             Some(slot) => slot,
             None => {
-                self.calls
-                    .push((index, String::new(), String::new(), String::new()));
+                self.calls.push(StreamedToolCall {
+                    index,
+                    ..StreamedToolCall::default()
+                });
                 self.calls.last_mut().expect("just pushed")
             }
         };
         if let Some(id) = fragment.get("id").and_then(Value::as_str) {
-            slot.1 = id.to_owned();
+            slot.id = id.to_owned();
         }
         let function = fragment.get("function");
         if let Some(name) = function
             .and_then(|function| function.get("name"))
             .and_then(Value::as_str)
         {
-            slot.2 = name.to_owned();
+            slot.name = name.to_owned();
         }
-        if let Some(arguments) = function
-            .and_then(|function| function.get("arguments"))
-            .and_then(Value::as_str)
-        {
-            slot.3.push_str(arguments);
+        // A streamed call's arguments arrive as string slices that concatenate,
+        // so a string is appended verbatim. An upstream that sends the object
+        // itself is not streaming it in pieces — that value *replaces* what was
+        // accumulated, because appending an object's rendering to a partial
+        // string would corrupt both. Reading only the string form dropped the
+        // object entirely and dispatched the call with no arguments at all.
+        match function.and_then(|function| function.get("arguments")) {
+            Some(Value::String(raw)) => slot.arguments.push_str(raw),
+            Some(value @ (Value::Object(_) | Value::Array(_))) => {
+                slot.arguments = value.to_string();
+            }
+            // Absent on most fragments, and on the opening one that carries
+            // only the id and the name.
+            None | Some(Value::Null) => {}
+            Some(_) => slot.unusable_arguments = true,
         }
     }
 
-    /// The reassembled calls, or `None` when the stream carried none. Calls
-    /// without a function name are dropped: a fragment stream that never
-    /// named its function is not a call anyone can dispatch.
     /// Assemble the accumulated fragments, or fail if any of them never named
-    /// its function.
+    /// its function or carried arguments in an unusable shape.
     ///
     /// Dropping an unnamed call silently was the wrong shape of forgiveness:
     /// the caller received an empty or short tool-call set while telemetry
@@ -1144,28 +1189,34 @@ impl StreamedToolCalls {
     /// to act. Once fragments have been observed the upstream has committed to
     /// a call, and an incomplete one means the stream was truncated.
     fn finish(self) -> Result<Vec<ToolCall>, String> {
-        if let Some((index, _, _, _)) = self
-            .calls
-            .iter()
-            .find(|(_, _, name, _)| name.trim().is_empty())
-        {
+        if let Some(call) = self.calls.iter().find(|call| call.name.trim().is_empty()) {
             return Err(format!(
-                "upstream streamed tool-call fragments for index {index} but never sent a function name"
+                "upstream streamed tool-call fragments for index {} but never sent a function name",
+                call.index
+            ));
+        }
+        // Same rule as the buffered path: an argument value that is neither a
+        // string nor an object cannot be reduced to `{}` without handing the
+        // caller the right function and the wrong arguments.
+        if let Some(call) = self.calls.iter().find(|call| call.unusable_arguments) {
+            return Err(format!(
+                "upstream streamed `function.arguments` for index {} that is neither a JSON string nor a JSON object",
+                call.index
             ));
         }
         Ok(self
             .calls
             .into_iter()
-            .map(|(_, id, name, arguments)| ToolCall {
-                id: (!id.is_empty()).then_some(id),
-                name,
+            .map(|call| ToolCall {
+                id: (!call.id.is_empty()).then_some(call.id),
+                name: call.name,
                 // An empty argument string is not valid JSON, and a caller that
                 // parses it would report a broken call for a function that
                 // simply takes none.
-                arguments: if arguments.is_empty() {
+                arguments: if call.arguments.is_empty() {
                     "{}".to_owned()
                 } else {
-                    arguments
+                    call.arguments
                 },
             })
             .collect())
@@ -1874,6 +1925,65 @@ mod tests {
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn tool_call_arguments_survive_an_upstream_that_sends_an_object() {
+        // OpenAI specifies `function.arguments` as a JSON *string*, but several
+        // compatible servers send the object. Reading only the string form
+        // dispatched the right function with `{}` — the worst shape of failure,
+        // because the request succeeds and the tool runs on nothing.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"c1","type":"function",
+                 "function":{"name":"read_file","arguments":{"path":"a.rs"}}}]}}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let generation = backend.generate(&[b"go"]).expect("tool call round trip");
+        let arguments: Value = serde_json::from_str(&generation.tool_calls[0].arguments)
+            .expect("the arguments must still be JSON");
+        assert_eq!(arguments["path"], "a.rs");
+    }
+
+    #[test]
+    fn a_streamed_object_argument_is_kept_rather_than_dropped() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":{"path":"a.rs"}}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("streaming should complete");
+        let arguments: Value = serde_json::from_str(&captured.tool_calls[0].arguments)
+            .expect("the arguments must still be JSON");
+        assert_eq!(arguments["path"], "a.rs");
+    }
+
+    #[test]
+    fn an_argument_value_that_is_neither_string_nor_object_fails_the_response() {
+        // Reducing a number to `{}` would be the same silent substitution the
+        // two tests above exist to prevent.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":7}}]}}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("an unusable argument value is not an empty one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
     }
 
     #[test]

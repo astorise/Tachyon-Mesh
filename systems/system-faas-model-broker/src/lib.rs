@@ -368,8 +368,18 @@ fn commit_upload(uri: &str) -> Result<String, String> {
             let _ = fs::remove_dir_all(&model_dir);
             cleanup_staging(&upload_id);
         })?;
-    write_meta_sidecar(&model_dir, format, &alias)?;
-    publish_model_uploaded(&alias, format, &model_dir, &pending.files)?;
+    // Both of these can fail *after* the archive is on disk — publication in
+    // particular now rejects an alias a configured binding owns. Without the
+    // same cleanup the unpack path already does, every rejected attempt left a
+    // complete model directory and its staging slot behind; worse, when the
+    // configured path is this same broker directory, a later restart could load
+    // the checkpoint that was just refused.
+    write_meta_sidecar(&model_dir, format, &alias)
+        .and_then(|()| publish_model_uploaded(&alias, format, &model_dir, &pending.files))
+        .inspect_err(|_error| {
+            let _ = fs::remove_dir_all(&model_dir);
+            cleanup_staging(&upload_id);
+        })?;
 
     cleanup_staging(&upload_id);
 

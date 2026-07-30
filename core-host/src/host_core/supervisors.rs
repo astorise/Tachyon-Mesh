@@ -688,6 +688,8 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         Arc::clone(&state.storage_broker),
     )?;
     let previous_runtime = state.runtime.load_full();
+    #[cfg(feature = "ai-inference")]
+    let previous_runtime_config = previous_runtime.config.clone();
     let draining_since = Instant::now();
     previous_runtime.mark_draining(draining_since);
     state
@@ -698,6 +700,25 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
             runtime: previous_runtime,
             draining_since,
         });
+
+    // Before the swap, withdraw every configured row the incoming runtime will
+    // not serve identically. Publication has to happen *after* the swap (see
+    // below), which leaves a window where the registry still describes the old
+    // runtime while the new one is answering — and an alias whose engine
+    // changed would be advertised as `gguf/<alias>` while requests executed an
+    // `openai:` upstream, the same "the listing lies about where a prompt goes"
+    // failure the ownership rule exists to prevent.
+    //
+    // Withdrawing first turns that into a transient *absence* instead: the
+    // alias 404s for the length of the swap and comes back correctly labelled.
+    // A missing row is a client's retry; a wrong one is a prompt sent somewhere
+    // it did not choose.
+    #[cfg(feature = "ai-inference")]
+    crate::system_storage::withdraw_changed_model_bindings(
+        &state.core_store,
+        &previous_runtime_config,
+        &runtime.config,
+    );
 
     state
         .background_workers

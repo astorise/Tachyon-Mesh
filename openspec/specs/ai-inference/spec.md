@@ -391,6 +391,32 @@ prompt somewhere it did not choose.
 - **WHEN** a binding is marked `dynamic`
 - **THEN** no configured-binding row is published for it
 
+#### Scenario: A reload withdraws the rows its own bindings no longer back
+
+- **WHEN** a configuration reload removes a non-dynamic binding, or changes the
+  path an alias resolves to
+- **THEN** the config-owned row for the alias it no longer backs is deleted
+  before the new runtime is installed, so the listing never advertises a model
+  the node has stopped serving
+- **AND** withdrawal is confined to rows the configuration itself owns: an
+  uploaded row is never removed by a reload, whatever the outgoing manifest said
+- **AND** ownership is re-read inside the deleting transaction, so a row that
+  became upload-owned between the comparison and the delete survives
+
+### Requirement: A rejected upload MUST leave nothing behind
+
+An upload that fails after its files are on disk SHALL remove them. A model
+directory that survives a rejected upload is not inert: it is a checkpoint the
+operator never accepted, occupying the alias's path and consuming the node's
+disk, and the next probe of that directory would treat it as real.
+
+#### Scenario: An upload rejected at publication removes its own files
+
+- **WHEN** an upload's sidecar write or registry publication fails — including a
+  rejection because a configured binding owns the alias
+- **THEN** the model directory and its staging area are removed
+- **AND** the original error is what the caller sees, not a cleanup failure
+
 ### Requirement: Tool calls MUST be recovered on the streaming path
 
 `guest-openai` SHALL recover tool calls when streaming, emitting

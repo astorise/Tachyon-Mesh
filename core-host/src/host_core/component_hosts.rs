@@ -399,9 +399,19 @@ impl ComponentHostState {
                 "AI inference runtime is unavailable for this component",
             )
         })?);
-        let (sender, receiver) = std::sync::mpsc::channel::<
+        // Bounded, so the generation thread advances only as fast as the guest
+        // drains it. An unbounded channel let a fast upstream enqueue a whole
+        // stream for a slow-but-connected client: the per-stream cap is 64 MiB
+        // and the node admits 32 concurrent streams, so queued payloads could
+        // reach gigabytes while every cancellation check stayed quiet — nobody
+        // had disconnected, they were simply behind.
+        //
+        // `sync_channel` also makes back-pressure the *same* signal as
+        // cancellation: `send` blocks while the consumer is merely slow, and
+        // fails only once it is gone.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<
             std::result::Result<StreamPayload, ai_inference::GenerationError>,
-        >();
+        >(STREAM_CHANNEL_CAPACITY);
         // Token counts are only known once generation ends, which is after the
         // last fragment has already gone down the channel. They therefore come
         // back beside the channel rather than through it: sending them as a
@@ -2013,6 +2023,15 @@ fn wit_tool_call(
     }
 }
 
+/// How many decoded events may sit between the generation thread and the guest.
+///
+/// Small on purpose: this is a hand-off buffer that absorbs scheduling jitter,
+/// not a place to store a response. A larger window only lets a fast producer
+/// build a backlog the client has not asked for, which is the memory this bound
+/// exists to cap.
+#[cfg(feature = "ai-inference")]
+const STREAM_CHANNEL_CAPACITY: usize = 64;
+
 /// The generation thread's end of a guest stream.
 ///
 /// Owns both cancellation signals: a failed `send` (the receiver is gone) and
@@ -2020,7 +2039,7 @@ fn wit_tool_call(
 /// difference is that only the flag can be read without emitting.
 #[cfg(feature = "ai-inference")]
 struct GuestStreamSink<'a> {
-    sender: &'a std::sync::mpsc::Sender<
+    sender: &'a std::sync::mpsc::SyncSender<
         std::result::Result<StreamPayload, ai_inference::GenerationError>,
     >,
     consumer_alive: &'a Arc<std::sync::atomic::AtomicBool>,

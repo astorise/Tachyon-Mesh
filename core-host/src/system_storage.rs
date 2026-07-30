@@ -674,6 +674,60 @@ fn row_is_config_owned(row: Option<&[u8]>) -> bool {
         .unwrap_or(false)
 }
 
+/// Withdraw configured rows the incoming config will not serve identically.
+///
+/// Called *before* a hot-reload swap, while the previous runtime is still
+/// answering. Publication necessarily happens after the swap — the new aliases
+/// are not loadable until then — so without this the window between the two
+/// advertises the old runtime's rows against the new runtime's behaviour. For
+/// an alias whose engine changed that is not a cosmetic lag: the listing offers
+/// `gguf/<alias>` while requests reach an `openai:` upstream.
+///
+/// Only rows that would *change* are withdrawn. An alias whose binding is
+/// identical on both sides keeps its row throughout, so an unrelated reload
+/// costs no availability.
+#[cfg(feature = "ai-inference")]
+pub(crate) fn withdraw_changed_model_bindings(
+    core_store: &crate::store::CoreStore,
+    previous: &crate::IntegrityConfig,
+    incoming: &crate::IntegrityConfig,
+) {
+    let publishable = |config: &crate::IntegrityConfig| {
+        config
+            .routes
+            .iter()
+            .flat_map(|route| route.models.iter())
+            .filter(|binding| !binding.dynamic && !binding.path.trim().is_empty())
+            .map(|binding| (binding.alias.clone(), binding.path.clone()))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    let incoming = publishable(incoming);
+
+    for (alias, path) in publishable(previous) {
+        // Same alias, same path — the row it would publish is byte-identical,
+        // so leaving it in place keeps the model listed across the reload.
+        if incoming.get(&alias).is_some_and(|next| *next == path) {
+            continue;
+        }
+        // Ownership is re-read inside the transaction: an upload that landed
+        // since the scan owns its row, and a reload must not delete it.
+        if let Err(error) =
+            core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
+                if row_is_config_owned(current) {
+                    crate::store::KvPartitionUpdate::Delete
+                } else {
+                    crate::store::KvPartitionUpdate::Keep
+                }
+            })
+        {
+            tracing::warn!(
+                %alias,
+                "failed to withdraw a changed model binding before the reload swap: {error:#}"
+            );
+        }
+    }
+}
+
 /// Every alias in the registry whose row this publisher owns.
 #[cfg(feature = "ai-inference")]
 fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
@@ -1218,6 +1272,75 @@ mod configured_binding_registry_tests {
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
         assert_eq!(entry["engine"], "openai");
         write_uploaded_model_row(&store, "free", b"{}".to_vec()).expect("a free alias is writable");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reload_withdraws_only_the_bindings_that_change() {
+        let (store, dir) = temp_store();
+        let previous = config_with(vec![
+            binding("unchanged", "openai:http://127.0.0.1:8080/v1", false),
+            binding("re-pointed", "openai:http://127.0.0.1:8080/v1", false),
+            binding("removed", "openai:http://127.0.0.1:9090/v1", false),
+        ]);
+        publish_configured_model_bindings(&store, &previous);
+
+        let incoming = config_with(vec![
+            binding("unchanged", "openai:http://127.0.0.1:8080/v1", false),
+            // Same alias, different backend: advertising the old engine while
+            // the new one answers is the failure this withdrawal prevents.
+            binding("re-pointed", "/models/re-pointed", false),
+        ]);
+        withdraw_changed_model_bindings(&store, &previous, &incoming);
+
+        let present = |alias: &str| {
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+                .expect("read")
+                .is_some()
+        };
+        assert!(
+            present("unchanged"),
+            "an identical binding keeps its row, so an unrelated reload costs no availability"
+        );
+        assert!(!present("re-pointed"), "a changed binding is withdrawn");
+        assert!(!present("removed"), "a removed binding is withdrawn");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reload_never_withdraws_an_uploaded_row() {
+        let (store, dir) = temp_store();
+        let uploaded = serde_json::json!({
+            "alias": "shared", "engine": "gguf", "vramRequiredMb": 4096,
+            "status": "available", "modelPath": "/data/models/shared",
+        });
+        store
+            .kv_partition_set(
+                AI_MODELS_REGISTRY_TABLE,
+                "shared",
+                &serde_json::to_vec(&uploaded).expect("serialize"),
+            )
+            .expect("seed");
+
+        // The alias leaves the manifest, but the row belongs to an upload —
+        // ownership is re-read inside the delete transaction.
+        withdraw_changed_model_bindings(
+            &store,
+            &config_with(vec![binding(
+                "shared",
+                "openai:http://127.0.0.1:8080/v1",
+                false,
+            )]),
+            &config_with(Vec::new()),
+        );
+
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "shared")
+            .expect("read")
+            .expect("an uploaded row must survive a reload");
+        let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(entry["engine"], "gguf");
         let _ = fs::remove_dir_all(dir);
     }
 

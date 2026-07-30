@@ -438,10 +438,27 @@ until the binding's timeout — up to an hour — and a handful of them would sp
 the node's whole outbound capacity on readers that left. The local decode loops
 honour the same signal beside their deadline check, for the same reason a
 deadline exists: finishing an answer nobody will read only occupies the slot.
-Speculative decoding checks it twice — once per round and once inside the
-acceptance loop — because one round verifies up to `draft_tokens` proposals, so
-checking only at the top would still run that many target forward passes after
-the client had gone.
+
+Speculative decoding checks *both* signals — the deadline and abandonment — at
+two depths, once per round and once inside the acceptance loop, and the draft
+proposer checks the deadline before each proposal. A round is not one forward
+pass: it drafts up to `draft_tokens` tokens and then verifies them, each a
+target forward pass, and `draft_tokens` is operator-supplied with no small
+ceiling. Testing only at the top of a round would therefore let a request that
+expired — or whose client had gone — still run a full round's worth of drafting
+and verification, which is exactly the work the deadline exists to bound. A
+proposer that stops early loses nothing: the verifier consumes whatever prefix
+it was given.
+
+The hand-off from the generation thread to the guest is bounded (64 events, a
+`sync_channel`), which makes the producer advance no faster than the guest
+drains it. An unbounded queue caps nothing that matters: it only fires a
+cancellation signal when the client *disconnects*, so a client that stays
+connected and reads slowly could have a fast upstream buffer an entire response
+ahead of it — up to the 64 MiB per-stream cap, times the 32 streams the node
+admits. Bounding it also collapses the two cases into one mechanism: `send`
+blocks while the consumer is merely slow and fails only once it is gone, so
+back-pressure and cancellation are the same call.
 
 A failed send is not the only signal, because it only fires when there is
 something to send. A sink also answers `is_live()` — backed by a flag the
@@ -514,6 +531,20 @@ all — name first, `arguments` in pieces after it. They are reassembled by
 fragment `index` and emitted as `stream-event::tool-call` once the stream ends,
 because a call is only dispatchable complete; dropping them would make the
 request look like a model that answered with silence.
+
+`arguments` is a JSON *string* in OpenAI's schema, but real servers send the
+object itself — some vLLM and Ollama builds do, and a proxy that re-serialises a
+response can too. Reading only the string form silently dropped the arguments
+and dispatched the call with `{}`, which is worse than failing: the tool runs,
+with defaults, and looks like the model asked for that. So an object or array
+value is re-serialised into the string the schema calls for, `null` and absent
+both become `{}` (the schema's own reading of "no arguments"), and a scalar that
+is neither — a bare number, a boolean — fails the response instead of being
+coerced, because there is no honest argument object to build from one. On the
+streaming path the same rule applies per fragment, and a fragment that cannot be
+used marks the call rather than the stream: the failure surfaces when the call
+is assembled rather than mid-frame, so the message names the offending call's
+index instead of pointing at a line of SSE.
 
 The structured channel is also what keeps time-to-first-token on tool-enabled
 requests. With calls confined to the text channel, prose had to be accumulated

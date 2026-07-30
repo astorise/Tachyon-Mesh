@@ -3444,10 +3444,12 @@ impl CandleLlmRuntime {
                 if target_token != proposed_token
                     || generated.len() == request.max_new_tokens
                     || context_ids.len() >= self.limits.max_position_embeddings
-                    // Checked inside the acceptance loop too: one round can
-                    // verify up to `draft_tokens` proposals, so testing only at
-                    // the top would still run that many target forward passes
-                    // after the stream was abandoned.
+                    // Both cancellation signals are checked inside the
+                    // acceptance loop, not only at the top of the round: one
+                    // round verifies up to `draft_tokens` proposals, each a
+                    // target forward pass, so testing once per round would let
+                    // an expired or abandoned request run all of them.
+                    || Instant::now() >= request.deadline
                     || sink.stopped()
                 {
                     break;
@@ -3506,6 +3508,14 @@ impl CandleLlmRuntime {
         let mut context = context_ids.to_vec();
         let mut tokens = Vec::with_capacity(max_tokens);
         for _ in 0..max_tokens {
+            // Each proposal is a full forward, and `draft_tokens` is an
+            // operator-supplied count with no small ceiling — so a round
+            // entered just before expiry could otherwise hold the lane for many
+            // of them. Whatever has been proposed so far is still usable: the
+            // caller verifies the prefix it got.
+            if Instant::now() >= request.deadline {
+                break;
+            }
             let Some(next) = self.greedy_next_token_id(&context, request)? else {
                 break;
             };
