@@ -26,7 +26,7 @@
 //! `TACHYON_UPSTREAM_API_KEY`. Absent both, the request is sent unauthenticated
 //! — the common case for a llama.cpp server on a trusted mesh link.
 
-use std::{env, io::BufRead, time::Duration};
+use std::{env, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -435,8 +435,28 @@ pub(crate) struct UpstreamOpenAiRuntime {
     alias: String,
     endpoint: UpstreamEndpoint,
     api_key: Option<String>,
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
+    /// Drives the async client from this backend's synchronous entry points.
+    ///
+    /// `reqwest::blocking` used to do exactly this behind the scenes, on a
+    /// thread of its own. The reason for owning it here instead is that the
+    /// blocking wrapper exposes no per-read deadline: a client that leaves
+    /// before the upstream's first SSE frame could not be noticed until a frame
+    /// arrived, and the request held its admission permit meanwhile. Owning the
+    /// runtime lets the read loop wrap each poll in a timeout and ask the sink
+    /// whether anyone is still listening.
+    runtime: tokio::runtime::Runtime,
 }
+
+/// How long the stream reader waits on the socket before checking whether the
+/// consumer is still there.
+///
+/// Not a timeout on the request — the binding's `timeout_ms` remains that, and
+/// exceeding this interval is not an error. It is only how often a *silent*
+/// upstream lets the loop come up for air. Short enough that an abandoned
+/// request releases its permit promptly, long enough that an idle stream costs
+/// a handful of wakeups a minute rather than a spin.
+const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 impl UpstreamOpenAiRuntime {
     /// Claim a binding whose `path` uses the `openai:` scheme.
@@ -449,11 +469,21 @@ impl UpstreamOpenAiRuntime {
         let Some(endpoint) = UpstreamEndpoint::parse(alias, path)? else {
             return Ok(None);
         };
-        // `reqwest::blocking` spins its own runtime on a private thread. That is
-        // safe here because inference executes on the scheduler's dedicated OS
-        // thread (`AcceleratorScheduler::new`'s `tachyon-*-dispatcher`), never
-        // inside a tokio worker.
-        let client = reqwest::blocking::Client::builder()
+        // A current-thread runtime, driven by whichever thread makes the call.
+        // Inference executes on the scheduler's dedicated OS thread
+        // (`AcceleratorScheduler::new`'s `tachyon-*-dispatcher`) and never
+        // inside a tokio worker, so `block_on` here cannot be re-entrant — the
+        // same invariant `reqwest::blocking` required, now stated where it is
+        // relied upon. One current-thread runtime also costs less than the
+        // background thread the blocking wrapper span up per client.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| UpstreamError::InvalidBinding {
+                alias: alias.to_owned(),
+                detail: format!("could not build the upstream HTTP runtime: {error}"),
+            })?;
+        let client = reqwest::Client::builder()
             .timeout(endpoint.timeout)
             .build()
             .map_err(|error| UpstreamError::InvalidBinding {
@@ -465,6 +495,7 @@ impl UpstreamOpenAiRuntime {
             api_key: api_key_for(alias),
             endpoint,
             client,
+            runtime,
         }))
     }
 
@@ -617,12 +648,12 @@ impl UpstreamOpenAiRuntime {
         Ok((Value::Object(body), timeout))
     }
 
-    fn post(
+    async fn post(
         &self,
         suffix: &str,
         body: &Value,
         timeout: Duration,
-    ) -> Result<reqwest::blocking::Response, UpstreamError> {
+    ) -> Result<reqwest::Response, UpstreamError> {
         let url = self.endpoint.url(suffix);
         // Per request, not per client: the binding's `timeout_ms` is the
         // ceiling, and a caller's `max_generation_ms` tightens it for this call
@@ -631,11 +662,14 @@ impl UpstreamOpenAiRuntime {
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
-        let response = request.send().map_err(|error| UpstreamError::Transport {
-            alias: self.alias.clone(),
-            endpoint: url.clone(),
-            detail: error.to_string(),
-        })?;
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| UpstreamError::Transport {
+                alias: self.alias.clone(),
+                endpoint: url.clone(),
+                detail: error.to_string(),
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -643,11 +677,7 @@ impl UpstreamOpenAiRuntime {
             // would allocate the whole error page first, so a broken upstream
             // returning a huge body could exhaust host memory before the
             // truncation below ever ran.
-            let mut raw = Vec::new();
-            let _ = std::io::copy(
-                &mut std::io::Read::take(response, MAX_ERROR_BODY_BYTES),
-                &mut raw,
-            );
+            let raw = read_bounded(&mut response, MAX_ERROR_BODY_BYTES).await;
             let body = String::from_utf8_lossy(&raw).chars().collect::<String>();
             return Err(UpstreamError::Status {
                 alias: self.alias.clone(),
@@ -695,8 +725,10 @@ impl UpstreamOpenAiRuntime {
             });
         };
         let (body, timeout) = self.chat_body(prompt, false)?;
-        let response = self.post("/chat/completions", &body, timeout)?;
-        let payload: Value = read_json(&self.alias, response)?;
+        let payload: Value = self.runtime.block_on(async {
+            let mut response = self.post("/chat/completions", &body, timeout).await?;
+            read_json(&self.alias, &mut response).await
+        })?;
         // Every OpenAI-shaped upstream returns `usage` on the buffered route,
         // so unlike the streaming path this is reliably populated.
         let usage = Self::read_usage(&payload);
@@ -775,12 +807,24 @@ impl UpstreamOpenAiRuntime {
         // emitted after streamed prose is unparseable — so offering tools cost
         // the whole time-to-first-token even on the requests that never
         // produced a call.
-        let response = self.post("/chat/completions", &body, timeout)?;
+        // The whole read runs inside one `block_on`, so the sink is borrowed
+        // across await points on a single thread — which is exactly why the
+        // runtime is current-thread. Nothing here needs to be `Send`.
+        self.runtime
+            .block_on(self.stream_response(body, timeout, sink))
+    }
+
+    async fn stream_response(
+        &self,
+        body: Value,
+        timeout: Duration,
+        sink: &mut dyn StreamSink,
+    ) -> Result<StreamOutcome, UpstreamError> {
+        let mut response = self.post("/chat/completions", &body, timeout).await?;
 
         // Bound the whole stream, so an upstream that never terminates cannot
         // grow the reader without limit.
-        let mut reader = std::io::BufReader::new(std::io::Read::take(response, MAX_STREAM_BYTES));
-        let mut line = String::new();
+        let mut reader = SseReader::default();
         let mut saw_done = false;
         let mut usage = None;
         let mut finish_reason = None;
@@ -791,33 +835,51 @@ impl UpstreamOpenAiRuntime {
         let mut abandoned = false;
         let mut streamed_tool_calls = StreamedToolCalls::default();
         loop {
-            line.clear();
-            // Bound the *read*, not just the result. A plain `read_line` grows
-            // its buffer until a newline, so an upstream that never sends one
-            // could force allocation all the way to `MAX_STREAM_BYTES` before
-            // any size check ran — and several concurrent streams would
-            // multiply that.
-            let read = std::io::Read::take(
-                std::io::Read::by_ref(&mut reader),
-                MAX_SSE_FRAME_BYTES as u64 + 1,
-            )
-            .read_line(&mut line)
-            .map_err(|error| UpstreamError::Transport {
-                alias: self.alias.clone(),
-                endpoint: self.endpoint.url("/chat/completions"),
-                detail: format!("failed to read the upstream stream: {error}"),
-            })?;
-            if read == 0 {
-                break;
-            }
-            if line.len() > MAX_SSE_FRAME_BYTES {
-                return Err(UpstreamError::MalformedResponse {
-                    alias: self.alias.clone(),
-                    detail: format!(
-                        "upstream SSE frame exceeds the {MAX_SSE_FRAME_BYTES}-byte limit"
-                    ),
-                });
-            }
+            // The cancellable read. Each poll waits at most
+            // `LIVENESS_POLL_INTERVAL` for socket activity; when it elapses the
+            // loop asks the sink whether anyone is still listening and goes
+            // back to waiting if so. That is what closes the window a blocking
+            // `read_line` left open: a client that leaves before the upstream's
+            // *first* frame used to go unnoticed until a frame arrived, holding
+            // an admission permit for up to the binding's whole `timeout_ms`.
+            //
+            // The interval is not a deadline. Exceeding it is the normal case
+            // for a model still thinking, and only the binding's timeout ends
+            // the request.
+            let line = match reader.next_line(&mut response).await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(SseReadError::Idle) => {
+                    if sink.is_live() {
+                        continue;
+                    }
+                    abandoned = true;
+                    break;
+                }
+                Err(SseReadError::FrameTooLarge) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "upstream SSE frame exceeds the {MAX_SSE_FRAME_BYTES}-byte limit"
+                        ),
+                    })
+                }
+                Err(SseReadError::StreamTooLarge) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "upstream SSE stream exceeds the {MAX_STREAM_BYTES}-byte limit"
+                        ),
+                    })
+                }
+                Err(SseReadError::Transport(detail)) => {
+                    return Err(UpstreamError::Transport {
+                        alias: self.alias.clone(),
+                        endpoint: self.endpoint.url("/chat/completions"),
+                        detail: format!("failed to read the upstream stream: {detail}"),
+                    })
+                }
+            };
             let Some(payload) = line.trim().strip_prefix("data:") else {
                 // Blank separator lines and SSE comments carry no delta.
                 continue;
@@ -985,8 +1047,12 @@ impl UpstreamOpenAiRuntime {
     /// Forward a single embedding request to the upstream `/embeddings` route.
     pub(crate) fn embed(&self, input: &str) -> Result<Vec<f32>, UpstreamError> {
         let body = json!({"model": self.endpoint.model, "input": input});
-        let response = self.post("/embeddings", &body, self.endpoint.timeout)?;
-        let payload: Value = read_json(&self.alias, response)?;
+        let payload: Value = self.runtime.block_on(async {
+            let mut response = self
+                .post("/embeddings", &body, self.endpoint.timeout)
+                .await?;
+            read_json(&self.alias, &mut response).await
+        })?;
         let embedding = payload
             .get("data")
             .and_then(Value::as_array)
@@ -1317,16 +1383,122 @@ impl StreamedToolCalls {
 
 /// Read a bounded JSON body, so a hostile or broken upstream cannot pull the
 /// host into an unbounded allocation.
-fn read_json(alias: &str, response: reqwest::blocking::Response) -> Result<Value, UpstreamError> {
+/// Why a poll of the SSE stream produced no line.
+#[derive(Debug)]
+enum SseReadError {
+    /// The socket was quiet for `LIVENESS_POLL_INTERVAL`. Not a failure — the
+    /// caller checks whether its consumer is still there and resumes.
+    Idle,
+    FrameTooLarge,
+    StreamTooLarge,
+    Transport(String),
+}
+
+/// Line framing over an async response body.
+///
+/// Replaces `BufRead::read_line`, which cannot be interrupted: the whole point
+/// is that a *quiet* socket must still hand control back so the caller can ask
+/// whether anyone is listening.
+///
+/// The two size caps that the blocking reader enforced are kept, and for the
+/// same reasons. `MAX_SSE_FRAME_BYTES` bounds one line, because a stream that
+/// never sends a newline would otherwise grow the buffer without limit;
+/// `MAX_STREAM_BYTES` bounds the whole response, because a stream that never
+/// ends would otherwise run forever.
+#[derive(Default)]
+struct SseReader {
+    /// Bytes received but not yet consumed as a complete line.
+    buffered: Vec<u8>,
+    /// Total bytes taken off the socket, against `MAX_STREAM_BYTES`.
+    consumed: u64,
+    /// Set once the body is exhausted, so a trailing line with no newline is
+    /// still delivered exactly once.
+    eof: bool,
+}
+
+impl SseReader {
+    /// The next complete line, or `Ok(None)` at end of stream.
+    ///
+    /// `Err(Idle)` means only that nothing arrived within the poll interval.
+    async fn next_line(
+        &mut self,
+        response: &mut reqwest::Response,
+    ) -> Result<Option<String>, SseReadError> {
+        loop {
+            if let Some(line) = self.take_line()? {
+                return Ok(Some(line));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            // A quiet socket returns control to the caller rather than parking
+            // here until the request timeout.
+            let chunk = match tokio::time::timeout(LIVENESS_POLL_INTERVAL, response.chunk()).await {
+                Err(_elapsed) => return Err(SseReadError::Idle),
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => {
+                    self.eof = true;
+                    continue;
+                }
+                Ok(Err(error)) => return Err(SseReadError::Transport(error.to_string())),
+            };
+            self.consumed = self.consumed.saturating_add(chunk.len() as u64);
+            if self.consumed > MAX_STREAM_BYTES {
+                return Err(SseReadError::StreamTooLarge);
+            }
+            self.buffered.extend_from_slice(&chunk);
+        }
+    }
+
+    /// Split one line out of the buffer, if a whole one is there.
+    fn take_line(&mut self) -> Result<Option<String>, SseReadError> {
+        let Some(end) = self.buffered.iter().position(|byte| *byte == b'\n') else {
+            // No newline yet. The buffer is a partial line, so it is bounded by
+            // the frame cap rather than by the stream cap — several concurrent
+            // streams each holding a near-`MAX_STREAM_BYTES` partial line is
+            // the allocation this prevents.
+            if self.buffered.len() > MAX_SSE_FRAME_BYTES {
+                return Err(SseReadError::FrameTooLarge);
+            }
+            if self.eof && !self.buffered.is_empty() {
+                // A final line the upstream never terminated. Delivered once,
+                // then the buffer is empty and the next call reports EOF.
+                let line = std::mem::take(&mut self.buffered);
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            return Ok(None);
+        };
+        if end > MAX_SSE_FRAME_BYTES {
+            return Err(SseReadError::FrameTooLarge);
+        }
+        let mut line: Vec<u8> = self.buffered.drain(..=end).collect();
+        line.pop();
+        Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+    }
+}
+
+/// Read at most `limit` bytes of a response body, stopping as soon as the cap
+/// is reached rather than buffering the whole thing and truncating after.
+///
+/// A partial read is deliberately not an error: every caller wants "as much as
+/// is safe to hold", and a transport failure partway through an error page is
+/// still worth reporting what arrived.
+async fn read_bounded(response: &mut reqwest::Response, limit: u64) -> Vec<u8> {
     let mut body = Vec::new();
-    std::io::copy(
-        &mut std::io::Read::take(response, MAX_RESPONSE_BYTES + 1),
-        &mut body,
-    )
-    .map_err(|error| UpstreamError::MalformedResponse {
-        alias: alias.to_owned(),
-        detail: format!("failed to read the upstream response body: {error}"),
-    })?;
+    while (body.len() as u64) < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body.truncate(limit as usize);
+    body
+}
+
+async fn read_json(alias: &str, response: &mut reqwest::Response) -> Result<Value, UpstreamError> {
+    // One byte past the cap, so a body sitting exactly on it is still accepted
+    // while anything larger is detectable.
+    let body = read_bounded(response, MAX_RESPONSE_BYTES + 1).await;
     if body.len() as u64 > MAX_RESPONSE_BYTES {
         return Err(UpstreamError::MalformedResponse {
             alias: alias.to_owned(),
@@ -1422,6 +1594,69 @@ impl FakeUpstream {
                     let _ = stream.flush();
                 });
             }
+        });
+
+        Self { base_url, requests }
+    }
+
+    /// A server that answers the request headers and then says nothing.
+    ///
+    /// Chunked, with no chunk ever sent, so the client is committed to a
+    /// successful response and then left waiting. This is the case a blocking
+    /// `read_line` could not escape: the socket is open, the upstream is alive,
+    /// and no byte of body will arrive for `hold`.
+    #[cfg(test)]
+    pub(crate) fn start_silent(hold: Duration) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (tx, requests) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Read, Write};
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(stream);
+            let mut target = String::new();
+            let mut content_length = 0usize;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                if target.is_empty() {
+                    target = line.trim().to_owned();
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+                line.clear();
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let _ = tx.send((target, String::from_utf8_lossy(&body).into_owned()));
+
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            let _ = stream.flush();
+            // Hold the connection open without sending a single chunk.
+            std::thread::sleep(hold);
+            // Then close the stream the way a real upstream does: a `[DONE]`
+            // sentinel, then the terminating chunk. Both matter — a truncated
+            // body surfaces as a transport error and a missing sentinel as a
+            // malformed one, and either would mask what the test measures,
+            // which is *when* the reader gave up rather than how it failed.
+            let sentinel = "data: [DONE]\n\n";
+            let _ = stream
+                .write_all(format!("{:x}\r\n{sentinel}\r\n0\r\n\r\n", sentinel.len()).as_bytes());
+            let _ = stream.flush();
         });
 
         Self { base_url, requests }
@@ -2271,6 +2506,62 @@ mod tests {
         fn is_live(&mut self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn a_silent_upstream_still_notices_a_client_that_already_left() {
+        // The window the per-frame liveness probe could not close: the client
+        // leaves *before* the upstream's first frame, so there is no frame to
+        // probe on. A blocking `read_line` parked here until the binding's
+        // whole `timeout_ms` — up to an hour — holding an admission permit the
+        // node only has 32 of.
+        let upstream = FakeUpstream::start_silent(Duration::from_secs(30));
+        // A 30s binding timeout, so "returned because it was cancelled" and
+        // "returned because the request timed out" cannot be confused.
+        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+
+        let started = std::time::Instant::now();
+        let mut sink = DepartedSink::default();
+        let outcome = backend.generate_streaming(&[b"go"], &mut sink);
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_ok(),
+            "an abandoned stream is not a failure, it is a stream nobody wanted: {outcome:?}"
+        );
+        assert_eq!(
+            sink.emitted, 0,
+            "a silent upstream produced nothing, so nothing should have been emitted"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the read must give up on a departed client within a poll interval or two, \
+             not hold the permit for the binding timeout; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_silent_upstream_is_not_abandoned_while_the_client_is_still_there() {
+        // The other half of the contract: the poll interval is not a deadline.
+        // A model that thinks for longer than one interval must not be treated
+        // as an abandoned request, or every slow generation would be cut off.
+        let upstream = FakeUpstream::start_silent(LIVENESS_POLL_INTERVAL * 4);
+        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+
+        let started = std::time::Instant::now();
+        let mut captured = CapturedStream::default();
+        let outcome = backend.generate_streaming(&[b"go"], &mut captured.sink());
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_ok(),
+            "a quiet socket is not an error: {outcome:?}"
+        );
+        assert!(
+            elapsed >= LIVENESS_POLL_INTERVAL * 3,
+            "a live consumer must keep waiting across poll intervals, not be cut off at the \
+             first one; took {elapsed:?}"
+        );
     }
 
     #[test]

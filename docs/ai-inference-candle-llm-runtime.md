@@ -502,11 +502,40 @@ something to send. A sink also answers `is_live()` — backed by a flag the
 per SSE frame, so a stream of role-only openings, usage frames or keep-alives
 cannot run to completion for a client that has already left.
 
-One window stays open: the read that waits for the upstream's *first* frame is
-uninterruptible, so a client that leaves before any frame arrives is noticed
-only when one does. Closing it needs a cancellable read, which the blocking HTTP
-client does not expose; until then the exposure is bounded by the binding's
-`timeout_ms` (and by a caller's `max_generation_ms`, which tightens it).
+That still left one window, and closing it is why this backend no longer uses
+`reqwest::blocking`. A frame-by-frame probe cannot help before the *first*
+frame: a client leaving while the upstream is still thinking was noticed only
+once a frame arrived, and until then the request held its admission permit —
+for up to the binding's whole `timeout_ms`, of which the node has 32 to give.
+The blocking client has no per-read deadline (`read_timeout` exists only on the
+async builder), so there was no way to wake the read periodically.
+
+So the backend owns a current-thread tokio runtime and drives the async client
+through it. The buffered and embedding paths simply `block_on`, exactly as the
+blocking wrapper did internally, and share one connection pool. The streaming
+path gets what it actually needed: each poll of the socket is wrapped in a
+`LIVENESS_POLL_INTERVAL` (500 ms) timeout, and when that elapses the loop asks
+the sink whether anyone is still listening before going back to waiting.
+
+The interval is emphatically **not** a deadline. Exceeding it is the normal case
+for a model still generating its first token, and only the binding's `timeout_ms`
+ends a request — a test asserts that a live consumer keeps waiting across
+several intervals, because getting this wrong would cut off every slow
+generation. What the interval buys is that an *abandoned* request releases its
+permit within a poll or two instead of holding it for the timeout.
+
+`BufRead::read_line` had to go with the blocking client, since the whole point
+is that a quiet socket must hand control back. `SseReader` frames lines over
+`Response::chunk()` and keeps both size caps the old reader enforced, for the
+same reasons: `MAX_SSE_FRAME_BYTES` bounds one line, because a stream that never
+sends a newline would otherwise grow the buffer without limit, and
+`MAX_STREAM_BYTES` bounds the whole response, because a stream that never ends
+would otherwise run forever.
+
+One invariant is now stated where it is relied upon rather than assumed:
+`block_on` cannot be re-entrant, so this backend must never run inside a tokio
+worker. It does not — inference executes on the scheduler's dedicated OS thread
+— and that was already the requirement `reqwest::blocking` imposed.
 
 One consequence is worth stating because it is easy to get wrong: with nothing
 enqueued on the `Network` lane, its scheduler queue depth would be permanently

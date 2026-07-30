@@ -803,6 +803,21 @@ refused rather than queued indefinitely.
 - **THEN** the backend still observes the departure and abandons the response,
   rather than running to completion because nothing was emitted to fail on
 
+#### Scenario: A silent upstream still notices a client that already left
+
+- **WHEN** a streaming client disconnects before the upstream has sent its first
+  frame, and the upstream stays silent
+- **THEN** the backend notices within a poll interval and abandons the request,
+  rather than waiting for a frame that may not come until the binding's
+  `timeout_ms` — which would hold an admission permit the node has few of
+
+#### Scenario: A quiet socket is not an abandoned request
+
+- **WHEN** the upstream sends nothing for longer than one poll interval and the
+  consumer is still there
+- **THEN** the read keeps waiting, because the interval is a liveness check and
+  not a deadline; only the binding's `timeout_ms` ends a request
+
 #### Scenario: An abandoned stream releases its permit at once
 
 - **WHEN** a streaming client disconnects and the component drops its
