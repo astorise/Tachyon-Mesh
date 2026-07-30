@@ -578,6 +578,12 @@ pub(crate) struct GenerationError {
     /// a decode error, an unknown alias, a rejected request — because inventing
     /// a status for those would misreport a local fault as a remote one.
     pub(crate) upstream_status: Option<u16>,
+    /// The caller's request was rejected before any backend ran it. Carried
+    /// separately from `upstream_status` because a locally refused request has
+    /// no remote status to relay, yet is just as much the caller's to fix —
+    /// and reporting it as a server fault sends clients into retry loops over
+    /// requests that cannot succeed.
+    pub(crate) invalid_request: bool,
 }
 
 impl GenerationError {
@@ -585,6 +591,16 @@ impl GenerationError {
         Self {
             message: message.into(),
             upstream_status: None,
+            invalid_request: false,
+        }
+    }
+
+    /// A local rejection of what the caller asked for.
+    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: None,
+            invalid_request: true,
         }
     }
 
@@ -593,12 +609,26 @@ impl GenerationError {
     /// unmodified, so the typed cause survives the trip through the scheduler
     /// and the backend trait and can be read back here.
     fn from_anyhow(error: &anyhow::Error) -> Self {
+        // Both typed errors survive the trip through `anyhow`, so the
+        // classification is read from the cause rather than guessed from the
+        // message: a request the local runtime refused and one a provider
+        // refused are both the caller's to fix, and neither is a host fault.
+        let invalid_request = error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<candle_llm_runtime::CandleLlmError>(),
+                Some(candle_llm_runtime::CandleLlmError::InvalidRequest { .. })
+            ) || matches!(
+                cause.downcast_ref::<upstream_openai::UpstreamError>(),
+                Some(upstream_openai::UpstreamError::InvalidRequest { .. })
+            )
+        });
         Self {
             message: error.to_string(),
             upstream_status: error
                 .chain()
                 .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>())
                 .and_then(upstream_openai::UpstreamError::http_status),
+            invalid_request,
         }
     }
 }
@@ -793,6 +823,16 @@ pub(crate) struct AiInferenceRuntime {
     /// lazily loaded from `{root}/{alias}` — gated upstream by the route's sealed
     /// `allowed_model_aliases`. `None` disables lazy loading (tests, no broker).
     dynamic_models_root: Option<PathBuf>,
+    /// Sealed metadata for the `dynamic` bindings, keyed by alias.
+    ///
+    /// A dynamic binding is skipped at boot because its files do not exist yet,
+    /// but the rest of what the manifest said about it — the device, the
+    /// hardware strategy, the QoS class — is a sealed deployment decision that
+    /// outlives the upload. Discarding it and rebuilding a bare CPU binding at
+    /// first use meant a deployment that asked for `cuda` silently got CPU:
+    /// the model still answered, just on the wrong hardware, at RAM cost and
+    /// a fraction of the speed, with nothing in the response to say so.
+    dynamic_bindings: Arc<HashMap<String, IntegrityModelBinding>>,
     /// Bounded concurrency for `openai:` bindings, which run off the batch
     /// scheduler entirely. Shared across clones of the runtime so the cap is a
     /// node-wide property.
@@ -860,6 +900,7 @@ impl AiInferenceRuntime {
         .map_err(|detail| anyhow!("Integrity Validation Failed: {detail}"))?;
 
         let mut models = HashMap::new();
+        let mut dynamic_bindings = HashMap::new();
         let mut sealed_aliases = std::collections::HashSet::new();
 
         for route in &config.routes {
@@ -876,6 +917,12 @@ impl AiInferenceRuntime {
                     // model is lazily materialised from `{dynamic_models_root}/{alias}`
                     // by `ensure_model_loaded` on first use. Skipping eager load
                     // here lets the host boot before the model has been uploaded.
+                    //
+                    // The binding is kept, though: `ensure_model_loaded` needs
+                    // its device and strategy to honour what the manifest
+                    // sealed. Only `path` is ignored, because the upload root
+                    // decides where the files land.
+                    dynamic_bindings.insert(binding.alias.clone(), binding.clone());
                     continue;
                 }
                 if binding.path.is_empty() {
@@ -896,6 +943,7 @@ impl AiInferenceRuntime {
         Ok(Self {
             schedulers,
             models: Arc::new(RwLock::new(models)),
+            dynamic_bindings: Arc::new(dynamic_bindings),
             dynamic_models_root: None,
             upstream_admission: Arc::new(UpstreamAdmission::from_env()),
         })
@@ -930,13 +978,20 @@ impl AiInferenceRuntime {
         if !model_dir.is_dir() {
             return Err(format!("model alias `{alias}` is not loaded"));
         }
+        // The sealed binding decides everything except where the files are —
+        // that is the upload root's to say. An alias with no dynamic binding at
+        // all is a bare broker upload, which has no manifest opinion to honour
+        // and gets the conservative CPU default.
+        let sealed = self.dynamic_bindings.get(alias);
         let binding = IntegrityModelBinding {
             alias: alias.to_owned(),
             path: model_dir.to_string_lossy().into_owned(),
-            device: crate::ModelDevice::Cpu,
-            qos: RouteQos::Standard,
+            device: sealed.map_or(crate::ModelDevice::Cpu, |binding| binding.device.clone()),
+            qos: sealed.map_or(RouteQos::Standard, |binding| binding.qos),
             dynamic: false,
-            hardware_strategy: Default::default(),
+            hardware_strategy: sealed
+                .map(|binding| binding.hardware_strategy.clone())
+                .unwrap_or_default(),
         };
         let backend_model: Arc<dyn BackendModel> =
             Arc::new(CandleBackendModel::load(&binding).map_err(|error| error.to_string())?);

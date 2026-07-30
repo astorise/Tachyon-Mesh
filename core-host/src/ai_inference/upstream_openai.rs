@@ -718,7 +718,31 @@ impl UpstreamOpenAiRuntime {
                 alias: self.alias.clone(),
                 detail: "response has no `choices[0].message` object".to_owned(),
             })?;
-        let content = message.get("content").and_then(Value::as_str);
+        // Absent and `null` both mean "this message carried no text", which is
+        // the normal shape beside `tool_calls`. A *present* non-string — an
+        // object, an array — is neither: reading it with `as_str` alone
+        // reported it as absent, so the tool-call branch below returned empty
+        // bytes while reporting a successful structured call, and the caller
+        // had no way to know an assistant message had been discarded. The
+        // streamed path draws exactly this line on `delta.content`; the
+        // buffered one has to draw it too, or the same response is rejected or
+        // silently emptied depending on which path served it.
+        let content = match message.get("content") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| UpstreamError::MalformedResponse {
+                            alias: self.alias.clone(),
+                            detail: format!(
+                                "response has a non-string `choices[0].message.content` of type {}",
+                                json_type_name(value)
+                            ),
+                        })?,
+                )
+            }
+        };
 
         // A tool call carries `content: null`, so requiring a content string
         // would turn every successful tool call into a malformed-response
@@ -866,10 +890,30 @@ impl UpstreamOpenAiRuntime {
             if let Some(reported) = Self::read_usage(&frame) {
                 usage = Some(reported);
             }
-            let choice = frame
-                .get("choices")
-                .and_then(Value::as_array)
-                .and_then(|choices| choices.first());
+            // Absent is a usage-only frame and an empty array is a legal
+            // keep-alive, so neither is an error. A *present* non-array is:
+            // `as_array` alone turned `{"choices":{"delta":{"content":"…"}}}`
+            // into no choice at all, so the frame's content was dropped and a
+            // following `[DONE]` still completed the stream successfully with
+            // the guest reporting an ordinary `stop`. Silently losing part of
+            // an answer is worse than failing the request.
+            let choices = match frame.get("choices") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    Some(
+                        value
+                            .as_array()
+                            .ok_or_else(|| UpstreamError::MalformedResponse {
+                                alias: self.alias.clone(),
+                                detail: format!(
+                                    "streamed frame has a non-array `choices` of type {}",
+                                    json_type_name(value)
+                                ),
+                            })?,
+                    )
+                }
+            };
+            let choice = choices.and_then(|choices| choices.first());
             // Sent on the last content-bearing frame, before `[DONE]`. Keeping
             // it is what lets the caller tell a completion that finished from
             // one the upstream truncated at its own token limit.
@@ -2109,6 +2153,92 @@ mod tests {
         assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
         assert!(
             error.to_string().contains("must be an array"),
+            "the error should name the shape problem, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_streamed_choices_value_that_is_not_an_array_fails_the_stream() {
+        // `as_array` alone turned a present object into *no choice at all*, so
+        // the frame's content was dropped, `[DONE]` still completed the stream,
+        // and the guest reported an ordinary `stop` over a truncated answer.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":{"delta":{"content":"answer"}}}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a non-array `choices` is not an absent one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("non-array `choices`"),
+            "the error should name the shape problem, got: {error}"
+        );
+        assert!(
+            captured.content.is_empty(),
+            "nothing may be emitted from a frame that could not be read"
+        );
+    }
+
+    #[test]
+    fn a_usage_only_frame_without_choices_is_not_an_error() {
+        // The other side of the rule: absent `choices` is the normal shape of a
+        // usage frame, and rejecting it would fail every stream that reports
+        // token counts.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+                "\n\n",
+                r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a usage frame carries no choices and is not malformed");
+        assert_eq!(captured.content.concat(), "hi");
+        assert_eq!(
+            outcome.usage.expect("usage is reported").completion_tokens,
+            1
+        );
+    }
+
+    #[test]
+    fn a_buffered_content_value_that_is_not_a_string_fails_beside_tool_calls() {
+        // With valid `tool_calls` present, `as_str` reported a *present* object
+        // as absent and the branch returned empty bytes while reporting a
+        // successful structured call — the assistant's message silently gone.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            concat!(
+                r#"{"choices":[{"message":{"content":{"text":"hi"},"tool_calls":"#,
+                r#"[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#,
+                r#"}}]}"#,
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("a non-string content value is not an absent one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("non-string"),
             "the error should name the shape problem, got: {error}"
         );
     }

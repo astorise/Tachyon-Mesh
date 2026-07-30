@@ -40,7 +40,7 @@ struct StorageComponentState {
     core_store_path: PathBuf,
 }
 
-const AI_MODELS_REGISTRY_TABLE: &str = "ai-models-registry";
+pub(crate) const AI_MODELS_REGISTRY_TABLE: &str = "ai-models-registry";
 
 struct ComponentRequest {
     method: String,
@@ -361,6 +361,15 @@ struct RegistryModelInfo<'a> {
     /// and returns already-structured calls).
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_parser: Option<&'a str>,
+    /// Set on a *reservation* row: the alias is still the manifest's, but no
+    /// runtime is serving it right now. Written for the length of a hot-reload
+    /// swap, and overwritten by the real row when publication follows.
+    ///
+    /// `guest-openai` filters these out, so the alias 404s while it is set —
+    /// the transient absence the withdrawal wants — while `row_is_config_owned`
+    /// still answers `true`, so an upload cannot claim the alias in the gap.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    withdrawn: bool,
 }
 
 /// The tool-call dialect to advertise for a configured binding.
@@ -516,6 +525,7 @@ pub(crate) fn publish_configured_model_bindings(
                 model_path: &binding.path,
                 source: Some(REGISTRY_SOURCE_CONFIG),
                 tool_call_parser: binding_tool_call_parser(&binding.path),
+                withdrawn: false,
             };
             let Ok(value) = serde_json::to_vec(&info) else {
                 continue;
@@ -656,6 +666,64 @@ pub(crate) fn write_uploaded_model_row(
     Ok(())
 }
 
+/// Apply a guest's write to the model registry, refusing rows a configured
+/// binding owns.
+///
+/// The rule itself is not new — `guest-openai` checks ownership before it
+/// registers, and `write_uploaded_model_row` checks it before an upload lands.
+/// What is new is *where*: a guest's `get` and `set` are two separate host
+/// transactions, so a reload publishing a configured row between them left the
+/// unconditional `set` to overwrite it, and the registry then advertised a
+/// registration while the configured backend answered — a prompt routed to an
+/// upstream the client never selected.
+///
+/// Enforcing it here closes that window and makes the rule hold for *any*
+/// component reaching this table, not only the one that remembers to ask.
+///
+/// Returns the sentinel below as its error so the guest can answer 409 rather
+/// than a blanket 500; `result<_, string>` is the only channel WIT gives us.
+pub(crate) fn apply_guest_registry_write(
+    core_store: &crate::store::CoreStore,
+    table: &str,
+    key: &str,
+    value: Option<Vec<u8>>,
+) -> std::result::Result<(), String> {
+    if table != AI_MODELS_REGISTRY_TABLE {
+        return match value {
+            Some(value) => core_store
+                .kv_partition_set(table, key, &value)
+                .map_err(|error| format!("{error:#}")),
+            None => core_store
+                .kv_partition_delete(table, key)
+                .map_err(|error| format!("{error:#}")),
+        };
+    }
+    let mut alias_taken = false;
+    core_store
+        .kv_partition_update(AI_MODELS_REGISTRY_TABLE, key, |current| {
+            if row_is_config_owned(current) {
+                alias_taken = true;
+                crate::store::KvPartitionUpdate::Keep
+            } else {
+                match value.clone() {
+                    Some(value) => crate::store::KvPartitionUpdate::Set(value),
+                    None => crate::store::KvPartitionUpdate::Delete,
+                }
+            }
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    if alias_taken {
+        return Err(format!(
+            "{GUEST_REGISTRY_ALIAS_TAKEN}: model alias `{key}` is claimed by a configured \
+             binding in the sealed manifest"
+        ));
+    }
+    Ok(())
+}
+
+/// Marker the guest matches on to turn an ownership refusal into a 409.
+pub(crate) const GUEST_REGISTRY_ALIAS_TAKEN: &str = "model-alias-claimed-by-config";
+
 /// Whether a registry row's raw bytes say the manifest publisher wrote it.
 /// Takes the value rather than the key so the caller can decide inside a
 /// transaction.
@@ -709,14 +777,48 @@ pub(crate) fn withdraw_changed_model_bindings(
         if incoming.get(&alias).is_some_and(|next| *next == path) {
             continue;
         }
+        // An alias the incoming config still owns is *reserved*, not released.
+        // Deleting it left the row unclaimed for the whole swap — worker
+        // replacement and runtime store, not a short window — and an upload
+        // committing in there succeeded, was reported installed, and was then
+        // overwritten by the incoming binding's publication. If the binding
+        // uses the broker directory, that upload's files also landed under a
+        // runtime that had not asked for them.
+        //
+        // The reservation is config-owned, so the upload path refuses it, and
+        // withdrawn, so the alias is not advertised until publication replaces
+        // it. An alias the incoming config does *not* own is genuinely
+        // released: nothing will republish it, and a reservation there would
+        // block the alias for good.
+        let reservation = incoming.contains_key(&alias).then(|| {
+            serde_json::to_vec(&RegistryModelInfo {
+                alias: &alias,
+                engine: "",
+                vram_required_mb: 0,
+                status: "reloading",
+                model_path: "",
+                source: Some(REGISTRY_SOURCE_CONFIG),
+                tool_call_parser: None,
+                withdrawn: true,
+            })
+        });
+        let reservation = match reservation {
+            Some(Ok(value)) => Some(value),
+            // Encoding cannot realistically fail, and if it did, releasing the
+            // alias is still better than leaving the previous row advertising a
+            // runtime that is about to stop answering.
+            Some(Err(_)) | None => None,
+        };
         // Ownership is re-read inside the transaction: an upload that landed
-        // since the scan owns its row, and a reload must not delete it.
+        // since the scan owns its row, and a reload must not touch it.
         if let Err(error) =
             core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
-                if row_is_config_owned(current) {
-                    crate::store::KvPartitionUpdate::Delete
-                } else {
-                    crate::store::KvPartitionUpdate::Keep
+                if !row_is_config_owned(current) {
+                    return crate::store::KvPartitionUpdate::Keep;
+                }
+                match reservation.clone() {
+                    Some(value) => crate::store::KvPartitionUpdate::Set(value),
+                    None => crate::store::KvPartitionUpdate::Delete,
                 }
             })
         {
@@ -776,6 +878,7 @@ impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
             model_path: &event.model_path,
             source: None,
             tool_call_parser: binding_tool_call_parser(&event.model_path),
+            withdrawn: false,
         };
         let value = serde_json::to_vec(&info)
             .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
@@ -1299,12 +1402,103 @@ mod configured_binding_registry_tests {
                 .expect("read")
                 .is_some()
         };
+        let row = |alias: &str| {
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+                .expect("read")
+                .map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).expect("row json"))
+        };
         assert!(
             present("unchanged"),
             "an identical binding keeps its row, so an unrelated reload costs no availability"
         );
-        assert!(!present("re-pointed"), "a changed binding is withdrawn");
-        assert!(!present("removed"), "a removed binding is withdrawn");
+
+        // A changed binding is withdrawn from *service* but not released: the
+        // incoming config still owns the alias, and the swap it is waiting on
+        // is long enough for an upload to land in the gap.
+        let reserved = row("re-pointed").expect("a re-pointed alias keeps a reservation row");
+        assert_eq!(
+            reserved["withdrawn"], true,
+            "a reservation must not be advertised — the alias 404s until publication"
+        );
+        assert_eq!(
+            reserved["source"], "config",
+            "and must stay config-owned, or an upload can claim it mid-swap"
+        );
+
+        // Which is the point: the same refusal an unchanged configured row
+        // gets, for the whole length of the reload.
+        let denied = write_uploaded_model_row(&store, "re-pointed", b"{}".to_vec())
+            .expect_err("an upload must not claim an alias the incoming config still owns");
+        assert!(
+            denied.contains("sealed manifest"),
+            "unexpected error: {denied}"
+        );
+
+        // A binding the incoming config dropped is genuinely released. Nothing
+        // will republish it, so a reservation there would block the alias for
+        // good.
+        assert!(
+            !present("removed"),
+            "a removed binding is withdrawn outright"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_guest_registration_cannot_overwrite_a_configured_row() {
+        let (store, dir) = temp_store();
+        let configured = config_with(vec![binding(
+            "coder",
+            "openai:http://127.0.0.1:8080/v1",
+            false,
+        )]);
+        publish_configured_model_bindings(&store, &configured);
+
+        // The guest checks ownership before it writes, but the check and the
+        // write are two separate host transactions — a reload publishing the
+        // alias in between would slip past it. The refusal that counts is this
+        // one, inside the write.
+        let registration = serde_json::json!({
+            "alias": "coder", "engine": "safetensors", "vramRequiredMb": 0,
+            "status": "available", "modelPath": "/models/mine",
+        });
+        let denied = apply_guest_registry_write(
+            &store,
+            AI_MODELS_REGISTRY_TABLE,
+            "coder",
+            Some(serde_json::to_vec(&registration).expect("serialize")),
+        )
+        .expect_err("a configured alias must not be overwritten by a registration");
+        assert!(
+            denied.contains(GUEST_REGISTRY_ALIAS_TAKEN),
+            "the guest turns this marker into a 409: {denied}"
+        );
+
+        // The configured row is intact — the registration did not partially
+        // land — so the listing still describes the backend that answers.
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "coder")
+            .expect("read")
+            .expect("the configured row survives");
+        let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
+        assert_eq!(row["source"], "config");
+        assert_eq!(row["modelPath"], "openai:http://127.0.0.1:8080/v1");
+
+        // A deregistration is refused the same way, from the same place.
+        let denied = apply_guest_registry_write(&store, AI_MODELS_REGISTRY_TABLE, "coder", None)
+            .expect_err("a configured alias must not be deregistered either");
+        assert!(denied.contains(GUEST_REGISTRY_ALIAS_TAKEN));
+
+        // And a free alias is unaffected: the rule guards configured rows, it
+        // does not make the table read-only.
+        apply_guest_registry_write(
+            &store,
+            AI_MODELS_REGISTRY_TABLE,
+            "mine",
+            Some(b"{\"alias\":\"mine\"}".to_vec()),
+        )
+        .expect("a free alias stays writable");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1465,6 +1659,7 @@ mod registry_casing_tests {
             model_path: "/data/tachyon_data/models/tinyllama",
             source: None,
             tool_call_parser: Some("qwen"),
+            withdrawn: false,
         };
         let bytes = serde_json::to_vec(&info).expect("serialize registry entry");
 
@@ -1513,6 +1708,7 @@ mod registry_casing_tests {
             model_path: "/data/tachyon_data/models/tinyllama",
             source: None,
             tool_call_parser: None,
+            withdrawn: false,
         };
         let value: serde_json::Value =
             serde_json::to_value(&info).expect("serialize registry entry");

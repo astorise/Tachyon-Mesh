@@ -557,6 +557,12 @@ struct TokenSink<'a> {
     /// it. Present so the sink can tell a generation that *ran out of budget*
     /// from one that finished — see [`TokenSink::finish_reason`].
     token_budget: Option<usize>,
+    /// Set when the decode loop ended the answer itself, on EOS or on a
+    /// caller's stop sequence. The token count alone cannot express this: an
+    /// answer whose EOS lands on exactly the budget's last token has both
+    /// spent its budget and finished normally, and only the loop knows which
+    /// of the two ended it.
+    ended_naturally: bool,
 }
 
 impl<'a> TokenSink<'a> {
@@ -567,6 +573,7 @@ impl<'a> TokenSink<'a> {
             prompt_tokens: 0,
             stopped: false,
             token_budget: None,
+            ended_naturally: false,
         }
     }
 
@@ -576,6 +583,12 @@ impl<'a> TokenSink<'a> {
 
     fn record_token_budget(&mut self, budget: usize) {
         self.token_budget = Some(budget);
+    }
+
+    /// Record that the model ended the answer — EOS, or a matched stop
+    /// sequence — rather than the budget ending it.
+    fn mark_natural_end(&mut self) {
+        self.ended_naturally = true;
     }
 
     /// Why decoding stopped, when this sink can tell.
@@ -592,7 +605,14 @@ impl<'a> TokenSink<'a> {
     /// finished normally. The upstream path already reported `length` here,
     /// so the same request was answered honestly or not depending on which
     /// backend served the alias.
+    /// A natural end wins over the count. The two coincide precisely when the
+    /// answer's last token is also its budget's last, and calling that
+    /// `length` tells the client a complete answer was truncated — the exact
+    /// misreport this reason exists to prevent, in the other direction.
     fn finish_reason(&self) -> Option<&'static str> {
+        if self.ended_naturally {
+            return None;
+        }
         self.token_budget
             .filter(|budget| self.completion_tokens >= *budget)
             .map(|_| "length")
@@ -3467,10 +3487,12 @@ impl CandleLlmRuntime {
                 })?;
                 let text = decoder.text();
                 if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
+                    sink.mark_natural_end();
                     emit_delta(sink, text, &mut emitted, stop_at);
                     return Ok(());
                 }
                 if self.is_eos_token(target_token) {
+                    sink.mark_natural_end();
                     emit_delta(sink, text, &mut emitted, text.len());
                     return Ok(());
                 }
@@ -3494,7 +3516,14 @@ impl CandleLlmRuntime {
         }
 
         let text = decoder.text();
-        let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+        // A stop sequence can still be sitting in the held-back tail when the
+        // budget runs out, and trimming it here is what completes the answer —
+        // so this is a natural end too, not a truncation.
+        let stop_at = find_earliest_stop(text, &request.stop);
+        if stop_at.is_some() {
+            sink.mark_natural_end();
+        }
+        let end = stop_at.unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
@@ -3961,6 +3990,9 @@ impl CandleLlmRuntime {
         // vocabulary copy nor the context resolution is paid `batch` times.
         let mut decoders = vec![IncrementalDecoder::from_tokenizer(&self.tokenizer); batch];
         let mut done = vec![false; batch];
+        // Parallel to `done`: which rows the model itself ended, as opposed to
+        // rows their budget ended.
+        let mut ended_naturally = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
         let max_new_tokens = requests
             .iter()
@@ -4013,6 +4045,10 @@ impl CandleLlmRuntime {
                     || find_earliest_stop(decoders[row].text(), &requests[row].stop).is_some()
                 {
                     done[row] = true;
+                    // Why it retired, not just that it did: a row whose EOS
+                    // lands on its budget's last token finished normally, and
+                    // the count below cannot tell that from a truncation.
+                    ended_naturally[row] = true;
                 }
             }
 
@@ -4049,7 +4085,8 @@ impl CandleLlmRuntime {
         decoders
             .iter()
             .zip(requests)
-            .map(|(decoder, request)| {
+            .zip(&ended_naturally)
+            .map(|((decoder, request), ended_naturally)| {
                 let text = decoder.text();
                 let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
                 let completion_tokens = decoder.tokens().len();
@@ -4064,8 +4101,9 @@ impl CandleLlmRuntime {
                 // Per row, not per batch: rows share a step count but not a
                 // budget, so one row can be truncated while its neighbours
                 // finished cleanly.
-                let finish_reason =
-                    (completion_tokens >= request.max_new_tokens).then_some("length");
+                let finish_reason = (!ended_naturally
+                    && completion_tokens >= request.max_new_tokens)
+                    .then_some("length");
                 Ok((text.as_bytes()[..end].to_vec(), usage, finish_reason))
             })
             .collect()
@@ -4135,10 +4173,12 @@ impl CandleLlmRuntime {
             let text = decoder.text();
             // A matched stop ends the decode: emit up to (not including) it.
             if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
+                sink.mark_natural_end();
                 emit_delta(sink, text, &mut emitted, stop_at);
                 return Ok(());
             }
             if eos_tokens.contains(&next) {
+                sink.mark_natural_end();
                 emit_delta(sink, text, &mut emitted, text.len());
                 return Ok(());
             }
@@ -4176,7 +4216,14 @@ impl CandleLlmRuntime {
         }
         // Token budget exhausted: flush the held-back tail, trimming any stop.
         let text = decoder.text();
-        let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+        // A stop sequence can still be sitting in the held-back tail when the
+        // budget runs out, and trimming it here is what completes the answer —
+        // so this is a natural end too, not a truncation.
+        let stop_at = find_earliest_stop(text, &request.stop);
+        if stop_at.is_some() {
+            sink.mark_natural_end();
+        }
+        let end = stop_at.unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
@@ -6507,6 +6554,31 @@ mod tests {
 
         sink.completion_tokens = 4;
         assert_eq!(sink.finish_reason(), Some("length"));
+    }
+
+    /// The boundary the count alone cannot express: an answer whose EOS or stop
+    /// sequence lands on exactly the budget's last token has both spent its
+    /// budget and finished normally. Reporting `length` there tells the client
+    /// a complete answer was truncated — the same misreport as the untracked
+    /// case, in the other direction.
+    #[test]
+    fn a_natural_end_on_the_budgets_last_token_is_not_length() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        sink.record_token_budget(4);
+        sink.completion_tokens = 4;
+        assert_eq!(
+            sink.finish_reason(),
+            Some("length"),
+            "the count alone still reads as truncation"
+        );
+
+        sink.mark_natural_end();
+        assert_eq!(
+            sink.finish_reason(),
+            None,
+            "but the model ended this answer itself, so the caller's `stop` is right"
+        );
     }
 
     /// Only the budget is named. EOS, a stop sequence and the deadline all

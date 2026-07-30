@@ -449,8 +449,11 @@ struct GenerationRequest {
     prompt: Option<String>,
     #[serde(default)]
     messages: Option<Vec<IncomingChatTurn>>,
-    #[serde(default = "default_max_new_tokens")]
-    max_new_tokens: usize,
+    /// Absent when the caller named no budget, which is what lets the default
+    /// be clamped to the context window while an explicit request that cannot
+    /// fit is refused. Resolved into `ParsedRequest::max_new_tokens`.
+    #[serde(default)]
+    max_new_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -604,9 +607,32 @@ impl Qwen35MoeRuntime {
         if encoded.is_empty() {
             bail!("Qwen prompt encoded to zero tokens");
         }
-        if encoded.len() + request.max_new_tokens > self.config.max_position_embeddings {
+        // The two cases differ, and conflating them is what made the raised
+        // default a regression here: a caller that named a budget has an
+        // expectation to violate, so an impossible one is an error, but a
+        // caller that named none has none, so the default is clamped to what
+        // the window can deliver. Refusing it outright turned prompts that fit
+        // comfortably under the old 256-token default into hard failures the
+        // moment the shared default became 1024.
+        let headroom = self
+            .config
+            .max_position_embeddings
+            .saturating_sub(encoded.len());
+        match request.requested_max_new_tokens {
+            Some(requested) if requested > headroom => {
+                bail!(
+                    "prompt tokens {} plus max_new_tokens {requested} exceed the {}-token context limit; lower max_new_tokens to at most {headroom}",
+                    encoded.len(),
+                    self.config.max_position_embeddings
+                );
+            }
+            _ => {}
+        }
+        let max_new_tokens = request.max_new_tokens.min(headroom);
+        if max_new_tokens == 0 {
             bail!(
-                "prompt and generation length exceed context limit {}",
+                "prompt tokens {} leave no room to generate within the {}-token context limit",
+                encoded.len(),
                 self.config.max_position_embeddings
             );
         }
@@ -643,7 +669,14 @@ impl Qwen35MoeRuntime {
         // large share of its wall-clock budget re-rendering text it had already
         // rendered, while holding the lane.
         let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
-        for step in 0..request.max_new_tokens {
+        // Set when the model ended the answer itself — EOS or a caller's stop
+        // sequence — as opposed to running out of budget. The distinction is
+        // invisible in the token count alone: an answer that ends on exactly
+        // the budget's last token satisfies `generated.len() >= max_new_tokens`
+        // while having finished perfectly normally, and reporting `length`
+        // there tells the client its complete answer was truncated.
+        let mut ended_naturally = false;
+        for step in 0..max_new_tokens {
             // Elapsed budget stops generation the way an exhausted token budget
             // does, rather than failing: freeing the scheduler slot is the
             // point, and a partial answer beats an error.
@@ -658,6 +691,7 @@ impl Qwen35MoeRuntime {
             let tensor = Tensor::from_vec(logits, self.config.vocab_size, &Device::Cpu)?;
             let token = processor.sample(&tensor)?;
             if token == self.config.eos_token_id {
+                ended_naturally = true;
                 break;
             }
             generated.push(token);
@@ -676,6 +710,7 @@ impl Qwen35MoeRuntime {
                 emitted = safe_end;
             }
             if stop.is_some() {
+                ended_naturally = true;
                 break;
             }
             logits = self.forward_token(token, encoded.len() + step, &mut state)?;
@@ -687,7 +722,8 @@ impl Qwen35MoeRuntime {
         // Same rule as the generic Candle runtime: only budget exhaustion is
         // named, because that is the case an absent reason would misreport as
         // a clean `stop` — and this backend serves the same `/ai/v1` clients.
-        let finish_reason = (generated.len() >= request.max_new_tokens).then_some("length");
+        let finish_reason =
+            (!ended_naturally && generated.len() >= max_new_tokens).then_some("length");
         Ok((usage, finish_reason))
     }
 
@@ -703,7 +739,7 @@ impl Qwen35MoeRuntime {
             GenerationRequest {
                 prompt: Some(raw.to_owned()),
                 messages: None,
-                max_new_tokens: default_max_new_tokens(),
+                max_new_tokens: None,
                 temperature: None,
                 top_p: None,
                 seed: None,
@@ -711,7 +747,8 @@ impl Qwen35MoeRuntime {
                 max_generation_ms: None,
             }
         };
-        if request.max_new_tokens == 0 || request.max_new_tokens > HOST_MAX_NEW_TOKENS {
+        if matches!(request.max_new_tokens, Some(requested) if requested == 0 || requested > HOST_MAX_NEW_TOKENS)
+        {
             bail!("max_new_tokens must be between 1 and {HOST_MAX_NEW_TOKENS}");
         }
         // Same bounds and same default as the Candle runtime, so a caller sees
@@ -771,7 +808,10 @@ impl Qwen35MoeRuntime {
         };
         Ok(ParsedRequest {
             prompt,
-            max_new_tokens: request.max_new_tokens,
+            max_new_tokens: request
+                .max_new_tokens
+                .unwrap_or_else(default_max_new_tokens),
+            requested_max_new_tokens: request.max_new_tokens,
             temperature: request.temperature,
             top_p: request.top_p,
             seed: request.seed,
@@ -956,6 +996,10 @@ fn env_u64(name: &str) -> Option<u64> {
 struct ParsedRequest {
     prompt: String,
     max_new_tokens: usize,
+    /// What the caller actually asked for, or `None` when it named no budget.
+    /// Only an explicit request is refused when it cannot fit the window; an
+    /// unstated one is clamped, exactly as the generic Candle runtime does.
+    requested_max_new_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,

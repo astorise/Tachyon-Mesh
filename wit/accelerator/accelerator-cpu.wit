@@ -33,6 +33,15 @@ interface cpu {
     record generation-error {
         message: string,
         upstream-status: option<u16>,
+        /// The *caller's* request was rejected, before any backend ran it.
+        ///
+        /// Distinct from `upstream-status`, which says a remote provider
+        /// rejected it: a budget above the binding's ceiling, or a prompt that
+        /// cannot fit the context window, is refused locally and has no remote
+        /// status to relay. Without this flag such a failure is indistinguishable
+        /// from a host fault, so a gateway reports it as a retryable 500 and the
+        /// client retries a request that can never succeed.
+        invalid-request: bool,
     }
 
     /// One tool call a backend recognised as *structured* data rather than as

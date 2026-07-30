@@ -1786,9 +1786,12 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_set(&res.table_name, &key, &value)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_write(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            Some(value),
+        )
     }
 
     fn delete(
@@ -1803,9 +1806,12 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_delete(&res.table_name, &key)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_write(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            None,
+        )
     }
 
     fn batch_set(
@@ -1819,6 +1825,21 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
+        }
+        // Per key, not one batch write: `batch_set` would otherwise be the way
+        // around the ownership rule `set` enforces, and a table this guarded
+        // must not have a second door. Non-registry tables keep the single
+        // transaction they had.
+        if res.table_name == crate::system_storage::AI_MODELS_REGISTRY_TABLE {
+            for (key, value) in &entries {
+                crate::system_storage::apply_guest_registry_write(
+                    &res.core_store,
+                    &res.table_name,
+                    key,
+                    Some(value.clone()),
+                )?;
+            }
+            return Ok(());
         }
         res.core_store
             .kv_partition_batch_set(&res.table_name, &entries)
@@ -1922,9 +1943,12 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_set(&res.table_name, &key, &value)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_write(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            Some(value),
+        )
     }
 
     fn delete(
@@ -1939,9 +1963,12 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_delete(&res.table_name, &key)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_write(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            None,
+        )
     }
 
     fn batch_set(
@@ -1955,6 +1982,21 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
+        }
+        // Per key, not one batch write: `batch_set` would otherwise be the way
+        // around the ownership rule `set` enforces, and a table this guarded
+        // must not have a second door. Non-registry tables keep the single
+        // transaction they had.
+        if res.table_name == crate::system_storage::AI_MODELS_REGISTRY_TABLE {
+            for (key, value) in &entries {
+                crate::system_storage::apply_guest_registry_write(
+                    &res.core_store,
+                    &res.table_name,
+                    key,
+                    Some(value.clone()),
+                )?;
+            }
+            return Ok(());
         }
         res.core_store
             .kv_partition_batch_set(&res.table_name, &entries)
@@ -2013,6 +2055,7 @@ fn wit_generation_error(error: ai_inference::GenerationError) -> WitGenerationEr
     WitGenerationError {
         message: error.message,
         upstream_status: error.upstream_status,
+        invalid_request: error.invalid_request,
     }
 }
 
@@ -2217,6 +2260,25 @@ pub(crate) struct HostTokenStream {
     saw_eof: bool,
 }
 
+/// Cancel the producer whenever this value goes away.
+///
+/// This lives in `Drop` rather than in the WIT `drop` hook because the hook
+/// only runs for a stream that was successfully *registered*. A
+/// `ResourceTable::push` that fails — a guest that has exhausted its resource
+/// table — drops this value on the error path instead, where the hook never
+/// fires: dropping the receiver alone makes the next `send` fail, but a
+/// generation thread already parked on the byte budget is asleep on a condvar
+/// that a closed channel does not wake, so it would hold its thread and its
+/// upstream admission permit until the request timed out.
+#[cfg(feature = "ai-inference")]
+impl Drop for HostTokenStream {
+    fn drop(&mut self) {
+        self.consumer_alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.budget.consumer_gone();
+    }
+}
+
 #[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for ComponentHostState {
     fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
@@ -2405,16 +2467,13 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
                     rep.rep(),
                 ))?;
         // Deleting the entry drops the receiver, which already makes the next
-        // `send` fail. This says the same thing to a backend that is *waiting*
-        // rather than sending — the case a slow upstream leaves it in, holding
-        // an admission permit for a client that has gone.
-        stream
-            .consumer_alive
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        // And wake a producer parked on the byte budget. Dropping the receiver
-        // unblocks a `send`, but a thread waiting for *room* is asleep on the
-        // condvar, where a closed channel is not a signal it can see.
-        stream.budget.consumer_gone();
+        // `send` fail, and `HostTokenStream::drop` says the same thing to a
+        // backend that is *waiting* rather than sending — clearing
+        // `consumer_alive` for one parked between frames, and waking one parked
+        // on the byte budget, where a closed channel is not a signal it can
+        // see. Both live in `Drop` so the failed-registration path gets them
+        // too.
+        drop(stream);
         Ok(())
     }
 }
