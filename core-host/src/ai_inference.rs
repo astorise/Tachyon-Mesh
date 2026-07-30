@@ -416,11 +416,20 @@ pub(crate) struct InferenceOutput {
 }
 
 impl InferenceOutput {
-    fn measured(bytes: Vec<u8>, usage: TokenUsage) -> Self {
+    /// A local backend's buffered result.
+    ///
+    /// `finish_reason` comes from the decode loop rather than being left
+    /// `None`: a generation that spent its whole `max_new_tokens` budget is
+    /// truncated, and `guest-openai` resolves an absent reason to `stop`. So a
+    /// local completion cut off mid-function used to be reported as having
+    /// finished normally, while the same request against an upstream reported
+    /// `length` — the client could avoid running incomplete code on one
+    /// backend and not the other.
+    fn measured(bytes: Vec<u8>, usage: TokenUsage, finish_reason: Option<&'static str>) -> Self {
         Self {
             bytes,
             usage: Some(usage),
-            finish_reason: None,
+            finish_reason: finish_reason.map(str::to_owned),
             tool_calls: Vec::new(),
         }
     }
@@ -546,6 +555,13 @@ impl StreamOutcome {
             usage,
             finish_reason: None,
         }
+    }
+
+    /// Attach the backend's own reason, when it reported one. `None` leaves the
+    /// outcome saying "not reported" rather than overwriting it with a guess.
+    fn with_finish_reason(mut self, finish_reason: Option<&str>) -> Self {
+        self.finish_reason = finish_reason.map(str::to_owned);
+        self
     }
 }
 
@@ -2302,7 +2318,9 @@ impl BackendModel for CandleBackendModel {
                     .map(|input| {
                         runtime
                             .generate(&[input.data.as_ref()])
-                            .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
+                            .map(|(bytes, usage, finish)| {
+                                InferenceOutput::measured(bytes, usage, finish)
+                            })
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
@@ -2330,7 +2348,9 @@ impl BackendModel for CandleBackendModel {
                     .map(|input| {
                         runtime
                             .generate(&[input.data.as_ref()])
-                            .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
+                            .map(|(bytes, usage, finish)| {
+                                InferenceOutput::measured(bytes, usage, finish)
+                            })
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
@@ -2376,7 +2396,9 @@ impl BackendModel for CandleBackendModel {
                             ),
                             None => target.generate(&[prompt]),
                         }
-                        .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
+                        .map(|(bytes, usage, finish)| {
+                            InferenceOutput::measured(bytes, usage, finish)
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
@@ -2451,7 +2473,9 @@ impl BackendModel for CandleBackendModel {
                     std::slice::from_ref(input),
                     &String::from_utf8_lossy(&bytes),
                 );
-                InferenceOutput::measured(bytes, usage)
+                // A mock has no token budget to exhaust, so it never reports a
+                // reason and the caller keeps inferring one.
+                InferenceOutput::measured(bytes, usage, None)
             })
             .collect())
     }
@@ -2475,7 +2499,7 @@ impl BackendModel for CandleBackendModel {
                                 &adapter.id,
                                 &adapter.path,
                             )
-                            .map(|(bytes, usage)| InferenceOutput::measured(bytes, usage))
+                            .map(|(bytes, usage, finish)| InferenceOutput::measured(bytes, usage, finish))
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
@@ -2609,7 +2633,9 @@ impl BackendModel for CandleBackendModel {
                         record_execution(&self.source.alias, executed_on, true);
                         outputs
                             .into_iter()
-                            .map(|(bytes, usage)| Ok(InferenceOutput::measured(bytes, usage)))
+                            .map(|(bytes, usage, finish)| {
+                                Ok(InferenceOutput::measured(bytes, usage, finish))
+                            })
                             .collect()
                     }
                     Ok(None) => self.execute_with_adapters_sequential_results(inputs, adapters),
@@ -2670,7 +2696,9 @@ impl BackendModel for CandleBackendModel {
             &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
         target
             .generate_with_adapter_streaming(&prompts, &adapter.id, &adapter.path, on_token)
-            .map(|usage| StreamOutcome::usage(Some(usage)))
+            .map(|(usage, finish_reason)| {
+                StreamOutcome::usage(Some(usage)).with_finish_reason(finish_reason)
+            })
             .map_err(|error| {
                 anyhow!(
                     "Candle LLM model `{}` loaded from `{}` failed: {error}",
@@ -2767,11 +2795,14 @@ impl BackendModel for CandleBackendModel {
         // therefore keep a plain `&str` callback, adapted here.
         let on_token: &mut dyn FnMut(&str) -> StreamControl =
             &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
-        // Local backends report no finish reason of their own: the decode loop
-        // ends on EOS, a stop sequence, the token budget, or the deadline, and
-        // which of those it was is the caller's to infer — exactly as on the
-        // buffered path, where `InferenceOutput::finish_reason` is also `None`.
-        let outcome = |usage: TokenUsage| StreamOutcome::usage(Some(usage));
+        // A local backend reports `length` when it spent its whole token budget
+        // and nothing otherwise: EOS, a stop sequence and the deadline stay the
+        // caller's to infer. Streaming and buffered agree here — an absent
+        // reason resolves to `stop` downstream, so a truncated streamed answer
+        // would otherwise be indistinguishable from a complete one.
+        let outcome = |(usage, finish_reason): (TokenUsage, Option<&'static str>)| {
+            StreamOutcome::usage(Some(usage)).with_finish_reason(finish_reason)
+        };
         match &self.kind {
             CandleBackendModelKind::Upstream(_) => unreachable!("handled above"),
             CandleBackendModelKind::ModelOptNvfp4(runtime) => {

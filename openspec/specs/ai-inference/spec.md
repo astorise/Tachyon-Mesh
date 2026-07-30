@@ -431,6 +431,41 @@ disk, and the next probe of that directory would treat it as real.
 - **THEN** the model directory and its staging area are removed
 - **AND** the original error is what the caller sees, not a cleanup failure
 
+#### Scenario: A rejected upload never destroys the checkpoint it would replace
+
+- **WHEN** an upload targets an alias whose configured binding points at the same
+  broker-managed directory, and publication then refuses it
+- **THEN** the previous checkpoint is still on disk and unchanged, because the
+  archive was unpacked beside the live directory rather than into it and the
+  previous one was moved aside rather than deleted
+- **AND** the alias keeps serving what the manifest declared: a refused upload
+  leaves the registry row, the runtime alias, and the files consistent with each
+  other
+
+### Requirement: A local generation MUST report an exhausted token budget
+
+A backend that stops because it reached the request's `max_new_tokens` SHALL
+report `length`. An absent finish reason resolves to `stop` downstream, so a
+truncated local completion would otherwise be described as having finished
+normally — and the upstream path already reports `length`, which made the
+honesty of the answer depend on which backend served the alias.
+
+#### Scenario: A budget-exhausted local generation reports `length`
+
+- **WHEN** a local Candle, ModelOpt or Qwen 3.5 MoE generation produces its full
+  `max_new_tokens` without reaching EOS or a stop sequence
+- **THEN** the finish reason is `length`, on both the buffered and streaming
+  paths, and the two agree
+- **AND** a batch-native decode evaluates this per row, since rows share a step
+  count but not a budget
+
+#### Scenario: Every other stopping condition stays unreported
+
+- **WHEN** a local generation ends on EOS, a stop sequence, or the deadline
+- **THEN** no finish reason is reported, and the caller keeps its own inference
+- **AND** a generation refused before decoding, and a mock binding, report
+  nothing — neither had a budget to exhaust
+
 ### Requirement: Tool calls MUST be recovered on the streaming path
 
 `guest-openai` SHALL recover tool calls when streaming, emitting

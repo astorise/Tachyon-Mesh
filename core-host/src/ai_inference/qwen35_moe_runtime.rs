@@ -473,8 +473,16 @@ struct IncomingChatTurn {
     content: Value,
 }
 
+/// The budget a request that omits `max_new_tokens` gets.
+///
+/// Shared with the generic Candle runtime rather than held separately. It was
+/// 64 here, so once `guest-openai` stopped sending its own default the same
+/// bare request answered in 1024 tokens on one local backend and 64 on this
+/// one — truncating mid-function on exactly the agentic workloads the raised
+/// default exists for. Which runtime happens to serve an alias is not
+/// something a caller chooses, so it must not change the answer's length.
 fn default_max_new_tokens() -> usize {
-    64
+    super::candle_llm_runtime::DEFAULT_MAX_NEW_TOKENS
 }
 
 impl Qwen35MoeRuntime {
@@ -567,21 +575,24 @@ impl Qwen35MoeRuntime {
         self.executed_on
     }
 
-    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<(Vec<u8>, TokenUsage)> {
+    pub(crate) fn generate(
+        &self,
+        prompts: &[&[u8]],
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>)> {
         let mut output = String::new();
         // A buffered caller is holding the call and cannot go away mid-decode.
-        let usage = self.generate_streaming(prompts, &mut |delta| {
+        let (usage, finish_reason) = self.generate_streaming(prompts, &mut |delta| {
             output.push_str(delta);
             StreamControl::Continue
         })?;
-        Ok((output.into_bytes(), usage))
+        Ok((output.into_bytes(), usage, finish_reason))
     }
 
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
         on_token: &mut dyn FnMut(&str) -> StreamControl,
-    ) -> Result<TokenUsage> {
+    ) -> Result<(TokenUsage, Option<&'static str>)> {
         if prompts.len() != 1 {
             bail!("Qwen 3.5 MoE runtime currently accepts exactly one prompt per decode");
         }
@@ -669,10 +680,15 @@ impl Qwen35MoeRuntime {
             }
             logits = self.forward_token(token, encoded.len() + step, &mut state)?;
         }
-        Ok(TokenUsage {
+        let usage = TokenUsage {
             prompt_tokens: encoded.len() as u32,
             completion_tokens: generated.len() as u32,
-        })
+        };
+        // Same rule as the generic Candle runtime: only budget exhaustion is
+        // named, because that is the case an absent reason would misreport as
+        // a clean `stop` — and this backend serves the same `/ai/v1` clients.
+        let finish_reason = (generated.len() >= request.max_new_tokens).then_some("length");
+        Ok((usage, finish_reason))
     }
 
     fn parse_request(&self, bytes: &[u8]) -> Result<ParsedRequest> {
@@ -1265,11 +1281,12 @@ mod tests {
         let host_memory_before = current_process_memory_bytes();
         let gpu_memory_before = nvidia_memory_used_mib();
         let started = std::time::Instant::now();
-        let (buffered, buffered_usage) = runtime.generate(&[request]).expect("buffered generation");
+        let (buffered, buffered_usage, buffered_finish) =
+            runtime.generate(&[request]).expect("buffered generation");
         let first_token_ms = started.elapsed().as_millis();
         let mut streamed = String::new();
         let decode_started = std::time::Instant::now();
-        let streamed_usage = runtime
+        let (streamed_usage, streamed_finish) = runtime
             .generate_streaming(&[request], &mut |delta| {
                 streamed.push_str(delta);
                 StreamControl::Continue
@@ -1283,6 +1300,7 @@ mod tests {
         // The buffered wrapper is an accumulator over the streaming core, so
         // the two must agree on what the generation cost as well as on its text.
         assert_eq!(buffered_usage, streamed_usage);
+        assert_eq!(buffered_finish, streamed_finish);
         assert!(buffered_usage.completion_tokens > 0);
         let working_set = runtime.working_set.lock().expect("working set");
         eprintln!(

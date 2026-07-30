@@ -348,39 +348,75 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     // mmap, detect the on-disk format, and drop the host dispatch sidecar.
     let alias = model_alias(&pending);
     let model_dir = models_dir().join(&alias);
-    if model_dir.exists() {
-        fs::remove_dir_all(&model_dir).map_err(|error| {
+
+    // Unpack beside the live directory, never into it. An upload can still be
+    // refused after its bytes are on disk — publication rejects an alias a
+    // configured binding owns — and when that binding points at this same
+    // `models/<alias>` path, unpacking in place has already destroyed the
+    // operator's checkpoint by the time the refusal arrives. The registry row
+    // and the runtime alias survive that; the files do not, so the next load
+    // finds nothing. Staging keeps the live directory intact until the upload
+    // is accepted.
+    //
+    // Keyed by upload id so two uploads in flight cannot share a staging
+    // directory, and so a leftover from a crashed attempt belongs to a
+    // finished upload rather than blocking this one.
+    let incoming_dir = models_dir().join(format!(".incoming-{upload_id}"));
+    let backup_dir = models_dir().join(format!(".replaced-{upload_id}"));
+    let _ = fs::remove_dir_all(&incoming_dir);
+    let _ = fs::remove_dir_all(&backup_dir);
+    fs::create_dir_all(&incoming_dir)
+        .map_err(|error| format!("failed to create the staging model directory: {error}"))?;
+
+    let format = unpack_targz(&staging_path, &incoming_dir)
+        .and_then(|()| validate_extracted_file_manifest(&incoming_dir, &pending.files))
+        .and_then(|()| detect_format(&incoming_dir))
+        .and_then(|format| write_meta_sidecar(&incoming_dir, format, &alias).map(|()| format))
+        .inspect_err(|_error| {
+            // Nothing outside the staging directory has been touched yet, so a
+            // failure here costs the live checkpoint nothing.
+            let _ = fs::remove_dir_all(&incoming_dir);
+            cleanup_staging(&upload_id);
+        })?;
+
+    // Move the previous checkpoint aside rather than deleting it, so a refused
+    // publication can put it back exactly as it was.
+    let replaced = model_dir.exists();
+    if replaced {
+        fs::rename(&model_dir, &backup_dir).map_err(|error| {
+            let _ = fs::remove_dir_all(&incoming_dir);
+            cleanup_staging(&upload_id);
             format!(
-                "failed to replace existing model `{}`: {error}",
+                "failed to set aside the existing model `{}`: {error}",
                 model_dir.display()
             )
         })?;
     }
-    fs::create_dir_all(&model_dir)
-        .map_err(|error| format!("failed to create model directory: {error}"))?;
+    if let Err(error) = fs::rename(&incoming_dir, &model_dir) {
+        if replaced {
+            let _ = fs::rename(&backup_dir, &model_dir);
+        }
+        let _ = fs::remove_dir_all(&incoming_dir);
+        cleanup_staging(&upload_id);
+        return Err(format!(
+            "failed to install the uploaded model at `{}`: {error}",
+            model_dir.display()
+        ));
+    }
 
-    let format = unpack_targz(&staging_path, &model_dir)
-        .and_then(|()| validate_extracted_file_manifest(&model_dir, &pending.files))
-        .and_then(|()| detect_format(&model_dir))
-        .inspect_err(|_error| {
-            // The archive is unusable: drop the half-written directory and the
-            // staging slot so a retry starts clean.
-            let _ = fs::remove_dir_all(&model_dir);
-            cleanup_staging(&upload_id);
-        })?;
-    // Both of these can fail *after* the archive is on disk — publication in
-    // particular now rejects an alias a configured binding owns. Without the
-    // same cleanup the unpack path already does, every rejected attempt left a
-    // complete model directory and its staging slot behind; worse, when the
-    // configured path is this same broker directory, a later restart could load
-    // the checkpoint that was just refused.
-    write_meta_sidecar(&model_dir, format, &alias)
-        .and_then(|()| publish_model_uploaded(&alias, format, &model_dir, &pending.files))
-        .inspect_err(|_error| {
-            let _ = fs::remove_dir_all(&model_dir);
-            cleanup_staging(&upload_id);
-        })?;
+    // Published last, because this is the step that can still refuse the
+    // upload. On refusal the new files go and the previous checkpoint comes
+    // back, leaving the alias exactly as the manifest left it.
+    if let Err(error) = publish_model_uploaded(&alias, format, &model_dir, &pending.files) {
+        let _ = fs::remove_dir_all(&model_dir);
+        if replaced {
+            let _ = fs::rename(&backup_dir, &model_dir);
+        }
+        cleanup_staging(&upload_id);
+        return Err(error);
+    }
 
+    let _ = fs::remove_dir_all(&backup_dir);
     cleanup_staging(&upload_id);
 
     Ok(model_dir.to_string_lossy().to_string())

@@ -883,14 +883,29 @@ impl UpstreamOpenAiRuntime {
             let Some(delta) = choice.and_then(|choice| choice.get("delta")) else {
                 continue;
             };
-            if let Some(content) = delta
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|content| !content.is_empty())
-            {
-                if sink.emit(StreamEvent::Content(content)).is_stop() {
-                    abandoned = true;
-                    break;
+            // Absent and `null` both mean "this frame carried no text" — the
+            // normal shape of a tool-call or role-only frame. A *present*
+            // non-string is different: reading it with `as_str` alone reported
+            // it as absent, so that part of the answer was dropped and the
+            // stream still finished successfully. The buffered path rejects an
+            // unusable message; this one now matches it, rather than returning
+            // a silently short answer a caller cannot detect.
+            match delta.get("content") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(content)) => {
+                    if !content.is_empty() && sink.emit(StreamEvent::Content(content)).is_stop() {
+                        abandoned = true;
+                        break;
+                    }
+                }
+                Some(other) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed `choices[0].delta.content` is {}, expected a string",
+                            json_type_name(other)
+                        ),
+                    })
                 }
             }
             // A streamed tool call arrives as `delta.tool_calls` fragments with
@@ -918,7 +933,12 @@ impl UpstreamOpenAiRuntime {
                             ),
                         })?;
                 for fragment in fragments {
-                    streamed_tool_calls.absorb(fragment);
+                    streamed_tool_calls.absorb(fragment).map_err(|detail| {
+                        UpstreamError::MalformedResponse {
+                            alias: self.alias.clone(),
+                            detail,
+                        }
+                    })?;
                 }
             }
         }
@@ -986,7 +1006,7 @@ impl UpstreamOpenAiRuntime {
                 detail: "`data[0].embedding` is empty".to_owned(),
             });
         }
-        embedding
+        let mut vector = embedding
             .iter()
             .map(|value| {
                 let value = value
@@ -1009,8 +1029,52 @@ impl UpstreamOpenAiRuntime {
                 }
                 Ok(narrowed)
             })
-            .collect()
+            .collect::<Result<Vec<f32>, UpstreamError>>()?;
+
+        // The `embed` contract promises an L2-normalized vector, and the local
+        // embedding backend delivers one — so a consumer treating a dot product
+        // as cosine similarity is reading the contract correctly. An upstream
+        // that normalizes is common but not universal, and returning a raw
+        // vector made rankings magnitude-dependent *only* for upstream-bound
+        // aliases: the same query scored differently depending on which backend
+        // happened to serve the alias, with nothing in the response saying so.
+        //
+        // Normalizing here rather than trusting the server also makes the
+        // double-normalization case free: a unit vector is its own normal.
+        normalize_in_place(&mut vector).map_err(|detail| UpstreamError::MalformedResponse {
+            alias: self.alias.clone(),
+            detail,
+        })?;
+        Ok(vector)
     }
+}
+
+/// Scale a vector to unit length in place.
+///
+/// The norm is accumulated in `f64`: a 4096-dimension embedding with components
+/// near `f32::MAX.sqrt()` overflows an `f32` accumulator to infinity, which
+/// would turn a perfectly good vector into NaNs.
+///
+/// A zero-norm vector is rejected rather than passed through. It cannot be
+/// normalized at all, and every cosine similarity against it is undefined — so
+/// returning it would satisfy the call and break the contract the caller is
+/// relying on.
+fn normalize_in_place(vector: &mut [f32]) -> Result<(), String> {
+    let norm = vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return Err(format!(
+            "`data[0].embedding` has an L2 norm of {norm}, so it cannot be normalized to the unit \
+             length the `embed` contract promises"
+        ));
+    }
+    for value in vector.iter_mut() {
+        *value = (f64::from(*value) / norm) as f32;
+    }
+    Ok(())
 }
 
 /// `true` for JSON that carries nothing worth forwarding: absent, null, or an
@@ -1140,8 +1204,35 @@ struct StreamedToolCalls {
 }
 
 impl StreamedToolCalls {
-    fn absorb(&mut self, fragment: &Value) {
-        let index = fragment.get("index").and_then(Value::as_u64).unwrap_or(0);
+    /// Absorb one `delta.tool_calls` fragment, or fail if it cannot be
+    /// attributed to a call.
+    ///
+    /// `index` is what joins fragments into calls, and it was defaulted to 0
+    /// when missing or oddly typed. That silently *merged* distinct calls into
+    /// one slot — the later id and name overwrote the earlier, while arguments
+    /// concatenated across both — so the caller could dispatch one function
+    /// with another's arguments. There is no safe default here: guessing which
+    /// call a fragment belongs to is exactly the mistake.
+    ///
+    /// Deliberately strict. OpenAI's streaming schema requires `index` on every
+    /// tool-call delta, so an upstream omitting it is not one this backend can
+    /// reassemble correctly, and failing says so instead of inventing an
+    /// answer.
+    fn absorb(&mut self, fragment: &Value) -> Result<(), String> {
+        let index = match fragment.get("index") {
+            Some(value) => value.as_u64().ok_or_else(|| {
+                format!(
+                    "streamed tool-call fragment has `index` of {}, expected a non-negative integer",
+                    json_type_name(value)
+                )
+            })?,
+            None => {
+                return Err(
+                    "streamed tool-call fragment has no `index`, so it cannot be attributed to a call"
+                        .to_owned(),
+                )
+            }
+        };
         let slot = match self.calls.iter_mut().find(|call| call.index == index) {
             Some(slot) => slot,
             None => {
@@ -1178,6 +1269,7 @@ impl StreamedToolCalls {
             None | Some(Value::Null) => {}
             Some(_) => slot.unusable_arguments = true,
         }
+        Ok(())
     }
 
     /// Assemble the accumulated fragments, or fail if any of them never named
@@ -1702,7 +1794,14 @@ mod tests {
         let backend = runtime("embed", &upstream.binding());
 
         let vector = backend.embed("hello").expect("embedding should round trip");
-        assert_eq!(vector, vec![0.25, -0.5, 1.0]);
+        // Normalized on the way out: the `embed` contract promises unit length,
+        // and the raw `[0.25, -0.5, 1.0]` has a norm of ~1.1456.
+        let norm = (0.25f32 * 0.25 + 0.5 * 0.5 + 1.0f32).sqrt();
+        let expected = [0.25 / norm, -0.5 / norm, 1.0 / norm];
+        assert_eq!(vector.len(), expected.len());
+        for (got, want) in vector.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
 
         let (target, body) = upstream.received();
         assert!(
@@ -2012,6 +2111,147 @@ mod tests {
             error.to_string().contains("must be an array"),
             "the error should name the shape problem, got: {error}"
         );
+    }
+
+    #[test]
+    fn a_streamed_content_value_that_is_not_a_string_fails_the_stream() {
+        // Reading this with `as_str` alone reported a *present* object as
+        // absent, so the delta was dropped and the stream still finished
+        // successfully. The client got a silently short answer with nothing
+        // marking it short — the buffered path rejects the same shape.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":{"text":"hi"}}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a non-string content value is not an absent one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("expected a string"),
+            "the error should name the shape problem, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_streamed_null_content_is_still_an_ordinary_frame() {
+        // `content: null` is how a tool-call or role-only frame carries no
+        // text. Rejecting it would fail every tool call, so absence and
+        // malformation must stay distinguishable.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant","content":null}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"content":"ok"}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a null content frame is not a failure");
+        assert_eq!(captured.content.concat(), "ok");
+    }
+
+    #[test]
+    fn streamed_tool_call_fragments_without_an_index_fail_the_stream() {
+        // Defaulting a missing index to 0 merged two distinct calls into one
+        // slot: the second id and name overwrote the first while the arguments
+        // concatenated across both, so the caller would dispatch one function
+        // with another's arguments.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"a","function":{"name":"read","arguments":"{}"}}]}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"b","function":{"name":"write","arguments":"{}"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a fragment with no index cannot be attributed to a call");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("no `index`"),
+            "the error should name the missing field, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_streamed_tool_call_index_of_the_wrong_type_fails_the_stream() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":"0","id":"a","function":{"name":"read"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a string index is not an integer one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
+    #[test]
+    fn an_upstream_embedding_is_normalized_to_unit_length() {
+        // `embed` promises an L2-normalized vector and the local backend
+        // delivers one, so a consumer using a dot product as cosine similarity
+        // is reading the contract correctly. Returning `[3, 4]` unchanged made
+        // rankings magnitude-dependent for upstream-bound aliases only.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"data":[{"embedding":[3.0,4.0]}]}"#,
+        );
+        let backend = runtime("embed", &upstream.binding());
+
+        let vector = backend.embed("hello").expect("embedding should round trip");
+        assert!((vector[0] - 0.6).abs() < 1e-6, "got {}", vector[0]);
+        assert!((vector[1] - 0.8).abs() < 1e-6, "got {}", vector[1]);
+        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "norm should be 1, got {norm}");
+    }
+
+    #[test]
+    fn a_zero_norm_upstream_embedding_is_rejected() {
+        // It cannot be normalized at all, and every cosine similarity against
+        // it is undefined — so returning it would satisfy the call and break
+        // the contract the caller is relying on.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"data":[{"embedding":[0.0,0.0,0.0]}]}"#,
+        );
+        let backend = runtime("embed", &upstream.binding());
+
+        let error = backend
+            .embed("hello")
+            .expect_err("a zero vector cannot satisfy the unit-length contract");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
     }
 
     /// A sink that emits nothing and reports the consumer gone from the start,

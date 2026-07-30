@@ -424,6 +424,8 @@ impl ComponentHostState {
         // what a backend needs while it is waiting on a slow upstream.
         let consumer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let generation_alive = Arc::clone(&consumer_alive);
+        let budget = Arc::new(StreamQueueBudget::default());
+        let generation_budget = Arc::clone(&budget);
         std::thread::Builder::new()
             .name("tachyon-stream-gen".to_owned())
             .spawn(move || {
@@ -437,6 +439,7 @@ impl ComponentHostState {
                 let mut sink = GuestStreamSink {
                     sender: &sender,
                     consumer_alive: &generation_alive,
+                    budget: &generation_budget,
                 };
                 match ai_runtime.stream_component_prompt(
                     &alias,
@@ -469,6 +472,7 @@ impl ComponentHostState {
             receiver,
             outcome,
             consumer_alive,
+            budget,
         })
     }
 }
@@ -2032,6 +2036,85 @@ fn wit_tool_call(
 #[cfg(feature = "ai-inference")]
 const STREAM_CHANNEL_CAPACITY: usize = 64;
 
+/// Bytes of decoded output allowed to sit between the generation thread and the
+/// guest, per stream.
+///
+/// A count alone does not bound memory. One upstream SSE frame may approach
+/// `MAX_SSE_FRAME_BYTES` (1 MiB), so 64 queued events could still hold ~64 MiB
+/// per stream and, across the 32 concurrent streams the node admits, roughly
+/// the same gigabytes the unbounded channel allowed. The two limits are kept
+/// together because they bound different shapes of backlog: the count stops a
+/// flood of tiny deltas, this stops a handful of enormous ones.
+#[cfg(feature = "ai-inference")]
+const STREAM_QUEUE_BUDGET_BYTES: usize = 256 * 1024;
+
+/// The queued-bytes budget for one stream.
+///
+/// Producer-blocking rather than lossy: dropping a fragment would silently
+/// truncate the answer, and the whole point of back-pressure here is that a
+/// slow consumer slows the producer instead of costing it output.
+#[cfg(feature = "ai-inference")]
+#[derive(Default)]
+struct StreamQueueBudget {
+    state: Mutex<StreamQueueState>,
+    drained: std::sync::Condvar,
+}
+
+#[cfg(feature = "ai-inference")]
+#[derive(Default)]
+struct StreamQueueState {
+    queued: usize,
+    consumer_gone: bool,
+}
+
+#[cfg(feature = "ai-inference")]
+impl StreamQueueBudget {
+    /// Block until `len` bytes fit, then charge them.
+    ///
+    /// `false` means the consumer has gone and the caller should stop — the
+    /// same answer a failed `send` gives, available while merely waiting.
+    fn reserve(&self, len: usize) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            // A poisoned lock means the peer panicked; treat it as a departed
+            // consumer rather than panicking this thread too.
+            Err(_) => return false,
+        };
+        loop {
+            if state.consumer_gone {
+                return false;
+            }
+            // An empty queue always admits, whatever the size. Otherwise a
+            // single event larger than the whole budget could never be sent and
+            // the stream would hang instead of merely being slow.
+            if state.queued == 0 || state.queued + len <= STREAM_QUEUE_BUDGET_BYTES {
+                state.queued += len;
+                return true;
+            }
+            state = match self.drained.wait(state) {
+                Ok(state) => state,
+                Err(_) => return false,
+            };
+        }
+    }
+
+    /// Give back the bytes of an event the guest has taken.
+    fn release(&self, len: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            state.queued = state.queued.saturating_sub(len);
+        }
+        self.drained.notify_all();
+    }
+
+    /// Wake a producer blocked on a budget nobody will drain again.
+    fn consumer_gone(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.consumer_gone = true;
+        }
+        self.drained.notify_all();
+    }
+}
+
 /// The generation thread's end of a guest stream.
 ///
 /// Owns both cancellation signals: a failed `send` (the receiver is gone) and
@@ -2043,6 +2126,7 @@ struct GuestStreamSink<'a> {
         std::result::Result<StreamPayload, ai_inference::GenerationError>,
     >,
     consumer_alive: &'a Arc<std::sync::atomic::AtomicBool>,
+    budget: &'a Arc<StreamQueueBudget>,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2052,9 +2136,22 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
             ai_inference::StreamEvent::Content(text) => StreamPayload::Content(text.to_owned()),
             ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
         };
+        // Charged before the send and refunded when the guest takes the event,
+        // so the producer waits on the *bytes* outstanding rather than only on
+        // the number of them.
+        let charged = payload.queued_bytes();
+        if !self.budget.reserve(charged) {
+            return ai_inference::StreamControl::Stop;
+        }
         match self.sender.send(Ok(payload)) {
             Ok(()) => ai_inference::StreamControl::Continue,
-            Err(_) => ai_inference::StreamControl::Stop,
+            Err(_) => {
+                // Nothing was queued, so the reservation must not outlive the
+                // failure — otherwise a later send would wait on bytes that
+                // will never be drained.
+                self.budget.release(charged);
+                ai_inference::StreamControl::Stop
+            }
         }
     }
 
@@ -2074,12 +2171,28 @@ enum StreamPayload {
 }
 
 #[cfg(feature = "ai-inference")]
+impl StreamPayload {
+    /// What this event costs while it waits in the channel. Approximate on
+    /// purpose — it counts the heap-allocated text, which is the part that
+    /// scales with the model's output and the only part worth bounding.
+    fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Content(text) => text.len(),
+            Self::ToolCall(call) => {
+                call.name.len() + call.arguments.len() + call.id.as_ref().map_or(0, String::len)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ai-inference")]
 pub(crate) struct StreamedGeneration {
     receiver: std::sync::mpsc::Receiver<
         std::result::Result<StreamPayload, ai_inference::GenerationError>,
     >,
     outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
     consumer_alive: Arc<std::sync::atomic::AtomicBool>,
+    budget: Arc<StreamQueueBudget>,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2088,6 +2201,9 @@ pub(crate) struct HostTokenStream {
         std::result::Result<StreamPayload, ai_inference::GenerationError>,
     >,
     outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
+    /// Refunded as each event is taken, and closed on drop so a producer
+    /// waiting for room does not wait for a consumer that has gone.
+    budget: Arc<StreamQueueBudget>,
     /// Cleared on drop, so a backend blocked between frames can see that this
     /// caller has gone without having to emit something first.
     consumer_alive: Arc<std::sync::atomic::AtomicBool>,
@@ -2170,6 +2286,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
             receiver,
             outcome,
             consumer_alive,
+            budget,
         } = self
             .stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
             .map_err(wit_generation_error)?;
@@ -2179,6 +2296,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
                 receiver,
                 outcome,
                 consumer_alive,
+                budget,
                 saw_eof: false,
             })
             .map_err(|error| {
@@ -2211,7 +2329,14 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         })?;
         // `recv` blocks until the next event; a disconnected channel means the
         // generation thread finished, so the stream is complete.
-        match stream.receiver.recv() {
+        let received = stream.receiver.recv();
+        // Refund before answering, so the producer regains room as soon as the
+        // bytes leave the queue rather than once the guest has finished with
+        // them. An error payload carries no queued text and was never charged.
+        if let Ok(Ok(payload)) = &received {
+            stream.budget.release(payload.queued_bytes());
+        }
+        match received {
             Ok(Ok(StreamPayload::Content(text))) => Ok(Some(
                 accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Content(
                     text,
@@ -2286,6 +2411,10 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         stream
             .consumer_alive
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // And wake a producer parked on the byte budget. Dropping the receiver
+        // unblocks a `send`, but a thread waiting for *room* is asleep on the
+        // condvar, where a closed channel is not a signal it can see.
+        stream.budget.consumer_gone();
         Ok(())
     }
 }
@@ -3499,5 +3628,67 @@ impl component_bindings::tachyon::mesh::response_body::HostStreamingResponse
             wasmtime::component::Resource::<HostStreamingResponseResource>::new_own(rep.rep()),
         )?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "ai-inference"))]
+mod stream_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_budget_admits_until_it_is_spent_and_again_once_drained() {
+        let budget = StreamQueueBudget::default();
+
+        assert!(budget.reserve(STREAM_QUEUE_BUDGET_BYTES - 1));
+        // Room for one more byte, so a one-byte event still fits.
+        assert!(budget.reserve(1));
+
+        budget.release(STREAM_QUEUE_BUDGET_BYTES);
+        // Drained: the next event is admitted immediately rather than waiting.
+        assert!(budget.reserve(16));
+        budget.release(16);
+    }
+
+    #[test]
+    fn an_event_larger_than_the_whole_budget_is_still_admitted_when_the_queue_is_empty() {
+        // Otherwise a single oversized frame — an upstream may send one up to
+        // `MAX_SSE_FRAME_BYTES` — could never be sent at all, and the stream
+        // would hang rather than merely be slow.
+        let budget = StreamQueueBudget::default();
+        assert!(budget.reserve(STREAM_QUEUE_BUDGET_BYTES * 4));
+        budget.release(STREAM_QUEUE_BUDGET_BYTES * 4);
+    }
+
+    #[test]
+    fn a_producer_waiting_for_room_is_released_when_the_consumer_goes() {
+        // The failure this prevents: the receiver is dropped while the
+        // generation thread is parked on the condvar. A closed channel is not
+        // something a sleeping thread can observe, so without the explicit
+        // wake it would hold its admission permit until the binding timeout.
+        let budget = Arc::new(StreamQueueBudget::default());
+        assert!(budget.reserve(STREAM_QUEUE_BUDGET_BYTES));
+
+        let producer = Arc::clone(&budget);
+        let waiting = std::thread::spawn(move || producer.reserve(STREAM_QUEUE_BUDGET_BYTES));
+
+        budget.consumer_gone();
+        assert!(
+            !waiting.join().expect("producer thread should not panic"),
+            "a producer woken by a departed consumer must be told to stop, not admitted"
+        );
+    }
+
+    #[test]
+    fn queued_bytes_counts_the_text_that_scales_with_the_answer() {
+        assert_eq!(StreamPayload::Content("hello".to_owned()).queued_bytes(), 5);
+        assert_eq!(
+            StreamPayload::ToolCall(ai_inference::ToolCall {
+                id: Some("id".to_owned()),
+                name: "read".to_owned(),
+                arguments: "{\"p\":1}".to_owned(),
+            })
+            .queued_bytes(),
+            2 + 4 + 7
+        );
     }
 }

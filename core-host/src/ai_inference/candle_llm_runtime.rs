@@ -519,7 +519,9 @@ enum SingleDeviceBackend {
 }
 
 /// One row of a native batch: its decoded output and what it cost.
-type BatchRowOutput = (Vec<u8>, TokenUsage);
+/// One row's result from a batch-native decode: bytes, counts, and the reason
+/// the row stopped when the loop can name it (`length` on budget exhaustion).
+type BatchRowOutput = (Vec<u8>, TokenUsage, Option<&'static str>);
 
 /// Token counts for one generation, as OpenAI's `usage` object reports them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -551,6 +553,10 @@ struct TokenSink<'a> {
     /// Latched rather than re-read because the answer cannot un-become "nobody
     /// is listening", and the decode loops check it beside the deadline.
     stopped: bool,
+    /// The request's `max_new_tokens`, recorded by whichever entry point parsed
+    /// it. Present so the sink can tell a generation that *ran out of budget*
+    /// from one that finished — see [`TokenSink::finish_reason`].
+    token_budget: Option<usize>,
 }
 
 impl<'a> TokenSink<'a> {
@@ -560,11 +566,36 @@ impl<'a> TokenSink<'a> {
             completion_tokens: 0,
             prompt_tokens: 0,
             stopped: false,
+            token_budget: None,
         }
     }
 
     fn record_prompt_tokens(&mut self, tokens: usize) {
         self.prompt_tokens = tokens;
+    }
+
+    fn record_token_budget(&mut self, budget: usize) {
+        self.token_budget = Some(budget);
+    }
+
+    /// Why decoding stopped, when this sink can tell.
+    ///
+    /// Only `length` is reported here, and only when the budget was spent
+    /// exactly. Everything else — EOS, a stop sequence, the deadline — is
+    /// reported as "not known" so the caller keeps its own inference, which is
+    /// what it did for every local generation before.
+    ///
+    /// This is the difference between a client running truncated code and
+    /// rejecting it. `guest-openai` resolves an absent reason to `stop`, so a
+    /// local generation that used its whole budget — the ordinary way an
+    /// agentic completion gets cut off mid-function — was reported as having
+    /// finished normally. The upstream path already reported `length` here,
+    /// so the same request was answered honestly or not depending on which
+    /// backend served the alias.
+    fn finish_reason(&self) -> Option<&'static str> {
+        self.token_budget
+            .filter(|budget| self.completion_tokens >= *budget)
+            .map(|_| "length")
     }
 
     fn usage(&self) -> TokenUsage {
@@ -2940,15 +2971,15 @@ impl CandleLlmRuntime {
     pub(crate) fn generate(
         &self,
         prompts: &[&[u8]],
-    ) -> Result<(Vec<u8>, TokenUsage), CandleLlmError> {
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut out = String::new();
         // A buffered caller never goes away mid-generation: it is holding the
         // call. `Continue` is the only honest answer here.
-        let usage = self.generate_streaming(prompts, &mut |delta| {
+        let (usage, finish_reason) = self.generate_streaming(prompts, &mut |delta| {
             out.push_str(delta);
             StreamControl::Continue
         })?;
-        Ok((out.into_bytes(), usage))
+        Ok((out.into_bytes(), usage, finish_reason))
     }
 
     pub(crate) fn generate_with_adapter(
@@ -2956,9 +2987,9 @@ impl CandleLlmRuntime {
         prompts: &[&[u8]],
         adapter_id: &str,
         adapter_path: &Path,
-    ) -> Result<(Vec<u8>, TokenUsage), CandleLlmError> {
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut out = String::new();
-        let usage = self.generate_with_adapter_streaming(
+        let (usage, finish_reason) = self.generate_with_adapter_streaming(
             prompts,
             adapter_id,
             adapter_path,
@@ -2967,7 +2998,7 @@ impl CandleLlmRuntime {
                 StreamControl::Continue
             },
         )?;
-        Ok((out.into_bytes(), usage))
+        Ok((out.into_bytes(), usage, finish_reason))
     }
 
     pub(crate) fn try_generate_batch_with_adapters(
@@ -3025,7 +3056,9 @@ impl CandleLlmRuntime {
                 prompt_tokens: prompt_len as u32,
                 completion_tokens: 0,
             };
-            return Ok(Some(vec![(Vec::new(), refused); prompts.len()]));
+            // Refused before decoding: no tokens were produced, so there is no
+            // budget to have exhausted and no reason to report.
+            return Ok(Some(vec![(Vec::new(), refused, None); prompts.len()]));
         }
 
         let LoadedModel::Safetensors {
@@ -3156,6 +3189,7 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
+        sink.record_token_budget(request.max_new_tokens);
 
         let LoadedModel::Safetensors {
             backend,
@@ -3251,14 +3285,14 @@ impl CandleLlmRuntime {
         prompts: &[&[u8]],
         draft: &Self,
         draft_tokens: usize,
-    ) -> Result<(Vec<u8>, TokenUsage), CandleLlmError> {
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut out = String::new();
-        let usage =
+        let (usage, finish_reason) =
             self.generate_speculative_streaming(prompts, draft, draft_tokens, &mut |delta| {
                 out.push_str(delta);
                 StreamControl::Continue
             })?;
-        Ok((out.into_bytes(), usage))
+        Ok((out.into_bytes(), usage, finish_reason))
     }
 
     /// Streaming generation: identical decoding to [`generate`], but each newly
@@ -3278,10 +3312,10 @@ impl CandleLlmRuntime {
         &self,
         prompts: &[&[u8]],
         on_token: &mut dyn FnMut(&str) -> StreamControl,
-    ) -> Result<TokenUsage, CandleLlmError> {
+    ) -> Result<(TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut sink = TokenSink::new(on_token);
         self.stream_into(prompts, &mut sink)?;
-        Ok(sink.usage())
+        Ok((sink.usage(), sink.finish_reason()))
     }
 
     pub(crate) fn generate_speculative_streaming(
@@ -3290,10 +3324,10 @@ impl CandleLlmRuntime {
         draft: &Self,
         draft_tokens: usize,
         on_token: &mut dyn FnMut(&str) -> StreamControl,
-    ) -> Result<TokenUsage, CandleLlmError> {
+    ) -> Result<(TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut sink = TokenSink::new(on_token);
         self.stream_speculative_into(prompts, draft, draft_tokens, &mut sink)?;
-        Ok(sink.usage())
+        Ok((sink.usage(), sink.finish_reason()))
     }
 
     pub(crate) fn generate_with_adapter_streaming(
@@ -3302,10 +3336,10 @@ impl CandleLlmRuntime {
         adapter_id: &str,
         adapter_path: &Path,
         on_token: &mut dyn FnMut(&str) -> StreamControl,
-    ) -> Result<TokenUsage, CandleLlmError> {
+    ) -> Result<(TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut sink = TokenSink::new(on_token);
         self.stream_with_adapter_into(prompts, adapter_id, adapter_path, &mut sink)?;
-        Ok(sink.usage())
+        Ok((sink.usage(), sink.finish_reason()))
     }
 
     fn stream_into(
@@ -3349,6 +3383,7 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
+        sink.record_token_budget(request.max_new_tokens);
 
         self.decode(&prompt_ids, request, sink)
     }
@@ -3385,6 +3420,7 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
+        sink.record_token_budget(request.max_new_tokens);
 
         let draft_tokens = draft_tokens.max(1);
         let mut context_ids = prompt_ids.clone();
@@ -4016,15 +4052,21 @@ impl CandleLlmRuntime {
             .map(|(decoder, request)| {
                 let text = decoder.text();
                 let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+                let completion_tokens = decoder.tokens().len();
                 let usage = TokenUsage {
                     // Every row in a native batch shares one prompt length —
                     // rows of unequal length are refused before this point.
                     prompt_tokens: prompt_len as u32,
                     // The decoder holds exactly the tokens it was pushed, which
                     // is the row's generated sequence.
-                    completion_tokens: decoder.tokens().len() as u32,
+                    completion_tokens: completion_tokens as u32,
                 };
-                Ok((text.as_bytes()[..end].to_vec(), usage))
+                // Per row, not per batch: rows share a step count but not a
+                // budget, so one row can be truncated while its neighbours
+                // finished cleanly.
+                let finish_reason =
+                    (completion_tokens >= request.max_new_tokens).then_some("length");
+                Ok((text.as_bytes()[..end].to_vec(), usage, finish_reason))
             })
             .collect()
     }
@@ -6446,6 +6488,38 @@ pub(crate) fn write_tachyon_tiny_gguf_fixture(root: &Path) -> anyhow::Result<()>
 mod tests {
     use super::*;
 
+    /// A local generation that spends its whole budget is truncated, and the
+    /// caller resolves an absent reason to `stop` — so without this the client
+    /// is told a half-written function completed normally.
+    #[test]
+    fn a_local_generation_that_spends_its_budget_reports_length() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        sink.record_token_budget(4);
+
+        sink.completion_tokens = 3;
+        assert_eq!(
+            sink.finish_reason(),
+            None,
+            "a generation that stopped short of its budget ended for some other \
+             reason, which the caller infers as it always did"
+        );
+
+        sink.completion_tokens = 4;
+        assert_eq!(sink.finish_reason(), Some("length"));
+    }
+
+    /// Only the budget is named. EOS, a stop sequence and the deadline all
+    /// leave the reason absent, because guessing between them would be exactly
+    /// the misreport this exists to prevent.
+    #[test]
+    fn a_sink_with_no_recorded_budget_reports_nothing() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        sink.completion_tokens = 99;
+        assert_eq!(sink.finish_reason(), None);
+    }
+
     #[test]
     fn architecture_registry_normalizes_supported_hf_aliases() {
         assert_eq!(
@@ -7334,7 +7408,7 @@ mod tests {
         // refused — otherwise every short-context checkpoint would reject
         // every default request.
         let defaulted = serde_json::json!({ "prompt": "hello" }).to_string();
-        let (_bytes, usage) = runtime
+        let (_bytes, usage, _finish) = runtime
             .generate(&[defaulted.as_bytes()])
             .expect("an unstated budget must be clamped, not refused");
         assert!(
@@ -7407,7 +7481,7 @@ mod tests {
         let prompt = "hello mesh";
         let request = format!(r#"{{"prompt":"{prompt}","max_new_tokens":6}}"#);
         let mut streamed = String::new();
-        let usage = runtime
+        let (usage, _finish) = runtime
             .generate_streaming(&[request.as_bytes()], &mut |delta| {
                 streamed.push_str(delta);
                 StreamControl::Continue
@@ -7445,9 +7519,10 @@ mod tests {
         // paths to report the same numbers.
         let (runtime, dir) = load_fixture("usage-parity");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":5}"#;
-        let (buffered, buffered_usage) = runtime.generate(&[request]).expect("buffered");
+        let (buffered, buffered_usage, buffered_finish) =
+            runtime.generate(&[request]).expect("buffered");
         let mut streamed = String::new();
-        let streamed_usage = runtime
+        let (streamed_usage, streamed_finish) = runtime
             .generate_streaming(&[request], &mut |delta| {
                 streamed.push_str(delta);
                 StreamControl::Continue
@@ -7456,6 +7531,10 @@ mod tests {
 
         assert_eq!(String::from_utf8(buffered).expect("utf-8"), streamed);
         assert_eq!(buffered_usage, streamed_usage);
+        // The buffered path is an accumulator over the streaming one, so they
+        // must also agree on *why* generation ended — not just on its text and
+        // its cost.
+        assert_eq!(buffered_finish, streamed_finish);
         assert!(buffered_usage.completion_tokens > 0);
         let _ = fs::remove_dir_all(dir);
     }
@@ -7466,7 +7545,7 @@ mod tests {
     #[test]
     fn a_single_token_generation_reports_one_completion_token() {
         let (runtime, dir) = load_fixture("usage-single");
-        let usage = runtime
+        let (usage, _finish) = runtime
             .generate_streaming(
                 &[br#"{"prompt":"hello","max_new_tokens":1}"#],
                 &mut |_delta| StreamControl::Continue,
@@ -8832,7 +8911,7 @@ mod tests {
         // counters; this proves the CUDA-gated dispatch arms forward the sink
         // rather than dropping it — they are compiled only in this build.
         let mut streamed = String::new();
-        let usage = runtime
+        let (usage, _finish) = runtime
             .generate_streaming(&[request], &mut |delta| {
                 streamed.push_str(delta);
                 StreamControl::Continue

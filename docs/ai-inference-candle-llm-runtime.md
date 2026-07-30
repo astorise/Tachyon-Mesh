@@ -269,6 +269,32 @@ requested. OpenAI only emits `usage` on a stream when
 that does not recognize it risks a 400 that breaks streaming outright — a bad
 trade for a reporting field.
 
+### Local backends report `length` too
+
+A local generation that spends its whole `max_new_tokens` budget is truncated,
+and `guest-openai` resolves an absent finish reason to `stop` — so reporting
+nothing meant a completion cut off mid-function was described to the client as
+having finished normally. The upstream path already relayed `length`, which made
+the honesty of the answer depend on which backend happened to serve the alias.
+
+`TokenSink` records the request's budget beside the prompt token count it
+already tracked, and reports `length` when the completion reached it. The three
+single-sequence loops and the batch-native loop all funnel through it, so Candle,
+ModelOpt and Qwen 3.5 MoE agree; the batch loop evaluates it per row, since rows
+share a step count but not a budget.
+
+Only `length` is named. EOS, a stop sequence and the deadline all leave the
+reason absent, exactly as before — guessing between them is the misreport this
+exists to prevent, and an absent reason is a caller's own inference to make. The
+buffered and streaming paths return the same value, and a test asserts it: the
+buffered path is an accumulator over the streaming one, so a divergence there
+would mean the same request was described differently depending on how it was
+asked for.
+
+A generation refused before decoding starts reports nothing — no tokens were
+produced, so there was no budget to exhaust — and a mock binding reports nothing
+because it has no budget at all.
+
 ## GGUF Families
 
 Architecture dispatch is candle's, not this crate's:
@@ -450,15 +476,25 @@ and verification, which is exactly the work the deadline exists to bound. A
 proposer that stops early loses nothing: the verifier consumes whatever prefix
 it was given.
 
-The hand-off from the generation thread to the guest is bounded (64 events, a
-`sync_channel`), which makes the producer advance no faster than the guest
-drains it. An unbounded queue caps nothing that matters: it only fires a
+The hand-off from the generation thread to the guest is bounded twice — by
+event count (a 64-slot `sync_channel`) and by queued *bytes* (256 KiB) — which
+makes the producer advance no faster than the guest drains it. Both limits are
+needed because they bound different shapes of backlog: the count stops a flood
+of tiny deltas, the byte budget stops a handful of enormous ones. A count alone
+does not bound memory at all, since one upstream SSE frame may approach 1 MiB,
+so 64 of them would still hold ~64 MiB per stream and reach the same gigabytes
+across 32 streams. An event larger than the whole budget is still admitted when
+the queue is empty, or a single oversized frame could never be sent and the
+stream would hang rather than merely be slow. An unbounded queue caps nothing that matters: it only fires a
 cancellation signal when the client *disconnects*, so a client that stays
 connected and reads slowly could have a fast upstream buffer an entire response
 ahead of it — up to the 64 MiB per-stream cap, times the 32 streams the node
 admits. Bounding it also collapses the two cases into one mechanism: `send`
 blocks while the consumer is merely slow and fails only once it is gone, so
-back-pressure and cancellation are the same call.
+back-pressure and cancellation are the same call. The byte budget needs one
+extra signal for that to hold — dropping the `token-stream` wakes a producer
+parked waiting for room, because a closed channel is not something a thread
+asleep on a condvar can observe.
 
 A failed send is not the only signal, because it only fires when there is
 something to send. A sink also answers `is_live()` — backed by a flag the
@@ -545,6 +581,36 @@ streaming path the same rule applies per fragment, and a fragment that cannot be
 used marks the call rather than the stream: the failure surfaces when the call
 is assembled rather than mid-frame, so the message names the offending call's
 index instead of pointing at a line of SSE.
+
+That index is required, not defaulted. It is what joins fragments into calls,
+and defaulting a missing one to 0 silently *merged* distinct calls into a single
+slot — the later id and name overwrote the earlier while the arguments
+concatenated across both — so a client could dispatch one function with
+another's arguments. There is no safe default here: guessing which call a
+fragment belongs to is exactly the mistake. OpenAI's streaming schema requires
+`index` on every tool-call delta, so an upstream omitting it is not one this
+backend can reassemble, and failing says so rather than inventing an answer.
+
+Streamed `content` is held to the same standard. Absent and `null` both mean
+"this frame carried no text" — the ordinary shape of a tool-call or role-only
+frame — but a *present* non-string is a malformed response. Reading it with
+`as_str` alone reported it as absent, so that part of the answer was dropped and
+the stream still completed successfully: a silently short answer with nothing
+marking it short. The buffered path already rejected an unusable message; the
+streaming path now matches it.
+
+Upstream embeddings are normalized on the way out. The `embed` contract promises
+a dense L2-normalized vector and the local backend delivers one, so a consumer
+treating a dot product as cosine similarity is reading the contract correctly.
+An upstream that normalizes is common but not universal, and returning a raw
+vector made rankings magnitude-dependent *only* for upstream-bound aliases —
+the same query scoring differently depending on which backend served it, with
+nothing in the response saying so. The norm is accumulated in `f64`, since a
+large embedding of large components overflows an `f32` accumulator to infinity
+and would turn a good vector into NaNs; a zero-norm vector is rejected rather
+than passed through, because it cannot be normalized at all and every similarity
+against it is undefined. Normalizing here rather than trusting the server also
+makes the already-normalized case free — a unit vector is its own normal.
 
 The structured channel is also what keeps time-to-first-token on tool-enabled
 requests. With calls confined to the text channel, prose had to be accumulated
