@@ -360,6 +360,47 @@ struct ModelInfo {
     /// row and take the model out of the listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_call_parser: Option<String>,
+    /// Who owns this row. `"config"` marks one the host derived from the sealed
+    /// manifest; absent means an upload or a registration owns it.
+    ///
+    /// Carried here so a round-trip through this guest preserves it. Without
+    /// the field, `serde` dropped it on deserialization and the re-serialized
+    /// row came back unmarked — so a registration silently *disowned* a
+    /// configured alias even when it did not mean to overwrite one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+}
+
+/// Marks a registry row the host derived from the sealed manifest.
+const REGISTRY_SOURCE_CONFIG: &str = "config";
+
+impl ModelInfo {
+    fn is_config_owned(&self) -> bool {
+        self.source.as_deref() == Some(REGISTRY_SOURCE_CONFIG)
+    }
+
+    /// Strip any ownership marker a request body carried.
+    ///
+    /// Only the host writes `source: "config"`. Accepting it from a
+    /// registration would let a caller lock an alias against the upload path —
+    /// which enforces the same rule from the other side — with no manifest
+    /// entry behind the claim.
+    fn clear_ownership_marker(&mut self) {
+        self.source = None;
+    }
+}
+
+/// Whether the manifest owns this alias's row.
+///
+/// A missing or unparseable row is *not* config-owned: the guard exists to
+/// protect a marker that is present, and treating an unreadable row as owned
+/// would make a corrupt entry permanently unfixable through this route.
+fn alias_is_config_owned(alias: &str) -> bool {
+    models_table()
+        .get(alias)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ModelInfo>(&raw).ok())
+        .is_some_and(|info| info.is_config_owned())
 }
 
 #[derive(Debug, Serialize)]
@@ -416,8 +457,25 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
 fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     // ── Registry write/list/deregister ───────────────────────────────────────
     if method.eq_ignore_ascii_case("POST") && path == ROUTE_REGISTER {
-        let info: ModelInfo = serde_json::from_slice(body)
+        let mut info: ModelInfo = serde_json::from_slice(body)
             .map_err(|e| format!("invalid model registration payload: {e}"))?;
+        // A non-dynamic configured binding is loaded eagerly at boot, so a
+        // request for its alias runs that backend whatever this table says.
+        // Letting a registration replace the row would advertise one model
+        // while another answers — for an `openai:` binding, a third-party
+        // server.
+        if alias_is_config_owned(&info.alias) {
+            return Ok(openai_error_payload(
+                409,
+                format!(
+                    "model alias `{}` is claimed by a configured binding in the sealed manifest; \
+                     register under a free alias, or declare the binding `dynamic`",
+                    info.alias
+                ),
+                "invalid_request_error",
+            ));
+        }
+        info.clear_ownership_marker();
         let value =
             serde_json::to_vec(&info).map_err(|e| format!("failed to encode model info: {e}"))?;
         models_table()
@@ -428,6 +486,20 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
 
     if method.eq_ignore_ascii_case("DELETE") && path.starts_with(ROUTE_DEREGISTER_PREFIX) {
         let alias = path.trim_start_matches(ROUTE_DEREGISTER_PREFIX);
+        // Same rule on the way out. Deleting a configured row does not stop the
+        // runtime serving the alias — it only removes it from
+        // `GET /ai/v1/models`, leaving a model that answers but cannot be
+        // discovered, and which no reload short of a config change restores.
+        if alias_is_config_owned(alias) {
+            return Ok(openai_error_payload(
+                409,
+                format!(
+                    "model alias `{alias}` is claimed by a configured binding in the sealed \
+                     manifest; it is removed by editing the manifest, not by deregistering"
+                ),
+                "invalid_request_error",
+            ));
+        }
         models_table()
             .delete(alias)
             .map_err(|e| format!("model registry delete failed: {e}"))?;
@@ -1499,6 +1571,74 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The registration route rewrites the whole row, so any field this struct
+    /// does not model is erased by the round-trip. When `source` was missing,
+    /// re-registering an alias stripped the manifest's ownership marker without
+    /// anyone overwriting anything deliberately — and the upload path, which
+    /// reads exactly that marker, then treated a configured alias as free.
+    #[test]
+    fn a_registry_row_round_trip_keeps_its_ownership_marker() {
+        let stored = br#"{
+            "alias": "shared",
+            "engine": "openai",
+            "vramRequiredMb": 0,
+            "status": "available",
+            "source": "config"
+        }"#;
+
+        let info: ModelInfo = serde_json::from_slice(stored).expect("row should parse");
+        assert!(info.is_config_owned());
+
+        let rewritten = serde_json::to_vec(&info).expect("row should re-encode");
+        let reparsed: ModelInfo = serde_json::from_slice(&rewritten).expect("row should re-parse");
+        assert!(
+            reparsed.is_config_owned(),
+            "a round-trip through this guest must not disown a configured alias"
+        );
+    }
+
+    #[test]
+    fn only_the_config_marker_claims_ownership() {
+        // Absent means an upload or a registration owns the row — the common
+        // case, and the one that must stay writable.
+        assert!(!registry_model("free", None).is_config_owned());
+
+        // An unrecognised value is not ownership either. Treating anything
+        // non-empty as owned would let a stray field freeze an alias.
+        let mut odd = registry_model("odd", None);
+        odd.source = Some("upload".to_owned());
+        assert!(!odd.is_config_owned());
+
+        let mut owned = registry_model("owned", None);
+        owned.source = Some(REGISTRY_SOURCE_CONFIG.to_owned());
+        assert!(owned.is_config_owned());
+    }
+
+    /// A row this guest writes must never claim the manifest's marker: the
+    /// upload path enforces the same rule from the other side, so a
+    /// registration that could set `source: "config"` would lock an alias
+    /// against uploads with no manifest entry backing it.
+    #[test]
+    fn a_registration_cannot_claim_manifest_ownership() {
+        let mut info: ModelInfo = serde_json::from_slice(
+            br#"{"alias":"claimed","engine":"gguf","vramRequiredMb":0,
+                 "status":"available","source":"config"}"#,
+        )
+        .expect("payload should parse");
+        assert!(info.is_config_owned(), "the request body did claim it");
+
+        // What the register route does before writing.
+        info.clear_ownership_marker();
+        assert!(!info.is_config_owned());
+
+        let encoded = serde_json::to_vec(&info).expect("row should encode");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("row should parse");
+        assert!(
+            value.get("source").is_none(),
+            "an unowned row omits the marker entirely rather than writing a null"
+        );
+    }
+
     #[test]
     fn chat_completions_rejects_a_malformed_request() {
         // A body with neither `model` nor `messages` is rejected during request
@@ -1535,6 +1675,7 @@ mod tests {
             vram_required_mb: 0,
             status: "available".to_owned(),
             tool_call_parser: parser.map(str::to_owned),
+            source: None,
         }
     }
 

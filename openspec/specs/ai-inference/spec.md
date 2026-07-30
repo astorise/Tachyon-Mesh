@@ -373,6 +373,20 @@ prompt somewhere it did not choose.
 - **AND** the rule holds on every path that writes an uploaded row, not only
   the storage-proxy one
 
+#### Scenario: The registration route cannot take or disown a configured alias
+
+- **WHEN** `POST /internal/guest-openai/register` names an alias whose row the
+  manifest owns
+- **THEN** the registration is refused with `409`, naming the alias and the way
+  out, because the runtime keeps executing the configured backend regardless
+- **AND** deregistering such an alias is refused on the same terms: removing the
+  row would leave a model that answers but cannot be discovered
+- **AND** a registration for a *free* alias never writes the ownership marker,
+  whatever the request body claims — only the host marks a row as
+  manifest-derived
+- **AND** a row that passes through this route keeps a marker it already had, so
+  registering does not silently disown a configured alias
+
 #### Scenario: A declared format outranks the files beside it
 
 - **WHEN** a model directory's sidecar declares a format and the directory also
