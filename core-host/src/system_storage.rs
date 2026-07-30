@@ -721,6 +721,36 @@ pub(crate) fn apply_guest_registry_write(
     Ok(())
 }
 
+/// Apply a guest's `batch-set` to the model registry, all-or-nothing.
+///
+/// The ownership rule and the atomicity `batch-set` promises have to hold at
+/// once. Validating per key in a loop of single-key writes satisfies the first
+/// and breaks the second: the entries before the refused one are already
+/// committed, leaving a half-applied batch a caller has no way to reason about.
+/// One transaction, with the ownership predicate read inside it, is both.
+pub(crate) fn apply_guest_registry_batch(
+    core_store: &crate::store::CoreStore,
+    table: &str,
+    entries: &[(String, Vec<u8>)],
+) -> std::result::Result<(), String> {
+    if table != AI_MODELS_REGISTRY_TABLE {
+        return core_store
+            .kv_partition_batch_set(table, entries)
+            .map_err(|error| format!("{error:#}"));
+    }
+    core_store
+        .kv_partition_batch_update(AI_MODELS_REGISTRY_TABLE, entries, |key, current| {
+            if row_is_config_owned(current) {
+                return Err(format!(
+                    "{GUEST_REGISTRY_ALIAS_TAKEN}: model alias `{key}` is claimed by a \
+                     configured binding in the sealed manifest"
+                ));
+            }
+            Ok(())
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
 /// Marker the guest matches on to turn an ownership refusal into a 409.
 pub(crate) const GUEST_REGISTRY_ALIAS_TAKEN: &str = "model-alias-claimed-by-config";
 
@@ -1499,6 +1529,64 @@ mod configured_binding_registry_tests {
             Some(b"{\"alias\":\"mine\"}".to_vec()),
         )
         .expect("a free alias stays writable");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refused_registry_batch_lands_nothing_at_all() {
+        let (store, dir) = temp_store();
+        let configured = config_with(vec![binding(
+            "coder",
+            "openai:http://127.0.0.1:8080/v1",
+            false,
+        )]);
+        publish_configured_model_bindings(&store, &configured);
+
+        // A free alias first, then one the manifest owns. Validating per key in
+        // a loop of single-key writes commits `mine` and then fails on `coder`,
+        // leaving a half-applied batch — which is exactly what `batch-set`
+        // promises callers it will not do.
+        let entries = vec![
+            ("mine".to_owned(), br#"{"alias":"mine"}"#.to_vec()),
+            ("coder".to_owned(), br#"{"alias":"coder"}"#.to_vec()),
+        ];
+        let denied = apply_guest_registry_batch(&store, AI_MODELS_REGISTRY_TABLE, &entries)
+            .expect_err("a batch touching a configured alias must be refused");
+        assert!(denied.contains(GUEST_REGISTRY_ALIAS_TAKEN), "got: {denied}");
+
+        assert!(
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "mine")
+                .expect("read")
+                .is_none(),
+            "the entry before the refused one must have rolled back with it"
+        );
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "coder")
+            .expect("read")
+            .expect("the configured row survives");
+        let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
+        assert_eq!(row["source"], "config");
+
+        // And a batch of free aliases still lands whole.
+        apply_guest_registry_batch(
+            &store,
+            AI_MODELS_REGISTRY_TABLE,
+            &[
+                ("mine".to_owned(), br#"{"alias":"mine"}"#.to_vec()),
+                ("yours".to_owned(), br#"{"alias":"yours"}"#.to_vec()),
+            ],
+        )
+        .expect("free aliases stay writable");
+        for alias in ["mine", "yours"] {
+            assert!(
+                store
+                    .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+                    .expect("read")
+                    .is_some(),
+                "`{alias}` should have been written"
+            );
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

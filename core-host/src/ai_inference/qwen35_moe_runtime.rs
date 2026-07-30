@@ -369,6 +369,21 @@ impl Qwen35MoeConfig {
     }
 }
 
+/// A rejection of what the *caller* asked for, typed rather than bare.
+///
+/// Validation here used plain `bail!`, which produces an `anyhow` error
+/// indistinguishable from a host fault once it reaches
+/// `GenerationError::from_anyhow` — so a request this runtime refused outright
+/// reached the client as a retryable 500 and was retried forever. The generic
+/// Candle runtime already had a typed variant for exactly this; reusing it
+/// keeps one classification rather than two that can drift.
+fn invalid_request(alias: &str, detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(super::candle_llm_runtime::CandleLlmError::InvalidRequest {
+        alias: alias.to_owned(),
+        detail: detail.into(),
+    })
+}
+
 pub(crate) struct Qwen35MoeRuntime {
     alias: String,
     root: PathBuf,
@@ -605,7 +620,10 @@ impl Qwen35MoeRuntime {
             .encode(request.prompt.clone(), true)
             .map_err(|error| anyhow!("failed to tokenize Qwen prompt: {error}"))?;
         if encoded.is_empty() {
-            bail!("Qwen prompt encoded to zero tokens");
+            return Err(invalid_request(
+                &self.alias,
+                "prompt encoded to zero tokens",
+            ));
         }
         // The two cases differ, and conflating them is what made the raised
         // default a regression here: a caller that named a budget has an
@@ -620,21 +638,27 @@ impl Qwen35MoeRuntime {
             .saturating_sub(encoded.len());
         match request.requested_max_new_tokens {
             Some(requested) if requested > headroom => {
-                bail!(
-                    "prompt tokens {} plus max_new_tokens {requested} exceed the {}-token context limit; lower max_new_tokens to at most {headroom}",
-                    encoded.len(),
-                    self.config.max_position_embeddings
-                );
+                return Err(invalid_request(
+                    &self.alias,
+                    format!(
+                        "prompt tokens {} plus max_new_tokens {requested} exceed the {}-token context limit; lower max_new_tokens to at most {headroom}",
+                        encoded.len(),
+                        self.config.max_position_embeddings
+                    ),
+                ));
             }
             _ => {}
         }
         let max_new_tokens = request.max_new_tokens.min(headroom);
         if max_new_tokens == 0 {
-            bail!(
-                "prompt tokens {} leave no room to generate within the {}-token context limit",
-                encoded.len(),
-                self.config.max_position_embeddings
-            );
+            return Err(invalid_request(
+                &self.alias,
+                format!(
+                    "prompt tokens {} leave no room to generate within the {}-token context limit",
+                    encoded.len(),
+                    self.config.max_position_embeddings
+                ),
+            ));
         }
 
         let mut state = HybridDecodeState::new(&self.config.layer_types);
@@ -645,10 +669,19 @@ impl Qwen35MoeRuntime {
             // runtime is exactly the case that used to outlast the budget
             // before a single token was produced.
             if position > 0 && Instant::now() >= request.deadline {
-                bail!(
-                    "generation deadline elapsed after prefilling {position} of {} prompt tokens",
-                    encoded.len()
-                );
+                // Not an error: the deadline's contract is that it stops
+                // generation and returns what was produced, and a prompt that
+                // outlasts prefill produced nothing. Failing here made a long
+                // prompt on this CPU-bound runtime a hard failure rather than
+                // an empty answer — and the generic runtime made the same
+                // mistake, in each of its own prefills.
+                return Ok((
+                    TokenUsage {
+                        prompt_tokens: encoded.len() as u32,
+                        completion_tokens: 0,
+                    },
+                    None,
+                ));
             }
             logits = self.forward_token(token, position, &mut state)?;
         }
@@ -729,7 +762,10 @@ impl Qwen35MoeRuntime {
 
     fn parse_request(&self, bytes: &[u8]) -> Result<ParsedRequest> {
         if bytes.len() > 16_384 {
-            bail!("Qwen generation request exceeds 16384 bytes");
+            return Err(invalid_request(
+                &self.alias,
+                "generation request exceeds 16384 bytes",
+            ));
         }
         let raw = std::str::from_utf8(bytes).context("Qwen prompt must be UTF-8")?;
         let request = if raw.trim_start().starts_with('{') {
@@ -749,7 +785,10 @@ impl Qwen35MoeRuntime {
         };
         if matches!(request.max_new_tokens, Some(requested) if requested == 0 || requested > HOST_MAX_NEW_TOKENS)
         {
-            bail!("max_new_tokens must be between 1 and {HOST_MAX_NEW_TOKENS}");
+            return Err(invalid_request(
+                &self.alias,
+                format!("max_new_tokens must be between 1 and {HOST_MAX_NEW_TOKENS}"),
+            ));
         }
         // Same bounds and same default as the Candle runtime, so a caller sees
         // one wall-clock contract whichever backend serves its alias.
@@ -758,10 +797,13 @@ impl Qwen35MoeRuntime {
             Some(millis) => {
                 let requested = Duration::from_millis(millis);
                 if requested.is_zero() || requested > HOST_MAX_GENERATION_DEADLINE {
-                    bail!(
-                        "max_generation_ms {millis} must be between 1 and {}",
-                        HOST_MAX_GENERATION_DEADLINE.as_millis()
-                    );
+                    return Err(invalid_request(
+                        &self.alias,
+                        format!(
+                            "max_generation_ms {millis} must be between 1 and {}",
+                            HOST_MAX_GENERATION_DEADLINE.as_millis()
+                        ),
+                    ));
                 }
                 requested
             }
@@ -769,7 +811,10 @@ impl Qwen35MoeRuntime {
         let deadline = Instant::now() + budget;
         let prompt = match (request.messages, request.prompt) {
             (Some(messages), _) if messages.is_empty() => {
-                bail!("chat request must contain at least one message")
+                return Err(invalid_request(
+                    &self.alias,
+                    "chat request must contain at least one message",
+                ))
             }
             (Some(messages), _) => {
                 let messages = messages
@@ -804,7 +849,12 @@ impl Qwen35MoeRuntime {
                 }
             }
             (None, Some(prompt)) => prompt,
-            (None, None) => bail!("generation request requires `messages` or `prompt`"),
+            (None, None) => {
+                return Err(invalid_request(
+                    &self.alias,
+                    "generation request requires `messages` or `prompt`",
+                ))
+            }
         };
         Ok(ParsedRequest {
             prompt,

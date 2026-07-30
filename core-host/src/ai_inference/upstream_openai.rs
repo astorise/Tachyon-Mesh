@@ -924,8 +924,24 @@ impl UpstreamOpenAiRuntime {
             {
                 finish_reason = Some(reported.to_owned());
             }
-            let Some(delta) = choice.and_then(|choice| choice.get("delta")) else {
-                continue;
+            // The same rule one level up: a frame legitimately carries no
+            // `delta` — a final frame that only reports `finish_reason` does —
+            // but a *present* non-object is not that. Accepting it left every
+            // `delta.get(...)` below reading it as neither content nor tool
+            // call, so `{"choices":[{"delta":"answer"}]}` was discarded whole
+            // and `[DONE]` still completed the stream on an ordinary `stop`.
+            let delta = match choice.and_then(|choice| choice.get("delta")) {
+                None | Some(Value::Null) => continue,
+                Some(delta) if delta.is_object() => delta,
+                Some(delta) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed frame has a non-object `delta` of type {}",
+                            json_type_name(delta)
+                        ),
+                    });
+                }
             };
             // Absent and `null` both mean "this frame carried no text" — the
             // normal shape of a tool-call or role-only frame. A *present*
@@ -2186,6 +2202,60 @@ mod tests {
             captured.content.is_empty(),
             "nothing may be emitted from a frame that could not be read"
         );
+    }
+
+    #[test]
+    fn a_streamed_delta_that_is_not_an_object_fails_the_stream() {
+        // One level below the `choices` case: a present non-object `delta` was
+        // accepted, and every `get` below it then read neither content nor tool
+        // call, so the frame was discarded whole and `[DONE]` still completed
+        // the stream on an ordinary `stop`.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":"answer"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a non-object delta is not an absent one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("non-object `delta`"),
+            "the error should name the shape problem, got: {error}"
+        );
+        assert!(captured.content.is_empty());
+    }
+
+    #[test]
+    fn a_final_frame_without_a_delta_is_not_an_error() {
+        // The other side: a frame that only reports `finish_reason` carries no
+        // `delta` at all, and rejecting it would fail ordinary streams.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"finish_reason":"stop"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a final frame carries no delta and is not malformed");
+        assert_eq!(captured.content.concat(), "hi");
+        assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]

@@ -404,6 +404,9 @@ prompt somewhere it did not choose.
 - **AND** the rule binds every component reaching the registry table, through
   any of `set`, `delete` or `batch-set`, not only the component that remembers
   to ask first
+- **AND** a refused `batch-set` applies none of its entries: the ownership test
+  happens inside the batch's own transaction, so the interface keeps the
+  atomicity it promises rather than leaving a half-applied batch behind
 
 #### Scenario: A declared format outranks the files beside it
 
@@ -548,6 +551,9 @@ host maximum.
 - **WHEN** a generation's deadline elapses before its token budget
 - **THEN** decoding stops and the text generated so far is returned
 - **AND** the request is not reported as an error
+- **AND** this holds for expiry during *prefill* too, in every prefill: a prompt
+  that outlasts the deadline before producing a token returns the empty answer,
+  which is the text produced so far, rather than failing the request
 
 #### Scenario: A deadline beyond the work changes nothing
 
@@ -917,6 +923,9 @@ spends the remote server's resources and costs this node one open connection.
 - **THEN** the runtime returns a typed malformed-response error naming the shape
 - **AND** it SHALL NOT read the value as absent, which would drop part of the
   answer and let the stream finish reporting an ordinary `stop`
+- **AND** the same rule applies to a frame's `delta`: a present non-object is an
+  error, while an absent one is the ordinary shape of a frame that only reports
+  `finish_reason`
 - **AND** genuinely absent or `null` values keep their meaning: a usage-only
   frame carries no `choices`, and a tool-call message carries no content
 
@@ -1170,6 +1179,10 @@ HTTP response, that response's status.
   cannot fit the context window — which is reported as 400
   `invalid_request_error`, because a local rejection is still the caller's to
   fix and a 500 sends it retrying a request that can never succeed
+- **AND** that classification SHALL survive the path the error actually takes —
+  the execution wrappers that add context, and the scheduler's fan-out of one
+  failure to every input in a batch — since an error flattened to its message
+  along the way arrives indistinguishable from a host fault
 
 #### Scenario: Streaming respects the scope gate
 - **WHEN** a guest calls `compute-stream` for a handle it does not hold, or for

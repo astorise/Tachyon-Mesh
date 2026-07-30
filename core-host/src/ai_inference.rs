@@ -586,6 +586,40 @@ pub(crate) struct GenerationError {
     pub(crate) invalid_request: bool,
 }
 
+/// One input's share of a failure the whole batch suffered.
+///
+/// The scheduler fans a single backend failure out to every input in its batch,
+/// which means re-materialising an error that cannot be cloned. Doing that with
+/// `to_string()` keeps the words and loses the type — and the type is what
+/// decides whether the caller sees 400 or 500, so a request the runtime refused
+/// came out the far side of a batch as an opaque host fault. Carrying the
+/// classification explicitly is what survives the fan-out.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct BatchFailure {
+    message: String,
+    invalid_request: bool,
+}
+
+impl BatchFailure {
+    /// Flatten an error into a form each input can carry, keeping both the full
+    /// message chain and the classification the chain encoded.
+    fn from_anyhow(error: &anyhow::Error) -> Self {
+        let classified = GenerationError::from_anyhow(error);
+        Self {
+            message: classified.message,
+            invalid_request: classified.invalid_request,
+        }
+    }
+
+    fn local(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            invalid_request: false,
+        }
+    }
+}
+
 impl GenerationError {
     pub(crate) fn local(message: impl Into<String>) -> Self {
         Self {
@@ -614,16 +648,28 @@ impl GenerationError {
         // message: a request the local runtime refused and one a provider
         // refused are both the caller's to fix, and neither is a host fault.
         let invalid_request = error.chain().any(|cause| {
-            matches!(
-                cause.downcast_ref::<candle_llm_runtime::CandleLlmError>(),
-                Some(candle_llm_runtime::CandleLlmError::InvalidRequest { .. })
-            ) || matches!(
-                cause.downcast_ref::<upstream_openai::UpstreamError>(),
-                Some(upstream_openai::UpstreamError::InvalidRequest { .. })
-            )
+            // A failure that crossed a batch fan-out carries its own verdict:
+            // the typed cause is gone by then, and re-deriving it from the
+            // message would be guessing.
+            cause
+                .downcast_ref::<BatchFailure>()
+                .is_some_and(|failure| failure.invalid_request)
+                || matches!(
+                    cause.downcast_ref::<candle_llm_runtime::CandleLlmError>(),
+                    Some(candle_llm_runtime::CandleLlmError::InvalidRequest { .. })
+                )
+                || matches!(
+                    cause.downcast_ref::<upstream_openai::UpstreamError>(),
+                    Some(upstream_openai::UpstreamError::InvalidRequest { .. })
+                )
         });
         Self {
-            message: error.to_string(),
+            // The whole chain, not just its outermost context. The wrappers
+            // that used to format the cause into their message now attach it
+            // as context — which is what lets the classification above see the
+            // typed error at all — so rendering only the top line would trade
+            // one regression for another and drop the detail the caller needs.
+            message: format!("{error:#}"),
             upstream_status: error
                 .chain()
                 .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>())
@@ -704,7 +750,10 @@ trait BackendModel: Send + Sync {
                 adapters.len(),
                 inputs.len()
             );
-            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+            return repeat_batch_error(
+                inputs.len().max(adapters.len()),
+                BatchFailure::local(message),
+            );
         }
         let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
         for group in adapter_assignment_groups(adapters) {
@@ -720,9 +769,9 @@ trait BackendModel: Send + Sync {
             let outputs = match outputs {
                 Ok(outputs) => outputs,
                 Err(error) => {
-                    let message = error.to_string();
+                    let failure = BatchFailure::from_anyhow(&error);
                     for index in group {
-                        results[index] = Some(Err(anyhow!("{}", message)));
+                        results[index] = Some(Err(anyhow::Error::new(failure.clone())));
                     }
                     continue;
                 }
@@ -733,8 +782,9 @@ trait BackendModel: Send + Sync {
                     outputs.len(),
                     group.len()
                 );
+                let failure = BatchFailure::local(message);
                 for index in group {
-                    results[index] = Some(Err(anyhow!("{}", message)));
+                    results[index] = Some(Err(anyhow::Error::new(failure.clone())));
                 }
                 continue;
             }
@@ -2050,21 +2100,24 @@ fn process_batch(
                 outputs.len(),
                 batch.len()
             );
+            let failure = BatchFailure::local(message);
             batch
                 .iter()
-                .map(|_| Err(anyhow::anyhow!("{}", message.clone())))
+                .map(|_| Err(anyhow::Error::new(failure.clone())))
                 .collect()
         }
         Err(error) => {
-            let message = format!(
-                "{} backend failed for model `{}`: {}",
+            // Wrapped, not reformatted: `{error}` would print only the
+            // outermost context and drop the detail the caller needs, and
+            // `from_anyhow` would lose the classification with it.
+            let failure = BatchFailure::from_anyhow(&error.context(format!(
+                "{} backend failed for model `{}`",
                 accelerator.as_str(),
-                model.alias,
-                error
-            );
+                model.alias
+            )));
             batch
                 .iter()
-                .map(|_| Err(anyhow::anyhow!("{}", message.clone())))
+                .map(|_| Err(anyhow::Error::new(failure.clone())))
                 .collect()
         }
     }
@@ -2378,9 +2431,9 @@ impl BackendModel for CandleBackendModel {
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        anyhow!(
-                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed",
                             self.source.alias,
                             runtime.root().display()
                         )
@@ -2408,9 +2461,9 @@ impl BackendModel for CandleBackendModel {
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        anyhow!(
-                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Candle LLM model `{}` loaded from `{}` failed",
                             self.source.alias,
                             runtime.root().display()
                         )
@@ -2456,9 +2509,9 @@ impl BackendModel for CandleBackendModel {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        anyhow!(
-                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Candle LLM model `{}` loaded from `{}` failed",
                             self.source.alias,
                             target.root().display()
                         )
@@ -2557,9 +2610,9 @@ impl BackendModel for CandleBackendModel {
                             .map(|(bytes, usage, finish)| InferenceOutput::measured(bytes, usage, finish))
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        anyhow!(
-                            "Candle LLM model `{}` failed with LoRA adapter `{}` at `{}`: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Candle LLM model `{}` failed with LoRA adapter `{}` at `{}`",
                             self.source.alias,
                             adapter.id,
                             adapter.path.display()
@@ -2602,12 +2655,15 @@ impl BackendModel for CandleBackendModel {
                 adapters.len(),
                 inputs.len()
             );
-            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+            return repeat_batch_error(
+                inputs.len().max(adapters.len()),
+                BatchFailure::local(message),
+            );
         }
         match &self.kind {
             CandleBackendModelKind::Upstream(runtime) => {
                 if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
-                    return repeat_batch_error(inputs.len(), error.to_string());
+                    return repeat_batch_error(inputs.len(), BatchFailure::from_anyhow(&error));
                 }
                 let alias = self.source.alias.as_str();
                 // Per-input isolation, which the trait default cannot give this
@@ -2662,7 +2718,7 @@ impl BackendModel for CandleBackendModel {
             }
             | CandleBackendModelKind::ModelOptNvfp4(target) => {
                 if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
-                    return repeat_batch_error(inputs.len(), error.to_string());
+                    return repeat_batch_error(inputs.len(), BatchFailure::from_anyhow(&error));
                 }
                 let prompts = inputs
                     .iter()
@@ -2673,11 +2729,11 @@ impl BackendModel for CandleBackendModel {
                         if outputs.len() != inputs.len() {
                             return repeat_batch_error(
                                 inputs.len(),
-                                format!(
+                                BatchFailure::local(format!(
                                     "Candle backend returned {} output(s) for a native mixed-adapter batch of {} input(s)",
                                     outputs.len(),
                                     inputs.len()
-                                ),
+                                )),
                             );
                         }
                         let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
@@ -2754,9 +2810,9 @@ impl BackendModel for CandleBackendModel {
             .map(|(usage, finish_reason)| {
                 StreamOutcome::usage(Some(usage)).with_finish_reason(finish_reason)
             })
-            .map_err(|error| {
-                anyhow!(
-                    "Candle LLM model `{}` loaded from `{}` failed: {error}",
+            .with_context(|| {
+                format!(
+                    "Candle LLM model `{}` loaded from `{}` failed",
                     self.source.alias,
                     target.root().display()
                 )
@@ -2783,9 +2839,9 @@ impl BackendModel for CandleBackendModel {
                 self.source.alias
             ),
             CandleBackendModelKind::Upstream(runtime) => {
-                let input = std::str::from_utf8(input.data.as_ref()).map_err(|error| {
-                    anyhow!(
-                        "embedding input for model `{}` was not UTF-8: {error}",
+                let input = std::str::from_utf8(input.data.as_ref()).with_context(|| {
+                    format!(
+                        "embedding input for model `{}` was not UTF-8",
                         self.source.alias
                     )
                 })?;
@@ -2794,15 +2850,15 @@ impl BackendModel for CandleBackendModel {
                 result
             }
             CandleBackendModelKind::TextEmbedding(runtime) => {
-                let input = std::str::from_utf8(input.data.as_ref()).map_err(|error| {
-                    anyhow!(
-                        "embedding input for model `{}` was not UTF-8: {error}",
+                let input = std::str::from_utf8(input.data.as_ref()).with_context(|| {
+                    format!(
+                        "embedding input for model `{}` was not UTF-8",
                         self.source.alias
                     )
                 })?;
-                let result = runtime.embed(input).map_err(|error| {
-                    anyhow!(
-                        "embedding model `{}` loaded from `{}` failed: {error}",
+                let result = runtime.embed(input).with_context(|| {
+                    format!(
+                        "embedding model `{}` loaded from `{}` failed",
                         self.source.alias,
                         runtime.root().display()
                     )
@@ -2869,9 +2925,9 @@ impl BackendModel for CandleBackendModel {
                 runtime
                     .generate_streaming(&prompts, on_token)
                     .map(outcome)
-                    .map_err(|error| {
-                        anyhow!(
-                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Candle LLM model `{}` loaded from `{}` failed",
                             self.source.alias,
                             runtime.root().display()
                         )
@@ -2896,9 +2952,9 @@ impl BackendModel for CandleBackendModel {
                     None => target.generate_streaming(&prompts, on_token),
                 }
                 .map(outcome)
-                .map_err(|error| {
-                    anyhow!(
-                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                .with_context(|| {
+                    format!(
+                        "Candle LLM model `{}` loaded from `{}` failed",
                         self.source.alias,
                         target.root().display()
                     )
@@ -2913,9 +2969,9 @@ impl BackendModel for CandleBackendModel {
                 runtime
                     .generate_streaming(&prompts, on_token)
                     .map(outcome)
-                    .map_err(|error| {
-                        anyhow!(
-                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed",
                             self.source.alias,
                             runtime.root().display()
                         )
@@ -3801,9 +3857,10 @@ impl SemanticContextFlattener {
     }
 }
 
-fn repeat_batch_error(count: usize, message: impl Into<String>) -> Vec<Result<InferenceOutput>> {
-    let message = message.into();
-    (0..count).map(|_| Err(anyhow!("{}", message))).collect()
+fn repeat_batch_error(count: usize, failure: BatchFailure) -> Vec<Result<InferenceOutput>> {
+    (0..count)
+        .map(|_| Err(anyhow::Error::new(failure.clone())))
+        .collect()
 }
 
 impl CandleBackendModel {
@@ -3818,7 +3875,10 @@ impl CandleBackendModel {
                 adapters.len(),
                 inputs.len()
             );
-            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+            return repeat_batch_error(
+                inputs.len().max(adapters.len()),
+                BatchFailure::local(message),
+            );
         }
         let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
         for group in adapter_assignment_groups(adapters) {
@@ -3834,9 +3894,9 @@ impl CandleBackendModel {
             let outputs = match outputs {
                 Ok(outputs) => outputs,
                 Err(error) => {
-                    let message = error.to_string();
+                    let failure = BatchFailure::from_anyhow(&error);
                     for index in group {
-                        results[index] = Some(Err(anyhow!("{}", message)));
+                        results[index] = Some(Err(anyhow::Error::new(failure.clone())));
                     }
                     continue;
                 }
@@ -3847,8 +3907,9 @@ impl CandleBackendModel {
                     outputs.len(),
                     group.len()
                 );
+                let failure = BatchFailure::local(message);
                 for index in group {
-                    results[index] = Some(Err(anyhow!("{}", message)));
+                    results[index] = Some(Err(anyhow::Error::new(failure.clone())));
                 }
                 continue;
             }
@@ -3866,6 +3927,102 @@ impl CandleBackendModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classification has to survive the *wrappers*, not just exist.
+    ///
+    /// The first attempt at this only tested the guest's mapping from a
+    /// hand-built `GenerationError`, so it passed while the real path was
+    /// broken: the execution wrappers formatted the cause into their message
+    /// with `anyhow!("…: {error}")`, which erased the typed error before the
+    /// downcast could ever see it. This exercises the wrapping those wrappers
+    /// actually do.
+    #[test]
+    fn a_local_rejection_survives_the_execution_wrappers() {
+        use anyhow::Context;
+
+        let rejected: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::InvalidRequest {
+            alias: "coder".to_owned(),
+            detail: "max_new_tokens 9000 exceeds the 4096-token ceiling".to_owned(),
+        });
+        let wrapped = rejected
+            .with_context(|| {
+                format!(
+                    "Candle LLM model `{}` loaded from `{}` failed",
+                    "coder", "/models/coder"
+                )
+            })
+            .expect_err("the request was rejected");
+
+        let error = GenerationError::from_anyhow(&wrapped);
+        assert!(
+            error.invalid_request,
+            "a request the runtime refused must reach the client as a 400, not a retryable 500"
+        );
+        assert_eq!(error.upstream_status, None, "no provider was involved");
+        // Both halves of the chain, or the message regresses to naming only the
+        // wrapper while the caller loses the detail it needs to fix its request.
+        assert!(
+            error.message.contains("max_new_tokens 9000"),
+            "the cause's detail must survive: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("loaded from"),
+            "and so must the wrapper's context: {}",
+            error.message
+        );
+    }
+
+    /// The scheduler fans one backend failure out to every input in the batch,
+    /// re-materialising an error that cannot be cloned. That fan-out was the
+    /// third place the classification died — after the execution wrappers and
+    /// before the guest — and the one that made the first fix look like it
+    /// worked in a unit test while doing nothing in production.
+    #[test]
+    fn a_local_rejection_survives_the_batch_fan_out() {
+        use anyhow::Context;
+
+        let rejected: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::InvalidRequest {
+            alias: "coder".to_owned(),
+            detail: "max_new_tokens 9000 exceeds the 4096-token ceiling".to_owned(),
+        });
+        let wrapped = rejected
+            .context("Candle LLM model `coder` loaded from `/models/coder` failed")
+            .expect_err("the request was rejected");
+
+        // Exactly what the fan-out does with it.
+        let fanned_out: Vec<_> = repeat_batch_error(3, BatchFailure::from_anyhow(&wrapped));
+        assert_eq!(fanned_out.len(), 3);
+        for result in fanned_out {
+            let error = GenerationError::from_anyhow(&result.expect_err("every input fails"));
+            assert!(
+                error.invalid_request,
+                "each input's share of a rejected request is still a rejected request"
+            );
+            assert!(
+                error.message.contains("max_new_tokens 9000"),
+                "and still says why: {}",
+                error.message
+            );
+        }
+    }
+
+    /// A host fault wrapped identically stays a 500 — the classification keys
+    /// on the typed cause, not on having been wrapped.
+    #[test]
+    fn a_host_failure_is_not_classified_as_the_callers_fault() {
+        use anyhow::Context;
+
+        let failed: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::Execution {
+            alias: "coder".to_owned(),
+            detail: "transformer forward pass failed".to_owned(),
+        });
+        let wrapped = failed
+            .context("Candle LLM model `coder` loaded from `/models/coder` failed")
+            .expect_err("the execution failed");
+
+        assert!(!GenerationError::from_anyhow(&wrapped).invalid_request);
+    }
 
     #[test]
     fn an_openai_binding_loads_as_an_upstream_without_touching_the_filesystem() {

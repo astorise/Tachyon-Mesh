@@ -1245,13 +1245,17 @@ impl SingleDeviceBackend {
                         )
                     }
                     None => {
-                        let (logits, index_pos) = runtime.llama_prefill_with_prefix_cache(
-                            &model,
-                            prompt_ids,
-                            &mut cache,
-                            device,
-                            request.deadline,
-                        )?;
+                        let Prefill::Ready { logits, index_pos } = runtime
+                            .llama_prefill_with_prefix_cache(
+                                &model,
+                                prompt_ids,
+                                &mut cache,
+                                device,
+                                request.deadline,
+                            )?
+                        else {
+                            return Ok(());
+                        };
                         runtime.decode_loop_from_logits(
                             logits,
                             index_pos,
@@ -1927,6 +1931,20 @@ impl SamplingPolicy {
             },
         }
     }
+}
+
+/// What a prefill produced, so an expired deadline is a *state* rather than an
+/// error.
+///
+/// Prefill and decode share one deadline, and the spec is explicit that its
+/// expiry stops generation and returns the text produced so far without
+/// reporting a failure. Every prefill here got that wrong the same way — each
+/// returned `Execution` — which turned a long prompt on a busy node into a hard
+/// error rather than an empty answer. Making the outcome a value keeps the
+/// three of them honest.
+enum Prefill {
+    Ready { logits: Tensor, index_pos: usize },
+    DeadlineExpired,
 }
 
 struct ParsedGenerationRequest {
@@ -3844,8 +3862,13 @@ impl CandleLlmRuntime {
         if prompt_ids.len() > self.limits.max_position_embeddings {
             return Ok(());
         }
-        let (logits, index_pos) =
-            self.run_prefill_chunks(prompt_ids, device, request.deadline, &mut forward)?;
+        // Nothing was generated, and that is the answer: an expired deadline
+        // returns what was produced rather than failing.
+        let Prefill::Ready { logits, index_pos } =
+            self.run_prefill_chunks(prompt_ids, device, request.deadline, &mut forward)?
+        else {
+            return Ok(());
+        };
         self.decode_loop_from_logits(
             logits,
             index_pos,
@@ -3865,13 +3888,22 @@ impl CandleLlmRuntime {
     /// same scheduler lane while it does — checking only in the decode loop
     /// would let a request blow through its stated wall-clock budget before
     /// producing a single token.
+    /// Run prefill, or stop because the deadline ran out mid-prompt.
+    ///
+    /// An expired deadline is not an execution failure. The contract is that
+    /// the deadline stops generation and returns what was produced — and a
+    /// prompt that outlasts it produces nothing, which is the empty case of
+    /// that rule, not an exception to it. Reporting it as an error meant a long
+    /// prompt on a slow node failed outright instead of returning early, and
+    /// the same mistake was made independently in each prefill; naming the
+    /// outcome is what stops the next one from repeating it.
     fn run_prefill_chunks(
         &self,
         prompt_ids: &[u32],
         device: &Device,
         deadline: Instant,
         forward: &mut impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
-    ) -> Result<(Tensor, usize), CandleLlmError> {
+    ) -> Result<Prefill, CandleLlmError> {
         let mut index_pos = 0usize;
         let mut logits = None;
         while index_pos < prompt_ids.len() {
@@ -3879,13 +3911,7 @@ impl CandleLlmRuntime {
             // cannot be interrupted. `prefill_chunk_tokens` is what bounds how
             // long the check can be delayed.
             if logits.is_some() && Instant::now() >= deadline {
-                return Err(CandleLlmError::Execution {
-                    alias: self.alias.clone(),
-                    detail: format!(
-                        "generation deadline elapsed after prefilling {index_pos} of {} prompt tokens",
-                        prompt_ids.len()
-                    ),
-                });
+                return Ok(Prefill::DeadlineExpired);
             }
             let remaining = prompt_ids.len() - index_pos;
             let chunk_len = self.limits.next_prefill_chunk_len(remaining);
@@ -3904,7 +3930,7 @@ impl CandleLlmRuntime {
 
         logits
             .ok_or_else(|| self.execution_error("prompt produced no prefill logits".to_owned()))
-            .map(|logits| (logits, index_pos))
+            .map(|logits| Prefill::Ready { logits, index_pos })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3953,9 +3979,23 @@ impl CandleLlmRuntime {
             // could retire a single one.
             let now = Instant::now();
             if index_pos < prompt_len && requests.iter().all(|request| now >= request.deadline) {
-                return Err(self.execution_error(format!(
-                    "generation deadline elapsed after prefilling {index_pos} of {prompt_len} prompt tokens"
-                )));
+                // Same rule as the other prefills: every row is out of time, so
+                // every row's answer is the empty one it produced. Failing the
+                // batch instead reported an error for requests that were merely
+                // slow.
+                return Ok(requests
+                    .iter()
+                    .map(|_| {
+                        (
+                            Vec::new(),
+                            TokenUsage {
+                                prompt_tokens: prompt_len as u32,
+                                completion_tokens: 0,
+                            },
+                            None,
+                        )
+                    })
+                    .collect());
             }
         }
         let mut logits = logits.ok_or_else(|| {
@@ -4235,7 +4275,7 @@ impl CandleLlmRuntime {
         cache: &mut Cache,
         device: &Device,
         deadline: Instant,
-    ) -> Result<(Tensor, usize), CandleLlmError> {
+    ) -> Result<Prefill, CandleLlmError> {
         let mut index_pos = 0usize;
         let mut logits = None;
         if let Some(entry) = self
@@ -4257,13 +4297,7 @@ impl CandleLlmRuntime {
             // held its scheduler lane well past `max_generation_ms`, since the
             // decode loop's check is only reached once prefill finishes.
             if logits.is_some() && Instant::now() >= deadline {
-                return Err(CandleLlmError::Execution {
-                    alias: self.alias.clone(),
-                    detail: format!(
-                        "generation deadline elapsed after prefilling {index_pos} of {} prompt tokens",
-                        prompt_ids.len()
-                    ),
-                });
+                return Ok(Prefill::DeadlineExpired);
             }
             let remaining = prompt_ids.len() - index_pos;
             let chunk_len = self.limits.next_prefill_chunk_len(remaining);
@@ -4293,7 +4327,7 @@ impl CandleLlmRuntime {
 
         logits
             .ok_or_else(|| self.execution_error("prompt produced no prefill logits".to_owned()))
-            .map(|logits| (logits, index_pos))
+            .map(|logits| Prefill::Ready { logits, index_pos })
     }
 
     /// Mask every vocabulary logit the grammar would reject for the next
@@ -7372,16 +7406,22 @@ mod tests {
         let (runtime, dir) = load_fixture_with_strategy("deadline-prefill", &strategy);
         let request =
             br#"{"prompt":"hello mesh from tachyon","max_new_tokens":4,"max_generation_ms":1}"#;
-        let error = runtime
+        // Stopping, not failing. The deadline's contract is that it ends
+        // generation and returns what was produced — which for a prompt that
+        // outlasts prefill is nothing. Reporting an error here made a slow node
+        // fail long prompts outright, and contradicted the same contract the
+        // decode loop honours two lines later.
+        let (bytes, usage, finish_reason) = runtime
             .generate(&[&request[..]])
-            .expect_err("an elapsed budget must stop prefill rather than run to completion");
+            .expect("an elapsed budget stops prefill, it does not fail the request");
         assert!(
-            error.to_string().contains("deadline elapsed"),
-            "prefill should name the elapsed deadline, got: {error}"
+            bytes.is_empty(),
+            "prefill never reached decode, so there is no text to return"
         );
-        assert!(
-            error.to_string().contains("prompt tokens"),
-            "the error should say how far prefill got, got: {error}"
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(
+            finish_reason, None,
+            "nothing was truncated against a token budget"
         );
         let _ = fs::remove_dir_all(dir);
     }

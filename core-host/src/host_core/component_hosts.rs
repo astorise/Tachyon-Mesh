@@ -1826,24 +1826,15 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        // Per key, not one batch write: `batch_set` would otherwise be the way
-        // around the ownership rule `set` enforces, and a table this guarded
-        // must not have a second door. Non-registry tables keep the single
-        // transaction they had.
-        if res.table_name == crate::system_storage::AI_MODELS_REGISTRY_TABLE {
-            for (key, value) in &entries {
-                crate::system_storage::apply_guest_registry_write(
-                    &res.core_store,
-                    &res.table_name,
-                    key,
-                    Some(value.clone()),
-                )?;
-            }
-            return Ok(());
-        }
-        res.core_store
-            .kv_partition_batch_set(&res.table_name, &entries)
-            .map_err(|e| format!("{e:#}"))
+        // `batch_set` must not be the way around the ownership rule `set`
+        // enforces — a table this guarded cannot have a second door — and it
+        // must stay atomic, which is what this interface promises. Both hold
+        // only if the check happens inside the one transaction.
+        crate::system_storage::apply_guest_registry_batch(
+            &res.core_store,
+            &res.table_name,
+            &entries,
+        )
     }
 
     fn get_range(
@@ -1983,24 +1974,15 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        // Per key, not one batch write: `batch_set` would otherwise be the way
-        // around the ownership rule `set` enforces, and a table this guarded
-        // must not have a second door. Non-registry tables keep the single
-        // transaction they had.
-        if res.table_name == crate::system_storage::AI_MODELS_REGISTRY_TABLE {
-            for (key, value) in &entries {
-                crate::system_storage::apply_guest_registry_write(
-                    &res.core_store,
-                    &res.table_name,
-                    key,
-                    Some(value.clone()),
-                )?;
-            }
-            return Ok(());
-        }
-        res.core_store
-            .kv_partition_batch_set(&res.table_name, &entries)
-            .map_err(|e| format!("{e:#}"))
+        // `batch_set` must not be the way around the ownership rule `set`
+        // enforces — a table this guarded cannot have a second door — and it
+        // must stay atomic, which is what this interface promises. Both hold
+        // only if the check happens inside the one transaction.
+        crate::system_storage::apply_guest_registry_batch(
+            &res.core_store,
+            &res.table_name,
+            &entries,
+        )
     }
 
     fn get_range(
