@@ -7,7 +7,9 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{Device, Tensor};
-use candle_transformers::generation::{IncrementalDecoder, LogitsProcessor, Sampling};
+use candle_transformers::generation::{
+    FinishReason, IncrementalDecoder, LogitsProcessor, Sampling, StopCriteria,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -702,13 +704,15 @@ impl Qwen35MoeRuntime {
         // large share of its wall-clock budget re-rendering text it had already
         // rendered, while holding the lane.
         let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
-        // Set when the model ended the answer itself — EOS or a caller's stop
-        // sequence — as opposed to running out of budget. The distinction is
-        // invisible in the token count alone: an answer that ends on exactly
-        // the budget's last token satisfies `generated.len() >= max_new_tokens`
-        // while having finished perfectly normally, and reporting `length`
-        // there tells the client its complete answer was truncated.
-        let mut ended_naturally = false;
+        // Stop sequences, the held-back tail, and the finish-reason rule, all
+        // from upstream — the same `StopCriteria` the generic Candle runtime
+        // uses, so the two backends cannot drift apart on them again.
+        //
+        // The hold is new here. This loop emitted up to `text.len()` on every
+        // step, so a stop sequence straddling two tokens had its first half
+        // streamed before the match was ever found.
+        let criteria = StopCriteria::new(request.stop.clone(), vec![self.config.eos_token_id]);
+        let mut finish = None;
         for step in 0..max_new_tokens {
             // Elapsed budget stops generation the way an exhausted token budget
             // does, rather than failing: freeing the scheduler slot is the
@@ -723,8 +727,8 @@ impl Qwen35MoeRuntime {
             }
             let tensor = Tensor::from_vec(logits, self.config.vocab_size, &Device::Cpu)?;
             let token = processor.sample(&tensor)?;
-            if token == self.config.eos_token_id {
-                ended_naturally = true;
+            if criteria.is_eos(token) {
+                finish = criteria.finish_reason(token, decoder.text(), false);
                 break;
             }
             generated.push(token);
@@ -732,31 +736,37 @@ impl Qwen35MoeRuntime {
                 .push(token)
                 .map_err(|error| anyhow!("failed to decode Qwen tokens: {error}"))?;
             let text = decoder.text();
-            let stop = request
-                .stop
-                .iter()
-                .filter_map(|needle| text.find(needle))
-                .min();
-            let safe_end = stop.unwrap_or(text.len());
+            let safe_end = criteria.safe_emit_end(text);
             if emitted < safe_end {
                 abandoned = on_token(&text[emitted..safe_end]).is_stop();
                 emitted = safe_end;
             }
-            if stop.is_some() {
-                ended_naturally = true;
+            if criteria.matched(text).is_some() {
+                finish = criteria.finish_reason(token, text, false);
                 break;
             }
             logits = self.forward_token(token, encoded.len() + step, &mut state)?;
+        }
+        // Flush what the hold kept back. Every exit from the loop leaves a
+        // suffix unsent — EOS breaks before the token is even pushed — and
+        // without this the answer loses its last few bytes.
+        let text = decoder.text();
+        let end = criteria.matched(text).unwrap_or(text.len());
+        if !abandoned && emitted < end {
+            on_token(&text[emitted..end]);
         }
         let usage = TokenUsage {
             prompt_tokens: encoded.len() as u32,
             completion_tokens: generated.len() as u32,
         };
-        // Same rule as the generic Candle runtime: only budget exhaustion is
-        // named, because that is the case an absent reason would misreport as
-        // a clean `stop` — and this backend serves the same `/ai/v1` clients.
-        let finish_reason =
-            (!ended_naturally && generated.len() >= max_new_tokens).then_some("length");
+        // Same rule as the generic Candle runtime, and now literally the same
+        // code: only budget exhaustion is named, because that is the case an
+        // absent reason would misreport as a clean `stop`.
+        let finish_reason = match finish {
+            Some(FinishReason::Stop) => None,
+            Some(FinishReason::Length) => Some("length"),
+            None => (generated.len() >= max_new_tokens).then_some("length"),
+        };
         Ok((usage, finish_reason))
     }
 
@@ -1353,6 +1363,56 @@ mod tests {
 
     /// One wall-clock contract across backends: a caller must not have to know
     /// which runtime serves its alias to know what budget it gets.
+    /// This backend held nothing back: it streamed up to `text.len()` on every
+    /// step, so a stop sequence straddling two tokens had its first half sent
+    /// before the match was found — the client saw bytes the buffered response
+    /// never contains. Sharing `StopCriteria` with the generic runtime is what
+    /// fixed it, and this pins the property rather than the implementation.
+    #[test]
+    fn a_stop_sequence_split_across_tokens_is_never_partially_emitted() {
+        let criteria = StopCriteria::new(vec!["<|end|>".to_owned()], vec![7]);
+
+        // The withheld tail is a fixed byte count — one short of the longest
+        // stop sequence — not a suffix the criteria tries to match. That is
+        // deliberately conservative: any prefix of a stop sequence is
+        // necessarily inside those bytes, so none of it can be emitted.
+        assert_eq!(criteria.hold(), "<|end|>".len() - 1);
+        assert_eq!(criteria.safe_emit_end("abc<|end"), "abc<|end".len() - 6);
+
+        // Once it completes, emission stops exactly at the match — the
+        // sequence itself is never part of the answer.
+        assert_eq!(criteria.safe_emit_end("abc<|end|>"), 3);
+        assert_eq!(criteria.matched("abc<|end|>"), Some(3));
+
+        // And with no stop configured nothing is withheld, so an ordinary
+        // generation still streams as it is produced.
+        let none = StopCriteria::new(Vec::<String>::new(), vec![7]);
+        assert_eq!(none.hold(), 0);
+        assert_eq!(none.safe_emit_end("abc"), 3);
+    }
+
+    /// The boundary the token count cannot express, asserted on the shared
+    /// verdict rather than on each backend's copy of the rule.
+    #[test]
+    fn an_eos_on_the_budgets_last_token_is_a_stop_not_a_length() {
+        let criteria = StopCriteria::new(Vec::<String>::new(), vec![7]);
+        assert_eq!(
+            criteria.finish_reason(7, "done", true),
+            Some(FinishReason::Stop),
+            "EOS landing on the last allowed token still ended the answer normally"
+        );
+        assert_eq!(
+            criteria.finish_reason(3, "done", true),
+            Some(FinishReason::Length),
+            "without a model-controlled ending, an exhausted budget is a truncation"
+        );
+        assert_eq!(
+            criteria.finish_reason(3, "done", false),
+            None,
+            "and a loop that stopped for some other reason names none"
+        );
+    }
+
     #[test]
     fn the_deadline_bounds_match_the_candle_runtime() {
         assert_eq!(DEFAULT_GENERATION_DEADLINE, Duration::from_secs(300));

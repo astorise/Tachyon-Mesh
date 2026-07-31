@@ -14,7 +14,7 @@ use candle_core::{
 };
 use candle_nn::VarBuilder;
 use candle_transformers::generation::IncrementalDecoder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::generation::{FinishReason, LogitsProcessor, Sampling, StopCriteria};
 use candle_transformers::models::deepseek2::{
     DeepSeekV2 as DeepSeekModel, DeepSeekV2Config as DeepSeekConfig,
 };
@@ -557,12 +557,14 @@ struct TokenSink<'a> {
     /// it. Present so the sink can tell a generation that *ran out of budget*
     /// from one that finished — see [`TokenSink::finish_reason`].
     token_budget: Option<usize>,
-    /// Set when the decode loop ended the answer itself, on EOS or on a
-    /// caller's stop sequence. The token count alone cannot express this: an
-    /// answer whose EOS lands on exactly the budget's last token has both
-    /// spent its budget and finished normally, and only the loop knows which
-    /// of the two ended it.
-    ended_naturally: bool,
+    /// What ended the generation, as `StopCriteria::finish_reason` judged it.
+    ///
+    /// The token count alone cannot express this: an answer whose EOS lands on
+    /// exactly the budget's last token has both spent its budget and finished
+    /// normally. That rule now lives upstream, so the four decode loops share
+    /// one verdict instead of each re-deriving it — which is how they came to
+    /// disagree in the first place.
+    finish: Option<FinishReason>,
 }
 
 impl<'a> TokenSink<'a> {
@@ -573,7 +575,7 @@ impl<'a> TokenSink<'a> {
             prompt_tokens: 0,
             stopped: false,
             token_budget: None,
-            ended_naturally: false,
+            finish: None,
         }
     }
 
@@ -585,10 +587,17 @@ impl<'a> TokenSink<'a> {
         self.token_budget = Some(budget);
     }
 
-    /// Record that the model ended the answer — EOS, or a matched stop
-    /// sequence — rather than the budget ending it.
-    fn mark_natural_end(&mut self) {
-        self.ended_naturally = true;
+    /// Record the verdict a loop obtained from its [`StopCriteria`].
+    fn record_finish(&mut self, reason: Option<FinishReason>) {
+        if let Some(reason) = reason {
+            self.finish = Some(reason);
+        }
+    }
+
+    /// Whether this generation has spent the budget it was given.
+    fn budget_exhausted(&self) -> bool {
+        self.token_budget
+            .is_some_and(|budget| self.completion_tokens >= budget)
     }
 
     /// Why decoding stopped, when this sink can tell.
@@ -605,17 +614,20 @@ impl<'a> TokenSink<'a> {
     /// finished normally. The upstream path already reported `length` here,
     /// so the same request was answered honestly or not depending on which
     /// backend served the alias.
-    /// A natural end wins over the count. The two coincide precisely when the
-    /// answer's last token is also its budget's last, and calling that
-    /// `length` tells the client a complete answer was truncated — the exact
-    /// misreport this reason exists to prevent, in the other direction.
+    /// `Stop` stays *unnamed* on the wire. `guest-openai` resolves an absent
+    /// reason to `stop`, so naming it would say the same thing twice; only
+    /// `length` has to be named, because that is the case an absent reason
+    /// would misreport as a clean finish.
+    ///
+    /// A loop that ended for a reason outside the criteria — the wall-clock
+    /// deadline, a departed consumer — records nothing, and the count decides
+    /// as it always did.
     fn finish_reason(&self) -> Option<&'static str> {
-        if self.ended_naturally {
-            return None;
+        match self.finish {
+            Some(FinishReason::Stop) => None,
+            Some(FinishReason::Length) => Some("length"),
+            None => self.budget_exhausted().then_some("length"),
         }
-        self.token_budget
-            .filter(|budget| self.completion_tokens >= *budget)
-            .map(|_| "length")
     }
 
     fn usage(&self) -> TokenUsage {
@@ -3463,14 +3475,11 @@ impl CandleLlmRuntime {
         let draft_tokens = draft_tokens.max(1);
         let mut context_ids = prompt_ids.clone();
         let mut generated = Vec::with_capacity(request.max_new_tokens);
-        let hold = request
-            .stop
-            .iter()
-            .map(String::len)
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(1);
+        let criteria = StopCriteria::new(request.stop.clone(), self.eos_token_ids());
         let mut emitted = 0usize;
+        // The flush below needs the token the loop stopped on to ask the
+        // criteria what ended the generation.
+        let mut last_token = None;
         let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
 
         while generated.len() < request.max_new_tokens
@@ -3498,24 +3507,24 @@ impl CandleLlmRuntime {
                 };
                 context_ids.push(target_token);
                 generated.push(target_token);
+                last_token = Some(target_token);
                 sink.record_token();
 
                 decoder.push(target_token).map_err(|error| {
                     self.execution_error(format!("failed to decode token: {error}"))
                 })?;
                 let text = decoder.text();
-                if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
-                    sink.mark_natural_end();
+                if let Some(stop_at) = criteria.matched(text) {
+                    sink.record_finish(criteria.finish_reason(target_token, text, false));
                     emit_delta(sink, text, &mut emitted, stop_at);
                     return Ok(());
                 }
-                if self.is_eos_token(target_token) {
-                    sink.mark_natural_end();
+                if criteria.is_eos(target_token) {
+                    sink.record_finish(criteria.finish_reason(target_token, text, false));
                     emit_delta(sink, text, &mut emitted, text.len());
                     return Ok(());
                 }
-                let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
-                emit_delta(sink, text, &mut emitted, safe);
+                emit_delta(sink, text, &mut emitted, criteria.safe_emit_end(text));
 
                 if target_token != proposed_token
                     || generated.len() == request.max_new_tokens
@@ -3536,12 +3545,14 @@ impl CandleLlmRuntime {
         let text = decoder.text();
         // A stop sequence can still be sitting in the held-back tail when the
         // budget runs out, and trimming it here is what completes the answer —
-        // so this is a natural end too, not a truncation.
-        let stop_at = find_earliest_stop(text, &request.stop);
-        if stop_at.is_some() {
-            sink.mark_natural_end();
+        // so this is a natural end too, not a truncation. `safe_emit_end`
+        // returns the match when there is one and the whole text otherwise,
+        // which is exactly the flush this needs.
+        if let Some(token) = last_token {
+            let exhausted = sink.budget_exhausted();
+            sink.record_finish(criteria.finish_reason(token, text, exhausted));
         }
-        let end = stop_at.unwrap_or(text.len());
+        let end = criteria.matched(text).unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
@@ -3567,6 +3578,20 @@ impl CandleLlmRuntime {
                 ..
             }
         )
+    }
+
+    /// The checkpoint's EOS ids, for building a [`StopCriteria`].
+    fn eos_token_ids(&self) -> Vec<u32> {
+        match &*self.inner {
+            LoadedModel::Safetensors { eos_tokens, .. } | LoadedModel::Gguf { eos_tokens, .. } => {
+                eos_tokens.clone()
+            }
+            LoadedModel::Parallel(parallel) => match parallel {
+                ParallelModel::Tensor { eos_tokens, .. }
+                | ParallelModel::Pipeline { eos_tokens, .. }
+                | ParallelModel::Expert { eos_tokens, .. } => eos_tokens.clone(),
+            },
+        }
     }
 
     fn is_eos_token(&self, token: u32) -> bool {
@@ -4032,7 +4057,13 @@ impl CandleLlmRuntime {
         let mut done = vec![false; batch];
         // Parallel to `done`: which rows the model itself ended, as opposed to
         // rows their budget ended.
-        let mut ended_naturally = vec![false; batch];
+        // One per row: rows share a forward pass but not a stop list, and the
+        // verdict each row retires with is its own.
+        let criteria: Vec<_> = requests
+            .iter()
+            .map(|request| StopCriteria::new(request.stop.clone(), eos_tokens.to_vec()))
+            .collect();
+        let mut finishes: Vec<Option<FinishReason>> = vec![None; batch];
         let mut next_tokens = vec![0u32; batch];
         let max_new_tokens = requests
             .iter()
@@ -4081,14 +4112,13 @@ impl CandleLlmRuntime {
                 decoders[row].push(next).map_err(|error| {
                     self.execution_error(format!("failed to decode token for row {row}: {error}"))
                 })?;
-                if eos_tokens.contains(&next)
-                    || find_earliest_stop(decoders[row].text(), &requests[row].stop).is_some()
-                {
+                let text = decoders[row].text();
+                if criteria[row].is_eos(next) || criteria[row].matched(text).is_some() {
                     done[row] = true;
                     // Why it retired, not just that it did: a row whose EOS
                     // lands on its budget's last token finished normally, and
                     // the count below cannot tell that from a truncation.
-                    ended_naturally[row] = true;
+                    finishes[row] = criteria[row].finish_reason(next, text, false);
                 }
             }
 
@@ -4125,10 +4155,11 @@ impl CandleLlmRuntime {
         decoders
             .iter()
             .zip(requests)
-            .zip(&ended_naturally)
-            .map(|((decoder, request), ended_naturally)| {
+            .zip(&criteria)
+            .zip(&finishes)
+            .map(|(((decoder, request), criteria), finish)| {
                 let text = decoder.text();
-                let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+                let end = criteria.matched(text).unwrap_or(text.len());
                 let completion_tokens = decoder.tokens().len();
                 let usage = TokenUsage {
                     // Every row in a native batch shares one prompt length —
@@ -4140,10 +4171,13 @@ impl CandleLlmRuntime {
                 };
                 // Per row, not per batch: rows share a step count but not a
                 // budget, so one row can be truncated while its neighbours
-                // finished cleanly.
-                let finish_reason = (!ended_naturally
-                    && completion_tokens >= request.max_new_tokens)
-                    .then_some("length");
+                // finished cleanly. A row that retired on its own criteria
+                // carries that verdict; only the rest fall back to the count.
+                let finish_reason = match finish {
+                    Some(FinishReason::Stop) => None,
+                    Some(FinishReason::Length) => Some("length"),
+                    None => (completion_tokens >= request.max_new_tokens).then_some("length"),
+                };
                 Ok((text.as_bytes()[..end].to_vec(), usage, finish_reason))
             })
             .collect()
@@ -4171,16 +4205,13 @@ impl CandleLlmRuntime {
             .map(|fsm| FsmLogitProcessor::new(Arc::clone(fsm)));
         let vocab_size = self.tokenizer.get_vocab_size(true);
         let mut generated = Vec::with_capacity(request.max_new_tokens);
-        // Hold back this many trailing bytes so a stop sequence split across the
-        // last token(s) is never partially emitted before it is matched.
-        let hold = request
-            .stop
-            .iter()
-            .map(String::len)
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(1);
+        // Stop sequences, the held-back tail that keeps one split across two
+        // tokens matchable, and the finish-reason rule, all from upstream.
+        let criteria = StopCriteria::new(request.stop.clone(), eos_tokens.to_vec());
         let mut emitted = 0usize;
+        // The flush below needs the token the loop stopped on to ask the
+        // criteria what ended the generation.
+        let mut last_token = None;
         // Detokenize incrementally: re-decoding `generated` in full on every
         // step is O(n²) in the generated length, which only became worth fixing
         // once generation budgets moved past a few hundred tokens.
@@ -4205,6 +4236,7 @@ impl CandleLlmRuntime {
                 }
             }
             generated.push(next);
+            last_token = Some(next);
             sink.record_token();
 
             decoder.push(next).map_err(|error| {
@@ -4212,19 +4244,18 @@ impl CandleLlmRuntime {
             })?;
             let text = decoder.text();
             // A matched stop ends the decode: emit up to (not including) it.
-            if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
-                sink.mark_natural_end();
+            if let Some(stop_at) = criteria.matched(text) {
+                sink.record_finish(criteria.finish_reason(next, text, false));
                 emit_delta(sink, text, &mut emitted, stop_at);
                 return Ok(());
             }
-            if eos_tokens.contains(&next) {
-                sink.mark_natural_end();
+            if criteria.is_eos(next) {
+                sink.record_finish(criteria.finish_reason(next, text, false));
                 emit_delta(sink, text, &mut emitted, text.len());
                 return Ok(());
             }
             // No stop yet: emit everything except the held-back tail.
-            let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
-            emit_delta(sink, text, &mut emitted, safe);
+            emit_delta(sink, text, &mut emitted, criteria.safe_emit_end(text));
 
             if step + 1 == request.max_new_tokens {
                 break;
@@ -4258,12 +4289,14 @@ impl CandleLlmRuntime {
         let text = decoder.text();
         // A stop sequence can still be sitting in the held-back tail when the
         // budget runs out, and trimming it here is what completes the answer —
-        // so this is a natural end too, not a truncation.
-        let stop_at = find_earliest_stop(text, &request.stop);
-        if stop_at.is_some() {
-            sink.mark_natural_end();
+        // so this is a natural end too, not a truncation. `safe_emit_end`
+        // returns the match when there is one and the whole text otherwise,
+        // which is exactly the flush this needs.
+        if let Some(token) = last_token {
+            let exhausted = sink.budget_exhausted();
+            sink.record_finish(criteria.finish_reason(token, text, exhausted));
         }
-        let end = stop_at.unwrap_or(text.len());
+        let end = criteria.matched(text).unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
@@ -4696,12 +4729,6 @@ fn sanitize_stop(stop: Option<Vec<String>>) -> Vec<String> {
 
 /// Byte offset of the earliest stop sequence in `text`, or `None`. The offset
 /// is a substring-match start, so it always lands on a UTF-8 codepoint boundary.
-fn find_earliest_stop(text: &str, stop: &[String]) -> Option<usize> {
-    stop.iter()
-        .filter_map(|needle| text.find(needle.as_str()))
-        .min()
-}
-
 /// Emit `text[*emitted..end]` through `sink` (when non-empty) and advance
 /// `*emitted`. `end` and `*emitted` must be codepoint boundaries.
 fn emit_delta(sink: &mut TokenSink<'_>, text: &str, emitted: &mut usize, end: usize) {
@@ -4709,18 +4736,6 @@ fn emit_delta(sink: &mut TokenSink<'_>, text: &str, emitted: &mut usize, end: us
         sink.emit(&text[*emitted..end]);
         *emitted = end;
     }
-}
-
-/// Largest codepoint boundary `<= idx` (a stable stand-in for the unstable
-/// `str::floor_char_boundary`).
-fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
-    if idx >= text.len() {
-        return text.len();
-    }
-    while idx > 0 && !text.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
 }
 
 /// Generic chat rendering used when a checkpoint ships no `chat_template`:
@@ -6607,7 +6622,7 @@ mod tests {
             "the count alone still reads as truncation"
         );
 
-        sink.mark_natural_end();
+        sink.record_finish(Some(FinishReason::Stop));
         assert_eq!(
             sink.finish_reason(),
             None,
@@ -8270,16 +8285,6 @@ mod tests {
         assert!(stops.len() <= MAX_STOP_SEQUENCES);
         assert!(!stops.iter().any(String::is_empty));
         assert!(!stops.iter().any(|s| s.len() > MAX_STOP_SEQUENCE_BYTES));
-    }
-
-    #[test]
-    fn find_earliest_stop_returns_the_earliest_match() {
-        let stops = vec!["END".to_owned(), "stop".to_owned()];
-        assert_eq!(find_earliest_stop("keep me END drop", &stops), Some(8));
-        // Earliest of several matches wins.
-        assert_eq!(find_earliest_stop("a stop b END c", &stops), Some(2));
-        // No match.
-        assert_eq!(find_earliest_stop("nothing here", &stops), None);
     }
 
     #[test]

@@ -117,8 +117,9 @@ decode matches now, not that a future token cannot rewrite text before the
 anchor, which a decoder applying a regex replacement can do. Unbounded decoders
 degrade to whole-sequence decoding rather than corrupting output.
 
-This runtime shipped that implementation first and then upstreamed it, so what
-remains here is the seam: `IncrementalDecoder::from_tokenizer(&self.tokenizer)`
+This runtime shipped that implementation first and then upstreamed it (candle
+PR #3789, merged into the fork, still under review upstream), so what remains
+here is the seam: `IncrementalDecoder::from_tokenizer(&self.tokenizer)`
 in each of the three generation loops, `push(token)` per step, and `text()` —
 which is always equal to a whole-sequence decode — fed to the stop-sequence scan
 and the delta emitter. Emission accounting stays local because the loops hold
@@ -142,6 +143,39 @@ Stop-sequence scanning is deliberately left as a full-text search per step: it
 is also O(n²), but it is a `memchr`-backed substring search over bytes, orders of
 magnitude cheaper per byte than tokenizer work, and keeping it whole-text avoids
 any question about missing an earlier match.
+
+## Stop Criteria and the Finish Reason
+
+The scan itself, the held-back tail that keeps a stop sequence split across two
+tokens matchable, and the rule for naming why generation ended, all come from
+`candle_transformers::generation::{StopCriteria, FinishReason}` — upstreamed for
+the same reason as the decoder, and adopted here the same way.
+
+Four decode loops had grown a copy of that logic: the ordinary one, the
+speculative one, the continuous-batch one, and Qwen 3.5's. A review pass found
+the same class of defect in every one of them, and differently in each — which
+is the signature of logic that should exist once. Two are worth naming, because
+they are what the shared version prevents:
+
+- **The finish reason inferred from the token count alone.** `completion_tokens
+  >= max_new_tokens` means `length` — except exactly at the boundary, where an
+  answer whose EOS or stop sequence lands on the budget's last token has both
+  spent its budget and ended normally. `StopCriteria::finish_reason` takes the
+  token, the text and whether the budget is spent, and gives a
+  model-controlled ending precedence over the count.
+- **Qwen 3.5 held nothing back.** It emitted up to `text.len()` on every step,
+  so a stop sequence straddling two tokens had its first half streamed before
+  the match was ever found — bytes the buffered response does not contain.
+  `safe_emit_end` withholds `hold()` bytes, one short of the longest stop
+  sequence, which is conservative by construction: any prefix of a stop
+  sequence necessarily lies inside them.
+
+`FinishReason::Stop` is deliberately *not* named on the wire. `guest-openai`
+resolves an absent reason to `stop`, so reporting it would say the same thing
+twice; only `length` has to be named, because that is the case an absent reason
+would misreport as a clean finish. A loop that ended for a reason outside the
+criteria — the wall-clock deadline, a departed consumer — records nothing and
+falls back to the count, exactly as before.
 
 ## Mock and Unsupported Bindings
 
