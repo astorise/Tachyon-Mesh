@@ -246,6 +246,15 @@ enum ModelArchitecture {
     Glm4,
     Lfm2,
     Phi2,
+    /// Qwen 3.5's *hybrid* stack: Gated DeltaNet linear-attention layers
+    /// interleaved with full-attention ones.
+    ///
+    /// Distinct from [`Self::Qwen35Moe`], which is the Qwen3/3.5 mixture of
+    /// experts — full attention throughout, experts in the feed-forward.
+    /// Routing a hybrid checkpoint there would load it against the wrong layer
+    /// structure, so the two spellings must not collapse however similar the
+    /// names look.
+    Qwen35Hybrid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +307,7 @@ impl ModelArchitecture {
             "qwen2" => Some(Self::Qwen2),
             "qwen3" => Some(Self::Qwen3),
             "qwen3moe" => Some(Self::Qwen35Moe),
+            "qwen3_5" => Some(Self::Qwen35Hybrid),
             "gemma" | "gemma2" | "gemma3" | "gemma-embedding" => Some(Self::Gemma3),
             "glm4" => Some(Self::Glm4),
             "lfm2" => Some(Self::Lfm2),
@@ -367,7 +377,7 @@ impl ModelArchitecture {
             },
             // GGUF-only: candle ships a quantized backend for each, and this
             // runtime has no safetensors loader for them.
-            Self::Glm4 | Self::Lfm2 | Self::Phi2 => ArchitectureCapabilities {
+            Self::Glm4 | Self::Lfm2 | Self::Phi2 | Self::Qwen35Hybrid => ArchitectureCapabilities {
                 safetensors: false,
                 gguf: true,
                 single: true,
@@ -414,6 +424,7 @@ impl ModelArchitecture {
             Self::Glm4 => "glm4",
             Self::Lfm2 => "lfm2",
             Self::Phi2 => "phi2",
+            Self::Qwen35Hybrid => "qwen3-5",
         }
     }
 
@@ -6679,6 +6690,43 @@ mod tests {
         assert!(is_multimodal_hf_model_type("gemma3_vl"));
     }
 
+    /// The two Qwen 3.5 spellings are different architectures, and the names
+    /// invite exactly the confusion this pins against: `qwen3moe` is full
+    /// attention with experts in the feed-forward, `qwen3_5` interleaves Gated
+    /// DeltaNet linear-attention layers with full-attention ones. A checkpoint
+    /// routed to the wrong one loads against the wrong layer structure.
+    #[test]
+    fn the_qwen35_moe_and_hybrid_spellings_do_not_collapse() {
+        assert_eq!(
+            ModelArchitecture::from_gguf_architecture("qwen3moe"),
+            Some(ModelArchitecture::Qwen35Moe)
+        );
+        assert_eq!(
+            ModelArchitecture::from_gguf_architecture("qwen3_5"),
+            Some(ModelArchitecture::Qwen35Hybrid)
+        );
+        assert_ne!(
+            ModelArchitecture::Qwen35Moe,
+            ModelArchitecture::Qwen35Hybrid
+        );
+
+        // The hybrid is GGUF-only: this runtime has no safetensors loader for
+        // it, and the NVFP4 Qwen 3.5 path is a separate, ModelOpt-specific
+        // runtime that this enum does not route to.
+        assert!(ModelArchitecture::Qwen35Hybrid.supports_format(ModelFormat::Gguf));
+        assert!(!ModelArchitecture::Qwen35Hybrid.supports_format(ModelFormat::Safetensors));
+
+        // And no HF `model_type` resolves to it, so a safetensors directory
+        // cannot reach it by accident.
+        for model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_moe"] {
+            assert_ne!(
+                ModelArchitecture::from_hf_model_type(model_type),
+                Some(ModelArchitecture::Qwen35Hybrid),
+                "`{model_type}` must not resolve to the GGUF-only hybrid"
+            );
+        }
+    }
+
     #[test]
     fn architecture_registry_keeps_format_support_explicit() {
         assert!(ModelArchitecture::Llama.supports_format(ModelFormat::Safetensors));
@@ -6854,6 +6902,7 @@ mod tests {
             (ModelArchitecture::Qwen2, "qwen2"),
             (ModelArchitecture::Qwen3, "qwen3"),
             (ModelArchitecture::Qwen35Moe, "qwen3moe"),
+            (ModelArchitecture::Qwen35Hybrid, "qwen3_5"),
             (ModelArchitecture::Gemma3, "gemma3"),
             (ModelArchitecture::Phi3, "phi3"),
         ] {
