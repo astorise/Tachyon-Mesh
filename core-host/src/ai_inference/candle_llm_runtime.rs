@@ -47,7 +47,7 @@ use super::paged_kv::{
 use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::samplers::{FsmCache, FsmLogitProcessor};
-use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
+use super::tensor_parallel_llama::{load_tensor_parallel_llama, TensorParallelCache};
 use super::ResolvedLoraAdapter;
 use super::StreamControl;
 use parallel_topology::{
@@ -83,9 +83,9 @@ struct MixtralConfigJson {
 }
 
 #[cfg(feature = "candle-cuda")]
-const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = true;
+pub(crate) const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = true;
 #[cfg(not(feature = "candle-cuda"))]
-const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = false;
+pub(crate) const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = false;
 
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -1493,7 +1493,7 @@ impl SingleDeviceBackend {
 /// [`PipelineParallelLlama::forward_at`] on every prefill/decode call.
 enum ParallelModel {
     Tensor {
-        model: Box<TensorParallelLlama>,
+        model: Box<candle_transformers::models::llama::Llama>,
         config: Config,
         eos_tokens: Vec<u32>,
         /// Devices the plan sharded across; `devices[0]` is the primary device
@@ -2881,7 +2881,7 @@ impl CandleLlmRuntime {
                 }
                 .map_err(invalid)?;
                 let model =
-                    TensorParallelLlama::load(var_builder, &config, &devices).map_err(invalid)?;
+                    load_tensor_parallel_llama(var_builder, &config, &devices).map_err(invalid)?;
                 Ok((
                     LoadedModel::Parallel(ParallelModel::Tensor {
                         model: Box::new(model),
