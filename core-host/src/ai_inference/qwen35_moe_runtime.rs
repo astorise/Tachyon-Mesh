@@ -1319,6 +1319,73 @@ mod tests {
         assert!(runtime.chat_template.is_some());
     }
 
+    /// Measures how prefill scales with prompt length, and reports it.
+    ///
+    /// Gated twice: on a real NVFP4 checkpoint, and on an explicit opt-in,
+    /// because it is a wall-clock measurement and belongs on a machine chosen
+    /// for it rather than in every developer's `cargo test`.
+    ///
+    /// The assertion is deliberately loose. Absolute throughput is a property
+    /// of the host, not of this code, so pinning a number here would fail on
+    /// every machine that is not the one it was written on. What *is* a
+    /// property of this code is the shape of the curve: prefill runs one
+    /// matrix-*vector* product per token per projection, so doubling the prompt
+    /// should roughly double the time. Anything worse than quadratic-ish growth
+    /// means a per-token cost that itself grows with position — a cache that
+    /// stopped hitting, a state that is being copied rather than updated — and
+    /// that is a defect at any absolute speed.
+    ///
+    /// The numbers it prints are the baseline for the batched-projection work:
+    /// a `matmul` over the whole prompt reads each weight once instead of once
+    /// per token, and this is what will show it.
+    #[test]
+    fn gated_prefill_scaling_is_reported_and_not_superlinear() {
+        let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
+            return;
+        };
+        if std::env::var("TACHYON_QWEN35_PREFILL_BENCH").as_deref() != Ok("1") {
+            return;
+        }
+        let runtime = Qwen35MoeRuntime::try_load("qwen35-bench", &path, "cpu")
+            .expect("runtime construction should succeed")
+            .expect("checkpoint should select the Qwen runtime");
+
+        // One decoded token, so the measurement is prefill plus a fixed
+        // constant rather than prefill plus a generation whose length varies.
+        let measure = |words: usize| -> std::time::Duration {
+            let prompt = "token ".repeat(words);
+            let request = serde_json::json!({
+                "prompt": prompt,
+                "max_new_tokens": 1,
+                "temperature": 0.0,
+            })
+            .to_string();
+            let started = Instant::now();
+            runtime
+                .generate(&[request.as_bytes()])
+                .expect("prefill benchmark generation should succeed");
+            started.elapsed()
+        };
+
+        // Warm the working set first: the first call pays for preparing every
+        // projection, which is a one-off and not what is being measured.
+        let _ = measure(16);
+
+        let short = measure(64);
+        let long = measure(128);
+        let ratio = long.as_secs_f64() / short.as_secs_f64().max(f64::EPSILON);
+        println!(
+            "qwen35 prefill: 64 tokens {short:?}, 128 tokens {long:?}, ratio {ratio:.2}, \
+             {:.1} tok/s at 128",
+            128.0 / long.as_secs_f64()
+        );
+        assert!(
+            ratio < 4.0,
+            "doubling the prompt should not cost more than ~4x; got {ratio:.2} \
+             ({short:?} -> {long:?}), which means per-token cost grows with position"
+        );
+    }
+
     #[test]
     fn working_set_is_bounded_and_reports_cache_activity() {
         let mut cache = LinearWorkingSet::new(8);

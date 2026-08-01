@@ -1,0 +1,92 @@
+name: GPU Acceptance
+
+# Everything here needs a real CUDA device, so none of it can run on the
+# hosted runners the rest of CI uses. `workflow_dispatch` keeps it on demand;
+# the weekly run is there so a silent break is found within days rather than at
+# the next release.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+
+# One GPU, one job at a time: these tests allocate most of the device's memory
+# and would fail each other rather than fail honestly if they overlapped.
+concurrency:
+  group: gpu-acceptance
+  cancel-in-progress: false
+
+jobs:
+  cuda-kernels:
+    name: NVFP4 kernels and quantized matmul
+    runs-on: [self-hosted, tachyon-cuda]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require a CUDA device
+        shell: bash
+        run: |
+          nvidia-smi
+          : "${TACHYON_CUTLASS_INCLUDE_DIR:?missing TACHYON_CUTLASS_INCLUDE_DIR}"
+      # The smoke tests are no-ops without this, and a silent no-op is the one
+      # outcome a GPU job must not have.
+      - name: NVFP4 CUDA smoke
+        env:
+          TACHYON_NVFP4_CUDA_SMOKE: "1"
+        run: |
+          cargo test -p core-host --features ai-inference,candle-cuda,nvfp4-cuda \
+            --bin core-host -- modelopt_nvfp4 --nocapture
+
+  candle-gpu-seams:
+    name: Paged KV and tensor-parallel seams
+    runs-on: [self-hosted, tachyon-cuda]
+    needs: cuda-kernels
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require a CUDA device
+        run: nvidia-smi
+      # The paged-attention seam and the sharded MLP are both compiled out
+      # without `candle-cuda`, so the hosted matrix never executes them. This
+      # is the only place their correctness is actually observed.
+      - name: Parallel Llama and paged KV
+        run: |
+          cargo test -p core-host --features ai-inference,candle-cuda \
+            --bin core-host -- tensor_parallel pipeline_parallel expert_parallel paged \
+            --nocapture
+
+  qwen35-nvfp4:
+    name: Qwen 3.5 NVFP4 checkpoint
+    runs-on: [self-hosted, tachyon-cuda]
+    needs: cuda-kernels
+    # The checkpoint is tens of gigabytes and lives on the runner, not in the
+    # repository. Without it every test below returns early, so the guard
+    # below turns that into a failure rather than a green tick.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require the installed checkpoint
+        shell: bash
+        run: |
+          nvidia-smi
+          : "${TACHYON_QWEN35_MOE_NVFP4_DIR:?missing TACHYON_QWEN35_MOE_NVFP4_DIR}"
+          test -d "$TACHYON_QWEN35_MOE_NVFP4_DIR"
+      - name: Native NVFP4 execution
+        env:
+          # Fail rather than fall back: the point of this job is to exercise
+          # the native kernel path, and a silent fallback to the scalar one
+          # would pass while testing nothing that needs a GPU.
+          TACHYON_NVFP4_NATIVE_REQUIRED: "1"
+        run: |
+          cargo test -p core-host --features ai-inference,candle-cuda,nvfp4-cuda \
+            --bin core-host -- qwen35_moe_runtime::tests::gated_ --nocapture
+
+      # Reported, not gated on a threshold: absolute throughput is a property
+      # of this runner. The job records it so a regression is visible in the
+      # log history, and the test itself only fails on growth that is wrong at
+      # any speed.
+      - name: Prefill scaling
+        env:
+          TACHYON_QWEN35_PREFILL_BENCH: "1"
+        run: |
+          cargo test -p core-host --features ai-inference,candle-cuda,nvfp4-cuda \
+            --bin core-host -- gated_prefill_scaling --nocapture
