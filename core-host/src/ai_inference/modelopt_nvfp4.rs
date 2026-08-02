@@ -1084,6 +1084,125 @@ impl PreparedLinear {
         Ok(output)
     }
 
+    /// Apply this operator to `tokens` inputs at once.
+    ///
+    /// `inputs` is `[tokens, cols]` row-major and the result is
+    /// `[tokens, rows]` row-major, so a caller holding a whole prompt can make
+    /// one call where it used to make one per token.
+    ///
+    /// The win is not the call count, it is the decode. `matvec` walks the
+    /// weight once per token, and for a quantized operator each step of that
+    /// walk is an unpack: an E2M1 nibble through a lookup table and a per-block
+    /// E4M3 scale, or an E4M3 byte and a tensor scale. Prefilling a 1024-token
+    /// prompt therefore unpacked every weight in the model 1024 times. Here the
+    /// weight loop is outermost, so each element is unpacked once and applied
+    /// to every token — which is also why this is memory-bandwidth bound rather
+    /// than arithmetic bound, and why the saving grows with the prompt.
+    ///
+    /// Accumulation order per output element is unchanged — rows outermost,
+    /// then blocks, then bytes, high nibble before low — so this returns
+    /// bit-identical results to calling `matvec` per token, not merely close
+    /// ones. `matmul_matches_matvec_for_every_operator_form` pins that.
+    pub(crate) fn matmul(&self, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let (rows, cols) = match self {
+            Self::Dense { rows, cols, .. }
+            | Self::Fp8 { rows, cols, .. }
+            | Self::Nvfp4 { rows, cols, .. } => (*rows, *cols),
+        };
+        if tokens == 0 {
+            return Ok(Vec::new());
+        }
+        if inputs.len() != tokens * cols {
+            bail!(
+                "linear input has {} values, expected {tokens} x {cols}",
+                inputs.len()
+            );
+        }
+        let mut output = vec![0.0f32; tokens * rows];
+        match self {
+            Self::Dense { weight, .. } => {
+                for row in 0..rows {
+                    let row_weights = &weight[row * cols..(row + 1) * cols];
+                    for (col, weight_value) in row_weights.iter().enumerate() {
+                        for token in 0..tokens {
+                            output[token * rows + row] += weight_value * inputs[token * cols + col];
+                        }
+                    }
+                }
+            }
+            Self::Fp8 { weight, scale, .. } => {
+                for row in 0..rows {
+                    let row_weights = &weight[row * cols..(row + 1) * cols];
+                    for (col, weight_value) in row_weights.iter().enumerate() {
+                        let decoded = e4m3_to_f32(*weight_value) * scale;
+                        for token in 0..tokens {
+                            output[token * rows + row] += decoded * inputs[token * cols + col];
+                        }
+                    }
+                }
+            }
+            Self::Nvfp4 {
+                packed,
+                scales,
+                tensor_scale,
+                ..
+            } => {
+                let packed_cols = cols / 2;
+                let scale_cols = cols / NVFP4_BLOCK_SIZE;
+                for row in 0..rows {
+                    for block in 0..scale_cols {
+                        let scale = e4m3_to_f32(scales[row * scale_cols + block]) * tensor_scale;
+                        let packed_offset = row * packed_cols + block * (NVFP4_BLOCK_SIZE / 2);
+                        let input_offset = block * NVFP4_BLOCK_SIZE;
+                        for byte_index in 0..NVFP4_BLOCK_SIZE / 2 {
+                            let byte = packed[packed_offset + byte_index];
+                            let high = E2M1_LUT[(byte >> 4) as usize] * scale;
+                            let low = E2M1_LUT[(byte & 0x0f) as usize] * scale;
+                            let value_index = input_offset + byte_index * 2;
+                            for token in 0..tokens {
+                                let base = token * cols;
+                                let out = &mut output[token * rows + row];
+                                *out += high * inputs[base + value_index];
+                                *out += low * inputs[base + value_index + 1];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    /// The native-kernel counterpart of [`Self::matmul`].
+    ///
+    /// Still one kernel launch per token: `Nvfp4CudaBackend` takes a single
+    /// activation vector, so batching it is a kernel change rather than a
+    /// caller change. This exists so the runtime has one batched entry point
+    /// whichever execution plan is active; it is no slower than the per-token
+    /// calls it replaces, and no faster until the kernel grows a batched form.
+    pub(crate) fn matmul_native_nvfp4(&self, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let cols = match self {
+            Self::Dense { cols, .. } | Self::Fp8 { cols, .. } | Self::Nvfp4 { cols, .. } => *cols,
+        };
+        if !matches!(self, Self::Nvfp4 { .. }) {
+            return self.matmul(inputs, tokens);
+        }
+        if tokens == 0 {
+            return Ok(Vec::new());
+        }
+        if inputs.len() != tokens * cols {
+            bail!(
+                "linear input has {} values, expected {tokens} x {cols}",
+                inputs.len()
+            );
+        }
+        let mut output = Vec::with_capacity(tokens);
+        for token in 0..tokens {
+            output.push(self.matvec_native_nvfp4(&inputs[token * cols..(token + 1) * cols])?);
+        }
+        Ok(output.concat())
+    }
+
     pub(crate) fn matvec_native_nvfp4(&self, input: &[f32]) -> Result<Vec<f32>> {
         match self {
             Self::Nvfp4 {
@@ -2024,6 +2143,89 @@ mod tests {
 
         assert!(error.to_string().contains("shape [N, K/2]"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The batched path must be a pure restructuring, not an approximation.
+    ///
+    /// Bit-identical, not "within epsilon": the loop reorder keeps each output
+    /// element's accumulation sequence exactly as `matvec` had it, so any
+    /// difference at all means the order moved — and a reordering that changes
+    /// results is a reordering that changed the model's output for every
+    /// prompt, silently. An epsilon comparison would hide precisely that.
+    #[test]
+    fn matmul_matches_matvec_for_every_operator_form() {
+        const COLS: usize = NVFP4_BLOCK_SIZE * 2;
+        const ROWS: usize = 3;
+        const TOKENS: usize = 5;
+
+        // Deterministic, and deliberately not smooth: values that vary in
+        // magnitude across the row are what make a changed summation order
+        // show up in the low bits.
+        let inputs: Vec<f32> = (0..TOKENS * COLS)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.37 + (i % 3) as f32 * 1.9)
+            .collect();
+
+        let dense = PreparedLinear::Dense {
+            rows: ROWS,
+            cols: COLS,
+            weight: (0..ROWS * COLS)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.21)
+                .collect(),
+        };
+        let fp8 = PreparedLinear::Fp8 {
+            rows: ROWS,
+            cols: COLS,
+            weight: (0..ROWS * COLS).map(|i| (i % 251) as u8).collect(),
+            scale: 0.125,
+        };
+        let nvfp4 = PreparedLinear::Nvfp4 {
+            rows: ROWS,
+            cols: COLS,
+            packed: (0..ROWS * COLS / 2).map(|i| (i % 253) as u8).collect(),
+            scales: (0..ROWS * COLS / NVFP4_BLOCK_SIZE)
+                .map(|i| (i % 199) as u8)
+                .collect(),
+            tensor_scale: 0.5,
+        };
+
+        for (name, operator) in [("dense", dense), ("fp8", fp8), ("nvfp4", nvfp4)] {
+            let batched = operator
+                .matmul(&inputs, TOKENS)
+                .unwrap_or_else(|error| panic!("{name} matmul failed: {error}"));
+            assert_eq!(batched.len(), TOKENS * ROWS, "{name} output shape");
+
+            for token in 0..TOKENS {
+                let expected = operator
+                    .matvec(&inputs[token * COLS..(token + 1) * COLS])
+                    .unwrap_or_else(|error| panic!("{name} matvec failed: {error}"));
+                assert_eq!(
+                    &batched[token * ROWS..(token + 1) * ROWS],
+                    expected.as_slice(),
+                    "{name}: batched token {token} differs from the per-token result"
+                );
+            }
+
+            // A single token through the batched path is the per-token path.
+            let one = operator.matmul(&inputs[..COLS], 1).expect("single token");
+            assert_eq!(one, operator.matvec(&inputs[..COLS]).expect("matvec"));
+
+            // And an empty batch is empty rather than an error: a caller with
+            // nothing to prefill should not have to special-case it.
+            assert!(operator.matmul(&[], 0).expect("empty batch").is_empty());
+        }
+    }
+
+    #[test]
+    fn matmul_rejects_an_input_that_is_not_a_whole_number_of_tokens() {
+        let operator = PreparedLinear::Dense {
+            rows: 2,
+            cols: 4,
+            weight: vec![0.0; 8],
+        };
+        let error = operator
+            .matmul(&[1.0, 2.0, 3.0], 2)
+            .expect_err("3 values cannot be 2 tokens of 4");
+        assert!(error.to_string().contains("expected 2 x 4"), "{error}");
     }
 
     #[test]

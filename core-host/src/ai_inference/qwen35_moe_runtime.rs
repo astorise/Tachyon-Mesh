@@ -685,7 +685,17 @@ impl Qwen35MoeRuntime {
                     None,
                 ));
             }
-            logits = self.forward_token(token, position, &mut state)?;
+            // Only the prompt's last token needs logits; the rest exist to
+            // advance the state.
+            let last = position + 1 == encoded.len();
+            logits = self.forward_token(token, position, &mut state, last)?;
+        }
+        // The loop above is the only producer, and only its last iteration asks
+        // for logits. Stated here because a future edit to either condition
+        // would otherwise surface as a tensor built from an empty slice, which
+        // says nothing about what actually went wrong.
+        if logits.is_empty() {
+            bail!("prefill produced no logits for the prompt's final token");
         }
         let sampling = resolve_sampling(
             request.temperature,
@@ -745,7 +755,8 @@ impl Qwen35MoeRuntime {
                 finish = criteria.finish_reason(token, text, false);
                 break;
             }
-            logits = self.forward_token(token, encoded.len() + step, &mut state)?;
+            // Decode always needs logits: every step samples from them.
+            logits = self.forward_token(token, encoded.len() + step, &mut state, true)?;
         }
         // Flush what the hold kept back. Every exit from the loop leaves a
         // suffix unsent — EOS breaks before the token is even pushed — and
@@ -885,11 +896,25 @@ impl Qwen35MoeRuntime {
         })
     }
 
+    /// Run one token through the stack.
+    ///
+    /// `want_logits` decides whether the final norm and `lm_head` run at all.
+    /// Prefill sets it only on the last token: the loop that walks a prompt
+    /// overwrites its `logits` on every step and samples from the final one, so
+    /// every earlier projection through a `vocab_size x hidden_size` operator
+    /// was computed and thrown away. On a 151k-token vocabulary that is by far
+    /// the largest operator in the model, and prefilling a 1024-token prompt
+    /// was paying for it 1024 times to use it once.
+    ///
+    /// The KV and recurrent state updates are unaffected — they happen before
+    /// this point, which is why the head can be skipped without changing what
+    /// the next token sees.
     fn forward_token(
         &self,
         token: u32,
         position: usize,
         state: &mut HybridDecodeState,
+        want_logits: bool,
     ) -> Result<Vec<f32>> {
         let hidden_size = self.config.hidden_size;
         let embedding = self
@@ -997,6 +1022,9 @@ impl Qwen35MoeRuntime {
                 shared_gate,
             )?;
             add_assign(&mut hidden, &moe)?;
+        }
+        if !want_logits {
+            return Ok(Vec::new());
         }
         let final_norm = self
             .model
