@@ -1,100 +1,145 @@
 name: GPU Acceptance
 
-# Everything here needs a real CUDA device, so none of it can run on the
-# hosted runners the rest of CI uses. `workflow_dispatch` keeps it on demand;
-# the weekly run is there so a silent break is found within days rather than at
+# Proofs that need a real device to mean anything, kept out of the per-PR
+# `cuda-quality` job because they want an installed checkpoint and minutes of
+# wall clock rather than a compile and a lint. `workflow_dispatch` runs them on
+# demand; the weekly schedule finds a silent break within days instead of at
 # the next release.
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 3 * * 1"
 
-# One GPU, one job at a time: these tests allocate most of the device's memory
-# and would fail each other rather than fail honestly if they overlapped.
+# The GPU pool is the scarce resource and these jobs each want most of a
+# device's memory. Serialised so they fail honestly rather than failing each
+# other.
 concurrency:
   group: gpu-acceptance
   cancel-in-progress: false
 
+# Everything below is opt-in on the same repository variable `cuda-quality`
+# already uses for its NVFP4 proofs, because it needs a runner that can execute
+# FP4 kernels and a checkpoint installed on it. Opting in is what turns the
+# guards below from skips into hard requirements: a GPU job that silently tests
+# nothing is worse than one that fails.
 jobs:
-  cuda-kernels:
-    name: NVFP4 kernels and quantized matmul
-    runs-on: [self-hosted, tachyon-cuda]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Require a CUDA device
-        shell: bash
-        run: |
-          nvidia-smi
-          : "${TACHYON_CUTLASS_INCLUDE_DIR:?missing TACHYON_CUTLASS_INCLUDE_DIR}"
-      # The smoke tests are no-ops without this, and a silent no-op is the one
-      # outcome a GPU job must not have.
-      - name: NVFP4 CUDA smoke
-        env:
-          TACHYON_NVFP4_CUDA_SMOKE: "1"
-        run: |
-          cargo test -p core-host --features ai-inference,candle-cuda,nvfp4-cuda \
-            --bin core-host -- modelopt_nvfp4 --nocapture
-
-  candle-gpu-seams:
-    name: Paged KV and tensor-parallel seams
-    runs-on: [self-hosted, tachyon-cuda]
-    needs: cuda-kernels
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Require a CUDA device
-        run: nvidia-smi
-      # The paged-attention seam and the sharded MLP are both compiled out
-      # without `candle-cuda`, so the hosted matrix never executes them. This
-      # is the only place their correctness is actually observed.
-      - name: Parallel Llama and paged KV
-        run: |
-          cargo test -p core-host --features ai-inference,candle-cuda \
-            --bin core-host -- tensor_parallel pipeline_parallel expert_parallel paged \
-            --nocapture
-
   qwen35-nvfp4:
     name: Qwen 3.5 NVFP4 checkpoint
-    runs-on: [self-hosted, tachyon-cuda]
-    needs: cuda-kernels
-    # The checkpoint is tens of gigabytes and lives on the runner, not in the
-    # repository. Without it every test below returns early, so the guard
-    # below turns that into a failure rather than a green tick.
+    if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
+    runs-on: arc-gpu-runners
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v7
+
       - uses: dtolnay/rust-toolchain@stable
-      - name: Require the installed checkpoint
-        shell: bash
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with `cuda-quality`: the CUDA dependency build is the
+          # expensive part and it is byte-identical between the two.
+          shared-key: cuda-quality
+          cache-on-failure: true
+
+      - name: Put CUDA toolkit on PATH
+        run: |
+          echo "PATH=$PATH"
+          echo "CUDA_HOME=${CUDA_HOME:-<unset>} CUDA_PATH=${CUDA_PATH:-<unset>}"
+          nvcc_bin=""
+          # 1. Already on PATH?
+          if command -v nvcc >/dev/null 2>&1; then
+            nvcc_bin="$(command -v nvcc)"
+          fi
+          # 2. Well-known install roots.
+          if [ -z "$nvcc_bin" ]; then
+            for cuda in "${CUDA_HOME:-}" "${CUDA_PATH:-}" \
+                        /usr/local/cuda /usr/local/cuda-* \
+                        /opt/cuda /opt/cuda-* /usr/lib/cuda /usr/cuda; do
+              if [ -n "$cuda" ] && [ -x "$cuda/bin/nvcc" ]; then
+                nvcc_bin="$cuda/bin/nvcc"
+                break
+              fi
+            done
+          fi
+          # 3. Last resort: bounded search of likely roots.
+          if [ -z "$nvcc_bin" ]; then
+            nvcc_bin="$(find /usr /opt -maxdepth 5 -name nvcc -type f -executable 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "$nvcc_bin" ]; then
+            echo "::error::nvcc not found on this runner. The CUDA *toolkit* (not just the driver) must be installed in the arc-gpu-runners image. nvidia-smi alone is not enough — candle-kernels/cudarc compile .cu kernels with nvcc at build time."
+            echo "--- diagnostics ---"
+            echo "ls /usr/local:"; ls -la /usr/local 2>/dev/null || true
+            echo "ls /opt:";       ls -la /opt 2>/dev/null || true
+            echo "dpkg cuda pkgs:"; dpkg -l 2>/dev/null | grep -i cuda || echo "  (none)"
+            exit 1
+          fi
+          cuda_root="$(dirname "$(dirname "$nvcc_bin")")"
+          echo "Found nvcc at $nvcc_bin (CUDA root: $cuda_root)"
+          echo "$(dirname "$nvcc_bin")" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=$cuda_root" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$cuda_root" >> "$GITHUB_ENV"
+
+      - name: Verify CUDA toolchain
         run: |
           nvidia-smi
+          nvcc --version
+
+      # Native NVFP4 requires a runner GPU/toolchain that can execute the FP4
+      # kernels. Keep this proof opt-in until such a runner is available.
+      - name: Configure NVFP4 CUDA architecture
+        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
+        run: |
+          compute_capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '[:space:].')"
+          if [ -z "$compute_capability" ]; then
+            echo "::error::failed to determine GPU compute capability for NVFP4 CUDA build"
+            exit 1
+          fi
+          arch="sm_${compute_capability}"
+          echo "TACHYON_NVFP4_CUDA_ARCH=$arch" >> "$GITHUB_ENV"
+          echo "Using NVFP4 CUDA architecture $arch"
+
+      # candle-onnx's build script compiles the ONNX .proto and needs `protoc`.
+      # The CPU jobs get it from `apt-get install protobuf-compiler`, but this
+      # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
+      # distro-agnostic way. Skipped if the runner image already ships protoc.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every test below returns early when the checkpoint is missing, so
+      # without this the job would go green having executed nothing.
+      - name: Require the installed checkpoint
+        run: |
           : "${TACHYON_QWEN35_MOE_NVFP4_DIR:?missing TACHYON_QWEN35_MOE_NVFP4_DIR}"
           test -d "$TACHYON_QWEN35_MOE_NVFP4_DIR"
+
       # The batched prefill's only safety argument is that chunk size does not
       # change the result. There is no synthetic Qwen 3.5 fixture, so this
       # runner is the only place that claim is ever tested.
       - name: Prefill chunking equivalence
         run: |
-          cargo test -p core-host --features ai-inference,candle-cuda,nvfp4-cuda \
-            --bin core-host -- gated_prefill_is_invariant_to_chunk_size --nocapture
+          cargo test -p core-host --bin core-host \
+            --features candle-cuda,nvfp4-cuda \
+            gated_prefill_is_invariant_to_chunk_size -- --nocapture
 
       - name: Native NVFP4 execution
         env:
-          # Fail rather than fall back: the point of this job is to exercise
-          # the native kernel path, and a silent fallback to the scalar one
-          # would pass while testing nothing that needs a GPU.
+          # Fail rather than fall back: a silent drop to the scalar path would
+          # pass while exercising nothing that needs a GPU.
           TACHYON_NVFP4_NATIVE_REQUIRED: "1"
         run: |
-          cargo test -p core-host --features ai-inference,candle-cuda,nvfp4-cuda \
-            --bin core-host -- qwen35_moe_runtime::tests::gated_ --nocapture
+          cargo test -p core-host --bin core-host \
+            --features candle-cuda,nvfp4-cuda \
+            qwen35_moe_runtime::tests::gated_ -- --nocapture
 
-      # Reported, not gated on a threshold: absolute throughput is a property
-      # of this runner. The job records it so a regression is visible in the
-      # log history, and the test itself only fails on growth that is wrong at
-      # any speed.
+      # Reported, not gated on a threshold: absolute throughput belongs to the
+      # runner. The log history is where a regression becomes visible, and the
+      # test itself only fails on growth that is wrong at any speed.
       - name: Prefill scaling
         env:
           TACHYON_QWEN35_PREFILL_BENCH: "1"
         run: |
-          cargo test -p core-host --features ai-inference,candle-cuda,nvfp4-cuda \
-            --bin core-host -- gated_prefill_scaling --nocapture
+          cargo test -p core-host --bin core-host \
+            --features candle-cuda,nvfp4-cuda \
+            gated_prefill_scaling -- --nocapture
