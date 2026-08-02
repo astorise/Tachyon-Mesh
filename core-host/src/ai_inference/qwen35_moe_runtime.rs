@@ -37,6 +37,14 @@ use primitives::{
 mod primitives;
 
 pub(crate) const QWEN35_MOE_PROFILE_V1: &str = "qwen3.5-moe-text-modelopt-0.44-v1";
+/// Prompt tokens per prefill pass through the layer stack.
+///
+/// Bounds two things at once: how much weight decoding is amortised across
+/// tokens, and how long an expired deadline can go unnoticed. A chunk cannot be
+/// abandoned partway — the recurrent state would then describe a token the KV
+/// cache never saw — so this is the granularity of both.
+const PREFILL_CHUNK_TOKENS: usize = 64;
+
 const OUTER_MODEL_TYPE: &str = "qwen3_5_moe";
 const TEXT_MODEL_TYPE: &str = "qwen3_5_moe_text";
 const ARCHITECTURE: &str = "Qwen3_5MoeForConditionalGeneration";
@@ -665,11 +673,14 @@ impl Qwen35MoeRuntime {
 
         let mut state = HybridDecodeState::new(&self.config.layer_types);
         let mut logits = Vec::new();
-        for (position, token) in encoded.get_ids().iter().copied().enumerate() {
-            // Prefill is per token here, so the budget is checked before each
-            // one rather than between chunks. A long prompt on this CPU-bound
-            // runtime is exactly the case that used to outlast the budget
-            // before a single token was produced.
+        let prompt_ids = encoded.get_ids();
+        // Between chunks, not between tokens. A chunk is one pass through the
+        // layer stack and cannot be interrupted partway without leaving the
+        // recurrent state describing a token the KV cache has not seen, so the
+        // chunk size is what bounds how long the deadline check can be delayed
+        // — the same trade the generic Candle prefill makes.
+        for (chunk_index, chunk) in prompt_ids.chunks(PREFILL_CHUNK_TOKENS).enumerate() {
+            let position = chunk_index * PREFILL_CHUNK_TOKENS;
             if position > 0 && Instant::now() >= request.deadline {
                 // Not an error: the deadline's contract is that it stops
                 // generation and returns what was produced, and a prompt that
@@ -685,10 +696,10 @@ impl Qwen35MoeRuntime {
                     None,
                 ));
             }
-            // Only the prompt's last token needs logits; the rest exist to
-            // advance the state.
-            let last = position + 1 == encoded.len();
-            logits = self.forward_token(token, position, &mut state, last)?;
+            // Only the prompt's last token needs logits; every earlier one
+            // exists to advance the state.
+            let last = position + chunk.len() == prompt_ids.len();
+            logits = self.forward_tokens(chunk, position, &mut state, last)?;
         }
         // The loop above is the only producer, and only its last iteration asks
         // for logits. Stated here because a future edit to either condition
@@ -755,8 +766,9 @@ impl Qwen35MoeRuntime {
                 finish = criteria.finish_reason(token, text, false);
                 break;
             }
-            // Decode always needs logits: every step samples from them.
-            logits = self.forward_token(token, encoded.len() + step, &mut state, true)?;
+            // Decode always needs logits: every step samples from them, and a
+            // single token is simply the batch of one.
+            logits = self.forward_tokens(&[token], encoded.len() + step, &mut state, true)?;
         }
         // Flush what the hold kept back. Every exit from the loop leaves a
         // suffix unsent — EOS breaks before the token is even pushed — and
@@ -896,49 +908,94 @@ impl Qwen35MoeRuntime {
         })
     }
 
-    /// Run one token through the stack.
+    /// Run `tokens` through the stack, advancing `state` by one position each.
     ///
-    /// `want_logits` decides whether the final norm and `lm_head` run at all.
-    /// Prefill sets it only on the last token: the loop that walks a prompt
-    /// overwrites its `logits` on every step and samples from the final one, so
-    /// every earlier projection through a `vocab_size x hidden_size` operator
-    /// was computed and thrown away. On a 151k-token vocabulary that is by far
-    /// the largest operator in the model, and prefilling a 1024-token prompt
-    /// was paying for it 1024 times to use it once.
+    /// One function for prefill and decode, with the batch size as the only
+    /// difference: decode calls it with a single token, prefill with a chunk of
+    /// the prompt. Two functions would have meant two copies of a forty-layer
+    /// hybrid loop, and the second copy is where the drift starts.
     ///
-    /// The KV and recurrent state updates are unaffected — they happen before
-    /// this point, which is why the head can be skipped without changing what
-    /// the next token sees.
-    fn forward_token(
+    /// Tokens are walked on the *inside* of the layer loop rather than the
+    /// outside. That inversion is the point: every projection is then one
+    /// `linear_batch` over the whole chunk, so a quantized operator's weights
+    /// are unpacked once instead of once per token. What stays per token is
+    /// what is genuinely sequential — the linear-attention recurrence, the KV
+    /// append, and the mixture-of-experts routing, which picks different
+    /// experts for different tokens.
+    ///
+    /// `want_logits` decides whether the final norm and `lm_head` run at all,
+    /// and only ever for the chunk's last token. Prefill overwrites its logits
+    /// on every step and samples from the final one, so projecting earlier
+    /// tokens through a `vocab_size x hidden_size` operator produced values
+    /// that were immediately discarded. The state updates all happen before the
+    /// head, which is why skipping it changes nothing the next token sees.
+    fn forward_tokens(
         &self,
-        token: u32,
-        position: usize,
+        tokens: &[u32],
+        start_position: usize,
         state: &mut HybridDecodeState,
         want_logits: bool,
     ) -> Result<Vec<f32>> {
         let hidden_size = self.config.hidden_size;
+        let count = tokens.len();
+        if count == 0 {
+            bail!("forward pass requires at least one token");
+        }
         let embedding = self
             .model
             .tensor_info("model.language_model.embed_tokens.weight")?;
-        let token = usize::try_from(token)?;
-        if token >= self.config.vocab_size {
-            bail!("token id {token} exceeds vocabulary");
+        let mut hidden = Vec::with_capacity(count * hidden_size);
+        for &token in tokens {
+            let token = usize::try_from(token)?;
+            if token >= self.config.vocab_size {
+                bail!("token id {token} exceeds vocabulary");
+            }
+            hidden.extend_from_slice(&embedding.read_f32_slice(token * hidden_size, hidden_size)?);
         }
-        let mut hidden = embedding.read_f32_slice(token * hidden_size, hidden_size)?;
+
+        // Normalize every row of `source` with `weight`, returning the same
+        // `[count, hidden_size]` layout the projections expect.
+        let normalize_rows = |source: &[f32], weight: &[f32]| -> Result<Vec<f32>> {
+            let mut out = Vec::with_capacity(count * hidden_size);
+            for token in 0..count {
+                out.extend(rms_norm_qwen(
+                    &source[token * hidden_size..(token + 1) * hidden_size],
+                    weight,
+                    self.config.rms_norm_eps as f32,
+                )?);
+            }
+            Ok(out)
+        };
+
         for layer in 0..self.config.num_hidden_layers {
             let prefix = format!("model.language_model.layers.{layer}");
             let norm_weight = self
                 .model
                 .tensor_info(&format!("{prefix}.input_layernorm.weight"))?
                 .read_f32()?;
-            let normalized = rms_norm_qwen(&hidden, &norm_weight, self.config.rms_norm_eps as f32)?;
+            let normalized = normalize_rows(&hidden, &norm_weight)?;
             let mixed = match (&self.config.layer_types[layer], &mut state.layers[layer]) {
                 (LayerType::LinearAttention, LayerDecodeState::Linear(layer_state)) => {
-                    let qkv =
-                        self.linear(&format!("{prefix}.linear_attn.in_proj_qkv"), &normalized)?;
-                    let z = self.linear(&format!("{prefix}.linear_attn.in_proj_z"), &normalized)?;
-                    let b = self.linear(&format!("{prefix}.linear_attn.in_proj_b"), &normalized)?;
-                    let a = self.linear(&format!("{prefix}.linear_attn.in_proj_a"), &normalized)?;
+                    let qkv = self.linear_batch(
+                        &format!("{prefix}.linear_attn.in_proj_qkv"),
+                        &normalized,
+                        count,
+                    )?;
+                    let z = self.linear_batch(
+                        &format!("{prefix}.linear_attn.in_proj_z"),
+                        &normalized,
+                        count,
+                    )?;
+                    let b = self.linear_batch(
+                        &format!("{prefix}.linear_attn.in_proj_b"),
+                        &normalized,
+                        count,
+                    )?;
+                    let a = self.linear_batch(
+                        &format!("{prefix}.linear_attn.in_proj_a"),
+                        &normalized,
+                        count,
+                    )?;
                     let conv = self
                         .model
                         .tensor_info(&format!("{prefix}.linear_attn.conv1d.weight"))?
@@ -955,28 +1012,51 @@ impl Qwen35MoeRuntime {
                         .model
                         .tensor_info(&format!("{prefix}.linear_attn.norm.weight"))?
                         .read_f32()?;
-                    let core = gated_delta_step(
-                        &qkv,
-                        &z,
-                        &b,
-                        &a,
-                        &conv,
-                        &a_log,
-                        &dt_bias,
-                        &gated_norm,
-                        self.config.linear_num_key_heads,
-                        self.config.linear_num_value_heads,
-                        self.config.linear_key_head_dim,
-                        self.config.linear_value_head_dim,
-                        self.config.linear_conv_kernel_dim,
-                        layer_state,
-                    )?;
-                    self.linear(&format!("{prefix}.linear_attn.out_proj"), &core)?
+                    let (qkv_width, z_width, b_width, a_width) = (
+                        qkv.len() / count,
+                        z.len() / count,
+                        b.len() / count,
+                        a.len() / count,
+                    );
+                    // Sequential by nature: each step reads the recurrent state
+                    // the previous one wrote.
+                    let mut cores = Vec::new();
+                    for token in 0..count {
+                        cores.extend(gated_delta_step(
+                            &qkv[token * qkv_width..(token + 1) * qkv_width],
+                            &z[token * z_width..(token + 1) * z_width],
+                            &b[token * b_width..(token + 1) * b_width],
+                            &a[token * a_width..(token + 1) * a_width],
+                            &conv,
+                            &a_log,
+                            &dt_bias,
+                            &gated_norm,
+                            self.config.linear_num_key_heads,
+                            self.config.linear_num_value_heads,
+                            self.config.linear_key_head_dim,
+                            self.config.linear_value_head_dim,
+                            self.config.linear_conv_kernel_dim,
+                            layer_state,
+                        )?);
+                    }
+                    self.linear_batch(&format!("{prefix}.linear_attn.out_proj"), &cores, count)?
                 }
                 (LayerType::FullAttention, LayerDecodeState::Full(layer_state)) => {
-                    let query = self.linear(&format!("{prefix}.self_attn.q_proj"), &normalized)?;
-                    let key = self.linear(&format!("{prefix}.self_attn.k_proj"), &normalized)?;
-                    let value = self.linear(&format!("{prefix}.self_attn.v_proj"), &normalized)?;
+                    let query = self.linear_batch(
+                        &format!("{prefix}.self_attn.q_proj"),
+                        &normalized,
+                        count,
+                    )?;
+                    let key = self.linear_batch(
+                        &format!("{prefix}.self_attn.k_proj"),
+                        &normalized,
+                        count,
+                    )?;
+                    let value = self.linear_batch(
+                        &format!("{prefix}.self_attn.v_proj"),
+                        &normalized,
+                        count,
+                    )?;
                     let q_norm = self
                         .model
                         .tensor_info(&format!("{prefix}.self_attn.q_norm.weight"))?
@@ -985,44 +1065,71 @@ impl Qwen35MoeRuntime {
                         .model
                         .tensor_info(&format!("{prefix}.self_attn.k_norm.weight"))?
                         .read_f32()?;
-                    let core = full_attention_step(
-                        &query,
-                        &key,
-                        &value,
-                        &q_norm,
-                        &k_norm,
-                        self.config.num_attention_heads,
-                        self.config.num_key_value_heads,
-                        self.config.head_dim,
-                        (self.config.head_dim as f64 * self.config.partial_rotary_factor) as usize,
-                        self.config.rope_parameters.rope_theta as f32,
-                        position,
-                        layer_state,
-                    )?;
-                    self.linear(&format!("{prefix}.self_attn.o_proj"), &core)?
+                    let (query_width, key_width, value_width) =
+                        (query.len() / count, key.len() / count, value.len() / count);
+                    // Also sequential: each token appends to the KV cache the
+                    // next one attends over.
+                    let mut cores = Vec::new();
+                    for token in 0..count {
+                        cores.extend(full_attention_step(
+                            &query[token * query_width..(token + 1) * query_width],
+                            &key[token * key_width..(token + 1) * key_width],
+                            &value[token * value_width..(token + 1) * value_width],
+                            &q_norm,
+                            &k_norm,
+                            self.config.num_attention_heads,
+                            self.config.num_key_value_heads,
+                            self.config.head_dim,
+                            (self.config.head_dim as f64 * self.config.partial_rotary_factor)
+                                as usize,
+                            self.config.rope_parameters.rope_theta as f32,
+                            start_position + token,
+                            layer_state,
+                        )?);
+                    }
+                    self.linear_batch(&format!("{prefix}.self_attn.o_proj"), &cores, count)?
                 }
                 _ => bail!("hybrid decode state does not match layer {layer}"),
             };
-            add_assign(&mut hidden, &mixed)?;
+            for token in 0..count {
+                let (row, mixed_row) = (
+                    &mut hidden[token * hidden_size..(token + 1) * hidden_size],
+                    &mixed[token * hidden_size..(token + 1) * hidden_size],
+                );
+                add_assign(row, mixed_row)?;
+            }
+
             let post_norm_weight = self
                 .model
                 .tensor_info(&format!("{prefix}.post_attention_layernorm.weight"))?
                 .read_f32()?;
-            let post_norm =
-                rms_norm_qwen(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32)?;
-            let router = self.linear(&format!("{prefix}.mlp.gate"), &post_norm)?;
-            let shared_gate =
-                self.linear(&format!("{prefix}.mlp.shared_expert_gate"), &post_norm)?[0];
-            let moe = sparse_moe_forward(
+            let post_norm = normalize_rows(&hidden, &post_norm_weight)?;
+            let router = self.linear_batch(&format!("{prefix}.mlp.gate"), &post_norm, count)?;
+            let shared_gate = self.linear_batch(
+                &format!("{prefix}.mlp.shared_expert_gate"),
                 &post_norm,
-                &router,
-                self.config.num_experts_per_tok,
-                |expert, input| self.mlp(&format!("{prefix}.mlp.experts.{expert}"), input),
-                |input| self.mlp(&format!("{prefix}.mlp.shared_expert"), input),
-                shared_gate,
+                count,
             )?;
-            add_assign(&mut hidden, &moe)?;
+            let router_width = router.len() / count;
+            // Per token, and not for want of trying: routing picks a different
+            // set of experts for each token, so there is no shared operator to
+            // batch across them.
+            for token in 0..count {
+                let moe = sparse_moe_forward(
+                    &post_norm[token * hidden_size..(token + 1) * hidden_size],
+                    &router[token * router_width..(token + 1) * router_width],
+                    self.config.num_experts_per_tok,
+                    |expert, input| self.mlp(&format!("{prefix}.mlp.experts.{expert}"), input),
+                    |input| self.mlp(&format!("{prefix}.mlp.shared_expert"), input),
+                    shared_gate[token],
+                )?;
+                add_assign(
+                    &mut hidden[token * hidden_size..(token + 1) * hidden_size],
+                    &moe,
+                )?;
+            }
         }
+
         if !want_logits {
             return Ok(Vec::new());
         }
@@ -1030,7 +1137,8 @@ impl Qwen35MoeRuntime {
             .model
             .tensor_info("model.language_model.norm.weight")?
             .read_f32()?;
-        let hidden = rms_norm_qwen(&hidden, &final_norm, self.config.rms_norm_eps as f32)?;
+        let last = &hidden[(count - 1) * hidden_size..];
+        let hidden = rms_norm_qwen(last, &final_norm, self.config.rms_norm_eps as f32)?;
         self.linear("lm_head", &hidden)
     }
 
@@ -1045,14 +1153,30 @@ impl Qwen35MoeRuntime {
         self.linear(&format!("{prefix}.down_proj"), &activated)
     }
 
-    fn linear(&self, base: &str, input: &[f32]) -> Result<Vec<f32>> {
+    /// Apply `base` to `tokens` activations at once.
+    ///
+    /// `inputs` is `[tokens, cols]` row-major and the result is
+    /// `[tokens, rows]`. One call decodes the operator's weights once instead
+    /// of once per token, which is the whole reason the layer loop below walks
+    /// tokens on the inside rather than the outside.
+    fn linear_batch(&self, base: &str, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let prepared = self.prepared_linear(base)?;
+        match &self.execution_plan {
+            Nvfp4ExecutionPlan::Native { .. } => prepared.matmul_native_nvfp4(inputs, tokens),
+            Nvfp4ExecutionPlan::Fallback(_) => prepared.matmul(inputs, tokens),
+        }
+        .with_context(|| format!("Qwen operator `{base}` failed"))
+    }
+
+    /// The working-set lookup both `linear` and `linear_batch` go through.
+    fn prepared_linear(&self, base: &str) -> Result<Arc<PreparedLinear>> {
         let cached = self
             .working_set
             .lock()
             .map_err(|_| anyhow!("Qwen working-set lock is poisoned"))?
             .get(base);
-        let prepared = match cached {
-            Some(prepared) => prepared,
+        match cached {
+            Some(prepared) => Ok(prepared),
             None => {
                 let prepared = Arc::new(
                     self.model
@@ -1063,9 +1187,13 @@ impl Qwen35MoeRuntime {
                     .lock()
                     .map_err(|_| anyhow!("Qwen working-set lock is poisoned"))?
                     .insert(base.to_owned(), prepared.clone());
-                prepared
+                Ok(prepared)
             }
-        };
+        }
+    }
+
+    fn linear(&self, base: &str, input: &[f32]) -> Result<Vec<f32>> {
+        let prepared = self.prepared_linear(base)?;
         match &self.execution_plan {
             Nvfp4ExecutionPlan::Native { .. } => prepared.matvec_native_nvfp4(input),
             Nvfp4ExecutionPlan::Fallback(_) => prepared.matvec(input),
@@ -1345,6 +1473,71 @@ mod tests {
         assert_eq!(runtime.config.num_hidden_layers, 40);
         assert_eq!(runtime.config.num_experts, 256);
         assert!(runtime.chat_template.is_some());
+    }
+
+    /// Chunk size must not change the answer.
+    ///
+    /// This is the whole safety argument for walking tokens inside the layer
+    /// loop. Batching moves *where* the projections are computed, never what
+    /// they compute: `PreparedLinear::matmul` keeps each output element's
+    /// accumulation order, and the recurrence, the KV append and the expert
+    /// routing all still run one token at a time. If that holds, prefilling a
+    /// prompt in one pass and prefilling it one token at a time must produce
+    /// the same logits — bit for bit, not approximately.
+    ///
+    /// Gated on a real checkpoint because it is the only place the hybrid
+    /// stack can actually run: there is no synthetic Qwen 3.5 fixture, so this
+    /// executes on the GPU runner and nowhere else. That is a real gap in the
+    /// safety net and the reason this test compares exactly rather than within
+    /// a tolerance — a loose comparison here would leave the restructure
+    /// effectively unverified.
+    #[test]
+    fn gated_prefill_is_invariant_to_chunk_size() {
+        let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
+            return;
+        };
+        let runtime = Qwen35MoeRuntime::try_load("qwen35-chunking", &path, "cpu")
+            .expect("runtime construction should succeed")
+            .expect("checkpoint should select the Qwen runtime");
+
+        // Long enough to span several chunks, so the boundary logic is
+        // exercised rather than skipped.
+        let prompt = "the mesh routes a prompt through many layers ".repeat(8);
+        let encoded = runtime
+            .tokenizer
+            .encode(prompt, true)
+            .expect("prompt should tokenize");
+        let ids = encoded.get_ids();
+        assert!(
+            ids.len() > PREFILL_CHUNK_TOKENS,
+            "the prompt must span more than one chunk to test anything"
+        );
+
+        let run = |chunk_size: usize| -> Vec<f32> {
+            let mut state = HybridDecodeState::new(&runtime.config.layer_types);
+            let mut logits = Vec::new();
+            for (index, chunk) in ids.chunks(chunk_size).enumerate() {
+                let position = index * chunk_size;
+                let last = position + chunk.len() == ids.len();
+                logits = runtime
+                    .forward_tokens(chunk, position, &mut state, last)
+                    .expect("prefill should succeed");
+            }
+            logits
+        };
+
+        let one_at_a_time = run(1);
+        let batched = run(PREFILL_CHUNK_TOKENS);
+        assert_eq!(
+            one_at_a_time.len(),
+            batched.len(),
+            "both paths produce logits for the prompt's last token"
+        );
+        assert_eq!(
+            one_at_a_time, batched,
+            "batching changed the result, so it changed more than where the \
+             projections are computed"
+        );
     }
 
     /// Measures how prefill scales with prompt length, and reports it.

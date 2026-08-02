@@ -70,6 +70,14 @@ jobs:
           nvidia-smi
           : "${TACHYON_QWEN35_MOE_NVFP4_DIR:?missing TACHYON_QWEN35_MOE_NVFP4_DIR}"
           test -d "$TACHYON_QWEN35_MOE_NVFP4_DIR"
+      # The batched prefill's only safety argument is that chunk size does not
+      # change the result. There is no synthetic Qwen 3.5 fixture, so this
+      # runner is the only place that claim is ever tested.
+      - name: Prefill chunking equivalence
+        run: |
+          cargo test -p core-host --features ai-inference,candle-cuda,nvfp4-cuda \
+            --bin core-host -- gated_prefill_is_invariant_to_chunk_size --nocapture
+
       - name: Native NVFP4 execution
         env:
           # Fail rather than fall back: the point of this job is to exercise
