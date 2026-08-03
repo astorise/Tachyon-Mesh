@@ -1180,13 +1180,26 @@ impl PreparedLinear {
     /// caller change. This exists so the runtime has one batched entry point
     /// whichever execution plan is active; it is no slower than the per-token
     /// calls it replaces, and no faster until the kernel grows a batched form.
+    /// `tokens` activations through this operator, in one kernel launch.
+    ///
+    /// This looped `matvec_native_nvfp4` until `candle-nvfp4-kernels` grew a
+    /// batched entry point (candle #3824). Until then the batched host path
+    /// was doing its work and then handing the result to a per-token kernel,
+    /// so a GPU build saw none of the saving — which is the whole reason the
+    /// batched kernel was asked for upstream rather than worked around here.
     pub(crate) fn matmul_native_nvfp4(&self, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
-        let cols = match self {
-            Self::Dense { cols, .. } | Self::Fp8 { cols, .. } | Self::Nvfp4 { cols, .. } => *cols,
-        };
-        if !matches!(self, Self::Nvfp4 { .. }) {
+        let Self::Nvfp4 {
+            rows,
+            cols,
+            packed,
+            scales,
+            tensor_scale,
+        } = self
+        else {
+            // Dense and FP8 operators have no native kernel; the host path is
+            // already their fastest form.
             return self.matmul(inputs, tokens);
-        }
+        };
         if tokens == 0 {
             return Ok(Vec::new());
         }
@@ -1196,11 +1209,23 @@ impl PreparedLinear {
                 inputs.len()
             );
         }
-        let mut output = Vec::with_capacity(tokens);
-        for token in 0..tokens {
-            output.push(self.matvec_native_nvfp4(&inputs[token * cols..(token + 1) * cols])?);
+        #[cfg(feature = "nvfp4-cuda")]
+        {
+            cuda::Nvfp4CudaBackend::linear_f32_host_batched(
+                inputs,
+                packed,
+                scales,
+                *tensor_scale,
+                *rows,
+                *cols,
+                tokens,
+            )
         }
-        Ok(output.concat())
+        #[cfg(not(feature = "nvfp4-cuda"))]
+        {
+            let _ = (rows, packed, scales, tensor_scale);
+            bail!("native NVFP4 execution requires the `nvfp4-cuda` feature")
+        }
     }
 
     pub(crate) fn matvec_native_nvfp4(&self, input: &[f32]) -> Result<Vec<f32>> {
@@ -1214,14 +1239,14 @@ impl PreparedLinear {
             } => {
                 #[cfg(feature = "nvfp4-cuda")]
                 {
-                    return cuda::Nvfp4CudaBackend::linear_f32_host(
+                    cuda::Nvfp4CudaBackend::linear_f32_host(
                         input,
                         packed,
                         scales,
                         *tensor_scale,
                         *rows,
                         *cols,
-                    );
+                    )
                 }
                 #[cfg(not(feature = "nvfp4-cuda"))]
                 {

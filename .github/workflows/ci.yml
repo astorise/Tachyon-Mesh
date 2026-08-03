@@ -524,16 +524,15 @@ jobs:
         timeout-minutes: 10
         run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
 
-      - name: Fetch CUTLASS headers
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
-        run: git clone --depth 1 --branch v4.3.5 https://github.com/NVIDIA/cutlass.git .ci-cutlass
-
+      # The CUTLASS headers used to be cloned here because this repository
+      # compiled its own NVFP4 kernel. `candle-nvfp4-kernels` owns that now and
+      # brings its own build, so the checkout and the include-dir hand-off are
+      # both gone.
       - name: Run native NVFP4 parity and telemetry proof
         if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
         env:
           TACHYON_NVFP4_CUDA_SMOKE: "1"
           TACHYON_NVFP4_NATIVE_REQUIRED: "1"
-          TACHYON_CUTLASS_INCLUDE_DIR: ${{ github.workspace }}/.ci-cutlass/include
         run: cargo test -p core-host --features "candle-cuda nvfp4-cuda" nvfp4_cuda -- --nocapture
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────

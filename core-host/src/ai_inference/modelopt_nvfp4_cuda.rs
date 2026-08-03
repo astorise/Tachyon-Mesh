@@ -1,71 +1,33 @@
-use std::{ffi::c_void, ptr::NonNull};
+//! NVFP4 execution, delegated to `candle-nvfp4-kernels`.
+//!
+//! This module used to carry its own CUTLASS kernel and the build-script
+//! plumbing that compiled it (`src/ai_inference/cuda/nvfp4_cutlass.cu`, a
+//! `TACHYON_CUTLASS_INCLUDE_DIR` probe, a `tachyon_nvfp4_cuda_compiled` cfg).
+//! Candle now ships the kernel as a crate, beside the FP8, AWQ and GPTQ ones
+//! (candle #3824), so what remains here is the adapter: our capability
+//! vocabulary on one side, the upstream entry points on the other.
+//!
+//! The `nvfp4-cuda` feature stays CPU-buildable and therefore stays in the
+//! standard feature matrix. `candle-nvfp4-kernels` is pulled in with its own
+//! `cuda` feature *off*; `candle-cuda` is what turns it on. Without it
+//! `is_available()` answers `false` and every entry point reports the
+//! operator as unsupported, which is exactly what the missing CUTLASS headers
+//! used to produce.
 
 use anyhow::{anyhow, Result};
 
-use super::{Nvfp4AcceleratorCapabilities, Nvfp4KernelKind, Nvfp4OutputDType};
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Nvfp4CudaLinearF32Params {
-    pub(crate) input: *const f32,
-    pub(crate) packed_weight: *const u8,
-    pub(crate) weight_scale_e4m3: *const u8,
-    pub(crate) tensor_scale: f32,
-    pub(crate) output: *mut f32,
-    pub(crate) m: i64,
-    pub(crate) n: i64,
-    pub(crate) k: i64,
-    pub(crate) stream: *mut c_void,
-}
-
-#[cfg(tachyon_nvfp4_cuda_compiled)]
-use std::os::raw::c_int;
-
-#[cfg(tachyon_nvfp4_cuda_compiled)]
-unsafe extern "C" {
-    fn tachyon_nvfp4_cutlass_is_available() -> c_int;
-    fn tachyon_nvfp4_cuda_dequantize_f32(
-        packed: *const u8,
-        block_scales_e4m3: *const u8,
-        tensor_scale: f32,
-        n_rows: i64,
-        n_cols: i64,
-        output: *mut f32,
-        stream: *mut c_void,
-    ) -> c_int;
-    fn tachyon_nvfp4_cuda_dequantize_bf16(
-        packed: *const u8,
-        block_scales_e4m3: *const u8,
-        tensor_scale: f32,
-        n_rows: i64,
-        n_cols: i64,
-        output: *mut u16,
-        stream: *mut c_void,
-    ) -> c_int;
-    fn tachyon_nvfp4_cutlass_linear_f32(params: Nvfp4CudaLinearF32Params) -> c_int;
-    fn tachyon_nvfp4_cutlass_linear_f32_host(
-        input: *const f32,
-        packed_weight: *const u8,
-        weight_scale_e4m3: *const u8,
-        tensor_scale: f32,
-        output: *mut f32,
-        m: i64,
-        n: i64,
-        k: i64,
-    ) -> c_int;
-}
+use super::{Nvfp4AcceleratorCapabilities, Nvfp4KernelKind};
 
 pub(crate) struct Nvfp4CudaBackend;
 
 impl Nvfp4CudaBackend {
-    #[cfg(tachyon_nvfp4_cuda_compiled)]
+    /// Whether this build and this device can execute FP4 natively.
+    ///
+    /// Delegated rather than re-derived: the kernel crate gates on compute
+    /// capability 10.0, and duplicating that threshold here is how the two
+    /// would eventually disagree about which devices are supported.
     pub(crate) fn is_available() -> bool {
-        unsafe { tachyon_nvfp4_cutlass_is_available() == 1 }
-    }
-
-    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
-    pub(crate) fn is_available() -> bool {
-        false
+        candle_nvfp4_kernels::is_available()
     }
 
     pub(crate) fn capabilities() -> Nvfp4AcceleratorCapabilities {
@@ -79,80 +41,7 @@ impl Nvfp4CudaBackend {
         }
     }
 
-    #[cfg(tachyon_nvfp4_cuda_compiled)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn launch_dequantize(
-        packed: NonNull<u8>,
-        block_scales_e4m3: NonNull<u8>,
-        tensor_scale: f32,
-        n_rows: usize,
-        n_cols: usize,
-        output: NonNull<c_void>,
-        output_dtype: Nvfp4OutputDType,
-        stream: *mut c_void,
-    ) -> Result<()> {
-        let n_rows = i64::try_from(n_rows)?;
-        let n_cols = i64::try_from(n_cols)?;
-        let status = match output_dtype {
-            Nvfp4OutputDType::F32 => unsafe {
-                tachyon_nvfp4_cuda_dequantize_f32(
-                    packed.as_ptr(),
-                    block_scales_e4m3.as_ptr(),
-                    tensor_scale,
-                    n_rows,
-                    n_cols,
-                    output.as_ptr().cast::<f32>(),
-                    stream,
-                )
-            },
-            Nvfp4OutputDType::BF16 => unsafe {
-                tachyon_nvfp4_cuda_dequantize_bf16(
-                    packed.as_ptr(),
-                    block_scales_e4m3.as_ptr(),
-                    tensor_scale,
-                    n_rows,
-                    n_cols,
-                    output.as_ptr().cast::<u16>(),
-                    stream,
-                )
-            },
-        };
-        cuda_status(status, "launch NVFP4 CUDA dequantization")
-    }
-
-    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn launch_dequantize(
-        _packed: NonNull<u8>,
-        _block_scales_e4m3: NonNull<u8>,
-        _tensor_scale: f32,
-        _n_rows: usize,
-        _n_cols: usize,
-        _output: NonNull<c_void>,
-        _output_dtype: Nvfp4OutputDType,
-        _stream: *mut c_void,
-    ) -> Result<()> {
-        Err(anyhow!(
-            "NVFP4 CUDA backend was enabled but native CUDA/CUTLASS kernels were not compiled"
-        ))
-    }
-
-    #[cfg(tachyon_nvfp4_cuda_compiled)]
-    pub(crate) unsafe fn launch_linear_f32(params: Nvfp4CudaLinearF32Params) -> Result<()> {
-        cuda_status(
-            unsafe { tachyon_nvfp4_cutlass_linear_f32(params) },
-            "launch NVFP4 CUDA/CUTLASS linear kernel",
-        )
-    }
-
-    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
-    pub(crate) unsafe fn launch_linear_f32(_params: Nvfp4CudaLinearF32Params) -> Result<()> {
-        Err(anyhow!(
-            "NVFP4 CUDA backend was enabled but native CUDA/CUTLASS kernels were not compiled"
-        ))
-    }
-
-    #[cfg(tachyon_nvfp4_cuda_compiled)]
+    /// One activation vector through one NVFP4 operator.
     pub(crate) fn linear_f32_host(
         input: &[f32],
         packed_weight: &[u8],
@@ -161,75 +50,42 @@ impl Nvfp4CudaBackend {
         rows: usize,
         cols: usize,
     ) -> Result<Vec<f32>> {
-        if input.len() != cols {
-            return Err(anyhow!(
-                "NVFP4 input has {} values, expected {cols}",
-                input.len()
-            ));
-        }
-        let mut output = vec![0.0f32; rows];
-        cuda_status(
-            unsafe {
-                tachyon_nvfp4_cutlass_linear_f32_host(
-                    input.as_ptr(),
-                    packed_weight.as_ptr(),
-                    weight_scale_e4m3.as_ptr(),
-                    tensor_scale,
-                    output.as_mut_ptr(),
-                    1,
-                    i64::try_from(rows)?,
-                    i64::try_from(cols)?,
-                )
-            },
-            "execute host-backed NVFP4 CUDA/CUTLASS linear",
-        )?;
-        Ok(output)
+        candle_nvfp4_kernels::linear_f32_host(
+            input,
+            packed_weight,
+            weight_scale_e4m3,
+            tensor_scale,
+            rows,
+            cols,
+        )
+        .map_err(|error| anyhow!("NVFP4 CUDA linear failed: {error}"))
     }
 
-    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
-    pub(crate) fn linear_f32_host(
-        _input: &[f32],
-        _packed_weight: &[u8],
-        _weight_scale_e4m3: &[u8],
-        _tensor_scale: f32,
-        _rows: usize,
-        _cols: usize,
+    /// `tokens` activations through one NVFP4 operator, in a single launch.
+    ///
+    /// This is the entry point that makes batching worth anything on a GPU.
+    /// Before it existed the caller looped [`Self::linear_f32_host`], so a
+    /// 1024-token prefill launched 1024 kernels per operator and re-read the
+    /// weight each time — the batched host path upstream of this was doing
+    /// real work and then handing it to a per-token kernel.
+    pub(crate) fn linear_f32_host_batched(
+        inputs: &[f32],
+        packed_weight: &[u8],
+        weight_scale_e4m3: &[u8],
+        tensor_scale: f32,
+        rows: usize,
+        cols: usize,
+        tokens: usize,
     ) -> Result<Vec<f32>> {
-        Err(anyhow!(
-            "NVFP4 CUDA backend was enabled but native CUDA/CUTLASS kernels were not compiled"
-        ))
-    }
-}
-
-#[cfg(tachyon_nvfp4_cuda_compiled)]
-fn cuda_status(status: c_int, action: &str) -> Result<()> {
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(anyhow!("{action} failed with CUDA status {status}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::mem::{align_of, size_of};
-
-    #[test]
-    fn linear_params_are_ffi_stable() {
-        assert_eq!(
-            align_of::<Nvfp4CudaLinearF32Params>(),
-            align_of::<*const f32>()
-        );
-        assert!(size_of::<Nvfp4CudaLinearF32Params>() >= 72);
-    }
-
-    #[test]
-    fn gated_cuda_capability_probe() {
-        if std::env::var("TACHYON_NVFP4_CUDA_SMOKE").as_deref() != Ok("1") {
-            return;
-        }
-
-        assert!(Nvfp4CudaBackend::is_available());
+        candle_nvfp4_kernels::linear_f32_host_batched(
+            inputs,
+            packed_weight,
+            weight_scale_e4m3,
+            tensor_scale,
+            rows,
+            cols,
+            tokens,
+        )
+        .map_err(|error| anyhow!("NVFP4 CUDA batched linear failed: {error}"))
     }
 }
