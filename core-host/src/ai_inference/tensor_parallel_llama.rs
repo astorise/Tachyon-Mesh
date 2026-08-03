@@ -22,7 +22,9 @@ use candle_transformers::models::llama::{BlockMlp, Config, Llama};
 
 #[cfg(feature = "candle-cuda")]
 use super::parallel::NcclShardGroup;
-use super::parallel::{split_for_row_parallel, ColumnParallelLinear, RowParallelLinear};
+use super::parallel::{
+    split_for_row_parallel, ColumnParallelLinear, NcclReducer, RowParallelLinear,
+};
 
 /// The KV cache and rotary tables every parallel variant here shares.
 ///
@@ -35,6 +37,9 @@ pub(crate) struct TensorParallelMlp {
     gate: ColumnParallelLinear,
     up: ColumnParallelLinear,
     down: RowParallelLinear,
+    /// How `down`'s single per-layer all-reduce travels. Defaults to the
+    /// host-staged sum; `with_nccl_group` swaps in the real collective.
+    reducer: NcclReducer,
     devices: Vec<Device>,
     primary: Device,
 }
@@ -57,6 +62,10 @@ impl TensorParallelMlp {
             gate: ColumnParallelLinear::shard(&gate_w, devices)?,
             up: ColumnParallelLinear::shard(&up_w, devices)?,
             down: RowParallelLinear::shard(&down_w, devices)?,
+            #[cfg(feature = "candle-cuda")]
+            reducer: NcclReducer::new(None),
+            #[cfg(not(feature = "candle-cuda"))]
+            reducer: NcclReducer::new(),
             devices: devices.to_vec(),
             primary: devices[0].clone(),
         })
@@ -67,7 +76,7 @@ impl TensorParallelMlp {
     /// across every layer) to this MLP's `down` projection.
     #[cfg(feature = "candle-cuda")]
     fn with_nccl_group(mut self, group: Option<std::sync::Arc<NcclShardGroup>>) -> Self {
-        self.down = self.down.with_nccl_group(group);
+        self.reducer = NcclReducer::new(group);
         self
     }
 
@@ -83,7 +92,9 @@ impl TensorParallelMlp {
         let up_out = self.up.forward(&x_2d, &self.primary)?;
         let hidden = (gate_out * up_out)?;
         let x_shards = split_for_row_parallel(&hidden, &self.devices)?;
-        let out_2d = self.down.forward(&x_shards, &self.primary)?;
+        let out_2d = self
+            .down
+            .forward_with_reducer(&x_shards, &self.primary, &self.reducer)?;
 
         let mut out_dims = in_shape.dims().to_vec();
         *out_dims.last_mut().expect("hidden_size dim exists") = out_2d.dim(1)?;
