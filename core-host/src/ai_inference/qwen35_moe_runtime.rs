@@ -29,8 +29,8 @@ use super::{
     StreamControl,
 };
 use primitives::{
-    full_attention_step, gated_delta_step, rms_norm_qwen, sparse_moe_forward, HybridDecodeState,
-    LayerDecodeState,
+    full_attention_step, gated_delta_step, rms_norm_qwen, sparse_moe_forward_batch,
+    HybridDecodeState, LayerDecodeState,
 };
 
 #[path = "qwen35_moe_primitives.rs"]
@@ -1110,23 +1110,23 @@ impl Qwen35MoeRuntime {
                 &post_norm,
                 count,
             )?;
-            let router_width = router.len() / count;
-            // Per token, and not for want of trying: routing picks a different
-            // set of experts for each token, so there is no shared operator to
-            // batch across them.
+            let moe = sparse_moe_forward_batch(
+                &post_norm,
+                &router,
+                count,
+                self.config.num_experts_per_tok,
+                |expert, inputs, tokens| {
+                    self.mlp(&format!("{prefix}.mlp.experts.{expert}"), inputs, tokens)
+                },
+                |inputs, tokens| self.mlp(&format!("{prefix}.mlp.shared_expert"), inputs, tokens),
+                &shared_gate,
+            )?;
             for token in 0..count {
-                let moe = sparse_moe_forward(
-                    &post_norm[token * hidden_size..(token + 1) * hidden_size],
-                    &router[token * router_width..(token + 1) * router_width],
-                    self.config.num_experts_per_tok,
-                    |expert, input| self.mlp(&format!("{prefix}.mlp.experts.{expert}"), input),
-                    |input| self.mlp(&format!("{prefix}.mlp.shared_expert"), input),
-                    shared_gate[token],
-                )?;
-                add_assign(
+                let (row, moe_row) = (
                     &mut hidden[token * hidden_size..(token + 1) * hidden_size],
-                    &moe,
-                )?;
+                    &moe[token * hidden_size..(token + 1) * hidden_size],
+                );
+                add_assign(row, moe_row)?;
             }
         }
 
@@ -1142,15 +1142,21 @@ impl Qwen35MoeRuntime {
         self.linear("lm_head", &hidden)
     }
 
-    fn mlp(&self, prefix: &str, input: &[f32]) -> Result<Vec<f32>> {
-        let gate = self.linear(&format!("{prefix}.gate_proj"), input)?;
-        let up = self.linear(&format!("{prefix}.up_proj"), input)?;
+    /// The feed-forward block for `tokens` activations at once.
+    ///
+    /// SwiGLU is elementwise, so batching it is only a matter of running the
+    /// three projections over the whole `[tokens, hidden_size]` block — which
+    /// is where the saving is, since each of them otherwise decodes its
+    /// quantized weights once per token.
+    fn mlp(&self, prefix: &str, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let gate = self.linear_batch(&format!("{prefix}.gate_proj"), inputs, tokens)?;
+        let up = self.linear_batch(&format!("{prefix}.up_proj"), inputs, tokens)?;
         let activated = gate
             .into_iter()
             .zip(up)
             .map(|(gate, up)| primitives::silu(gate) * up)
             .collect::<Vec<_>>();
-        self.linear(&format!("{prefix}.down_proj"), &activated)
+        self.linear_batch(&format!("{prefix}.down_proj"), &activated, tokens)
     }
 
     /// Apply `base` to `tokens` activations at once.

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Result};
 
 use super::LayerType;
@@ -111,32 +113,111 @@ pub(crate) fn route_top_k(logits: &[f32], top_k: usize) -> Result<Vec<(usize, f3
     Ok(probabilities)
 }
 
-pub(crate) fn sparse_moe_forward(
+/// Run the sparse mixture over `tokens` activations at once.
+///
+/// Routing is per token — that is what a mixture is — but the *operators* are
+/// not: several tokens in a chunk pick the same expert, and running them
+/// separately decodes that expert's weights once per token. So the routes are
+/// resolved first, the tokens that chose an expert are handed to it together,
+/// and only then is the mixture accumulated.
+///
+/// The accumulation stays per token and in route order, which is what keeps
+/// this bit-identical to running the same tokens one at a time. Chunk size is
+/// a performance knob; a prefill that changed the answer when the chunk grew
+/// would be a bug wearing an optimization's clothes.
+///
+/// `hidden` is `[tokens, hidden_size]` row-major, `router_logits` is
+/// `[tokens, num_experts]`, and `experts` receives `(expert, [n, hidden_size],
+/// n)` for the `n` tokens routed to it.
+pub(crate) fn sparse_moe_forward_batch(
     hidden: &[f32],
     router_logits: &[f32],
+    tokens: usize,
     top_k: usize,
-    mut expert: impl FnMut(usize, &[f32]) -> Result<Vec<f32>>,
-    shared_expert: impl FnOnce(&[f32]) -> Result<Vec<f32>>,
-    shared_gate_logit: f32,
+    mut experts: impl FnMut(usize, &[f32], usize) -> Result<Vec<f32>>,
+    shared_expert: impl FnOnce(&[f32], usize) -> Result<Vec<f32>>,
+    shared_gate_logits: &[f32],
 ) -> Result<Vec<f32>> {
-    let routes = route_top_k(router_logits, top_k)?;
-    let mut output = vec![0.0f32; hidden.len()];
-    for (expert_index, weight) in routes {
-        let values = expert(expert_index, hidden)?;
-        if values.len() != hidden.len() {
-            bail!("expert {expert_index} returned an invalid hidden dimension");
-        }
-        for (output, value) in output.iter_mut().zip(values) {
-            *output += value * weight;
+    if tokens == 0 {
+        bail!("sparse mixture requires at least one token");
+    }
+    if hidden.is_empty() || !hidden.len().is_multiple_of(tokens) {
+        bail!(
+            "sparse mixture hidden state has {} values, expected a multiple of {tokens}",
+            hidden.len()
+        );
+    }
+    if !router_logits.len().is_multiple_of(tokens) {
+        bail!(
+            "sparse mixture router has {} logits, expected a multiple of {tokens}",
+            router_logits.len()
+        );
+    }
+    if shared_gate_logits.len() != tokens {
+        bail!(
+            "sparse mixture shared gate has {} logits, expected {tokens}",
+            shared_gate_logits.len()
+        );
+    }
+    let hidden_size = hidden.len() / tokens;
+    let router_width = router_logits.len() / tokens;
+
+    let routes = (0..tokens)
+        .map(|token| {
+            route_top_k(
+                &router_logits[token * router_width..(token + 1) * router_width],
+                top_k,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Ascending by construction, which is what lets the accumulation below find
+    // a token's row in an expert's output by binary search.
+    let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (token, routes) in routes.iter().enumerate() {
+        for (expert, _) in routes {
+            members.entry(*expert).or_default().push(token);
         }
     }
-    let shared = shared_expert(hidden)?;
+
+    let mut computed: BTreeMap<usize, Vec<f32>> = BTreeMap::new();
+    for (expert, members) in &members {
+        let mut inputs = Vec::with_capacity(members.len() * hidden_size);
+        for &token in members {
+            inputs.extend_from_slice(&hidden[token * hidden_size..(token + 1) * hidden_size]);
+        }
+        let values = experts(*expert, &inputs, members.len())?;
+        if values.len() != members.len() * hidden_size {
+            bail!("expert {expert} returned an invalid hidden dimension");
+        }
+        computed.insert(*expert, values);
+    }
+
+    let shared = shared_expert(hidden, tokens)?;
     if shared.len() != hidden.len() {
         bail!("shared expert returned an invalid hidden dimension");
     }
-    let gate = sigmoid(shared_gate_logit);
-    for (output, value) in output.iter_mut().zip(shared) {
-        *output += value * gate;
+
+    let mut output = vec![0.0f32; hidden.len()];
+    for token in 0..tokens {
+        let row = &mut output[token * hidden_size..(token + 1) * hidden_size];
+        for (expert, weight) in &routes[token] {
+            let (Some(members), Some(values)) = (members.get(expert), computed.get(expert)) else {
+                bail!("expert {expert} was routed to but never executed");
+            };
+            let Ok(index) = members.binary_search(&token) else {
+                bail!("expert {expert} was not given token {token}");
+            };
+            let values = &values[index * hidden_size..(index + 1) * hidden_size];
+            for (output, value) in row.iter_mut().zip(values) {
+                *output += value * weight;
+            }
+        }
+        let gate = sigmoid(shared_gate_logits[token]);
+        let values = &shared[token * hidden_size..(token + 1) * hidden_size];
+        for (output, value) in row.iter_mut().zip(values) {
+            *output += value * gate;
+        }
     }
     Ok(output)
 }
@@ -402,22 +483,30 @@ mod tests {
         assert!((routes.iter().map(|(_, weight)| weight).sum::<f32>() - 1.0).abs() < 1e-6);
     }
 
+    /// A stand-in expert: deterministic, distinguishable per expert, and
+    /// elementwise, so batching it can only differ from the per-token form if
+    /// the mixture itself does.
+    fn stub_expert(expert: usize, inputs: &[f32], _tokens: usize) -> Result<Vec<f32>> {
+        Ok(inputs
+            .iter()
+            .map(|value| value * (expert + 1) as f32 + expert as f32)
+            .collect())
+    }
+
     #[test]
     fn sparse_moe_executes_only_selected_experts_and_shared_expert() {
         let mut visited = Vec::new();
-        let output = sparse_moe_forward(
+        let output = sparse_moe_forward_batch(
             &[1.0, 2.0],
             &[4.0, 3.0, -2.0],
+            1,
             2,
-            |index, hidden| {
-                visited.push(index);
-                Ok(hidden
-                    .iter()
-                    .map(|value| value * (index + 1) as f32)
-                    .collect())
+            |expert, inputs, tokens| {
+                visited.push(expert);
+                stub_expert(expert, inputs, tokens)
             },
-            |hidden| Ok(hidden.to_vec()),
-            0.0,
+            |hidden, _| Ok(hidden.to_vec()),
+            &[0.0],
         )
         .expect("MoE");
         assert_eq!(visited, vec![0, 1]);
@@ -426,16 +515,95 @@ mod tests {
 
     #[test]
     fn sparse_moe_rejects_invalid_expert_components() {
-        let error = sparse_moe_forward(
+        let error = sparse_moe_forward_batch(
             &[1.0, 2.0],
             &[1.0, 0.0],
             1,
-            |_index, _hidden| Ok(vec![1.0]),
-            |hidden| Ok(hidden.to_vec()),
-            0.0,
+            1,
+            |_expert, _inputs, _tokens| Ok(vec![1.0]),
+            |hidden, _| Ok(hidden.to_vec()),
+            &[0.0],
         )
         .expect_err("invalid expert output must fail");
         assert!(error.to_string().contains("invalid hidden dimension"));
+    }
+
+    /// The safety argument for chunked prefill. Grouping tokens by expert
+    /// changes which activations an operator sees together; it must not change
+    /// a single bit of what comes out, or a longer chunk would quietly be a
+    /// different model.
+    #[test]
+    fn a_batched_mixture_is_bit_identical_to_one_token_at_a_time() {
+        const TOKENS: usize = 7;
+        const HIDDEN: usize = 5;
+        const EXPERTS: usize = 6;
+
+        // Deterministic and deliberately uneven, so the routes overlap on some
+        // experts and leave others unused.
+        let hidden = (0..TOKENS * HIDDEN)
+            .map(|index| ((index * 37 % 23) as f32 - 11.0) / 7.0)
+            .collect::<Vec<f32>>();
+        let router = (0..TOKENS * EXPERTS)
+            .map(|index| ((index * 53 % 19) as f32 - 9.0) / 3.0)
+            .collect::<Vec<f32>>();
+        let gates = (0..TOKENS)
+            .map(|token| (token as f32 - 3.0) / 2.0)
+            .collect::<Vec<f32>>();
+
+        let batched = sparse_moe_forward_batch(
+            &hidden,
+            &router,
+            TOKENS,
+            2,
+            stub_expert,
+            |inputs, _| Ok(inputs.iter().map(|value| value * 0.5).collect()),
+            &gates,
+        )
+        .expect("batched MoE");
+
+        let mut one_at_a_time = Vec::with_capacity(hidden.len());
+        for token in 0..TOKENS {
+            one_at_a_time.extend(
+                sparse_moe_forward_batch(
+                    &hidden[token * HIDDEN..(token + 1) * HIDDEN],
+                    &router[token * EXPERTS..(token + 1) * EXPERTS],
+                    1,
+                    2,
+                    stub_expert,
+                    |inputs, _| Ok(inputs.iter().map(|value| value * 0.5).collect()),
+                    &gates[token..token + 1],
+                )
+                .expect("single-token MoE"),
+            );
+        }
+
+        assert_eq!(batched, one_at_a_time);
+    }
+
+    #[test]
+    fn a_batched_mixture_decodes_each_expert_once_for_the_whole_chunk() {
+        const TOKENS: usize = 8;
+        const HIDDEN: usize = 3;
+
+        // Every token routes to the same single expert, which is the case that
+        // makes the saving visible: one call, not eight.
+        let hidden = vec![0.25f32; TOKENS * HIDDEN];
+        let router = [1.0f32, 0.0].repeat(TOKENS);
+        let mut calls = Vec::new();
+        sparse_moe_forward_batch(
+            &hidden,
+            &router,
+            TOKENS,
+            1,
+            |expert, inputs, tokens| {
+                calls.push((expert, tokens));
+                stub_expert(expert, inputs, tokens)
+            },
+            |inputs, _| Ok(inputs.to_vec()),
+            &[0.0; TOKENS],
+        )
+        .expect("MoE");
+        assert_eq!(calls, vec![(0, TOKENS)]);
     }
 
     #[test]
