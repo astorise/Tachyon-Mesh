@@ -125,16 +125,13 @@ jobs:
 
       # The proof that decides whether `qwen35_moe_runtime.rs` can be deleted.
       #
-      # `TACHYON_QWEN35_DEQUANTIZED_FALLBACK` unpacks the weights to dense f32
-      # so the comparison runs on a device that cannot execute the NVFP4
-      # kernel — every architecture before Blackwell. That costs eight times
-      # the packed memory and says nothing about throughput, but the question
-      # here is whether the two implementations agree, and for that the
-      # arithmetic is the same either way. On a Blackwell runner the variable
-      # is ignored and the packed path is used.
+      # This briefly set `TACHYON_QWEN35_DEQUANTIZED_FALLBACK`, because the
+      # kernel refused to run below compute capability 10.0 and the comparison
+      # had to reach it somehow. candle #3831 established that nothing in the
+      # kernel needs FP4 tensor cores, so the packed path — the one that is
+      # actually shipped — now runs on any CUDA device, and the comparison runs
+      # against the real thing rather than an approximation of it.
       - name: Upstream layers match the scalar runtime
-        env:
-          TACHYON_QWEN35_DEQUANTIZED_FALLBACK: "1"
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda,nvfp4-cuda \

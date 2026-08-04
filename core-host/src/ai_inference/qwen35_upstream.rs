@@ -127,7 +127,7 @@ pub(crate) enum WeightResidency {
     /// for, and the only form that fits a large checkpoint.
     Packed,
     /// Unpacked to dense f32 at load. Eight times the memory, and the only way
-    /// to exercise these layers where the kernel refuses to run.
+    /// to exercise these layers in a build that has no NVFP4 kernel.
     DequantizedF32,
 }
 
@@ -137,10 +137,15 @@ const DEQUANTIZED_FALLBACK_ENV: &str = "TACHYON_QWEN35_DEQUANTIZED_FALLBACK";
 
 /// Decide how this host will hold the weights, or refuse.
 ///
-/// `native` is whether the NVFP4 kernel will run here — today that means a
-/// Blackwell device, because `candle_nvfp4_cuda_is_available` gates on compute
-/// capability 10.0. Everywhere else the packed form cannot be multiplied at
-/// all, so the choice is between the dequantized form and not running.
+/// `native` is whether the NVFP4 kernel is reachable at all. It used to mean a
+/// Blackwell device: the kernel gated itself on compute capability 10.0 even
+/// though nothing in it needs FP4 tensor cores. candle #3831 separated the two
+/// signals, so the packed path now runs wherever there is a CUDA device, and
+/// the capability question moved to `supports_fp4_tensor_cores`.
+///
+/// What is left is the build. A `candle-cuda` binary compiled without the
+/// `nvfp4-cuda` feature has a device and no kernel, and that is the one case
+/// the dequantized form still answers.
 pub(crate) fn residency(
     device_is_cuda: bool,
     native: bool,
@@ -159,10 +164,10 @@ pub(crate) fn residency(
         return Ok(WeightResidency::DequantizedF32);
     }
     bail!(
-        "this device cannot execute the NVFP4 kernel (compute capability 10.0 or newer is \
-         required). Set {DEQUANTIZED_FALLBACK_ENV}=1 to unpack the weights to dense f32 \
-         instead — eight times the memory of the packed checkpoint, which is why it is not \
-         the default"
+        "this build has no NVFP4 kernel: it was compiled without the `nvfp4-cuda` feature. \
+         Rebuild with it, or set {DEQUANTIZED_FALLBACK_ENV}=1 to unpack the weights to dense \
+         f32 instead — eight times the memory of the packed checkpoint, which is why it is \
+         not the default"
     )
 }
 
@@ -394,15 +399,15 @@ mod tests {
         );
     }
 
-    /// The default on a device the kernel refuses is to stop, not to quietly
-    /// use eight times the memory. Said out loud, with the way out in the
+    /// The default when there is no kernel is to stop, not to quietly use
+    /// eight times the memory. Said out loud, with both ways out in the
     /// message, because a silent 8x is how a machine dies at 3am.
     #[test]
-    fn a_device_without_the_kernel_refuses_unless_asked() {
-        let error = residency(true, false, false)
-            .expect_err("an older architecture cannot run the packed path");
+    fn a_build_without_the_kernel_refuses_unless_asked() {
+        let error =
+            residency(true, false, false).expect_err("a build with no kernel cannot run packed");
         let message = error.to_string();
-        assert!(message.contains("compute capability 10.0"), "{message}");
+        assert!(message.contains("nvfp4-cuda"), "{message}");
         assert!(message.contains(DEQUANTIZED_FALLBACK_ENV), "{message}");
         assert_eq!(
             residency(true, false, true).expect("the opt-in allows the dense form"),
