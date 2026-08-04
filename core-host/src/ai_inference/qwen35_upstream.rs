@@ -120,11 +120,62 @@ impl Projection for Nvfp4Projection {
     }
 }
 
+/// How a projection's weight will be held on the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WeightResidency {
+    /// Packed E2M1 nibbles, multiplied by the NVFP4 kernel. What the format is
+    /// for, and the only form that fits a large checkpoint.
+    Packed,
+    /// Unpacked to dense f32 at load. Eight times the memory, and the only way
+    /// to exercise these layers where the kernel refuses to run.
+    DequantizedF32,
+}
+
+/// The opt-in for the dequantized form. Off by default and deliberately
+/// awkward to reach: it is a development tool, not a deployment mode.
+const DEQUANTIZED_FALLBACK_ENV: &str = "TACHYON_QWEN35_DEQUANTIZED_FALLBACK";
+
+/// Decide how this host will hold the weights, or refuse.
+///
+/// `native` is whether the NVFP4 kernel will run here — today that means a
+/// Blackwell device, because `candle_nvfp4_cuda_is_available` gates on compute
+/// capability 10.0. Everywhere else the packed form cannot be multiplied at
+/// all, so the choice is between the dequantized form and not running.
+pub(crate) fn residency(
+    device_is_cuda: bool,
+    native: bool,
+    fallback_opted_in: bool,
+) -> Result<WeightResidency> {
+    if !device_is_cuda {
+        bail!(
+            "Qwen 3.5 through candle's layers needs a CUDA device; the scalar runtime is the \
+             host path"
+        );
+    }
+    if native {
+        return Ok(WeightResidency::Packed);
+    }
+    if fallback_opted_in {
+        return Ok(WeightResidency::DequantizedF32);
+    }
+    bail!(
+        "this device cannot execute the NVFP4 kernel (compute capability 10.0 or newer is \
+         required). Set {DEQUANTIZED_FALLBACK_ENV}=1 to unpack the weights to dense f32 \
+         instead — eight times the memory of the packed checkpoint, which is why it is not \
+         the default"
+    )
+}
+
+fn fallback_opted_in() -> bool {
+    std::env::var(DEQUANTIZED_FALLBACK_ENV).is_ok_and(|value| value == "1")
+}
+
 /// Build the projection named `path`, or explain why this host cannot.
 fn projection(
     model: &ModelOptNvfp4Directory,
     path: &str,
     device: &Device,
+    residency: WeightResidency,
 ) -> Result<Box<dyn Projection>> {
     let linear = model
         .modelopt_linear(path)
@@ -132,45 +183,54 @@ fn projection(
     let ModelOptLinearTensors::Nvfp4(linear) = linear else {
         bail!("projection `{path}` is not NVFP4-quantized; this loader has no dense path")
     };
-    #[cfg(feature = "nvfp4-cuda")]
-    {
-        let packed = linear.packed_weight.tensor.read_bytes()?;
-        let scales = linear.block_scales.tensor.read_bytes()?;
-        let tensor_scale = super::modelopt_nvfp4::read_scalar_f32(&linear.tensor_scale.tensor)?;
-        let shape = &linear.packed_weight.tensor.info.shape;
-        let (rows, cols) = (shape[0], shape[1] * 2);
-        // Uploaded onto the device the model's activations live on, not
-        // whichever one this process happened to open first.
-        let resident = super::modelopt_nvfp4::cuda::Nvfp4DeviceLinear::upload_on(
-            device,
-            &packed,
-            &scales,
-            tensor_scale,
-            rows,
-            cols,
-        )
-        .with_context(|| {
-            format!("projection `{path}` could not be made resident on a CUDA device")
-        })?;
-        Ok(Box::new(Nvfp4Projection { resident }))
-    }
-    #[cfg(not(feature = "nvfp4-cuda"))]
-    {
-        let _ = (linear, device);
-        bail!("loading Qwen 3.5 through candle's layers requires the `nvfp4-cuda` feature")
-    }
-}
+    let packed = linear.packed_weight.tensor.read_bytes()?;
+    let scales = linear.block_scales.tensor.read_bytes()?;
+    let tensor_scale = super::modelopt_nvfp4::read_scalar_f32(&linear.tensor_scale.tensor)?;
+    let shape = &linear.packed_weight.tensor.info.shape;
+    let (rows, cols) = (shape[0], shape[1] * 2);
 
-/// Refuse a host that cannot execute FP4, rather than reaching for a dense
-/// path that does not exist here.
-fn require_fp4_device(device: &Device) -> Result<()> {
-    if !device.is_cuda() {
-        bail!(
-            "Qwen 3.5 through candle's layers needs a CUDA device that can execute FP4; \
-             the scalar runtime is the host path"
-        );
+    match residency {
+        WeightResidency::Packed => {
+            #[cfg(feature = "nvfp4-cuda")]
+            {
+                // Uploaded onto the device the model's activations live on, not
+                // whichever one this process happened to open first.
+                let resident = super::modelopt_nvfp4::cuda::Nvfp4DeviceLinear::upload_on(
+                    device,
+                    &packed,
+                    &scales,
+                    tensor_scale,
+                    rows,
+                    cols,
+                )
+                .with_context(|| {
+                    format!("projection `{path}` could not be made resident on a CUDA device")
+                })?;
+                Ok(Box::new(Nvfp4Projection { resident }))
+            }
+            #[cfg(not(feature = "nvfp4-cuda"))]
+            {
+                let _ = (packed, scales, tensor_scale, rows, cols, device);
+                bail!("the packed NVFP4 path requires the `nvfp4-cuda` feature")
+            }
+        }
+        WeightResidency::DequantizedF32 => {
+            let dense = super::modelopt_nvfp4::dequantize_nvfp4_e4m3(
+                &packed,
+                &scales,
+                tensor_scale,
+                rows,
+                cols,
+                super::modelopt_nvfp4::Nvfp4OutputDType::F32,
+            )
+            .with_context(|| format!("projection `{path}` could not be dequantized"))?;
+            let super::modelopt_nvfp4::Nvfp4DenseValues::F32(values) = dense else {
+                bail!("dequantizing `{path}` to f32 produced another dtype")
+            };
+            let weight = candle_core::Tensor::from_vec(values, (rows, cols), device)?;
+            Ok(Box::new(candle_nn::Linear::new(weight, None)))
+        }
     }
-    Ok(())
 }
 
 /// Load the checkpoint into upstream's `ModelForCausalLM`.
@@ -183,7 +243,21 @@ pub(crate) fn load(
     config: &Qwen35MoeConfig,
     device: &Device,
 ) -> Result<ModelForCausalLM> {
-    require_fp4_device(device)?;
+    #[cfg(feature = "nvfp4-cuda")]
+    let native = super::modelopt_nvfp4::cuda::Nvfp4CudaBackend::is_available();
+    // Without the feature there is no kernel to be capable of anything, so the
+    // dequantized form is the only one on offer — and still only on request.
+    #[cfg(not(feature = "nvfp4-cuda"))]
+    let native = false;
+    let residency = residency(device.is_cuda(), native, fallback_opted_in())?;
+    if residency == WeightResidency::DequantizedF32 {
+        tracing::warn!(
+            alias = model.alias(),
+            "loading Qwen 3.5 with dequantized f32 weights: this device cannot execute the \
+             NVFP4 kernel. Memory use is eight times the packed checkpoint and throughput is \
+             not representative — for parity checks, not for serving"
+        );
+    }
     let shards = model.shard_paths();
     if shards.is_empty() {
         bail!("checkpoint `{}` has no safetensors shards", model.alias());
@@ -200,7 +274,7 @@ pub(crate) fn load(
                     "projection `{name}` wants a bias; ModelOpt Qwen 3.5 checkpoints have none"
                 )));
             }
-            projection(model, &tensor_path(&vb.prefix(), name), device)
+            projection(model, &tensor_path(&vb.prefix(), name), device, residency)
                 .map_err(|error| candle_core::Error::Msg(format!("{error:#}")))
         },
     )
@@ -307,16 +381,44 @@ mod tests {
         assert_eq!(tensor_path("", "lm_head"), "lm_head");
     }
 
-    /// The refusal matters more than it looks: the alternative a loader is
-    /// tempted into is dequantizing to f32, which on a mixture-of-experts
-    /// checkpoint is eight times the packed size and fits nowhere.
     #[test]
-    fn a_host_without_fp4_execution_is_refused_rather_than_dequantized() {
-        let error =
-            require_fp4_device(&Device::Cpu).expect_err("a CPU host has no FP4 execution to offer");
-        assert!(
-            error.to_string().contains("CUDA device"),
-            "unexpected error: {error}"
+    fn a_host_with_the_kernel_holds_the_weights_packed() {
+        assert_eq!(
+            residency(true, true, false).expect("a capable device loads"),
+            WeightResidency::Packed
         );
+        // The opt-in does not override a device that can do the real thing.
+        assert_eq!(
+            residency(true, true, true).expect("a capable device loads"),
+            WeightResidency::Packed
+        );
+    }
+
+    /// The default on a device the kernel refuses is to stop, not to quietly
+    /// use eight times the memory. Said out loud, with the way out in the
+    /// message, because a silent 8x is how a machine dies at 3am.
+    #[test]
+    fn a_device_without_the_kernel_refuses_unless_asked() {
+        let error = residency(true, false, false)
+            .expect_err("an older architecture cannot run the packed path");
+        let message = error.to_string();
+        assert!(message.contains("compute capability 10.0"), "{message}");
+        assert!(message.contains(DEQUANTIZED_FALLBACK_ENV), "{message}");
+        assert_eq!(
+            residency(true, false, true).expect("the opt-in allows the dense form"),
+            WeightResidency::DequantizedF32
+        );
+    }
+
+    #[test]
+    fn a_host_without_a_cuda_device_is_refused_whatever_the_opt_in_says() {
+        for opted_in in [false, true] {
+            let error = residency(false, false, opted_in)
+                .expect_err("a CPU host has nothing to offer these layers");
+            assert!(
+                error.to_string().contains("CUDA device"),
+                "unexpected error: {error}"
+            );
+        }
     }
 }

@@ -124,9 +124,17 @@ jobs:
             gated_prefill_is_invariant_to_chunk_size -- --nocapture
 
       # The proof that decides whether `qwen35_moe_runtime.rs` can be deleted.
-      # It needs a checkpoint and a device that executes FP4, so this runner is
-      # the only place it is anything but a compile.
+      #
+      # `TACHYON_QWEN35_DEQUANTIZED_FALLBACK` unpacks the weights to dense f32
+      # so the comparison runs on a device that cannot execute the NVFP4
+      # kernel — every architecture before Blackwell. That costs eight times
+      # the packed memory and says nothing about throughput, but the question
+      # here is whether the two implementations agree, and for that the
+      # arithmetic is the same either way. On a Blackwell runner the variable
+      # is ignored and the packed path is used.
       - name: Upstream layers match the scalar runtime
+        env:
+          TACHYON_QWEN35_DEQUANTIZED_FALLBACK: "1"
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda,nvfp4-cuda \
