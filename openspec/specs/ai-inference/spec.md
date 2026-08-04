@@ -1547,10 +1547,11 @@ cache's per-step reallocation is fundamentally incompatible with CUDA
 graph replay, so `cuda_graph_decode` without `paged_attention` SHALL
 continue to fail closed with a typed error naming that dependency, not
 just naming the missing `CudaGraph` wiring. `flashinfer_attention` SHALL
-be enabled only for a Llama-family checkpoint on a CUDA device when the
-`candle-flashinfer` build feature and decode-attention dispatch are available.
-Every other architecture, non-CUDA device, or build without that feature SHALL
-fail closed with a typed error. Prefill (multi-token) forward passes SHALL
+be enabled only for a Safetensors Llama-family checkpoint on a CUDA device.
+There SHALL be no separate build feature in that condition: the FlashInfer
+decode seam is compiled by `ai-inference`, and `candle-cuda` is the single
+switch that gives it a device. Every other architecture or non-CUDA device
+SHALL fail closed with a typed error. Prefill (multi-token) forward passes SHALL
 continue to use the existing attention path because
 `flashinfer_decode_attention` is decode-only.
 
@@ -1607,10 +1608,11 @@ continue to use the existing attention path because
 - **THEN** loading fails with a typed `UnsupportedModel` error naming the unsupported combination
 - **AND** the runtime does not silently pick one attention path over the other
 
-#### Scenario: FlashInfer remains an optional dependency
-- **WHEN** `core-host` is built without the `candle-flashinfer` feature
-- **THEN** the FlashInfer-style Candle crate remains unlinked
-- **AND** default and CPU-only AI inference builds are unchanged
+#### Scenario: The FlashInfer crate needs no CUDA to build
+- **WHEN** `core-host` is built with `ai-inference` and no CUDA toolchain
+- **THEN** the FlashInfer-style Candle crate is linked and compiles as pure Rust
+- **AND** `flashinfer_attention` still fails closed, because the rejection
+  turns on the absence of a CUDA device rather than on a Cargo feature
 
 ### Requirement: The runtime MUST validate a parallel plan against discovered hardware before loading weights
 Before constructing any parallel engine, the runtime SHALL validate the requested plan against the cluster's discovered hardware topology (device count, interconnect class, per-shard VRAM) and SHALL abort the load with a typed topology error — loading no weights — when the plan cannot be satisfied. This hardware-aware check is in addition to the structural plan validation already performed by the config API.

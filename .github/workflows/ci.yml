@@ -449,7 +449,7 @@ jobs:
       # covered by the FlashInfer test steps below, which the fast lane skips.
       - name: Check Candle CUDA + FlashInfer host build (Renovate compile-only lane)
         if: env.RENOVATE_PR == 'true'
-        run: cargo check -p core-host --features "candle-cuda candle-flashinfer"
+        run: cargo check -p core-host --features candle-cuda
 
       - name: Lint Candle CUDA host build
         if: env.RENOVATE_PR != 'true'
@@ -509,7 +509,7 @@ jobs:
       - name: Build FlashInfer CUDA test binaries
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 30
-        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" --no-run
+        run: cargo test -p core-host --bin core-host --features candle-cuda --no-run
 
       # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
       # actually dispatches through candle-flashinfer-kernels::flashinfer_decode_attention
@@ -518,12 +518,12 @@ jobs:
       - name: Run FlashInfer decode-attention CUDA execution proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 15
-        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
 
       - name: Run FlashInfer/paged-attention combination rejection proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
 
       # The CUTLASS headers used to be cloned here because this repository
       # compiled its own NVFP4 kernel. `candle-nvfp4-kernels` owns that now and

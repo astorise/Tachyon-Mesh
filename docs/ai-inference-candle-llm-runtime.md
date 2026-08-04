@@ -872,11 +872,11 @@ Model bindings can opt in with:
 
 The pinned `astorise/candle` fork carries an additive `use_flashinfer_attention`
 seam on `candle_transformers::models::llama::Config` (mirroring the existing
-`use_flash_attn` flag), wired to the optional `candle-flashinfer-kernels`
-crate's `flashinfer_decode_attention`.
+`use_flash_attn` flag), wired to the `candle-flashinfer-kernels` crate's
+`flashinfer_decode_attention`. The crate comes in with `ai-inference` and
+builds without CUDA; `candle-cuda` is what gives it a device.
 
-A Llama model binding on a CUDA device with the `candle-flashinfer` Cargo
-feature compiled in can opt in with:
+A Llama model binding on a CUDA device can opt in with:
 
 ```json
 {
@@ -896,8 +896,8 @@ block-size or head-dim alignment requirement. `flashinfer_attention` cannot be
 combined with `paged_attention` in the same deployment (they select different
 decode-attention kernels over different KV cache layouts) — that combination
 is rejected with a typed error rather than silently picking one. Every other
-combination (non-Llama architecture, non-CUDA device, or a build without
-`candle-flashinfer` compiled in) keeps the existing typed rejection. See
+combination (non-Llama architecture, non-Safetensors format, or non-CUDA
+device) keeps the existing typed rejection. See
 `openspec/changes/wire-flashinfer-decode-attention`.
 
 ## CUDA Graph Decode Status

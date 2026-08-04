@@ -20,22 +20,26 @@ admin-plane = []
 # Candle + TurboQuant + ONNX inference — pure Rust, musl-compatible.
 # candle-onnx executes .onnx models; wasmtime-wasi-nn (no ORT) provides the
 # WASI-NN guest interface backed by our CandleOnnxBackend.
-# `candle-nvfp4-kernels` is in here rather than behind a feature of its own
-# because it is not a hardware switch. Built without its `cuda` feature it is
-# pure Rust, compiles with no toolkit — no nvcc, no CUTLASS — and answers
-# `is_available() == false`, which is exactly what a CPU host should hear. The
-# separate `nvfp4-cuda` feature that used to carry it only ever decided whether
-# the crate was linked, and having two names for "is the code present" and "can
-# the device run it" is what let the second question be answered in the wrong
-# place for so long. `candle-cuda` turns on the kernel crate's own `cuda`
-# feature; that is the one switch that needs a toolchain.
+# The two candle kernel crates are in here rather than behind features of their
+# own, because neither is a hardware switch. Built without their `cuda` feature
+# they are pure Rust, compile with no toolkit — no nvcc, no CUTLASS — and report
+# themselves unavailable, which is exactly what a CPU host should hear. The
+# `nvfp4-cuda` and `candle-flashinfer` features that used to carry them decided
+# only whether the crates were linked, and having separate names for "is the
+# code present" and "can this device run it" is what let the second question go
+# on being answered in the wrong place. `candle-cuda` turns on both crates' own
+# `cuda` features; that is the one switch that needs a toolchain.
+#
+# `candle-transformers/flashinfer-kernels` rides along for the same reason: it
+# compiles upstream's FlashInfer decode seam, which without CUDA is a reference
+# implementation, not a device requirement.
 ai-inference = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-onnx", "dep:candle-transformers",
-    "dep:candle-nvfp4-kernels",
+    "dep:candle-nvfp4-kernels", "dep:candle-flashinfer-kernels",
+    "candle-transformers/flashinfer-kernels",
     "dep:lru", "dep:minijinja", "dep:minijinja-contrib", "dep:parallel-topology", "dep:prost",
     "dep:tokenizers", "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
 ]
-candle-flashinfer = ["ai-inference", "dep:candle-flashinfer-kernels", "candle-transformers/flashinfer-kernels"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
 # VRAM helpers, BaaS scratch tables) so they are excluded from the default build but
@@ -47,7 +51,7 @@ mtls = []
 candle-cuda = [
     "ai-inference",
     "candle-core/cuda",
-    "candle-flashinfer-kernels?/cuda",
+    "candle-flashinfer-kernels/cuda",
     "candle-nn/lora-cuda",
     "candle-onnx/cuda",
     "candle-transformers/cuda",

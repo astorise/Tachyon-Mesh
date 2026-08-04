@@ -2131,15 +2131,14 @@ impl CandleLlmRuntime {
             });
         }
 
-        // flashinfer_attention needs the same Llama+CUDA baseline plus the
-        // separate, optional `candle-flashinfer` Cargo feature: unlike
-        // `flash-attn` (unconditionally bundled into `candle-cuda`, so
-        // `single_device_cuda_supported` alone is enough for paged_attention),
-        // `candle-transformers/flashinfer-kernels` is only compiled in when
-        // `candle-flashinfer` is enabled. Without that check, a `candle-cuda`
-        // build lacking `candle-flashinfer` would report this as supported and
-        // then panic at decode time (`unimplemented!("compile with
-        // '--features flashinfer-kernels'")`).
+        // flashinfer_attention needs the same Llama+CUDA baseline as
+        // paged_attention, and nothing more. It used to need a
+        // `cfg!(feature = "candle-flashinfer")` beside it, because
+        // `candle-transformers/flashinfer-kernels` was compiled in only under
+        // that separate feature and a `candle-cuda` build without it would
+        // report support and then panic at decode time. `ai-inference` now
+        // compiles the seam unconditionally, so `single_device_cuda_supported`
+        // carries the whole question again.
         //
         // The Safetensors requirement is the same one paged_attention carries:
         // only `load_safetensors` builds the decode path FlashInfer hooks into.
@@ -2148,7 +2147,6 @@ impl CandleLlmRuntime {
         // quantized attention — `QuantizedLlama` owns its own decode path and
         // never sees `strategy` at all.
         let flashinfer_attention_supported = single_device_cuda_supported
-            && cfg!(feature = "candle-flashinfer")
             && format == ModelFormat::Safetensors
             && requested_device != "cpu";
         if strategy.flashinfer_attention {
@@ -2157,7 +2155,7 @@ impl CandleLlmRuntime {
                     alias: alias.to_owned(),
                     path: root.to_path_buf(),
                     detail:
-                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Safetensors Llama checkpoint on a CUDA device with the candle-flashinfer feature compiled in"
+                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Safetensors Llama checkpoint on a CUDA device"
                             .to_owned(),
                 });
             }
@@ -2349,13 +2347,10 @@ impl CandleLlmRuntime {
                         }
                     })?;
                 let mut config = llama_config.into_config(false);
-                // `Config::use_flashinfer_attention` exists regardless of the
-                // `candle-flashinfer` Cargo feature (only its dead-code lint
-                // is feature-gated on the fork side), and
                 // `try_load_with_topology` has already rejected every request
-                // where this would be `true` without that feature compiled
-                // in, so assigning it unconditionally here is safe — it's a
-                // no-op `false` on any build without the feature.
+                // where this could be `true` without a CUDA device under it,
+                // so assigning it unconditionally is safe: on any other build
+                // it is a no-op `false`.
                 config.use_flashinfer_attention = strategy.flashinfer_attention;
                 let limits = GenerationLimits::with_context(config.max_position_embeddings);
                 let eos_tokens = eos_token_ids(&config);
@@ -9430,7 +9425,7 @@ mod tests {
     }
 
     #[test]
-    fn flashinfer_attention_strategy_is_rejected_until_decode_attention_is_wired() {
+    fn flashinfer_attention_strategy_is_rejected_on_a_cpu_route() {
         let dir = write_fixture_dir("flashinfer-reject");
         let strategy = HardwareStrategy {
             flashinfer_attention: true,
@@ -9450,9 +9445,8 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // Holds on every build (with or without candle-cuda/candle-flashinfer):
-    // only a Llama checkpoint on a CUDA device can get flashinfer_attention
-    // wired.
+    // Holds on every build, with or without `candle-cuda`: only a Llama
+    // checkpoint on a CUDA device can get flashinfer_attention wired.
     #[test]
     fn flashinfer_attention_strategy_is_rejected_for_a_non_llama_architecture() {
         let dir = std::env::temp_dir().join(format!(
@@ -9522,10 +9516,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // Reaching the paged-attention conflict message (rather than the "feature
-    // not compiled in" rejection) requires both candle-cuda and
-    // candle-flashinfer, same as the real execution test below.
-    #[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]
+    // Reaching the paged-attention conflict message rather than the
+    // CUDA-baseline rejection needs `candle-cuda`, same as the real execution
+    // test below.
+    #[cfg(feature = "candle-cuda")]
     #[test]
     fn flashinfer_attention_and_paged_attention_combination_is_rejected() {
         let dir = write_fixture_dir("flashinfer-paged-combo-reject");
@@ -9551,7 +9545,7 @@ mod tests {
     // Requires a real CUDA device (`arc-gpu-runners`/`cuda-quality`) — not
     // runnable on this repo's default Windows dev sandbox, same as
     // `single_device_llama_paged_attention_generates_a_real_decode_on_cuda`.
-    #[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]
+    #[cfg(feature = "candle-cuda")]
     #[test]
     fn single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda() {
         let dir = write_fixture_dir("flashinfer-attn-cuda");
@@ -9592,7 +9586,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[cfg(feature = "candle-flashinfer")]
     #[test]
     fn flashinfer_kernel_dependency_runs_reference_decode_attention() {
         use candle_flashinfer_kernels::flashinfer_decode_attention;
