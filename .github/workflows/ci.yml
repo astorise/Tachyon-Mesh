@@ -739,11 +739,13 @@ jobs:
           # build (transport stack included); this one is the maximally
           # minimal floor.
           - "--no-default-features"
-          # "All CPU features": every feature except core-host/candle-cuda, which
-          # pulls in cudarc and requires `nvcc` (validated separately by the
-          # cuda-quality job on the GPU runner). A bare `--all-features` would
-          # break on these CPU-only runners. Mirrors publish-docker-images'
-          # "-all-features" variant.
+          # "All CPU features": every feature except the two GPU backends —
+          # `candle-cuda`, which pulls in cudarc and needs `nvcc` (validated
+          # separately by the cuda-quality job on the GPU runner), and
+          # `candle-metal`, which needs macOS. Both kernel crates are built
+          # here regardless: they ride in on `ai-inference` and compile as pure
+          # Rust. A bare `--all-features` would break on these CPU-only
+          # runners. Mirrors publish-docker-images' "-all-features" variant.
           - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
@@ -811,11 +813,13 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          # "All CPU features": every feature except core-host/candle-cuda, which
-          # pulls in cudarc and requires `nvcc` (validated separately by the
-          # cuda-quality job on the GPU runner). A bare `--all-features` would
-          # break on these CPU-only runners. Mirrors publish-docker-images'
-          # "-all-features" variant.
+          # "All CPU features": every feature except the two GPU backends —
+          # `candle-cuda`, which pulls in cudarc and needs `nvcc` (validated
+          # separately by the cuda-quality job on the GPU runner), and
+          # `candle-metal`, which needs macOS. Both kernel crates are built
+          # here regardless: they ride in on `ai-inference` and compile as pure
+          # Rust. A bare `--all-features` would break on these CPU-only
+          # runners. Mirrors publish-docker-images' "-all-features" variant.
           - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
