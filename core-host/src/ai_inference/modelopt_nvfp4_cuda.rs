@@ -14,9 +14,86 @@
 //! operator as unsupported, which is exactly what the missing CUTLASS headers
 //! used to produce.
 
+use std::sync::OnceLock;
+
 use anyhow::{anyhow, Result};
+use candle_core::{Device, Tensor};
 
 use super::{Nvfp4AcceleratorCapabilities, Nvfp4KernelKind};
+
+/// The CUDA device every NVFP4 operator uploads to.
+///
+/// One per process rather than one per operator: `Device::new_cuda` opens a
+/// context, and a model has hundreds of operators that all want the same one.
+fn device() -> Option<&'static Device> {
+    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
+    DEVICE.get_or_init(|| Device::new_cuda(0).ok()).as_ref()
+}
+
+/// An NVFP4 operator whose weight lives on the device.
+///
+/// The host entry points below re-upload the packed weight and its scales on
+/// every call, which for a `[rows, cols]` operator is megabytes per activation
+/// — far more traffic than the activation itself. The weight never changes, so
+/// this uploads it once at load and every later call moves only the tokens.
+pub(crate) struct Nvfp4DeviceLinear {
+    inner: candle_nvfp4_kernels::Nvfp4Linear,
+    cols: usize,
+}
+
+impl std::fmt::Debug for Nvfp4DeviceLinear {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Nvfp4DeviceLinear")
+    }
+}
+
+impl Clone for Nvfp4DeviceLinear {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            cols: self.cols,
+        }
+    }
+}
+
+impl Nvfp4DeviceLinear {
+    /// Uploads one operator, or answers `None` when this build or this device
+    /// cannot execute FP4 — in which case the caller keeps the host path it
+    /// already had.
+    pub(crate) fn upload(
+        packed_weight: &[u8],
+        weight_scale_e4m3: &[u8],
+        tensor_scale: f32,
+        rows: usize,
+        cols: usize,
+    ) -> Option<Self> {
+        if !Nvfp4CudaBackend::is_available() {
+            return None;
+        }
+        let inner = candle_nvfp4_kernels::Nvfp4Linear::new(
+            packed_weight,
+            weight_scale_e4m3,
+            tensor_scale,
+            rows,
+            cols,
+            device()?,
+        )
+        .ok()?;
+        Some(Self { inner, cols })
+    }
+
+    /// `tokens` activations through the resident operator. Only the
+    /// activations cross the bus.
+    pub(crate) fn matmul(&self, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let device = device().ok_or_else(|| anyhow!("NVFP4 CUDA device is no longer available"))?;
+        let inputs = Tensor::from_slice(inputs, (tokens, self.cols), device)
+            .map_err(|error| anyhow!("NVFP4 activation upload failed: {error}"))?;
+        self.inner
+            .forward(&inputs)
+            .and_then(|output| output.flatten_all()?.to_vec1::<f32>())
+            .map_err(|error| anyhow!("NVFP4 CUDA resident linear failed: {error}"))
+    }
+}
 
 pub(crate) struct Nvfp4CudaBackend;
 

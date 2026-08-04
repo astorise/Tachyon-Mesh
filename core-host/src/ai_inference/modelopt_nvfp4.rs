@@ -1012,8 +1012,20 @@ pub(crate) enum PreparedLinear {
         packed: Vec<u8>,
         scales: Vec<u8>,
         tensor_scale: f32,
+        /// The same operator, resident on the device, uploaded on first native
+        /// use. Empty on a build or a device that cannot execute FP4, which is
+        /// what keeps the host path reachable without a second code path.
+        resident: ResidentOperator,
     },
 }
+
+/// A lazily-uploaded device operator, or nothing at all when this build has no
+/// NVFP4 CUDA support. `Default` on both arms is what lets every construction
+/// site stay free of `cfg`.
+#[cfg(feature = "nvfp4-cuda")]
+type ResidentOperator = std::sync::OnceLock<Option<cuda::Nvfp4DeviceLinear>>;
+#[cfg(not(feature = "nvfp4-cuda"))]
+type ResidentOperator = ();
 
 impl PreparedLinear {
     pub(crate) fn resident_bytes(&self) -> u64 {
@@ -1194,6 +1206,7 @@ impl PreparedLinear {
             packed,
             scales,
             tensor_scale,
+            resident,
         } = self
         else {
             // Dense and FP8 operators have no native kernel; the host path is
@@ -1211,51 +1224,38 @@ impl PreparedLinear {
         }
         #[cfg(feature = "nvfp4-cuda")]
         {
-            cuda::Nvfp4CudaBackend::linear_f32_host_batched(
-                inputs,
-                packed,
-                scales,
-                *tensor_scale,
-                *rows,
-                *cols,
-                tokens,
-            )
+            // Uploaded once and kept; the host entry point below re-sends the
+            // whole operator on every call, which for anything but a tiny
+            // weight costs more than the activation it is multiplying.
+            let resident = resident.get_or_init(|| {
+                cuda::Nvfp4DeviceLinear::upload(packed, scales, *tensor_scale, *rows, *cols)
+            });
+            match resident {
+                Some(resident) => resident.matmul(inputs, tokens),
+                None => cuda::Nvfp4CudaBackend::linear_f32_host_batched(
+                    inputs,
+                    packed,
+                    scales,
+                    *tensor_scale,
+                    *rows,
+                    *cols,
+                    tokens,
+                ),
+            }
         }
         #[cfg(not(feature = "nvfp4-cuda"))]
         {
-            let _ = (rows, packed, scales, tensor_scale);
+            let _ = (rows, packed, scales, tensor_scale, resident);
             bail!("native NVFP4 execution requires the `nvfp4-cuda` feature")
         }
     }
 
     pub(crate) fn matvec_native_nvfp4(&self, input: &[f32]) -> Result<Vec<f32>> {
-        match self {
-            Self::Nvfp4 {
-                rows,
-                cols,
-                packed,
-                scales,
-                tensor_scale,
-            } => {
-                #[cfg(feature = "nvfp4-cuda")]
-                {
-                    cuda::Nvfp4CudaBackend::linear_f32_host(
-                        input,
-                        packed,
-                        scales,
-                        *tensor_scale,
-                        *rows,
-                        *cols,
-                    )
-                }
-                #[cfg(not(feature = "nvfp4-cuda"))]
-                {
-                    let _ = (rows, cols, packed, scales, tensor_scale, input);
-                    bail!("native NVFP4 execution requires the `nvfp4-cuda` feature")
-                }
-            }
-            _ => self.matvec(input),
-        }
+        // One token is the batched path with `tokens = 1`, and going through it
+        // is what lets a decode step reuse the operator a prefill chunk already
+        // uploaded. `matmul` is bit-identical to `matvec` at one token, which
+        // `matmul_matches_matvec_for_every_operator_form` holds to.
+        self.matmul_native_nvfp4(input, 1)
     }
 }
 
@@ -1342,6 +1342,7 @@ impl ModelOptLinearTensors {
                     packed,
                     scales,
                     tensor_scale,
+                    resident: Default::default(),
                 })
             }
             Self::Fp8(linear) => {
@@ -2211,6 +2212,7 @@ mod tests {
                 .map(|i| (i % 199) as u8)
                 .collect(),
             tensor_scale: 0.5,
+            resident: Default::default(),
         };
 
         for (name, operator) in [("dense", dense), ("fp8", fp8), ("nvfp4", nvfp4)] {
@@ -2358,6 +2360,7 @@ mod tests {
             packed: vec![0x22; 8],
             scales: vec![0x38],
             tensor_scale: 1.0,
+            resident: Default::default(),
         };
         let dense_output = dense.matvec(&[1.0; 16]).expect("dense");
         let fp8_output = fp8.matvec(&dense_output).expect("fp8");
@@ -2377,6 +2380,7 @@ mod tests {
             packed: vec![0x22; 16],
             scales: vec![0x38; 2],
             tensor_scale: 1.0,
+            resident: Default::default(),
         };
         let input = vec![1.0f32; 16];
         let fallback = linear.matvec(&input).expect("fallback");
