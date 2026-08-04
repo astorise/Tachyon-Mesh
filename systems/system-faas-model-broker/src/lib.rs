@@ -364,6 +364,21 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     let incoming_dir = models_dir().join(format!(".incoming-{upload_id}"));
     let backup_dir = models_dir().join(format!(".replaced-{upload_id}"));
     let _ = fs::remove_dir_all(&incoming_dir);
+    // A crash between the two renames below parks the live checkpoint in
+    // `.replaced-{upload_id}` with nothing at `model_dir`. The upload stays
+    // retryable, and this used to open by deleting that backup — so if the
+    // retry was refused in turn, `replaced` was false, there was nothing to
+    // put back, and the operator's checkpoint was gone for good. Restore it
+    // first: past this point either the live directory is whole or there was
+    // never one, which is the state the rest of this function assumes.
+    if backup_dir.exists() && !model_dir.exists() {
+        fs::rename(&backup_dir, &model_dir).map_err(|error| {
+            format!(
+                "failed to recover the checkpoint an interrupted upload left in `{}`: {error}",
+                backup_dir.display()
+            )
+        })?;
+    }
     let _ = fs::remove_dir_all(&backup_dir);
     fs::create_dir_all(&incoming_dir)
         .map_err(|error| format!("failed to create the staging model directory: {error}"))?;
@@ -371,7 +386,9 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     let format = unpack_targz(&staging_path, &incoming_dir)
         .and_then(|()| validate_extracted_file_manifest(&incoming_dir, &pending.files))
         .and_then(|()| detect_format(&incoming_dir))
-        .and_then(|format| write_meta_sidecar(&incoming_dir, format, &alias).map(|()| format))
+        .and_then(|format| {
+            write_meta_sidecar(&incoming_dir, format, &alias, &upload_id).map(|()| format)
+        })
         .inspect_err(|_error| {
             // Nothing outside the staging directory has been touched yet, so a
             // failure here costs the live checkpoint nothing.
@@ -408,11 +425,34 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     // upload. On refusal the new files go and the previous checkpoint comes
     // back, leaving the alias exactly as the manifest left it.
     if let Err(error) = publish_model_uploaded(&alias, format, &model_dir, &pending.files) {
-        let _ = fs::remove_dir_all(&model_dir);
-        if replaced {
-            let _ = fs::rename(&backup_dir, &model_dir);
+        // Unwind only what is still ours. Two commits for the same alias can
+        // interleave: by the time this refusal arrives, a second upload may
+        // have moved our directory aside and installed its own. Removing the
+        // live directory blindly would delete a checkpoint its caller was told
+        // had installed, and dropping our backup on top would lose that one
+        // too — the sequence ends with both callers holding a failure and
+        // neither model live.
+        if installed_upload_id(&model_dir).as_deref() == Some(upload_id.as_str()) {
+            let _ = fs::remove_dir_all(&model_dir);
+            if replaced {
+                let _ = fs::rename(&backup_dir, &model_dir);
+            }
+            cleanup_staging(&upload_id);
+            return Err(error);
         }
+        // Someone else owns the live path. Deleting is the irreversible half
+        // of a rollback and restoring is the destructive one, so do neither:
+        // leave the backup on disk and say where it is. An operator can put it
+        // back; nothing here can put it back correctly.
         cleanup_staging(&upload_id);
+        if replaced {
+            return Err(format!(
+                "{error} (a concurrent upload now owns `{}`; this upload's previous checkpoint \
+                 was left at `{}` rather than restored over it)",
+                model_dir.display(),
+                backup_dir.display()
+            ));
+        }
         return Err(error);
     }
 
@@ -662,14 +702,35 @@ fn file_starts_with_gguf_magic(path: &Path) -> bool {
 }
 
 /// Write the host dispatch sidecar declaring the detected format.
-fn write_meta_sidecar(dir: &Path, format: &str, alias: &str) -> Result<(), String> {
+fn write_meta_sidecar(
+    dir: &Path,
+    format: &str,
+    alias: &str,
+    upload_id: &str,
+) -> Result<(), String> {
     let body = serde_json::to_vec(&serde_json::json!({
         "format": format,
         "alias": alias,
+        // Who installed this directory. The host ignores unknown sidecar keys,
+        // so this costs it nothing and buys the rollback below the one fact it
+        // cannot otherwise have: whether the checkpoint sitting at the live
+        // path is still the one this upload put there.
+        "upload_id": upload_id,
     }))
     .map_err(|error| format!("failed to encode model metadata sidecar: {error}"))?;
     fs::write(dir.join(MODEL_META_JSON), body)
         .map_err(|error| format!("failed to write model metadata sidecar: {error}"))
+}
+
+/// The upload that installed the checkpoint at `dir`, when it says.
+///
+/// `None` covers a directory with no sidecar, an unreadable one, and one
+/// written before this key existed — all of which mean the same thing to the
+/// only caller: do not assume this directory is yours.
+fn installed_upload_id(dir: &Path) -> Option<String> {
+    let raw = fs::read(dir.join(MODEL_META_JSON)).ok()?;
+    let meta: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    meta.get("upload_id")?.as_str().map(str::to_owned)
 }
 
 /// Reject aliases that are not a single safe path component.
