@@ -1556,10 +1556,11 @@ mod tests {
     /// business. What must agree is the answer — the token the model would
     /// emit — and the logits either side of it.
     ///
-    /// Gated three times over: on an installed checkpoint, on a device that can
-    /// execute FP4, and therefore on `TACHYON_ENABLE_NVFP4_CI`. Until that
-    /// runner exists this test compiles and does nothing, which is worth
-    /// stating plainly rather than discovering later.
+    /// Gated on an installed checkpoint and a CUDA device — no longer on FP4
+    /// tensor cores, which candle #3831 established the kernel never needed.
+    /// What remains is `TACHYON_ENABLE_NVFP4_CI` and the weights it implies:
+    /// without them this test compiles and does nothing, which is worth stating
+    /// plainly rather than discovering later.
     #[test]
     fn gated_upstream_layers_agree_with_the_scalar_runtime() {
         let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {

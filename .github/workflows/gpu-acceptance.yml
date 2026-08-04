@@ -17,11 +17,13 @@ concurrency:
   group: gpu-acceptance
   cancel-in-progress: false
 
-# Everything below is opt-in on the same repository variable `cuda-quality`
-# already uses for its NVFP4 proofs, because it needs a runner that can execute
-# FP4 kernels and a checkpoint installed on it. Opting in is what turns the
-# guards below from skips into hard requirements: a GPU job that silently tests
-# nothing is worse than one that fails.
+# Everything below is opt-in on `TACHYON_ENABLE_NVFP4_CI`, and the reason is
+# the checkpoint rather than the hardware: candle #3831 dropped the FP4
+# tensor-core floor, so the kernel itself runs anywhere CUDA does, but these
+# tests need the Qwen 3.5 NVFP4 weights installed on the runner and each one
+# returns early without them. Opting in is what turns those early returns into
+# hard requirements: a GPU job that silently tests nothing is worse than one
+# that fails. `cuda-quality` needs neither, and is no longer gated.
 jobs:
   qwen35-nvfp4:
     name: Qwen 3.5 NVFP4 checkpoint
@@ -84,10 +86,11 @@ jobs:
           nvidia-smi
           nvcc --version
 
-      # Native NVFP4 requires a runner GPU/toolchain that can execute the FP4
-      # kernels. Keep this proof opt-in until such a runner is available.
+      # Build for whatever this runner actually is. The architecture is read
+      # from the device rather than pinned, so the kernel is compiled for the
+      # GPU that will run it. The job-level gate already decided this job runs
+      # at all; repeating it here would only be a second place to get wrong.
       - name: Configure NVFP4 CUDA architecture
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
         run: |
           compute_capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '[:space:].')"
           if [ -z "$compute_capability" ]; then

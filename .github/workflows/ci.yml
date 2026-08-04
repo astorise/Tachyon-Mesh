@@ -417,10 +417,11 @@ jobs:
           nvidia-smi
           nvcc --version
 
-      # Native NVFP4 requires a runner GPU/toolchain that can execute the FP4
-      # kernels. Keep this proof opt-in until such a runner is available.
+      # Build for whatever this runner actually is. The architecture is read
+      # from the device rather than pinned, so the kernel is compiled for the
+      # GPU that will run it.
       - name: Configure NVFP4 CUDA architecture
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
+        if: env.RENOVATE_PR != 'true'
         run: |
           compute_capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '[:space:].')"
           if [ -z "$compute_capability" ]; then
@@ -528,8 +529,13 @@ jobs:
       # compiled its own NVFP4 kernel. `candle-nvfp4-kernels` owns that now and
       # brings its own build, so the checkout and the include-dir hand-off are
       # both gone.
+      # Synthetic tensors, no checkpoint: this asks only whether the native
+      # kernel agrees with the scalar fallback on the runner's own device.
+      # candle #3831 removed the compute-capability floor that used to keep it
+      # opt-in, and candle's own suite owns the hardware question now, so it
+      # runs on every PR against whatever GPU the pool hands us.
       - name: Run native NVFP4 parity and telemetry proof
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
+        if: env.RENOVATE_PR != 'true'
         env:
           TACHYON_NVFP4_CUDA_SMOKE: "1"
           TACHYON_NVFP4_NATIVE_REQUIRED: "1"
