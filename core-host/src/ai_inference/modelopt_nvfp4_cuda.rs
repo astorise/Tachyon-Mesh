@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, Result};
 use candle_core::{Device, Tensor};
 
-use super::{Nvfp4AcceleratorCapabilities, Nvfp4KernelKind};
+use super::Nvfp4KernelAvailability;
 
 /// The CUDA device every NVFP4 operator uploads to.
 ///
@@ -131,23 +131,22 @@ impl Nvfp4DeviceLinear {
 pub(crate) struct Nvfp4CudaBackend;
 
 impl Nvfp4CudaBackend {
-    /// Whether this build and this device can execute FP4 natively.
+    /// Whether the NVFP4 kernel can be called from this build.
     ///
-    /// Delegated rather than re-derived: the kernel crate gates on compute
-    /// capability 10.0, and duplicating that threshold here is how the two
-    /// would eventually disagree about which devices are supported.
+    /// Asked, never re-derived. Whatever the kernel requires of a device is
+    /// the kernel's to state — and it has already changed once: candle #3831
+    /// dropped the compute-capability 10.0 floor after establishing that
+    /// nothing in the kernel needs FP4 tensor cores. Any copy of that rule
+    /// kept on this side would now be wrong.
     pub(crate) fn is_available() -> bool {
         candle_nvfp4_kernels::is_available()
     }
 
-    pub(crate) fn capabilities() -> Nvfp4AcceleratorCapabilities {
+    pub(crate) fn availability() -> Nvfp4KernelAvailability {
         if Self::is_available() {
-            Nvfp4AcceleratorCapabilities::native_fp4([
-                Nvfp4KernelKind::Dequantize,
-                Nvfp4KernelKind::Matmul,
-            ])
+            Nvfp4KernelAvailability::Reachable
         } else {
-            Nvfp4AcceleratorCapabilities::fallback_only()
+            Nvfp4KernelAvailability::Absent
         }
     }
 

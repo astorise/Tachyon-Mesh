@@ -68,62 +68,68 @@ pub(crate) struct Nvfp4FallbackMemoryLimits {
     pub(crate) max_accelerator_bytes: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Nvfp4KernelKind {
-    Dequantize,
-    Matmul,
+/// Whether packed NVFP4 operators can be multiplied through candle's kernel.
+///
+/// One question, and candle is what answers it. This used to be three fields —
+/// `native_fp4`, `runtime_available`, a set of compiled kernel kinds — with
+/// the conjunction re-derived here: a model of the device kept on this side of
+/// the boundary. candle #3831 turned the first of them into a falsehood. The
+/// kernel needs no FP4 tensor cores, so `native_fp4` read true on hardware
+/// that has none, and the name went on promising something the value had
+/// stopped meaning. Describing hardware is candle's job; what belongs here is
+/// only whether the call is reachable from this build.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Nvfp4KernelAvailability {
+    Reachable,
+    #[default]
+    Absent,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Nvfp4AcceleratorCapabilities {
-    pub(crate) native_fp4: bool,
-    pub(crate) runtime_available: bool,
-    pub(crate) compiled_kernels: BTreeSet<Nvfp4KernelKind>,
-}
-
-impl Nvfp4AcceleratorCapabilities {
-    pub(crate) fn fallback_only() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn native_fp4(kernels: impl IntoIterator<Item = Nvfp4KernelKind>) -> Self {
-        Self {
-            native_fp4: true,
-            runtime_available: true,
-            compiled_kernels: kernels.into_iter().collect(),
-        }
-    }
-
-    pub(crate) fn supports_native_nvfp4_matmul(&self) -> bool {
-        self.native_fp4
-            && self.runtime_available
-            && self.compiled_kernels.contains(&Nvfp4KernelKind::Dequantize)
-            && self.compiled_kernels.contains(&Nvfp4KernelKind::Matmul)
-    }
-
-    pub(crate) fn cuda_cutlass() -> Self {
+impl Nvfp4KernelAvailability {
+    /// Ask candle, or answer `Absent` for a build that has no kernel to ask.
+    pub(crate) fn detect() -> Self {
         #[cfg(feature = "nvfp4-cuda")]
         {
-            cuda::Nvfp4CudaBackend::capabilities()
+            cuda::Nvfp4CudaBackend::availability()
         }
         #[cfg(not(feature = "nvfp4-cuda"))]
         {
-            Self::fallback_only()
+            Self::Absent
         }
+    }
+
+    fn is_reachable(self) -> bool {
+        self == Self::Reachable
     }
 }
 
+/// Whether unpacking the checkpoint to dense f32 is an acceptable answer.
+///
+/// Not a hardware question, which is why no probe and no environment variable
+/// decides it. On the host path the dense form *is* the runtime — there is
+/// nothing else for a CPU to multiply. On an accelerator it is a development
+/// tool that costs eight times the packed memory, so it happens only when
+/// someone names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Nvfp4KernelSelectionMode {
-    NativePreferred,
-    NativeRequired,
+pub(crate) enum Nvfp4FallbackPolicy {
+    Permitted,
+    Refused,
+}
+
+/// The opt-in that turns [`Nvfp4FallbackPolicy::Refused`] back into
+/// `Permitted`. Deliberately awkward to reach, and deliberately a single name:
+/// both NVFP4 loaders read this one variable, so there is one switch with one
+/// meaning rather than two knobs pulling against each other.
+pub(crate) const DEQUANTIZED_FALLBACK_ENV: &str = "TACHYON_QWEN35_DEQUANTIZED_FALLBACK";
+
+/// Whether the operator asked for the dense form by name.
+pub(crate) fn dequantized_fallback_opted_in() -> bool {
+    std::env::var(DEQUANTIZED_FALLBACK_ENV).is_ok_and(|value| value == "1")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Nvfp4ExecutionPlan {
-    Native {
-        required_kernels: Vec<Nvfp4KernelKind>,
-    },
+    Native,
     Fallback(Nvfp4FallbackMemoryEstimate),
 }
 
@@ -407,21 +413,24 @@ impl ModelOptNvfp4Directory {
 
     pub(crate) fn select_execution_plan(
         &self,
-        capabilities: &Nvfp4AcceleratorCapabilities,
+        availability: Nvfp4KernelAvailability,
         output_dtype: Nvfp4OutputDType,
         fallback_scope: Nvfp4FallbackScope,
         fallback_limits: Nvfp4FallbackMemoryLimits,
-        mode: Nvfp4KernelSelectionMode,
+        fallback: Nvfp4FallbackPolicy,
     ) -> Result<Nvfp4ExecutionPlan> {
-        if capabilities.supports_native_nvfp4_matmul() {
-            return Ok(Nvfp4ExecutionPlan::Native {
-                required_kernels: vec![Nvfp4KernelKind::Dequantize, Nvfp4KernelKind::Matmul],
-            });
+        if availability.is_reachable() {
+            return Ok(Nvfp4ExecutionPlan::Native);
         }
-        if mode == Nvfp4KernelSelectionMode::NativeRequired {
+        if fallback == Nvfp4FallbackPolicy::Refused {
             return Err(ModelOptNvfp4LoadError::UnsupportedQuantization {
                 alias: self.alias.clone(),
-                detail: "native NVFP4 execution requires FP4-capable hardware, runtime availability, and compiled dequant+matmul kernels".to_owned(),
+                detail: format!(
+                    "an accelerator was requested but this build has no NVFP4 kernel to run on \
+                     it: compile with the `nvfp4-cuda` feature, or set {DEQUANTIZED_FALLBACK_ENV}\
+                     =1 to unpack the weights to dense f32 instead — eight times the packed size, \
+                     which is why it is not what happens by default"
+                ),
             }
             .into());
         }
@@ -2448,33 +2457,25 @@ mod tests {
     }
 
     #[test]
-    fn native_kernel_plan_is_selected_when_capabilities_are_complete() {
+    fn a_reachable_kernel_is_used_even_when_the_fallback_is_permitted() {
         let root = temp_model_dir("modelopt-native-plan");
         write_minimal_modelopt_nvfp4_dir(&root);
         let model = ModelOptNvfp4Directory::try_load("nvfp4", &root)
             .expect("loader should not error")
             .expect("directory should be detected");
-        let capabilities = Nvfp4AcceleratorCapabilities::native_fp4([
-            Nvfp4KernelKind::Dequantize,
-            Nvfp4KernelKind::Matmul,
-        ]);
-
         let plan = model
             .select_execution_plan(
-                &capabilities,
+                Nvfp4KernelAvailability::Reachable,
                 Nvfp4OutputDType::BF16,
                 Nvfp4FallbackScope::LayerWindow(1),
                 Nvfp4FallbackMemoryLimits::default(),
-                Nvfp4KernelSelectionMode::NativePreferred,
+                Nvfp4FallbackPolicy::Permitted,
             )
             .expect("native plan should be selected");
 
-        assert_eq!(
-            plan,
-            Nvfp4ExecutionPlan::Native {
-                required_kernels: vec![Nvfp4KernelKind::Dequantize, Nvfp4KernelKind::Matmul],
-            }
-        );
+        // Reachable wins over a permitted fallback: the dense form is what a
+        // host without the kernel falls back *to*, never a preference.
+        assert_eq!(plan, Nvfp4ExecutionPlan::Native);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2488,14 +2489,14 @@ mod tests {
 
         let plan = model
             .select_execution_plan(
-                &Nvfp4AcceleratorCapabilities::fallback_only(),
+                Nvfp4KernelAvailability::Absent,
                 Nvfp4OutputDType::BF16,
                 Nvfp4FallbackScope::LayerWindow(1),
                 Nvfp4FallbackMemoryLimits {
                     max_host_ram_bytes: Some(1024),
                     max_accelerator_bytes: Some(1024),
                 },
-                Nvfp4KernelSelectionMode::NativePreferred,
+                Nvfp4FallbackPolicy::Permitted,
             )
             .expect("fallback plan should be selected");
 
@@ -2510,7 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn native_required_rejects_missing_kernel_support() {
+    fn a_refused_fallback_rejects_a_build_with_no_kernel() {
         let root = temp_model_dir("modelopt-native-required");
         write_minimal_modelopt_nvfp4_dir(&root);
         let model = ModelOptNvfp4Directory::try_load("nvfp4", &root)
@@ -2519,28 +2520,31 @@ mod tests {
 
         let error = model
             .select_execution_plan(
-                &Nvfp4AcceleratorCapabilities::fallback_only(),
+                Nvfp4KernelAvailability::Absent,
                 Nvfp4OutputDType::BF16,
                 Nvfp4FallbackScope::LayerWindow(1),
                 Nvfp4FallbackMemoryLimits::default(),
-                Nvfp4KernelSelectionMode::NativeRequired,
+                Nvfp4FallbackPolicy::Refused,
             )
-            .expect_err("native-required should reject missing kernels");
+            .expect_err("a refused fallback should reject a build with no kernel");
 
-        assert!(error
-            .to_string()
-            .contains("native NVFP4 execution requires"));
+        // The message has to name both ways out, because neither is guessable
+        // from the failure: rebuild with the feature, or ask for the dense
+        // form by name.
+        let error = error.to_string();
+        assert!(error.contains("no NVFP4 kernel"), "{error}");
+        assert!(error.contains("nvfp4-cuda"), "{error}");
+        assert!(error.contains(DEQUANTIZED_FALLBACK_ENV), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(not(feature = "nvfp4-cuda"))]
     #[test]
-    fn cuda_cutlass_capability_is_unavailable_without_feature() {
-        let capabilities = Nvfp4AcceleratorCapabilities::cuda_cutlass();
-
-        assert!(!capabilities.native_fp4);
-        assert!(!capabilities.runtime_available);
-        assert!(capabilities.compiled_kernels.is_empty());
+    fn a_build_without_the_kernel_feature_reports_it_absent() {
+        assert_eq!(
+            Nvfp4KernelAvailability::detect(),
+            Nvfp4KernelAvailability::Absent
+        );
     }
 
     #[test]

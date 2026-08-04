@@ -32,17 +32,28 @@ Production limits are configured in bytes:
 
 - `TACHYON_NVFP4_MAX_HOST_RAM_BYTES`
 - `TACHYON_NVFP4_MAX_ACCELERATOR_BYTES`
-- `TACHYON_NVFP4_NATIVE_REQUIRED=1` to reject fallback
 
-## Native Kernel Requirements
+## Which path runs
 
-Native NVFP4 execution is capability-gated. A backend must report:
+Two things decide it, and neither is a probe of the device.
 
-- FP4-capable accelerator hardware
-- Runtime availability for the accelerator stack
-- Compiled NVFP4 dequant and matmul kernels
+The route says where the work happens. A `cpu` route is the dense path by
+definition — unpacking is the only thing a host has to multiply — so it needs
+no permission. A `gpu` route is a claim that the accelerator does the work, and
+a build that cannot make good on it fails to load rather than serving the same
+tokens off the wrong device.
 
-Without all three, Tachyon selects the BF16/F32 fallback when allowed by memory limits, or returns an unsupported native-execution error when native execution is required.
+Whether the kernel is reachable is candle's answer, not ours: the `nvfp4-cuda`
+feature must be compiled in and `candle-nvfp4-kernels` must report a usable
+device. Tachyon used to keep its own model of this — an FP4-hardware flag, a
+runtime-availability flag, a set of compiled kernel kinds — and candle #3831
+made the first of them false in practice by removing the compute-capability
+floor the kernel never needed. Hardware requirements belong to the kernel that
+has them; anything mirrored here goes stale the next time upstream moves.
+
+`TACHYON_QWEN35_DEQUANTIZED_FALLBACK=1` turns a refused GPU route back into the
+dense path. It costs eight times the packed memory, it is a development tool
+rather than a deployment mode, and it is the only switch involved.
 
 ## CUDA/CUTLASS Build
 

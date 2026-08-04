@@ -538,7 +538,6 @@ jobs:
         if: env.RENOVATE_PR != 'true'
         env:
           TACHYON_NVFP4_CUDA_SMOKE: "1"
-          TACHYON_NVFP4_NATIVE_REQUIRED: "1"
         run: cargo test -p core-host --features "candle-cuda nvfp4-cuda" nvfp4_cuda -- --nocapture
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────

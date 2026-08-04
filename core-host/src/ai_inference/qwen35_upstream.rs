@@ -14,13 +14,13 @@
 //!
 //! ## Why the scalar runtime is still here
 //!
-//! A resident NVFP4 operator needs a CUDA device that can execute FP4. Where
-//! there is none — every CPU box, and today every CI runner — this loader
-//! refuses rather than silently dequantizing a mixture-of-experts checkpoint to
-//! f32, which would be eight times the packed size and would fit nowhere. The
-//! scalar runtime stays as that host fallback. It is a second implementation of
-//! one architecture and it will drift; it should be deleted once the GPU
-//! pipeline actually runs.
+//! A resident NVFP4 operator needs a CUDA device — any of them, since candle
+//! #3831; FP4 tensor cores were never part of it. Where there is none, every
+//! CPU box included, this loader refuses rather than silently dequantizing a
+//! mixture-of-experts checkpoint to f32, which would be eight times the packed
+//! size and would fit nowhere. The scalar runtime stays as that host fallback.
+//! It is a second implementation of one architecture and it will drift; it
+//! should be deleted once the GPU pipeline actually runs.
 
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device};
@@ -30,7 +30,10 @@ use candle_transformers::models::qwen3_5::{
     TextConfig,
 };
 
-use super::modelopt_nvfp4::{ModelOptLinearTensors, ModelOptNvfp4Directory};
+use super::modelopt_nvfp4::{
+    dequantized_fallback_opted_in, ModelOptLinearTensors, ModelOptNvfp4Directory,
+    DEQUANTIZED_FALLBACK_ENV,
+};
 use super::qwen35_moe_runtime::{LayerType, Qwen35MoeConfig};
 
 /// Translate our validated checkpoint config into upstream's.
@@ -131,10 +134,6 @@ pub(crate) enum WeightResidency {
     DequantizedF32,
 }
 
-/// The opt-in for the dequantized form. Off by default and deliberately
-/// awkward to reach: it is a development tool, not a deployment mode.
-const DEQUANTIZED_FALLBACK_ENV: &str = "TACHYON_QWEN35_DEQUANTIZED_FALLBACK";
-
 /// Decide how this host will hold the weights, or refuse.
 ///
 /// `native` is whether the NVFP4 kernel is reachable at all. It used to mean a
@@ -169,10 +168,6 @@ pub(crate) fn residency(
          f32 instead — eight times the memory of the packed checkpoint, which is why it is \
          not the default"
     )
-}
-
-fn fallback_opted_in() -> bool {
-    std::env::var(DEQUANTIZED_FALLBACK_ENV).is_ok_and(|value| value == "1")
 }
 
 /// Build the projection named `path`, or explain why this host cannot.
@@ -254,7 +249,7 @@ pub(crate) fn load(
     // dequantized form is the only one on offer — and still only on request.
     #[cfg(not(feature = "nvfp4-cuda"))]
     let native = false;
-    let residency = residency(device.is_cuda(), native, fallback_opted_in())?;
+    let residency = residency(device.is_cuda(), native, dequantized_fallback_opted_in())?;
     if residency == WeightResidency::DequantizedF32 {
         tracing::warn!(
             alias = model.alias(),

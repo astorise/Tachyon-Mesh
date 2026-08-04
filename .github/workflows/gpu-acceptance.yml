@@ -140,11 +140,14 @@ jobs:
             --features candle-cuda,nvfp4-cuda \
             gated_upstream_layers_agree_with_the_scalar_runtime -- --nocapture
 
+      # `gated_a_gpu_route_runs_the_kernel_or_refuses_to_load` is the one that
+      # makes this step mean something: it asks for the accelerator and fails
+      # if the load answers with the host path. The refusal used to be bought
+      # with `TACHYON_NVFP4_NATIVE_REQUIRED=1` here, which asked about hardware
+      # from outside the process and — because every other test in this filter
+      # requests `cpu` — would have refused the whole step rather than
+      # sharpening it.
       - name: Native NVFP4 execution
-        env:
-          # Fail rather than fall back: a silent drop to the scalar path would
-          # pass while exercising nothing that needs a GPU.
-          TACHYON_NVFP4_NATIVE_REQUIRED: "1"
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda,nvfp4-cuda \

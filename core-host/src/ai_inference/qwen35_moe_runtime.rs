@@ -21,9 +21,9 @@ use super::{
         HOST_MAX_GENERATION_DEADLINE, HOST_MAX_NEW_TOKENS,
     },
     modelopt_nvfp4::{
-        ModelOptLinearTensors, ModelOptNvfp4Directory, Nvfp4AcceleratorCapabilities,
-        Nvfp4ExecutionPlan, Nvfp4FallbackMemoryLimits, Nvfp4FallbackScope,
-        Nvfp4KernelSelectionMode, Nvfp4OutputDType, PreparedLinear, SafetensorsDType,
+        dequantized_fallback_opted_in, ModelOptLinearTensors, ModelOptNvfp4Directory,
+        Nvfp4ExecutionPlan, Nvfp4FallbackMemoryLimits, Nvfp4FallbackPolicy, Nvfp4FallbackScope,
+        Nvfp4KernelAvailability, Nvfp4OutputDType, PreparedLinear, SafetensorsDType,
         NVFP4_BLOCK_SIZE,
     },
     StreamControl,
@@ -559,25 +559,40 @@ impl Qwen35MoeRuntime {
             max_host_ram_bytes: env_u64("TACHYON_NVFP4_MAX_HOST_RAM_BYTES"),
             max_accelerator_bytes: env_u64("TACHYON_NVFP4_MAX_ACCELERATOR_BYTES"),
         };
-        let mode = if std::env::var("TACHYON_NVFP4_NATIVE_REQUIRED").as_deref() == Ok("1") {
-            Nvfp4KernelSelectionMode::NativeRequired
+        // Which of the two paths runs is settled by what the caller asked for
+        // and what candle can reach — not by a probe of the device, and no
+        // longer by an environment variable naming one.
+        //
+        // A `cpu` route is the dense path by definition: unpacking is the only
+        // thing a host has to multiply, so it needs no permission. A `gpu`
+        // route is a statement that the accelerator will do the work, and a
+        // build that cannot make good on it fails to load rather than quietly
+        // serving the same tokens eight times slower off the wrong device.
+        // That refusal is what `TACHYON_NVFP4_NATIVE_REQUIRED=1` used to buy,
+        // except it bought it by asking about hardware; asking for a GPU says
+        // the same thing and is the caller's own words.
+        let (availability, fallback) = if requested_device == "gpu" {
+            let fallback = if dequantized_fallback_opted_in() {
+                Nvfp4FallbackPolicy::Permitted
+            } else {
+                Nvfp4FallbackPolicy::Refused
+            };
+            (Nvfp4KernelAvailability::detect(), fallback)
         } else {
-            Nvfp4KernelSelectionMode::NativePreferred
-        };
-        let capabilities = if requested_device == "gpu" {
-            Nvfp4AcceleratorCapabilities::cuda_cutlass()
-        } else {
-            Nvfp4AcceleratorCapabilities::fallback_only()
+            (
+                Nvfp4KernelAvailability::Absent,
+                Nvfp4FallbackPolicy::Permitted,
+            )
         };
         let execution_plan = model.select_execution_plan(
-            &capabilities,
+            availability,
             Nvfp4OutputDType::F32,
             Nvfp4FallbackScope::LayerWindow(1),
             fallback_limits,
-            mode,
+            fallback,
         )?;
         let executed_on = match (&execution_plan, requested_device) {
-            (Nvfp4ExecutionPlan::Native { .. }, _) => "gpu_native_fp4",
+            (Nvfp4ExecutionPlan::Native, _) => "gpu_native_fp4",
             (Nvfp4ExecutionPlan::Fallback(_), "gpu") => "gpu_fallback",
             (Nvfp4ExecutionPlan::Fallback(_), _) => "cpu_fallback",
         };
@@ -1168,7 +1183,7 @@ impl Qwen35MoeRuntime {
     fn linear_batch(&self, base: &str, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
         let prepared = self.prepared_linear(base)?;
         match &self.execution_plan {
-            Nvfp4ExecutionPlan::Native { .. } => prepared.matmul_native_nvfp4(inputs, tokens),
+            Nvfp4ExecutionPlan::Native => prepared.matmul_native_nvfp4(inputs, tokens),
             Nvfp4ExecutionPlan::Fallback(_) => prepared.matmul(inputs, tokens),
         }
         .with_context(|| format!("Qwen operator `{base}` failed"))
@@ -1201,7 +1216,7 @@ impl Qwen35MoeRuntime {
     fn linear(&self, base: &str, input: &[f32]) -> Result<Vec<f32>> {
         let prepared = self.prepared_linear(base)?;
         match &self.execution_plan {
-            Nvfp4ExecutionPlan::Native { .. } => prepared.matvec_native_nvfp4(input),
+            Nvfp4ExecutionPlan::Native => prepared.matvec_native_nvfp4(input),
             Nvfp4ExecutionPlan::Fallback(_) => prepared.matvec(input),
         }
         .with_context(|| format!("Qwen operator `{base}` failed"))
@@ -1479,6 +1494,48 @@ mod tests {
         assert_eq!(runtime.config.num_hidden_layers, 40);
         assert_eq!(runtime.config.num_experts, 256);
         assert!(runtime.chat_template.is_some());
+    }
+
+    /// A GPU route runs the kernel or it does not load.
+    ///
+    /// This is the property `TACHYON_NVFP4_NATIVE_REQUIRED=1` was buying, and
+    /// it was buying it in the wrong currency: an environment variable about
+    /// hardware, set by whoever remembered to. It belongs to the loader.
+    /// Asking for an accelerator is a claim about where the work happens, so
+    /// either the packed path runs or the load fails — never a silent descent
+    /// to the host path, which would answer with the same tokens and none of
+    /// the meaning.
+    ///
+    /// Both halves are asserted because both are reachable: a build with the
+    /// kernel must reach it, and a build without one must refuse rather than
+    /// fall back. Skipped only where candle reports no CUDA device — that is
+    /// the hardware speaking, and it is the sole excuse this test accepts.
+    #[test]
+    fn gated_a_gpu_route_runs_the_kernel_or_refuses_to_load() {
+        let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
+            return;
+        };
+        if candle_core::Device::new_cuda(0).is_err() {
+            eprintln!("skipping GPU-route selection: no CUDA device");
+            return;
+        }
+
+        let loaded = Qwen35MoeRuntime::try_load("qwen35-gpu-route", &path, "gpu");
+
+        if cfg!(feature = "nvfp4-cuda") {
+            let runtime = loaded
+                .expect("a GPU route must load where the kernel is reachable")
+                .expect("checkpoint should select the Qwen runtime");
+            assert_eq!(runtime.executed_on(), "gpu_native_fp4");
+        } else {
+            let Err(error) = loaded else {
+                panic!("a build with no kernel must refuse a GPU route, not load one");
+            };
+            assert!(
+                error.to_string().contains("no NVFP4 kernel"),
+                "the refusal should name the missing kernel, got: {error}"
+            );
+        }
     }
 
     /// Chunk size must not change the answer.
