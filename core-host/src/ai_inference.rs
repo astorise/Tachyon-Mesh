@@ -20,6 +20,7 @@ pub(crate) mod parallel;
 pub(crate) mod pipeline_parallel_llama;
 #[path = "ai_inference/qwen35_moe_runtime.rs"]
 mod qwen35_moe_runtime;
+mod qwen35_upstream;
 #[path = "ai_inference/samplers.rs"]
 mod samplers;
 #[path = "ai_inference/tensor_parallel_llama.rs"]

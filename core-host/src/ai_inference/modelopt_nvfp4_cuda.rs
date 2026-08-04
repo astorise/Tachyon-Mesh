@@ -67,6 +67,27 @@ impl Nvfp4DeviceLinear {
         rows: usize,
         cols: usize,
     ) -> Option<Self> {
+        Self::upload_on(
+            device()?,
+            packed_weight,
+            weight_scale_e4m3,
+            tensor_scale,
+            rows,
+            cols,
+        )
+    }
+
+    /// The same, onto a device the caller names — so an operator lands on the
+    /// device its activations already live on, rather than on whichever one
+    /// this process opened first.
+    pub(crate) fn upload_on(
+        device: &Device,
+        packed_weight: &[u8],
+        weight_scale_e4m3: &[u8],
+        tensor_scale: f32,
+        rows: usize,
+        cols: usize,
+    ) -> Option<Self> {
         if !Nvfp4CudaBackend::is_available() {
             return None;
         }
@@ -76,20 +97,32 @@ impl Nvfp4DeviceLinear {
             tensor_scale,
             rows,
             cols,
-            device()?,
+            device,
         )
         .ok()?;
         Some(Self { inner, cols })
     }
 
-    /// `tokens` activations through the resident operator. Only the
-    /// activations cross the bus.
+    /// The operator applied to a tensor already on the device.
+    ///
+    /// The entry point that costs nothing: no staging in, no staging out. A
+    /// caller whose activations are tensors should never reach for
+    /// [`Self::matmul`].
+    pub(crate) fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        self.inner.forward(xs)
+    }
+
+    /// `tokens` host activations through the resident operator.
+    ///
+    /// For the scalar runtime, which holds its state in `Vec<f32>`: the weight
+    /// stays resident but the activations still cross the bus twice. That is
+    /// the cost of a host-side model, and it is why this exists beside
+    /// [`Self::forward`] rather than instead of it.
     pub(crate) fn matmul(&self, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
         let device = device().ok_or_else(|| anyhow!("NVFP4 CUDA device is no longer available"))?;
         let inputs = Tensor::from_slice(inputs, (tokens, self.cols), device)
             .map_err(|error| anyhow!("NVFP4 activation upload failed: {error}"))?;
-        self.inner
-            .forward(&inputs)
+        self.forward(&inputs)
             .and_then(|output| output.flatten_all()?.to_vec1::<f32>())
             .map_err(|error| anyhow!("NVFP4 CUDA resident linear failed: {error}"))
     }

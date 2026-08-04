@@ -212,6 +212,12 @@ impl ModelOptNvfp4Directory {
         &self.root
     }
 
+    /// The checkpoint's shard files, for a loader that maps the whole thing
+    /// rather than reading tensors individually.
+    pub(crate) fn shard_paths(&self) -> Vec<PathBuf> {
+        self.shard_index.shard_paths(&self.root)
+    }
+
     pub(crate) fn quantization(&self) -> &ModelOptNvfp4QuantizationLayout {
         &self.quantization
     }
@@ -567,6 +573,12 @@ impl SafetensorsShardIndex {
 
     pub(crate) fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    /// Every shard file, in index order. What a `VarBuilder` needs to mmap the
+    /// checkpoint whole, as opposed to reading one tensor at a time.
+    pub(crate) fn shard_paths(&self, root: &Path) -> Vec<PathBuf> {
+        self.shards.iter().map(|shard| root.join(shard)).collect()
     }
 
     pub(crate) fn has_tensor_suffix(&self, suffix: &str) -> bool {
@@ -1782,7 +1794,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits(value)
 }
 
-fn read_scalar_f32(tensor: &SafetensorsTensorRef) -> Result<f32> {
+pub(crate) fn read_scalar_f32(tensor: &SafetensorsTensorRef) -> Result<f32> {
     let values = tensor.read_f32()?;
     if values.len() != 1 {
         bail!(
