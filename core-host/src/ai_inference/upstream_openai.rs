@@ -438,6 +438,85 @@ pub(crate) struct UpstreamOpenAiRuntime {
     client: reqwest::blocking::Client,
 }
 
+/// How long a silent upstream is given before this side re-checks that anyone
+/// is still listening. Short enough that an abandoned request frees its
+/// admission permit promptly, long enough that a busy stream is not paying for
+/// a wakeup per frame.
+const SSE_LIVENESS_POLL: Duration = Duration::from_millis(250);
+
+/// What one poll of the reader thread found.
+enum SseRead {
+    Line(String),
+    /// Nothing within the poll window — the upstream is thinking, not gone.
+    Idle,
+    Eof,
+    Failed(String),
+}
+
+/// Reads SSE lines on a dedicated thread so the caller can keep answering for
+/// itself while a blocking read is in flight.
+struct SseLineReader {
+    lines: std::sync::mpsc::Receiver<Result<String, String>>,
+}
+
+impl SseLineReader {
+    fn spawn<R: std::io::Read + Send + 'static>(mut reader: std::io::BufReader<R>) -> Self {
+        // Depth one: the reader stays one line ahead and then parks. Buffering
+        // more would let a fast upstream race ahead of a consumer that has
+        // already gone away, which is the situation this whole seam exists to
+        // end early.
+        let (tx, lines) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("tachyon-upstream-sse".to_owned())
+            .spawn(move || {
+                loop {
+                    let mut line = String::new();
+                    // Bound the *read*, not just the result. A plain
+                    // `read_line` grows its buffer until a newline, so an
+                    // upstream that never sends one could force allocation all
+                    // the way to `MAX_STREAM_BYTES` before any size check ran —
+                    // and several concurrent streams would multiply that.
+                    let read = std::io::Read::take(
+                        std::io::Read::by_ref(&mut reader),
+                        MAX_SSE_FRAME_BYTES as u64 + 1,
+                    )
+                    .read_line(&mut line);
+                    let message = match read {
+                        Ok(0) => return,
+                        Ok(_) => Ok(line),
+                        Err(error) => {
+                            let _ = tx
+                                .send(Err(format!("failed to read the upstream stream: {error}")));
+                            return;
+                        }
+                    };
+                    // A closed receiver means the caller has stopped caring.
+                    // Returning drops the response, which closes the socket.
+                    if tx.send(message).is_err() {
+                        return;
+                    }
+                }
+            })
+            // A host that cannot spawn is already failing; report it as an
+            // empty stream rather than panicking inside a request.
+            .map_or_else(
+                |_| Self {
+                    lines: std::sync::mpsc::channel().1,
+                },
+                |_handle| Self { lines },
+            )
+    }
+
+    fn next_line(&mut self, poll: Duration) -> SseRead {
+        match self.lines.recv_timeout(poll) {
+            Ok(Ok(line)) => SseRead::Line(line),
+            Ok(Err(detail)) => SseRead::Failed(detail),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => SseRead::Idle,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => SseRead::Eof,
+        }
+    }
+}
+
 impl UpstreamOpenAiRuntime {
     /// Claim a binding whose `path` uses the `openai:` scheme.
     ///
@@ -803,7 +882,25 @@ impl UpstreamOpenAiRuntime {
 
         // Bound the whole stream, so an upstream that never terminates cannot
         // grow the reader without limit.
-        let mut reader = std::io::BufReader::new(std::io::Read::take(response, MAX_STREAM_BYTES));
+        let reader = std::io::BufReader::new(std::io::Read::take(response, MAX_STREAM_BYTES));
+        // Read on its own thread so this loop can answer for itself while the
+        // upstream says nothing.
+        //
+        // `read_line` is uninterruptible, and a stream's cancellation signal
+        // only ever arrived through `sink`'s return value — which needs a frame
+        // to have landed first. A client that disconnected while the upstream
+        // was still thinking therefore went unnoticed until the request
+        // timeout, up to an hour, with the admission permit held the whole
+        // time; thirty-two of those exhaust the node's upstream capacity.
+        // reqwest's blocking client has no per-read timeout to lean on, so the
+        // blocking read moves off this thread and the poll below asks
+        // `is_live()` between frames instead.
+        //
+        // The reader is bounded by the admission permit that is already held
+        // here, so this adds no thread a burst could multiply. It ends when the
+        // receiver drops: the send fails, the response is dropped, the socket
+        // closes.
+        let mut lines = SseLineReader::spawn(reader);
         let mut line = String::new();
         let mut saw_done = false;
         let mut usage = None;
@@ -816,24 +913,32 @@ impl UpstreamOpenAiRuntime {
         let mut streamed_tool_calls = StreamedToolCalls::default();
         loop {
             line.clear();
-            // Bound the *read*, not just the result. A plain `read_line` grows
-            // its buffer until a newline, so an upstream that never sends one
-            // could force allocation all the way to `MAX_STREAM_BYTES` before
-            // any size check ran — and several concurrent streams would
-            // multiply that.
-            let read = std::io::Read::take(
-                std::io::Read::by_ref(&mut reader),
-                MAX_SSE_FRAME_BYTES as u64 + 1,
-            )
-            .read_line(&mut line)
-            .map_err(|error| UpstreamError::Transport {
-                alias: self.alias.clone(),
-                endpoint: self.endpoint.url("/chat/completions"),
-                detail: format!("failed to read the upstream stream: {error}"),
-            })?;
-            if read == 0 {
+            let next = loop {
+                match lines.next_line(SSE_LIVENESS_POLL) {
+                    SseRead::Line(line) => break Some(line),
+                    SseRead::Eof => break None,
+                    SseRead::Failed(detail) => {
+                        return Err(UpstreamError::Transport {
+                            alias: self.alias.clone(),
+                            endpoint: self.endpoint.url("/chat/completions"),
+                            detail,
+                        })
+                    }
+                    // Nothing yet. The only question worth asking while an
+                    // upstream is silent is whether anyone is still waiting for
+                    // it.
+                    SseRead::Idle => {
+                        if !sink.is_live() {
+                            abandoned = true;
+                            break None;
+                        }
+                    }
+                }
+            };
+            let Some(next) = next else {
                 break;
-            }
+            };
+            line.push_str(&next);
             if line.len() > MAX_SSE_FRAME_BYTES {
                 return Err(UpstreamError::MalformedResponse {
                     alias: self.alias.clone(),
@@ -1869,6 +1974,72 @@ mod tests {
             "unexpected request line: {target}"
         );
         assert_eq!(body["input"], "hello");
+    }
+
+    /// A silent upstream must not hold the permit once nobody is listening.
+    ///
+    /// The regression this guards is the one `sink`-based cancellation could
+    /// not see: the client goes away *before* the first frame, so no callback
+    /// ever runs to report it. Before the reader moved off this thread, the
+    /// blocking `read_line` sat here until the request timeout with the
+    /// admission permit held; thirty-two of those take the node's upstream
+    /// capacity out of service. The server here sends headers and then says
+    /// nothing at all, which is exactly the shape that used to hang.
+    #[test]
+    fn a_silent_upstream_is_abandoned_once_the_client_has_gone() {
+        struct DeadSink;
+        impl StreamSink for DeadSink {
+            fn emit(&mut self, _event: StreamEvent<'_>) -> StreamControl {
+                panic!("a silent upstream produces no event to emit")
+            }
+            fn is_live(&mut self) -> bool {
+                false
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        // Holds the connection open, headers sent, body never written.
+        // Detached and parked on `accept`, so the test never joins it.
+        //
+        // The readiness signal is not ceremony: under the full suite this
+        // thread can go unscheduled long enough for the client to give up
+        // waiting for headers, which fails the test for a reason that has
+        // nothing to do with what it checks. Waiting until it is demonstrably
+        // about to accept removes that race.
+        let (listening, ready) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = listening.send(());
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        ready
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the fixture server should reach its accept loop");
+
+        let backend = runtime("coder", &format!("{UPSTREAM_SCHEME}{base_url}"));
+        let started = std::time::Instant::now();
+        let result = backend.generate_streaming(&[b"hi"], &mut DeadSink);
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "abandoning for a departed client is the intended outcome, not a failure: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the read must give up on the poll interval, not on the request timeout; took {elapsed:?}"
+        );
     }
 
     #[test]
