@@ -78,10 +78,13 @@ pub(crate) struct Nvfp4FallbackMemoryLimits {
 /// that has none, and the name went on promising something the value had
 /// stopped meaning. Describing hardware is candle's job; what belongs here is
 /// only whether the call is reachable from this build.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Deliberately not `Default`. The struct this replaced defaulted to "no
+/// kernel" so that `fallback_only()` could be `Self::default()`, and a default
+/// here would let a caller obtain an answer without asking anyone — which is
+/// the habit the whole change is against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Nvfp4KernelAvailability {
     Reachable,
-    #[default]
     Absent,
 }
 
