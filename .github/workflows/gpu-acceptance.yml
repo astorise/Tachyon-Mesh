@@ -123,6 +123,15 @@ jobs:
             --features candle-cuda,nvfp4-cuda \
             gated_prefill_is_invariant_to_chunk_size -- --nocapture
 
+      # The proof that decides whether `qwen35_moe_runtime.rs` can be deleted.
+      # It needs a checkpoint and a device that executes FP4, so this runner is
+      # the only place it is anything but a compile.
+      - name: Upstream layers match the scalar runtime
+        run: |
+          cargo test -p core-host --bin core-host \
+            --features candle-cuda,nvfp4-cuda \
+            gated_upstream_layers_agree_with_the_scalar_runtime -- --nocapture
+
       - name: Native NVFP4 execution
         env:
           # Fail rather than fall back: a silent drop to the scalar path would

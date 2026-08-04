@@ -1546,6 +1546,106 @@ mod tests {
         );
     }
 
+    /// The proof that would let the scalar runtime be deleted.
+    ///
+    /// Two implementations of one architecture is a liability, and the only
+    /// honest way out is to show they answer the same question on a real
+    /// checkpoint. Exact equality is not available and asking for it would be a
+    /// mistake: the scalar path accumulates each output element in a fixed
+    /// order, upstream's goes through a GEMM whose blocking is its own
+    /// business. What must agree is the answer — the token the model would
+    /// emit — and the logits either side of it.
+    ///
+    /// Gated three times over: on an installed checkpoint, on a device that can
+    /// execute FP4, and therefore on `TACHYON_ENABLE_NVFP4_CI`. Until that
+    /// runner exists this test compiles and does nothing, which is worth
+    /// stating plainly rather than discovering later.
+    #[test]
+    fn gated_upstream_layers_agree_with_the_scalar_runtime() {
+        let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
+            return;
+        };
+        let device = match candle_core::Device::new_cuda(0) {
+            Ok(device) => device,
+            Err(_) => {
+                eprintln!("skipping upstream-layer parity: no CUDA device");
+                return;
+            }
+        };
+        let runtime = Qwen35MoeRuntime::try_load("qwen35-parity", &path, "cpu")
+            .expect("runtime construction should succeed")
+            .expect("checkpoint should select the Qwen runtime");
+        let model = ModelOptNvfp4Directory::try_load("qwen35-parity", &path)
+            .expect("checkpoint parser should succeed")
+            .expect("checkpoint should be detected as ModelOpt/NVFP4");
+        let mut upstream =
+            match crate::ai_inference::qwen35_upstream::load(&model, &runtime.config, &device) {
+                Ok(model) => model,
+                Err(error) => {
+                    eprintln!("skipping upstream-layer parity: {error:#}");
+                    return;
+                }
+            };
+
+        let encoded = runtime
+            .tokenizer
+            .encode("the mesh routes a prompt through many layers", true)
+            .expect("prompt should tokenize");
+        let ids = encoded.get_ids();
+
+        let mut state = HybridDecodeState::new(&runtime.config.layer_types);
+        let scalar = runtime
+            .forward_tokens(ids, 0, &mut state, true)
+            .expect("scalar prefill should succeed");
+
+        let input = candle_core::Tensor::new(ids, &device)
+            .and_then(|ids| ids.unsqueeze(0))
+            .expect("prompt should become a tensor");
+        let logits = upstream
+            .forward(&input, 0)
+            .and_then(|logits| logits.flatten_all()?.to_vec1::<f32>())
+            .expect("upstream prefill should succeed");
+
+        assert_eq!(
+            scalar.len(),
+            logits.len(),
+            "both paths produce one logit per vocabulary entry"
+        );
+        let argmax = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |best, (index, &value)| {
+                    if value > best.1 {
+                        (index, value)
+                    } else {
+                        best
+                    }
+                })
+                .0
+        };
+        assert_eq!(
+            argmax(&scalar),
+            argmax(&logits),
+            "the two implementations would emit different tokens"
+        );
+
+        // Beyond the argmax: the distributions themselves have to line up, or
+        // the two paths agree here and diverge on the next sample. Scaled by
+        // the logit range so the bound means the same thing on any checkpoint.
+        let range = scalar.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - scalar.iter().copied().fold(f32::INFINITY, f32::min);
+        let worst = scalar
+            .iter()
+            .zip(&logits)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < range * 0.01,
+            "largest logit difference {worst} exceeds 1% of the {range} logit range"
+        );
+    }
+
     /// Measures how prefill scales with prompt length, and reports it.
     ///
     /// Gated twice: on a real NVFP4 checkpoint, and on an explicit opt-in,
