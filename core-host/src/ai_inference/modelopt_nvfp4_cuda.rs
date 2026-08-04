@@ -118,33 +118,17 @@ impl Nvfp4CudaBackend {
         }
     }
 
-    /// One activation vector through one NVFP4 operator.
-    pub(crate) fn linear_f32_host(
-        input: &[f32],
-        packed_weight: &[u8],
-        weight_scale_e4m3: &[u8],
-        tensor_scale: f32,
-        rows: usize,
-        cols: usize,
-    ) -> Result<Vec<f32>> {
-        candle_nvfp4_kernels::linear_f32_host(
-            input,
-            packed_weight,
-            weight_scale_e4m3,
-            tensor_scale,
-            rows,
-            cols,
-        )
-        .map_err(|error| anyhow!("NVFP4 CUDA linear failed: {error}"))
-    }
-
     /// `tokens` activations through one NVFP4 operator, in a single launch.
     ///
-    /// This is the entry point that makes batching worth anything on a GPU.
-    /// Before it existed the caller looped [`Self::linear_f32_host`], so a
-    /// 1024-token prefill launched 1024 kernels per operator and re-read the
-    /// weight each time — the batched host path upstream of this was doing
-    /// real work and then handing it to a per-token kernel.
+    /// The last host-staging path, and the one every native call falls back to
+    /// when the operator could not be made resident. It re-sends the weight on
+    /// every call; that is the price of not holding device memory, and it is
+    /// why [`Nvfp4DeviceLinear`] exists above it.
+    ///
+    /// There is deliberately no single-activation sibling: one token is this
+    /// with `tokens = 1`, and a separate entry point is an invitation to reach
+    /// for the slow one by accident — which is exactly what the runtime used to
+    /// do, launching a kernel per token through a whole prefill.
     pub(crate) fn linear_f32_host_batched(
         inputs: &[f32],
         packed_weight: &[u8],
