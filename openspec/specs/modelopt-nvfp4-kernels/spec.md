@@ -65,23 +65,29 @@ The runtime SHALL execute packed NVFP4 weights through native kernels only when 
 - **THEN** the runtime uses the bounded fallback only when configured memory limits permit it
 - **AND** otherwise returns a typed unsupported-execution error
 
-### Requirement: CUDA/CUTLASS NVFP4 backend MUST be feature-gated
-The runtime SHALL expose a concrete CUDA/CUTLASS native backend only when the `nvfp4-cuda` feature is enabled and the build has CUDA/CUTLASS inputs.
+### Requirement: Native NVFP4 execution MUST be gated by `candle-cuda` alone
+The NVFP4 kernel crate SHALL be linked by `ai-inference` unconditionally, and
+`candle-cuda` SHALL be the only Cargo feature that decides whether it is
+compiled with CUDA support. Tachyon SHALL NOT carry a second feature, an
+environment variable, or a capability record describing what a device can
+execute; native availability SHALL be whatever `candle-nvfp4-kernels` reports.
 
 #### Scenario: Standard build does not require CUDA
-- **WHEN** `nvfp4-cuda` is not enabled
+- **WHEN** `ai-inference` is enabled without `candle-cuda`
 - **THEN** Tachyon builds and tests without CUDA, NVCC, or CUTLASS headers
+- **AND** the NVFP4 code path is compiled, with no `cfg` arm stubbing it out
 - **AND** native NVFP4 capability is reported unavailable
 
-#### Scenario: Feature-only build does not require CUDA inputs
-- **WHEN** `nvfp4-cuda` is enabled without CUDA toolkit or CUTLASS include paths
-- **THEN** Tachyon builds the Rust NVFP4 capability layer without compiling native CUDA kernels
-- **AND** native NVFP4 capability is reported unavailable
+#### Scenario: CUDA build exposes native kernels
+- **WHEN** `candle-cuda` is enabled with a CUDA toolchain
+- **THEN** the build compiles `candle-nvfp4-kernels` with its `cuda` feature
+- **AND** native availability is decided at runtime by the kernel crate, on
+  any CUDA device rather than a minimum compute capability
 
-#### Scenario: CUDA/CUTLASS build exposes native kernels
-- **WHEN** `nvfp4-cuda` is enabled with CUDA toolkit and CUTLASS include paths
-- **THEN** the build compiles the native NVFP4 CUDA source
-- **AND** runtime capability checks can report compiled dequant and matmul kernels
+#### Scenario: No hardware description is kept on the Tachyon side
+- **WHEN** a reader looks for what decides native execution
+- **THEN** they find one call into `candle-nvfp4-kernels` and no local record
+  of FP4 hardware support, runtime availability, or compiled kernel kinds
 
 ### Requirement: Mixed FP8 and NVFP4 operators MUST compose in one forward graph
 

@@ -123,7 +123,7 @@ jobs:
       - name: Prefill chunking equivalence
         run: |
           cargo test -p core-host --bin core-host \
-            --features candle-cuda,nvfp4-cuda \
+            --features candle-cuda \
             gated_prefill_is_invariant_to_chunk_size -- --nocapture
 
       # The proof that decides whether `qwen35_moe_runtime.rs` can be deleted.
@@ -137,7 +137,7 @@ jobs:
       - name: Upstream layers match the scalar runtime
         run: |
           cargo test -p core-host --bin core-host \
-            --features candle-cuda,nvfp4-cuda \
+            --features candle-cuda \
             gated_upstream_layers_agree_with_the_scalar_runtime -- --nocapture
 
       # `gated_a_gpu_route_runs_the_kernel_or_refuses_to_load` is the one that
@@ -150,7 +150,7 @@ jobs:
       - name: Native NVFP4 execution
         run: |
           cargo test -p core-host --bin core-host \
-            --features candle-cuda,nvfp4-cuda \
+            --features candle-cuda \
             qwen35_moe_runtime::tests::gated_ -- --nocapture
 
       # Reported, not gated on a threshold: absolute throughput belongs to the
@@ -161,5 +161,5 @@ jobs:
           TACHYON_QWEN35_PREFILL_BENCH: "1"
         run: |
           cargo test -p core-host --bin core-host \
-            --features candle-cuda,nvfp4-cuda \
+            --features candle-cuda \
             gated_prefill_scaling -- --nocapture

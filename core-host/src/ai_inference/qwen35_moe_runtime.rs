@@ -1506,8 +1506,9 @@ mod tests {
     /// to the host path, which would answer with the same tokens and none of
     /// the meaning.
     ///
-    /// Both halves are asserted because both are reachable: a build with the
-    /// kernel must reach it, and a build without one must refuse rather than
+    /// Both halves are asserted because both are reachable. `candle-cuda` is
+    /// what compiles CUDA support into the kernel crate, so with it the packed
+    /// path must be reached, and without it the load must refuse rather than
     /// fall back. Skipped only where candle reports no CUDA device — that is
     /// the hardware speaking, and it is the sole excuse this test accepts.
     #[test]
@@ -1522,7 +1523,7 @@ mod tests {
 
         let loaded = Qwen35MoeRuntime::try_load("qwen35-gpu-route", &path, "gpu");
 
-        if cfg!(feature = "nvfp4-cuda") {
+        if cfg!(feature = "candle-cuda") {
             let runtime = loaded
                 .expect("a GPU route must load where the kernel is reachable")
                 .expect("checkpoint should select the Qwen runtime");
@@ -1532,7 +1533,7 @@ mod tests {
                 panic!("a build with no kernel must refuse a GPU route, not load one");
             };
             assert!(
-                error.to_string().contains("no NVFP4 kernel"),
+                error.to_string().contains("no usable NVFP4 kernel"),
                 "the refusal should name the missing kernel, got: {error}"
             );
         }

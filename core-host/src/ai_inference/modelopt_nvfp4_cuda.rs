@@ -7,12 +7,12 @@
 //! (candle #3824), so what remains here is the adapter: our capability
 //! vocabulary on one side, the upstream entry points on the other.
 //!
-//! The `nvfp4-cuda` feature stays CPU-buildable and therefore stays in the
-//! standard feature matrix. `candle-nvfp4-kernels` is pulled in with its own
-//! `cuda` feature *off*; `candle-cuda` is what turns it on. Without it
-//! `is_available()` answers `false` and every entry point reports the
-//! operator as unsupported, which is exactly what the missing CUTLASS headers
-//! used to produce.
+//! This file is always compiled. `candle-nvfp4-kernels` comes in with
+//! `ai-inference`, with its own `cuda` feature *off*; `candle-cuda` is what
+//! turns it on. Without it `is_available()` answers `false` and every entry
+//! point reports the operator as unsupported, which is exactly what the
+//! missing CUTLASS headers used to produce — so a CPU build needs no `cfg` to
+//! stay honest, it just gets told no.
 
 use std::sync::OnceLock;
 

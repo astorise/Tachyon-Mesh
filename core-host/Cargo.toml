@@ -20,8 +20,18 @@ admin-plane = []
 # Candle + TurboQuant + ONNX inference — pure Rust, musl-compatible.
 # candle-onnx executes .onnx models; wasmtime-wasi-nn (no ORT) provides the
 # WASI-NN guest interface backed by our CandleOnnxBackend.
+# `candle-nvfp4-kernels` is in here rather than behind a feature of its own
+# because it is not a hardware switch. Built without its `cuda` feature it is
+# pure Rust, compiles with no toolkit — no nvcc, no CUTLASS — and answers
+# `is_available() == false`, which is exactly what a CPU host should hear. The
+# separate `nvfp4-cuda` feature that used to carry it only ever decided whether
+# the crate was linked, and having two names for "is the code present" and "can
+# the device run it" is what let the second question be answered in the wrong
+# place for so long. `candle-cuda` turns on the kernel crate's own `cuda`
+# feature; that is the one switch that needs a toolchain.
 ai-inference = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-onnx", "dep:candle-transformers",
+    "dep:candle-nvfp4-kernels",
     "dep:lru", "dep:minijinja", "dep:minijinja-contrib", "dep:parallel-topology", "dep:prost",
     "dep:tokenizers", "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
 ]
@@ -48,7 +58,7 @@ candle-cuda = [
     # replicated attention; single-device Llama only takes the paged path when
     # the host attaches a PagedKvCache via cache.set_paged_kv.
     "candle-transformers/flash-attn",
-    "candle-nvfp4-kernels?/cuda",
+    "candle-nvfp4-kernels/cuda",
     "dep:candle-flash-attn",
     "dep:cudarc",
     "dep:nvml-wrapper",
@@ -69,14 +79,6 @@ candle-metal = [
     "candle-nn/metal",
     "candle-transformers/metal",
 ]
-# `nvfp4-cuda` stays CPU-buildable (no `candle-core/cuda`) so it remains in the
-# standard non-CUDA feature matrix. The candle CUDA backend is activated by the
-# separate `candle-cuda` feature (which enables `candle-core/cuda` et al.) and is
-# what the parallel dispatch, multi-GPU enumeration, and tensor-parallel
-# all-reduce gate on (`#[cfg(feature = "candle-cuda")]`); it is exercised by the
-# dedicated `cuda-quality` CI job. The default build stays CUDA-free
-# (`default = ["ring"]`) and reproducible without a CUDA toolchain.
-nvfp4-cuda = ["ai-inference", "dep:candle-nvfp4-kernels"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
 ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]

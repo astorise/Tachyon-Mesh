@@ -1343,14 +1343,19 @@ The `cuda-quality` CI job (or an equivalent job on the same GPU-equipped self-ho
 - **THEN** it uses multiple NCCL ranks on that single device (loopback communicator initialization) rather than requiring a second physical GPU
 - **AND** the test is skipped, not failed, on a `candle-cuda` build executed on a host reporting zero CUDA devices
 
-### Requirement: The `nvfp4-cuda` and `candle-cuda` Cargo features MUST be documented as independent
-Inline documentation describing the relationship between the `nvfp4-cuda` and `candle-cuda` Cargo features SHALL accurately reflect that they are separate, sibling features — enabling one does not enable the other — matching `core-host/Cargo.toml`'s actual feature graph.
+### Requirement: `candle-cuda` MUST be documented as the single CUDA switch
+Inline documentation describing what enables CUDA execution SHALL name
+`candle-cuda` as the only Cargo feature involved, matching
+`core-host/Cargo.toml`'s actual feature graph. The `nvfp4-cuda` feature that
+once sat beside it has been folded into `ai-inference`, because it decided
+only whether the kernel crate was linked — never what a device could do — and
+two names for those two questions is what let the second be answered locally.
 
-#### Scenario: The topology-discovery comment accurately describes feature independence
+#### Scenario: The topology-discovery comment names one feature
 - **GIVEN** a reader inspects the comment above `discover_cluster_topology`'s CUDA-enumeration loop in `core-host/src/ai_inference/parallel.rs`
 - **WHEN** they read the comment to understand what enables multi-GPU enumeration
-- **THEN** the comment states that the `candle-cuda` feature, not `nvfp4-cuda`, is required
-- **AND** the comment does not claim `nvfp4-cuda` pulls in or implies `candle-cuda`
+- **THEN** the comment states that the `candle-cuda` feature is required
+- **AND** the comment does not refer to a separate NVFP4 Cargo feature
 
 ### Requirement: Route-scoped dynamic model bindings
 

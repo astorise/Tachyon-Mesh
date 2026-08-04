@@ -63,10 +63,11 @@ pub(crate) fn discover_cluster_topology() -> ClusterTopology {
         free_vram_bytes: 0,
     }];
 
-    // With the `candle-cuda` Cargo feature compiled in (a separate, sibling
-    // feature to `nvfp4-cuda` — enabling `nvfp4-cuda` alone does NOT pull in
-    // `candle-cuda`; see core-host/Cargo.toml), `cuda_if_available` actually
-    // opens devices, so this loop enumerates every real GPU ordinal.
+    // With the `candle-cuda` Cargo feature compiled in — the one switch that
+    // needs a CUDA toolchain, and what turns on `candle-core/cuda` and the
+    // kernel crates' own `cuda` features; see core-host/Cargo.toml —
+    // `cuda_if_available` actually opens devices, so this loop enumerates
+    // every real GPU ordinal.
     // `free_vram_bytes` stays `0` (unknown) until NVML telemetry lands;
     // `validate_parallel_topology` only enforces the VRAM check when the plan
     // declares a non-zero per-shard requirement, so a `0` here never causes a

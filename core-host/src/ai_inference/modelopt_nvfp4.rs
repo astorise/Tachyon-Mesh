@@ -11,7 +11,6 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-#[cfg(feature = "nvfp4-cuda")]
 #[path = "modelopt_nvfp4_cuda.rs"]
 pub(crate) mod cuda;
 
@@ -89,16 +88,10 @@ pub(crate) enum Nvfp4KernelAvailability {
 }
 
 impl Nvfp4KernelAvailability {
-    /// Ask candle, or answer `Absent` for a build that has no kernel to ask.
+    /// Ask candle. There is no second arm and no `cfg`: the kernel crate is
+    /// always linked, and whether it can do anything is its answer to give.
     pub(crate) fn detect() -> Self {
-        #[cfg(feature = "nvfp4-cuda")]
-        {
-            cuda::Nvfp4CudaBackend::availability()
-        }
-        #[cfg(not(feature = "nvfp4-cuda"))]
-        {
-            Self::Absent
-        }
+        cuda::Nvfp4CudaBackend::availability()
     }
 
     fn is_reachable(self) -> bool {
@@ -429,10 +422,11 @@ impl ModelOptNvfp4Directory {
             return Err(ModelOptNvfp4LoadError::UnsupportedQuantization {
                 alias: self.alias.clone(),
                 detail: format!(
-                    "an accelerator was requested but this build has no NVFP4 kernel to run on \
-                     it: compile with the `nvfp4-cuda` feature, or set {DEQUANTIZED_FALLBACK_ENV}\
-                     =1 to unpack the weights to dense f32 instead — eight times the packed size, \
-                     which is why it is not what happens by default"
+                    "an accelerator was requested but candle reports no usable NVFP4 kernel: \
+                     build with the `candle-cuda` feature and run on a host with a CUDA device, \
+                     or set {DEQUANTIZED_FALLBACK_ENV}=1 to unpack the weights to dense f32 \
+                     instead — eight times the packed size, which is why it is not what happens \
+                     by default"
                 ),
             }
             .into());
@@ -1043,13 +1037,10 @@ pub(crate) enum PreparedLinear {
     },
 }
 
-/// A lazily-uploaded device operator, or nothing at all when this build has no
-/// NVFP4 CUDA support. `Default` on both arms is what lets every construction
-/// site stay free of `cfg`.
-#[cfg(feature = "nvfp4-cuda")]
+/// A lazily-uploaded device operator. `None` inside the `OnceLock` is a host
+/// that tried and could not — no device, or no CUDA support compiled into the
+/// kernel crate — which is why every construction site can stay free of `cfg`.
 type ResidentOperator = std::sync::OnceLock<Option<cuda::Nvfp4DeviceLinear>>;
-#[cfg(not(feature = "nvfp4-cuda"))]
-type ResidentOperator = ();
 
 impl PreparedLinear {
     pub(crate) fn resident_bytes(&self) -> u64 {
@@ -1246,31 +1237,23 @@ impl PreparedLinear {
                 inputs.len()
             );
         }
-        #[cfg(feature = "nvfp4-cuda")]
-        {
-            // Uploaded once and kept; the host entry point below re-sends the
-            // whole operator on every call, which for anything but a tiny
-            // weight costs more than the activation it is multiplying.
-            let resident = resident.get_or_init(|| {
-                cuda::Nvfp4DeviceLinear::upload(packed, scales, *tensor_scale, *rows, *cols)
-            });
-            match resident {
-                Some(resident) => resident.matmul(inputs, tokens),
-                None => cuda::Nvfp4CudaBackend::linear_f32_host_batched(
-                    inputs,
-                    packed,
-                    scales,
-                    *tensor_scale,
-                    *rows,
-                    *cols,
-                    tokens,
-                ),
-            }
-        }
-        #[cfg(not(feature = "nvfp4-cuda"))]
-        {
-            let _ = (rows, packed, scales, tensor_scale, resident);
-            bail!("native NVFP4 execution requires the `nvfp4-cuda` feature")
+        // Uploaded once and kept; the host entry point below re-sends the
+        // whole operator on every call, which for anything but a tiny weight
+        // costs more than the activation it is multiplying.
+        let resident = resident.get_or_init(|| {
+            cuda::Nvfp4DeviceLinear::upload(packed, scales, *tensor_scale, *rows, *cols)
+        });
+        match resident {
+            Some(resident) => resident.matmul(inputs, tokens),
+            None => cuda::Nvfp4CudaBackend::linear_f32_host_batched(
+                inputs,
+                packed,
+                scales,
+                *tensor_scale,
+                *rows,
+                *cols,
+                tokens,
+            ),
         }
     }
 
@@ -2392,7 +2375,6 @@ mod tests {
         assert_eq!(output, vec![16.0]);
     }
 
-    #[cfg(feature = "nvfp4-cuda")]
     #[test]
     fn nvfp4_cuda_host_linear_matches_fallback() {
         if std::env::var("TACHYON_NVFP4_CUDA_SMOKE").as_deref() != Ok("1") {
@@ -2532,18 +2514,21 @@ mod tests {
             .expect_err("a refused fallback should reject a build with no kernel");
 
         // The message has to name both ways out, because neither is guessable
-        // from the failure: rebuild with the feature, or ask for the dense
-        // form by name.
+        // from the failure: get a CUDA backend and a device under it, or ask
+        // for the dense form by name.
         let error = error.to_string();
-        assert!(error.contains("no NVFP4 kernel"), "{error}");
-        assert!(error.contains("nvfp4-cuda"), "{error}");
+        assert!(error.contains("no usable NVFP4 kernel"), "{error}");
+        assert!(error.contains("candle-cuda"), "{error}");
         assert!(error.contains(DEQUANTIZED_FALLBACK_ENV), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(not(feature = "nvfp4-cuda"))]
+    /// Conditioned on `candle-cuda`, not on a feature of ours: the kernel
+    /// crate is always linked now, and what decides whether it can do anything
+    /// is whether candle's CUDA backend was compiled under it.
+    #[cfg(not(feature = "candle-cuda"))]
     #[test]
-    fn a_build_without_the_kernel_feature_reports_it_absent() {
+    fn a_build_without_the_cuda_backend_reports_the_kernel_absent() {
         assert_eq!(
             Nvfp4KernelAvailability::detect(),
             Nvfp4KernelAvailability::Absent

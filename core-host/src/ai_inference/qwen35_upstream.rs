@@ -111,12 +111,10 @@ fn tensor_path(prefix: &str, name: &str) -> String {
 /// preserves the leading dimensions and never stages through the host, so
 /// anything this wrapper did beyond delegating would be a copy the migration
 /// exists to remove.
-#[cfg(feature = "nvfp4-cuda")]
 struct Nvfp4Projection {
     resident: super::modelopt_nvfp4::cuda::Nvfp4DeviceLinear,
 }
 
-#[cfg(feature = "nvfp4-cuda")]
 impl Projection for Nvfp4Projection {
     fn forward(&self, xs: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
         self.resident.forward(xs)
@@ -144,9 +142,9 @@ pub(crate) enum WeightResidency {
 /// wherever there is a CUDA device, and the capability question moved to
 /// `supports_fp4_tensor_cores`.
 ///
-/// What is left is the build. A `candle-cuda` binary compiled without the
-/// `nvfp4-cuda` feature has a device and no kernel, and that is the one case
-/// the dequantized form still answers.
+/// What is left is a build with no CUDA backend under the kernel crate, or a
+/// host with no device to run it on. Either way candle says `Absent`, and that
+/// is the case the dequantized form still answers.
 pub(crate) fn residency(
     device_is_cuda: bool,
     availability: Nvfp4KernelAvailability,
@@ -165,10 +163,10 @@ pub(crate) fn residency(
         return Ok(WeightResidency::DequantizedF32);
     }
     bail!(
-        "this build has no NVFP4 kernel: it was compiled without the `nvfp4-cuda` feature. \
-         Rebuild with it, or set {DEQUANTIZED_FALLBACK_ENV}=1 to unpack the weights to dense \
-         f32 instead — eight times the memory of the packed checkpoint, which is why it is \
-         not the default"
+        "candle reports no usable NVFP4 kernel on this host: build with the `candle-cuda` \
+         feature and run where there is a CUDA device, or set {DEQUANTIZED_FALLBACK_ENV}=1 to \
+         unpack the weights to dense f32 instead — eight times the memory of the packed \
+         checkpoint, which is why it is not the default"
     )
 }
 
@@ -193,28 +191,20 @@ fn projection(
 
     match residency {
         WeightResidency::Packed => {
-            #[cfg(feature = "nvfp4-cuda")]
-            {
-                // Uploaded onto the device the model's activations live on, not
-                // whichever one this process happened to open first.
-                let resident = super::modelopt_nvfp4::cuda::Nvfp4DeviceLinear::upload_on(
-                    device,
-                    &packed,
-                    &scales,
-                    tensor_scale,
-                    rows,
-                    cols,
-                )
-                .with_context(|| {
-                    format!("projection `{path}` could not be made resident on a CUDA device")
-                })?;
-                Ok(Box::new(Nvfp4Projection { resident }))
-            }
-            #[cfg(not(feature = "nvfp4-cuda"))]
-            {
-                let _ = (packed, scales, tensor_scale, rows, cols, device);
-                bail!("the packed NVFP4 path requires the `nvfp4-cuda` feature")
-            }
+            // Uploaded onto the device the model's activations live on, not
+            // whichever one this process happened to open first.
+            let resident = super::modelopt_nvfp4::cuda::Nvfp4DeviceLinear::upload_on(
+                device,
+                &packed,
+                &scales,
+                tensor_scale,
+                rows,
+                cols,
+            )
+            .with_context(|| {
+                format!("projection `{path}` could not be made resident on a CUDA device")
+            })?;
+            Ok(Box::new(Nvfp4Projection { resident }))
         }
         WeightResidency::DequantizedF32 => {
             let dense = super::modelopt_nvfp4::dequantize_nvfp4_e4m3(
@@ -404,7 +394,7 @@ mod tests {
         let error = residency(true, Nvfp4KernelAvailability::Absent, false)
             .expect_err("a build with no kernel cannot run packed");
         let message = error.to_string();
-        assert!(message.contains("nvfp4-cuda"), "{message}");
+        assert!(message.contains("candle-cuda"), "{message}");
         assert!(message.contains(DEQUANTIZED_FALLBACK_ENV), "{message}");
         assert_eq!(
             residency(true, Nvfp4KernelAvailability::Absent, true)

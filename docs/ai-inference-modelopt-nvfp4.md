@@ -43,39 +43,39 @@ no permission. A `gpu` route is a claim that the accelerator does the work, and
 a build that cannot make good on it fails to load rather than serving the same
 tokens off the wrong device.
 
-Whether the kernel is reachable is candle's answer, not ours: the `nvfp4-cuda`
-feature must be compiled in and `candle-nvfp4-kernels` must report a usable
-device. Tachyon used to keep its own model of this — an FP4-hardware flag, a
-runtime-availability flag, a set of compiled kernel kinds — and candle #3831
-made the first of them false in practice by removing the compute-capability
-floor the kernel never needed. Hardware requirements belong to the kernel that
-has them; anything mirrored here goes stale the next time upstream moves.
+Whether the kernel is reachable is candle's answer, not ours: it is whatever
+`candle-nvfp4-kernels` reports. Tachyon used to keep its own model of this — an
+FP4-hardware flag, a runtime-availability flag, a set of compiled kernel kinds —
+and candle #3831 made the first of them false in practice by removing the
+compute-capability floor the kernel never needed. Hardware requirements belong
+to the kernel that has them; anything mirrored here goes stale the next time
+upstream moves.
 
 `TACHYON_QWEN35_DEQUANTIZED_FALLBACK=1` turns a refused GPU route back into the
 dense path. It costs eight times the packed memory, it is a development tool
 rather than a deployment mode, and it is the only switch involved.
 
-## CUDA/CUTLASS Build
+## Building the native path
 
-The concrete native backend is behind the `nvfp4-cuda` feature. Standard builds do not require CUDA, NVCC, or CUTLASS. CI and `--all-features` builds may enable `nvfp4-cuda` without native inputs; in that case Tachyon compiles the Rust capability layer and reports native NVFP4 CUDA kernels unavailable.
+There is no NVFP4 feature to enable. `candle-nvfp4-kernels` comes in with
+`ai-inference`, and on a plain build it compiles as pure Rust — no CUDA, no
+NVCC, no CUTLASS — and reports itself unavailable. `candle-cuda` is what turns
+on its `cuda` feature, and that is the build that needs a toolchain.
 
-To compile the native backend, set:
+This used to be a repository-owned kernel with its own build script, driven by
+`TACHYON_NVFP4_CUDA_HOME`, `TACHYON_CUTLASS_INCLUDE_DIR` and `TACHYON_NVCC`.
+Candle owns the kernel now (candle #3824); those variables are read by nothing
+and setting them does nothing. `TACHYON_NVFP4_CUDA_ARCH` still selects the NVCC
+architecture, and CI derives it from the runner's own `compute_cap` rather than
+pinning a value.
 
-- `TACHYON_NVFP4_CUDA_HOME`, `CUDA_HOME`, or `CUDA_PATH`: CUDA toolkit root
-- `TACHYON_CUTLASS_INCLUDE_DIR`: CUTLASS include directory
-- `TACHYON_NVFP4_CUDA_ARCH`: optional NVCC architecture, default `sm_100a`
-- `TACHYON_NVCC`: optional explicit `nvcc` path
+```bash
+# CPU host: compiles, reports the kernel unavailable, exercises the fallback.
+cargo test -p core-host --features ai-inference modelopt_nvfp4
 
-Example:
-
-```powershell
-$env:CUDA_PATH='C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0'
-$env:TACHYON_CUTLASS_INCLUDE_DIR='C:\src\cutlass\include'
-$env:TACHYON_NVFP4_CUDA_ARCH='sm_120'
-cargo test -p core-host --features "ai-inference nvfp4-cuda" modelopt_nvfp4
+# CUDA host: compiles the kernel and runs it.
+cargo test -p core-host --features candle-cuda nvfp4_cuda
 ```
-
-The native source provides CUDA entrypoints for NVFP4 dequantization and an initial linear matmul kernel that consumes ModelOpt packed FP4 weights and FP8 E4M3 scales. CUTLASS headers are required to compile the native kernels so future block-scaled Tensor Core kernels can use the same ABI boundary.
 
 The Qwen runtime selects the native packed path once per loaded model. Each
 request records `executed_on` as one of `gpu_native_fp4`, `gpu_fallback`, or

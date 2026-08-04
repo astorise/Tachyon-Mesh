@@ -538,7 +538,7 @@ jobs:
         if: env.RENOVATE_PR != 'true'
         env:
           TACHYON_NVFP4_CUDA_SMOKE: "1"
-        run: cargo test -p core-host --features "candle-cuda nvfp4-cuda" nvfp4_cuda -- --nocapture
+        run: cargo test -p core-host --features candle-cuda nvfp4_cuda -- --nocapture
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos
@@ -744,7 +744,7 @@ jobs:
           # cuda-quality job on the GPU runner). A bare `--all-features` would
           # break on these CPU-only runners. Mirrors publish-docker-images'
           # "-all-features" variant.
-          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
           # Worker data-plane profile (#310): `admin-plane` is in `default`, so
@@ -816,7 +816,7 @@ jobs:
           # cuda-quality job on the GPU runner). A bare `--all-features` would
           # break on these CPU-only runners. Mirrors publish-docker-images'
           # "-all-features" variant.
-          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
           # Worker data-plane profile (#310) — see the matching comment on
