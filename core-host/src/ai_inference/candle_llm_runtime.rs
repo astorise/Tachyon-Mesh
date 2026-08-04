@@ -1827,12 +1827,26 @@ struct ModelMeta {
 /// template that never mentions tools yields `None` rather than a default.
 pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
     if let Some(declared) = read_declared_tool_call_parser(root) {
+        tracing::info!(
+            parser = declared,
+            path = %root.display(),
+            source = MODEL_META_JSON,
+            "tool-call dialect declared by sidecar"
+        );
         return Some(declared);
     }
-    let source = ChatTemplate::read_source(root)?;
+    let Some(source) = ChatTemplate::read_source(root) else {
+        // `ChatTemplate::load` warns about the same absence with the alias in
+        // hand, so this stays at debug rather than saying it twice per model.
+        tracing::debug!(
+            path = %root.display(),
+            "no chat template to read a tool-call dialect from"
+        );
+        return None;
+    };
     // Ordered by specificity: a template carrying a tag convention names its
     // dialect outright, so those are checked before the generic JSON case.
-    if source.contains("[TOOL_CALLS]") {
+    let detected = if source.contains("[TOOL_CALLS]") {
         Some("mistral")
     } else if source.contains("<tool_call>") {
         Some("qwen")
@@ -1844,7 +1858,28 @@ pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
         Some("json")
     } else {
         None
+    };
+    match detected {
+        // Named at info because it is the one line that explains, after the
+        // fact, why an agent's tool calls arrived as prose: the dialect is a
+        // guess from the template's markers, and `qwen` in particular covers
+        // several fine-tunes that do not all format calls the same way. When a
+        // model calls tools badly, this is the first thing to check, and
+        // `.tachyon-model.json` is how to overrule it.
+        Some(parser) => tracing::info!(
+            parser,
+            path = %root.display(),
+            source = "chat_template",
+            "tool-call dialect inferred from the chat template; override it with \
+             `tool_call_parser` in {MODEL_META_JSON} if calls come back as text"
+        ),
+        None => tracing::info!(
+            path = %root.display(),
+            "chat template mentions no tools: no tool-call dialect selected, so any call this \
+             model emits will be delivered as assistant content"
+        ),
     }
+    detected
 }
 
 /// The sidecar's declared parser, validated against the dialects
@@ -4844,9 +4879,26 @@ impl ChatTemplate {
 
     /// Load the model's chat template from `tokenizer_config.json`, or `None`
     /// when the file or the `chat_template` field is absent.
+    ///
+    /// Both absences are logged, because both are silent in their consequences
+    /// and loud in their effects. Without a template, `messages` requests never
+    /// get the turn markers the checkpoint was tuned on: an instruct model
+    /// receives what looks to it like raw continuation text, answers plausibly,
+    /// and nothing in the response says why the quality collapsed. It is also
+    /// the packaging mistake GGUF invites — the template lives in the file's
+    /// own metadata, which candle's quantized loader does not surface, so a
+    /// `.gguf` downloaded without its Hugging Face siblings lands here.
     pub(crate) fn load(alias: &str, root: &Path) -> Result<Option<Self>, CandleLlmError> {
         let path = root.join(TOKENIZER_CONFIG_JSON);
         if !path.exists() {
+            tracing::warn!(
+                alias,
+                path = %root.display(),
+                file = TOKENIZER_CONFIG_JSON,
+                "no chat template: `messages` requests will be rendered without the model's \
+                 turn markers, and no tool-call dialect can be detected. Ship the checkpoint's \
+                 {TOKENIZER_CONFIG_JSON} beside the weights"
+            );
             return Ok(None);
         }
         let raw = fs::read(&path).map_err(|error| CandleLlmError::InvalidComponent {
@@ -4866,6 +4918,13 @@ impl ChatTemplate {
             .chat_template
             .and_then(ChatTemplateField::into_source)
         else {
+            tracing::warn!(
+                alias,
+                path = %root.display(),
+                file = TOKENIZER_CONFIG_JSON,
+                "{TOKENIZER_CONFIG_JSON} declares no `chat_template`: `messages` requests will \
+                 be rendered without the model's turn markers"
+            );
             return Ok(None);
         };
         Ok(Some(Self {
