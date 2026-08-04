@@ -32,7 +32,7 @@ use candle_transformers::models::qwen3_5::{
 
 use super::modelopt_nvfp4::{
     dequantized_fallback_opted_in, ModelOptLinearTensors, ModelOptNvfp4Directory,
-    DEQUANTIZED_FALLBACK_ENV,
+    Nvfp4KernelAvailability, DEQUANTIZED_FALLBACK_ENV,
 };
 use super::qwen35_moe_runtime::{LayerType, Qwen35MoeConfig};
 
@@ -136,18 +136,20 @@ pub(crate) enum WeightResidency {
 
 /// Decide how this host will hold the weights, or refuse.
 ///
-/// `native` is whether the NVFP4 kernel is reachable at all. It used to mean a
-/// Blackwell device: the kernel gated itself on compute capability 10.0 even
-/// though nothing in it needs FP4 tensor cores. candle #3831 separated the two
-/// signals, so the packed path now runs wherever there is a CUDA device, and
-/// the capability question moved to `supports_fp4_tensor_cores`.
+/// `availability` is candle's answer about its own kernel, passed in rather
+/// than recomputed so that every caller reaches it the same way. It used to be
+/// a bare `native: bool` meaning a Blackwell device — the kernel gated itself
+/// on compute capability 10.0 even though nothing in it needs FP4 tensor
+/// cores. candle #3831 separated the two signals, so the packed path now runs
+/// wherever there is a CUDA device, and the capability question moved to
+/// `supports_fp4_tensor_cores`.
 ///
 /// What is left is the build. A `candle-cuda` binary compiled without the
 /// `nvfp4-cuda` feature has a device and no kernel, and that is the one case
 /// the dequantized form still answers.
 pub(crate) fn residency(
     device_is_cuda: bool,
-    native: bool,
+    availability: Nvfp4KernelAvailability,
     fallback_opted_in: bool,
 ) -> Result<WeightResidency> {
     if !device_is_cuda {
@@ -156,7 +158,7 @@ pub(crate) fn residency(
              host path"
         );
     }
-    if native {
+    if availability == Nvfp4KernelAvailability::Reachable {
         return Ok(WeightResidency::Packed);
     }
     if fallback_opted_in {
@@ -243,19 +245,17 @@ pub(crate) fn load(
     config: &Qwen35MoeConfig,
     device: &Device,
 ) -> Result<ModelForCausalLM> {
-    #[cfg(feature = "nvfp4-cuda")]
-    let native = super::modelopt_nvfp4::cuda::Nvfp4CudaBackend::is_available();
-    // Without the feature there is no kernel to be capable of anything, so the
-    // dequantized form is the only one on offer — and still only on request.
-    #[cfg(not(feature = "nvfp4-cuda"))]
-    let native = false;
-    let residency = residency(device.is_cuda(), native, dequantized_fallback_opted_in())?;
+    let residency = residency(
+        device.is_cuda(),
+        Nvfp4KernelAvailability::detect(),
+        dequantized_fallback_opted_in(),
+    )?;
     if residency == WeightResidency::DequantizedF32 {
         tracing::warn!(
             alias = model.alias(),
-            "loading Qwen 3.5 with dequantized f32 weights: this device cannot execute the \
-             NVFP4 kernel. Memory use is eight times the packed checkpoint and throughput is \
-             not representative — for parity checks, not for serving"
+            "loading Qwen 3.5 with dequantized f32 weights: this build has no NVFP4 kernel to \
+             reach. Memory use is eight times the packed checkpoint and throughput is not \
+             representative — for parity checks, not for serving"
         );
     }
     let shards = model.shard_paths();
@@ -384,12 +384,14 @@ mod tests {
     #[test]
     fn a_host_with_the_kernel_holds_the_weights_packed() {
         assert_eq!(
-            residency(true, true, false).expect("a capable device loads"),
+            residency(true, Nvfp4KernelAvailability::Reachable, false)
+                .expect("a capable device loads"),
             WeightResidency::Packed
         );
-        // The opt-in does not override a device that can do the real thing.
+        // The opt-in does not override a host that can do the real thing.
         assert_eq!(
-            residency(true, true, true).expect("a capable device loads"),
+            residency(true, Nvfp4KernelAvailability::Reachable, true)
+                .expect("a capable device loads"),
             WeightResidency::Packed
         );
     }
@@ -399,13 +401,14 @@ mod tests {
     /// message, because a silent 8x is how a machine dies at 3am.
     #[test]
     fn a_build_without_the_kernel_refuses_unless_asked() {
-        let error =
-            residency(true, false, false).expect_err("a build with no kernel cannot run packed");
+        let error = residency(true, Nvfp4KernelAvailability::Absent, false)
+            .expect_err("a build with no kernel cannot run packed");
         let message = error.to_string();
         assert!(message.contains("nvfp4-cuda"), "{message}");
         assert!(message.contains(DEQUANTIZED_FALLBACK_ENV), "{message}");
         assert_eq!(
-            residency(true, false, true).expect("the opt-in allows the dense form"),
+            residency(true, Nvfp4KernelAvailability::Absent, true)
+                .expect("the opt-in allows the dense form"),
             WeightResidency::DequantizedF32
         );
     }
@@ -413,7 +416,7 @@ mod tests {
     #[test]
     fn a_host_without_a_cuda_device_is_refused_whatever_the_opt_in_says() {
         for opted_in in [false, true] {
-            let error = residency(false, false, opted_in)
+            let error = residency(false, Nvfp4KernelAvailability::Absent, opted_in)
                 .expect_err("a CPU host has nothing to offer these layers");
             assert!(
                 error.to_string().contains("CUDA device"),
