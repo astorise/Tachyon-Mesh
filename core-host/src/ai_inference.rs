@@ -101,6 +101,18 @@ struct UpstreamAdmission {
     state: Mutex<UpstreamAdmissionState>,
     released: Condvar,
     capacity: usize,
+    /// How deep the queue for a permit may get before new callers are refused
+    /// outright instead of parked.
+    ///
+    /// `capacity` bounds the requests in flight; on its own it bounds nothing
+    /// else. A streaming caller has already spawned its dedicated OS thread by
+    /// the time it reaches [`Self::acquire`], so a burst against a full gate
+    /// parks an unbounded number of threads, each for up to
+    /// [`UPSTREAM_ADMISSION_TIMEOUT`], and exhausts thread stacks or the
+    /// process limit while only `capacity` requests are actually being served.
+    /// Refusing past this depth turns that into the overload error it always
+    /// was.
+    max_waiting: usize,
 }
 
 #[derive(Default)]
@@ -113,12 +125,24 @@ struct UpstreamAdmissionState {
     waiting: usize,
 }
 
+/// Queued callers allowed per permit before [`UpstreamAdmission::acquire`]
+/// refuses rather than parks. Four is a backlog a burst can drain within the
+/// admission timeout at any realistic upstream latency, without letting the
+/// parked-thread count run away from the work in flight.
+const UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT: usize = 4;
+
 impl UpstreamAdmission {
     fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             state: Mutex::new(UpstreamAdmissionState::default()),
             released: Condvar::new(),
-            capacity: capacity.max(1),
+            capacity,
+            // Deep enough that a normal burst still queues and is served —
+            // refusing a caller that would have waited a moment is its own kind
+            // of failure — and shallow enough that the parked threads stay a
+            // multiple of the work actually in flight.
+            max_waiting: capacity.saturating_mul(UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT),
         }
     }
 
@@ -137,6 +161,13 @@ impl UpstreamAdmission {
     fn acquire(&self) -> Result<UpstreamPermit<'_>, String> {
         let mut state = self.state.lock().expect("upstream admission lock poisoned");
         if state.in_flight >= self.capacity {
+            if state.waiting >= self.max_waiting {
+                return Err(format!(
+                    "upstream request queue is saturated ({} in flight, {} already queued, limit \
+                     {}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`",
+                    state.in_flight, state.waiting, self.capacity
+                ));
+            }
             state.waiting += 1;
             let deadline = std::time::Instant::now() + UPSTREAM_ADMISSION_TIMEOUT;
             loop {
@@ -884,6 +915,19 @@ pub(crate) struct AiInferenceRuntime {
     /// the model still answered, just on the wrong hardware, at RAM cost and
     /// a fraction of the speed, with nothing in the response to say so.
     dynamic_bindings: Arc<HashMap<String, IntegrityModelBinding>>,
+    /// One in-flight first load per alias.
+    ///
+    /// Without it, two requests that miss the registry together both load the
+    /// whole checkpoint before either inserts, and `or_insert` drops the loser
+    /// only once both finished. On CPU that wastes a load; on an accelerator
+    /// both copies are resident at the same moment, so peak VRAM approaches
+    /// twice the model and a checkpoint sized to fit turns into an OOM.
+    ///
+    /// Keyed per alias so unrelated models still load in parallel. Entries are
+    /// left behind after a load — one empty mutex per alias ever loaded, which
+    /// is bounded by the alias count and cheaper than the bookkeeping needed to
+    /// retire one safely while another caller may still be waiting on it.
+    loading: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Bounded concurrency for `openai:` bindings, which run off the batch
     /// scheduler entirely. Shared across clones of the runtime so the cap is a
     /// node-wide property.
@@ -995,6 +1039,7 @@ impl AiInferenceRuntime {
             schedulers,
             models: Arc::new(RwLock::new(models)),
             dynamic_bindings: Arc::new(dynamic_bindings),
+            loading: Arc::new(Mutex::new(HashMap::new())),
             dynamic_models_root: None,
             upstream_admission: Arc::new(UpstreamAdmission::from_env()),
         })
@@ -1029,6 +1074,25 @@ impl AiInferenceRuntime {
         if !model_dir.is_dir() {
             return Err(format!("model alias `{alias}` is not loaded"));
         }
+        // Past here a checkpoint is about to be read onto a device, so only one
+        // caller per alias may proceed. The gate is taken before any loading
+        // work and released once the model is registered.
+        let gate = {
+            let mut loading = self.loading.lock().expect("model load gate poisoned");
+            Arc::clone(loading.entry(alias.to_owned()).or_default())
+        };
+        let _loading = gate.lock().expect("model load gate poisoned");
+        // Re-checked under the gate: whoever held it before us may have just
+        // finished this exact load, and repeating it is the cost this whole
+        // gate exists to avoid.
+        if self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .contains_key(alias)
+        {
+            return Ok(());
+        }
         // The sealed binding decides everything except where the files are —
         // that is the upload root's to say. An alias with no dynamic binding at
         // all is a bare broker upload, which has no manifest opinion to honour
@@ -1050,8 +1114,10 @@ impl AiInferenceRuntime {
             CandleModel::load_mock_with_backend(&binding, backend_model)
                 .map_err(|error| error.to_string())?,
         );
-        // Insert under the write lock; `or_insert` tolerates a concurrent first-use
-        // race (the loser's freshly loaded model is simply dropped).
+        // `or_insert` rather than `insert`: the gate above makes a concurrent
+        // first-use race for this alias impossible, but a model registered by
+        // some other path in the meantime is still its own truth and must not
+        // be replaced.
         self.models
             .write()
             .expect("model registry lock poisoned")
@@ -4471,6 +4537,43 @@ mod tests {
             gate.waiting(),
             1,
             "a blocked caller is visible as backlog, not as in-flight work"
+        );
+    }
+
+    /// A full queue refuses immediately rather than parking another thread.
+    ///
+    /// The caller has already spawned its dedicated stream thread by the time
+    /// it gets here, so an unbounded queue converts a burst into unbounded
+    /// parked threads — each held for the whole admission timeout while only
+    /// `capacity` requests are actually being served. Refusing past the depth
+    /// is what keeps the parked count a multiple of the work in flight.
+    #[test]
+    fn a_queue_at_its_depth_refuses_instead_of_parking_another_caller() {
+        let gate = UpstreamAdmission::new(1);
+        let _held = gate.acquire().expect("first permit fits");
+        // Stand in for callers already parked, so the refusal can be observed
+        // without waiting out `UPSTREAM_ADMISSION_TIMEOUT` for each of them.
+        {
+            let mut state = gate.state.lock().expect("gate lock");
+            state.waiting = UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT;
+        }
+
+        let Err(refused) = gate.acquire() else {
+            panic!("a queue at its depth must refuse rather than park");
+        };
+
+        assert!(
+            refused.contains("already queued"),
+            "the refusal must say the queue is what is full, not the capacity: {refused}"
+        );
+        assert!(
+            refused.contains(UPSTREAM_MAX_CONCURRENCY_ENV),
+            "the refusal must name the knob that raises the limit: {refused}"
+        );
+        assert_eq!(
+            gate.waiting(),
+            UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT,
+            "a refused caller never joins the backlog it was refused for"
         );
     }
 
