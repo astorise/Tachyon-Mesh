@@ -1314,6 +1314,22 @@ impl UpstreamOpenAiRuntime {
 
     /// Forward a single embedding request to the upstream `/embeddings` route.
     pub(crate) fn embed(&self, input: &str) -> Result<Vec<f32>, UpstreamError> {
+        // The same bounded-input contract `chat_body` enforces, for the same
+        // reason. Nothing between the public embeddings route and here imposed
+        // one, so a component could hand over an arbitrarily large string and
+        // have it serialised into a request body — an allocation this node pays
+        // for on every co-batched thread before the upstream ever sees it.
+        // Checked before building the body, so the oversized copy is never
+        // made.
+        if input.len() > MAX_PROMPT_BYTES_CEILING {
+            return Err(UpstreamError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "embedding input bytes {} exceed limit {MAX_PROMPT_BYTES_CEILING}",
+                    input.len()
+                ),
+            });
+        }
         let body = json!({"model": self.endpoint.model, "input": input});
         let response = self.post("/embeddings", &body, self.endpoint.timeout)?;
         let payload: Value = read_json(&self.alias, response)?;
@@ -2414,6 +2430,36 @@ mod tests {
             panic!("a non-function call type must not be silently relabelled");
         };
         assert!(error.to_string().contains("only `function`"), "{error}");
+    }
+
+    /// An embedding input is bounded like a prompt is.
+    ///
+    /// Nothing between the public embeddings route and the backend imposed a
+    /// ceiling, so a component could hand over an arbitrarily large string and
+    /// have this node serialise it into a request body — an allocation paid on
+    /// every co-batched thread before the upstream ever sees it.
+    #[test]
+    fn an_oversized_embedding_input_is_refused_before_it_is_serialized() {
+        // No fixture server: the refusal has to happen before anything is sent,
+        // so a reachable upstream would prove less than an unreachable one.
+        let backend = runtime("coder", "openai:http://127.0.0.1:9/v1");
+        let oversized = "x".repeat(MAX_PROMPT_BYTES_CEILING + 1);
+
+        let Err(error) = backend.embed(&oversized) else {
+            panic!("an input past the ceiling must not reach the wire");
+        };
+        let error = error.to_string();
+        assert!(error.contains("embedding input bytes"), "{error}");
+
+        // The boundary itself is allowed: the ceiling is a limit, not a margin.
+        let at_limit = "x".repeat(MAX_PROMPT_BYTES_CEILING);
+        let Err(error) = backend.embed(&at_limit) else {
+            panic!("the unreachable fixture endpoint cannot answer");
+        };
+        assert!(
+            !error.to_string().contains("exceed limit"),
+            "an input exactly at the ceiling is refused by the network, not by the bound: {error}"
+        );
     }
 
     /// A call is an instruction, so it waits for the stream to finish.
