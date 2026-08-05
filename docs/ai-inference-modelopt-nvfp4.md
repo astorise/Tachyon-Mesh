@@ -65,9 +65,10 @@ on its `cuda` feature, and that is the build that needs a toolchain.
 This used to be a repository-owned kernel with its own build script, driven by
 `TACHYON_NVFP4_CUDA_HOME`, `TACHYON_CUTLASS_INCLUDE_DIR` and `TACHYON_NVCC`.
 Candle owns the kernel now (candle #3824); those variables are read by nothing
-and setting them does nothing. `TACHYON_NVFP4_CUDA_ARCH` still selects the NVCC
-architecture, and CI derives it from the runner's own `compute_cap` rather than
-pinning a value.
+and setting them does nothing — `TACHYON_NVFP4_CUDA_ARCH` included. The kernel
+crate's build script hands architecture selection to `cudaforge`, which reads
+the device itself and picks the `a` variant where the family has one. CI used
+to derive that value from `nvidia-smi` and export it; nothing ever read it.
 
 ```bash
 # CPU host: compiles, reports the kernel unavailable, exercises the fallback.

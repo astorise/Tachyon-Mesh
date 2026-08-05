@@ -86,30 +86,6 @@ jobs:
           nvidia-smi
           nvcc --version
 
-      # Build for whatever this runner actually is. The architecture is read
-      # from the device rather than pinned, so the kernel is compiled for the
-      # GPU that will run it. The job-level gate already decided this job runs
-      # at all; repeating it here would only be a second place to get wrong.
-      - name: Configure NVFP4 CUDA architecture
-        run: |
-          compute_capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '[:space:].')"
-          if [ -z "$compute_capability" ]; then
-            echo "::error::failed to determine GPU compute capability for NVFP4 CUDA build"
-            exit 1
-          fi
-          # Blackwell's FP4 tensor-core instructions only compile for the
-          # architecture-specific `a` target. Deriving the name by removing the
-          # decimal point alone turns capability 10.0 into `sm_100`, which
-          # builds — silently without the instructions this job exists to
-          # exercise, or fails in the kernel compile. Families that have no `a`
-          # variant keep the plain name.
-          case "$compute_capability" in
-            100|101|103|120|121) arch="sm_${compute_capability}a" ;;
-            *) arch="sm_${compute_capability}" ;;
-          esac
-          echo "TACHYON_NVFP4_CUDA_ARCH=$arch" >> "$GITHUB_ENV"
-          echo "Using NVFP4 CUDA architecture $arch"
-
       # candle-onnx's build script compiles the ONNX .proto and needs `protoc`.
       # The CPU jobs get it from `apt-get install protobuf-compiler`, but this
       # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
