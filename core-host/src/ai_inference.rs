@@ -2455,7 +2455,22 @@ impl BackendModel for CandleBackendModel {
     }
 
     fn scheduling_lane(&self) -> Option<AcceleratorKind> {
-        matches!(self.kind, CandleBackendModelKind::Upstream(_)).then_some(AcceleratorKind::Network)
+        if matches!(self.kind, CandleBackendModelKind::Upstream(_)) {
+            return Some(AcceleratorKind::Network);
+        }
+        // A GGUF binding asking for `cuda` on a host with no physical GPU
+        // resolves to `Device::Cpu` — deliberately, so a `candle-cuda` build
+        // stays usable without one. The binding still said `cuda`, so the work
+        // queued on the GPU lane and had VRAM accounted against it while every
+        // forward ran on the CPU: the GPU lane showed load that could not
+        // exist, and the CPU lane doing the work looked idle to mesh
+        // admission, which is what decides whether to hand a request to a peer.
+        if let CandleBackendModelKind::TextGeneration { target, .. } = &self.kind {
+            if target.executes_on_host() {
+                return Some(AcceleratorKind::Cpu);
+            }
+        }
+        None
     }
 
     fn as_any(&self) -> &dyn Any {

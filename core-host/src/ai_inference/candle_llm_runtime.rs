@@ -2064,6 +2064,26 @@ struct ParsedGenerationRequest {
 }
 
 impl CandleLlmRuntime {
+    /// Whether the weights actually ended up on the host rather than a device.
+    ///
+    /// `Device::cuda_if_available` follows this runtime's convention of falling
+    /// back to `Device::Cpu` when no physical GPU is attached, which keeps a
+    /// `candle-cuda` build usable on a machine without one. But the binding
+    /// still says `cuda`, so the scheduler queued the work on the GPU lane and
+    /// accounted VRAM for it while every forward ran on the CPU — the GPU lane
+    /// showed load that could not exist, and the CPU lane, which was doing the
+    /// work, looked idle to mesh admission.
+    ///
+    /// Only the GGUF path resolves a non-CPU device today; every other loader
+    /// builds against `Device::Cpu` regardless, and those bindings are already
+    /// declared `cpu`.
+    pub(crate) fn executes_on_host(&self) -> bool {
+        match self.inner.as_ref() {
+            LoadedModel::Gguf { device, .. } => device.is_cpu(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn try_load(
         alias: &str,
         path: impl AsRef<Path>,
@@ -6729,6 +6749,28 @@ mod tests {
     /// completion abandoned mid-function reported as having ended cleanly.
     /// The schema has no word for "ran out of clock"; `length` is the one that
     /// means there was more to say.
+    /// A GGUF binding that landed on the host says so.
+    ///
+    /// `Device::cuda_if_available` falls back to `Device::Cpu` when no physical
+    /// GPU is attached, which is what keeps a `candle-cuda` build usable
+    /// without one. The binding still said `cuda`, so the scheduler queued the
+    /// work on the GPU lane and accounted VRAM for it while every forward ran
+    /// on the CPU — a GPU lane showing load that cannot exist, and a CPU lane
+    /// doing the work while looking idle to the admission that decides whether
+    /// to hand a request to a peer.
+    #[test]
+    fn a_gguf_model_that_fell_back_to_the_host_reports_the_cpu_lane() {
+        let (runtime, dir) = load_gguf_fixture("gguf-host-lane");
+        // The fixture loads on `cpu`, which is the same resolved state a `cuda`
+        // binding reaches on a host with no GPU — the seam reads the device the
+        // weights actually landed on, not the string the binding asked for.
+        assert!(
+            runtime.executes_on_host(),
+            "a GGUF checkpoint on `Device::Cpu` executes on the host whatever was requested"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A replayed tool exchange has to reach the template intact.
     ///
     /// `ChatTurn` carried only role and content, so an assistant turn that made
