@@ -17,7 +17,7 @@ use tokenizers::Tokenizer;
 use super::{
     architecture_registry::{ArchitectureDescriptor, ArchitectureKind, ArchitectureMatch},
     candle_llm_runtime::{
-        ChatTemplate, ChatTurn, TokenUsage, DEFAULT_GENERATION_DEADLINE,
+        prompt_limits_for, ChatTemplate, ChatTurn, TokenUsage, DEFAULT_GENERATION_DEADLINE,
         HOST_MAX_GENERATION_DEADLINE, HOST_MAX_NEW_TOKENS,
     },
     modelopt_nvfp4::{
@@ -821,10 +821,24 @@ impl Qwen35MoeRuntime {
     }
 
     fn parse_request(&self, bytes: &[u8]) -> Result<ParsedRequest> {
-        if bytes.len() > 16_384 {
+        // Derived from this checkpoint's context window, the way the generic
+        // Candle runtime derives its own. A flat 16 KiB is roughly four
+        // thousand tokens of code, so on a model whose window has room for many
+        // times that, an agentic client sending a file plus its tool
+        // definitions was refused before anything looked at whether it fit.
+        // That is the regression `prompt_limits_for` was written to end, and
+        // this path was still carrying the constant it replaced.
+        let (_max_prompt_tokens, max_prompt_bytes) =
+            prompt_limits_for(self.config.max_position_embeddings);
+        if bytes.len() > max_prompt_bytes {
             return Err(invalid_request(
                 &self.alias,
-                "generation request exceeds 16384 bytes",
+                format!(
+                    "generation request is {} bytes, over the {max_prompt_bytes}-byte limit this \
+                     checkpoint's {}-token context window allows",
+                    bytes.len(),
+                    self.config.max_position_embeddings
+                ),
             ));
         }
         let raw = std::str::from_utf8(bytes).context("Qwen prompt must be UTF-8")?;
@@ -1884,6 +1898,30 @@ mod tests {
             None,
             "and a loop that stopped for some other reason names none"
         );
+    }
+
+    /// The byte cap follows the checkpoint, not a constant.
+    ///
+    /// A flat 16 KiB is roughly four thousand tokens of code. On a Qwen 3.5
+    /// window there is room for many times that, so an agentic client sending
+    /// a file plus its tool definitions was refused before anything looked at
+    /// whether the prompt fit. `prompt_limits_for` exists to end exactly that,
+    /// and this path was still carrying the constant it replaced.
+    #[test]
+    fn the_qwen_byte_cap_scales_with_the_context_window() {
+        let (_tokens, small) = prompt_limits_for(2_048);
+        let (_tokens, large) = prompt_limits_for(262_144);
+        assert!(
+            large > small,
+            "a larger window has to buy a larger prompt, got {large} and {small}"
+        );
+        assert!(
+            large > 16_384,
+            "the old flat cap must not still be the ceiling for a large window, got {large}"
+        );
+        // And a tiny checkpoint keeps a workable floor rather than inheriting a
+        // cap proportional to almost nothing.
+        assert!(small > 0);
     }
 
     #[test]
