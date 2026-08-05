@@ -2073,6 +2073,23 @@ const STREAM_CHANNEL_CAPACITY: usize = 64;
 #[cfg(feature = "ai-inference")]
 const STREAM_QUEUE_BUDGET_BYTES: usize = 256 * 1024;
 
+/// How long a producer waits for the consumer to drain before treating it as
+/// gone.
+///
+/// A client that disconnects wakes [`StreamBudget::consumer_gone`]; one that
+/// stays connected and simply stops reading wakes nothing. The guest then
+/// stops calling `token-stream.next`, and the producer used to wait on the
+/// condition variable forever — generation deadlines and upstream HTTP
+/// timeouts are only consulted by the backend *between* sink calls, so none of
+/// them can reach a thread parked inside one. The stream thread, the route
+/// permit, the model execution and any upstream admission permit stayed held
+/// with it.
+///
+/// Measured from the last drain rather than from the start of the stream, so a
+/// slow but progressing consumer is never cut off. Nothing draining for this
+/// long is a consumer in name only.
+const STREAM_BACKPRESSURE_STALL_LIMIT: Duration = Duration::from_secs(120);
+
 /// The queued-bytes budget for one stream.
 ///
 /// Producer-blocking rather than lossy: dropping a fragment would silently
@@ -2099,12 +2116,19 @@ impl StreamQueueBudget {
     /// `false` means the consumer has gone and the caller should stop — the
     /// same answer a failed `send` gives, available while merely waiting.
     fn reserve(&self, len: usize) -> bool {
+        self.reserve_until(len, Instant::now() + STREAM_BACKPRESSURE_STALL_LIMIT)
+    }
+
+    /// [`Self::reserve`] with the stall deadline supplied, so a test can prove
+    /// the timeout path without sitting out the production limit.
+    fn reserve_until(&self, len: usize, deadline: Instant) -> bool {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             // A poisoned lock means the peer panicked; treat it as a departed
             // consumer rather than panicking this thread too.
             Err(_) => return false,
         };
+        let mut remaining = deadline.saturating_duration_since(Instant::now());
         loop {
             if state.consumer_gone {
                 return false;
@@ -2116,10 +2140,20 @@ impl StreamQueueBudget {
                 state.queued += len;
                 return true;
             }
-            state = match self.drained.wait(state) {
-                Ok(state) => state,
+            let (next, timed_out) = match self.drained.wait_timeout(state, remaining) {
+                Ok((next, result)) => (next, result.timed_out()),
                 Err(_) => return false,
             };
+            state = next;
+            if timed_out {
+                // Report it the way a departed consumer is reported: the caller
+                // already knows how to unwind that, and from a producer's side
+                // the two are the same situation.
+                state.consumer_gone = true;
+                self.drained.notify_all();
+                return false;
+            }
+            remaining = deadline.saturating_duration_since(Instant::now());
         }
     }
 
@@ -3675,6 +3709,44 @@ impl component_bindings::tachyon::mesh::response_body::HostStreamingResponse
 #[cfg(all(test, feature = "ai-inference"))]
 mod stream_budget_tests {
     use super::*;
+
+    /// A consumer that stops reading without disconnecting must not park the
+    /// producer forever.
+    ///
+    /// Disconnecting wakes `consumer_gone`; going quiet wakes nothing, and the
+    /// generation deadline and upstream timeouts are only consulted between
+    /// sink calls, so none of them can reach a thread parked inside one. The
+    /// stall limit is what makes that case terminate, and the producer reports
+    /// it exactly as it reports a departure — from its side the two are the
+    /// same situation.
+    #[test]
+    fn a_consumer_that_stops_draining_releases_the_producer_at_the_stall_limit() {
+        let budget = StreamQueueBudget::default();
+        assert!(
+            budget.reserve(STREAM_QUEUE_BUDGET_BYTES),
+            "the first event fits"
+        );
+
+        let started = Instant::now();
+        let admitted = budget.reserve_until(
+            STREAM_QUEUE_BUDGET_BYTES,
+            Instant::now() + Duration::from_millis(50),
+        );
+
+        assert!(
+            !admitted,
+            "a stalled consumer must refuse the reservation, not hold the producer"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must end on its own deadline, not on the production limit"
+        );
+        assert!(
+            !budget.reserve(1),
+            "once the stall is called, later events take the same answer rather than \
+             re-waiting the whole limit each time"
+        );
+    }
 
     #[test]
     fn the_budget_admits_until_it_is_spent_and_again_once_drained() {
