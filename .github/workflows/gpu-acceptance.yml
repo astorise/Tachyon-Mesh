@@ -97,10 +97,28 @@ jobs:
 
       # Every test below returns early when the checkpoint is missing, so
       # without this the job would go green having executed nothing.
+      #
+      # Resolved here rather than assumed. The path used to be read straight
+      # from the process environment, which the workflow never sets — so it
+      # only worked if the runner image happened to export it, and an operator
+      # enabling this job had nowhere in the repository to say where the
+      # weights are. The repository variable is that place; a runner that
+      # exports its own value still wins nothing and loses nothing, because it
+      # is the fallback.
       - name: Require the installed checkpoint
         run: |
-          : "${TACHYON_QWEN35_MOE_NVFP4_DIR:?missing TACHYON_QWEN35_MOE_NVFP4_DIR}"
-          test -d "$TACHYON_QWEN35_MOE_NVFP4_DIR"
+          checkpoint="${{ vars.TACHYON_QWEN35_MOE_NVFP4_DIR }}"
+          checkpoint="${checkpoint:-${TACHYON_QWEN35_MOE_NVFP4_DIR:-}}"
+          if [ -z "$checkpoint" ]; then
+            echo "::error::no Qwen 3.5 NVFP4 checkpoint configured. Set the repository variable TACHYON_QWEN35_MOE_NVFP4_DIR to its directory on the runner, or export it from the runner image."
+            exit 1
+          fi
+          if [ ! -d "$checkpoint" ]; then
+            echo "::error::TACHYON_QWEN35_MOE_NVFP4_DIR is \`$checkpoint\`, which is not a directory on this runner."
+            exit 1
+          fi
+          echo "Using checkpoint $checkpoint"
+          echo "TACHYON_QWEN35_MOE_NVFP4_DIR=$checkpoint" >> "$GITHUB_ENV"
 
       # The batched prefill's only safety argument is that chunk size does not
       # change the result. There is no synthetic Qwen 3.5 fixture, so this
