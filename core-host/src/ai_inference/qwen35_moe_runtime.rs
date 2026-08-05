@@ -876,6 +876,13 @@ impl Qwen35MoeRuntime {
                         Ok(ChatTurn {
                             role: message.role,
                             content: content.to_owned(),
+                            // This runtime's request shape carries no tool
+                            // history yet, so there is nothing to relay. The
+                            // fields exist so the template sees the same
+                            // message shape whichever runtime built it.
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;

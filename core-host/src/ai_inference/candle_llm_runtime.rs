@@ -1935,11 +1935,32 @@ pub(crate) struct ChatTurn {
     /// Absent or `null` on an assistant turn that carried only tool calls —
     /// which is exactly what a client replays on the next turn of an agentic
     /// conversation. Requiring a string here rejected the whole request, so the
-    /// second turn after any tool call failed outright. This runtime has no
-    /// tool-aware template, so the turn renders as empty content rather than
-    /// carrying the calls, but the conversation survives.
+    /// second turn after any tool call failed outright.
     #[serde(default, deserialize_with = "nullable_string")]
     pub(crate) content: String,
+    /// The calls an assistant turn made, carried through to the template
+    /// unchanged.
+    ///
+    /// Kept rather than dropped, because the checkpoint's own template knows
+    /// what to do with them: a Qwen or Mistral template branches on
+    /// `message.tool_calls` and renders the tagged form the model was tuned on.
+    /// Dropping them left the assistant's turn as empty content, so on the
+    /// second turn of an agentic conversation the model saw a tool result with
+    /// no request behind it — and answered as if it had never asked. The
+    /// conversation survived; its meaning did not.
+    ///
+    /// Opaque `Value`: this side has no business reshaping a call it is only
+    /// relaying, and a template reads whatever fields its own model expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_calls: Option<serde_json::Value>,
+    /// Which call a `role: "tool"` turn answers. Templates that render tool
+    /// results key the pairing off it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_call_id: Option<String>,
+    /// The function a tool result came from, for the templates that render the
+    /// name beside the result rather than relying on the id alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
 }
 
 /// Deserialize a missing or `null` string as empty rather than failing.
@@ -6708,6 +6729,73 @@ mod tests {
     /// completion abandoned mid-function reported as having ended cleanly.
     /// The schema has no word for "ran out of clock"; `length` is the one that
     /// means there was more to say.
+    /// A replayed tool exchange has to reach the template intact.
+    ///
+    /// `ChatTurn` carried only role and content, so an assistant turn that made
+    /// a call rendered as empty content. On the second turn of an agentic
+    /// conversation the model therefore saw a tool *result* with no request
+    /// behind it, and answered as if it had never asked. The conversation
+    /// survived; its meaning did not.
+    ///
+    /// The template here mirrors how a real Qwen template branches, so what is
+    /// checked is that the fields arrive — not that this runtime invents any
+    /// rendering of its own.
+    #[test]
+    fn a_replayed_tool_call_and_its_result_reach_the_chat_template() {
+        let template = ChatTemplate {
+            source: concat!(
+                "{% for m in messages %}",
+                "<|{{ m.role }}|>{{ m.content }}",
+                "{%- if m.tool_calls %}<call>{{ m.tool_calls[0].function.name }}</call>{% endif %}",
+                "{%- if m.tool_call_id %}<for>{{ m.tool_call_id }}</for>{% endif %}",
+                "{%- if m.name %}<from>{{ m.name }}</from>{% endif %}",
+                "{% endfor %}"
+            )
+            .to_owned(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+
+        let messages = vec![
+            ChatTurn {
+                role: "assistant".to_owned(),
+                content: String::new(),
+                tool_calls: Some(serde_json::json!([{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }])),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatTurn {
+                role: "tool".to_owned(),
+                content: "fn main() {}".to_owned(),
+                tool_calls: None,
+                tool_call_id: Some("c1".to_owned()),
+                name: Some("read_file".to_owned()),
+            },
+        ];
+
+        let rendered = template.render(&messages).expect("template renders");
+        assert!(
+            rendered.contains("<call>read_file</call>"),
+            "the assistant's call must survive the replay: {rendered}"
+        );
+        assert!(
+            rendered.contains("<for>c1</for>"),
+            "the result must stay paired with the call it answers: {rendered}"
+        );
+        assert!(
+            rendered.contains("<from>read_file</from>"),
+            "templates that name the function beside the result need it: {rendered}"
+        );
+        assert!(
+            rendered.contains("fn main() {}"),
+            "the result's own content is still the content: {rendered}"
+        );
+    }
+
     #[test]
     fn a_generation_the_deadline_cut_short_reports_length() {
         let mut emit = |_: &str| StreamControl::Continue;
@@ -8391,6 +8479,9 @@ mod tests {
         let messages = vec![ChatTurn {
             role: "user".to_owned(),
             content: "  hi  ".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         }];
         let rendered = reloaded
             .render_chat(&messages)
