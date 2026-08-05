@@ -890,15 +890,19 @@ pub(crate) async fn forward_request_to_override(
     })?;
     let status = response.status();
     let response_headers = response.headers().clone();
-    let response_body = response.bytes().await.map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("failed to read override response body from `{destination}`: {error}"),
-        )
-    })?;
+    // Streamed through rather than read whole. `bytes()` waited for the peer to
+    // finish before this node sent anything, so a redirected SSE generation
+    // arrived as one blob at the end: time-to-first-token became total
+    // generation time, and an agentic client watching for deltas saw nothing
+    // until the answer was already complete. Mesh QoS redirects exactly the
+    // requests a node is too busy to serve, so this hit hardest when the
+    // stream mattered most.
+    //
+    // A buffered response streams just as correctly — one chunk — so this needs
+    // no branch on content type.
     let mut built = Response::builder()
         .status(status)
-        .body(Body::from(response_body))
+        .body(Body::from_stream(response.bytes_stream()))
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

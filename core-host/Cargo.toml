@@ -149,7 +149,14 @@ prometheus = "0.14"
 prost = { version = "0.14", optional = true }
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# `stream` is what lets a redirected SSE response stay a stream: without it the
+# mesh's peer forward can only read a body whole, which turns a redirected
+# token stream into one blob delivered at the end.
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "rustls",
+    "stream",
+] }
 redb = "4.0"
 semver = "1.0"
 schemars = "1"
