@@ -2104,6 +2104,7 @@ fn scope_registry_rows_to_route(
         .collect()
 }
 
+#[cfg(feature = "ai-inference")]
 const STREAM_CHANNEL_CAPACITY: usize = 64;
 
 /// Bytes of decoded output allowed to sit between the generation thread and the
@@ -2133,6 +2134,7 @@ const STREAM_QUEUE_BUDGET_BYTES: usize = 256 * 1024;
 /// Measured from the last drain rather than from the start of the stream, so a
 /// slow but progressing consumer is never cut off. Nothing draining for this
 /// long is a consumer in name only.
+#[cfg(feature = "ai-inference")]
 const STREAM_BACKPRESSURE_STALL_LIMIT: Duration = Duration::from_secs(120);
 
 /// The queued-bytes budget for one stream.
