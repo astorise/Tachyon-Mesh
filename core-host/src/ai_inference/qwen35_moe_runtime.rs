@@ -883,6 +883,7 @@ impl Qwen35MoeRuntime {
                             tool_calls: None,
                             tool_call_id: None,
                             name: None,
+                            function_call: None,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;

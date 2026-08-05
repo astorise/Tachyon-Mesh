@@ -1961,6 +1961,14 @@ pub(crate) struct ChatTurn {
     /// name beside the result rather than relying on the id alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
+    /// The pre-`tool_calls` shape of an assistant turn that made a call.
+    ///
+    /// Carried for the same reason as `tool_calls`, and separately because a
+    /// client replaying a legacy conversation sends this one instead. A
+    /// template that handles it reads it; one that does not renders as it
+    /// always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) function_call: Option<serde_json::Value>,
 }
 
 /// Deserialize a missing or `null` string as empty rather than failing.
@@ -6809,6 +6817,7 @@ mod tests {
                 }])),
                 tool_call_id: None,
                 name: None,
+                function_call: None,
             },
             ChatTurn {
                 role: "tool".to_owned(),
@@ -6816,6 +6825,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: Some("c1".to_owned()),
                 name: Some("read_file".to_owned()),
+                function_call: None,
             },
         ];
 
@@ -8524,6 +8534,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            function_call: None,
         }];
         let rendered = reloaded
             .render_chat(&messages)

@@ -155,6 +155,15 @@ struct ChatMessage {
     /// Legacy function-call name on a tool turn; some upstreams still key on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// The pre-`tool_calls` shape of an assistant turn that made a call.
+    ///
+    /// A client continuing a legacy conversation replays it, and with no field
+    /// to land in it was dropped: the upstream then saw a `role: "function"`
+    /// result with no request before it, and answered as though it had never
+    /// asked. Relayed opaquely, like `tool_calls`, because the provider that
+    /// still speaks this dialect is the one that knows its shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_call: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -166,6 +175,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             name: None,
+            function_call: None,
         }
     }
 }
@@ -747,9 +757,11 @@ fn handle_chat_completions_buffered(
                     Some(parsed.content)
                 },
                 tool_calls: parsed.tool_calls,
-                // Response-side only: an assistant turn never carries these.
+                // Response-side only: this node answers in the modern shape,
+                // and an assistant turn never carries the other three.
                 tool_call_id: None,
                 name: None,
+                function_call: None,
             },
             finish_reason,
         }],
@@ -2162,6 +2174,37 @@ mod tests {
             arguments: "{}".to_owned(),
         }]);
         assert_eq!(calls[0].id, "call_tachyon_0");
+    }
+
+    #[test]
+    fn a_legacy_function_call_survives_the_message_history() {
+        // A client continuing a pre-`tool_calls` conversation replays the
+        // assistant turn that made the call. With no field to land in it was
+        // dropped, so the upstream saw a `role: "function"` result with no
+        // request before it and answered as though it had never asked.
+        let raw = serde_json::json!({
+            "model": "coder",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": null,
+                 "function_call": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"role": "function", "name": "read_file", "content": "fn main() {}"}
+            ]
+        });
+        let request: ChatCompletionRequest =
+            serde_json::from_value(raw).expect("a legacy history is a valid request");
+
+        let payload = build_generation_request(&request).expect("request builds");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        let assistant = &payload["messages"][1];
+        assert_eq!(
+            assistant["function_call"]["name"], "read_file",
+            "the call the assistant made has to reach the host: {payload}"
+        );
+        // And the result stays paired with it, which is what makes the pair
+        // legible to a provider that still speaks this dialect.
+        assert_eq!(payload["messages"][2]["name"], "read_file");
+        assert_eq!(payload["messages"][2]["content"], "fn main() {}");
     }
 
     #[test]
