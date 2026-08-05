@@ -503,10 +503,14 @@ fn declared_model_format(path: &str) -> Option<&'static str> {
 /// config. `dynamic` bindings are skipped entirely — they are registered by the
 /// upload that materialises them.
 #[cfg(feature = "ai-inference")]
+/// Returns how many registry transactions failed, so a caller that placed
+/// withdrawal reservations before the swap can tell whether they were lifted.
+/// Zero means the registry now describes the runtime that is answering.
 pub(crate) fn publish_configured_model_bindings(
     core_store: &crate::store::CoreStore,
     config: &crate::IntegrityConfig,
-) {
+) -> usize {
+    let mut failures = 0usize;
     let mut configured = std::collections::HashSet::new();
     for route in &config.routes {
         for binding in &route.models {
@@ -589,6 +593,7 @@ pub(crate) fn publish_configured_model_bindings(
                     crate::store::KvPartitionUpdate::Set(value)
                 },
             ) {
+                failures += 1;
                 tracing::warn!(
                     alias = %binding.alias,
                     "failed to refresh configured model binding in the registry: {error:#}"
@@ -615,6 +620,7 @@ pub(crate) fn publish_configured_model_bindings(
                 }
             })
         {
+            failures += 1;
             tracing::warn!(
                 %alias,
                 "failed to drop a stale configured model binding from the registry: {error:#}"
@@ -623,6 +629,7 @@ pub(crate) fn publish_configured_model_bindings(
             tracing::info!(%alias, "dropped a configured model binding that left the manifest");
         }
     }
+    failures
 }
 
 /// Write an uploaded model's registry row, unless a configured binding owns
@@ -1525,6 +1532,44 @@ mod configured_binding_registry_tests {
             denied.contains("sealed manifest"),
             "unexpected error: {denied}"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Publication reports what it could not write.
+    ///
+    /// The withdrawal before a swap leaves a reservation on every alias it
+    /// touched, and this publication is what lifts them — so a caller has to be
+    /// able to tell whether it did. Returning nothing meant a failed
+    /// transaction left the alias hidden and refused to uploads with no way to
+    /// notice, and no reconciliation anywhere to fix it before the next reload.
+    #[test]
+    fn publication_reports_the_transactions_it_completed() {
+        let (store, dir) = temp_store();
+        let config = config_with(vec![
+            binding("coder", "openai:http://127.0.0.1:8080/v1", false),
+            binding("embed", "/models/embed", false),
+        ]);
+
+        assert_eq!(
+            publish_configured_model_bindings(&store, &config),
+            0,
+            "a healthy store writes every row, so nothing stays withdrawn"
+        );
+
+        // And the sweep of a dropped alias counts the same way, so a reload
+        // that removes a binding can also tell whether the removal landed.
+        assert_eq!(
+            publish_configured_model_bindings(&store, &config_with(Vec::new())),
+            0
+        );
+        assert!(
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "coder")
+                .expect("read")
+                .is_none(),
+            "a binding that left the manifest is swept, which is what frees its reservation"
+        );
+
         let _ = fs::remove_dir_all(dir);
     }
 
