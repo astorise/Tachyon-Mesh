@@ -749,18 +749,62 @@ impl UpstreamOpenAiRuntime {
     /// volunteer it (and every upstream on the buffered path) are reported;
     /// the rest report nothing, which the caller renders as an absent `usage`
     /// rather than as zeros.
-    fn read_usage(payload: &Value) -> Option<TokenUsage> {
-        let usage = payload.get("usage").filter(|usage| !usage.is_null())?;
-        let field = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0) as u32;
-        let prompt_tokens = field("prompt_tokens");
-        let completion_tokens = field("completion_tokens");
+    /// An absent or null counter is genuinely unreported and reads as zero. A
+    /// *present* one that is not a non-negative integer, or one too large for
+    /// the `u32` the counters cross the WIT boundary as, is a malformed
+    /// response and says so. Both used to be swallowed: `as_u64().unwrap_or(0)`
+    /// turned `"100"` into an authoritative zero, and the unchecked cast turned
+    /// `4294967297` into `1` — client-visible billing figures, quietly wrong,
+    /// with the other counter lending them credibility.
+    fn read_usage(payload: &Value) -> Result<Option<TokenUsage>, String> {
+        let Some(usage) = payload.get("usage").filter(|usage| !usage.is_null()) else {
+            return Ok(None);
+        };
+        let field = |name: &str| -> Result<u32, String> {
+            match usage.get(name) {
+                None | Some(Value::Null) => Ok(0),
+                Some(value) => {
+                    let count = value.as_u64().ok_or_else(|| {
+                        format!(
+                            "`usage.{name}` must be a non-negative integer, got {}",
+                            json_type_name(value)
+                        )
+                    })?;
+                    u32::try_from(count).map_err(|_| {
+                        format!("`usage.{name}` is {count}, beyond the range a token count carries")
+                    })
+                }
+            }
+        };
+        let prompt_tokens = field("prompt_tokens")?;
+        let completion_tokens = field("completion_tokens")?;
         if prompt_tokens == 0 && completion_tokens == 0 {
-            return None;
+            return Ok(None);
         }
-        Some(TokenUsage {
+        Ok(Some(TokenUsage {
             prompt_tokens,
             completion_tokens,
-        })
+        }))
+    }
+
+    /// The choice's `finish_reason`, or why it cannot be read.
+    ///
+    /// Absent, null and empty all mean "not reported yet" — a streamed frame
+    /// carries one only at the end. A present non-string does not: `as_str`
+    /// used to turn it into that same absence, and `guest-openai` renders an
+    /// absent reason as `stop`, so an upstream that truncated at its own token
+    /// limit could report the answer complete. A client then runs half a
+    /// function believing it read the whole one.
+    fn read_finish_reason(choice: Option<&Value>) -> Result<Option<String>, String> {
+        match choice.and_then(|choice| choice.get("finish_reason")) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(reason)) if reason.is_empty() => Ok(None),
+            Some(Value::String(reason)) => Ok(Some(reason.clone())),
+            Some(other) => Err(format!(
+                "`choices[0].finish_reason` must be a string, got {}",
+                json_type_name(other)
+            )),
+        }
     }
 
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<UpstreamGeneration, UpstreamError> {
@@ -778,16 +822,23 @@ impl UpstreamOpenAiRuntime {
         let payload: Value = read_json(&self.alias, response)?;
         // Every OpenAI-shaped upstream returns `usage` on the buffered route,
         // so unlike the streaming path this is reliably populated.
-        let usage = Self::read_usage(&payload);
+        let usage =
+            Self::read_usage(&payload).map_err(|detail| UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail,
+            })?;
         // `length` means the upstream hit its own token limit, so the answer is
         // truncated. Reporting it as `stop` let a client run half a function.
-        let finish_reason = payload
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("finish_reason"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let finish_reason = Self::read_finish_reason(
+            payload
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first()),
+        )
+        .map_err(|detail| UpstreamError::MalformedResponse {
+            alias: self.alias.clone(),
+            detail,
+        })?;
         let message = payload
             .get("choices")
             .and_then(Value::as_array)
@@ -992,7 +1043,12 @@ impl UpstreamOpenAiRuntime {
                 abandoned = true;
                 break;
             }
-            if let Some(reported) = Self::read_usage(&frame) {
+            if let Some(reported) =
+                Self::read_usage(&frame).map_err(|detail| UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                })?
+            {
                 usage = Some(reported);
             }
             // Absent is a usage-only frame and an empty array is a legal
@@ -1022,12 +1078,31 @@ impl UpstreamOpenAiRuntime {
             // Sent on the last content-bearing frame, before `[DONE]`. Keeping
             // it is what lets the caller tell a completion that finished from
             // one the upstream truncated at its own token limit.
-            if let Some(reported) = choice
-                .and_then(|choice| choice.get("finish_reason"))
-                .and_then(Value::as_str)
-                .filter(|reason| !reason.is_empty())
-            {
-                finish_reason = Some(reported.to_owned());
+            if let Some(reported) = Self::read_finish_reason(choice).map_err(|detail| {
+                UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                }
+            })? {
+                // Two different reasons for one choice is not a stream this
+                // side can reconcile. Last-write-wins let a `length` — the
+                // answer was truncated — be overwritten by a later `stop`,
+                // which is precisely the direction that loses information the
+                // caller acts on.
+                if finish_reason
+                    .as_deref()
+                    .is_some_and(|earlier| earlier != reported)
+                {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "upstream reported conflicting finish reasons for one choice: \
+                             `{}` then `{reported}`",
+                            finish_reason.unwrap_or_default()
+                        ),
+                    });
+                }
+                finish_reason = Some(reported);
             }
             // The same rule one level up: a frame legitimately carries no
             // `delta` — a final frame that only reports `finish_reason` does —
@@ -2040,6 +2115,88 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "the read must give up on the poll interval, not on the request timeout; took {elapsed:?}"
         );
+    }
+
+    /// A present-but-wrong counter is a malformed response, not a zero.
+    ///
+    /// `as_u64().unwrap_or(0)` published an authoritative zero beside a real
+    /// count, and the real one lent it credibility — a client-visible billing
+    /// figure, quietly wrong. Absent and null stay zero, because those are
+    /// genuinely "not reported".
+    #[test]
+    fn a_malformed_usage_counter_fails_the_response_instead_of_reading_as_zero() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"}}],
+                "usage":{"prompt_tokens":"100","completion_tokens":5}}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a non-integer usage counter must not be reported as measured");
+        };
+        let error = error.to_string();
+        assert!(error.contains("usage.prompt_tokens"), "{error}");
+    }
+
+    /// The counters cross the WIT boundary as `u32`; an unchecked cast turned
+    /// `4294967297` into `1`, which is worse than refusing it.
+    #[test]
+    fn a_usage_counter_beyond_u32_fails_rather_than_wrapping() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"}}],
+                "usage":{"prompt_tokens":4294967297,"completion_tokens":5}}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a usage counter beyond u32 must not wrap into a plausible one");
+        };
+        let error = error.to_string();
+        assert!(error.contains("beyond the range"), "{error}");
+    }
+
+    /// `guest-openai` renders an absent finish reason as `stop`, so silently
+    /// dropping a malformed one reports a truncated answer as complete.
+    #[test]
+    fn a_non_string_finish_reason_fails_rather_than_reading_as_absent() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"},"finish_reason":42}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a non-string finish reason must not be read as absence");
+        };
+        let error = error.to_string();
+        assert!(error.contains("finish_reason"), "{error}");
+    }
+
+    /// Last-write-wins let a `length` be overwritten by a later `stop` — the
+    /// one direction that turns a truncated answer into a complete-looking one.
+    #[test]
+    fn conflicting_streamed_finish_reasons_fail_the_stream() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &[
+                r#"data: {"choices":[{"delta":{"content":"half"},"finish_reason":"length"}]}"#,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                "data: [DONE]",
+                "",
+            ]
+            .join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("two different finish reasons for one choice must fail the stream");
+        };
+        let error = error.to_string();
+        assert!(error.contains("conflicting finish reasons"), "{error}");
     }
 
     #[test]
