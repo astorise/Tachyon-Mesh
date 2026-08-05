@@ -1561,6 +1561,16 @@ struct StreamedToolCalls {
     /// In first-seen order, so the emitted list preserves the upstream's own
     /// ordering.
     calls: Vec<StreamedToolCall>,
+    /// `index` to its slot in `calls`.
+    ///
+    /// The order has to come from a `Vec`, but finding a slot by scanning it
+    /// made every fragment cost a walk of everything seen so far. One call
+    /// streamed in many pieces is the ordinary case and stays cheap either way;
+    /// many *distinct* indices is the one that does not, and the 64 MiB stream
+    /// bound leaves room for hundreds of thousands of small fragments — so a
+    /// broken or hostile upstream could spend this node's CPU quadratically for
+    /// the price of its own bandwidth.
+    by_index: std::collections::HashMap<u64, usize>,
 }
 
 impl StreamedToolCalls {
@@ -1593,9 +1603,10 @@ impl StreamedToolCalls {
                 )
             }
         };
-        let slot = match self.calls.iter_mut().find(|call| call.index == index) {
-            Some(slot) => slot,
+        let slot = match self.by_index.get(&index).copied() {
+            Some(at) => &mut self.calls[at],
             None => {
+                self.by_index.insert(index, self.calls.len());
                 self.calls.push(StreamedToolCall {
                     index,
                     ..StreamedToolCall::default()
@@ -2430,6 +2441,53 @@ mod tests {
             panic!("a non-function call type must not be silently relabelled");
         };
         assert!(error.to_string().contains("only `function`"), "{error}");
+    }
+
+    /// The map and the order have to agree.
+    ///
+    /// The lookup moved off a linear scan, and the risk of that is a slot found
+    /// by index that is not the slot the order puts it in — fragments landing
+    /// on the wrong call, which is silent and produces a dispatchable result.
+    /// So this interleaves indices rather than filling them in turn, and checks
+    /// both the grouping and the first-seen ordering.
+    #[test]
+    fn fragments_reach_their_own_call_whatever_order_the_indices_arrive_in() {
+        let fragment = |index: u64, name: Option<&str>, args: &str| {
+            let mut value = serde_json::json!({ "index": index });
+            let function = value
+                .as_object_mut()
+                .expect("object")
+                .entry("function")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(name) = name {
+                function["name"] = serde_json::json!(name);
+            }
+            function["arguments"] = serde_json::json!(args);
+            value
+        };
+
+        let mut calls = StreamedToolCalls::default();
+        // Opened out of order, then continued out of order.
+        calls
+            .absorb(&fragment(2, Some("second"), "{\"b\":"))
+            .expect("open 2");
+        calls
+            .absorb(&fragment(0, Some("first"), "{\"a\":"))
+            .expect("open 0");
+        calls.absorb(&fragment(2, None, "2}")).expect("continue 2");
+        calls.absorb(&fragment(0, None, "1}")).expect("continue 0");
+
+        let finished = calls.finish().expect("both calls are complete");
+        assert_eq!(
+            finished
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"],
+            "the emitted order is first-seen, not index order"
+        );
+        assert_eq!(finished[0].arguments, r#"{"b":2}"#);
+        assert_eq!(finished[1].arguments, r#"{"a":1}"#);
     }
 
     /// An embedding input is bounded like a prompt is.
