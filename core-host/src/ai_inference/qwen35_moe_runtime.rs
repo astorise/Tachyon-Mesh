@@ -731,6 +731,10 @@ impl Qwen35MoeRuntime {
         let mut processor =
             LogitsProcessor::from_sampling(request.seed.unwrap_or(299_792_458), sampling);
         let mut generated = Vec::<u32>::new();
+        // Every token this decode produced, EOS included — which is what
+        // `completion_tokens` reports and what `generated` deliberately does
+        // not hold.
+        let mut sampled = 0u32;
         let mut emitted = 0usize;
         let mut abandoned = false;
         // Incremental, like every other production decode loop. Re-decoding the
@@ -763,6 +767,14 @@ impl Qwen35MoeRuntime {
             }
             let tensor = Tensor::from_vec(logits, self.config.vocab_size, &Device::Cpu)?;
             let token = processor.sample(&tensor)?;
+            // Counted where it is produced, not where it is kept. `generated`
+            // holds what gets decoded into text, and EOS never joins it —
+            // pushing it would emit its literal form. But it *was* generated:
+            // it cost a forward pass and a sampling step, and the generic
+            // Candle runtime counts it, so reading the count off `generated`
+            // made the same request report different `completion_tokens`
+            // depending on which backend served the alias.
+            sampled += 1;
             if criteria.is_eos(token) {
                 finish = criteria.finish_reason(token, decoder.text(), false);
                 break;
@@ -795,7 +807,7 @@ impl Qwen35MoeRuntime {
         }
         let usage = TokenUsage {
             prompt_tokens: encoded.len() as u32,
-            completion_tokens: generated.len() as u32,
+            completion_tokens: sampled,
         };
         // Same rule as the generic Candle runtime, and now literally the same
         // code: only budget exhaustion is named, because that is the case an
@@ -1917,6 +1929,17 @@ mod tests {
         assert_eq!(buffered_usage, streamed_usage);
         assert_eq!(buffered_finish, streamed_finish);
         assert!(buffered_usage.completion_tokens > 0);
+        // The request asks for one new token, and a completion that ends
+        // naturally samples EOS after it. Reading the count off `generated` —
+        // which never holds EOS, because pushing it would emit its literal
+        // form — reported one token where the generic Candle runtime reports
+        // two for the same request, so the figure a client is billed on
+        // depended on which backend served the alias.
+        assert!(
+            buffered_usage.completion_tokens >= 2,
+            "a naturally-ended completion counts the EOS it sampled, got {}",
+            buffered_usage.completion_tokens
+        );
         let working_set = runtime.working_set.lock().expect("working set");
         eprintln!(
             "{}",
