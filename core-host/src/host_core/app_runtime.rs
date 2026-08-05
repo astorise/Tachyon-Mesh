@@ -997,11 +997,18 @@ pub(crate) fn requested_model_alias(
 /// mesh QoS then watched an idle local queue while the upstream the request
 /// actually targeted was saturated.
 ///
-/// Only the last segment is taken, and only when the prefix is a plain engine
-/// label, so an alias is never invented from an arbitrary slashed string.
+/// The engine prefix is the part before the *first* slash, because that is
+/// where the id puts it. Taking the part after the last one instead truncated
+/// any alias that contains a slash — `gguf/Qwen/Qwen3-Coder` yielded
+/// `Qwen3-Coder`, which matches nothing, while the full string does not match
+/// either. A model named the way Hugging Face names them was therefore
+/// unreachable through the qualified id this route advertises for it.
+///
+/// The unqualified form is still tried first, so an alias that genuinely
+/// contains a slash wins before anything is stripped.
 fn model_alias_candidates(requested: &str) -> [&str; 2] {
     let tail = requested
-        .rsplit_once('/')
+        .split_once('/')
         .map(|(_engine, alias)| alias)
         .unwrap_or(requested);
     [requested, tail]
@@ -1035,6 +1042,56 @@ fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) 
 #[cfg(test)]
 mod requested_model_alias_tests {
     use super::*;
+
+    /// A model named the way Hugging Face names them stays reachable.
+    ///
+    /// The engine prefix is the part before the *first* slash, because that is
+    /// where `{engine}/{alias}` puts it. Stripping from the last slash instead
+    /// truncated any alias containing one, so `gguf/Qwen/Qwen3-Coder` produced
+    /// `Qwen3-Coder` — which matches nothing — while the full string matched
+    /// nothing either.
+    #[test]
+    fn a_qualified_id_keeps_the_slashes_inside_the_alias() {
+        assert_eq!(
+            model_alias_candidates("gguf/Qwen/Qwen3-Coder"),
+            ["gguf/Qwen/Qwen3-Coder", "Qwen/Qwen3-Coder"]
+        );
+        // The ordinary case is unchanged.
+        assert_eq!(
+            model_alias_candidates("gguf/coder"),
+            ["gguf/coder", "coder"]
+        );
+        // And an unqualified alias offers itself twice rather than inventing a
+        // second candidate.
+        assert_eq!(model_alias_candidates("coder"), ["coder", "coder"]);
+    }
+
+    /// The unqualified form is tried first, so an alias that really does
+    /// contain a slash wins before anything is stripped.
+    #[test]
+    fn an_alias_containing_a_slash_matches_before_any_prefix_is_removed() {
+        let route = IntegrityRoute {
+            path: "/ai".to_owned(),
+            models: vec![IntegrityModelBinding {
+                alias: "Qwen/Qwen3-Coder".to_owned(),
+                path: "/models/qwen".to_owned(),
+                device: ModelDevice::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: HardwareStrategy::default(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("Qwen/Qwen3-Coder".to_owned())),
+            Some("Qwen/Qwen3-Coder".to_owned())
+        );
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("gguf/Qwen/Qwen3-Coder".to_owned())),
+            Some("Qwen/Qwen3-Coder".to_owned()),
+            "the qualified id this route advertises has to resolve back to it"
+        );
+    }
 
     fn model_binding(alias: &str) -> IntegrityModelBinding {
         IntegrityModelBinding {
