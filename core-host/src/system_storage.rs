@@ -698,6 +698,7 @@ pub(crate) fn apply_guest_registry_write(
                 .map_err(|error| format!("{error:#}")),
         };
     }
+    reject_forged_config_marker(key, value.as_ref())?;
     let mut alias_taken = false;
     core_store
         .kv_partition_update(AI_MODELS_REGISTRY_TABLE, key, |current| {
@@ -738,6 +739,9 @@ pub(crate) fn apply_guest_registry_batch(
             .kv_partition_batch_set(table, entries)
             .map_err(|error| format!("{error:#}"));
     }
+    for (key, value) in entries {
+        reject_forged_config_marker(key, Some(value))?;
+    }
     core_store
         .kv_partition_batch_update(AI_MODELS_REGISTRY_TABLE, entries, |key, current| {
             if row_is_config_owned(current) {
@@ -749,6 +753,32 @@ pub(crate) fn apply_guest_registry_batch(
             Ok(())
         })
         .map_err(|error| format!("{error:#}"))
+}
+
+/// Refuse a guest-supplied row that claims to be the manifest publisher's.
+///
+/// The ownership check reads the row already stored; it says nothing about
+/// what is being written. A component with registry write access could
+/// therefore set a *free* alias to `{"source":"config",…}` and have
+/// `row_is_config_owned` treat it as manifest-owned from then on — every later
+/// upload refused, every guest update and delete refused, and no manifest
+/// entry anywhere to explain why. The alias is claimed until someone edits the
+/// store by hand.
+///
+/// Refused rather than rewritten. A guest that reads a config-owned row and
+/// writes it back is already stopped by the ownership check, so the only way
+/// to reach here with this marker is to mint one for an alias nobody owns —
+/// never legitimate, and quietly stripping it would hide the bug or the
+/// attempt that produced it.
+fn reject_forged_config_marker(key: &str, value: Option<&Vec<u8>>) -> Result<(), String> {
+    if row_is_config_owned(value.map(Vec::as_slice)) {
+        return Err(format!(
+            "model alias `{key}`: a registry row may not declare \
+             `source: \"{REGISTRY_SOURCE_CONFIG}\"`; that marker belongs to the manifest \
+             publisher"
+        ));
+    }
+    Ok(())
 }
 
 /// Marker the guest matches on to turn an ownership refusal into a 409.
@@ -1473,6 +1503,80 @@ mod configured_binding_registry_tests {
             "a removed binding is withdrawn outright"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A guest cannot mint the manifest publisher's marker.
+    ///
+    /// The ownership check reads the row already stored and says nothing about
+    /// what is being written, so a component could set a *free* alias to
+    /// `source: "config"` and have it treated as manifest-owned from then on:
+    /// uploads refused, guest updates and deletes refused, and no manifest
+    /// entry anywhere to explain why. The alias would stay claimed until
+    /// someone edited the store by hand.
+    #[test]
+    fn a_guest_cannot_forge_the_config_ownership_marker() {
+        let (store, dir) = temp_store();
+        let forged = serde_json::json!({
+            "alias": "mine", "engine": "gguf", "vramRequiredMb": 0,
+            "status": "available", "modelPath": "/models/mine",
+            "source": "config",
+        });
+
+        let denied = apply_guest_registry_write(
+            &store,
+            AI_MODELS_REGISTRY_TABLE,
+            "mine",
+            Some(serde_json::to_vec(&forged).expect("serialize")),
+        )
+        .expect_err("a guest row may not declare itself config-owned");
+        assert!(
+            denied.contains("belongs to the manifest publisher"),
+            "{denied}"
+        );
+
+        // Nothing landed, so the alias is still free for its rightful writer.
+        assert!(
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "mine")
+                .expect("read")
+                .is_none(),
+            "a refused write must not leave a partial row behind"
+        );
+
+        // The batch path takes the same answer, and takes it for the whole
+        // batch: one forged entry must not commit its neighbours.
+        let honest = serde_json::json!({
+            "alias": "other", "engine": "gguf", "vramRequiredMb": 0,
+            "status": "available", "modelPath": "/models/other",
+        });
+        let denied = apply_guest_registry_batch(
+            &store,
+            AI_MODELS_REGISTRY_TABLE,
+            &[
+                (
+                    "other".to_owned(),
+                    serde_json::to_vec(&honest).expect("serialize"),
+                ),
+                (
+                    "mine".to_owned(),
+                    serde_json::to_vec(&forged).expect("serialize"),
+                ),
+            ],
+        )
+        .expect_err("a batch carrying a forged marker must be refused whole");
+        assert!(
+            denied.contains("belongs to the manifest publisher"),
+            "{denied}"
+        );
+        assert!(
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "other")
+                .expect("read")
+                .is_none(),
+            "the honest entry beside a forged one must not commit on its own"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
