@@ -1671,14 +1671,17 @@ mod tests {
         let model = ModelOptNvfp4Directory::try_load("qwen35-parity", &path)
             .expect("checkpoint parser should succeed")
             .expect("checkpoint should be detected as ModelOpt/NVFP4");
+        // A load failure is the failure, not a reason to skip. This test is the
+        // proof that decides whether the scalar runtime can be deleted, and
+        // passing green when the model it compares against cannot even be
+        // built is the one outcome that makes it worthless: the migration would
+        // read a passing check that had compared nothing.
+        //
+        // The one legitimate skip is the CUDA device above — that is hardware
+        // speaking, and there is nothing to compare on a host without one.
         let mut upstream =
-            match crate::ai_inference::qwen35_upstream::load(&model, &runtime.config, &device) {
-                Ok(model) => model,
-                Err(error) => {
-                    eprintln!("skipping upstream-layer parity: {error:#}");
-                    return;
-                }
-            };
+            crate::ai_inference::qwen35_upstream::load(&model, &runtime.config, &device)
+                .expect("the upstream model must load on a host that has a CUDA device");
 
         let encoded = runtime
             .tokenizer

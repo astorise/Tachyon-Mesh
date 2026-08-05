@@ -97,7 +97,16 @@ jobs:
             echo "::error::failed to determine GPU compute capability for NVFP4 CUDA build"
             exit 1
           fi
-          arch="sm_${compute_capability}"
+          # Blackwell's FP4 tensor-core instructions only compile for the
+          # architecture-specific `a` target. Deriving the name by removing the
+          # decimal point alone turns capability 10.0 into `sm_100`, which
+          # builds — silently without the instructions this job exists to
+          # exercise, or fails in the kernel compile. Families that have no `a`
+          # variant keep the plain name.
+          case "$compute_capability" in
+            100|101|103|120|121) arch="sm_${compute_capability}a" ;;
+            *) arch="sm_${compute_capability}" ;;
+          esac
           echo "TACHYON_NVFP4_CUDA_ARCH=$arch" >> "$GITHUB_ENV"
           echo "Using NVFP4 CUDA architecture $arch"
 
