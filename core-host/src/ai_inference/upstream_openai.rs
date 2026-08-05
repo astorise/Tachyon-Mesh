@@ -1264,7 +1264,16 @@ impl UpstreamOpenAiRuntime {
             }
         }
 
-        if !abandoned {
+        // Emitted only once the stream is known to have finished. A tool call
+        // is an instruction the caller acts on, and this used to hand them over
+        // before the missing-sentinel check below could refuse the stream — so
+        // an upstream that died mid-generation, after its call fragments but
+        // before `[DONE]`, got its half-finished intent dispatched and *then*
+        // reported the request as failed. The caller had already run it.
+        //
+        // `abandoned` keeps its own exemption: nobody is left to receive the
+        // calls, so there is nothing to be premature about.
+        if !abandoned && saw_done {
             for call in
                 streamed_tool_calls
                     .finish()
@@ -2405,6 +2414,43 @@ mod tests {
             panic!("a non-function call type must not be silently relabelled");
         };
         assert!(error.to_string().contains("only `function`"), "{error}");
+    }
+
+    /// A call is an instruction, so it waits for the stream to finish.
+    ///
+    /// An upstream that dies after its tool-call fragments but before `[DONE]`
+    /// used to have its half-finished intent dispatched, and *then* the request
+    /// reported as failed — by which time the caller had already run it. The
+    /// stream still fails; what changes is that nothing was handed over first.
+    #[test]
+    fn a_tool_call_is_not_emitted_by_a_stream_that_never_finished() {
+        let emitted = std::cell::RefCell::new(Vec::<String>::new());
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            // Complete fragments, no sentinel: the shape a restart leaves.
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"apply_patch","arguments":"{\"path\":\"a.rs\"}"}}]}}]}"#,
+                "",
+            ]
+            .join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let Err(error) = backend.generate_streaming(&[b"go"], &mut |event: StreamEvent<'_>| {
+            if let StreamEvent::ToolCall(call) = event {
+                emitted.borrow_mut().push(call.name.clone());
+            }
+            StreamControl::Continue
+        }) else {
+            panic!("a stream ending before `[DONE]` is truncated, not complete");
+        };
+        assert!(error.to_string().contains("[DONE]"), "{error}");
+        assert!(
+            emitted.borrow().is_empty(),
+            "nothing may be dispatched from a stream that then fails: {:?}",
+            emitted.borrow()
+        );
     }
 
     /// A present-but-wrong counter is a malformed response, not a zero.
