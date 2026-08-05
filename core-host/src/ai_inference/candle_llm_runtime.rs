@@ -642,9 +642,12 @@ impl<'a> TokenSink<'a> {
     /// `length` has to be named, because that is the case an absent reason
     /// would misreport as a clean finish.
     ///
-    /// A loop that ended for a reason outside the criteria — the wall-clock
-    /// deadline, a departed consumer — records nothing, and the count decides
-    /// as it always did.
+    /// The wall-clock deadline records `Length` when it fires: the answer is
+    /// cut short, and an absent reason would be rendered as `stop` by
+    /// `guest-openai` — telling a caller a completion abandoned mid-function
+    /// finished cleanly. A departed consumer still records nothing, because
+    /// there is nobody left to mislead, and the count decides as it always
+    /// did.
     fn finish_reason(&self) -> Option<&'static str> {
         match self.finish {
             Some(FinishReason::Stop) => None,
@@ -3988,7 +3991,13 @@ impl CandleLlmRuntime {
             // Between chunks, not mid-chunk: a chunk is one forward pass and
             // cannot be interrupted. `prefill_chunk_tokens` is what bounds how
             // long the check can be delayed.
-            if logits.is_some() && Instant::now() >= deadline {
+            //
+            // Checked before the first chunk too. It used to wait for `logits`
+            // to exist, so a request whose deadline had already passed while it
+            // queued still paid for one full forward over its prompt — the
+            // largest single unit of work on this path, and spent on an answer
+            // nobody would receive.
+            if Instant::now() >= deadline {
                 return Ok(Prefill::DeadlineExpired);
             }
             let remaining = prompt_ids.len() - index_pos;
@@ -4320,7 +4329,16 @@ impl CandleLlmRuntime {
             // what was generated — rather than erroring: a partial answer is
             // worth more to the caller than a failure, and the point is to free
             // the scheduler slot.
+            //
+            // Recorded as `Length`, because that is what happened: the answer
+            // is cut short. Breaking without recording left `finish_reason`
+            // resolving to nothing, and `guest-openai` renders an absent reason
+            // as `stop` — so a completion abandoned mid-function was reported
+            // as having finished cleanly, which is the one thing a caller must
+            // not be told. The schema has no word for "ran out of clock", and
+            // `length` is the one that means "there was more to say".
             if Instant::now() >= request.deadline {
+                sink.record_finish(Some(FinishReason::Length));
                 break;
             }
             // Nobody left to read it. Same reasoning as the deadline: the slot
@@ -6680,6 +6698,36 @@ mod tests {
 
         sink.completion_tokens = 4;
         assert_eq!(sink.finish_reason(), Some("length"));
+    }
+
+    /// A generation the clock cut off is not a generation that finished.
+    ///
+    /// The token budget was already reported; the wall-clock deadline was not.
+    /// It breaks the decode loop well short of the budget, so the count says
+    /// nothing, and `guest-openai` renders an absent reason as `stop` — a
+    /// completion abandoned mid-function reported as having ended cleanly.
+    /// The schema has no word for "ran out of clock"; `length` is the one that
+    /// means there was more to say.
+    #[test]
+    fn a_generation_the_deadline_cut_short_reports_length() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        // A budget far from spent, so nothing but the recorded reason can carry
+        // the truncation.
+        sink.record_token_budget(4_096);
+        sink.completion_tokens = 12;
+        assert_eq!(
+            sink.finish_reason(),
+            None,
+            "before the deadline fires there is nothing to report"
+        );
+
+        sink.record_finish(Some(FinishReason::Length));
+        assert_eq!(
+            sink.finish_reason(),
+            Some("length"),
+            "the clock cutting an answer short has to reach the client"
+        );
     }
 
     /// The boundary the count alone cannot express: an answer whose EOS or stop
