@@ -107,18 +107,27 @@ pub(crate) enum UpstreamError {
 }
 
 impl UpstreamError {
-    /// The HTTP status the remote provider returned, when the failure *was* a
-    /// remote response. Every other variant yields `None`: a transport failure
-    /// never reached a server, and a rejected request never left this node, so
-    /// attributing a status to either would report a local fault as the
-    /// provider's.
+    /// The status this node should answer with when an upstream call fails.
+    ///
+    /// A remote response keeps its own status: a 401, a 404 or a 429 means
+    /// something specific and actionable, and flattening it loses that.
+    ///
+    /// A transport failure and an unusable body used to yield `None`, on the
+    /// reasoning that no server had answered so no status was the provider's to
+    /// attribute. But `None` is rendered as 500 `server_error`, which says
+    /// *this* node broke — and an agent retrying a 500 against a node that is
+    /// working fine retries forever against an upstream that is not. Serving
+    /// this alias makes the node a gateway, and 502 is exactly what HTTP has
+    /// for a gateway whose upstream did not answer usably. That is a truthful
+    /// answer, not an attribution.
+    ///
+    /// The two genuinely local faults keep `None`: a malformed binding is this
+    /// deployment's own configuration, and a rejected request never left.
     pub(crate) fn http_status(&self) -> Option<u16> {
         match self {
             Self::Status { status, .. } => Some(*status),
-            Self::InvalidBinding { .. }
-            | Self::InvalidRequest { .. }
-            | Self::Transport { .. }
-            | Self::MalformedResponse { .. } => None,
+            Self::Transport { .. } | Self::MalformedResponse { .. } => Some(502),
+            Self::InvalidBinding { .. } | Self::InvalidRequest { .. } => None,
         }
     }
 }
@@ -2270,6 +2279,59 @@ mod tests {
             SseRead::Eof => "eof",
             SseRead::Failed(_) => "a failure",
         }
+    }
+
+    /// A gateway answers 502 when its upstream does not answer usably.
+    ///
+    /// `None` renders as 500 `server_error` — this node broke — and an agent
+    /// retrying that against a healthy node retries forever against an upstream
+    /// that is not. The two genuinely local faults keep `None`, because neither
+    /// ever reached a provider.
+    #[test]
+    fn an_upstream_that_cannot_answer_is_reported_as_a_gateway_failure() {
+        let status = |error: UpstreamError| error.http_status();
+
+        assert_eq!(
+            status(UpstreamError::Transport {
+                alias: "coder".to_owned(),
+                endpoint: "http://gone.invalid/v1".to_owned(),
+                detail: "connection refused".to_owned(),
+            }),
+            Some(502)
+        );
+        assert_eq!(
+            status(UpstreamError::MalformedResponse {
+                alias: "coder".to_owned(),
+                detail: "not JSON".to_owned(),
+            }),
+            Some(502)
+        );
+        // A remote status is specific and actionable; flattening it loses that.
+        assert_eq!(
+            status(UpstreamError::Status {
+                alias: "coder".to_owned(),
+                endpoint: "http://up.invalid/v1".to_owned(),
+                status: 429,
+                body: "slow down".to_owned(),
+            }),
+            Some(429)
+        );
+        assert_eq!(
+            status(UpstreamError::InvalidRequest {
+                alias: "coder".to_owned(),
+                detail: "no prompt".to_owned(),
+            }),
+            None,
+            "a request that never left this node is not the provider's failure"
+        );
+        assert_eq!(
+            status(UpstreamError::InvalidBinding {
+                alias: "coder".to_owned(),
+                detail: "bad url".to_owned(),
+            }),
+            None,
+            "a malformed binding is this deployment's own configuration"
+        );
     }
 
     /// The pre-`tool_calls` shape some providers still emit.
