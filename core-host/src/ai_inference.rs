@@ -131,6 +131,24 @@ struct UpstreamAdmissionState {
 /// parked-thread count run away from the work in flight.
 const UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT: usize = 4;
 
+/// The node's one upstream admission gate.
+///
+/// Built per runtime, the cap was a property of a *generation* rather than of
+/// the node. A hot reload constructs a new runtime while the previous one is
+/// still draining its requests, so for the length of that overlap each had its
+/// own gate and the node allowed twice the configured concurrency against the
+/// same upstream — which is precisely when a provider is least able to absorb
+/// it, since a reload is often what a saturated node is being restarted for.
+///
+/// Read from the environment once. A reload cannot change the cap, and that is
+/// the honest behaviour: the value bounds sockets held by this process, so
+/// re-reading it mid-flight would leave permits outstanding against a limit
+/// nothing had counted them under.
+fn node_upstream_admission() -> Arc<UpstreamAdmission> {
+    static GATE: OnceLock<Arc<UpstreamAdmission>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(UpstreamAdmission::from_env())))
+}
+
 impl UpstreamAdmission {
     fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
@@ -951,8 +969,9 @@ pub(crate) struct AiInferenceRuntime {
     /// retire one safely while another caller may still be waiting on it.
     loading: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Bounded concurrency for `openai:` bindings, which run off the batch
-    /// scheduler entirely. Shared across clones of the runtime so the cap is a
-    /// node-wide property.
+    /// scheduler entirely. Shared across clones of the runtime *and* across
+    /// runtime generations, so the cap is a property of the node rather than of
+    /// whichever manifest is loaded — see [`node_upstream_admission`].
     upstream_admission: Arc<UpstreamAdmission>,
 }
 
@@ -1063,7 +1082,7 @@ impl AiInferenceRuntime {
             dynamic_bindings: Arc::new(dynamic_bindings),
             loading: Arc::new(Mutex::new(HashMap::new())),
             dynamic_models_root: None,
-            upstream_admission: Arc::new(UpstreamAdmission::from_env()),
+            upstream_admission: node_upstream_admission(),
         })
     }
 
@@ -4580,6 +4599,29 @@ mod tests {
             1,
             "a blocked caller is visible as backlog, not as in-flight work"
         );
+    }
+
+    /// The cap belongs to the node, not to whichever manifest is loaded.
+    ///
+    /// Built per runtime, a hot reload gave the incoming generation its own
+    /// gate while the previous one was still draining — so for the length of
+    /// that overlap the node allowed twice the configured concurrency against
+    /// the same upstream, at exactly the moment a provider is least able to
+    /// absorb it.
+    #[test]
+    fn every_runtime_generation_shares_one_upstream_gate() {
+        let first = node_upstream_admission();
+        let second = node_upstream_admission();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second generation must not get a gate of its own"
+        );
+
+        // Pointer equality is the whole property: the same `Arc` is the same
+        // `UpstreamAdmission` behind the same mutex, so a permit taken through
+        // either handle is counted by both. Asserting on `in_flight` instead
+        // would race any other test in this binary that builds a runtime and
+        // acquires — a flake that would say nothing extra.
     }
 
     /// A refused admission is an overload, not a broken node.
