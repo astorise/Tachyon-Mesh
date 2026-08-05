@@ -708,7 +708,23 @@ fn write_meta_sidecar(
     alias: &str,
     upload_id: &str,
 ) -> Result<(), String> {
-    let body = serde_json::to_vec(&serde_json::json!({
+    // Carried over from the archive's own sidecar, if it brought one. This is
+    // the documented escape hatch for a checkpoint whose chat template does not
+    // match how it was actually fine-tuned to emit calls — a Qwen Coder build
+    // whose template says `<tool_call>` while the model speaks a different
+    // dialect, say. Rewriting the sidecar from scratch threw the uploader's
+    // declaration away, and the loss is silent: tool calls simply come back as
+    // prose, which reads like the model choosing not to call anything.
+    //
+    // Relayed unvalidated. The host already checks the value against the
+    // dialects the guest implements and warns on anything else, and a second
+    // allowlist here would be one more place to forget a new one.
+    let declared_parser = fs::read(dir.join(MODEL_META_JSON))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|meta| meta.get("tool_call_parser").cloned())
+        .filter(|parser| !parser.is_null());
+    let mut body = serde_json::json!({
         "format": format,
         "alias": alias,
         // Who installed this directory. The host ignores unknown sidecar keys,
@@ -716,8 +732,12 @@ fn write_meta_sidecar(
         // cannot otherwise have: whether the checkpoint sitting at the live
         // path is still the one this upload put there.
         "upload_id": upload_id,
-    }))
-    .map_err(|error| format!("failed to encode model metadata sidecar: {error}"))?;
+    });
+    if let (Some(parser), Some(object)) = (declared_parser, body.as_object_mut()) {
+        object.insert("tool_call_parser".to_owned(), parser);
+    }
+    let body = serde_json::to_vec(&body)
+        .map_err(|error| format!("failed to encode model metadata sidecar: {error}"))?;
     fs::write(dir.join(MODEL_META_JSON), body)
         .map_err(|error| format!("failed to write model metadata sidecar: {error}"))
 }
@@ -922,6 +942,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An uploader's tool-call dialect survives the sidecar rewrite.
+    ///
+    /// It is the documented escape hatch for a checkpoint whose chat template
+    /// does not match how it was fine-tuned to emit calls, and rewriting the
+    /// sidecar from scratch threw it away. The loss is silent: calls come back
+    /// as prose, which reads exactly like a model choosing not to call
+    /// anything.
+    #[test]
+    fn an_uploaded_tool_call_parser_survives_the_sidecar_rewrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-broker-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("fixture dir");
+
+        // The archive brought its own declaration.
+        fs::write(
+            dir.join(MODEL_META_JSON),
+            br#"{"format":"gguf","tool_call_parser":"qwen_coder"}"#,
+        )
+        .expect("uploaded sidecar");
+
+        write_meta_sidecar(&dir, "gguf", "coder", "up-1").expect("sidecar rewrite");
+        let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
+        let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        assert_eq!(meta["tool_call_parser"], "qwen_coder");
+        // The broker's own fields still win: they describe where the files
+        // actually landed.
+        assert_eq!(meta["alias"], "coder");
+        assert_eq!(meta["upload_id"], "up-1");
+
+        // An archive with no declaration gets no key invented for it, so the
+        // host falls back to reading the chat template as it always did.
+        fs::remove_file(dir.join(MODEL_META_JSON)).expect("clear");
+        write_meta_sidecar(&dir, "gguf", "coder", "up-2").expect("sidecar rewrite");
+        let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
+        let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        assert!(meta.get("tool_call_parser").is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn model_upload_accepts_large_local_chunks() {
