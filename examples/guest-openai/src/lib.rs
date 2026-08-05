@@ -920,12 +920,21 @@ fn handle_chat_completions_streaming(
         // whitespace the parser dropped from the front. Trimming that prefix at
         // both ends instead would hand its own trailing whitespace back as new
         // content — three newlines where the buffered parser produces two.
-        let tail = if parsed.tool_calls.is_empty() {
-            whole.get(sent..).unwrap_or_default()
-        } else {
-            let consumed = whole.get(..sent).unwrap_or_default().trim_start().len();
-            parsed.content.get(consumed..).unwrap_or_default()
-        };
+        //
+        // Which of the two applies turns on whether the *parse* is what
+        // supplies the calls, not on whether it found any. When the host
+        // already reported structured calls they win outright, so the parse is
+        // discarded whole — and its content has to be discarded with it.
+        // Keeping only its opinion of the text cut out the regions it mistook
+        // for calls, so a response carrying both a real structured call and
+        // prose that merely looks like one lost that prose, silently, on the
+        // stream but not in the buffered reply.
+        let tail = unsent_tail(
+            &whole,
+            sent,
+            &parsed,
+            /* host_supplied_calls */ !tool_calls.is_empty(),
+        );
         if !tail.is_empty() {
             let chunk = ChatCompletionChunk {
                 usage: None,
@@ -1220,6 +1229,37 @@ fn adopt_host_tool_calls(
 /// truth, and a client that checks the reason before dispatching is protected.
 /// `content_filter` outranks it for the same reason: the answer is not the
 /// model's own.
+/// The content the stream still owes, once the gate has sent `sent` bytes.
+///
+/// Two reconciliations, because the two cases differ.
+///
+/// When the parse is what supplies the calls, `parsed.content` is the text
+/// minus those regions, trimmed at both ends. Only its *leading* trim shifts
+/// the offset of what was sent, so the consumed length is the sent prefix minus
+/// the whitespace the parser dropped from the front. Trimming that prefix at
+/// both ends instead would hand its own trailing whitespace back as new content
+/// — three newlines where the buffered parser produces two.
+///
+/// Otherwise the raw text is the truth and the exact byte cut is right. That
+/// covers a response with no calls at all, and — the case this used to get
+/// wrong — one where the *host* reported structured calls. Those win outright,
+/// so the parse is discarded whole; keeping only its opinion of the text cut
+/// out the regions it mistook for calls, and a response carrying both a real
+/// structured call and prose that merely looks like one lost that prose on the
+/// stream while the buffered reply kept it.
+fn unsent_tail<'a>(
+    whole: &'a str,
+    sent: usize,
+    parsed: &'a ParsedAssistantOutput,
+    host_supplied_calls: bool,
+) -> &'a str {
+    if host_supplied_calls || parsed.tool_calls.is_empty() {
+        return whole.get(sent..).unwrap_or_default();
+    }
+    let consumed = whole.get(..sent).unwrap_or_default().trim_start().len();
+    parsed.content.get(consumed..).unwrap_or_default()
+}
+
 fn resolve_finish_reason(host_reported: Option<&str>, has_tool_calls: bool) -> &'static str {
     match host_reported {
         Some("length") => "length",
@@ -2174,6 +2214,49 @@ mod tests {
             arguments: "{}".to_owned(),
         }]);
         assert_eq!(calls[0].id, "call_tachyon_0");
+    }
+
+    #[test]
+    fn a_host_supplied_call_does_not_let_the_parser_eat_the_prose() {
+        // A response carrying a real structured call *and* prose that merely
+        // looks like one. The parse's calls are discarded — the host's win —
+        // so its opinion of the content has to be discarded with it, or the
+        // regions it mistook for calls vanish from the stream while the
+        // buffered reply keeps them.
+        let whole = "Here is some JSON: {\"name\":\"lookup\",\"arguments\":{}}";
+        let parsed = ParsedAssistantOutput {
+            content: "Here is some JSON:".to_owned(),
+            tool_calls: vec![ToolCall {
+                id: "parsed".to_owned(),
+                kind: "function".to_owned(),
+                function: ToolCallFunction {
+                    name: "lookup".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            }],
+        };
+
+        assert_eq!(
+            unsent_tail(whole, 0, &parsed, true),
+            whole,
+            "with the host supplying the calls, the raw text is the truth"
+        );
+
+        // And when the parse *is* what supplies them, its content still wins —
+        // that is the case the offset arithmetic exists for.
+        assert_eq!(
+            unsent_tail(whole, 0, &parsed, false),
+            parsed.content,
+            "a parser-recovered call still removes its own region"
+        );
+
+        // No calls anywhere: the exact byte cut, so leading whitespace the gate
+        // held back is not trimmed away.
+        let plain = ParsedAssistantOutput {
+            content: whole.to_owned(),
+            tool_calls: Vec::new(),
+        };
+        assert_eq!(unsent_tail(whole, 5, &plain, false), &whole[5..]);
     }
 
     #[test]
