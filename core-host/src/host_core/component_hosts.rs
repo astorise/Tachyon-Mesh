@@ -1852,9 +1852,24 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
+        let rows = res
+            .core_store
             .kv_partition_get_range(&res.table_name, &start_key, &end_key, limit, offset)
-            .map_err(|e| format!("{e:#}"))
+            .map_err(|e| format!("{e:#}"))?;
+        // The model registry is one table for the whole node, but a route may
+        // only execute the aliases its own manifest entry seals — and
+        // `load_accelerator_model` enforces exactly that. Handing the full
+        // table back made `GET /ai/v1/models` advertise models belonging to
+        // other routes, which a client can see, select, and then be refused
+        // for, with nothing in the listing to say why. Reading it through the
+        // same set the execution check uses keeps the two answers consistent.
+        //
+        // The limit bounds the rows read, not the rows returned, as it does for
+        // any filtered view. The listing asks for one large page, so this costs
+        // it nothing.
+        #[cfg(feature = "ai-inference")]
+        let rows = scope_registry_rows_to_route(&res.table_name, rows, &self.allowed_model_aliases);
+        Ok(rows)
     }
 
     fn drop(
@@ -2059,6 +2074,36 @@ fn wit_tool_call(
 /// build a backlog the client has not asked for, which is the memory this bound
 /// exists to cap.
 #[cfg(feature = "ai-inference")]
+/// Narrow a table read to the aliases the reading route may execute.
+///
+/// The model registry is one table for the whole node, but a route may only
+/// execute the aliases its own manifest entry seals — which is what
+/// `load_accelerator_model` enforces. Handing back the full table made
+/// `GET /ai/v1/models` advertise models belonging to other routes: a client
+/// could see one, select it, and be refused, with nothing in the listing to
+/// say why. Reading through the same set the execution check uses keeps the
+/// two answers consistent.
+///
+/// Every other table is returned untouched; this rule is about the registry,
+/// not about tables in general.
+///
+/// The caller's `limit` bounds the rows *read*, not the rows returned, as it
+/// does for any filtered view. The listing asks for one large page, so it
+/// costs nothing there.
+#[cfg(feature = "ai-inference")]
+fn scope_registry_rows_to_route(
+    table_name: &str,
+    rows: Vec<(String, Vec<u8>)>,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<(String, Vec<u8>)> {
+    if table_name != crate::system_storage::AI_MODELS_REGISTRY_TABLE {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|(alias, _)| allowed.contains(alias))
+        .collect()
+}
+
 const STREAM_CHANNEL_CAPACITY: usize = 64;
 
 /// Bytes of decoded output allowed to sit between the generation thread and the
@@ -3703,6 +3748,55 @@ impl component_bindings::tachyon::mesh::response_body::HostStreamingResponse
             wasmtime::component::Resource::<HostStreamingResponseResource>::new_own(rep.rep()),
         )?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "ai-inference"))]
+mod registry_scope_tests {
+    use super::*;
+
+    /// The listing and the execution check must agree.
+    ///
+    /// A route may only run the aliases its manifest entry seals, and
+    /// `load_accelerator_model` refuses the rest. A listing built from the
+    /// whole node's registry therefore offered clients models they would be
+    /// refused for, with nothing in the row to say so.
+    #[test]
+    fn the_registry_view_shows_only_what_this_route_may_execute() {
+        let rows = || {
+            vec![
+                ("mine".to_owned(), b"{}".to_vec()),
+                ("someone-elses".to_owned(), b"{}".to_vec()),
+            ]
+        };
+        let allowed: std::collections::BTreeSet<String> = ["mine".to_owned()].into_iter().collect();
+
+        let scoped = scope_registry_rows_to_route(
+            crate::system_storage::AI_MODELS_REGISTRY_TABLE,
+            rows(),
+            &allowed,
+        );
+        assert_eq!(
+            scoped
+                .into_iter()
+                .map(|(alias, _)| alias)
+                .collect::<Vec<_>>(),
+            vec!["mine".to_owned()],
+            "another route's model must not be advertised by this one"
+        );
+
+        // A route that seals nothing sees nothing, which is the same answer
+        // execution would give it.
+        let scoped = scope_registry_rows_to_route(
+            crate::system_storage::AI_MODELS_REGISTRY_TABLE,
+            rows(),
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(scoped.is_empty());
+
+        // The rule is about the registry, not about tables in general.
+        let untouched = scope_registry_rows_to_route("some-other-table", rows(), &allowed);
+        assert_eq!(untouched.len(), 2, "an unrelated table is returned whole");
     }
 }
 
