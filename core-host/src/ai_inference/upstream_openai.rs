@@ -1016,6 +1016,19 @@ impl UpstreamOpenAiRuntime {
                     detail: format!("upstream sent an SSE data frame that is not JSON: {error}"),
                 }
             })?;
+            // Valid JSON is not yet a frame. A scalar or an array parses, and
+            // then every `.get(...)` below answers `None` — so `data: "answer"`
+            // read as a usage-only event, its text vanished, and a following
+            // `[DONE]` completed the request successfully.
+            if !frame.is_object() {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "upstream SSE data frame must be a JSON object, got {}",
+                        json_type_name(&frame)
+                    ),
+                });
+            }
             // An upstream that committed HTTP 200 and then failed reports it
             // in-band. Without this the frame carries no delta, gets skipped,
             // and `[DONE]` makes the whole request look successful — so the
@@ -1074,7 +1087,24 @@ impl UpstreamOpenAiRuntime {
                     )
                 }
             };
-            let choice = choices.and_then(|choices| choices.first());
+            // Same rule one level in: an empty array is a legal keep-alive, but
+            // a present entry that is not an object is not a choice. Kept, it
+            // read as one that merely omitted `delta` and `finish_reason`, so
+            // `{"choices":[42]}` was discarded whole and `[DONE]` still
+            // completed the stream on an ordinary `stop`.
+            let choice = match choices.and_then(|choices| choices.first()) {
+                None => None,
+                Some(choice) if choice.is_object() => Some(choice),
+                Some(other) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed `choices[0]` must be an object, got {}",
+                            json_type_name(other)
+                        ),
+                    })
+                }
+            };
             // Sent on the last content-bearing frame, before `[DONE]`. Keeping
             // it is what lets the caller tell a completion that finished from
             // one the upstream truncated at its own token limit.
@@ -1483,14 +1513,40 @@ impl StreamedToolCalls {
                 self.calls.last_mut().expect("just pushed")
             }
         };
-        if let Some(id) = fragment.get("id").and_then(Value::as_str) {
+        // An id or a name is sent once, on the opening fragment. A *second*,
+        // different one for the same index is not an update — it means two
+        // calls are being merged under one slot, and every argument fragment
+        // seen so far belongs to whichever one this is not. Overwriting kept
+        // the accumulated arguments and swapped the identity on top of them, so
+        // the caller dispatched a call that never existed: one function's name
+        // with another's arguments, echoed back under an id the upstream never
+        // paired with them.
+        if let Some(id) = fragment
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            if !slot.id.is_empty() && slot.id != id {
+                return Err(format!(
+                    "streamed tool call at index {index} was given a second id: `{}` then `{id}`",
+                    slot.id
+                ));
+            }
             slot.id = id.to_owned();
         }
         let function = fragment.get("function");
         if let Some(name) = function
             .and_then(|function| function.get("name"))
             .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
         {
+            if !slot.name.is_empty() && slot.name != name {
+                return Err(format!(
+                    "streamed tool call at index {index} was given a second function name: \
+                     `{}` then `{name}`",
+                    slot.name
+                ));
+            }
             slot.name = name.to_owned();
         }
         // A streamed call's arguments arrive as string slices that concatenate,
@@ -1535,6 +1591,37 @@ impl StreamedToolCalls {
                 "upstream streamed `function.arguments` for index {} that is neither a JSON string nor a JSON object",
                 call.index
             ));
+        }
+        // Concatenating string fragments is how a streamed call's arguments
+        // arrive, so a stream that ends mid-value leaves something like
+        // `{"path":` behind — syntactically a string, semantically half a call.
+        // Passed through, it reaches the client as a successful, dispatchable
+        // invocation whose arguments cannot be parsed; whether that surfaces as
+        // a crash or as a silently skipped tool depends on the client. The
+        // assembled text has to be a JSON object, which is what the OpenAI
+        // schema promises and what every caller assumes.
+        for call in &self.calls {
+            if call.arguments.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(&call.arguments) {
+                Ok(Value::Object(_)) => {}
+                Ok(other) => {
+                    return Err(format!(
+                        "upstream streamed `function.arguments` for index {} that is a JSON {}, \
+                         not an object",
+                        call.index,
+                        json_type_name(&other)
+                    ))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "upstream streamed `function.arguments` for index {} that is not valid \
+                         JSON: {error}",
+                        call.index
+                    ))
+                }
+            }
         }
         Ok(self
             .calls
@@ -2051,78 +2138,85 @@ mod tests {
         assert_eq!(body["input"], "hello");
     }
 
-    /// A silent upstream must not hold the permit once nobody is listening.
+    /// A silent source must report `Idle`, not hold the caller.
     ///
-    /// The regression this guards is the one `sink`-based cancellation could
-    /// not see: the client goes away *before* the first frame, so no callback
-    /// ever runs to report it. Before the reader moved off this thread, the
-    /// blocking `read_line` sat here until the request timeout with the
-    /// admission permit held; thirty-two of those take the node's upstream
-    /// capacity out of service. The server here sends headers and then says
-    /// nothing at all, which is exactly the shape that used to hang.
+    /// This is the seam the cancellation fix turns on: `read_line` is
+    /// uninterruptible, so the read moved to its own thread and the stream loop
+    /// polls `is_live` between frames. Exercised directly rather than through a
+    /// real socket — a round trip adds a connect that can fail under load for
+    /// reasons that have nothing to do with the mechanism, and a test that
+    /// fails for the wrong reason is worse than no test. The end-to-end
+    /// behaviour is covered by
+    /// `a_stream_carrying_no_content_still_notices_a_departed_client`.
     #[test]
-    fn a_silent_upstream_is_abandoned_once_the_client_has_gone() {
-        struct DeadSink;
-        impl StreamSink for DeadSink {
-            fn emit(&mut self, _event: StreamEvent<'_>) -> StreamControl {
-                panic!("a silent upstream produces no event to emit")
-            }
-            fn is_live(&mut self) -> bool {
-                false
+    fn a_reader_with_nothing_to_give_reports_idle_rather_than_blocking() {
+        /// Blocks in `read` until the test feeds it, the way a socket blocks on
+        /// a silent upstream.
+        struct Fed(std::sync::mpsc::Receiver<Vec<u8>>);
+        impl std::io::Read for Fed {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.recv() {
+                    Ok(chunk) => {
+                        let len = chunk.len().min(buf.len());
+                        buf[..len].copy_from_slice(&chunk[..len]);
+                        Ok(len)
+                    }
+                    // The far end went away: EOF, as a closed socket reads.
+                    Err(_) => Ok(0),
+                }
             }
         }
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
-        let base_url = format!(
-            "http://{}/v1",
-            listener
-                .local_addr()
-                .expect("listener should have an address")
-        );
-        // Holds the connection open, headers sent, body never written.
-        // Detached and parked on `accept`, so the test never joins it.
-        //
-        // The readiness signal is not ceremony: under the full suite this
-        // thread can go unscheduled long enough for the client to give up
-        // waiting for headers, which fails the test for a reason that has
-        // nothing to do with what it checks. Waiting until it is demonstrably
-        // about to accept removes that race.
-        let (listening, ready) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = listening.send(());
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
-            let _ = stream.flush();
-            std::thread::sleep(Duration::from_secs(30));
-        });
-        ready
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the fixture server should reach its accept loop");
+        let (feed, fed) = std::sync::mpsc::channel();
+        let mut reader = SseLineReader::spawn(std::io::BufReader::new(Fed(fed)));
 
-        let backend = runtime("coder", &format!("{UPSTREAM_SCHEME}{base_url}"));
         let started = std::time::Instant::now();
-        let result = backend.generate_streaming(&[b"hi"], &mut DeadSink);
-        let elapsed = started.elapsed();
+        assert!(
+            matches!(reader.next_line(Duration::from_millis(50)), SseRead::Idle),
+            "a source with nothing to give must yield the caller, not hold it"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the poll must return on its own window; took {:?}",
+            started.elapsed()
+        );
 
-        assert!(
-            result.is_ok(),
-            "abandoning for a departed client is the intended outcome, not a failure: {result:?}"
+        feed.send(b"data: hi\n".to_vec()).expect("fixture feed");
+        let line = loop {
+            match reader.next_line(Duration::from_millis(250)) {
+                SseRead::Line(line) => break line,
+                SseRead::Idle => continue,
+                other => panic!("expected the fed line, got {}", sse_read_name(&other)),
+            }
+        };
+        assert_eq!(
+            line, "data: hi\n",
+            "a fed line arrives intact after the idle poll"
         );
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "the read must give up on the poll interval, not on the request timeout; took {elapsed:?}"
-        );
+
+        drop(feed);
+        loop {
+            match reader.next_line(Duration::from_millis(250)) {
+                SseRead::Eof => break,
+                SseRead::Idle => continue,
+                other => panic!(
+                    "a closed source must read as EOF, got {}",
+                    sse_read_name(&other)
+                ),
+            }
+        }
+    }
+
+    fn sse_read_name(read: &SseRead) -> &'static str {
+        match read {
+            SseRead::Line(_) => "a line",
+            SseRead::Idle => "idle",
+            SseRead::Eof => "eof",
+            SseRead::Failed(_) => "a failure",
+        }
     }
 
     /// A present-but-wrong counter is a malformed response, not a zero.
-    ///
-    /// `as_u64().unwrap_or(0)` published an authoritative zero beside a real
-    /// count, and the real one lent it credibility — a client-visible billing
-    /// figure, quietly wrong. Absent and null stay zero, because those are
-    /// genuinely "not reported".
     #[test]
     fn a_malformed_usage_counter_fails_the_response_instead_of_reading_as_zero() {
         let upstream = FakeUpstream::start(
@@ -2197,6 +2291,94 @@ mod tests {
         };
         let error = error.to_string();
         assert!(error.contains("conflicting finish reasons"), "{error}");
+    }
+
+    /// Two identities under one index means two calls merged into one slot, and
+    /// the arguments accumulated so far belong to whichever this is not.
+    #[test]
+    fn a_second_identity_for_one_streamed_tool_call_index_fails_the_stream() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+                "data: [DONE]",
+                "",
+            ]
+            .join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("a second id for one tool-call index must fail the stream");
+        };
+        let error = error.to_string();
+        assert!(error.contains("second id"), "{error}");
+    }
+
+    /// A stream that ends mid-value leaves `{"path":` behind — a string, and
+    /// half a call. Passed through it dispatches as a successful invocation
+    /// whose arguments no client can parse.
+    #[test]
+    fn streamed_tool_call_arguments_that_are_not_a_json_object_fail_the_stream() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+                "data: [DONE]",
+                "",
+            ]
+            .join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("incomplete argument JSON must not dispatch as a usable call");
+        };
+        let error = error.to_string();
+        assert!(error.contains("not valid"), "{error}");
+    }
+
+    /// A scalar frame parses as JSON and then answers `None` to every lookup,
+    /// so its text vanished and `[DONE]` completed the request successfully.
+    #[test]
+    fn a_non_object_sse_frame_fails_rather_than_reading_as_empty() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &["data: \"answer\"", "data: [DONE]", ""].join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("a scalar data frame must not read as an empty event");
+        };
+        let error = error.to_string();
+        assert!(error.contains("must be a JSON object"), "{error}");
+    }
+
+    /// Same one level in: `{"choices":[42]}` read as a choice that merely
+    /// omitted its delta.
+    #[test]
+    fn a_non_object_streamed_choice_fails_rather_than_reading_as_empty() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &["data: {\"choices\":[42]}", "data: [DONE]", ""].join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("a non-object choice must not read as an empty one");
+        };
+        let error = error.to_string();
+        assert!(error.contains("must be an object"), "{error}");
     }
 
     #[test]
