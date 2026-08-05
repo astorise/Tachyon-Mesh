@@ -430,9 +430,6 @@ fn binding_engine_label(path: &str) -> &'static str {
         // a directory declaring `safetensors` while still holding a stale
         // `.gguf` advertised itself as `gguf/<alias>` and then loaded
         // safetensors.
-        if let Some(declared) = declared_model_format(path) {
-            return declared;
-        }
         let mut has_gguf = false;
         let mut has_onnx = false;
         if let Ok(entries) = std::path::Path::new(path).read_dir() {
@@ -443,6 +440,24 @@ fn binding_engine_label(path: &str) -> &'static str {
                     _ => {}
                 }
             }
+        }
+        // ONNX outranks the sidecar, because the loader never asks the sidecar
+        // about it. `CandleEmbeddingRuntime::try_load` runs first and resolves
+        // its file by `model_file`, then `model.onnx`, then any `.onnx` in the
+        // directory — the declared format is consulted nowhere in that path. A
+        // directory declaring `safetensors` beside a usable ONNX therefore
+        // loaded the embedding backend while advertising `safetensors/<alias>`,
+        // and the label is half the public `{engine}/{alias}` id, not just
+        // metadata.
+        //
+        // "Usable" is that runtime's own bar: without `tokenizer.json` it
+        // declines and the next probe takes over, so the declaration is honest
+        // again and wins below.
+        if has_onnx && std::path::Path::new(path).join("tokenizer.json").is_file() {
+            return "onnx";
+        }
+        if let Some(declared) = declared_model_format(path) {
+            return declared;
         }
         // ONNX first, because that is the order `CandleBackendModel::load`
         // probes in: `CandleEmbeddingRuntime::try_load` runs before the GGUF
@@ -1532,6 +1547,58 @@ mod configured_binding_registry_tests {
             denied.contains("sealed manifest"),
             "unexpected error: {denied}"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The engine label has to name the backend that will answer.
+    ///
+    /// It is half the public `{engine}/{alias}` id, so a directory advertised
+    /// as `safetensors/<alias>` while the ONNX embedding backend executes is a
+    /// listing that lies about where a prompt goes. The sidecar is
+    /// authoritative for the loaders that read it — and
+    /// `CandleEmbeddingRuntime::try_load`, which runs first, never does.
+    #[test]
+    fn a_usable_onnx_outranks_a_sidecar_the_loader_will_not_consult() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-engine-label-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("fixture dir");
+        let path = dir.to_string_lossy().to_string();
+
+        fs::write(
+            dir.join(".tachyon-model.json"),
+            br#"{"format":"safetensors"}"#,
+        )
+        .expect("sidecar");
+        assert_eq!(
+            binding_engine_label(&path),
+            "safetensors",
+            "with nothing else to go on the declaration stands"
+        );
+
+        // An ONNX file alone is not enough: the embedding runtime needs a
+        // tokenizer, and without one it declines and the declaration is honest.
+        fs::write(dir.join("model.onnx"), b"not really onnx").expect("onnx");
+        assert_eq!(
+            binding_engine_label(&path),
+            "safetensors",
+            "an ONNX the embedding runtime would decline does not change what answers"
+        );
+
+        // With the tokenizer the embedding runtime claims the directory, and
+        // the label has to say so.
+        fs::write(dir.join("tokenizer.json"), b"{}").expect("tokenizer");
+        assert_eq!(
+            binding_engine_label(&path),
+            "onnx",
+            "the label must name the backend the loader's probe order selects"
+        );
+
         let _ = fs::remove_dir_all(dir);
     }
 
