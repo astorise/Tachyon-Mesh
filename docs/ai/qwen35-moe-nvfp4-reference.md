@@ -49,8 +49,11 @@ tokenization integration, and KV-cache examples. It does not provide the Qwen
 3.5 gated-delta hybrid architecture or ModelOpt mixed FP8/NVFP4 tensor mapping.
 Those remain Tachyon runtime responsibilities.
 
-Production NVFP4 CUDA kernels are capability-gated to SM100 or newer. Older
-GPUs may use only bounded layer/operator fallback and must reject execution
+Whether the production NVFP4 CUDA kernels are reachable is `candle-nvfp4-kernels`'
+answer, not a compute capability Tachyon checks for itself. This page used to
+say SM100 or newer; candle #3831 removed that floor after establishing that
+nothing in the kernel needs FP4 tensor cores. A build that cannot reach the
+kernel may use only bounded layer/operator fallback, and must reject execution
 when configured host or accelerator memory limits would be exceeded.
 
 Sources:
