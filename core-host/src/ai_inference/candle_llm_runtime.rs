@@ -3601,6 +3601,7 @@ impl CandleLlmRuntime {
                 &context_ids,
                 &request,
                 draft_tokens.min(remaining),
+                sink,
             )?;
             if proposed.is_empty() {
                 break;
@@ -3717,6 +3718,7 @@ impl CandleLlmRuntime {
         context_ids: &[u32],
         request: &ParsedGenerationRequest,
         max_tokens: usize,
+        sink: &TokenSink<'_>,
     ) -> Result<Vec<u32>, CandleLlmError> {
         let mut context = context_ids.to_vec();
         let mut tokens = Vec::with_capacity(max_tokens);
@@ -3726,7 +3728,13 @@ impl CandleLlmRuntime {
             // entered just before expiry could otherwise hold the lane for many
             // of them. Whatever has been proposed so far is still usable: the
             // caller verifies the prefix it got.
-            if Instant::now() >= request.deadline {
+            //
+            // The consumer is asked here as well as between rounds. The outer
+            // loop's check only fires once a whole round is done, so a client
+            // that left partway through one kept the draft proposing for the
+            // rest of it — the most expensive way there is to produce nothing,
+            // bounded only by a deadline that can be an hour.
+            if Instant::now() >= request.deadline || sink.stopped() {
                 break;
             }
             let Some(next) = self.greedy_next_token_id(&context, request)? else {
@@ -6845,6 +6853,32 @@ mod tests {
         assert!(
             rendered.contains("fn main() {}"),
             "the result's own content is still the content: {rendered}"
+        );
+    }
+
+    /// A departed consumer stops the draft, not just the round.
+    ///
+    /// Speculative decoding runs `draft_tokens` full forwards per round, an
+    /// operator-supplied count with no small ceiling. The outer loop only asks
+    /// whether the consumer is still there *between* rounds, so a client that
+    /// left partway through one kept the draft proposing for the rest of it —
+    /// the most expensive way there is to produce nothing, bounded only by a
+    /// deadline that can be an hour.
+    #[test]
+    fn a_stopped_sink_is_visible_to_the_draft_loop() {
+        let mut emit = |_: &str| StreamControl::Stop;
+        let mut sink = TokenSink::new(&mut emit);
+        assert!(
+            !sink.stopped(),
+            "a fresh sink has no reason to think the consumer left"
+        );
+
+        // The consumer answers `Stop` to the first thing it is handed, which is
+        // how a departure is learned at all.
+        sink.emit("anything");
+        assert!(
+            sink.stopped(),
+            "the draft loop reads this to know it is working for nobody"
         );
     }
 
