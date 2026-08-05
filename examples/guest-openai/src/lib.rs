@@ -59,6 +59,13 @@ struct ChatCompletionRequest {
     tools: Vec<serde_json::Value>,
     #[serde(default)]
     tool_choice: Option<serde_json::Value>,
+    /// Wall-clock budget for this generation. Not an OpenAI field, so it was
+    /// simply dropped: the host fell back to its own default and a client that
+    /// had asked for a shorter leash on an agentic turn waited out the long
+    /// one. Accepted here and forwarded; the host still clamps it to its
+    /// ceiling.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
     #[serde(default)]
     tool_call_parser: Option<ToolCallParser>,
     #[serde(default)]
@@ -203,6 +210,10 @@ impl ToolCallParser {
 struct ExtraBody {
     #[serde(default)]
     tool_call_parser: Option<ToolCallParser>,
+    /// Mirrors the top-level field, for clients that keep every nonstandard
+    /// option in one place.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1468,6 +1479,14 @@ fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, S
     if let Some(seed) = request.seed {
         object.insert("seed".to_owned(), serde_json::json!(seed));
     }
+    if let Some(budget) = request.max_generation_ms.or_else(|| {
+        request
+            .extra_body
+            .as_ref()
+            .and_then(|body| body.max_generation_ms)
+    }) {
+        object.insert("max_generation_ms".to_owned(), serde_json::json!(budget));
+    }
     if let Some(stop) = request.stop.clone() {
         object.insert("stop".to_owned(), serde_json::json!(stop.into_vec()));
     }
@@ -1609,10 +1628,16 @@ fn generation_error_payload(
     let message = format!("inference failed for model `{model}`: {}", error.message);
     let (status, kind) = match error.upstream_status {
         Some(429) => (429, "rate_limit_error"),
-        // The provider rejected the request we forwarded, which almost always
-        // reflects the caller's own parameters — an unknown model, a tool
-        // schema it will not accept, a context overflow.
-        Some(400 | 404 | 405 | 409 | 413 | 422) => (400, "invalid_request_error"),
+        // The provider rejected the request we forwarded, which for these
+        // reflects the caller's own parameters — a tool schema it will not
+        // accept, a context overflow, a conflicting field.
+        Some(400 | 409 | 413 | 422) => (400, "invalid_request_error"),
+        // Not the caller's. The upstream model name and the endpoint path both
+        // come from the binding; a client can choose the mesh alias and nothing
+        // else. Telling it `invalid_request_error` sends it looking for a
+        // mistake in a request it cannot change, while the real fault — a
+        // misconfigured `?model=` or base URL — goes unreported.
+        Some(404 | 405) => (502, "server_error"),
         Some(status @ 502..=504) => (status, "server_error"),
         Some(_) => (502, "server_error"),
         None if error.invalid_request => (400, "invalid_request_error"),
@@ -1746,6 +1771,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hello")],
             tools: vec![serde_json::json!({"type": "function"})],
             tool_choice: None,
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: None,
@@ -1899,6 +1925,7 @@ mod tests {
         let mut via_extra_body = tool_request_named("local-coder");
         via_extra_body.extra_body = Some(ExtraBody {
             tool_call_parser: Some(ToolCallParser::Json),
+            max_generation_ms: None,
         });
         via_extra_body.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
         assert_eq!(
@@ -1929,6 +1956,7 @@ mod tests {
             ],
             tools: Vec::new(),
             tool_choice: None,
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: None,
@@ -1961,6 +1989,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: Vec::new(),
             tool_choice: None,
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: Some(32),
@@ -1990,6 +2019,7 @@ mod tests {
                 "function": { "name": "get_weather" }
             })],
             tool_choice: Some(serde_json::json!("auto")),
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: None,
@@ -2132,6 +2162,59 @@ mod tests {
             arguments: "{}".to_owned(),
         }]);
         assert_eq!(calls[0].id, "call_tachyon_0");
+    }
+
+    #[test]
+    fn a_requested_generation_budget_reaches_the_host() {
+        // Not an OpenAI field, so it used to be dropped: the host fell back to
+        // its own default and a client asking for a shorter leash waited out
+        // the long one. Accepted top level and via `extra_body`, because
+        // clients differ on where they keep nonstandard options.
+        let mut request = tool_request_named("qwen3-coder");
+        request.max_generation_ms = Some(5_000);
+        let payload = build_generation_request(&request).expect("request builds");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(payload["max_generation_ms"], 5_000);
+
+        let mut via_extra = tool_request_named("qwen3-coder");
+        via_extra.extra_body = Some(ExtraBody {
+            tool_call_parser: None,
+            max_generation_ms: Some(7_000),
+        });
+        let payload = build_generation_request(&via_extra).expect("request builds");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(payload["max_generation_ms"], 7_000);
+
+        // Omission stays omission, so the binding's own default still applies.
+        let payload =
+            build_generation_request(&tool_request_named("qwen3-coder")).expect("request builds");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert!(payload.get("max_generation_ms").is_none());
+    }
+
+    #[test]
+    fn a_configured_endpoint_that_is_not_found_is_the_gateway_s_failure() {
+        // The upstream model name and the endpoint path both come from the
+        // binding. A client picks the mesh alias and nothing else, so
+        // `invalid_request_error` sends it hunting for a mistake in a request
+        // it cannot change while the real fault goes unreported.
+        let not_found = bindings::tachyon::accelerator::cpu::GenerationError {
+            message: "upstream said 404".to_owned(),
+            upstream_status: Some(404),
+            invalid_request: false,
+        };
+        let (status, _body) = generation_error_payload("coder", not_found);
+        assert_eq!(status, 502);
+
+        // A 400 really is about the forwarded parameters and stays the
+        // caller's.
+        let rejected = bindings::tachyon::accelerator::cpu::GenerationError {
+            message: "upstream said 400".to_owned(),
+            upstream_status: Some(400),
+            invalid_request: false,
+        };
+        let (status, _body) = generation_error_payload("coder", rejected);
+        assert_eq!(status, 400);
     }
 
     #[test]
@@ -2408,6 +2491,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: Vec::new(),
             tool_choice: None,
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: None,
