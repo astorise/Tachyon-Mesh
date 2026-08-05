@@ -2152,6 +2152,75 @@ pub(crate) async fn enforce_resource_admission(
     }))
 }
 
+/// Whether every model this route can run lives behind an `openai:` upstream.
+///
+/// Deliberately "every", not "the first": a route mixing an upstream with a
+/// local checkpoint still has something on the local device, and exempting it
+/// would let that model bypass the admission its neighbours obey. A route with
+/// no models at all is not upstream-only — it has nothing to be upstream about,
+/// and the ordinary path already ignores it.
+#[cfg(all(test, feature = "ai-inference"))]
+mod vram_admission_scope_tests {
+    use super::*;
+
+    fn route_with(paths: &[&str]) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/ai".to_owned(),
+            models: paths
+                .iter()
+                .map(|path| IntegrityModelBinding {
+                    alias: "coder".to_owned(),
+                    path: (*path).to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: HardwareStrategy::default(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Local VRAM pressure says nothing about a route served from upstreams.
+    ///
+    /// Rejecting one with `vram-saturated` invents a failure: the provider is
+    /// healthy, the request would have succeeded, and the client is handed a
+    /// 503 naming a resource its request never touches.
+    #[test]
+    fn only_a_route_served_entirely_from_upstreams_skips_vram_admission() {
+        assert!(route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1"
+        ])));
+        assert!(route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1",
+            "openai:http://b.invalid/v1",
+        ])));
+
+        // One local checkpoint is enough to keep the check: exempting a mixed
+        // route would let that model bypass the admission its neighbours obey.
+        assert!(!route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1",
+            "/models/local",
+        ])));
+        assert!(!route_is_entirely_upstream(&route_with(&["/models/local"])));
+
+        // A route with no models is not upstream-only — it has nothing to be
+        // upstream about, and the ordinary path already ignores it.
+        assert!(!route_is_entirely_upstream(&route_with(&[])));
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+fn route_is_entirely_upstream(route: &IntegrityRoute) -> bool {
+    !route.models.is_empty()
+        && route.models.iter().all(|binding| {
+            binding
+                .path
+                .trim()
+                .starts_with(ai_inference::UPSTREAM_SCHEME)
+        })
+}
+
 /// Returns a rejection `RouteExecutionResult` when VRAM pressure is critical
 /// for routes that drive AI inference, or `None` to allow the request through.
 ///
@@ -2166,6 +2235,16 @@ pub(crate) fn enforce_vram_admission(
     state: &AppState,
     route: &IntegrityRoute,
 ) -> Option<RouteExecutionResult> {
+    // A route served entirely from upstreams holds no local VRAM, so local
+    // pressure says nothing about whether it can run. Rejecting it with
+    // `vram-saturated` invented a failure: the remote provider was healthy, the
+    // request would have succeeded, and the client got a 503 naming a resource
+    // its request never touches. Local models on the same route keep the check,
+    // which is why this asks about every binding rather than the first.
+    #[cfg(feature = "ai-inference")]
+    if route_is_entirely_upstream(route) {
+        return None;
+    }
     match state.memory_governor.vram_pressure() {
         memory_governor::MemoryPressure::Critical => {
             tracing::warn!(
