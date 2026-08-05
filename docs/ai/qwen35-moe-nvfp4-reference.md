@@ -43,11 +43,18 @@ selected experts, and adds the sigmoid-gated shared expert. Each expert is
 
 ## Reusable Candle inventory
 
-Candle 0.10 provides dense tensor operations, RMSNorm, Qwen 3 full-attention
+Candle provides dense tensor operations, RMSNorm, Qwen 3 full-attention
 building blocks, Qwen 3 MoE routing, fused MoE infrastructure, sampling,
-tokenization integration, and KV-cache examples. It does not provide the Qwen
-3.5 gated-delta hybrid architecture or ModelOpt mixed FP8/NVFP4 tensor mapping.
-Those remain Tachyon runtime responsibilities.
+tokenization integration, and KV-cache examples. It also provides the Qwen 3.5
+hybrid architecture itself — `candle_transformers::models::qwen3_5`, including
+`Qwen3_5GatedDeltaNet` and the recurrent gated delta rule. This page used to
+say it did not; `qwen35_upstream.rs` is the wrapper that consumes it, and
+`gated_upstream_layers_agree_with_the_scalar_runtime` is the parity proof that
+decides whether the local scalar runtime is still needed.
+
+What remains a Tachyon responsibility is the ModelOpt mixed FP8/NVFP4 tensor
+mapping: reading the quantized-layer metadata and feeding upstream's modules
+the weights it expects.
 
 Whether the production NVFP4 CUDA kernels are reachable is `candle-nvfp4-kernels`'
 answer, not a compute capability Tachyon checks for itself. This page used to
