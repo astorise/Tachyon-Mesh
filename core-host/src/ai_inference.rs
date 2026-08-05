@@ -606,9 +606,14 @@ impl StreamOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GenerationError {
     pub(crate) message: String,
-    /// HTTP status a remote provider returned. `None` for every local failure —
-    /// a decode error, an unknown alias, a rejected request — because inventing
-    /// a status for those would misreport a local fault as a remote one.
+    /// The HTTP status this node should answer with, when the failure has one.
+    ///
+    /// Usually the status a remote provider returned. Two cases are this
+    /// node's own and still carry one, because they describe *its* role rather
+    /// than inventing a remote fault: an upstream that could not be reached or
+    /// answered unusably is a gateway failure, and a saturated admission queue
+    /// is an overload. `None` stays the answer for a genuine local fault — a
+    /// decode error, an unknown alias — where any status would be a fiction.
     pub(crate) upstream_status: Option<u16>,
     /// The caller's request was rejected before any backend ran it. Carried
     /// separately from `upstream_status` because a locally refused request has
@@ -714,6 +719,23 @@ impl GenerationError {
 impl std::fmt::Display for GenerationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
+    }
+}
+
+impl GenerationError {
+    /// This node is at capacity for the alias, not broken.
+    ///
+    /// Without a status the caller sees 500 `server_error` — a node that has
+    /// failed — and an agent retries against it immediately, adding to the
+    /// queue that refused it. 503 is what says "come back", which is the whole
+    /// content of an admission refusal, and it is the one answer that makes a
+    /// client's backoff correct rather than harmful.
+    fn overloaded(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: Some(503),
+            invalid_request: false,
+        }
     }
 }
 
@@ -1298,7 +1320,10 @@ impl AiInferenceRuntime {
             // Upstream bindings skip the batch scheduler: see
             // `UpstreamAdmission`. The permit is released when `_permit` drops
             // at the end of this scope, including on the error paths below.
-            let _permit = self.upstream_admission.acquire()?;
+            let _permit = self
+                .upstream_admission
+                .acquire()
+                .map_err(GenerationError::overloaded)?;
             let mut outputs = model
                 .backend_model
                 .execute_with_adapters(&[input], &[adapter])
@@ -1362,7 +1387,8 @@ impl AiInferenceRuntime {
         // unbounded sockets while `/v1/chat/completions` stayed gated.
         let _permit = (model.accelerator == AcceleratorKind::Network)
             .then(|| self.upstream_admission.acquire())
-            .transpose()?;
+            .transpose()
+            .map_err(GenerationError::overloaded)?;
         model
             .backend_model
             .embed_text(&tensor)
@@ -1414,7 +1440,8 @@ impl AiInferenceRuntime {
         // client stops reading, which is exactly the resource the cap governs.
         let _permit = (model.accelerator == AcceleratorKind::Network)
             .then(|| self.upstream_admission.acquire())
-            .transpose()?;
+            .transpose()
+            .map_err(GenerationError::overloaded)?;
         match adapter {
             Some(adapter) => model
                 .backend_model
@@ -4553,6 +4580,37 @@ mod tests {
             1,
             "a blocked caller is visible as backlog, not as in-flight work"
         );
+    }
+
+    /// A refused admission is an overload, not a broken node.
+    ///
+    /// Without a status the caller sees 500 `server_error` — a node that has
+    /// failed — and an agent retries immediately, adding to the queue that just
+    /// refused it. 503 is what says "come back", and it is the answer that
+    /// makes a client's backoff correct rather than harmful.
+    #[test]
+    fn a_refused_admission_is_reported_as_an_overload() {
+        let gate = UpstreamAdmission::new(1);
+        let _held = gate.acquire().expect("first permit fits");
+        {
+            let mut state = gate.state.lock().expect("gate lock");
+            state.waiting = UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT;
+        }
+        let Err(refusal) = gate.acquire() else {
+            panic!("a queue at its depth refuses");
+        };
+
+        let error = GenerationError::overloaded(refusal);
+        assert_eq!(
+            error.upstream_status,
+            Some(503),
+            "an overloaded node has to say so, or the client's retry makes it worse"
+        );
+        assert!(
+            !error.invalid_request,
+            "the request was fine; there was simply no room for it"
+        );
+        assert!(error.message.contains("saturated"), "{}", error.message);
     }
 
     /// A full queue refuses immediately rather than parking another thread.
