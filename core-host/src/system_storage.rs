@@ -595,15 +595,27 @@ pub(crate) fn publish_configured_model_bindings(
             // The write is still a single transaction: a read followed by a
             // write would let an upload land in between and be reported as the
             // winner when it is not.
+            // Overwriting is right, but *losing* the upload is not. The row is
+            // an uploaded checkpoint's only registry metadata; delete it and
+            // the files stay on disk with nothing pointing at them, so when the
+            // configured binding later leaves the manifest the sweep below
+            // removes the config row and the upload is gone from the listing
+            // for good — recoverable only by uploading it again. The displaced
+            // row therefore rides along inside the config row, and the sweep
+            // puts it back instead of deleting.
             if let Err(error) = core_store.kv_partition_update(
                 AI_MODELS_REGISTRY_TABLE,
                 &binding.alias,
                 |current| {
-                    if !row_is_config_owned(current) {
+                    let shadowed = current.filter(|_| !row_is_config_owned(current));
+                    if let Some(shadowed) = shadowed {
                         tracing::warn!(
                             alias = %binding.alias,
-                            "an uploaded model shares an alias with a configured binding; the configured binding is what executes, so the registry row now describes it"
+                            "an uploaded model shares an alias with a configured binding; the configured binding is what executes, so the registry row now describes it and the upload's row is held aside"
                         );
+                        if let Some(carried) = carry_shadowed_upload(&value, shadowed) {
+                            return crate::store::KvPartitionUpdate::Set(carried);
+                        }
                     }
                     crate::store::KvPartitionUpdate::Set(value)
                 },
@@ -628,10 +640,15 @@ pub(crate) fn publish_configured_model_bindings(
         // ownership is re-checked inside the deleting transaction.
         if let Err(error) =
             core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
-                if row_is_config_owned(current) {
-                    crate::store::KvPartitionUpdate::Delete
-                } else {
-                    crate::store::KvPartitionUpdate::Keep
+                if !row_is_config_owned(current) {
+                    return crate::store::KvPartitionUpdate::Keep;
+                }
+                // An upload this binding displaced comes back rather than
+                // going down with it. Its files never moved; only the row that
+                // made them findable did.
+                match current.and_then(shadowed_upload_row) {
+                    Some(restored) => crate::store::KvPartitionUpdate::Set(restored),
+                    None => crate::store::KvPartitionUpdate::Delete,
                 }
             })
         {
@@ -801,6 +818,42 @@ fn reject_forged_config_marker(key: &str, value: Option<&Vec<u8>>) -> Result<(),
         ));
     }
     Ok(())
+}
+
+/// The key a displaced upload row is parked under inside a config row.
+///
+/// Namespaced and camel-cased like the rest of the row so it travels with it
+/// through every reader; `RegistryModelInfo` does not declare it, and the
+/// guest's `ModelInfo` ignores unknown fields, so nothing downstream has to
+/// learn about it.
+#[cfg(feature = "ai-inference")]
+const SHADOWED_UPLOAD_KEY: &str = "shadowedUpload";
+
+/// Fold `shadowed` into `value` so a later sweep can put it back.
+///
+/// `None` when either side is not a JSON object, in which case the caller
+/// writes the config row plain — losing the upload's row is bad, but writing a
+/// malformed one in its place would be worse.
+#[cfg(feature = "ai-inference")]
+fn carry_shadowed_upload(value: &[u8], shadowed: &[u8]) -> Option<Vec<u8>> {
+    let mut row = serde_json::from_slice::<serde_json::Value>(value).ok()?;
+    let shadowed = serde_json::from_slice::<serde_json::Value>(shadowed).ok()?;
+    // A config row displacing another config row carries nothing: only an
+    // upload's row is at risk of being the last copy.
+    row.as_object_mut()?
+        .insert(SHADOWED_UPLOAD_KEY.to_owned(), shadowed);
+    serde_json::to_vec(&row).ok()
+}
+
+/// The upload row a config row is holding aside, ready to be written back.
+#[cfg(feature = "ai-inference")]
+fn shadowed_upload_row(row: &[u8]) -> Option<Vec<u8>> {
+    let row = serde_json::from_slice::<serde_json::Value>(row).ok()?;
+    let shadowed = row.get(SHADOWED_UPLOAD_KEY)?;
+    // Never restore something that would claim the publisher's own marker: the
+    // row was an upload's when it was set aside and must still read as one.
+    let restored = serde_json::to_vec(shadowed).ok()?;
+    (!row_is_config_owned(Some(restored.as_slice()))).then_some(restored)
 }
 
 /// Marker the guest matches on to turn an ownership refusal into a 409.
@@ -1547,6 +1600,71 @@ mod configured_binding_registry_tests {
             denied.contains("sealed manifest"),
             "unexpected error: {denied}"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An upload a binding displaced survives the binding.
+    ///
+    /// The registry row is an uploaded checkpoint's only metadata. Overwriting
+    /// it is right — the configured binding is what executes, so the listing
+    /// has to describe that — but deleting it when the binding later leaves
+    /// stranded the files: still on disk, absent from every listing, and
+    /// recoverable only by uploading them again.
+    #[test]
+    fn an_upload_displaced_by_a_binding_comes_back_when_the_binding_leaves() {
+        let (store, dir) = temp_store();
+
+        let upload = serde_json::json!({
+            "alias": "shared", "engine": "gguf", "vramRequiredMb": 4096,
+            "status": "available", "modelPath": "/models/shared",
+        });
+        write_uploaded_model_row(
+            &store,
+            "shared",
+            serde_json::to_vec(&upload).expect("serialize"),
+        )
+        .expect("a free alias accepts an upload");
+
+        // A later manifest claims the same alias. The listing must describe the
+        // backend that answers, so the config row wins.
+        let config = config_with(vec![binding(
+            "shared",
+            "openai:http://127.0.0.1:8080/v1",
+            false,
+        )]);
+        publish_configured_model_bindings(&store, &config);
+        let row = |alias: &str| {
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+                .expect("read")
+                .map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).expect("row json"))
+        };
+        let shadowing = row("shared").expect("the configured row is published");
+        assert_eq!(shadowing["source"], "config");
+        assert_eq!(shadowing["modelPath"], "openai:http://127.0.0.1:8080/v1");
+
+        // The binding leaves. The upload never moved, so its row comes back
+        // rather than going down with the binding that hid it.
+        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        let restored = row("shared").expect("the displaced upload is restored, not swept");
+        assert_eq!(restored["modelPath"], "/models/shared");
+        assert_eq!(restored["vramRequiredMb"], 4096);
+        assert!(
+            restored.get("source").is_none(),
+            "the restored row is the upload's again, not the publisher's"
+        );
+
+        // And a config row with nothing held aside is still swept, so a binding
+        // that never displaced anything leaves no trace.
+        let plain = config_with(vec![binding("solo", "/models/solo", false)]);
+        publish_configured_model_bindings(&store, &plain);
+        assert!(row("solo").is_some());
+        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        assert!(
+            row("solo").is_none(),
+            "a binding that displaced nothing is swept"
+        );
+
         let _ = fs::remove_dir_all(dir);
     }
 
