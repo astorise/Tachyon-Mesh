@@ -82,9 +82,21 @@ struct MixtralConfigJson {
     num_local_experts: usize,
 }
 
-#[cfg(feature = "candle-cuda")]
-pub(crate) const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = true;
-#[cfg(not(feature = "candle-cuda"))]
+/// Whether the parallel Llama engines ask upstream for flash attention.
+///
+/// False on every build, and not because the kernel is unavailable: it is
+/// because the weights are wrong for it. `load_parallel` builds tensor-,
+/// pipeline- and expert-parallel weights as F32, and `candle-flash-attn`
+/// accepts only F16/BF16 — on the CPU stand-ins a CUDA binary falls back to
+/// when no physical GPU is present, it has no implementation at all. Keyed to
+/// `candle-cuda` this read `true` on exactly the builds that would then fail
+/// on the first attention forward of every parallel mode, the supported
+/// no-GPU fallback included.
+///
+/// Earning it back means narrowing the parallel weights to F16/BF16 at load
+/// and gating on the resolved devices actually being CUDA. That is a real
+/// change to the numerics the dense-parity tests pin, so it belongs to
+/// whoever makes it deliberately rather than to a `cfg`.
 pub(crate) const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = false;
 
 const CONFIG_JSON: &str = "config.json";
