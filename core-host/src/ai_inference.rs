@@ -1025,12 +1025,22 @@ impl AiInferenceRuntime {
         // variables collide would each send the other's API key to a
         // third-party server. Nothing at request time can see the collision,
         // so this fails the boot instead.
+        //
+        // Only bindings that can actually load as upstreams. A `dynamic` one
+        // never does — `ensure_model_loaded` replaces its path with the broker
+        // directory the upload landed in — so its declared path is not a
+        // statement about where requests go. Counting it meant two dynamic
+        // aliases that normalise to the same suffix, `vendor-a` and
+        // `vendor_a`, could refuse the whole boot over a credential neither
+        // would ever read.
         assert_no_credential_collisions(
             config
                 .routes
                 .iter()
                 .flat_map(|route| route.models.iter())
-                .filter(|binding| binding.path.trim().starts_with(UPSTREAM_SCHEME))
+                .filter(|binding| {
+                    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
+                })
                 .map(|binding| binding.alias.as_str()),
         )
         .map_err(|detail| anyhow!("Integrity Validation Failed: {detail}"))?;
@@ -6192,6 +6202,63 @@ mod tests {
             .expect("restored tensor should convert");
 
         assert_eq!(restored, vec![-1.0, 0.0, 0.33333334, 0.0]);
+    }
+
+    /// A dynamic binding cannot be an upstream, so it cannot collide as one.
+    ///
+    /// `ensure_model_loaded` replaces a dynamic binding's path with the broker
+    /// directory the upload landed in, so its declared path says nothing about
+    /// where requests go. Counting it let two dynamic aliases that normalise to
+    /// the same credential suffix — `vendor-a` and `vendor_a` — refuse the
+    /// whole boot over a variable neither would ever read.
+    #[test]
+    fn dynamic_aliases_do_not_collide_over_credentials_they_never_use() {
+        let colliding = |dynamic: bool| {
+            let mut route = IntegrityRoute::user("/api/guest-ai");
+            route.models = ["vendor-a", "vendor_a"]
+                .into_iter()
+                .map(|alias| IntegrityModelBinding {
+                    alias: alias.to_owned(),
+                    path: "openai:http://up.invalid/v1".to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic,
+                    hardware_strategy: Default::default(),
+                })
+                .collect();
+            IntegrityConfig {
+                routes: vec![route],
+                ..IntegrityConfig::default_sealed()
+            }
+        };
+
+        let upstream_aliases = |config: &IntegrityConfig| {
+            config
+                .routes
+                .iter()
+                .flat_map(|route| route.models.iter())
+                .filter(|binding| {
+                    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
+                })
+                .map(|binding| binding.alias.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Non-dynamic: both really do load as upstreams, and one would send the
+        // other's key to a third party. That still refuses the boot.
+        let statics = upstream_aliases(&colliding(false));
+        assert!(
+            assert_no_credential_collisions(statics.iter().map(String::as_str)).is_err(),
+            "two real upstreams sharing a credential suffix must not boot"
+        );
+
+        // Dynamic: nothing here will ever read a credential.
+        let dynamics = upstream_aliases(&colliding(true));
+        assert!(
+            dynamics.is_empty(),
+            "a dynamic binding is not an upstream, whatever its declared path says"
+        );
+        assert!(assert_no_credential_collisions(dynamics.iter().map(String::as_str)).is_ok());
     }
 
     fn config_with_model(alias: &str) -> IntegrityConfig {
