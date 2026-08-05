@@ -847,21 +847,26 @@ pub(crate) fn withdraw_changed_model_bindings(
         //
         // The reservation is config-owned, so the upload path refuses it, and
         // withdrawn, so the alias is not advertised until publication replaces
-        // it. An alias the incoming config does *not* own is genuinely
-        // released: nothing will republish it, and a reservation there would
-        // block the alias for good.
-        let reservation = incoming.contains_key(&alias).then(|| {
-            serde_json::to_vec(&RegistryModelInfo {
-                alias: &alias,
-                engine: "",
-                vram_required_mb: 0,
-                status: "reloading",
-                model_path: "",
-                source: Some(REGISTRY_SOURCE_CONFIG),
-                tool_call_parser: None,
-                withdrawn: true,
-            })
-        });
+        // it.
+        //
+        // Placed for every alias being withdrawn, including the ones the
+        // incoming config drops. Deleting those outright opened the same window
+        // one step later: the alias reads as free while the *previous* runtime
+        // is still the one answering, so an upload could commit, be advertised,
+        // and take requests the configured backend was still serving. Holding
+        // the reservation across the swap is not a leak, because the
+        // publication that follows sweeps every config-owned row the incoming
+        // manifest does not claim — which is exactly this one.
+        let reservation = Some(serde_json::to_vec(&RegistryModelInfo {
+            alias: &alias,
+            engine: "",
+            vram_required_mb: 0,
+            status: "reloading",
+            model_path: "",
+            source: Some(REGISTRY_SOURCE_CONFIG),
+            tool_call_parser: None,
+            withdrawn: true,
+        }));
         let reservation = match reservation {
             Some(Ok(value)) => Some(value),
             // Encoding cannot realistically fail, and if it did, releasing the
@@ -1495,12 +1500,30 @@ mod configured_binding_registry_tests {
             "unexpected error: {denied}"
         );
 
-        // A binding the incoming config dropped is genuinely released. Nothing
-        // will republish it, so a reservation there would block the alias for
-        // good.
+        // A binding the incoming config dropped is reserved too, not released.
+        // Deleting it outright opened the same window one step later: the alias
+        // reads as free while the *previous* runtime is still answering for it,
+        // so an upload could commit, be advertised, and take requests the
+        // configured backend was still serving.
+        //
+        // This used to be released on the reasoning that nothing would
+        // republish it, so a reservation would block the alias for good. That
+        // premise was wrong: the publication after the swap sweeps every
+        // config-owned row the incoming manifest does not claim, and this is
+        // one of them. The cost of holding it is an alias unavailable until
+        // that publication runs — the same exposure a changed alias already
+        // accepts, and a smaller one than routing a prompt to a backend the
+        // caller did not choose.
+        assert_eq!(
+            row("removed").map(|row| row["withdrawn"].clone()),
+            Some(serde_json::json!(true)),
+            "a removed binding is held withdrawn until the swap completes"
+        );
+        let denied = write_uploaded_model_row(&store, "removed", b"{}".to_vec())
+            .expect_err("the reservation must hold while the previous runtime still answers");
         assert!(
-            !present("removed"),
-            "a removed binding is withdrawn outright"
+            denied.contains("sealed manifest"),
+            "unexpected error: {denied}"
         );
         let _ = fs::remove_dir_all(dir);
     }
