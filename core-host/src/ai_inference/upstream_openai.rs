@@ -892,11 +892,53 @@ impl UpstreamOpenAiRuntime {
             });
         }
 
-        let text = content.ok_or_else(|| UpstreamError::MalformedResponse {
-            alias: self.alias.clone(),
-            detail: "response has no `choices[0].message.content` string and no `tool_calls`"
-                .to_owned(),
-        })?;
+        // The shape OpenAI-compatible providers used before `tool_calls`, and
+        // still the only one some of them emit. It carries a single call with
+        // no id. Recognising it costs one branch; not recognising it made every
+        // buffered request to such a provider fail as malformed, since neither
+        // content nor `tool_calls` is present.
+        if let Some(legacy) = message
+            .get("function_call")
+            .filter(|call| !is_empty_json(call))
+        {
+            let calls = tool_calls_from_value(
+                &self.alias,
+                &Value::Array(vec![json!({
+                    "type": "function",
+                    "function": legacy,
+                })]),
+            )?;
+            return Ok(UpstreamGeneration {
+                bytes: content.unwrap_or_default().as_bytes().to_vec(),
+                usage,
+                finish_reason,
+                tool_calls: calls,
+            });
+        }
+
+        // A reported finish reason makes an absent content an *answer* — an
+        // empty one. A safety filter returning `content_filter` with
+        // `content: null` is the common case, and rejecting it handed the
+        // client a 500 in place of the result the upstream actually reached.
+        // Only a response with no content, no calls and no reason is shapeless
+        // enough to have nothing to report.
+        let Some(text) = content else {
+            if finish_reason.is_some() {
+                return Ok(UpstreamGeneration {
+                    bytes: Vec::new(),
+                    usage,
+                    finish_reason,
+                    tool_calls: Vec::new(),
+                });
+            }
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail:
+                    "response has no `choices[0].message.content` string, no `tool_calls` and no \
+                     `finish_reason`"
+                        .to_owned(),
+            });
+        };
         Ok(UpstreamGeneration {
             bytes: text.as_bytes().to_vec(),
             usage,
@@ -1386,6 +1428,20 @@ fn tool_calls_from_value(alias: &str, tool_calls: &Value) -> Result<Vec<ToolCall
                 return Err(malformed(format!(
                     "`choices[0].message.tool_calls[{index}]` has no `function.name`"
                 )));
+            }
+            // The guest hardcodes `"function"` back onto whatever it echoes, so
+            // an upstream naming a different kind here would have that kind
+            // silently relabelled and dispatched as a function call. Absent is
+            // fine — the field is optional and `function` is its only defined
+            // value — but a present, different one is a call this backend does
+            // not know how to carry.
+            if let Some(kind) = call.get("type").and_then(Value::as_str) {
+                if kind != "function" {
+                    return Err(malformed(format!(
+                        "`choices[0].message.tool_calls[{index}].type` is `{kind}`, and only \
+                         `function` calls can be carried"
+                    )));
+                }
             }
             let arguments = tool_call_arguments(function.and_then(|f| f.get("arguments")))
                 .ok_or_else(|| {
@@ -2214,6 +2270,79 @@ mod tests {
             SseRead::Eof => "eof",
             SseRead::Failed(_) => "a failure",
         }
+    }
+
+    /// The pre-`tool_calls` shape some providers still emit.
+    ///
+    /// It carries neither content nor `tool_calls`, so every buffered request
+    /// to such a provider used to fail as malformed.
+    #[test]
+    fn a_legacy_function_call_response_is_carried_as_a_tool_call() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,
+                "function_call":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}},
+                "finish_reason":"function_call"}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let generation = backend.generate(&[b"go"]).expect("legacy call round trip");
+        assert_eq!(generation.tool_calls.len(), 1);
+        assert_eq!(generation.tool_calls[0].name, "read_file");
+        assert_eq!(generation.tool_calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assert!(
+            generation.tool_calls[0].id.is_none(),
+            "the legacy shape carries no id, and one must not be invented"
+        );
+    }
+
+    /// A filtered completion is a result, not a malformed response.
+    #[test]
+    fn a_content_filtered_completion_without_content_is_an_empty_answer() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null},"finish_reason":"content_filter"}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let generation = backend
+            .generate(&[b"go"])
+            .expect("a filtered completion is a result the client must see");
+        assert!(generation.bytes.is_empty());
+        assert_eq!(generation.finish_reason.as_deref(), Some("content_filter"));
+    }
+
+    /// With no content, no calls and no reason there is nothing to report, and
+    /// that stays an error.
+    #[test]
+    fn a_message_with_nothing_at_all_is_still_malformed() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null}}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a message with no content, no calls and no reason reports nothing");
+        };
+        assert!(error.to_string().contains("no `finish_reason`"), "{error}");
+    }
+
+    /// The guest relabels whatever it echoes as `function`, so a different kind
+    /// would be dispatched as one.
+    #[test]
+    fn a_tool_call_of_another_type_is_refused_rather_than_relabelled() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"c1","type":"custom","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a non-function call type must not be silently relabelled");
+        };
+        assert!(error.to_string().contains("only `function`"), "{error}");
     }
 
     /// A present-but-wrong counter is a malformed response, not a zero.
