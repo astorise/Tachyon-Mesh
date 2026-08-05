@@ -698,7 +698,12 @@ fn handle_chat_completions_buffered(
         };
     // Structured calls win outright: the backend received them as fields, so
     // re-reading the text for calls could only ever guess worse.
-    let parsed = if completed.tool_calls.is_empty() {
+    // Structured calls are adopted only when the client asked for tools. An
+    // upstream that returns `tool_calls` to a request that offered none is
+    // answering a question nobody put, and surfacing them would hand a client
+    // that never opted in a `message.tool_calls` array plus a `tool_calls`
+    // finish reason — a response shape it has no code path for.
+    let parsed = if completed.tool_calls.is_empty() || !request.has_tool_intent() {
         parse_assistant_output(&request, &completed.text)
     } else {
         ParsedAssistantOutput {
@@ -1197,7 +1202,12 @@ fn resolve_finish_reason(host_reported: Option<&str>, has_tool_calls: bool) -> &
         Some("length") => "length",
         Some("content_filter") => "content_filter",
         _ if has_tool_calls => "tool_calls",
-        Some("tool_calls") => "tool_calls",
+        // Reported by the provider but with nothing behind it. Passing it on
+        // tells the client to go read `message.tool_calls` and dispatch what it
+        // finds there, and it will find an empty array — so the turn ends with
+        // an agent waiting on a call that was never made. `stop` is the honest
+        // description of a response that carries only text.
+        Some("tool_calls") => "stop",
         // Anything else, including an absent reason, is an ordinary completion
         // as far as the OpenAI schema is concerned.
         _ => "stop",
@@ -1256,8 +1266,29 @@ impl ChatCompletionRequest {
     }
 
     /// Whether the caller offered the model any tool to call.
+    ///
+    /// `tool_choice: "none"` is an offer withdrawn. The OpenAI schema uses it
+    /// to say "you may see the tools, do not call them", and a nonempty `tools`
+    /// list alongside it is the normal way to send that — so reading intent
+    /// from the list alone enabled the parser for exactly the request that
+    /// asked it not to. A local model's tool-shaped prose then became
+    /// dispatchable calls against a client that had ruled them out.
     fn has_tool_intent(&self) -> bool {
+        if self.tool_choice_is_none() {
+            return false;
+        }
         !self.tools.is_empty() || self.tool_choice.is_some()
+    }
+
+    /// Whether `tool_choice` is the literal `"none"`.
+    ///
+    /// Only the string form: `{"type":"function",…}` names a call the client
+    /// wants, and any other shape is not a withdrawal this side should infer.
+    fn tool_choice_is_none(&self) -> bool {
+        self.tool_choice
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|choice| choice == "none")
     }
 
     fn resolved_tool_call_parser(&self) -> Option<ToolCallParser> {
@@ -2104,6 +2135,34 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_none_withdraws_the_offer_the_tools_list_makes() {
+        // The schema's way of saying "you may see the tools, do not call them",
+        // and a nonempty list alongside it is how that is normally sent — so
+        // reading intent from the list alone armed the parser for exactly the
+        // request that asked it not to.
+        let mut request = tool_request_named("qwen3-coder");
+        request.tool_choice = Some(serde_json::json!("none"));
+        assert!(
+            !request.has_tool_intent(),
+            "`tool_choice: none` is an offer withdrawn, whatever the tools list says"
+        );
+        assert!(
+            request.resolved_tool_call_parser().is_none(),
+            "no parser may recover calls from prose for a request that ruled them out"
+        );
+
+        // A named function is the opposite instruction and must still arm it.
+        request.tool_choice = Some(serde_json::json!({
+            "type": "function",
+            "function": {"name": "read_file"}
+        }));
+        assert!(
+            request.has_tool_intent(),
+            "naming a function is a request for a call, not a withdrawal"
+        );
+    }
+
+    #[test]
     fn a_truncated_tool_call_reports_length_not_tool_calls() {
         // The dangerous case: the upstream ran out of budget mid-call, so the
         // arguments are incomplete. Reporting `tool_calls` tells the client the
@@ -2117,10 +2176,11 @@ mod tests {
         // or the parser recovered it from the text.
         assert_eq!(resolve_finish_reason(Some("stop"), true), "tool_calls");
         assert_eq!(resolve_finish_reason(None, true), "tool_calls");
-        assert_eq!(
-            resolve_finish_reason(Some("tool_calls"), false),
-            "tool_calls"
-        );
+        // Reported by the provider with nothing behind it. `has_tool_calls` is
+        // read from the same list that fills `message.tool_calls`, so `false`
+        // here means the client would be sent to an empty array and told to
+        // dispatch from it — an agent then waits on a call nobody made.
+        assert_eq!(resolve_finish_reason(Some("tool_calls"), false), "stop");
         // And an ordinary completion is `stop`, including when nothing was
         // reported at all.
         assert_eq!(resolve_finish_reason(None, false), "stop");
