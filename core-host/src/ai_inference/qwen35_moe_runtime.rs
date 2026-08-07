@@ -474,6 +474,14 @@ struct GenerationRequest {
     prompt: Option<String>,
     #[serde(default)]
     messages: Option<Vec<IncomingChatTurn>>,
+    /// Tool schemas offered by the caller, handed to the chat template's
+    /// `tools` variable. Declared here for the same reason as
+    /// `max_generation_ms` below: this runtime parses its own request shape,
+    /// so a field it does not name is a field serde silently drops — and a
+    /// Qwen template gates its tool block on `{% if tools %}`, so dropping
+    /// them means the model is never told the functions exist.
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
     /// Absent when the caller named no budget, which is what lets the default
     /// be clamped to the context window while an explicit request that cannot
     /// fit is refused. Resolved into `ParsedRequest::max_new_tokens`.
@@ -513,6 +521,48 @@ fn default_max_new_tokens() -> usize {
     super::candle_llm_runtime::DEFAULT_MAX_NEW_TOKENS
 }
 
+/// What a manifest's device string asks this runtime to do.
+///
+/// The string arrives from `ModelDevice::as_str()`, which spells the
+/// accelerator `cuda` and never `gpu`. This runtime only ever saw `gpu`
+/// because its own tests passed that literal, so a real CUDA binding was
+/// refused outright — the native path was unreachable through any manifest,
+/// and the gated test stayed green while proving it about a value production
+/// does not emit. Parsing here, from the same string the binding carries,
+/// is what keeps the two ends together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen35Route {
+    /// The host does the multiplying: the dense path, by definition.
+    Host,
+    /// An accelerator does it. The NVFP4 kernel is CUDA-only, so this is the
+    /// only accelerator spelling that can be honoured.
+    Cuda,
+}
+
+impl Qwen35Route {
+    pub(crate) fn parse(requested_device: &str) -> Result<Self> {
+        match requested_device {
+            "cpu" => Ok(Self::Host),
+            // `cuda` is what a binding carries; `gpu` is the device-agnostic
+            // spelling callers and tests use. Both are the same request.
+            "cuda" | "gpu" => Ok(Self::Cuda),
+            // Every other accelerator is refused rather than quietly served
+            // from the host. `candle-nvfp4-kernels` has no backend for them,
+            // and answering with the same tokens off the wrong device is the
+            // silent descent this runtime exists to prevent.
+            other => bail!(
+                "Qwen 3.5 MoE runtime supports `cpu` or a CUDA accelerator (`cuda`/`gpu`), got \
+                 `{other}`: the NVFP4 kernel has no {other} backend, and serving these weights \
+                 from the host instead would answer with the same tokens and none of the meaning"
+            ),
+        }
+    }
+
+    fn is_accelerator(self) -> bool {
+        self == Self::Cuda
+    }
+}
+
 impl Qwen35MoeRuntime {
     pub(crate) fn try_load(
         alias: &str,
@@ -537,11 +587,7 @@ impl Qwen35MoeRuntime {
         if matched.kind != ArchitectureKind::Qwen35MoeText {
             bail!("resolved architecture is not Qwen 3.5 MoE text");
         }
-        if requested_device != "cpu" && requested_device != "gpu" {
-            bail!(
-                "Qwen 3.5 MoE runtime supports `cpu` or capability-gated `gpu`, got `{requested_device}`"
-            );
-        }
+        let route = Qwen35Route::parse(requested_device)?;
         let root = path.as_ref();
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
             .map_err(|error| anyhow!("failed to load Qwen tokenizer.json: {error}"))?;
@@ -571,7 +617,7 @@ impl Qwen35MoeRuntime {
         // That refusal is what `TACHYON_NVFP4_NATIVE_REQUIRED=1` used to buy,
         // except it bought it by asking about hardware; asking for a GPU says
         // the same thing and is the caller's own words.
-        let (availability, fallback) = if requested_device == "gpu" {
+        let (availability, fallback) = if route.is_accelerator() {
             let fallback = if dequantized_fallback_opted_in() {
                 Nvfp4FallbackPolicy::Permitted
             } else {
@@ -591,10 +637,10 @@ impl Qwen35MoeRuntime {
             fallback_limits,
             fallback,
         )?;
-        let executed_on = match (&execution_plan, requested_device) {
+        let executed_on = match (&execution_plan, route) {
             (Nvfp4ExecutionPlan::Native, _) => "gpu_native_fp4",
-            (Nvfp4ExecutionPlan::Fallback(_), "gpu") => "gpu_fallback",
-            (Nvfp4ExecutionPlan::Fallback(_), _) => "cpu_fallback",
+            (Nvfp4ExecutionPlan::Fallback(_), Qwen35Route::Cuda) => "gpu_fallback",
+            (Nvfp4ExecutionPlan::Fallback(_), Qwen35Route::Host) => "cpu_fallback",
         };
         Ok(Self {
             alias: alias.to_owned(),
@@ -849,6 +895,7 @@ impl Qwen35MoeRuntime {
             GenerationRequest {
                 prompt: Some(raw.to_owned()),
                 messages: None,
+                tools: None,
                 max_new_tokens: None,
                 temperature: None,
                 top_p: None,
@@ -915,7 +962,7 @@ impl Qwen35MoeRuntime {
                     .collect::<Result<Vec<_>>>()?;
                 match &self.chat_template {
                     Some(template) => template
-                        .render(&messages)
+                        .render(&messages, request.tools.as_deref())
                         .map_err(|error| anyhow!("failed to render Qwen chat template: {error}"))?,
                     None => {
                         let mut prompt = String::new();
@@ -1501,6 +1548,54 @@ mod tests {
         assert!(!declares_qwen35(&config));
     }
 
+    /// The device string a binding actually carries must reach the kernel.
+    ///
+    /// `ai_inference.rs` hands this runtime `binding.device.as_str()`, and
+    /// `ModelDevice::as_str()` spells the accelerator `cuda`. The guard used
+    /// to accept only `cpu` and `gpu`, so every CUDA manifest was refused
+    /// before it reached the loader — the native NVFP4 path was unreachable
+    /// outside the tests, which passed the literal `"gpu"` and stayed green.
+    ///
+    /// Asserting through `ModelDevice` rather than string literals is the
+    /// point: a literal here would have agreed with the old guard and proved
+    /// nothing.
+    #[test]
+    fn a_binding_device_selects_the_route_it_names() {
+        assert_eq!(
+            Qwen35Route::parse(crate::ModelDevice::Cuda.as_str()).expect("cuda binds a GPU route"),
+            Qwen35Route::Cuda
+        );
+        assert_eq!(
+            Qwen35Route::parse(crate::ModelDevice::Cpu.as_str()).expect("cpu binds a host route"),
+            Qwen35Route::Host
+        );
+        // The device-agnostic spelling callers and gated tests use.
+        assert_eq!(
+            Qwen35Route::parse("gpu").expect("`gpu` is the same request as `cuda`"),
+            Qwen35Route::Cuda
+        );
+    }
+
+    /// Accelerators the NVFP4 kernel has no backend for are refused, not
+    /// served from the host. A Metal binding that quietly answered on the CPU
+    /// would return the same tokens off the wrong device, which is exactly
+    /// what a `gpu` route is a claim against.
+    #[test]
+    fn an_accelerator_without_an_nvfp4_backend_is_refused_by_name() {
+        for device in [
+            crate::ModelDevice::Metal,
+            crate::ModelDevice::Npu,
+            crate::ModelDevice::Tpu,
+        ] {
+            let error = Qwen35Route::parse(device.as_str())
+                .expect_err("no NVFP4 backend exists for this accelerator");
+            assert!(
+                error.to_string().contains(device.as_str()),
+                "the refusal should name the device it refused, got: {error}"
+            );
+        }
+    }
+
     #[test]
     fn gated_installed_checkpoint_validates_complete_profile() {
         let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
@@ -1555,7 +1650,14 @@ mod tests {
             return;
         }
 
-        let loaded = Qwen35MoeRuntime::try_load("qwen35-gpu-route", &path, "gpu");
+        // The string a real binding carries, not the literal this test used
+        // to pass. `ModelDevice::as_str()` never yields `"gpu"`, so a literal
+        // here exercised a route no manifest can request.
+        let loaded = Qwen35MoeRuntime::try_load(
+            "qwen35-gpu-route",
+            &path,
+            crate::ModelDevice::Cuda.as_str(),
+        );
 
         if cfg!(feature = "candle-cuda") {
             let runtime = loaded

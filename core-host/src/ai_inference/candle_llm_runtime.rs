@@ -1988,6 +1988,23 @@ struct GenerationRequest {
     /// them into the final prompt; `prompt` is ignored.
     #[serde(default)]
     messages: Option<Vec<ChatTurn>>,
+    /// Tool schemas the caller offered, forwarded verbatim into the chat
+    /// template's `tools` variable.
+    ///
+    /// The guest has always put these on the wire; the host used to drop them
+    /// on the floor, because this struct had no field for them and serde
+    /// discards what it cannot name. A tool-aware template — every one of the
+    /// dialects `detect_tool_call_parser` recognises gates on `{% if tools %}`
+    /// — therefore rendered its no-tools branch, and the model was never told
+    /// which functions exist. The registry still advertised a parser and the
+    /// guest still armed its gate, so a local agent request came back as
+    /// ordinary prose with nothing to parse and no error anywhere.
+    ///
+    /// Kept as raw JSON: the schemas belong to the template, which reads
+    /// whatever shape the model was trained on. Giving them a typed shape here
+    /// would mean guessing that shape on the model's behalf.
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
     max_new_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -4573,7 +4590,11 @@ impl CandleLlmRuntime {
     /// `chat_template` (from `tokenizer_config.json`) when present so the result
     /// matches the checkpoint's expected control tokens; otherwise falls back to
     /// a generic, deterministic rendering that ends on an open assistant turn.
-    fn render_chat(&self, messages: &[ChatTurn]) -> Result<String, CandleLlmError> {
+    fn render_chat(
+        &self,
+        messages: &[ChatTurn],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<String, CandleLlmError> {
         if messages.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -4583,13 +4604,25 @@ impl CandleLlmRuntime {
         match &self.chat_template {
             Some(template) => {
                 template
-                    .render(messages)
+                    .render(messages, tools)
                     .map_err(|detail| CandleLlmError::InvalidRequest {
                         alias: self.alias.clone(),
                         detail: format!("failed to render chat template: {detail}"),
                     })
             }
-            None => Ok(render_generic_chat(messages)),
+            None => {
+                // No template means no place to put the schemas. Say so once
+                // rather than letting the caller wonder why the model ignored
+                // the tools it was offered.
+                if tools.is_some_and(|tools| !tools.is_empty()) {
+                    tracing::warn!(
+                        alias = %self.alias,
+                        "request offered tools but this model has no chat template; the generic \
+                         renderer cannot describe them, so the model will not be told they exist"
+                    );
+                }
+                Ok(render_generic_chat(messages))
+            }
         }
     }
 
@@ -4715,7 +4748,7 @@ impl CandleLlmRuntime {
             // Prefer structured `messages` (chat-templated); otherwise a raw
             // `prompt`. Exactly one source of prompt text must be present.
             let prompt = match (request.messages, request.prompt) {
-                (Some(messages), _) => self.render_chat(&messages)?,
+                (Some(messages), _) => self.render_chat(&messages, request.tools.as_deref())?,
                 (None, Some(prompt)) => prompt,
                 (None, None) => {
                     return Err(CandleLlmError::InvalidRequest {
@@ -5029,7 +5062,17 @@ impl ChatTemplate {
 
     /// Render `messages` through the Jinja template with `add_generation_prompt`
     /// set, so the prompt ends ready for the assistant to continue.
-    pub(crate) fn render(&self, messages: &[ChatTurn]) -> Result<String, String> {
+    ///
+    /// `tools` populates the template variable of the same name. Every tool
+    /// dialect this runtime recognises gates its tool block on it, so passing
+    /// `None` renders the plain-chat branch — which is the right answer when
+    /// the caller offered nothing, and was the wrong one for every caller that
+    /// did.
+    pub(crate) fn render(
+        &self,
+        messages: &[ChatTurn],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<String, String> {
         let mut env = minijinja::Environment::new();
         // Real HF templates call `raise_exception(...)` to reject malformed
         // conversations (e.g. a system turn where the model forbids one).
@@ -5052,6 +5095,11 @@ impl ChatTemplate {
         template
             .render(minijinja::context! {
                 messages => messages,
+                // Absent rather than empty when nothing was offered: templates
+                // test `{% if tools %}`, and an empty list is falsy in Jinja,
+                // but keeping the variable undefined matches what upstream
+                // `apply_chat_template` does when `tools=None`.
+                tools => tools,
                 add_generation_prompt => true,
                 bos_token => self.bos_token,
                 eos_token => self.eos_token,
@@ -6837,7 +6885,7 @@ mod tests {
             },
         ];
 
-        let rendered = template.render(&messages).expect("template renders");
+        let rendered = template.render(&messages, None).expect("template renders");
         assert!(
             rendered.contains("<call>read_file</call>"),
             "the assistant's call must survive the replay: {rendered}"
@@ -6854,6 +6902,98 @@ mod tests {
             rendered.contains("fn main() {}"),
             "the result's own content is still the content: {rendered}"
         );
+    }
+
+    /// The schemas the caller offered must reach the template's `tools`.
+    ///
+    /// Every dialect `detect_tool_call_parser` recognises gates its tool block
+    /// on `{% if tools %}`. The host used to render that branch's else-side
+    /// unconditionally — `GenerationRequest` had no `tools` field, so serde
+    /// dropped what the guest had already put on the wire — and the model was
+    /// never told which functions existed. The registry advertised a parser
+    /// and the guest armed its gate all the same, so the failure was a plain
+    /// prose answer with nothing to parse and no error to read.
+    ///
+    /// Both directions are asserted: offering nothing must still render the
+    /// plain branch, or this fix would have made every ordinary chat request
+    /// claim tools it does not have.
+    #[test]
+    fn offered_tools_reach_the_chat_template_and_absence_still_renders_plain() {
+        let template = ChatTemplate {
+            source: concat!(
+                "{% if tools %}<tools>",
+                "{% for t in tools %}{{ t.function.name }},{% endfor %}",
+                "</tools>{% else %}<no-tools>{% endif %}",
+                "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}"
+            )
+            .to_owned(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+        let messages = vec![ChatTurn {
+            role: "user".to_owned(),
+            content: "read the file".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            function_call: None,
+        }];
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+            serde_json::json!({"type": "function", "function": {"name": "write_file"}}),
+        ];
+
+        let with_tools = template
+            .render(&messages, Some(&tools))
+            .expect("template renders with tools");
+        assert!(
+            with_tools.contains("<tools>read_file,write_file,</tools>"),
+            "every offered schema must reach the prompt, in order: {with_tools}"
+        );
+
+        let without = template
+            .render(&messages, None)
+            .expect("template renders without tools");
+        assert!(
+            without.contains("<no-tools>"),
+            "a request that offered nothing must still take the plain branch: {without}"
+        );
+    }
+
+    /// The same property one layer out, where the bug actually lived.
+    ///
+    /// The template test above would have passed at every point in this
+    /// runtime's history, because it calls `render` directly. What was broken
+    /// is the step before it: the host parsed the guest's JSON into a struct
+    /// with no `tools` field, so the schemas were discarded between the wire
+    /// and the renderer. This drives `parse_request` with the payload the
+    /// guest actually sends.
+    #[test]
+    fn tools_on_the_wire_survive_into_the_rendered_prompt() {
+        let (mut runtime, dir) = load_fixture("tools-on-the-wire");
+        runtime.chat_template = Some(std::sync::Arc::new(ChatTemplate {
+            source: "{% if tools %}TOOLS:{% for t in tools %}{{ t.function.name }}{% endfor %}\
+                     {% endif %}{% for m in messages %}{{ m.content }}{% endfor %}"
+                .to_owned(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        }));
+
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "read it"}],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        })
+        .to_string();
+        let parsed = runtime
+            .parse_request(body.as_bytes())
+            .expect("request parses");
+
+        assert!(
+            parsed.prompt.contains("TOOLS:read_file"),
+            "the offered schema must survive deserialization into the prompt: {}",
+            parsed.prompt
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A departed consumer stops the draft, not just the round.
@@ -8571,7 +8711,7 @@ mod tests {
             function_call: None,
         }];
         let rendered = reloaded
-            .render_chat(&messages)
+            .render_chat(&messages, None)
             .expect("model template should render");
         assert_eq!(
             rendered, "<s><|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
