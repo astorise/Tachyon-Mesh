@@ -877,6 +877,35 @@ fn row_is_config_owned(row: Option<&[u8]>) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the registry row for `alias` still matches what publishing `path`
+/// would write today.
+///
+/// Compares the two fields the publisher derives from the directory's
+/// contents rather than from the manifest — `engine` and `tool_call_parser` —
+/// so a checkpoint replaced in place is seen for what it is. A missing row is
+/// "not current": there is nothing to keep listed, and withdrawing reserves
+/// the alias for the publication that follows the swap.
+#[cfg(feature = "ai-inference")]
+fn stored_row_still_current(core_store: &crate::store::CoreStore, alias: &str, path: &str) -> bool {
+    let Ok(Some(raw)) = core_store.kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias) else {
+        return false;
+    };
+    let Ok(row) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let stored = |field: &str| {
+        row.get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    // `RegistryModelInfo` is `rename_all = "camelCase"`, so the stored key is
+    // `toolCallParser`. Reading the Rust field name here would have found
+    // nothing every time and withdrawn every parser-declaring binding on every
+    // reload — a silent availability cost, in the code meant to avoid one.
+    stored("engine").as_deref() == Some(binding_engine_label(path))
+        && stored("toolCallParser").as_deref() == binding_tool_call_parser(path)
+}
+
 /// Withdraw configured rows the incoming config will not serve identically.
 ///
 /// Called *before* a hot-reload swap, while the previous runtime is still
@@ -907,9 +936,25 @@ pub(crate) fn withdraw_changed_model_bindings(
     let incoming = publishable(incoming);
 
     for (alias, path) in publishable(previous) {
-        // Same alias, same path — the row it would publish is byte-identical,
-        // so leaving it in place keeps the model listed across the reload.
-        if incoming.get(&alias).is_some_and(|next| *next == path) {
+        // Same alias, same path, *and* the stored row still says what a fresh
+        // publication would say.
+        //
+        // The path alone used to decide this, and the row it stands for is not
+        // a function of the path: the publisher derives `engine` and
+        // `tool_call_parser` from the directory's contents, which a checkpoint
+        // swapped in place behind an unchanged path changes underneath it. The
+        // comparison also has to be against the *stored* row rather than
+        // against the incoming config, because both configs are read here at
+        // the same instant and would agree about a directory neither of them
+        // describes. The stored row is the only witness of what the last
+        // publication saw.
+        //
+        // Getting this wrong kept the old row listed while the new backend was
+        // already serving, and if the best-effort publication after the swap
+        // then failed, it stayed listed indefinitely.
+        if incoming.get(&alias).is_some_and(|next| *next == path)
+            && stored_row_still_current(core_store, &alias, &path)
+        {
             continue;
         }
         // An alias the incoming config still owns is *reserved*, not released.
@@ -1516,6 +1561,91 @@ mod configured_binding_registry_tests {
         assert_eq!(entry["engine"], "openai");
         write_uploaded_model_row(&store, "free", b"{}".to_vec()).expect("a free alias is writable");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    /// A checkpoint replaced behind an unchanged path is a change.
+    ///
+    /// The withdrawal used to compare alias and path, on the assumption that
+    /// the row a path publishes is a function of the path. It is not: the
+    /// publisher reads `engine` and `tool_call_parser` out of the directory,
+    /// so swapping the checkpoint in place produces a different row from the
+    /// same string. The old row stayed listed while the new backend served,
+    /// and a failed best-effort publication after the swap left it listed for
+    /// good.
+    ///
+    /// Comparing the two *configs* would not have caught it either — both are
+    /// read at the same instant and neither describes the directory. The
+    /// stored row is the only witness of what the last publication saw, which
+    /// is why the reload here passes the same config on both sides.
+    #[test]
+    fn a_reload_withdraws_a_binding_whose_checkpoint_changed_under_its_path() {
+        let (store, dir) = temp_store();
+        let model_dir = dir.join("qwen-coder");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        let sidecar = model_dir.join(".tachyon-model.json");
+        std::fs::write(&sidecar, br#"{"tool_call_parser":"qwen"}"#).expect("write sidecar");
+
+        let path = model_dir.to_string_lossy().into_owned();
+        assert_eq!(
+            binding_tool_call_parser(&path),
+            Some("qwen"),
+            "the sidecar is what the publisher reads the dialect from"
+        );
+        let config = config_with(vec![binding("qwen-coder", &path, false)]);
+        publish_configured_model_bindings(&store, &config);
+
+        let published = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "qwen-coder")
+            .expect("read")
+            .expect("the binding publishes a row");
+        let published: serde_json::Value = serde_json::from_slice(&published).expect("row json");
+        assert_eq!(
+            published["toolCallParser"], "qwen",
+            "the published row records the dialect the directory declared"
+        );
+
+        // Same alias, same path, different checkpoint.
+        std::fs::write(&sidecar, br#"{"tool_call_parser":"mistral"}"#).expect("rewrite sidecar");
+        withdraw_changed_model_bindings(&store, &config, &config);
+
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "qwen-coder")
+            .expect("read")
+            .expect("a changed binding keeps a reservation row rather than vanishing");
+        let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
+        assert_eq!(
+            row["withdrawn"], true,
+            "a row that no longer describes what the path holds must not stay advertised"
+        );
+    }
+
+    /// The converse: an untouched directory costs no availability.
+    #[test]
+    fn a_reload_keeps_a_binding_whose_checkpoint_is_unchanged() {
+        let (store, dir) = temp_store();
+        let model_dir = dir.join("qwen-coder");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(
+            model_dir.join(".tachyon-model.json"),
+            br#"{"tool_call_parser":"qwen"}"#,
+        )
+        .expect("write sidecar");
+
+        let path = model_dir.to_string_lossy().into_owned();
+        let config = config_with(vec![binding("qwen-coder", &path, false)]);
+        publish_configured_model_bindings(&store, &config);
+        withdraw_changed_model_bindings(&store, &config, &config);
+
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "qwen-coder")
+            .expect("read")
+            .expect("the row survives");
+        let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
+        assert_ne!(
+            row["withdrawn"], true,
+            "an unchanged binding must stay listed across the reload"
+        );
     }
 
     #[test]

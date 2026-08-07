@@ -436,6 +436,27 @@ fn alias_is_config_owned(alias: &str) -> bool {
         .is_some_and(|info| info.is_config_owned())
 }
 
+/// Whether the registry holds a *reservation* row for `alias`.
+///
+/// `list_models()` filters withdrawn rows out, which is right for the listing
+/// and for resolving a qualified `engine/alias`: both go through the filtered
+/// set, so a reserved alias is absent from each. A bare name did not, because
+/// the resolver falls back to using the requested name as the alias when it
+/// matches nothing — a fallback meant for aliases the registry never knew, not
+/// for one it is deliberately holding.
+///
+/// The effect was a hole exactly the width of a reload: hidden from
+/// `GET /ai/v1/models`, still reachable by bare name, and answered by whichever
+/// runtime happened to be sealed for the route. Reading the raw row is what
+/// tells the two cases apart, since the filtered list cannot.
+fn alias_is_withdrawn(alias: &str) -> bool {
+    models_table()
+        .get(alias)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ModelInfo>(&raw).ok())
+        .is_some_and(|info| info.withdrawn)
+}
+
 #[derive(Debug, Serialize)]
 struct OpenAiModel {
     id: String,
@@ -661,16 +682,14 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
 
     let models = list_models()?;
     let registered = resolve_registered_model(&request.model, &models);
-    let alias = match registered {
-        Some(model) => model.alias.clone(),
-        None if !request.model.contains('/') => request.model.clone(),
-        None => {
-            return Ok(openai_error_payload(
-                404,
-                format!("model `{}` is unavailable", request.model),
-                "model_not_found",
-            ));
-        }
+    let Some(alias) = resolve_requested_alias(&request.model, registered, || {
+        alias_is_withdrawn(&request.model)
+    }) else {
+        return Ok(openai_error_payload(
+            404,
+            format!("model `{}` is unavailable", request.model),
+            "model_not_found",
+        ));
     };
     // Before either handler runs: every downstream use of the parser — the
     // streaming gate, the host-side generation request, and the final parse —
@@ -698,6 +717,37 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
 
 /// Find the registry row a request's `model` names, by bare alias or by the
 /// `{engine}/{alias}` id `GET /ai/v1/models` advertises.
+/// The alias a request names, or `None` when it must be answered with a 404.
+///
+/// Three cases, and the middle one is the one that was missing:
+///
+/// * a row in the listing — the registry's own alias, whatever spelling the
+///   client used to reach it;
+/// * a bare name the registry is *holding* — reserved during a reload swap, so
+///   it is unavailable rather than unknown;
+/// * a bare name the registry has never heard of — passed through, because an
+///   alias can be loadable without having a row yet.
+///
+/// `reserved` is a closure rather than a `bool` because it reads the raw
+/// registry row through the host, and only the second case needs to ask. A
+/// request that resolved, or that used a qualified `engine/alias`, decides
+/// without the extra round trip.
+fn resolve_requested_alias(
+    requested: &str,
+    registered: Option<&ModelInfo>,
+    reserved: impl FnOnce() -> bool,
+) -> Option<String> {
+    if let Some(model) = registered {
+        return Some(model.alias.clone());
+    }
+    // A qualified name that matched nothing is simply not here: the engine
+    // prefix only exists on rows, so there is no bare-alias reading of it.
+    if requested.contains('/') {
+        return None;
+    }
+    (!reserved()).then(|| requested.to_owned())
+}
+
 fn resolve_registered_model<'a>(requested: &str, models: &'a [ModelInfo]) -> Option<&'a ModelInfo> {
     models.iter().find(|model| {
         model.alias == requested || format!("{}/{}", model.engine, model.alias) == requested
@@ -1834,6 +1884,49 @@ mod tests {
             stream: None,
             stream_options: None,
         }
+    }
+
+    /// A reserved alias is unavailable, not a free name to load.
+    ///
+    /// `list_models()` filters withdrawn rows, so a reserved alias is absent
+    /// from the listing and from `resolve_registered_model`. The bare-name
+    /// fallback then read that absence as "the registry never heard of this"
+    /// and used the name as an alias — which, for the length of a reload swap,
+    /// ran the request against whichever runtime was sealed for the route
+    /// while `GET /ai/v1/models` reported the model as gone.
+    ///
+    /// The reservation lookup is injected here because it reads the raw row
+    /// through the host; the decision it feeds is what this pins down.
+    #[test]
+    fn a_reserved_bare_alias_is_unavailable_rather_than_loadable() {
+        // Reserved: hidden from the listing, held by the registry.
+        assert_eq!(
+            resolve_requested_alias("qwen-coder", None, || true),
+            None,
+            "an alias the registry is holding must 404, not fall through"
+        );
+        // Unknown: hidden from the listing because it has no row at all.
+        assert_eq!(
+            resolve_requested_alias("qwen-coder", None, || false),
+            Some("qwen-coder".to_owned()),
+            "a name with no row stays loadable: rows are not a precondition"
+        );
+        // Qualified and unmatched: no bare-alias reading exists for it, and the
+        // reservation lookup must not even be consulted.
+        assert_eq!(
+            resolve_requested_alias("gguf/qwen-coder", None, || {
+                panic!("a qualified name must decide without reading the registry row")
+            }),
+            None
+        );
+        // Resolved: the registry's own alias wins over the requested spelling.
+        let model = registry_model("qwen-coder", None);
+        assert_eq!(
+            resolve_requested_alias("safetensors/qwen-coder", Some(&model), || {
+                panic!("a resolved model must decide without reading the registry row")
+            }),
+            Some("qwen-coder".to_owned())
+        );
     }
 
     fn registry_model(alias: &str, parser: Option<&str>) -> ModelInfo {
