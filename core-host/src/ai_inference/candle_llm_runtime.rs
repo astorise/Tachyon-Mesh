@@ -319,7 +319,12 @@ impl ModelArchitecture {
             "qwen2" => Some(Self::Qwen2),
             "qwen3" => Some(Self::Qwen3),
             "qwen3moe" => Some(Self::Qwen35Moe),
-            "qwen3_5" => Some(Self::Qwen35Hybrid),
+            // Real Unsloth-converted Qwen3.5 GGUFs write `qwen35`, without the
+            // underscore; `qwen3_5` is the alias other conversion paths emit.
+            // candle accepts both since huggingface/candle#3821, and this gate
+            // runs first, so knowing only the alias meant a genuine Qwen3.5
+            // checkpoint was refused here before the loader ever saw it.
+            "qwen35" | "qwen3_5" => Some(Self::Qwen35Hybrid),
             "gemma" | "gemma2" | "gemma3" | "gemma-embedding" => Some(Self::Gemma3),
             "glm4" => Some(Self::Glm4),
             "lfm2" => Some(Self::Lfm2),
@@ -7133,6 +7138,17 @@ mod tests {
             ModelArchitecture::from_gguf_architecture("qwen3_5"),
             Some(ModelArchitecture::Qwen35Hybrid)
         );
+        // The spelling a real Unsloth-converted checkpoint carries. It is not
+        // an alias of the alias: `qwen35` is what the files say, and knowing
+        // only `qwen3_5` refused every one of them at this gate.
+        assert_eq!(
+            ModelArchitecture::from_gguf_architecture("qwen35"),
+            Some(ModelArchitecture::Qwen35Hybrid)
+        );
+        // The MoE sibling stays distinct under the underscore-less spelling
+        // too: candle reports `qwen35moe` as known-but-unimplemented, and it
+        // must not fall into the hybrid by prefix.
+        assert_eq!(ModelArchitecture::from_gguf_architecture("qwen35moe"), None);
         assert_ne!(
             ModelArchitecture::Qwen35Moe,
             ModelArchitecture::Qwen35Hybrid
