@@ -55,6 +55,10 @@ candle-cuda = [
     "candle-nn/lora-cuda",
     "candle-onnx/cuda",
     "candle-transformers/cuda",
+    # `auto_linear` only reaches the fused device-resident NVFP4 operator when
+    # this is on; without it, upstream's chooser silently picks the packed CPU
+    # path even on a CUDA device.
+    "candle-transformers/nvfp4-cuda",
     # Compiles in candle-transformers' paged-attention call site (the
     # cache.set_paged_kv/paged_kv seam added for hardware_strategy.paged_attention);
     # gated behind this feature because it pulls in the CUDA-only

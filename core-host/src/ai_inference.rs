@@ -18,8 +18,7 @@ mod paged_kv;
 pub(crate) mod parallel;
 #[path = "ai_inference/pipeline_parallel_llama.rs"]
 pub(crate) mod pipeline_parallel_llama;
-#[path = "ai_inference/qwen35_moe_runtime.rs"]
-mod qwen35_moe_runtime;
+mod qwen35_profile;
 mod qwen35_upstream;
 #[path = "ai_inference/samplers.rs"]
 mod samplers;
@@ -2281,7 +2280,7 @@ enum CandleBackendModelKind {
     /// documented follow-up.
     ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
     TextEmbedding(Box<candle_embedding_runtime::CandleEmbeddingRuntime>),
-    Qwen35Moe(Box<qwen35_moe_runtime::Qwen35MoeRuntime>),
+    Qwen35Moe(Box<qwen35_upstream::Qwen35MoeRuntime>),
     Vendor(vendor_accelerator::VendorAcceleratorRuntime),
     /// An OpenAI-compatible server reached over the network. No weights are
     /// resident on this node: the alias exists so the mesh can route, authorise,
@@ -2368,7 +2367,7 @@ impl CandleBackendModel {
             match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(&binding.alias, &binding.path)? {
                 Some(model) => {
                     static DESCRIPTORS: [&dyn architecture_registry::ArchitectureDescriptor; 1] =
-                        [&qwen35_moe_runtime::QWEN35_MOE_DESCRIPTOR];
+                        [&qwen35_profile::QWEN35_MOE_DESCRIPTOR];
                     let registry = architecture_registry::ArchitectureRegistry::new(&DESCRIPTORS);
                     match registry.resolve(&model)? {
                         Some(architecture)
@@ -2376,7 +2375,7 @@ impl CandleBackendModel {
                                 == architecture_registry::ArchitectureKind::Qwen35MoeText =>
                         {
                             CandleBackendModelKind::Qwen35Moe(Box::new(
-                                qwen35_moe_runtime::Qwen35MoeRuntime::from_model(
+                                qwen35_upstream::Qwen35MoeRuntime::from_model(
                                     &binding.alias,
                                     &binding.path,
                                     binding.device.as_str(),

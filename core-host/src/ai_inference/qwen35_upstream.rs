@@ -1,40 +1,67 @@
-//! Loading a ModelOpt NVFP4 checkpoint into candle's own Qwen 3.5 layers.
+//! The Qwen 3.5 MoE runtime, executing on candle's own layers.
 //!
-//! `qwen35_moe_runtime.rs` reimplements the architecture — attention, the
-//! gated-delta recurrence, the sparse mixture, the norms — because for a long
-//! time there was nowhere else for it to live: the upstream model was dense,
-//! its projections were concrete `Linear`s, and NVFP4 weights could only be
-//! multiplied through a host-staging kernel. Three changes removed all three
-//! obstacles (candle #3831, #3832, #3837), and what is left for us to supply
-//! is the only thing that was ever ours: how a `[rows, cols]` weight stored as
-//! packed E2M1 nibbles multiplies an activation.
+//! This module used to be a loader beside a second, local implementation of
+//! the architecture: `qwen35_moe_runtime.rs` reimplemented attention, the
+//! gated-delta recurrence, the sparse mixture and the norms, because for a
+//! long time there was nowhere else for them to live. Three upstream changes
+//! removed every reason (candle #3831, #3832, #3837), and a fourth removed the
+//! last one: #3857 gave NVFP4 a packed CPU operator, so a host without a CUDA
+//! device no longer has to choose between an eight-times unpack and nothing at
+//! all.
 //!
-//! So this module is a projection factory and a config translation, and the
-//! model is upstream's.
+//! What is left here is the join: translate the validated checkpoint config
+//! into upstream's, hand upstream a projection factory that knows how ModelOpt
+//! stores a weight, and run the decode loop. The architecture is candle's.
 //!
-//! ## Why the scalar runtime is still here
+//! ## One request at a time
 //!
-//! A resident NVFP4 operator needs a CUDA device — any of them, since candle
-//! #3831; FP4 tensor cores were never part of it. Where there is none, every
-//! CPU box included, this loader refuses rather than silently dequantizing a
-//! mixture-of-experts checkpoint to f32, which would be eight times the packed
-//! size and would fit nowhere. The scalar runtime stays as that host fallback.
-//! It is a second implementation of one architecture and it will drift; it
-//! should be deleted once the GPU pipeline actually runs.
+//! `ModelForCausalLM::forward` takes `&mut self` because the model owns its KV
+//! cache and the recurrent state of every linear-attention layer. The scalar
+//! runtime kept that state in a local, so requests to one alias were naturally
+//! concurrent; upstream's is inside the model, so they cannot be. The `Mutex`
+//! is what makes that safe, and `clear_kv_cache` between requests is what keeps
+//! one answer out of the next. The scheduler already bounds concurrency, and a
+//! 40-layer 256-expert mixture does not serve many requests at once in any
+//! case — but this is a narrowing, not a free simplification.
 
-use anyhow::{bail, Context, Result};
-use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, Context, Result};
+use candle_core::{Device, Tensor};
+use candle_transformers::generation::{
+    FinishReason, IncrementalDecoder, LogitsProcessor, Sampling, StopCriteria,
+};
 use candle_transformers::models::qwen3_5::{
     Config as UpstreamConfig, ModelForCausalLM, Projection, RopeParameters as UpstreamRope,
     TextConfig,
 };
+use candle_transformers::quantized_nvfp4::{auto_linear, Nvfp4Config};
+use serde::Deserialize;
+use serde_json::Value;
+use tokenizers::Tokenizer;
 
-use super::modelopt_nvfp4::{
-    dequantized_fallback_opted_in, ModelOptLinearTensors, ModelOptNvfp4Directory,
-    Nvfp4KernelAvailability, DEQUANTIZED_FALLBACK_ENV,
+use super::candle_llm_runtime::{
+    prompt_limits_for, ChatTemplate, ChatTurn, TokenUsage, DEFAULT_GENERATION_DEADLINE,
+    HOST_MAX_GENERATION_DEADLINE, HOST_MAX_NEW_TOKENS,
 };
-use super::qwen35_moe_runtime::{LayerType, Qwen35MoeConfig};
+use super::modelopt_nvfp4::{
+    dequantized_fallback_opted_in, ModelOptNvfp4Directory, Nvfp4KernelAvailability,
+    DEQUANTIZED_FALLBACK_ENV,
+};
+use super::qwen35_profile::{LayerType, Qwen35MoeConfig, Qwen35Route, QWEN35_MOE_DESCRIPTOR};
+use super::{
+    architecture_registry::{ArchitectureDescriptor, ArchitectureKind},
+    StreamControl,
+};
+
+/// Prompt tokens per prefill pass through the layer stack.
+///
+/// The unit at which the deadline can be observed: a pass cannot be
+/// interrupted partway without leaving the recurrent state describing a token
+/// the KV cache has not seen.
+const PREFILL_CHUNK_TOKENS: usize = 64;
 
 /// Translate our validated checkpoint config into upstream's.
 ///
@@ -46,12 +73,11 @@ use super::qwen35_moe_runtime::{LayerType, Qwen35MoeConfig};
 ///   checkpoint with `num_experts > 0` is sparse, so upstream never reads it;
 ///   it is set to the MoE width so that a wrong value cannot quietly size
 ///   anything.
-/// * `hidden_act` — Qwen 3.5 is SwiGLU with SiLU, which is what our scalar
-///   implementation applies and what the checkpoints carry.
-/// * `attention_bias` — ModelOpt Qwen 3.5 checkpoints have no attention bias,
-///   and our implementation never read one. If that ever changes the
-///   projections will fail to find their bias tensors, which is the loud
-///   failure rather than the silent one.
+/// * `hidden_act` — Qwen 3.5 is SwiGLU with SiLU, which is what the
+///   checkpoints carry.
+/// * `attention_bias` — ModelOpt Qwen 3.5 checkpoints have no attention bias.
+///   If that ever changes the projections will fail to find their bias
+///   tensors, which is the loud failure rather than the silent one.
 pub(crate) fn upstream_config(config: &Qwen35MoeConfig) -> UpstreamConfig {
     UpstreamConfig {
         text_config: TextConfig {
@@ -91,137 +117,501 @@ pub(crate) fn upstream_config(config: &Qwen35MoeConfig) -> UpstreamConfig {
     }
 }
 
-/// The checkpoint-relative name of a projection.
+/// A rejection of what the *caller* asked for, typed rather than bare.
 ///
-/// Upstream hands the factory a leaf name and a `VarBuilder` rooted at the
-/// containing module, which is exactly the split a dense loader wants and
-/// exactly the wrong one for us: an NVFP4 operator is three tensors that have
-/// to be found by their full path. `VarBuilder::prefix` is the other half.
-fn tensor_path(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{prefix}.{name}")
+/// A plain `bail!` produces an `anyhow` error indistinguishable from a host
+/// fault once it reaches `GenerationError::from_anyhow`, so a request this
+/// runtime refused outright reached the client as a retryable 500 and was
+/// retried forever.
+fn invalid_request(alias: &str, detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(super::candle_llm_runtime::CandleLlmError::InvalidRequest {
+        alias: alias.to_owned(),
+        detail: detail.into(),
+    })
+}
+
+pub(crate) struct Qwen35MoeRuntime {
+    alias: String,
+    root: PathBuf,
+    config: Qwen35MoeConfig,
+    tokenizer: Tokenizer,
+    chat_template: Option<ChatTemplate>,
+    executed_on: &'static str,
+    /// See the module docs: upstream's model owns the state a decode advances,
+    /// so one decode at a time per loaded alias.
+    model: Mutex<ModelForCausalLM>,
+}
+
+impl Qwen35MoeRuntime {
+    pub(crate) fn try_load(
+        alias: &str,
+        path: impl AsRef<Path>,
+        requested_device: &str,
+    ) -> Result<Option<Self>> {
+        let Some(model) = ModelOptNvfp4Directory::try_load(alias, path.as_ref())? else {
+            return Ok(None);
+        };
+        Self::from_model(alias, path, requested_device, model).map(Some)
     }
-}
 
-/// One NVFP4 operator, as upstream's layers see it.
-///
-/// A pure pass-through, and deliberately so: the resident operator already
-/// preserves the leading dimensions and never stages through the host, so
-/// anything this wrapper did beyond delegating would be a copy the migration
-/// exists to remove.
-struct Nvfp4Projection {
-    resident: super::modelopt_nvfp4::cuda::Nvfp4DeviceLinear,
-}
+    pub(crate) fn from_model(
+        alias: &str,
+        path: impl AsRef<Path>,
+        requested_device: &str,
+        model: ModelOptNvfp4Directory,
+    ) -> Result<Self> {
+        let matched = QWEN35_MOE_DESCRIPTOR.inspect(&model)?.ok_or_else(|| {
+            anyhow!("ModelOpt/NVFP4 model `{alias}` does not match the Qwen 3.5 MoE text profile")
+        })?;
+        if matched.kind != ArchitectureKind::Qwen35MoeText {
+            bail!("resolved architecture is not Qwen 3.5 MoE text");
+        }
+        let route = Qwen35Route::parse(requested_device)?;
+        let root = path.as_ref();
+        let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
+            .map_err(|error| anyhow!("failed to load Qwen tokenizer.json: {error}"))?;
+        let chat_template = ChatTemplate::load(alias, root)?;
+        let config = Qwen35MoeConfig::validate_model(&model)?;
 
-impl Projection for Nvfp4Projection {
-    fn forward(&self, xs: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
-        self.resident.forward(xs)
+        // A `gpu` route is a claim that the accelerator does the work, and it
+        // has to be checked *here* rather than left to `auto_linear`: without
+        // the `nvfp4-cuda` feature compiled in, upstream's chooser silently
+        // picks the packed CPU operator even on a CUDA device, which answers
+        // with the same tokens off the wrong hardware. That silent descent is
+        // the whole thing a `gpu` route exists to rule out.
+        let device = match route {
+            Qwen35Route::Host => Device::Cpu,
+            Qwen35Route::Cuda => {
+                if Nvfp4KernelAvailability::detect() != Nvfp4KernelAvailability::Reachable
+                    && !dequantized_fallback_opted_in()
+                {
+                    bail!(
+                        "candle reports no usable NVFP4 kernel on this host: build with the \
+                         `candle-cuda` feature and run where there is a CUDA device, or set \
+                         {DEQUANTIZED_FALLBACK_ENV}=1 to unpack the weights to dense f32 \
+                         instead — eight times the memory of the packed checkpoint, which is \
+                         why it is not the default"
+                    );
+                }
+                Device::new_cuda(0).context("a `cuda` route needs a CUDA device")?
+            }
+        };
+        let executed_on = match route {
+            Qwen35Route::Cuda => "gpu_native_fp4",
+            // Packed on the host since candle #3857: the checkpoint's own
+            // footprint rather than eight times it, decoded per row during the
+            // forward pass.
+            Qwen35Route::Host => "cpu_packed_fp4",
+        };
+
+        let model = load(&model, &config, &device)?;
+        Ok(Self {
+            alias: alias.to_owned(),
+            root: root.to_path_buf(),
+            config,
+            tokenizer,
+            chat_template,
+            executed_on,
+            model: Mutex::new(model),
+        })
     }
-}
 
-/// How a projection's weight will be held on the device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WeightResidency {
-    /// Packed E2M1 nibbles, multiplied by the NVFP4 kernel. What the format is
-    /// for, and the only form that fits a large checkpoint.
-    Packed,
-    /// Unpacked to dense f32 at load. Eight times the memory, and the only way
-    /// to exercise these layers in a build that has no NVFP4 kernel.
-    DequantizedF32,
-}
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
 
-/// Decide how this host will hold the weights, or refuse.
-///
-/// `availability` is candle's answer about its own kernel, passed in rather
-/// than recomputed so that every caller reaches it the same way. It used to be
-/// a bare `native: bool` meaning a Blackwell device — the kernel gated itself
-/// on compute capability 10.0 even though nothing in it needs FP4 tensor
-/// cores. candle #3831 separated the two signals, so the packed path now runs
-/// wherever there is a CUDA device, and the capability question moved to
-/// `supports_fp4_tensor_cores`.
-///
-/// What is left is a build with no CUDA backend under the kernel crate, or a
-/// host with no device to run it on. Either way candle says `Absent`, and that
-/// is the case the dequantized form still answers.
-pub(crate) fn residency(
-    device_is_cuda: bool,
-    availability: Nvfp4KernelAvailability,
-    fallback_opted_in: bool,
-) -> Result<WeightResidency> {
-    if !device_is_cuda {
-        bail!(
-            "Qwen 3.5 through candle's layers needs a CUDA device; the scalar runtime is the \
-             host path"
+    pub(crate) fn executed_on(&self) -> &'static str {
+        self.executed_on
+    }
+
+    pub(crate) fn generate(
+        &self,
+        prompts: &[&[u8]],
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>)> {
+        let mut output = String::new();
+        // A buffered caller is holding the call and cannot go away mid-decode.
+        let (usage, finish_reason) = self.generate_streaming(prompts, &mut |delta| {
+            output.push_str(delta);
+            StreamControl::Continue
+        })?;
+        Ok((output.into_bytes(), usage, finish_reason))
+    }
+
+    pub(crate) fn generate_streaming(
+        &self,
+        prompts: &[&[u8]],
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
+    ) -> Result<(TokenUsage, Option<&'static str>)> {
+        if prompts.len() != 1 {
+            bail!("Qwen 3.5 MoE runtime currently accepts exactly one prompt per decode");
+        }
+        let request = self.parse_request(prompts[0])?;
+        let encoded = self
+            .tokenizer
+            .encode(request.prompt.clone(), true)
+            .map_err(|error| anyhow!("failed to tokenize Qwen prompt: {error}"))?;
+        if encoded.is_empty() {
+            return Err(invalid_request(
+                &self.alias,
+                "prompt encoded to zero tokens",
+            ));
+        }
+        // A caller that named a budget has an expectation to violate, so an
+        // impossible one is an error; a caller that named none has none, so the
+        // default is clamped to what the window can deliver.
+        let headroom = self
+            .config
+            .max_position_embeddings
+            .saturating_sub(encoded.len());
+        if let Some(requested) = request.requested_max_new_tokens {
+            if requested > headroom {
+                return Err(invalid_request(
+                    &self.alias,
+                    format!(
+                        "prompt tokens {} plus max_new_tokens {requested} exceed the {}-token context limit; lower max_new_tokens to at most {headroom}",
+                        encoded.len(),
+                        self.config.max_position_embeddings
+                    ),
+                ));
+            }
+        }
+        let max_new_tokens = request.max_new_tokens.min(headroom);
+        if max_new_tokens == 0 {
+            return Err(invalid_request(
+                &self.alias,
+                format!(
+                    "prompt tokens {} leave no room to generate within the {}-token context limit",
+                    encoded.len(),
+                    self.config.max_position_embeddings
+                ),
+            ));
+        }
+
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|_| anyhow!("Qwen 3.5 runtime lock was poisoned by an earlier panic"))?;
+        // The previous request's cache and recurrent state say nothing about
+        // this prompt, and upstream keeps both inside the model.
+        model.clear_kv_cache();
+
+        let prompt_ids = encoded.get_ids();
+        let device = self.device_of(&model);
+        let mut logits: Option<Tensor> = None;
+        for (chunk_index, chunk) in prompt_ids.chunks(PREFILL_CHUNK_TOKENS).enumerate() {
+            let position = chunk_index * PREFILL_CHUNK_TOKENS;
+            if position > 0 && Instant::now() >= request.deadline {
+                // Not an error: the deadline's contract is that it stops
+                // generation and returns what was produced, and a prompt that
+                // outlasts prefill produced nothing.
+                return Ok((
+                    TokenUsage {
+                        prompt_tokens: encoded.len() as u32,
+                        completion_tokens: 0,
+                    },
+                    None,
+                ));
+            }
+            let input = Tensor::new(chunk, &device)?.unsqueeze(0)?;
+            logits = Some(model.forward(&input, position)?);
+        }
+        // Upstream narrows to the final position itself, so every chunk yields
+        // logits and only the last one's are worth keeping.
+        let Some(mut logits) = logits else {
+            bail!("prefill produced no logits for the prompt's final token");
+        };
+
+        let sampling = resolve_sampling(
+            request.temperature,
+            request.top_p,
+            request.seed.unwrap_or(299_792_458),
         );
+        let mut processor =
+            LogitsProcessor::from_sampling(request.seed.unwrap_or(299_792_458), sampling);
+        let mut generated = Vec::<u32>::new();
+        // Every token this decode produced, EOS included — which is what
+        // `completion_tokens` reports and what `generated` deliberately does
+        // not hold.
+        let mut sampled = 0u32;
+        let mut emitted = 0usize;
+        let mut abandoned = false;
+        let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
+        // Stop sequences, the held-back tail and the finish-reason rule all
+        // come from upstream, the same `StopCriteria` the generic Candle
+        // runtime uses, so the two backends cannot drift apart on them.
+        let criteria = StopCriteria::new(request.stop.clone(), vec![self.config.eos_token_id]);
+        let mut finish = None;
+        for step in 0..max_new_tokens {
+            // An elapsed budget stops generation the way an exhausted token
+            // budget does, rather than failing: freeing the scheduler slot is
+            // the point, and a partial answer beats an error.
+            if Instant::now() >= request.deadline {
+                break;
+            }
+            // Same reasoning for a consumer that went away.
+            if abandoned {
+                break;
+            }
+            let token = processor.sample(&logits.squeeze(0)?.squeeze(0)?)?;
+            // Counted where it is produced, not where it is kept: EOS costs a
+            // forward pass and a sampling step, and the generic Candle runtime
+            // counts it, so reading the count off `generated` made the same
+            // request report different `completion_tokens` depending on which
+            // backend served the alias.
+            sampled += 1;
+            if criteria.is_eos(token) {
+                finish = criteria.finish_reason(token, decoder.text(), false);
+                break;
+            }
+            generated.push(token);
+            decoder
+                .push(token)
+                .map_err(|error| anyhow!("failed to decode Qwen tokens: {error}"))?;
+            let text = decoder.text();
+            let safe_end = criteria.safe_emit_end(text);
+            if emitted < safe_end {
+                abandoned = on_token(&text[emitted..safe_end]).is_stop();
+                emitted = safe_end;
+            }
+            if criteria.matched(text).is_some() {
+                finish = criteria.finish_reason(token, text, false);
+                break;
+            }
+            let input = Tensor::new(&[token][..], &device)?.unsqueeze(0)?;
+            logits = model.forward(&input, encoded.len() + step)?;
+        }
+        // Flush what the hold kept back: every exit leaves a suffix unsent —
+        // EOS breaks before the token is even pushed.
+        let text = decoder.text();
+        let end = criteria.matched(text).unwrap_or(text.len());
+        if !abandoned && emitted < end {
+            on_token(&text[emitted..end]);
+        }
+        let usage = TokenUsage {
+            prompt_tokens: encoded.len() as u32,
+            completion_tokens: sampled,
+        };
+        // Only budget exhaustion is named, because that is the case an absent
+        // reason would misreport as a clean `stop`.
+        let finish_reason = match finish {
+            Some(FinishReason::Stop) => None,
+            Some(FinishReason::Length) => Some("length"),
+            None => (generated.len() >= max_new_tokens).then_some("length"),
+        };
+        Ok((usage, finish_reason))
     }
-    if availability == Nvfp4KernelAvailability::Reachable {
-        return Ok(WeightResidency::Packed);
+
+    /// The device the loaded weights live on.
+    ///
+    /// Read back from the model rather than stored beside it, so the tensors a
+    /// decode builds cannot end up on a different device from the ones it
+    /// multiplies.
+    fn device_of(&self, model: &ModelForCausalLM) -> Device {
+        let _ = model;
+        match self.executed_on {
+            "gpu_native_fp4" => Device::new_cuda(0).unwrap_or(Device::Cpu),
+            _ => Device::Cpu,
+        }
     }
-    if fallback_opted_in {
-        return Ok(WeightResidency::DequantizedF32);
+
+    fn parse_request(&self, bytes: &[u8]) -> Result<ParsedRequest> {
+        // Derived from this checkpoint's context window, the way the generic
+        // Candle runtime derives its own: a flat byte cap refused an agentic
+        // client's file plus its tool definitions before anything looked at
+        // whether they fit.
+        let (_max_prompt_tokens, max_prompt_bytes) =
+            prompt_limits_for(self.config.max_position_embeddings);
+        if bytes.len() > max_prompt_bytes {
+            return Err(invalid_request(
+                &self.alias,
+                format!(
+                    "generation request is {} bytes, over the {max_prompt_bytes}-byte limit this \
+                     checkpoint's {}-token context window allows",
+                    bytes.len(),
+                    self.config.max_position_embeddings
+                ),
+            ));
+        }
+        let raw = std::str::from_utf8(bytes).context("Qwen prompt must be UTF-8")?;
+        let request = if raw.trim_start().starts_with('{') {
+            serde_json::from_str::<GenerationRequest>(raw)
+                .context("invalid Qwen JSON generation request")?
+        } else {
+            GenerationRequest {
+                prompt: Some(raw.to_owned()),
+                ..GenerationRequest::default()
+            }
+        };
+        if matches!(request.max_new_tokens, Some(requested) if requested == 0 || requested > HOST_MAX_NEW_TOKENS)
+        {
+            return Err(invalid_request(
+                &self.alias,
+                format!("max_new_tokens must be between 1 and {HOST_MAX_NEW_TOKENS}"),
+            ));
+        }
+        // Same bounds and same default as the Candle runtime, so a caller sees
+        // one wall-clock contract whichever backend serves its alias.
+        let budget = match request.max_generation_ms {
+            None => DEFAULT_GENERATION_DEADLINE,
+            Some(millis) => {
+                let requested = Duration::from_millis(millis);
+                if requested.is_zero() || requested > HOST_MAX_GENERATION_DEADLINE {
+                    return Err(invalid_request(
+                        &self.alias,
+                        format!(
+                            "max_generation_ms {millis} must be between 1 and {}",
+                            HOST_MAX_GENERATION_DEADLINE.as_millis()
+                        ),
+                    ));
+                }
+                requested
+            }
+        };
+        let deadline = Instant::now() + budget;
+        let prompt = match (request.messages, request.prompt) {
+            (Some(messages), _) if messages.is_empty() => {
+                return Err(invalid_request(
+                    &self.alias,
+                    "chat request must contain at least one message",
+                ))
+            }
+            (Some(messages), _) => {
+                let messages = messages
+                    .into_iter()
+                    .map(|message| {
+                        let content = message.content.as_str().ok_or_else(|| {
+                            anyhow!(
+                                "Qwen 3.5 text runtime does not support image or structured message content"
+                            )
+                        })?;
+                        Ok(ChatTurn {
+                            role: message.role,
+                            content: content.to_owned(),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                            function_call: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                match &self.chat_template {
+                    Some(template) => template
+                        .render(&messages, request.tools.as_deref())
+                        .map_err(|error| anyhow!("failed to render Qwen chat template: {error}"))?,
+                    None => {
+                        let mut prompt = String::new();
+                        for message in messages {
+                            prompt.push_str(&message.role);
+                            prompt.push_str(": ");
+                            prompt.push_str(&message.content);
+                            prompt.push('\n');
+                        }
+                        prompt.push_str("assistant:");
+                        prompt
+                    }
+                }
+            }
+            (None, Some(prompt)) => prompt,
+            (None, None) => {
+                return Err(invalid_request(
+                    &self.alias,
+                    "generation request requires `messages` or `prompt`",
+                ))
+            }
+        };
+        Ok(ParsedRequest {
+            prompt,
+            max_new_tokens: request
+                .max_new_tokens
+                .unwrap_or_else(default_max_new_tokens),
+            requested_max_new_tokens: request.max_new_tokens,
+            temperature: request.temperature,
+            top_p: request.top_p,
+            seed: request.seed,
+            stop: request
+                .stop
+                .into_iter()
+                .filter(|stop| !stop.is_empty() && stop.len() <= 256)
+                .take(8)
+                .collect(),
+            deadline,
+        })
     }
-    bail!(
-        "candle reports no usable NVFP4 kernel on this host: build with the `candle-cuda` \
-         feature and run where there is a CUDA device, or set {DEQUANTIZED_FALLBACK_ENV}=1 to \
-         unpack the weights to dense f32 instead — eight times the memory of the packed \
-         checkpoint, which is why it is not the default"
-    )
 }
 
-/// Build the projection named `path`, or explain why this host cannot.
-fn projection(
-    model: &ModelOptNvfp4Directory,
-    path: &str,
-    device: &Device,
-    residency: WeightResidency,
-) -> Result<Box<dyn Projection>> {
-    let linear = model
-        .modelopt_linear(path)
-        .with_context(|| format!("projection `{path}` is not a ModelOpt linear"))?;
-    let ModelOptLinearTensors::Nvfp4(linear) = linear else {
-        bail!("projection `{path}` is not NVFP4-quantized; this loader has no dense path")
-    };
-    let packed = linear.packed_weight.tensor.read_bytes()?;
-    let scales = linear.block_scales.tensor.read_bytes()?;
-    let tensor_scale = super::modelopt_nvfp4::read_scalar_f32(&linear.tensor_scale.tensor)?;
-    let shape = &linear.packed_weight.tensor.info.shape;
-    let (rows, cols) = (shape[0], shape[1] * 2);
+#[derive(Debug, Default, Deserialize)]
+struct GenerationRequest {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    messages: Option<Vec<IncomingChatTurn>>,
+    /// Tool schemas offered by the caller, handed to the chat template's
+    /// `tools` variable. This runtime parses its own request shape, so a field
+    /// it does not name is one serde silently drops — and a Qwen template gates
+    /// its tool block on `{% if tools %}`, so dropping them means the model is
+    /// never told the functions exist.
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    /// Absent when the caller named no budget, which is what lets the default
+    /// be clamped to the context window while an explicit request that cannot
+    /// fit is refused.
+    #[serde(default)]
+    max_new_tokens: Option<usize>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stop: Vec<String>,
+    /// Wall-clock budget, in milliseconds. Omitting it here silently ignored
+    /// the caller's budget and let a slow generation hold its scheduler lane.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
+}
 
-    match residency {
-        WeightResidency::Packed => {
-            // Uploaded onto the device the model's activations live on, not
-            // whichever one this process happened to open first.
-            let resident = super::modelopt_nvfp4::cuda::Nvfp4DeviceLinear::upload_on(
-                device,
-                &packed,
-                &scales,
-                tensor_scale,
-                rows,
-                cols,
-            )
-            .with_context(|| {
-                format!("projection `{path}` could not be made resident on a CUDA device")
-            })?;
-            Ok(Box::new(Nvfp4Projection { resident }))
-        }
-        WeightResidency::DequantizedF32 => {
-            let dense = super::modelopt_nvfp4::dequantize_nvfp4_e4m3(
-                &packed,
-                &scales,
-                tensor_scale,
-                rows,
-                cols,
-                super::modelopt_nvfp4::Nvfp4OutputDType::F32,
-            )
-            .with_context(|| format!("projection `{path}` could not be dequantized"))?;
-            let super::modelopt_nvfp4::Nvfp4DenseValues::F32(values) = dense else {
-                bail!("dequantizing `{path}` to f32 produced another dtype")
-            };
-            let weight = candle_core::Tensor::from_vec(values, (rows, cols), device)?;
-            Ok(Box::new(candle_nn::Linear::new(weight, None)))
-        }
+#[derive(Debug, Deserialize)]
+struct IncomingChatTurn {
+    role: String,
+    content: Value,
+}
+
+struct ParsedRequest {
+    prompt: String,
+    max_new_tokens: usize,
+    /// What the caller actually asked for, or `None` when it named no budget.
+    requested_max_new_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+    stop: Vec<String>,
+    /// Absolute, anchored at parse time so tokenizing and prefilling count
+    /// against the budget — that work holds the same scheduler slot.
+    deadline: Instant,
+}
+
+/// The budget a request that omits `max_new_tokens` gets.
+///
+/// Shared with the generic Candle runtime rather than held separately, so the
+/// same bare request does not answer in 1024 tokens on one local backend and
+/// 64 on this one.
+fn default_max_new_tokens() -> usize {
+    super::candle_llm_runtime::DEFAULT_MAX_NEW_TOKENS
+}
+
+fn resolve_sampling(temperature: Option<f32>, top_p: Option<f32>, _seed: u64) -> Sampling {
+    let Some(temperature) = temperature.filter(|value| value.is_finite() && *value > 1e-7) else {
+        return Sampling::ArgMax;
+    };
+    match top_p.filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0) {
+        Some(p) => Sampling::TopP {
+            p: f64::from(p),
+            temperature: f64::from(temperature),
+        },
+        None => Sampling::All {
+            temperature: f64::from(temperature),
+        },
     }
 }
 
@@ -229,43 +619,39 @@ fn projection(
 ///
 /// Every weight that is not a projection — embeddings, norms, the short
 /// convolution, `dt_bias`, `A_log` — is read by upstream through the
-/// `VarBuilder`, unquantized, exactly as it sits in the checkpoint.
+/// `VarBuilder`, unquantized, exactly as it sits in the checkpoint. The
+/// projections go through candle's own ModelOpt weight source, which reads the
+/// packed weight, the block scales and the tensor scale from the same
+/// `VarBuilder` path and picks the operator: device-resident on CUDA with the
+/// fused kernel, packed on the host otherwise. This module used to hand-roll
+/// that choice, including its own dequantize-to-dense fallback; candle #3846
+/// and #3857 made both redundant.
 pub(crate) fn load(
     model: &ModelOptNvfp4Directory,
     config: &Qwen35MoeConfig,
     device: &Device,
 ) -> Result<ModelForCausalLM> {
-    let residency = residency(
-        device.is_cuda(),
-        Nvfp4KernelAvailability::detect(),
-        dequantized_fallback_opted_in(),
-    )?;
-    if residency == WeightResidency::DequantizedF32 {
-        tracing::warn!(
-            alias = model.alias(),
-            "loading Qwen 3.5 with dequantized f32 weights: this build has no NVFP4 kernel to \
-             reach. Memory use is eight times the packed checkpoint and throughput is not \
-             representative — for parity checks, not for serving"
-        );
-    }
     let shards = model.shard_paths();
     if shards.is_empty() {
         bail!("checkpoint `{}` has no safetensors shards", model.alias());
     }
     // SAFETY: the shards are mapped read-only and outlive the model; the
     // checkpoint directory is validated before this point.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, DType::F32, device)? };
+    let vb = unsafe {
+        candle_nn::VarBuilder::from_mmaped_safetensors(&shards, candle_core::DType::F32, device)?
+    };
+    let cfg = Nvfp4Config::default();
     ModelForCausalLM::new_with_projections(
         &upstream_config(config),
         vb,
-        |name, vb, _in_dim, _out_dim, bias| {
+        move |name, vb, in_dim, out_dim, bias| {
             if bias {
                 return Err(candle_core::Error::Msg(format!(
                     "projection `{name}` wants a bias; ModelOpt Qwen 3.5 checkpoints have none"
                 )));
             }
-            projection(model, &tensor_path(&vb.prefix(), name), device, residency)
-                .map_err(|error| candle_core::Error::Msg(format!("{error:#}")))
+            let linear = auto_linear(in_dim, out_dim, bias, vb.pp(name), cfg)?;
+            Ok(Box::new(linear) as Box<dyn Projection>)
         },
     )
     .map_err(Into::into)
@@ -299,119 +685,52 @@ mod tests {
             "num_experts_per_tok": 3,
             "moe_intermediate_size": 96,
             "shared_expert_intermediate_size": 112,
+            "max_position_embeddings": 4096,
             "eos_token_id": 7,
-            "max_position_embeddings": 256
+            "tie_word_embeddings": false,
+            "mtp_num_hidden_layers": 0
         }))
-        .expect("sample config deserializes")
+        .expect("fixture config should deserialize")
     }
 
     #[test]
     fn the_translated_config_keeps_every_dimension_the_checkpoint_states() {
-        let ours = config();
-        let theirs = upstream_config(&ours).text_config;
-        assert_eq!(theirs.vocab_size, ours.vocab_size);
-        assert_eq!(theirs.hidden_size, ours.hidden_size);
-        assert_eq!(theirs.num_hidden_layers, ours.num_hidden_layers);
-        assert_eq!(theirs.num_attention_heads, ours.num_attention_heads);
-        assert_eq!(theirs.num_key_value_heads, ours.num_key_value_heads);
-        assert_eq!(theirs.head_dim, Some(ours.head_dim));
-        assert_eq!(theirs.num_experts, ours.num_experts);
-        assert_eq!(theirs.num_experts_per_tok, ours.num_experts_per_tok);
-        assert_eq!(theirs.moe_intermediate_size, ours.moe_intermediate_size);
-        assert_eq!(
-            theirs.shared_expert_intermediate_size,
-            ours.shared_expert_intermediate_size
-        );
-        assert_eq!(theirs.linear_conv_kernel_dim, ours.linear_conv_kernel_dim);
-        assert_eq!(theirs.linear_key_head_dim, ours.linear_key_head_dim);
-        assert_eq!(theirs.linear_value_head_dim, ours.linear_value_head_dim);
-        assert_eq!(theirs.linear_num_key_heads, ours.linear_num_key_heads);
-        assert_eq!(theirs.linear_num_value_heads, ours.linear_num_value_heads);
+        let translated = upstream_config(&config());
+        let text = &translated.text_config;
+        assert_eq!(text.vocab_size, 128);
+        assert_eq!(text.hidden_size, 64);
+        assert_eq!(text.num_hidden_layers, 2);
+        assert_eq!(text.num_attention_heads, 8);
+        assert_eq!(text.num_key_value_heads, 4);
+        assert_eq!(text.head_dim, Some(16));
+        assert_eq!(text.linear_key_head_dim, 32);
+        assert_eq!(text.linear_value_head_dim, 48);
+        assert_eq!(text.linear_num_key_heads, 2);
+        assert_eq!(text.linear_num_value_heads, 6);
+        assert_eq!(text.num_experts, 10);
+        assert_eq!(text.num_experts_per_tok, 3);
+        assert_eq!(text.moe_intermediate_size, 96);
+        assert_eq!(text.shared_expert_intermediate_size, 112);
+        assert_eq!(text.max_position_embeddings, 4096);
+        // Sparse everywhere, so upstream never reads this — it is pinned to the
+        // MoE width rather than left to size something wrongly.
+        assert_eq!(text.intermediate_size, 96);
+        assert!(!text.attention_bias);
     }
 
-    /// The rotary factor is the field that fails silently when it is dropped:
-    /// upstream would rotate the whole head and the model would simply be
-    /// wrong. It has to survive translation exactly.
     #[test]
     fn the_translated_config_carries_the_partial_rotary_factor() {
-        let mut ours = config();
-        ours.partial_rotary_factor = 0.25;
-        assert_eq!(
-            upstream_config(&ours).text_config.partial_rotary_factor,
-            0.25
-        );
+        let translated = upstream_config(&config());
+        assert!((translated.text_config.partial_rotary_factor - 0.5).abs() < f64::EPSILON);
+        assert!((translated.text_config.rope_parameters.rope_theta - 10000.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn layer_types_survive_translation_in_order() {
-        let mut ours = config();
-        ours.layer_types = vec![
-            LayerType::LinearAttention,
-            LayerType::FullAttention,
-            LayerType::LinearAttention,
-        ];
+        let translated = upstream_config(&config());
         assert_eq!(
-            upstream_config(&ours).text_config.layer_types,
-            vec!["linear_attention", "full_attention", "linear_attention"]
+            translated.text_config.layer_types,
+            vec!["linear_attention".to_owned(), "full_attention".to_owned()]
         );
-    }
-
-    #[test]
-    fn a_projection_path_is_its_module_prefix_and_its_leaf() {
-        assert_eq!(
-            tensor_path("model.language_model.layers.3.mlp", "experts.5.gate_proj"),
-            "model.language_model.layers.3.mlp.experts.5.gate_proj"
-        );
-        assert_eq!(
-            tensor_path("model.language_model.layers.0.self_attn", "q_proj"),
-            "model.language_model.layers.0.self_attn.q_proj"
-        );
-        // The head sits at the checkpoint root, where upstream's `VarBuilder`
-        // has no prefix to contribute.
-        assert_eq!(tensor_path("", "lm_head"), "lm_head");
-    }
-
-    #[test]
-    fn a_host_with_the_kernel_holds_the_weights_packed() {
-        assert_eq!(
-            residency(true, Nvfp4KernelAvailability::Reachable, false)
-                .expect("a capable device loads"),
-            WeightResidency::Packed
-        );
-        // The opt-in does not override a host that can do the real thing.
-        assert_eq!(
-            residency(true, Nvfp4KernelAvailability::Reachable, true)
-                .expect("a capable device loads"),
-            WeightResidency::Packed
-        );
-    }
-
-    /// The default when there is no kernel is to stop, not to quietly use
-    /// eight times the memory. Said out loud, with both ways out in the
-    /// message, because a silent 8x is how a machine dies at 3am.
-    #[test]
-    fn a_build_without_the_kernel_refuses_unless_asked() {
-        let error = residency(true, Nvfp4KernelAvailability::Absent, false)
-            .expect_err("a build with no kernel cannot run packed");
-        let message = error.to_string();
-        assert!(message.contains("candle-cuda"), "{message}");
-        assert!(message.contains(DEQUANTIZED_FALLBACK_ENV), "{message}");
-        assert_eq!(
-            residency(true, Nvfp4KernelAvailability::Absent, true)
-                .expect("the opt-in allows the dense form"),
-            WeightResidency::DequantizedF32
-        );
-    }
-
-    #[test]
-    fn a_host_without_a_cuda_device_is_refused_whatever_the_opt_in_says() {
-        for opted_in in [false, true] {
-            let error = residency(false, Nvfp4KernelAvailability::Absent, opted_in)
-                .expect_err("a CPU host has nothing to offer these layers");
-            assert!(
-                error.to_string().contains("CUDA device"),
-                "unexpected error: {error}"
-            );
-        }
     }
 }

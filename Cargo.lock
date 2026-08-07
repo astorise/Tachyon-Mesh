@@ -895,6 +895,7 @@ dependencies = [
  "candle-flash-attn",
  "candle-flashinfer-kernels",
  "candle-nn",
+ "candle-nvfp4-kernels",
  "fancy-regex 0.18.0",
  "float8",
  "num-traits",
