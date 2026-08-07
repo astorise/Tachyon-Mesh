@@ -1563,7 +1563,6 @@ mod configured_binding_registry_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
     /// A checkpoint replaced behind an unchanged path is a change.
     ///
     /// The withdrawal used to compare alias and path, on the assumption that
