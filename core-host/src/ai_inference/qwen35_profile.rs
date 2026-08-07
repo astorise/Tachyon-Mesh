@@ -601,7 +601,7 @@ mod tests {
 
     /// The device string a binding actually carries must reach the kernel.
     ///
-
+    /// `ai_inference.rs` hands the runtime `binding.device.as_str()`, and
     /// `ModelDevice::as_str()` spells the accelerator `cuda`. The guard used
     /// to accept only `cpu` and `gpu`, so every CUDA manifest was refused
     /// before it reached the loader — the native NVFP4 path was unreachable
