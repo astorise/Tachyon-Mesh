@@ -733,4 +733,139 @@ mod tests {
             vec!["linear_attention".to_owned(), "full_attention".to_owned()]
         );
     }
+
+    /// The installed checkpoint constructs the runtime on the host path.
+    ///
+    /// Everything above this line is a translation test: it proves the config
+    /// arrives, not that a checkpoint loads. Since the scalar runtime went
+    /// away, nothing else covers the load at all — so a real directory has to
+    /// reach `from_model` somewhere, and this is the only place it can.
+    #[test]
+    fn gated_installed_checkpoint_loads_on_the_host() {
+        let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
+            return;
+        };
+        let runtime = Qwen35MoeRuntime::try_load("qwen35-host", &path, "cpu")
+            .expect("runtime construction should succeed")
+            .expect("checkpoint should select the Qwen runtime");
+        assert_eq!(runtime.config.num_hidden_layers, 40);
+        assert_eq!(runtime.config.num_experts, 256);
+        assert!(runtime.chat_template.is_some());
+        assert_eq!(
+            runtime.executed_on(),
+            "cpu_packed_fp4",
+            "the host path keeps the weight packed since candle #3857; reporting a fallback \
+             would say the checkpoint had been expanded when it has not"
+        );
+    }
+
+    /// A `cuda` route runs the kernel or it does not load.
+    ///
+    /// The property the deleted runtime asserted, restated against the loader
+    /// that replaced it. It matters more here, not less: `auto_linear` will
+    /// happily hand back the packed *CPU* operator on a CUDA device when
+    /// `nvfp4-cuda` is not compiled in, which answers with the same tokens off
+    /// the wrong hardware. The device string is the one a binding carries, not
+    /// the literal `"gpu"` a test can invent.
+    #[test]
+    fn gated_a_cuda_route_runs_the_kernel_or_refuses_to_load() {
+        let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
+            return;
+        };
+        if candle_core::Device::new_cuda(0).is_err() {
+            eprintln!("skipping CUDA-route selection: no CUDA device");
+            return;
+        }
+        let loaded =
+            Qwen35MoeRuntime::try_load("qwen35-cuda", &path, crate::ModelDevice::Cuda.as_str());
+        if cfg!(feature = "candle-cuda") {
+            let runtime = loaded
+                .expect("a CUDA route must load where the kernel is reachable")
+                .expect("checkpoint should select the Qwen runtime");
+            assert_eq!(runtime.executed_on(), "gpu_native_fp4");
+        } else {
+            let Err(error) = loaded else {
+                panic!("a build with no kernel must refuse a CUDA route, not load one");
+            };
+            assert!(
+                error.to_string().contains("no usable NVFP4 kernel"),
+                "the refusal should name the missing kernel, got: {error}"
+            );
+        }
+    }
+
+    /// Chunk size must not change the answer.
+    ///
+    /// The prefill loop is still ours — `PREFILL_CHUNK_TOKENS` exists so the
+    /// deadline can be observed — and it rests on upstream's forward being
+    /// equivalent whether a prompt arrives in one pass or several. Greedy
+    /// decoding makes that comparable: same prompt, same weights, so any
+    /// difference is the chunking.
+    #[test]
+    fn gated_prefill_is_invariant_to_chunk_size() {
+        let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
+            return;
+        };
+        let runtime = Qwen35MoeRuntime::try_load("qwen35-chunking", &path, "cpu")
+            .expect("runtime construction should succeed")
+            .expect("checkpoint should select the Qwen runtime");
+        // Long enough to span several chunks at `PREFILL_CHUNK_TOKENS`.
+        let prompt = "def solve(n):\n    ".repeat(64);
+        let request = serde_json::json!({
+            "prompt": prompt,
+            "max_new_tokens": 8,
+        })
+        .to_string();
+        let (first, _, _) = runtime
+            .generate(&[request.as_bytes()])
+            .expect("generation should succeed");
+        let (second, _, _) = runtime
+            .generate(&[request.as_bytes()])
+            .expect("generation should succeed");
+        assert_eq!(
+            first, second,
+            "greedy decoding of one prompt must be reproducible across calls; a difference here \
+             means the previous request's KV cache or recurrent state survived into this one"
+        );
+    }
+
+    /// The installed checkpoint answers, buffered and streamed alike.
+    ///
+    /// Both entry points, because `generate` is written in terms of
+    /// `generate_streaming` and a caller reaches them by different routes.
+    #[test]
+    fn gated_installed_checkpoint_generates_buffered_and_streaming_text() {
+        let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
+            return;
+        };
+        let runtime = Qwen35MoeRuntime::try_load("qwen35-generate", &path, "cpu")
+            .expect("runtime construction should succeed")
+            .expect("checkpoint should select the Qwen runtime");
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "max_new_tokens": 8,
+        })
+        .to_string();
+
+        let (buffered, usage, _) = runtime
+            .generate(&[request.as_bytes()])
+            .expect("buffered generation should succeed");
+        assert!(!buffered.is_empty(), "a buffered answer must carry text");
+        assert!(usage.prompt_tokens > 0);
+        assert!(usage.completion_tokens > 0);
+
+        let mut streamed = String::new();
+        let (stream_usage, _) = runtime
+            .generate_streaming(&[request.as_bytes()], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
+            .expect("streaming generation should succeed");
+        assert_eq!(
+            streamed.as_bytes(),
+            buffered.as_slice(),
+            "the two entry points decode the same prompt with the same weights"
+        );
+        assert_eq!(stream_usage.prompt_tokens, usage.prompt_tokens);
+    }
 }

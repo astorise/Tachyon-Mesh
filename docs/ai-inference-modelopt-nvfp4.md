@@ -78,9 +78,13 @@ cargo test -p core-host --features ai-inference modelopt_nvfp4
 cargo test -p core-host --features candle-cuda nvfp4_cuda
 ```
 
-The Qwen runtime selects the native packed path once per loaded model. Each
-request records `executed_on` as one of `gpu_native_fp4`, `gpu_fallback`, or
-`cpu_fallback`. WASI-NN ONNX execution records `gpu_onnx` or `cpu`. The bounded
+The Qwen runtime selects the operator once per loaded model, and records
+`executed_on` as `gpu_native_fp4` on a CUDA route or `cpu_packed_fp4` on the
+host. The host value is not a fallback: candle #3857 gave NVFP4 a packed CPU
+operator, so the weight stays at the checkpoint's own footprint and is decoded
+per row during the forward pass rather than expanded eightfold at load. The
+`gpu_fallback` and `cpu_fallback` values are gone with the scalar runtime that
+produced them. WASI-NN ONNX execution records `gpu_onnx` or `cpu`. The bounded
 in-process telemetry log is available through
 `ai_inference::inference_execution_telemetry()` for admin/metrics consumers.
 
@@ -91,6 +95,13 @@ never fall through to `MOCK_LLM_RESPONSE`. Checkpoints matching
 `qwen3.5-moe-text-modelopt-0.44-v1` execute through the hybrid Qwen 3.5 runtime.
 Other architectures return an actionable compatibility error.
 
-The Qwen runtime pages only the current layer, selected routed experts, shared
-expert, and required attention state. See
+Execution is candle's: `qwen35_upstream.rs` translates the validated config,
+hands upstream a projection factory built on `quantized_nvfp4::auto_linear`,
+and runs the decode loop. Nothing pages weights any more — that was the scalar
+runtime's answer to a checkpoint it had to dequantize operator by operator, and
+it went with it.
+
+One consequence is worth knowing before deploying: upstream's model owns the KV
+cache and every linear-attention layer's recurrent state, so requests to one
+alias are serialized. See
 [`ai/qwen35-moe-nvfp4-reference.md`](ai/qwen35-moe-nvfp4-reference.md).

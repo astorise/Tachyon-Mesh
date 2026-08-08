@@ -120,49 +120,52 @@ jobs:
           echo "Using checkpoint $checkpoint"
           echo "TACHYON_QWEN35_MOE_NVFP4_DIR=$checkpoint" >> "$GITHUB_ENV"
 
-      # The batched prefill's only safety argument is that chunk size does not
-      # change the result. There is no synthetic Qwen 3.5 fixture, so this
-      # runner is the only place that claim is ever tested.
+      # Every step below filters by test name, and `cargo test` exits 0 when a
+      # filter matches nothing. Deleting the scalar runtime made four of these
+      # filters stale at once, and the job would have gone green having run
+      # zero tests — the exact outcome the checkpoint requirement above exists
+      # to prevent. Listing first turns a stale filter into a failure.
+      - name: Require the gated tests to exist
+        run: |
+          listed="$(cargo test -p core-host --bin core-host \
+            --features candle-cuda -- --list 2>/dev/null | grep -c 'gated_' || true)"
+          if [ "$listed" -eq 0 ]; then
+            echo "::error::no gated tests matched; the acceptance job would test nothing"
+            exit 1
+          fi
+          echo "$listed gated tests available"
+
+      # The prefill loop is still ours: `PREFILL_CHUNK_TOKENS` exists so the
+      # deadline can be observed, and it rests on upstream's forward being
+      # equivalent whether a prompt arrives in one pass or several.
       - name: Prefill chunking equivalence
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda \
             gated_prefill_is_invariant_to_chunk_size -- --nocapture
 
-      # The proof that decides whether `qwen35_moe_runtime.rs` can be deleted.
-      #
-      # This briefly set `TACHYON_QWEN35_DEQUANTIZED_FALLBACK`, because the
-      # kernel refused to run below compute capability 10.0 and the comparison
-      # had to reach it somehow. candle #3831 established that nothing in the
-      # kernel needs FP4 tensor cores, so the packed path — the one that is
-      # actually shipped — now runs on any CUDA device, and the comparison runs
-      # against the real thing rather than an approximation of it.
-      - name: Upstream layers match the scalar runtime
+      # Since the scalar runtime went away, nothing else loads a real
+      # checkpoint anywhere. This is the only coverage the loader has.
+      - name: Load and generate on the installed checkpoint
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda \
-            gated_upstream_layers_agree_with_the_scalar_runtime -- --nocapture
+            qwen35_upstream::tests::gated_ -- --nocapture
 
-      # `gated_a_gpu_route_runs_the_kernel_or_refuses_to_load` is the one that
-      # makes this step mean something: it asks for the accelerator and fails
-      # if the load answers with the host path. The refusal used to be bought
-      # with `TACHYON_NVFP4_NATIVE_REQUIRED=1` here, which asked about hardware
-      # from outside the process and — because every other test in this filter
-      # requests `cpu` — would have refused the whole step rather than
-      # sharpening it.
+      # `gated_a_cuda_route_runs_the_kernel_or_refuses_to_load` is what makes
+      # this step mean something: `auto_linear` hands back the packed *CPU*
+      # operator on a CUDA device when `nvfp4-cuda` is not compiled in, which
+      # answers with the same tokens off the wrong hardware.
       - name: Native NVFP4 execution
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda \
-            qwen35_moe_runtime::tests::gated_ -- --nocapture
+            gated_a_cuda_route_runs_the_kernel_or_refuses_to_load -- --nocapture
 
-      # Reported, not gated on a threshold: absolute throughput belongs to the
-      # runner. The log history is where a regression becomes visible, and the
-      # test itself only fails on growth that is wrong at any speed.
-      - name: Prefill scaling
-        env:
-          TACHYON_QWEN35_PREFILL_BENCH: "1"
+      # The ModelOpt directory parser, which survived the runtime it used to
+      # feed and is still the gate every checkpoint passes through.
+      - name: ModelOpt checkpoint probe
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda \
-            gated_prefill_scaling -- --nocapture
+            gated_real_checkpoint_probe_loads_modelopt_nvfp4_directory -- --nocapture

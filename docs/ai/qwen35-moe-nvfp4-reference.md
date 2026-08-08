@@ -47,10 +47,11 @@ Candle provides dense tensor operations, RMSNorm, Qwen 3 full-attention
 building blocks, Qwen 3 MoE routing, fused MoE infrastructure, sampling,
 tokenization integration, and KV-cache examples. It also provides the Qwen 3.5
 hybrid architecture itself — `candle_transformers::models::qwen3_5`, including
-`Qwen3_5GatedDeltaNet` and the recurrent gated delta rule. This page used to
-say it did not; `qwen35_upstream.rs` is the wrapper that consumes it, and
-`gated_upstream_layers_agree_with_the_scalar_runtime` is the parity proof that
-decides whether the local scalar runtime is still needed.
+`Qwen3_5GatedDeltaNet` and the recurrent gated delta rule. `qwen35_upstream.rs`
+executes on it: the local scalar reimplementation that used to sit beside it
+has been deleted, along with the parity test that compared the two. That test
+had never run — the GPU job has no checkpoint — so the equivalence was never
+demonstrated and cannot now be demonstrated that way.
 
 What remains a Tachyon responsibility is the ModelOpt mixed FP8/NVFP4 tensor
 mapping: reading the quantized-layer metadata and feeding upstream's modules
@@ -92,9 +93,12 @@ the gated Rust profile test.
 
 Runtime controls:
 
-- `TACHYON_QWEN35_MAX_DENSE_OPERATOR_BYTES`: maximum dense fallback operator.
-- `TACHYON_QWEN35_WORKING_SET_BYTES`: bounded prepared-weight working set.
 - `TACHYON_MODEL_OPT_NVFP4_DIR`: generic ModelOpt parser probe.
+
+`TACHYON_QWEN35_MAX_DENSE_OPERATOR_BYTES` and `TACHYON_QWEN35_WORKING_SET_BYTES`
+bounded the scalar runtime's per-operator dequantization and its prepared-weight
+working set. Neither exists now: candle holds the weights, packed, and there is
+no working set to page. They are read by nothing, and setting them does nothing.
 
 Contract failures identify the layer, expert, projection, tensor, shape, or
 quantization assignment that must be corrected.
