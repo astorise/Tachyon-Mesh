@@ -86,10 +86,17 @@ fixtures.
 
 ## Fixture regeneration and qualification
 
-Run `scripts/export_qwen35_moe_fixtures.py` against a local trusted tiny model.
-The script uses `local_files_only=True` and never downloads CI artifacts. For
-the installed production checkpoint, set `TACHYON_QWEN35_MOE_NVFP4_DIR` and run
-the gated Rust profile test.
+For the installed production checkpoint, set `TACHYON_QWEN35_MOE_NVFP4_DIR` and
+run the gated tests in `qwen35_upstream.rs`. They are the only coverage the
+loader has: no synthetic checkpoint exercises it, so a run without that
+variable set skips them rather than substituting a weaker check.
+
+`scripts/export_qwen35_moe_fixtures.py` exported golden intermediate states and
+logits from a local trusted tiny model, for the scalar runtime's parity tests to
+compare against. Those tests were deleted with the runtime, so nothing reads its
+output today. The script is kept — it is the starting point for any future
+numeric validation against `transformers` — but running it currently produces a
+file no test consumes.
 
 Runtime controls:
 
