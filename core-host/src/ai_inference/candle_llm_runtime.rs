@@ -314,26 +314,54 @@ impl ModelArchitecture {
     /// one backend reads all of them — so a `gemma2` GGUF resolves to the
     /// gemma3 backend rather than to the safetensors-only `Gemma2`.
     fn from_gguf_architecture(architecture: &str) -> Option<Self> {
+        // Candle resolves the name, including every alias it recognises —
+        // `qwen35` beside `qwen3_5`, the whole gemma family onto one backend.
+        // This used to be a second `match` on the same strings, and it drifted
+        // twice in two days: `qwen35` (candle #3821) and `qwen35moe` were each
+        // added upstream and silently missing here, where a missing arm means
+        // a loadable checkpoint refused before the loader ever sees it.
+        if let Some(architecture) = GgufArchitecture::from_name(architecture) {
+            return Some(Self::from_quantized_lm(architecture));
+        }
+        // Families this host names but candle has no quantized backend for.
+        // Each is `gguf: false` in the capability table, so these arms change
+        // nothing about what loads — they change what the refusal *says*,
+        // naming the family instead of calling the checkpoint unrecognized.
         match architecture {
-            GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
-            "qwen2" => Some(Self::Qwen2),
-            "qwen3" => Some(Self::Qwen3),
-            "qwen3moe" => Some(Self::Qwen35Moe),
-            // Real Unsloth-converted Qwen3.5 GGUFs write `qwen35`, without the
-            // underscore; `qwen3_5` is the alias other conversion paths emit.
-            // candle accepts both since huggingface/candle#3821, and this gate
-            // runs first, so knowing only the alias meant a genuine Qwen3.5
-            // checkpoint was refused here before the loader ever saw it.
-            "qwen35" | "qwen3_5" => Some(Self::Qwen35Hybrid),
-            "gemma" | "gemma2" | "gemma3" | "gemma-embedding" => Some(Self::Gemma3),
-            "glm4" => Some(Self::Glm4),
-            "lfm2" => Some(Self::Lfm2),
-            "phi2" => Some(Self::Phi2),
-            "phi3" => Some(Self::Phi3),
             "phi4" => Some(Self::Phi4),
             "deepseek2" => Some(Self::DeepSeekV2),
             "deepseek3" => Some(Self::DeepSeekV3),
             _ => None,
+        }
+    }
+
+    /// Candle's GGUF registry, mapped onto this host's wider enum.
+    ///
+    /// Total by construction, and that is the point: a family added upstream
+    /// stops compiling here until it is placed, instead of resolving to `None`
+    /// and being discovered by a test — or not discovered at all, which is how
+    /// `glm4`, `lfm2`, `phi2` and `qwen3moe` came to be advertised and
+    /// unloadable.
+    ///
+    /// This host's enum is the wider of the two: it also names safetensors-only
+    /// families candle has no quantized backend for, so the mapping runs one
+    /// way only.
+    fn from_quantized_lm(architecture: GgufArchitecture) -> Self {
+        match architecture {
+            GgufArchitecture::Llama => Self::Llama,
+            GgufArchitecture::Gemma3 => Self::Gemma3,
+            GgufArchitecture::Glm4 => Self::Glm4,
+            GgufArchitecture::Lfm2 => Self::Lfm2,
+            GgufArchitecture::Phi2 => Self::Phi2,
+            GgufArchitecture::Phi3 => Self::Phi3,
+            GgufArchitecture::Qwen2 => Self::Qwen2,
+            GgufArchitecture::Qwen3 => Self::Qwen3,
+            // Full attention with experts in the feed-forward, against the
+            // hybrid that interleaves Gated DeltaNet layers with full-attention
+            // ones. A checkpoint routed to the wrong one loads against the
+            // wrong layer structure.
+            GgufArchitecture::Qwen3Moe => Self::Qwen35Moe,
+            GgufArchitecture::Qwen3_5 => Self::Qwen35Hybrid,
         }
     }
 
@@ -7322,6 +7350,11 @@ mod tests {
     #[test]
     fn every_loadable_gguf_family_passes_the_architecture_gate() {
         for name in quantized_lm::SUPPORTED_ARCHITECTURES {
+            // Resolution is no longer the interesting half: the gate asks
+            // candle, so a name in this list resolves by construction. What is
+            // still worth pinning is the capability table — a family candle
+            // can load but that this host marks `gguf: false` is advertised
+            // and unloadable, which is the failure the whole gate exists for.
             let architecture = ModelArchitecture::from_gguf_architecture(name)
                 .unwrap_or_else(|| panic!("`{name}` is loadable but the gate rejects it"));
             assert!(
