@@ -98,13 +98,41 @@ struct ChatCompletionRequest {
 
 /// The subset of OpenAI's `response_format` this route acts on.
 ///
-/// `{"type": "text"}` and `{"type": "json_object"}` are accepted and carry no
-/// schema; only `json_schema` constrains decoding, and only its `schema` is
-/// forwarded — `name` and `strict` describe the request, not the grammar.
+/// `{"type": "text"}` carries no constraint. The other two do: `json_schema`
+/// forwards its own `schema` — `name` and `strict` describe the request, not
+/// the grammar — and `json_object` asks for *some* valid JSON object without
+/// saying which, which is the permissive object schema rather than nothing.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ResponseFormat {
+    /// Dropping this left `json_object` indistinguishable from `text`, so a
+    /// client that asked for JSON got unconstrained prose and no error.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     json_schema: Option<JsonSchemaFormat>,
+}
+
+impl ResponseFormat {
+    /// The schema text to constrain decoding with, if this format asks for one.
+    ///
+    /// An explicit schema wins over the `type`, including when a client sends
+    /// `json_schema` with a schema and some other `type` — the schema is the
+    /// more specific statement of intent, and honouring it is never wrong.
+    fn schema_source(&self) -> Option<String> {
+        if let Some(schema) = self
+            .json_schema
+            .as_ref()
+            .and_then(|format| format.schema.as_ref())
+        {
+            return Some(schema.to_string());
+        }
+        // "Any object" is the whole of what `json_object` promises, and it is
+        // expressible: the host's compiler reads a schema with no `properties`
+        // as accepting every object and nothing else. Forwarding nothing here
+        // made the mode a no-op that clients cannot detect, since the failure
+        // looks like a model that ignored the instruction.
+        (self.kind.as_deref() == Some("json_object")).then(|| r#"{"type":"object"}"#.to_owned())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -820,6 +848,19 @@ fn handle_chat_completions_buffered(
             tool_calls: adopt_host_tool_calls(completed.tool_calls),
         }
     };
+    // Checked after both sources have been reconciled, so the rule covers a
+    // call the host reported as a field and one recovered from the text alike:
+    // either way it is an instruction the client has no code for.
+    if let Some(name) = request.unoffered_call(&parsed.tool_calls) {
+        return Ok(openai_error_payload(
+            502,
+            format!(
+                "model `{}` returned a call to `{name}`, which this request did not offer",
+                request.model
+            ),
+            "server_error",
+        ));
+    }
     let finish_reason = resolve_finish_reason(
         completed.finish_reason.as_deref(),
         !parsed.tool_calls.is_empty(),
@@ -1052,6 +1093,22 @@ fn handle_chat_completions_streaming(
         if tool_calls.is_empty() {
             tool_calls = parsed.tool_calls;
         }
+    }
+
+    // The same rule as the buffered path, on the only channel left: the status
+    // line went out with the headers, so an unusable call is reported as an
+    // error frame rather than emitted as a dispatchable delta.
+    if let Some(name) = request.unoffered_call(&tool_calls) {
+        write_sse_error(
+            &writer,
+            &request.model,
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: format!("returned a call to `{name}`, which this request did not offer"),
+                upstream_status: Some(502),
+                invalid_request: false,
+            },
+        )?;
+        return Ok((200, Vec::new()));
     }
 
     // Read now rather than at the top: like `usage`, it is only known once the
@@ -1441,6 +1498,46 @@ impl ChatCompletionRequest {
         !self.tools.is_empty() || self.tool_choice.is_some()
     }
 
+    /// The function names this request actually advertised.
+    ///
+    /// `tool_choice` contributes its own named function: a request may pin a
+    /// call without repeating the list, and `has_tool_intent` already treats
+    /// that as an offer.
+    ///
+    /// Empty means *nothing readable was offered*, which is not the same as
+    /// "no tools": a client can send entries this side cannot parse a name out
+    /// of. Validation is skipped in that case rather than refusing everything,
+    /// because a set we failed to read is not evidence about what was in it.
+    fn offered_tool_names(&self) -> Vec<&str> {
+        fn named(value: &serde_json::Value) -> Option<&str> {
+            value.get("function")?.get("name")?.as_str()
+        }
+        let mut names: Vec<&str> = self.tools.iter().filter_map(|tool| named(tool)).collect();
+        if let Some(chosen) = self.tool_choice.as_ref().and_then(|choice| named(choice)) {
+            names.push(chosen);
+        }
+        names
+    }
+
+    /// The first call naming a function this request never offered.
+    ///
+    /// A backend answering with a call outside the advertised set is answering
+    /// a question nobody put — the same rule the intent gate applies to a
+    /// request that offered no tools at all, one entry at a time. Passing it on
+    /// hands the client a dispatchable `type: "function"` call it has no code
+    /// for, and on an `openai:` binding the backend that produced it is a
+    /// third-party server the *operator* chose, not the client.
+    fn unoffered_call<'c>(&self, calls: &'c [ToolCall]) -> Option<&'c str> {
+        let offered = self.offered_tool_names();
+        if offered.is_empty() {
+            return None;
+        }
+        calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .find(|name| !offered.contains(name))
+    }
+
     /// Whether `tool_choice` is the literal `"none"`.
     ///
     /// Only the string form: `{"type":"function",…}` names a call the client
@@ -1641,19 +1738,13 @@ fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, S
         object.insert("stop".to_owned(), serde_json::json!(stop.into_vec()));
     }
     // The host takes the schema as source text, which is what its grammar
-    // compiler parses. Forwarded only when a schema is actually present:
-    // `{"type": "json_object"}` asks for JSON without saying which, and has no
-    // grammar to compile.
+    // compiler parses. `text` is the only format that forwards nothing.
     if let Some(schema) = request
         .response_format
         .as_ref()
-        .and_then(|format| format.json_schema.as_ref())
-        .and_then(|format| format.schema.as_ref())
+        .and_then(ResponseFormat::schema_source)
     {
-        object.insert(
-            "json_schema".to_owned(),
-            serde_json::Value::String(schema.to_string()),
-        );
+        object.insert("json_schema".to_owned(), serde_json::Value::String(schema));
     }
     if !request.tools.is_empty() {
         object.insert("tools".to_owned(), serde_json::json!(request.tools));
@@ -2249,6 +2340,108 @@ mod tests {
         assert_eq!(payload["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(payload["tool_choice"], "auto");
         assert_eq!(payload["tool_call_parser"], "qwen_coder");
+    }
+
+    #[test]
+    fn a_json_object_response_format_forwards_the_permissive_object_schema() {
+        // `json_object` names no schema, and forwarding nothing made it a
+        // silent no-op: the client asked for JSON and got prose, with no error
+        // anywhere to say the mode had been ignored. "Any object" is the whole
+        // of what the mode promises, and the host's compiler expresses exactly
+        // that for a schema with no declared properties.
+        let format = |body: &str| {
+            let request: ChatCompletionRequest = serde_json::from_str(body).expect("valid request");
+            let payload: serde_json::Value =
+                serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                    .expect("valid json");
+            payload["json_schema"].clone()
+        };
+
+        assert_eq!(
+            format(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_object"}}"#
+            ),
+            serde_json::json!(r#"{"type":"object"}"#)
+        );
+        // `text` is the one format that constrains nothing.
+        assert_eq!(
+            format(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"text"}}"#
+            ),
+            serde_json::Value::Null
+        );
+        // An explicit schema still wins: it is the more specific statement.
+        assert_eq!(
+            format(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"a":{"type":"integer"}}}}}}"#
+            ),
+            serde_json::json!(r#"{"properties":{"a":{"type":"integer"}},"type":"object"}"#)
+        );
+    }
+
+    #[test]
+    fn a_call_the_request_never_offered_is_not_exposed() {
+        let request =
+            |tools: serde_json::Value, choice: Option<serde_json::Value>| ChatCompletionRequest {
+                model: "qwen-coder".to_owned(),
+                messages: vec![ChatMessage::text("user", "go")],
+                tools: tools.as_array().expect("array").clone(),
+                tool_choice: choice,
+                max_generation_ms: None,
+                tool_call_parser: None,
+                extra_body: None,
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                seed: None,
+                stop: None,
+                stream: None,
+                stream_options: None,
+                response_format: None,
+            };
+        let call = |name: &str| ToolCall {
+            id: "call_1".to_owned(),
+            kind: "function".to_owned(),
+            function: ToolCallFunction {
+                name: name.to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        };
+        let offered = serde_json::json!([
+            {"type": "function", "function": {"name": "read_file"}}
+        ]);
+
+        assert_eq!(
+            request(offered.clone(), None).unoffered_call(&[call("read_file")]),
+            None
+        );
+        // The whole point: a backend naming something else is answering a
+        // question nobody put, and on an `openai:` binding that backend is a
+        // third-party server the operator chose, not the client.
+        assert_eq!(
+            request(offered.clone(), None).unoffered_call(&[call("rm_rf")]),
+            Some("rm_rf")
+        );
+        // A pinned `tool_choice` is an offer in its own right — a request may
+        // name a call without repeating the list.
+        assert_eq!(
+            request(
+                serde_json::json!([]),
+                Some(serde_json::json!({"type":"function","function":{"name":"pinned"}}))
+            )
+            .unoffered_call(&[call("pinned")]),
+            None
+        );
+        // Nothing readable was offered, which is not evidence about what was in
+        // the set. Refusing everything there would break a client whose tool
+        // entries this side simply cannot parse a name out of.
+        assert_eq!(
+            request(serde_json::json!([{"type": "function"}]), None).unoffered_call(&[call("any")]),
+            None
+        );
     }
 
     #[test]

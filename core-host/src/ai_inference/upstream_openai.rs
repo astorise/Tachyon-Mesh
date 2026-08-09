@@ -769,6 +769,17 @@ impl UpstreamOpenAiRuntime {
         let Some(usage) = payload.get("usage").filter(|usage| !usage.is_null()) else {
             return Ok(None);
         };
+        // Present but not an object is a malformed response, not an absent one.
+        // Every `usage.get(...)` below answers `None` for a string as readily as
+        // for a missing key, so `"usage":"unavailable"` reported both counters
+        // as unmeasured and the generation as successful — the one shape where
+        // accounting data goes missing without anything saying so.
+        if !usage.is_object() {
+            return Err(format!(
+                "`usage` is {}, expected an object",
+                json_type_name(usage)
+            ));
+        }
         let field = |name: &str| -> Result<u32, String> {
             match usage.get(name) {
                 None | Some(Value::Null) => Ok(0),
@@ -1276,6 +1287,20 @@ impl UpstreamOpenAiRuntime {
                     })?;
                 }
             }
+            // The pre-`tool_calls` shape, streamed. The buffered path has
+            // always recognised it; reading only `delta.tool_calls` here turned
+            // a provider that speaks it into one that answers with silence.
+            if let Some(legacy) = delta
+                .get("function_call")
+                .filter(|value| !is_empty_json(value))
+            {
+                streamed_tool_calls
+                    .absorb_legacy(legacy)
+                    .map_err(|detail| UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail,
+                    })?;
+            }
         }
 
         // Emitted only once the stream is known to have finished. A tool call
@@ -1597,6 +1622,10 @@ struct StreamedToolCalls {
     /// In first-seen order, so the emitted list preserves the upstream's own
     /// ordering.
     calls: Vec<StreamedToolCall>,
+    /// The single call a provider streaming the pre-`tool_calls` shape is
+    /// building, accumulated separately because that shape carries no `index`
+    /// to key on and no id to echo.
+    legacy: Option<StreamedToolCall>,
     /// `index` to its slot in `calls`.
     ///
     /// The order has to come from a `Vec`, but finding a slot by scanning it
@@ -1639,6 +1668,19 @@ impl StreamedToolCalls {
                 )
             }
         };
+        // The guest hardcodes `"function"` back onto whatever it echoes, so a
+        // fragment naming a different kind would have that kind silently
+        // relabelled and dispatched as a function call. The buffered parser
+        // already refuses this; checked before the slot is created so a refused
+        // fragment leaves nothing half-absorbed behind it.
+        if let Some(kind) = fragment.get("type").and_then(Value::as_str) {
+            if kind != "function" {
+                return Err(format!(
+                    "streamed tool call at index {index} has type `{kind}`, and only `function` \
+                     calls can be carried"
+                ));
+            }
+        }
         let slot = match self.by_index.get(&index).copied() {
             Some(at) => &mut self.calls[at],
             None => {
@@ -1705,6 +1747,50 @@ impl StreamedToolCalls {
         Ok(())
     }
 
+    /// Absorb one `delta.function_call` fragment.
+    ///
+    /// The shape OpenAI-compatible providers used before `tool_calls`, and
+    /// still the only one some of them stream. The buffered path already
+    /// recognises it; the streaming path read only `delta.tool_calls`, so every
+    /// name and argument fragment was dropped and a stream that ended on
+    /// `finish_reason: "function_call"` reached the client as an empty ordinary
+    /// answer — the model's whole intent gone, with nothing marking its
+    /// absence.
+    ///
+    /// It carries one call, no id and no index: `name` arrives once, then
+    /// `arguments` in string pieces, exactly like the modern shape one level
+    /// deeper. Accumulating into the same slot type means `finish` validates it
+    /// identically — a name is required, and the assembled arguments must parse
+    /// as a JSON object.
+    fn absorb_legacy(&mut self, fragment: &Value) -> Result<(), String> {
+        let slot = self.legacy.get_or_insert_with(StreamedToolCall::default);
+        if let Some(name) = fragment
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            // Same rule as the keyed shape: a second, different name means two
+            // calls are being merged, and the arguments accumulated so far
+            // belong to whichever one this is not.
+            if !slot.name.is_empty() && slot.name != name {
+                return Err(format!(
+                    "streamed `function_call` was given a second function name: `{}` then `{name}`",
+                    slot.name
+                ));
+            }
+            slot.name = name.to_owned();
+        }
+        match fragment.get("arguments") {
+            Some(Value::String(raw)) => slot.arguments.push_str(raw),
+            Some(value @ (Value::Object(_) | Value::Array(_))) => {
+                slot.arguments = value.to_string();
+            }
+            None | Some(Value::Null) => {}
+            Some(_) => slot.unusable_arguments = true,
+        }
+        Ok(())
+    }
+
     /// Assemble the accumulated fragments, or fail if any of them never named
     /// its function or carried arguments in an unusable shape.
     ///
@@ -1713,7 +1799,18 @@ impl StreamedToolCalls {
     /// recorded a healthy generation, so an agent simply saw the model decline
     /// to act. Once fragments have been observed the upstream has committed to
     /// a call, and an incomplete one means the stream was truncated.
-    fn finish(self) -> Result<Vec<ToolCall>, String> {
+    fn finish(mut self) -> Result<Vec<ToolCall>, String> {
+        // The keyed shape wins when a stream carried both, which is the same
+        // precedence the buffered path applies: `tool_calls` is strictly more
+        // expressive, and a provider emitting both is repeating one call in two
+        // dialects rather than announcing two. The legacy accumulator is only
+        // consulted when nothing keyed arrived, and from there it is validated
+        // like any other slot.
+        if let Some(legacy) = self.legacy.take() {
+            if self.calls.is_empty() {
+                self.calls.push(legacy);
+            }
+        }
         if let Some(call) = self.calls.iter().find(|call| call.name.trim().is_empty()) {
             return Err(format!(
                 "upstream streamed tool-call fragments for index {} but never sent a function name",
@@ -2971,6 +3068,93 @@ mod tests {
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn a_legacy_streamed_function_call_is_reassembled() {
+        // The pre-`tool_calls` shape, streamed: name once, then argument
+        // pieces, all on `delta.function_call`. Reading only `delta.tool_calls`
+        // dropped every fragment, so a stream ending on
+        // `finish_reason: "function_call"` reached the client as an empty
+        // ordinary answer — the buffered path has always understood it.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"function_call":{"name":"read_file","arguments":""}}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"function_call":{"arguments":"{\"path\":"}}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"function_call":{"arguments":"\"a.rs\"}"}}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{},"finish_reason":"function_call"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        backend
+            .generate_streaming(&[b"read a.rs"], &mut captured.sink())
+            .expect("streaming should complete");
+        assert_eq!(
+            captured.tool_calls,
+            vec![ToolCall {
+                // The legacy shape carries no id, and one must not be invented
+                // here — the guest mints it, matching the buffered path.
+                id: None,
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"a.rs\"}".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_streamed_tool_call_type_other_than_function_fails_the_stream() {
+        // The guest hardcodes `"function"` back onto whatever it echoes, so a
+        // fragment naming another kind would have that kind relabelled and
+        // dispatched as a function call. The buffered parser refuses the same
+        // payload; leaving the assembler open made the verdict depend on which
+        // route served the request.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"custom","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("only `function` calls can be carried");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(error.to_string().contains("custom"), "{error}");
+        assert!(captured.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn a_non_object_usage_value_fails_instead_of_reading_as_unmeasured() {
+        // `usage.get(...)` answers `None` for a string as readily as for a
+        // missing key, so a malformed provider payload reported both counters
+        // as unmeasured and the generation as successful — accounting data
+        // dropped with nothing saying so.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"}}],"usage":"unavailable"}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("a scalar `usage` is malformed, not absent");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(error.to_string().contains("expected an object"), "{error}");
     }
 
     #[test]
