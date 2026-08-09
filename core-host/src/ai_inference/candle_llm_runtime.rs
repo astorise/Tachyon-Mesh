@@ -3712,7 +3712,17 @@ impl CandleLlmRuntime {
         // which is exactly the flush this needs.
         if let Some(token) = last_token {
             let exhausted = sink.budget_exhausted();
-            sink.record_finish(criteria.finish_reason(token, text, exhausted));
+            // The clock is a third way to end, beside the token budget and the
+            // stop criteria, and only the first two reach `finish_reason`. A
+            // speculative decode that accepted some tokens and then ran out of
+            // wall clock arrived here with no verdict, so the guest reported a
+            // truncated answer as a clean `stop` — the same omission the
+            // single-sequence and batch deadlines carried.
+            let finish = match criteria.finish_reason(token, text, exhausted) {
+                None if Instant::now() >= request.deadline => Some(FinishReason::Length),
+                other => other,
+            };
+            sink.record_finish(finish);
         }
         let end = criteria.matched(text).unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);

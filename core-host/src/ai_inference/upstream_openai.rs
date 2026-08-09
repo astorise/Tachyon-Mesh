@@ -857,6 +857,20 @@ impl UpstreamOpenAiRuntime {
                 alias: self.alias.clone(),
                 detail: "response has no `choices[0].message` object".to_owned(),
             })?;
+        // Present but not an object is not the same as absent, and only the
+        // absent case was refused. Every read below goes through `get`, which
+        // answers `None` for a string or an array alike, so a corrupted message
+        // produced no content, no tool calls and no error — a successful,
+        // empty completion.
+        if !message.is_object() {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "response has a `choices[0].message` that is {}, not an object",
+                    json_type_name(message)
+                ),
+            });
+        }
         // Absent and `null` both mean "this message carried no text", which is
         // the normal shape beside `tool_calls`. A *present* non-string — an
         // object, an array — is neither: reading it with `as_str` alone
@@ -1483,6 +1497,28 @@ fn tool_calls_from_value(alias: &str, tool_calls: &Value) -> Result<Vec<ToolCall
                         "`choices[0].message.tool_calls[{index}].function.arguments` is neither a JSON string nor a JSON object"
                     ))
                 })?;
+            // The string form is the one the OpenAI schema specifies, and it is
+            // the one nothing has checked: a truncated or non-object payload
+            // travels to the client as a dispatchable call whose arguments
+            // cannot be parsed. The streamed assembler already refuses exactly
+            // this, so without the same check here whether a broken call is
+            // caught depends on which route served the request.
+            match serde_json::from_str::<Value>(&arguments) {
+                Ok(Value::Object(_)) => {}
+                Ok(other) => {
+                    return Err(malformed(format!(
+                        "`choices[0].message.tool_calls[{index}].function.arguments` is a JSON {}, \
+                         not an object",
+                        json_type_name(&other)
+                    )))
+                }
+                Err(error) => {
+                    return Err(malformed(format!(
+                        "`choices[0].message.tool_calls[{index}].function.arguments` is not valid \
+                         JSON: {error}"
+                    )))
+                }
+            }
             Ok(ToolCall {
                 id: call
                     .get("id")
@@ -3160,6 +3196,82 @@ mod tests {
         assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
         assert!(
             error.to_string().contains("non-string"),
+            "the error should name the shape problem, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_buffered_message_that_is_not_an_object_fails() {
+        // Present but not an object is not the same as absent, and only absent
+        // was refused. Every read below the check goes through `get`, which
+        // answers `None` for a string as readily as for a missing key, so a
+        // corrupted message produced no content, no tool calls and no error.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":"hi"}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("a scalar message is not a completion");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("not an object"),
+            "the error should name the shape problem, got: {error}"
+        );
+    }
+
+    #[test]
+    fn buffered_tool_call_arguments_that_are_not_a_json_object_fail() {
+        // The string form is the one OpenAI specifies and the one nothing
+        // checked: a truncated payload travelled to the client as a
+        // dispatchable call whose arguments cannot be parsed. The streamed
+        // assembler already refuses this, so leaving the buffered path open
+        // made the verdict depend on which route served the request.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            concat!(
+                r#"{"choices":[{"message":{"content":null,"tool_calls":"#,
+                r#"[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]"#,
+                r#"}}]}"#,
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("half an argument object is not a dispatchable call");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("not valid JSON"),
+            "the error should name the parse failure, got: {error}"
+        );
+    }
+
+    #[test]
+    fn buffered_tool_call_arguments_that_are_a_json_scalar_fail() {
+        // Valid JSON, but not an argument set. Passed through, the caller
+        // dispatches the right function against `7` and reports success.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            concat!(
+                r#"{"choices":[{"message":{"content":null,"tool_calls":"#,
+                r#"[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"7"}}]"#,
+                r#"}}]}"#,
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("a bare number is not an argument set");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("not an object"),
             "the error should name the shape problem, got: {error}"
         );
     }

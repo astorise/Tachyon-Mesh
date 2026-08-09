@@ -568,6 +568,14 @@ pub(crate) fn publish_configured_model_bindings(
                 }
                 Ok(false) => {}
                 Err(error) => {
+                    // Counted, not just logged: the caller's whole reason for
+                    // reading this number is to decide whether the withdrawal
+                    // reservations it placed before the swap were lifted. A
+                    // transaction that failed here left the alias reserved and
+                    // unpublished, which is exactly the state the retry exists
+                    // for — reporting zero would end the reload with the alias
+                    // withdrawn and no row describing it.
+                    failures += 1;
                     tracing::warn!(
                         alias = %binding.alias,
                         "failed to publish configured model binding to the registry: {error:#}"
@@ -614,6 +622,20 @@ pub(crate) fn publish_configured_model_bindings(
                             "an uploaded model shares an alias with a configured binding; the configured binding is what executes, so the registry row now describes it and the upload's row is held aside"
                         );
                         if let Some(carried) = carry_shadowed_upload(&value, shadowed) {
+                            return crate::store::KvPartitionUpdate::Set(carried);
+                        }
+                        return crate::store::KvPartitionUpdate::Set(value);
+                    }
+                    // The row is already this publisher's, which is the state
+                    // every reload after the first one finds. If a previous
+                    // reload parked an upload inside it, the fresh row does not
+                    // carry it — so writing `value` plain would drop the only
+                    // saved copy of the displaced upload's metadata, and the
+                    // sweep would later delete the config row with nothing to
+                    // restore. Displacing an upload once must not become
+                    // deleting it on the next reload.
+                    if let Some(parked) = current.and_then(shadowed_upload_row) {
+                        if let Some(carried) = carry_shadowed_upload(&value, &parked) {
                             return crate::store::KvPartitionUpdate::Set(carried);
                         }
                     }
@@ -996,13 +1018,23 @@ pub(crate) fn withdraw_changed_model_bindings(
         };
         // Ownership is re-read inside the transaction: an upload that landed
         // since the scan owns its row, and a reload must not touch it.
+        //
+        // An *absent* row is not an upload's, and it is the case
+        // `stored_row_still_current` deliberately routes here — a binding whose
+        // publication never landed still has a runtime answering for it, so the
+        // alias needs sealing exactly like a stale one. Treating absent as
+        // "not ours" left it free for the whole swap, which is the window the
+        // reservation exists to close: an upload commits into it, is reported
+        // installed, and is then displaced by the publication that follows.
         if let Err(error) =
             core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
-                if !row_is_config_owned(current) {
+                if current.is_some() && !row_is_config_owned(current) {
                     return crate::store::KvPartitionUpdate::Keep;
                 }
                 match reservation.clone() {
                     Some(value) => crate::store::KvPartitionUpdate::Set(value),
+                    // Nothing to withdraw and nothing writable to reserve with.
+                    None if current.is_none() => crate::store::KvPartitionUpdate::Keep,
                     None => crate::store::KvPartitionUpdate::Delete,
                 }
             })
@@ -1732,6 +1764,59 @@ mod configured_binding_registry_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A binding whose row never landed is sealed like any other.
+    ///
+    /// The alias list comes from the outgoing *config*, not from a scan, so a
+    /// binding whose publication failed — or whose row an operator removed —
+    /// arrives here with nothing stored. The runtime is still answering for it,
+    /// which is the entire premise of the reservation; treating an absent row
+    /// as "not ours" left the alias free for the whole swap, and an upload
+    /// landing in that window was reported installed and then displaced by the
+    /// publication that follows.
+    #[test]
+    fn a_configured_alias_with_no_stored_row_is_still_reserved() {
+        let (store, dir) = temp_store();
+        let previous = config_with(vec![binding(
+            "never-published",
+            "openai:http://127.0.0.1:8080/v1",
+            false,
+        )]);
+        // Deliberately no `publish_configured_model_bindings` call: the table
+        // has no row for this alias.
+        assert!(store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "never-published")
+            .expect("read")
+            .is_none());
+
+        withdraw_changed_model_bindings(&store, &previous, &config_with(Vec::new()));
+
+        let raw = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "never-published")
+            .expect("read")
+            .expect("an unpublished binding is sealed on the way out");
+        let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
+        assert_eq!(row["withdrawn"], true);
+        assert_eq!(row["source"], "config");
+        let denied = write_uploaded_model_row(&store, "never-published", b"{}".to_vec())
+            .expect_err("the seal is what stops an upload claiming the alias mid-swap");
+        assert!(
+            denied.contains("sealed manifest"),
+            "unexpected error: {denied}"
+        );
+
+        // And the publication after the swap sweeps it, so the seal is not a
+        // permanent lock on an alias no config claims.
+        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        assert!(
+            store
+                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "never-published")
+                .expect("read")
+                .is_none(),
+            "a reservation no manifest claims is swept, not held forever"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// An upload a binding displaced survives the binding.
     ///
     /// The registry row is an uploaded checkpoint's only metadata. Overwriting
@@ -1782,6 +1867,24 @@ mod configured_binding_registry_tests {
             restored.get("source").is_none(),
             "the restored row is the upload's again, not the publisher's"
         );
+
+        // The same thing, but with a reload in the middle — which is every
+        // restart after the first. The refresh finds a row that is already the
+        // publisher's, and writing a fresh one over it dropped the only saved
+        // copy of the displaced upload: the alias then swept clean when the
+        // binding left, and the files on disk became unreachable.
+        write_uploaded_model_row(
+            &store,
+            "shared",
+            serde_json::to_vec(&upload).expect("serialize"),
+        )
+        .expect("the restored alias is the upload's again, so it accepts a write");
+        publish_configured_model_bindings(&store, &config);
+        publish_configured_model_bindings(&store, &config);
+        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        let restored = row("shared").expect("a reload must not consume the displaced upload");
+        assert_eq!(restored["modelPath"], "/models/shared");
+        assert!(restored.get("source").is_none());
 
         // And a config row with nothing held aside is still swept, so a binding
         // that never displaced anything leaves no trace.

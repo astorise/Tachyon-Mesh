@@ -327,6 +327,7 @@ fn append_chunk(uri: &str, chunk: &[u8]) -> Result<(), String> {
 
 fn commit_upload(uri: &str) -> Result<String, String> {
     ensure_dirs()?;
+    reclaim_discarded_backups();
     let upload_id = upload_id_from_uri(uri, COMMIT_PREFIX)?;
     let pending = load_pending_upload(&upload_id)?;
     if pending.bytes_received == 0 || pending.bytes_received > pending.size_bytes {
@@ -456,10 +457,51 @@ fn commit_upload(uri: &str) -> Result<String, String> {
         return Err(error);
     }
 
-    let _ = fs::remove_dir_all(&backup_dir);
+    // The upload is live, so the backup is dead weight. A failed removal used
+    // to be dropped here, and nothing ever came back for it: the directory is
+    // keyed by an upload id no later commit knows, so one busy file or one
+    // transient error stranded a whole previous checkpoint — once per update,
+    // on a volume sized for the models rather than for their history.
+    //
+    // Renaming into the swept namespace is the recovery, and it has to be a
+    // separate name rather than a re-try of `.replaced-`: the concurrent-upload
+    // path above *deliberately* leaves a `.replaced-` directory behind for an
+    // operator to restore by hand, and a sweep that could not tell the two
+    // apart would delete exactly the one that was kept on purpose.
+    if fs::remove_dir_all(&backup_dir).is_err() && backup_dir.exists() {
+        let _ = fs::rename(
+            &backup_dir,
+            models_dir().join(format!("{DISCARDED_BACKUP_PREFIX}{upload_id}")),
+        );
+    }
     cleanup_staging(&upload_id);
 
     Ok(model_dir.to_string_lossy().to_string())
+}
+
+/// Directory prefix for a replaced checkpoint whose removal failed after its
+/// replacement went live. Leading dot, like the other internal names, so
+/// `validate_alias` can never let an upload claim one.
+const DISCARDED_BACKUP_PREFIX: &str = ".discarded-";
+
+/// Delete backups an earlier commit finished with but could not remove.
+///
+/// Nothing is renamed into this namespace until its upload has fully succeeded
+/// and something else owns the live path, so a sweep here cannot take a
+/// checkpoint anyone is still counting on.
+fn reclaim_discarded_backups() {
+    let Ok(entries) = fs::read_dir(models_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(DISCARDED_BACKUP_PREFIX))
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// The model directory / registry name: the caller-supplied alias, or the bare

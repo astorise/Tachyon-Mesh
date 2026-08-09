@@ -300,7 +300,14 @@ impl Qwen35MoeRuntime {
         let mut logits: Option<Tensor> = None;
         for (chunk_index, chunk) in prompt_ids.chunks(PREFILL_CHUNK_TOKENS).enumerate() {
             let position = chunk_index * PREFILL_CHUNK_TOKENS;
-            if position > 0 && Instant::now() >= request.deadline {
+            // Checked before the first chunk too. The budget is anchored at
+            // parse time, and tokenizing plus waiting for the model mutex both
+            // happen after that — so an expired request could still spend a
+            // forward pass over 64 prompt tokens, the most expensive unit of
+            // work here, while holding the serialized model and its scheduler
+            // lane. The generic Candle runtime had the same off-by-one guard
+            // and lost it for the same reason.
+            if Instant::now() >= request.deadline {
                 // Not an error: the deadline's contract is that it stops
                 // generation and returns what was produced, and a prompt that
                 // outlasts prefill produced nothing.
@@ -486,18 +493,28 @@ impl Qwen35MoeRuntime {
                 let messages = messages
                     .into_iter()
                     .map(|message| {
-                        let content = message.content.as_str().ok_or_else(|| {
-                            anyhow!(
+                        // Absent and `null` both mean "this turn carried no
+                        // text", which is the normal shape of an assistant
+                        // turn that made a tool call. A *present* non-string
+                        // is structured or image content, which this text
+                        // runtime refuses rather than flattening.
+                        let content = match &message.content {
+                            Value::Null => String::new(),
+                            Value::String(text) => text.clone(),
+                            _ => bail!(
                                 "Qwen 3.5 text runtime does not support image or structured message content"
-                            )
-                        })?;
+                            ),
+                        };
                         Ok(ChatTurn {
                             role: message.role,
-                            content: content.to_owned(),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                            function_call: None,
+                            content,
+                            // Forwarded, not dropped: the template needs the
+                            // call to pair a result with the request it
+                            // answers.
+                            tool_calls: message.tool_calls,
+                            tool_call_id: message.tool_call_id,
+                            name: message.name,
+                            function_call: message.function_call,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -578,10 +595,31 @@ struct GenerationRequest {
     max_generation_ms: Option<u64>,
 }
 
+/// A chat turn as it arrives on the wire.
+///
+/// This mirrors `ChatTurn` rather than narrowing it, and the narrowing was a
+/// bug: a replayed assistant turn that made a tool call carries `tool_calls`
+/// with null or absent content, and the tool's answer carries `tool_call_id`.
+/// Requiring `content` failed that turn outright, and dropping the correlation
+/// fields left the template unable to say which call a result answered — so
+/// every multi-turn tool workflow lost its history on this runtime.
+///
+/// `content` stays a `Value` because it is the one field this runtime narrows
+/// on purpose: structured or image content is refused with a typed error
+/// rather than silently flattened.
 #[derive(Debug, Deserialize)]
 struct IncomingChatTurn {
     role: String,
+    #[serde(default)]
     content: Value,
+    #[serde(default)]
+    tool_calls: Option<Value>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    function_call: Option<Value>,
 }
 
 struct ParsedRequest {
