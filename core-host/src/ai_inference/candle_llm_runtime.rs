@@ -361,6 +361,12 @@ impl ModelArchitecture {
             // ones. A checkpoint routed to the wrong one loads against the
             // wrong layer structure.
             GgufArchitecture::Qwen3Moe => Self::Qwen35Moe,
+            // The MoE sibling of the hybrid, and the reason the two spellings
+            // are pinned apart below: `qwen35moe` is a prefix of nothing and a
+            // suffix of nothing, but it shares `qwen35` with the hybrid, so a
+            // `starts_with` anywhere in this path would route a mixture into a
+            // backend built for interleaved Gated DeltaNet layers.
+            GgufArchitecture::Qwen3_5Moe => Self::Qwen35Moe,
             GgufArchitecture::Qwen3_5 => Self::Qwen35Hybrid,
         }
     }
@@ -7173,10 +7179,14 @@ mod tests {
             ModelArchitecture::from_gguf_architecture("qwen35"),
             Some(ModelArchitecture::Qwen35Hybrid)
         );
-        // The MoE sibling stays distinct under the underscore-less spelling
-        // too: candle reports `qwen35moe` as known-but-unimplemented, and it
-        // must not fall into the hybrid by prefix.
-        assert_eq!(ModelArchitecture::from_gguf_architecture("qwen35moe"), None);
+        // The MoE sibling under the underscore-less spelling. candle gained a
+        // backend for it, so it resolves now where it used to be refused — but
+        // what this pins is unchanged and is the whole point: it must land on
+        // the mixture, never on the hybrid it shares a prefix with.
+        assert_eq!(
+            ModelArchitecture::from_gguf_architecture("qwen35moe"),
+            Some(ModelArchitecture::Qwen35Moe)
+        );
         assert_ne!(
             ModelArchitecture::Qwen35Moe,
             ModelArchitecture::Qwen35Hybrid
