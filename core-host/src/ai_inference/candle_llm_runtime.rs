@@ -4258,6 +4258,13 @@ impl CandleLlmRuntime {
                 // remaining rows keep their shared forward pass.
                 if Instant::now() >= requests[row].deadline {
                     done[row] = true;
+                    // The verdict travels with the row, the way a stop
+                    // sequence's does. Retiring it silently left `finish` unset
+                    // and the token count below the requested maximum, so the
+                    // assembly below reported a truncated answer as a clean
+                    // `stop` — for this row only, while its co-batched
+                    // neighbours reported correctly.
+                    finishes[row] = Some(FinishReason::Length);
                     continue;
                 }
                 let row_logits = logits.get(row).map_err(|error| {

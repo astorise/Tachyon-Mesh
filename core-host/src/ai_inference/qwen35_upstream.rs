@@ -346,6 +346,13 @@ impl Qwen35MoeRuntime {
             // budget does, rather than failing: freeing the scheduler slot is
             // the point, and a partial answer beats an error.
             if Instant::now() >= request.deadline {
+                // Named, not left unset. An absent reason maps to `None` below
+                // unless the budget happened to run out on the exact token the
+                // caller asked for, so a deadline-truncated answer reached the
+                // client as a clean `stop` — indistinguishable from a model
+                // that chose to finish. The generic Candle runtime records the
+                // same verdict on its own deadline.
+                finish = Some(FinishReason::Length);
                 break;
             }
             // Same reasoning for a consumer that went away.

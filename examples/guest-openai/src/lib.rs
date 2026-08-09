@@ -86,6 +86,31 @@ struct ChatCompletionRequest {
     /// final chunk breaks naive clients that assume every chunk has a choice.
     #[serde(default)]
     stream_options: Option<StreamOptions>,
+    /// Structured-output request. Declared here because serde drops what this
+    /// struct does not name: the host has a constrained decoder and the
+    /// upstream backend has a `response_format` translation, and neither was
+    /// reachable through the public OpenAI route because the field never
+    /// survived deserialization. A client supplying a schema got unconstrained
+    /// output and no error — the same failure the `tools` field had.
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
+}
+
+/// The subset of OpenAI's `response_format` this route acts on.
+///
+/// `{"type": "text"}` and `{"type": "json_object"}` are accepted and carry no
+/// schema; only `json_schema` constrains decoding, and only its `schema` is
+/// forwarded — `name` and `strict` describe the request, not the grammar.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ResponseFormat {
+    #[serde(default)]
+    json_schema: Option<JsonSchemaFormat>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct JsonSchemaFormat {
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -624,6 +649,19 @@ fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let registered = resolve_registered_model(&request.model, &models);
     let alias = match registered {
         Some(model) => model.alias.as_str(),
+        // Same reservation rule as the chat path. `list_models()` filters a
+        // withdrawn row, so a bare embedding name fell through to this
+        // fallback and ran against whichever runtime was sealed for the route
+        // — for the length of a reload window, or indefinitely after a failed
+        // reconciliation. The chat path grew this check; embeddings resolve
+        // through the same lookup and needed it too.
+        None if !request.model.contains('/') && alias_is_withdrawn(&request.model) => {
+            return Ok(openai_error_payload(
+                404,
+                format!("model `{}` is unavailable", request.model),
+                "model_not_found",
+            ));
+        }
         None if !request.model.contains('/') => request.model.as_str(),
         None => {
             return Ok(openai_error_payload(
@@ -946,7 +984,17 @@ fn handle_chat_completions_streaming(
     //
     // Structured calls win over anything parsed out of the text, for the same
     // reason as on the buffered path: the backend received them as fields.
-    let mut tool_calls = adopt_host_tool_calls(host_tool_calls);
+    // Gated on intent, like the buffered branch. An upstream that returns
+    // structured calls to a request that offered no tools — or set
+    // `tool_choice: "none"` — is answering a question the client did not ask,
+    // and adopting them here exposed a dispatchable `tool_calls` delta the
+    // caller had explicitly forbidden. The buffered path grew this guard; the
+    // streamed one adopted unconditionally.
+    let mut tool_calls = if request.has_tool_intent() {
+        adopt_host_tool_calls(host_tool_calls)
+    } else {
+        Vec::new()
+    };
     if let Some(gate) = gate {
         let (whole, sent) = gate.finish();
         let parsed = parse_assistant_output(&request, &whole);
@@ -1592,6 +1640,21 @@ fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, S
     if let Some(stop) = request.stop.clone() {
         object.insert("stop".to_owned(), serde_json::json!(stop.into_vec()));
     }
+    // The host takes the schema as source text, which is what its grammar
+    // compiler parses. Forwarded only when a schema is actually present:
+    // `{"type": "json_object"}` asks for JSON without saying which, and has no
+    // grammar to compile.
+    if let Some(schema) = request
+        .response_format
+        .as_ref()
+        .and_then(|format| format.json_schema.as_ref())
+        .and_then(|format| format.schema.as_ref())
+    {
+        object.insert(
+            "json_schema".to_owned(),
+            serde_json::Value::String(schema.to_string()),
+        );
+    }
     if !request.tools.is_empty() {
         object.insert("tools".to_owned(), serde_json::json!(request.tools));
     }
@@ -1883,6 +1946,7 @@ mod tests {
             stop: None,
             stream: None,
             stream_options: None,
+            response_format: None,
         }
     }
 
@@ -2111,6 +2175,7 @@ mod tests {
             stop: None,
             stream: None,
             stream_options: None,
+            response_format: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -2144,6 +2209,7 @@ mod tests {
             stop: Some(StopField::One("\n\n".to_owned())),
             stream: None,
             stream_options: None,
+            response_format: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -2174,6 +2240,7 @@ mod tests {
             stop: None,
             stream: None,
             stream_options: None,
+            response_format: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -2720,6 +2787,7 @@ mod tests {
             stop: None,
             stream: None,
             stream_options: None,
+            response_format: None,
         };
         let parsed = parse_assistant_output(&request, r#"{"name":"search","arguments":{}}"#);
 
