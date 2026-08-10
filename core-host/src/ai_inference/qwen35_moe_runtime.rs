@@ -649,6 +649,7 @@ impl Qwen35MoeRuntime {
             // does, rather than failing: freeing the scheduler slot is the
             // point, and a partial answer beats an error.
             if Instant::now() >= request.deadline {
+                budget_exhausted = true;
                 break;
             }
             // Same reasoning for a consumer that went away: finishing an

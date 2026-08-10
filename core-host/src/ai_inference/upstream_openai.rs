@@ -704,9 +704,14 @@ impl UpstreamOpenAiRuntime {
     /// rather than as zeros.
     fn read_usage(payload: &Value) -> Option<TokenUsage> {
         let usage = payload.get("usage").filter(|usage| !usage.is_null())?;
-        let field = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0) as u32;
-        let prompt_tokens = field("prompt_tokens");
-        let completion_tokens = field("completion_tokens");
+        let field = |name: &str| {
+            usage
+                .get(name)
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+        };
+        let prompt_tokens = field("prompt_tokens")?;
+        let completion_tokens = field("completion_tokens")?;
         if prompt_tokens == 0 && completion_tokens == 0 {
             return None;
         }
@@ -769,6 +774,14 @@ impl UpstreamOpenAiRuntime {
                 usage,
                 finish_reason,
                 tool_calls: tool_calls_from_value(&self.alias, tool_calls)?,
+            });
+        }
+
+        if finish_reason.as_deref() == Some("tool_calls") {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream reported `finish_reason: tool_calls` without a tool call"
+                    .to_owned(),
             });
         }
 
@@ -838,6 +851,7 @@ impl UpstreamOpenAiRuntime {
         let mut saw_done = false;
         let mut usage = None;
         let mut finish_reason = None;
+        let mut saw_choice = false;
         // Set when the sink asks to stop — the client went away. The read loop
         // then abandons the upstream response instead of draining it to
         // `[DONE]`, which is what releases the socket, the thread and the
@@ -945,6 +959,7 @@ impl UpstreamOpenAiRuntime {
                 .get("choices")
                 .and_then(Value::as_array)
                 .and_then(|choices| choices.first());
+            saw_choice |= choice.is_some();
             // Sent on the last content-bearing frame, before `[DONE]`. Keeping
             // it is what lets the caller tell a completion that finished from
             // one the upstream truncated at its own token limit.
@@ -1022,6 +1037,12 @@ impl UpstreamOpenAiRuntime {
             return Err(UpstreamError::MalformedResponse {
                 alias: self.alias.clone(),
                 detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
+            });
+        }
+        if saw_done && !saw_choice {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream SSE stream completed without a choice".to_owned(),
             });
         }
 
@@ -1531,6 +1552,12 @@ impl SseReader {
             }
             return Ok(None);
         };
+        // A CR at the current buffer boundary may be the first half of CRLF.
+        // Wait for one more byte so the following LF is not mistaken for a
+        // separate blank event separator. At EOF it is definitively bare CR.
+        if self.buffered[end] == b'\r' && end + 1 == self.buffered.len() && !self.eof {
+            return Ok(None);
+        }
         if end > MAX_SSE_FRAME_BYTES {
             return Err(SseReadError::FrameTooLarge);
         }
