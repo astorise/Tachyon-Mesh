@@ -614,11 +614,9 @@ impl GenerationError {
                     upstream_openai::UpstreamError::InvalidRequest { .. } => {
                         Some("invalid-request")
                     }
-                    upstream_openai::UpstreamError::Transport { detail, .. }
-                        if detail.contains("timed out") || detail.contains("timeout") =>
-                    {
-                        Some("timeout")
-                    }
+                    upstream_openai::UpstreamError::Transport {
+                        timed_out: true, ..
+                    } => Some("timeout"),
                     upstream_openai::UpstreamError::Transport { .. } => Some("transport"),
                     upstream_openai::UpstreamError::MalformedResponse { .. } => {
                         Some("malformed-response")

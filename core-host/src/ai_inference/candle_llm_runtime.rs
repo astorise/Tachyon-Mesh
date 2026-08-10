@@ -1785,7 +1785,7 @@ pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
     // dialect outright, so those are checked before the generic JSON case.
     if source.contains("[TOOL_CALLS]") {
         Some("mistral")
-    } else if source.contains("<tool_call>") {
+    } else if source.contains("<tool_call>") || source.contains("<tool_calls>") {
         Some("qwen")
     } else if source.contains("tools") {
         // Tool-aware, but with no tag convention: the call is rendered as a

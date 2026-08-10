@@ -487,7 +487,13 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         // `GET /ai/v1/models`, leaving a model that answers but cannot be
         // discovered, and which no reload short of a config change restores.
         let table = models_table();
-        while let Ok(previous) = table.get(alias) {
+        while let Some(previous) = table.get(alias).map(Some).or_else(|error| {
+            if error == format!("key `{alias}` not found") {
+                Ok(None)
+            } else {
+                Err(format!("model registry delete failed: {error}"))
+            }
+        })? {
             if serde_json::from_slice::<ModelInfo>(&previous)
                 .ok()
                 .is_some_and(|row| row.is_config_owned())
@@ -1478,7 +1484,10 @@ fn completion_id() -> String {
         .map(|since| since.as_nanos() as u64)
         .unwrap_or(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("chatcmpl-{nanos:016x}{seq:08x}")
+    let mut nonce = [0_u8; 8];
+    let _ = getrandom::fill(&mut nonce);
+    let random = u64::from_le_bytes(nonce);
+    format!("chatcmpl-{nanos:016x}{random:016x}{seq:08x}")
 }
 
 fn models_table() -> bindings::tachyon::mesh::kv_partition::Table {

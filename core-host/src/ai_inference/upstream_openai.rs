@@ -94,6 +94,7 @@ pub(crate) enum UpstreamError {
         alias: String,
         endpoint: String,
         detail: String,
+        timed_out: bool,
     },
     #[error("upstream `{alias}` at `{endpoint}` returned HTTP {status}: {body}")]
     Status {
@@ -669,6 +670,7 @@ impl UpstreamOpenAiRuntime {
                 alias: self.alias.clone(),
                 endpoint: url.clone(),
                 detail: error.to_string(),
+                timed_out: error.is_timeout(),
             })?;
 
         let status = response.status();
@@ -880,11 +882,12 @@ impl UpstreamOpenAiRuntime {
                         ),
                     })
                 }
-                Err(SseReadError::Transport(detail)) => {
+                Err(SseReadError::Transport { detail, timed_out }) => {
                     return Err(UpstreamError::Transport {
                         alias: self.alias.clone(),
                         endpoint: self.endpoint.url("/chat/completions"),
                         detail: format!("failed to read the upstream stream: {detail}"),
+                        timed_out,
                     })
                 }
                 Err(SseReadError::InvalidUtf8(detail)) => {
@@ -1023,14 +1026,20 @@ impl UpstreamOpenAiRuntime {
         }
 
         if !abandoned {
-            for call in
-                streamed_tool_calls
-                    .finish()
-                    .map_err(|detail| UpstreamError::MalformedResponse {
-                        alias: self.alias.clone(),
-                        detail,
-                    })?
-            {
+            let calls = streamed_tool_calls.finish().map_err(|detail| {
+                UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                }
+            })?;
+            if finish_reason.as_deref() == Some("tool_calls") && calls.is_empty() {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: "upstream reported `finish_reason: tool_calls` without a tool call"
+                        .to_owned(),
+                });
+            }
+            for call in calls {
                 if sink.emit(StreamEvent::ToolCall(call)).is_stop() {
                     break;
                 }
@@ -1401,7 +1410,10 @@ enum SseReadError {
     Idle,
     FrameTooLarge,
     StreamTooLarge,
-    Transport(String),
+    Transport {
+        detail: String,
+        timed_out: bool,
+    },
     InvalidUtf8(String),
 }
 
@@ -1480,7 +1492,12 @@ impl SseReader {
                     self.eof = true;
                     continue;
                 }
-                Ok(Err(error)) => return Err(SseReadError::Transport(error.to_string())),
+                Ok(Err(error)) => {
+                    return Err(SseReadError::Transport {
+                        detail: error.to_string(),
+                        timed_out: error.is_timeout(),
+                    })
+                }
             };
             self.consumed = self.consumed.saturating_add(chunk.len() as u64);
             if self.consumed > MAX_STREAM_BYTES {
@@ -1492,7 +1509,11 @@ impl SseReader {
 
     /// Split one line out of the buffer, if a whole one is there.
     fn take_line(&mut self) -> Result<Option<String>, SseReadError> {
-        let Some(end) = self.buffered.iter().position(|byte| *byte == b'\n') else {
+        let Some(end) = self
+            .buffered
+            .iter()
+            .position(|byte| matches!(*byte, b'\n' | b'\r'))
+        else {
             // No newline yet. The buffer is a partial line, so it is bounded by
             // the frame cap rather than by the stream cap — several concurrent
             // streams each holding a near-`MAX_STREAM_BYTES` partial line is
@@ -1514,7 +1535,10 @@ impl SseReader {
             return Err(SseReadError::FrameTooLarge);
         }
         let mut line: Vec<u8> = self.buffered.drain(..=end).collect();
-        line.pop();
+        let terminator = line.pop();
+        if terminator == Some(b'\r') && self.buffered.first() == Some(&b'\n') {
+            self.buffered.remove(0);
+        }
         String::from_utf8(line)
             .map(Some)
             .map_err(|error| SseReadError::InvalidUtf8(format!("SSE frame is not UTF-8: {error}")))

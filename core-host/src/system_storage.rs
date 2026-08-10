@@ -703,10 +703,13 @@ pub(crate) fn withdraw_changed_model_bindings(
     };
     let incoming = publishable(incoming);
 
-    for (alias, path) in publishable(previous) {
-        // Same alias, same path — the row it would publish is byte-identical,
-        // so leaving it in place keeps the model listed across the reload.
-        if incoming.get(&alias).is_some_and(|next| *next == path) {
+    for (alias, _path) in publishable(previous) {
+        // An alias that remains configured must keep its ownership marker
+        // throughout the swap. Removing it creates a window in which an upload
+        // can claim the alias and modify the configured checkpoint before the
+        // replacement row is published. The post-swap publisher refreshes the
+        // path and engine; withdrawal is only for aliases no longer configured.
+        if incoming.contains_key(&alias) {
             continue;
         }
         // Ownership is re-read inside the transaction: an upload that landed
