@@ -424,6 +424,17 @@ struct HostGenerationRequest {
     /// for 1 ms could hold a network slot for the binding's full timeout.
     #[serde(default)]
     max_generation_ms: Option<u64>,
+    /// Whether the caller asked for token counts on the stream.
+    ///
+    /// Not read from the wire unprompted: OpenAI only emits streamed `usage`
+    /// when `stream_options.include_usage` is set, and volunteering that field
+    /// to an upstream that does not know it risks a 400 that breaks streaming
+    /// outright — a bad trade for a reporting field nobody requested. When a
+    /// client *did* request it the trade reverses: dropping the option leaves
+    /// `read_usage` with nothing to read, and the caller is silently denied the
+    /// trailing usage chunk it explicitly asked for.
+    #[serde(default)]
+    include_usage: Option<bool>,
 }
 
 /// A completed upstream generation: its bytes, the counts the upstream
@@ -661,6 +672,16 @@ impl UpstreamOpenAiRuntime {
         body.insert("model".to_owned(), json!(self.endpoint.model));
         body.insert("messages".to_owned(), Value::Array(messages));
         body.insert("stream".to_owned(), json!(stream));
+        // Only on a stream, and only when asked: a buffered response reports
+        // usage unconditionally, so the option would be noise there, and an
+        // upstream that rejects the unknown field should only ever see it on
+        // behalf of a caller who wanted what it buys.
+        if stream && request.include_usage == Some(true) {
+            body.insert(
+                "stream_options".to_owned(),
+                json!({ "include_usage": true }),
+            );
+        }
         body.insert("max_tokens".to_owned(), json!(max_new_tokens));
         if let Some(temperature) = request.temperature {
             body.insert("temperature".to_owned(), json!(temperature));
@@ -2319,6 +2340,66 @@ mod tests {
 
         let (_, body) = upstream.received();
         assert_eq!(body["stream"], true);
+        assert!(
+            body.get("stream_options").is_none(),
+            "the option is one an upstream may reject; a caller that never asked for usage \
+             gains nothing from that risk"
+        );
+    }
+
+    #[test]
+    fn a_requested_stream_usage_option_reaches_the_upstream() {
+        // OpenAI-compatible providers emit streamed `usage` only when the
+        // option is present. Dropping it left `read_usage` with nothing to
+        // read, so the trailing usage chunk the client explicitly asked for
+        // never arrived — the option is only sent on behalf of a caller who
+        // wanted what it buys.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+                "\n\n",
+                r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(
+                &[br#"{"prompt":"go","include_usage":true}"#],
+                &mut captured.sink(),
+            )
+            .expect("streaming should complete");
+        assert_eq!(
+            outcome.usage.expect("usage is reported").completion_tokens,
+            1
+        );
+
+        let (_, body) = upstream.received();
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn a_buffered_request_does_not_carry_the_stream_usage_option() {
+        // A buffered response reports usage unconditionally, so the option
+        // would be noise on that route — and noise an upstream may 400 on.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        backend
+            .generate(&[br#"{"prompt":"go","include_usage":true}"#])
+            .expect("buffered generation should succeed");
+
+        let (_, body) = upstream.received();
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
     }
 
     #[test]

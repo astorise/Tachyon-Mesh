@@ -365,22 +365,7 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     let incoming_dir = models_dir().join(format!(".incoming-{upload_id}"));
     let backup_dir = models_dir().join(format!(".replaced-{upload_id}"));
     let _ = fs::remove_dir_all(&incoming_dir);
-    // A crash between the two renames below parks the live checkpoint in
-    // `.replaced-{upload_id}` with nothing at `model_dir`. The upload stays
-    // retryable, and this used to open by deleting that backup — so if the
-    // retry was refused in turn, `replaced` was false, there was nothing to
-    // put back, and the operator's checkpoint was gone for good. Restore it
-    // first: past this point either the live directory is whole or there was
-    // never one, which is the state the rest of this function assumes.
-    if backup_dir.exists() && !model_dir.exists() {
-        fs::rename(&backup_dir, &model_dir).map_err(|error| {
-            format!(
-                "failed to recover the checkpoint an interrupted upload left in `{}`: {error}",
-                backup_dir.display()
-            )
-        })?;
-    }
-    let _ = fs::remove_dir_all(&backup_dir);
+    reconcile_interrupted_commit(&model_dir, &backup_dir, &upload_id)?;
     fs::create_dir_all(&incoming_dir)
         .map_err(|error| format!("failed to create the staging model directory: {error}"))?;
 
@@ -502,6 +487,64 @@ fn reclaim_discarded_backups() {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Put the live path back the way a crashed attempt found it.
+///
+/// A commit renames twice — live checkpoint to `.replaced-{upload_id}`, then
+/// the staged upload onto the live path — and a crash between or just after
+/// them leaves a backup behind. Three states are distinguishable when a retry
+/// arrives, and each needs a different answer:
+///
+/// - **Nothing on the live path.** The crash landed between the renames. Put
+///   the backup back. This one was already handled: opening by *deleting* the
+///   backup meant a retry that was then refused had nothing to restore, and
+///   the operator's checkpoint was gone for good.
+/// - **Our own files on the live path.** The crash landed after the second
+///   rename, before publication accepted or refused them. Both directories
+///   exist, so the case above does not fire — and deleting the backup here
+///   discarded the operator's checkpoint while leaving an *unpublished* upload
+///   live. A refusal on the retry could then only roll back to the rejected
+///   upload. Our half-installed files are the disposable half: the staging
+///   archive still holds them and the retry re-unpacks them anyway, so rewind
+///   to the state the first attempt started from and let it redo the sequence.
+/// - **Somebody else's files on the live path.** What the concurrent-upload
+///   path deliberately parks for an operator, and what a crash another upload
+///   then committed over also leaves. Neither directory is safe to touch:
+///   deleting the backup loses the checkpoint it was kept for, restoring it
+///   destroys a model somebody was told had installed. Refusing names the two
+///   paths that need a decision.
+///
+/// Past this point the live directory is either whole or absent, which is what
+/// the rest of the commit assumes.
+fn reconcile_interrupted_commit(
+    model_dir: &Path,
+    backup_dir: &Path,
+    upload_id: &str,
+) -> Result<(), String> {
+    if !backup_dir.exists() {
+        return Ok(());
+    }
+    if model_dir.exists() {
+        if installed_upload_id(model_dir).as_deref() != Some(upload_id) {
+            return Err(format!(
+                "model upload `{upload_id}` cannot commit: an earlier attempt's checkpoint is \
+                 parked at `{}` while `{}` is owned by another upload; restore or remove the \
+                 parked directory before retrying",
+                backup_dir.display(),
+                model_dir.display()
+            ));
+        }
+        let _ = fs::remove_dir_all(model_dir);
+    }
+    fs::rename(backup_dir, model_dir).map_err(|error| {
+        format!(
+            "failed to restore the checkpoint an interrupted upload left in `{}`: {error}",
+            backup_dir.display()
+        )
+    })?;
+    let _ = fs::remove_dir_all(backup_dir);
+    Ok(())
 }
 
 /// The model directory / registry name: the caller-supplied alias, or the bare
@@ -1029,6 +1072,75 @@ mod tests {
         assert!(meta.get("tool_call_parser").is_none());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The two crash windows a retry has to tell apart.
+    #[test]
+    fn an_interrupted_commit_restores_the_checkpoint_it_displaced() {
+        let root = std::env::temp_dir().join(format!(
+            "tachyon-broker-reconcile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        let model_dir = root.join("coder");
+        let backup_dir = root.join(".replaced-up-1");
+        let plant = |dir: &Path, marker: &str, upload_id: Option<&str>| {
+            fs::create_dir_all(dir).expect("fixture dir");
+            fs::write(dir.join("weights.bin"), marker).expect("fixture file");
+            if let Some(upload_id) = upload_id {
+                fs::write(
+                    dir.join(MODEL_META_JSON),
+                    format!(r#"{{"format":"gguf","alias":"coder","upload_id":"{upload_id}"}}"#),
+                )
+                .expect("fixture sidecar");
+            }
+        };
+        let live = || fs::read_to_string(model_dir.join("weights.bin")).expect("live checkpoint");
+
+        // Crash between the renames: the checkpoint is parked and nothing is
+        // live. Deleting the backup here — which is what this used to do —
+        // left a refused retry with nothing to put back.
+        plant(&backup_dir, "operator", None);
+        reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1").expect("recovers");
+        assert_eq!(live(), "operator");
+        assert!(!backup_dir.exists());
+
+        // Crash after the second rename: our own unpublished files are live
+        // *and* the checkpoint is parked. Both exist, so the case above does
+        // not fire, and deleting the backup discarded the operator's
+        // checkpoint while leaving an upload nothing had accepted.
+        plant(&backup_dir, "operator", None);
+        plant(&model_dir, "upload", Some("up-1"));
+        reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1").expect("rewinds");
+        assert_eq!(
+            live(),
+            "operator",
+            "the retry must start from the state the first attempt found"
+        );
+        assert!(!backup_dir.exists());
+
+        // Someone else owns the live path. Neither directory is safe to touch,
+        // and the refusal names both so an operator can decide.
+        plant(&backup_dir, "operator", None);
+        plant(&model_dir, "other-upload", Some("up-2"));
+        let error = reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1")
+            .expect_err("a live directory owned by another upload is not ours to move");
+        assert!(error.contains(".replaced-up-1"), "{error}");
+        assert_eq!(live(), "other-upload");
+        assert!(
+            backup_dir.exists(),
+            "the parked checkpoint is left for an operator"
+        );
+
+        // Nothing parked is the ordinary case and must stay a no-op.
+        fs::remove_dir_all(&backup_dir).expect("clear");
+        reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1").expect("no-op");
+        assert_eq!(live(), "other-upload");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

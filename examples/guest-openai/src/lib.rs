@@ -113,25 +113,40 @@ struct ResponseFormat {
 }
 
 impl ResponseFormat {
-    /// The schema text to constrain decoding with, if this format asks for one.
+    /// The schema text to constrain decoding with, or why this format cannot be
+    /// honoured.
     ///
     /// An explicit schema wins over the `type`, including when a client sends
     /// `json_schema` with a schema and some other `type` — the schema is the
     /// more specific statement of intent, and honouring it is never wrong.
-    fn schema_source(&self) -> Option<String> {
+    ///
+    /// `Err` for `json_schema` that names no schema. Silently dropping the
+    /// constraint is the one outcome a caller cannot detect: it asked for
+    /// schema-conforming data, got prose, and has nothing telling it the
+    /// difference — so the parse it runs next treats arbitrary text as
+    /// structured. Refusing is a 400 the client can read and fix.
+    fn schema_source(&self) -> Result<Option<String>, String> {
         if let Some(schema) = self
             .json_schema
             .as_ref()
             .and_then(|format| format.schema.as_ref())
         {
-            return Some(schema.to_string());
+            return Ok(Some(schema.to_string()));
         }
-        // "Any object" is the whole of what `json_object` promises, and it is
-        // expressible: the host's compiler reads a schema with no `properties`
-        // as accepting every object and nothing else. Forwarding nothing here
-        // made the mode a no-op that clients cannot detect, since the failure
-        // looks like a model that ignored the instruction.
-        (self.kind.as_deref() == Some("json_object")).then(|| r#"{"type":"object"}"#.to_owned())
+        match self.kind.as_deref() {
+            // "Any object" is the whole of what `json_object` promises, and it
+            // is expressible: the host's compiler reads a schema with no
+            // `properties` as accepting every object and nothing else.
+            // Forwarding nothing here made the mode a no-op that clients cannot
+            // detect, since the failure looks like a model that ignored the
+            // instruction.
+            Some("json_object") => Ok(Some(r#"{"type":"object"}"#.to_owned())),
+            Some("json_schema") => Err(
+                "`response_format` of type `json_schema` must carry `json_schema.schema`"
+                    .to_owned(),
+            ),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -744,6 +759,14 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     }
     if request.messages.is_empty() {
         return Err("chat completion request must include at least one message".to_owned());
+    }
+    // Checked here rather than at encode time so the refusal is a 400 the
+    // client can act on, and so it lands before a model is loaded — a request
+    // this route cannot honour should not cost a checkpoint residency.
+    if let Some(format) = request.response_format.as_ref() {
+        if let Err(detail) = format.schema_source() {
+            return Ok(openai_error_payload(400, detail, "invalid_request_error"));
+        }
     }
 
     let models = list_models()?;
@@ -1737,12 +1760,28 @@ fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, S
     if let Some(stop) = request.stop.clone() {
         object.insert("stop".to_owned(), serde_json::json!(stop.into_vec()));
     }
+    // Carried so an `openai:` backend can ask its own provider for streamed
+    // usage. Providers emit it only when the option is present, so without this
+    // the host had nothing to read and the trailing usage chunk this client
+    // explicitly requested never arrived. Sent as the intent, not as the
+    // upstream's field: a local backend measures usage regardless, and the
+    // upstream runtime is the only place that knows whether the option is safe
+    // to forward.
+    if request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage)
+    {
+        object.insert("include_usage".to_owned(), serde_json::json!(true));
+    }
     // The host takes the schema as source text, which is what its grammar
     // compiler parses. `text` is the only format that forwards nothing.
     if let Some(schema) = request
         .response_format
         .as_ref()
-        .and_then(ResponseFormat::schema_source)
+        .map(ResponseFormat::schema_source)
+        .transpose()?
+        .flatten()
     {
         object.insert("json_schema".to_owned(), serde_json::Value::String(schema));
     }
@@ -2379,6 +2418,58 @@ mod tests {
                     "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"a":{"type":"integer"}}}}}}"#
             ),
             serde_json::json!(r#"{"properties":{"a":{"type":"integer"}},"type":"object"}"#)
+        );
+    }
+
+    #[test]
+    fn a_json_schema_format_without_a_schema_is_refused() {
+        // Dropping the constraint is the one outcome a caller cannot detect: it
+        // asked for schema-conforming data, got prose, and has nothing telling
+        // it the difference — so whatever it parses next treats arbitrary text
+        // as structured.
+        let (status, body) = route_request(
+            "POST",
+            ROUTE_CHAT_COMPLETIONS,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                 "response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#,
+        )
+        .expect("a malformed format is a request error, not a host failure");
+        assert_eq!(status, 400);
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("json_schema.schema")),
+            "the error should name the missing field: {payload}"
+        );
+    }
+
+    #[test]
+    fn a_stream_usage_request_reaches_the_host_envelope() {
+        // Providers emit streamed usage only when the option is present, so
+        // without carrying the intent the host had nothing to read and the
+        // trailing usage chunk this client asked for never arrived.
+        let with = |body: &str| {
+            let request: ChatCompletionRequest = serde_json::from_str(body).expect("valid request");
+            let payload: serde_json::Value =
+                serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                    .expect("valid json");
+            payload["include_usage"].clone()
+        };
+
+        assert_eq!(
+            with(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "stream":true,"stream_options":{"include_usage":true}}"#
+            ),
+            serde_json::json!(true)
+        );
+        // Absent unless asked: the field is one an upstream may reject, and a
+        // client that never requested usage gains nothing from that risk.
+        assert_eq!(
+            with(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#),
+            serde_json::Value::Null
         );
     }
 

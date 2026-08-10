@@ -124,16 +124,35 @@ jobs:
       # filter matches nothing. Deleting the scalar runtime made four of these
       # filters stale at once, and the job would have gone green having run
       # zero tests — the exact outcome the checkpoint requirement above exists
-      # to prevent. Listing first turns a stale filter into a failure.
+      # to prevent.
+      #
+      # Each filter is checked, not just "some gated test exists": with one
+      # blanket check, renaming a single proof left the guard green while that
+      # proof was silently skipped, because the other three still matched. The
+      # filters below are the ones the steps use verbatim, and a libtest filter
+      # is a substring match on the test path — which is exactly what `grep -F`
+      # answers against the listing.
       - name: Require the gated tests to exist
         run: |
-          listed="$(cargo test -p core-host --bin core-host \
-            --features candle-cuda -- --list 2>/dev/null | grep -c 'gated_' || true)"
-          if [ "$listed" -eq 0 ]; then
-            echo "::error::no gated tests matched; the acceptance job would test nothing"
-            exit 1
-          fi
-          echo "$listed gated tests available"
+          set -o pipefail
+          cargo test -p core-host --bin core-host \
+            --features candle-cuda -- --list > /tmp/gated-tests.txt
+          missing=0
+          for filter in \
+            gated_prefill_is_invariant_to_chunk_size \
+            qwen35_upstream::tests::gated_ \
+            gated_a_cuda_route_runs_the_kernel_or_refuses_to_load \
+            gated_real_checkpoint_probe_loads_modelopt_nvfp4_directory
+          do
+            matched="$(grep -cF "$filter" /tmp/gated-tests.txt || true)"
+            if [ "$matched" -eq 0 ]; then
+              echo "::error::no test matches \`$filter\`; the step using it would run nothing"
+              missing=1
+            else
+              echo "$filter -> $matched test(s)"
+            fi
+          done
+          exit "$missing"
 
       # The prefill loop is still ours: `PREFILL_CHUNK_TOKENS` exists so the
       # deadline can be observed, and it rests on upstream's forward being
