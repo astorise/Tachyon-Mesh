@@ -117,6 +117,9 @@ impl ComponentHostState {
                 }
             }
         };
+        // Computed before the struct literal, which moves `runtime_config`.
+        #[cfg(feature = "ai-inference")]
+        let listable = listable_model_aliases(route, &runtime_config);
         Ok(Self {
             ctx: build_component_wasi_ctx(route, host_identity.as_ref(), s3_preps)?,
             table: ResourceTable::new(),
@@ -148,6 +151,8 @@ impl ComponentHostState {
                 .iter()
                 .map(|binding| binding.alias.clone())
                 .collect(),
+            #[cfg(feature = "ai-inference")]
+            listable_model_aliases: listable,
             #[cfg(feature = "ai-inference")]
             adapter_id: route.adapter_id.clone(),
             #[cfg(feature = "ai-inference")]
@@ -1868,7 +1873,8 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         // any filtered view. The listing asks for one large page, so this costs
         // it nothing.
         #[cfg(feature = "ai-inference")]
-        let rows = scope_registry_rows_to_route(&res.table_name, rows, &self.allowed_model_aliases);
+        let rows =
+            scope_registry_rows_to_route(&res.table_name, rows, &self.listable_model_aliases);
         Ok(rows)
     }
 
@@ -2090,6 +2096,49 @@ fn wit_tool_call(
 /// The caller's `limit` bounds the rows *read*, not the rows returned, as it
 /// does for any filtered view. The listing asks for one large page, so it
 /// costs nothing there.
+/// The registry aliases a route's component may read.
+///
+/// Sealing the *read* with the route's own bindings was wrong for the shape
+/// the OpenAI surface actually takes: `/ai/v1/models` lists and seals nothing,
+/// `/ai/v1/chat/completions` executes and seals the models, and one component
+/// serves both. The listing route's set was therefore empty, and the filter
+/// removed every row — `GET /ai/v1/models` answered `{"data": []}` on a node
+/// with models loaded and answering, which is worse than the over-advertising
+/// the filter was written to stop.
+///
+/// The union is taken over routes sharing a *module* with this one, so the
+/// boundary is the component rather than the node: a second, unrelated guest on
+/// the same host still cannot read this one's aliases. Execution is unaffected —
+/// `load_accelerator_model` keeps checking the per-route set — so this widens
+/// what a component can see, never what it can run.
+///
+/// A route with no targets is named by `route.name`, matching how
+/// `select_stream_route_module` resolves a module for one.
+#[cfg(feature = "ai-inference")]
+fn listable_model_aliases(
+    route: &IntegrityRoute,
+    config: &IntegrityConfig,
+) -> std::collections::BTreeSet<String> {
+    let modules = |route: &IntegrityRoute| -> std::collections::BTreeSet<String> {
+        if route.targets.is_empty() {
+            return std::iter::once(route.name.clone()).collect();
+        }
+        route
+            .targets
+            .iter()
+            .map(|target| target.module.clone())
+            .collect()
+    };
+    let own = modules(route);
+    config
+        .routes
+        .iter()
+        .filter(|candidate| !modules(candidate).is_disjoint(&own))
+        .flat_map(|candidate| candidate.models.iter())
+        .map(|binding| binding.alias.clone())
+        .collect()
+}
+
 #[cfg(feature = "ai-inference")]
 fn scope_registry_rows_to_route(
     table_name: &str,
@@ -3787,8 +3836,9 @@ mod registry_scope_tests {
             "another route's model must not be advertised by this one"
         );
 
-        // A route that seals nothing sees nothing, which is the same answer
-        // execution would give it.
+        // An empty set filters everything. Which set gets passed matters more
+        // than this arithmetic does — see the test below: feeding it the
+        // *executing* set emptied the public listing outright.
         let scoped = scope_registry_rows_to_route(
             crate::system_storage::AI_MODELS_REGISTRY_TABLE,
             rows(),
@@ -3799,6 +3849,67 @@ mod registry_scope_tests {
         // The rule is about the registry, not about tables in general.
         let untouched = scope_registry_rows_to_route("some-other-table", rows(), &allowed);
         assert_eq!(untouched.len(), 2, "an unrelated table is returned whole");
+    }
+
+    /// A listing route seals no bindings, and still has to list.
+    ///
+    /// `/ai/v1/models` lists while `/ai/v1/chat/completions` executes, and one
+    /// component serves both — the shape both shipped manifests use. Scoping
+    /// the read by the listing route's own (empty) bindings filtered every row,
+    /// so `GET /ai/v1/models` answered with an empty list on a node with models
+    /// loaded and answering.
+    #[test]
+    fn a_listing_route_sees_the_models_its_component_can_execute() {
+        let route = |name: &str, path: &str, module: &str, models: &[&str]| IntegrityRoute {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            targets: vec![RouteTarget {
+                module: module.to_owned(),
+                weight: 100,
+                websocket: false,
+                match_header: None,
+                requires: Vec::new(),
+            }],
+            models: models
+                .iter()
+                .map(
+                    |alias| crate::host_core::domain_types::IntegrityModelBinding {
+                        alias: (*alias).to_owned(),
+                        path: String::new(),
+                        device: Default::default(),
+                        qos: Default::default(),
+                        dynamic: true,
+                        hardware_strategy: Default::default(),
+                    },
+                )
+                .collect(),
+            ..IntegrityRoute::default()
+        };
+        let listing = route("openai-models", "/ai/v1/models", "guest-openai", &[]);
+        let config = IntegrityConfig {
+            routes: vec![
+                listing.clone(),
+                route(
+                    "openai-chat",
+                    "/ai/v1/chat/completions",
+                    "guest-openai",
+                    &["coder"],
+                ),
+                // A different component's models stay invisible: the boundary
+                // is the component, not the node.
+                route("other", "/other", "guest-other", &["not-ours"]),
+            ],
+            ..IntegrityConfig::default()
+        };
+
+        assert_eq!(
+            listable_model_aliases(&listing, &config),
+            ["coder".to_owned()].into_iter().collect(),
+            "the listing route must see what its own component executes, and nothing further"
+        );
+        // Execution is untouched: the listing route still seals nothing, so
+        // `load_accelerator_model` refuses it every alias.
+        assert!(listing.models.is_empty());
     }
 }
 

@@ -654,7 +654,17 @@ pub(crate) fn publish_configured_model_bindings(
     // Drop configured rows whose binding is gone, or a removed alias would stay
     // listed in `GET /ai/v1/models` forever. Upload-owned rows are never swept:
     // their model is still on disk and reachable.
-    for alias in config_owned_aliases(core_store) {
+    let owned = match config_owned_aliases(core_store) {
+        Ok(owned) => owned,
+        Err(error) => {
+            // Counted, so the reload retries instead of accepting a sweep that
+            // never ran. Nothing has been deleted on this path yet, so stopping
+            // here leaves the registry exactly as the publication above left it.
+            tracing::warn!("failed to scan the model registry for stale bindings: {error}");
+            return failures + 1;
+        }
+    };
+    for alias in owned {
         if configured.contains(alias.as_str()) {
             continue;
         }
@@ -1048,8 +1058,16 @@ pub(crate) fn withdraw_changed_model_bindings(
 }
 
 /// Every alias in the registry whose row this publisher owns.
+///
+/// `Err` when a page could not be read. A failed read used to become an empty
+/// page, which is indistinguishable from the end of the table: the sweep then
+/// finished early, reported nothing wrong, and the reload's retry loop returned
+/// satisfied — leaving aliases the manifest had dropped still advertised in
+/// `GET /ai/v1/models` with no runtime behind them. Under-sweeping is not itself
+/// destructive, so the answer is to say the scan was incomplete and be retried,
+/// rather than to act on a partial view.
 #[cfg(feature = "ai-inference")]
-fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
+fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Result<Vec<String>, String> {
     /// Rows per read. The page size is a transaction-size bound, not a limit
     /// on how much of the table this sweep covers.
     const PAGE: u32 = 10_000;
@@ -1062,7 +1080,9 @@ fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
         // page stayed advertised forever after leaving the manifest.
         let page = core_store
             .kv_partition_get_range(AI_MODELS_REGISTRY_TABLE, "", "\u{10ffff}", PAGE, offset)
-            .unwrap_or_default();
+            .map_err(|error| {
+                format!("failed to read the model registry at offset {offset}: {error:#}")
+            })?;
         let read = page.len() as u32;
         owned.extend(page.into_iter().filter_map(|(alias, raw)| {
             let row = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
@@ -1070,7 +1090,7 @@ fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
                 .then_some(alias)
         }));
         if read < PAGE {
-            return owned;
+            return Ok(owned);
         }
         offset = offset.saturating_add(read);
     }
@@ -1761,6 +1781,35 @@ mod configured_binding_registry_tests {
             denied.contains("sealed manifest"),
             "unexpected error: {denied}"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A scan that could not finish is reported, not treated as an empty table.
+    ///
+    /// `unwrap_or_default()` turned a failed page read into "no more rows",
+    /// which is indistinguishable from the end of the table: the sweep stopped
+    /// early, publication reported zero failures, and the reload's retry loop
+    /// returned satisfied — leaving aliases the manifest had dropped still
+    /// advertised with no runtime behind them.
+    #[test]
+    fn a_failed_registry_scan_is_a_publication_failure() {
+        let (store, dir) = temp_store();
+        let config = config_with(vec![binding(
+            "coder",
+            "openai:http://127.0.0.1:8080/v1",
+            false,
+        )]);
+        assert_eq!(publish_configured_model_bindings(&store, &config), 0);
+
+        // A healthy table scans, and says so as `Ok` — the shape that lets the
+        // publisher above tell "no stale rows" apart from "could not look".
+        // Injecting a store failure needs a fake `CoreStore` this module does
+        // not have, so what is proved here is the success half; the failure
+        // half is carried by the signature, which no longer lets a caller read
+        // an error as an empty page.
+        let owned = config_owned_aliases(&store).expect("a healthy table scans");
+        assert_eq!(owned, vec!["coder".to_owned()]);
+
         let _ = fs::remove_dir_all(dir);
     }
 

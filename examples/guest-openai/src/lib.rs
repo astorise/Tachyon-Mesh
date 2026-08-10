@@ -116,36 +116,48 @@ impl ResponseFormat {
     /// The schema text to constrain decoding with, or why this format cannot be
     /// honoured.
     ///
-    /// An explicit schema wins over the `type`, including when a client sends
-    /// `json_schema` with a schema and some other `type` — the schema is the
-    /// more specific statement of intent, and honouring it is never wrong.
+    /// Every way this route refuses a format is a refusal a client can read.
+    /// The one thing it must never do is accept a format and then not apply it:
+    /// the caller asked for schema-conforming data, got prose, and has nothing
+    /// telling it the difference — so whatever it parses next treats arbitrary
+    /// text as structured.
     ///
-    /// `Err` for `json_schema` that names no schema. Silently dropping the
-    /// constraint is the one outcome a caller cannot detect: it asked for
-    /// schema-conforming data, got prose, and has nothing telling it the
-    /// difference — so the parse it runs next treats arbitrary text as
-    /// structured. Refusing is a 400 the client can read and fix.
+    /// The `type` is checked before the schema, so a misspelling is a 400 even
+    /// when a schema rides along. Within a recognised type an explicit schema
+    /// wins, which is what lets `json_object` carry one and be honoured
+    /// precisely rather than permissively.
     fn schema_source(&self) -> Result<Option<String>, String> {
-        if let Some(schema) = self
+        let declared = self
             .json_schema
             .as_ref()
             .and_then(|format| format.schema.as_ref())
-        {
-            return Ok(Some(schema.to_string()));
-        }
+            .map(serde_json::Value::to_string);
         match self.kind.as_deref() {
+            // The only type that constrains nothing.
+            Some("text") => Ok(None),
             // "Any object" is the whole of what `json_object` promises, and it
             // is expressible: the host's compiler reads a schema with no
             // `properties` as accepting every object and nothing else.
             // Forwarding nothing here made the mode a no-op that clients cannot
             // detect, since the failure looks like a model that ignored the
             // instruction.
-            Some("json_object") => Ok(Some(r#"{"type":"object"}"#.to_owned())),
-            Some("json_schema") => Err(
-                "`response_format` of type `json_schema` must carry `json_schema.schema`"
-                    .to_owned(),
-            ),
-            _ => Ok(None),
+            Some("json_object") => Ok(Some(
+                declared.unwrap_or_else(|| r#"{"type":"object"}"#.to_owned()),
+            )),
+            Some("json_schema") => declared.map(Some).ok_or_else(|| {
+                "`response_format` of type `json_schema` must carry `json_schema.schema`".to_owned()
+            }),
+            // No `type` at all is not a format; a bare `json_schema` block is
+            // still honoured, since that is unambiguous about what was wanted.
+            None => Ok(declared),
+            // A misspelling — `json-Object`, `json_obect` — used to fall
+            // through to unconstrained inference and a 200. The caller stated a
+            // format, so answering as though it had not is the same silent
+            // no-op the branches above exist to prevent.
+            Some(other) => Err(format!(
+                "`response_format.type` `{other}` is not supported; use `text`, `json_object`, \
+                 or `json_schema`"
+            )),
         }
     }
 }
@@ -2443,6 +2455,49 @@ mod tests {
                 .is_some_and(|message| message.contains("json_schema.schema")),
             "the error should name the missing field: {payload}"
         );
+    }
+
+    #[test]
+    fn an_unsupported_response_format_type_is_refused() {
+        // A misspelling used to fall through to unconstrained inference and a
+        // 200. The caller stated a format, so answering as though it had not is
+        // the same silent no-op the missing-schema refusal exists to prevent.
+        let (status, body) = route_request(
+            "POST",
+            ROUTE_CHAT_COMPLETIONS,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                 "response_format":{"type":"json-Object"}}"#,
+        )
+        .expect("an unsupported format is a request error, not a host failure");
+        assert_eq!(status, 400);
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("json-Object")),
+            "the error should quote what was sent: {payload}"
+        );
+
+        // Checked before the schema, so a misspelling is refused even when one
+        // rides along and would otherwise have been honoured.
+        let format = |body: &str| {
+            serde_json::from_str::<ResponseFormat>(body)
+                .expect("valid json")
+                .schema_source()
+        };
+        assert!(format(r#"{"type":"bogus","json_schema":{"schema":{"type":"object"}}}"#).is_err());
+        // And a recognised type still lets an explicit schema win, which is
+        // what makes `json_object` with a schema precise rather than permissive.
+        assert_eq!(
+            format(
+                r#"{"type":"json_object","json_schema":{"schema":{"type":"object","properties":{"a":{"type":"integer"}}}}}"#
+            ),
+            Ok(Some(
+                r#"{"properties":{"a":{"type":"integer"}},"type":"object"}"#.to_owned()
+            ))
+        );
+        assert_eq!(format(r#"{"type":"text"}"#), Ok(None));
     }
 
     #[test]

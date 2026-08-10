@@ -473,6 +473,65 @@ enum SseRead {
     Failed(String),
 }
 
+/// How many reader threads may exist at once, across every upstream binding.
+///
+/// A reader outlives its request when the client disconnects while the upstream
+/// is silent: `read_line` is uninterruptible and reqwest's blocking client has
+/// no per-read timeout, so the thread cannot observe the closed channel until
+/// the upstream speaks or the request timeout fires. Its admission permit is
+/// already released by then, so nothing else was counting these — a client that
+/// connects and disconnects in a loop against a silent upstream accumulated a
+/// thread and a socket per attempt, past any concurrency bound.
+///
+/// This bounds that accumulation. It is deliberately above the default upstream
+/// concurrency (8) so a healthy node never meets it: reaching this ceiling means
+/// readers are parked, which is a condition to refuse under rather than absorb.
+const MAX_LIVE_SSE_READERS: usize = 64;
+
+/// Reader threads currently alive, including ones parked past their request.
+static LIVE_SSE_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Decrements the live-reader count however its thread ends — a clean EOF, a
+/// read error, or a send to a receiver that has gone away.
+struct SseReaderSlot;
+
+impl SseReaderSlot {
+    /// `None` when the ceiling is reached, which the caller reports as an
+    /// overloaded upstream rather than spawning a thread it cannot account for.
+    fn claim() -> Option<Self> {
+        claim_below(&LIVE_SSE_READERS, MAX_LIVE_SSE_READERS).then_some(Self)
+    }
+}
+
+/// Increment `counter` unless doing so would reach `ceiling`.
+///
+/// Split out from [`SseReaderSlot::claim`] so the ceiling can be exercised
+/// against a local counter: exhausting the process-wide one would refuse the
+/// streams every other test in this file opens.
+fn claim_below(counter: &std::sync::atomic::AtomicUsize, ceiling: usize) -> bool {
+    let mut live = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        if live >= ceiling {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            live,
+            live + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => live = observed,
+        }
+    }
+}
+
+impl Drop for SseReaderSlot {
+    fn drop(&mut self) {
+        LIVE_SSE_READERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Reads SSE lines on a dedicated thread so the caller can keep answering for
 /// itself while a blocking read is in flight.
 struct SseLineReader {
@@ -480,7 +539,10 @@ struct SseLineReader {
 }
 
 impl SseLineReader {
-    fn spawn<R: std::io::Read + Send + 'static>(mut reader: std::io::BufReader<R>) -> Self {
+    fn spawn<R: std::io::Read + Send + 'static>(
+        mut reader: std::io::BufReader<R>,
+        slot: SseReaderSlot,
+    ) -> Self {
         // Depth one: the reader stays one line ahead and then parks. Buffering
         // more would let a fast upstream race ahead of a consumer that has
         // already gone away, which is the situation this whole seam exists to
@@ -489,6 +551,10 @@ impl SseLineReader {
         std::thread::Builder::new()
             .name("tachyon-upstream-sse".to_owned())
             .spawn(move || {
+                // Held for the thread's whole life, so the count falls on every
+                // exit — including the parked reader that finally wakes when its
+                // request times out.
+                let _slot = slot;
                 loop {
                     let mut line = String::new();
                     // Bound the *read*, not just the result. A plain
@@ -1026,6 +1092,20 @@ impl UpstreamOpenAiRuntime {
         // emitted after streamed prose is unparseable — so offering tools cost
         // the whole time-to-first-token even on the requests that never
         // produced a call.
+        // Claimed before the request goes out: a node already holding parked
+        // readers should refuse rather than open another socket it cannot
+        // account for, and refusing costs the upstream nothing if we never
+        // asked.
+        let Some(slot) = SseReaderSlot::claim() else {
+            return Err(UpstreamError::Transport {
+                alias: self.alias.clone(),
+                endpoint: self.endpoint.url("/chat/completions"),
+                detail: format!(
+                    "{MAX_LIVE_SSE_READERS} upstream stream readers are already live on this \
+                     node, some of them parked on silent upstreams; refusing to open another"
+                ),
+            });
+        };
         let response = self.post("/chat/completions", &body, timeout)?;
 
         // Bound the whole stream, so an upstream that never terminates cannot
@@ -1044,11 +1124,20 @@ impl UpstreamOpenAiRuntime {
         // blocking read moves off this thread and the poll below asks
         // `is_live()` between frames instead.
         //
-        // The reader is bounded by the admission permit that is already held
-        // here, so this adds no thread a burst could multiply. It ends when the
-        // receiver drops: the send fails, the response is dropped, the socket
-        // closes.
-        let mut lines = SseLineReader::spawn(reader);
+        // The reader normally ends when the receiver drops: its next send
+        // fails, the response is dropped, the socket closes.
+        //
+        // Normally, and not always — which an earlier version of this comment
+        // claimed. That send only happens once a line has been *read*, so a
+        // reader parked on a silent upstream cannot observe the closed channel
+        // at all; it wakes when the upstream finally speaks or when the request
+        // timeout fires, and the admission permit is long released by then.
+        // `SseReaderSlot` is what keeps those parked readers accounted for, so
+        // a client that connects and disconnects in a loop meets a refusal
+        // instead of growing a thread and a socket per attempt. Cutting the
+        // parking short needs the body driven on the async client with a
+        // cancellation future, which is a larger change than this seam.
+        let mut lines = SseLineReader::spawn(reader, slot);
         let mut line = String::new();
         let mut saw_done = false;
         let mut usage = None;
@@ -2483,7 +2572,10 @@ mod tests {
         }
 
         let (feed, fed) = std::sync::mpsc::channel();
-        let mut reader = SseLineReader::spawn(std::io::BufReader::new(Fed(fed)));
+        let mut reader = SseLineReader::spawn(
+            std::io::BufReader::new(Fed(fed)),
+            SseReaderSlot::claim().expect("a fresh node has reader slots"),
+        );
 
         let started = std::time::Instant::now();
         assert!(
@@ -3149,6 +3241,40 @@ mod tests {
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             }]
         );
+    }
+
+    /// Parked readers are counted, so they cannot accumulate without bound.
+    ///
+    /// A reader outlives its request when the client disconnects while the
+    /// upstream is silent: `read_line` is uninterruptible, so the thread cannot
+    /// see the closed channel until the upstream speaks or the request times
+    /// out. Its admission permit is released long before that, so nothing else
+    /// was counting these — a connect/disconnect loop against a silent upstream
+    /// added a thread and a socket per attempt.
+    #[test]
+    fn live_stream_readers_are_bounded() {
+        // Against a local counter: taking every slot of the process-wide one
+        // would refuse the streams the other tests here open.
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        assert!(claim_below(&counter, 2));
+        assert!(claim_below(&counter, 2));
+        assert!(
+            !claim_below(&counter, 2),
+            "at the ceiling a node must refuse rather than open a socket it cannot account for"
+        );
+
+        // A slot returns on drop, whichever way its thread ended, so a node
+        // that sheds parked readers can serve again.
+        counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(claim_below(&counter, 2));
+
+        // And the real slot uses the real counter, releasing on drop.
+        let live = || LIVE_SSE_READERS.load(std::sync::atomic::Ordering::Relaxed);
+        let before = live();
+        let slot = SseReaderSlot::claim().expect("a node below its ceiling has slots");
+        assert_eq!(live(), before + 1);
+        drop(slot);
+        assert_eq!(live(), before);
     }
 
     #[test]
