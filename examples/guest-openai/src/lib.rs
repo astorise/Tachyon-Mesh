@@ -487,11 +487,7 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         // `GET /ai/v1/models`, leaving a model that answers but cannot be
         // discovered, and which no reload short of a config change restores.
         let table = models_table();
-        loop {
-            let previous = match table.get(alias) {
-                Ok(row) => row,
-                Err(_) => break,
-            };
+        while let Ok(previous) = table.get(alias) {
             if serde_json::from_slice::<ModelInfo>(&previous)
                 .ok()
                 .is_some_and(|row| row.is_config_owned())
