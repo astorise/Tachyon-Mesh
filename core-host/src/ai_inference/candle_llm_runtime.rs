@@ -4,10 +4,16 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
-use candle_core::{quantized::gguf_file, safetensors::MmapedSafetensors, DType, Device, Tensor};
+use candle_core::{
+    quantized::{gguf_file, GgmlDType},
+    safetensors::MmapedSafetensors,
+    DType, Device, Tensor,
+};
 use candle_nn::VarBuilder;
+use candle_transformers::generation::IncrementalDecoder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::deepseek2::{
     DeepSeekV2 as DeepSeekModel, DeepSeekV2Config as DeepSeekConfig,
@@ -18,7 +24,9 @@ use candle_transformers::models::llama::{
     Cache, Config, Llama, LlamaConfig, LlamaEosToks, LoraConfig, PagedKvCache,
 };
 use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3Model};
-use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlama;
+use candle_transformers::models::quantized_lm::{
+    self, Architecture as GgufArchitecture, QuantizedLm,
+};
 use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2Model};
 use candle_transformers::models::qwen3::{Config as Qwen3Config, ModelForCausalLM as Qwen3Model};
 use candle_transformers::models::qwen3_moe::{
@@ -41,6 +49,7 @@ use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::samplers::{FsmCache, FsmLogitProcessor};
 use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
 use super::ResolvedLoraAdapter;
+use super::StreamControl;
 use parallel_topology::{
     validate_parallel_topology, ClusterTopology, ParallelExecutionPlan, ParallelStrategy,
 };
@@ -98,13 +107,47 @@ const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const GGUF_EXTENSION: &str = "gguf";
 /// GGUF `general.architecture` value for the Llama family.
 const GGUF_LLAMA_ARCHITECTURE: &str = "llama";
+
 /// Error component label for GGUF load failures.
 const GGUF_COMPONENT: &str = "model.gguf";
-const DEFAULT_MAX_NEW_TOKENS: usize = 64;
+/// Generation budget applied when a request omits `max_new_tokens`.
+///
+/// Raised from 64, which predated this runtime serving agentic coding clients:
+/// 64 tokens is a sentence, not an edit. The value is a *default*, not a cap —
+/// a caller that knows what it wants still names its own budget, bounded by
+/// [`HOST_MAX_NEW_TOKENS`].
+pub(crate) const DEFAULT_MAX_NEW_TOKENS: usize = 1_024;
 pub(crate) const DEFAULT_SPECULATIVE_DRAFT_TOKENS: usize = 4;
 /// Hard upper bound on `max_new_tokens` for any single request, regardless of
 /// what the caller asks for. Protects the host from unbounded decode loops.
-pub(crate) const HOST_MAX_NEW_TOKENS: usize = 256;
+///
+/// Raised from 256, which truncated an agentic coding response mid-function.
+/// 4096 is the point where the two costs that actually scale stay reasonable on
+/// the hardware this runtime targets: the KV cache grows linearly with
+/// generated length and is bounded anyway by the checkpoint's context window
+/// (see [`prompt_limits_for`], which reserves this much headroom), while the
+/// contiguous cache path pays a quadratic memory-traffic term that is still
+/// small next to inherent decode cost at this length.
+///
+/// It stays far below [`super::upstream_openai::UPSTREAM_MAX_NEW_TOKENS`] on
+/// purpose: this cap bounds work done *here*, on local VRAM, whereas an
+/// upstream generation spends the remote server's resources.
+pub(crate) const HOST_MAX_NEW_TOKENS: usize = 4_096;
+/// Wall-clock budget for one generation when the request does not set
+/// `max_generation_ms`.
+///
+/// This, not [`HOST_MAX_NEW_TOKENS`], is what actually bounds how long a
+/// request holds a scheduler slot. The token cap is a coarse safety valve
+/// against an unbounded loop; it cannot bound *time*, because throughput spans
+/// more than an order of magnitude across model size, quantization and device —
+/// and varies as much between two models on one device as between devices.
+///
+/// Matches the upstream backend's default request timeout, so a local and a
+/// remote binding behave alike from a caller's point of view.
+pub(crate) const DEFAULT_GENERATION_DEADLINE: Duration = Duration::from_secs(300);
+/// Hard ceiling on a request's `max_generation_ms`, mirroring the upstream
+/// backend's `MAX_TIMEOUT` so no single request can wedge a lane indefinitely.
+pub(crate) const HOST_MAX_GENERATION_DEADLINE: Duration = Duration::from_secs(3_600);
 /// Seed used when a generation request samples (temperature > 0) but does not
 /// pin a `seed`. Fixed so that an un-seeded sampled request is still reproducible
 /// for a given prompt — callers that want variation pass their own `seed`.
@@ -113,9 +156,31 @@ const DEFAULT_SAMPLING_SEED: u64 = 299_792_458;
 /// the length of each, so a caller cannot force unbounded substring scans.
 const MAX_STOP_SEQUENCES: usize = 8;
 const MAX_STOP_SEQUENCE_BYTES: usize = 256;
-/// Hard upper bound on the raw prompt size (bytes) accepted before tokenization.
-pub(crate) const DEFAULT_MAX_PROMPT_BYTES: usize = 16_384;
+/// Context window assumed when a checkpoint's config does not declare one.
 const DEFAULT_MAX_PROMPT_TOKENS: usize = 4_096;
+/// Absolute ceiling on the raw prompt size (bytes) accepted before
+/// tokenization, regardless of how long the checkpoint's context window is.
+///
+/// The byte cap exists to bound what a single request can pull into host memory
+/// *before* the tokenizer can tell how many tokens it really is; the token cap
+/// below is the semantic limit. A 256k-context model would otherwise justify a
+/// byte budget large enough to be its own denial-of-service.
+pub(crate) const MAX_PROMPT_BYTES_CEILING: usize = 4 * 1024 * 1024;
+/// Floor on the byte budget: the flat cap this derivation replaced. Keeping it
+/// as a minimum means the change can only ever *widen* what a checkpoint
+/// accepts. Without it, a short-context model would end up with a byte budget
+/// tighter than before — the token estimate below is a lower bound on bytes per
+/// token, and a tokenizer with long tokens fits far more text into a token than
+/// it assumes.
+const MIN_PROMPT_BYTES: usize = 16 * 1024;
+/// Bytes budgeted per prompt token when deriving the byte cap. Deliberately
+/// generous: under-budgeting rejects valid prompts, while over-budgeting only
+/// defers the rejection to the token check a moment later.
+const PROMPT_BYTES_PER_TOKEN: usize = 4;
+/// Floor on the prompt token budget, so a small or mis-declared context window
+/// cannot make the runtime reject ordinary prompts. Never allowed to exceed the
+/// checkpoint's actual context window.
+const MIN_PROMPT_TOKENS: usize = 512;
 const DEFAULT_MAX_BATCH_SIZE: usize = 32;
 const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 8_192;
 const PREFIX_CACHE_BLOCK_TOKENS: usize = 16;
@@ -175,6 +240,12 @@ enum ModelArchitecture {
     DeepSeekV3,
     DeepSeekR1,
     Qwen35Moe,
+    /// GGUF-only families: candle ships a `quantized_*` backend for each, but
+    /// no safetensors loader this runtime uses, so they are reachable through
+    /// a `.gguf` checkpoint and refused for safetensors.
+    Glm4,
+    Lfm2,
+    Phi2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,13 +280,28 @@ impl ModelArchitecture {
         }
     }
 
+    /// Map a GGUF `general.architecture` string onto the host's registry.
+    ///
+    /// This gate runs *before* `load_gguf`, so anything missing here is
+    /// refused as an unrecognized architecture no matter what the capability
+    /// table or the quantized loader would accept. Keep it in step with
+    /// `quantized_lm::SUPPORTED_ARCHITECTURES`: a family present in the loader
+    /// but absent here is dead code, which is exactly what happened to `glm4`,
+    /// `lfm2`, `phi2` and `qwen3moe`.
+    ///
+    /// The gemma spellings collapse the way candle's registry collapses them —
+    /// one backend reads all of them — so a `gemma2` GGUF resolves to the
+    /// gemma3 backend rather than to the safetensors-only `Gemma2`.
     fn from_gguf_architecture(architecture: &str) -> Option<Self> {
         match architecture {
             GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
             "qwen2" => Some(Self::Qwen2),
             "qwen3" => Some(Self::Qwen3),
-            "gemma2" => Some(Self::Gemma2),
-            "gemma3" => Some(Self::Gemma3),
+            "qwen3moe" => Some(Self::Qwen35Moe),
+            "gemma" | "gemma2" | "gemma3" | "gemma-embedding" => Some(Self::Gemma3),
+            "glm4" => Some(Self::Glm4),
+            "lfm2" => Some(Self::Lfm2),
+            "phi2" => Some(Self::Phi2),
             "phi3" => Some(Self::Phi3),
             "phi4" => Some(Self::Phi4),
             "deepseek2" => Some(Self::DeepSeekV2),
@@ -244,9 +330,15 @@ impl ModelArchitecture {
                 expert_parallel: true,
                 specialized_runtime: false,
             },
+            // `gguf: true` even though the fused expert path is CUDA-only and
+            // wants an F16/BF16 working dtype: `load_gguf` runs candle's
+            // `Architecture::check_device_support` before reading a tensor, so
+            // a CPU or Metal binding fails at load with the backend's own
+            // message. Refusing the format outright here would also refuse the
+            // CUDA binding, which does work.
             Self::Qwen35Moe => ArchitectureCapabilities {
                 safetensors: true,
-                gguf: false,
+                gguf: true,
                 single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
@@ -255,23 +347,36 @@ impl ModelArchitecture {
             },
             Self::Qwen2 | Self::Qwen3 => ArchitectureCapabilities {
                 safetensors: true,
-                gguf: false,
+                gguf: true,
                 single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
                 expert_parallel: false,
                 specialized_runtime: false,
             },
-            Self::Gemma2 | Self::Gemma3 => ArchitectureCapabilities {
+            // Only families the fork ships a `quantized_*` module for get
+            // `gguf: true`; Gemma2 and Phi4 have safetensors loaders only.
+            Self::Gemma3 | Self::Phi3 => ArchitectureCapabilities {
                 safetensors: true,
-                gguf: false,
+                gguf: true,
                 single: true,
                 tensor_parallel: false,
                 pipeline_parallel: false,
                 expert_parallel: false,
                 specialized_runtime: false,
             },
-            Self::Phi3 | Self::Phi4 | Self::DeepSeekV2 => ArchitectureCapabilities {
+            // GGUF-only: candle ships a quantized backend for each, and this
+            // runtime has no safetensors loader for them.
+            Self::Glm4 | Self::Lfm2 | Self::Phi2 => ArchitectureCapabilities {
+                safetensors: false,
+                gguf: true,
+                single: true,
+                tensor_parallel: false,
+                pipeline_parallel: false,
+                expert_parallel: false,
+                specialized_runtime: false,
+            },
+            Self::Gemma2 | Self::Phi4 | Self::DeepSeekV2 => ArchitectureCapabilities {
                 safetensors: true,
                 gguf: false,
                 single: true,
@@ -306,6 +411,9 @@ impl ModelArchitecture {
             Self::DeepSeekV3 => "deepseek-v3",
             Self::DeepSeekR1 => "deepseek-r1",
             Self::Qwen35Moe => "qwen3-moe",
+            Self::Glm4 => "glm4",
+            Self::Lfm2 => "lfm2",
+            Self::Phi2 => "phi2",
         }
     }
 
@@ -338,6 +446,14 @@ fn is_multimodal_hf_model_type(model_type: &str) -> bool {
 /// A loaded, ready-to-run Llama-family model. Weights are mmapped (safetensors)
 /// or read (GGUF) from the model directory — never copied into the Tachyon
 /// artifact. Shared behind an `Arc` so the runtime stays cheap to clone.
+// The variants are deliberately unbalanced in size: `Safetensors` owns a whole
+// model struct inline while `Gguf` now holds a boxed trait object (it stopped
+// carrying the concrete backend inline when `QuantizedLm` gained `Send`).
+// Boxing the large one, as clippy suggests, would buy nothing here — a
+// `LoadedModel` is built once per loaded model and lives behind an `Arc`, never
+// in an array or a hot copy, so the only effect would be an extra indirection
+// on every forward pass.
+#[allow(clippy::large_enum_variant)]
 enum LoadedModel {
     /// Full-precision safetensors model behind a family-neutral dispatch
     /// boundary. Each family owns its Candle-specific cache semantics here.
@@ -350,8 +466,14 @@ enum LoadedModel {
     /// `index_pos == 0`), so it is guarded by a `Mutex`; the QoS scheduler
     /// already serialises execution per accelerator, so contention is minimal.
     Gguf {
-        model: Mutex<QuantizedLlama>,
+        model: Mutex<Box<dyn QuantizedLm>>,
         eos_tokens: Vec<u32>,
+        /// Device the quantized weights were uploaded to. `Device::Cpu` for a
+        /// `cpu` binding (the historical path); a real CUDA device once the
+        /// binding asks for one on a `candle-cuda` build. Input tensors must be
+        /// built here — `QuantizedLlama::forward` has no device coercion, so a
+        /// CPU input against CUDA weights fails the matmul outright.
+        device: Device,
     },
     /// A multi-device parallel engine, selected when the deployment's
     /// `hardware_strategy.distribution_mode` is not `single`. The engines
@@ -396,11 +518,119 @@ enum SingleDeviceBackend {
     DeepSeek(Mutex<DeepSeekModel>),
 }
 
-struct DecodeLoopContext<'a> {
+/// One row of a native batch: its decoded output and what it cost.
+/// One row's result from a batch-native decode: bytes, counts, and the reason
+/// the row stopped when the loop can name it (`length` on budget exhaustion).
+type BatchRowOutput = (Vec<u8>, TokenUsage, Option<&'static str>);
+
+/// Token counts for one generation, as OpenAI's `usage` object reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub(crate) prompt_tokens: u32,
+    pub(crate) completion_tokens: u32,
+}
+
+/// Where a decode loop sends its text, and what it records about what it sent.
+///
+/// The count lives here rather than in the loops' return type because a decode
+/// loop has a dozen exits — stop sequence matched, EOS, deadline elapsed,
+/// budget exhausted, context window full — spread across three loops and
+/// fifteen dispatch arms. Carrying it on the sink makes the count correct at
+/// every one of them by construction, instead of correct at whichever ones
+/// were remembered.
+struct TokenSink<'a> {
+    emit: &'a mut dyn FnMut(&str) -> StreamControl,
+    /// Tokens appended to the sequence so far. Not the number of `emit` calls:
+    /// a token can produce no text (its bytes complete a character only once a
+    /// later token arrives), and text is held back while a stop sequence might
+    /// still match.
+    completion_tokens: usize,
+    /// Tokens the prompt encoded to, recorded by whichever entry point
+    /// tokenized it — a fallback (speculative decode declining its draft, say)
+    /// re-enters a different loop with the same prompt.
+    prompt_tokens: usize,
+    /// Latched once the consumer asked to stop — a disconnected SSE client.
+    /// Latched rather than re-read because the answer cannot un-become "nobody
+    /// is listening", and the decode loops check it beside the deadline.
+    stopped: bool,
+    /// Set by a decode loop only when it exits by exhausting the token budget.
+    /// Token counts alone are insufficient because EOS may be sampled on the
+    /// final permitted token.
+    budget_exhausted: bool,
+}
+
+impl<'a> TokenSink<'a> {
+    fn new(emit: &'a mut dyn FnMut(&str) -> StreamControl) -> Self {
+        Self {
+            emit,
+            completion_tokens: 0,
+            prompt_tokens: 0,
+            stopped: false,
+            budget_exhausted: false,
+        }
+    }
+
+    fn record_prompt_tokens(&mut self, tokens: usize) {
+        self.prompt_tokens = tokens;
+    }
+
+    /// Why decoding stopped, when this sink can tell.
+    ///
+    /// Only `length` is reported here, and only when the budget was spent
+    /// exactly. Everything else — EOS, a stop sequence, the deadline — is
+    /// reported as "not known" so the caller keeps its own inference, which is
+    /// what it did for every local generation before.
+    ///
+    /// This is the difference between a client running truncated code and
+    /// rejecting it. `guest-openai` resolves an absent reason to `stop`, so a
+    /// local generation that used its whole budget — the ordinary way an
+    /// agentic completion gets cut off mid-function — was reported as having
+    /// finished normally. The upstream path already reported `length` here,
+    /// so the same request was answered honestly or not depending on which
+    /// backend served the alias.
+    fn finish_reason(&self) -> Option<&'static str> {
+        self.budget_exhausted.then_some("length")
+    }
+
+    fn usage(&self) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: self.prompt_tokens as u32,
+            completion_tokens: self.completion_tokens as u32,
+        }
+    }
+
+    fn emit(&mut self, text: &str) {
+        if (self.emit)(text).is_stop() {
+            self.stopped = true;
+        }
+    }
+
+    /// Whether the consumer has gone away. Checked where the deadline is, and
+    /// for the same reason: finishing a generation nobody will read spends a
+    /// scheduler slot, and on the upstream path an admission permit, for
+    /// nothing.
+    fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Record one token appended to the generated sequence.
+    fn record_token(&mut self) {
+        self.completion_tokens += 1;
+    }
+
+    fn mark_budget_exhausted(&mut self) {
+        self.budget_exhausted = true;
+    }
+}
+
+struct DecodeLoopContext<'a, 'sink> {
     request: &'a ParsedGenerationRequest,
     eos_tokens: &'a [u32],
     input_device: &'a Device,
-    on_token: &'a mut dyn FnMut(&str),
+    /// Second lifetime because the sink outlives the borrow of it: the emit
+    /// callback belongs to the caller of the whole generation, not to one
+    /// decode loop.
+    sink: &'a mut TokenSink<'sink>,
 }
 
 /// Model-level `hardware_strategy.paged_attention` state for a Llama
@@ -858,7 +1088,7 @@ impl SingleDeviceBackend {
         request: &ParsedGenerationRequest,
         eos_tokens: &[u32],
         device: &Device,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         match self {
             Self::Llama {
@@ -887,7 +1117,7 @@ impl SingleDeviceBackend {
                                 request,
                                 eos_tokens,
                                 device,
-                                on_token,
+                                sink,
                                 |input, index_pos| {
                                     let seq_len = input.dims2()?.1;
                                     if seq_len != 1 {
@@ -978,7 +1208,7 @@ impl SingleDeviceBackend {
                             request,
                             eos_tokens,
                             device,
-                            on_token,
+                            sink,
                             |input, index_pos| {
                                 paged_llama_forward(
                                     &model,
@@ -994,7 +1224,11 @@ impl SingleDeviceBackend {
                     }
                     None => {
                         let (logits, index_pos) = runtime.llama_prefill_with_prefix_cache(
-                            &model, prompt_ids, &mut cache, device,
+                            &model,
+                            prompt_ids,
+                            &mut cache,
+                            device,
+                            request.deadline,
                         )?;
                         runtime.decode_loop_from_logits(
                             logits,
@@ -1004,7 +1238,7 @@ impl SingleDeviceBackend {
                                 request,
                                 eos_tokens,
                                 input_device: device,
-                                on_token,
+                                sink,
                             },
                             |input, index_pos| model.forward(input, index_pos, &mut cache),
                         )
@@ -1021,7 +1255,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1035,7 +1269,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1049,7 +1283,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1063,7 +1297,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1077,7 +1311,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1091,7 +1325,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos)?.squeeze(1),
                 )
             }
@@ -1105,7 +1339,7 @@ impl SingleDeviceBackend {
                     request,
                     eos_tokens,
                     device,
-                    on_token,
+                    sink,
                     |input, index_pos| model.forward(input, index_pos),
                 )
             }
@@ -1292,17 +1526,53 @@ struct GenerationLimits {
     /// `None` disables chunking; `Some(n)` bounds each prefill forward to at
     /// most `n` tokens. The default is `Some(8192)` to match candle-vllm.
     prefill_chunk_tokens: Option<usize>,
+    /// Applied when a request does not set `max_generation_ms`.
+    default_generation_deadline: Duration,
+}
+
+/// Derive `(max_prompt_tokens, max_prompt_bytes)` from a checkpoint's context
+/// window.
+///
+/// These used to be flat constants — 4096 tokens and 16 KiB — chosen when the
+/// runtime only served short prompts. 16 KiB is roughly four thousand tokens of
+/// code, so an agentic client sending a file plus its tool definitions was
+/// rejected outright on a model whose context window had room to spare.
+///
+/// The token budget reserves `HOST_MAX_NEW_TOKENS` of headroom, so a prompt
+/// that passes validation can never leave the decode loop with zero positions
+/// left — which would return empty output rather than an error. Reserving is
+/// skipped when the window is too small to afford it (tiny test checkpoints),
+/// and the floor never exceeds the real window.
+pub(crate) fn prompt_limits_for(max_position_embeddings: usize) -> (usize, usize) {
+    // Reserve proportionally, not absolutely. `HOST_MAX_NEW_TOKENS` is the
+    // largest generation the host will *allow*, not what every request needs;
+    // subtracting it outright would leave a 4k-context checkpoint with almost
+    // no prompt budget. A quarter of the window, capped at the host maximum,
+    // keeps generation headroom on small models without wasting it on large
+    // ones.
+    let reserved = HOST_MAX_NEW_TOKENS.min(max_position_embeddings / 4);
+    let floor = MIN_PROMPT_TOKENS.min(max_position_embeddings);
+    let max_prompt_tokens = max_position_embeddings
+        .saturating_sub(reserved)
+        .max(floor)
+        .max(1);
+    let max_prompt_bytes = max_prompt_tokens
+        .saturating_mul(PROMPT_BYTES_PER_TOKEN)
+        .clamp(MIN_PROMPT_BYTES, MAX_PROMPT_BYTES_CEILING);
+    (max_prompt_tokens, max_prompt_bytes)
 }
 
 impl GenerationLimits {
     fn with_context(max_position_embeddings: usize) -> Self {
+        let (max_prompt_tokens, max_prompt_bytes) = prompt_limits_for(max_position_embeddings);
         Self {
             default_max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
-            max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
-            max_prompt_tokens: DEFAULT_MAX_PROMPT_TOKENS,
+            max_prompt_bytes,
+            max_prompt_tokens,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_position_embeddings,
             prefill_chunk_tokens: Some(DEFAULT_PREFILL_CHUNK_TOKENS),
+            default_generation_deadline: DEFAULT_GENERATION_DEADLINE,
         }
     }
 
@@ -1475,12 +1745,81 @@ fn default_max_position_embeddings() -> usize {
     DEFAULT_MAX_PROMPT_TOKENS
 }
 
-/// Parsed `.tachyon-model.json` sidecar. Only the declared format is consumed;
-/// unknown fields are ignored so the broker can extend it freely.
+/// Parsed `.tachyon-model.json` sidecar. Unknown fields are ignored so the
+/// broker can extend it freely.
 #[derive(Debug, Deserialize)]
 struct ModelMeta {
     #[serde(default)]
     format: String,
+    /// Declared tool-call dialect, overriding what the chat template implies.
+    /// The escape hatch for a checkpoint whose template does not match how it
+    /// was actually fine-tuned to emit calls.
+    #[serde(default)]
+    tool_call_parser: Option<String>,
+}
+
+/// The tool-call dialect a checkpoint emits, resolved from what the model *is*
+/// rather than from what it was named.
+///
+/// The alias is not evidence: a Qwen checkpoint registered as `local-coder`
+/// tells a name-matching heuristic nothing, and the result — tool calls
+/// arriving as literal `<tool_call>` text in `content` — is indistinguishable
+/// from a model that simply chose not to call a tool. For an agentic client
+/// that is a silent, total failure.
+///
+/// Resolution order, most authoritative first:
+///
+/// 1. An explicit `tool_call_parser` in the `.tachyon-model.json` sidecar.
+/// 2. The marker the model's own `chat_template` renders around a call.
+///
+/// Returns `None` when neither speaks, leaving the caller free to fall back to
+/// whatever guess it was making before — this narrows the guessing, it does not
+/// replace it with a different one. Every answer is positive evidence: a
+/// template that never mentions tools yields `None` rather than a default.
+pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
+    if let Some(declared) = read_declared_tool_call_parser(root) {
+        return Some(declared);
+    }
+    let source = ChatTemplate::read_source(root)?;
+    // Ordered by specificity: a template carrying a tag convention names its
+    // dialect outright, so those are checked before the generic JSON case.
+    if source.contains("[TOOL_CALLS]") {
+        Some("mistral")
+    } else if source.contains("<tool_call>") {
+        Some("qwen")
+    } else if source.contains("tools") {
+        // Tool-aware, but with no tag convention: the call is rendered as a
+        // bare JSON object, which is what the `json` parser reads. Gated on the
+        // template actually handling tools so a plain chat template does not
+        // acquire a parser it has no use for.
+        Some("json")
+    } else {
+        None
+    }
+}
+
+/// The sidecar's declared parser, validated against the dialects
+/// `guest-openai` implements. An unrecognized value is ignored rather than
+/// propagated: publishing it would make the guest drop the row on a
+/// deserialize miss and take the model out of `GET /ai/v1/models` entirely.
+fn read_declared_tool_call_parser(root: &Path) -> Option<&'static str> {
+    let raw = fs::read(root.join(MODEL_META_JSON)).ok()?;
+    let meta: ModelMeta = serde_json::from_slice(&raw).ok()?;
+    let declared = meta.tool_call_parser?;
+    match declared.trim().to_ascii_lowercase().as_str() {
+        "json" => Some("json"),
+        "qwen" => Some("qwen"),
+        "qwen_coder" => Some("qwen_coder"),
+        "mistral" => Some("mistral"),
+        other => {
+            tracing::warn!(
+                parser = %other,
+                path = %root.display(),
+                "ignoring unrecognized tool_call_parser in {MODEL_META_JSON}"
+            );
+            None
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1494,7 +1833,22 @@ struct SafetensorsIndex {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub(crate) struct ChatTurn {
     pub(crate) role: String,
+    /// Absent or `null` on an assistant turn that carried only tool calls —
+    /// which is exactly what a client replays on the next turn of an agentic
+    /// conversation. Requiring a string here rejected the whole request, so the
+    /// second turn after any tool call failed outright. This runtime has no
+    /// tool-aware template, so the turn renders as empty content rather than
+    /// carrying the calls, but the conversation survives.
+    #[serde(default, deserialize_with = "nullable_string")]
     pub(crate) content: String,
+}
+
+/// Deserialize a missing or `null` string as empty rather than failing.
+fn nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1519,6 +1873,10 @@ struct GenerationRequest {
     /// the supported subset.
     #[serde(default)]
     json_schema: Option<String>,
+    /// Wall-clock budget for this generation, in milliseconds. Absent uses the
+    /// binding's default; the host clamps it to `HOST_MAX_GENERATION_DEADLINE`.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
 }
 
 /// Token-selection policy resolved from a request's `temperature`/`top_p`/`seed`.
@@ -1552,11 +1910,23 @@ impl SamplingPolicy {
 struct ParsedGenerationRequest {
     prompt: String,
     max_new_tokens: usize,
+    /// What the caller actually asked for, or `None` when it named no budget.
+    /// Only an explicit request is refused when it cannot fit the window.
+    requested_max_new_tokens: Option<usize>,
     sampling: SamplingPolicy,
     stop: Vec<String>,
     /// Compiled grammar for constrained decoding, when the request supplied
     /// `json_schema`.
     fsm: Option<Arc<super::samplers::CompiledFsm>>,
+    /// Wall-clock point past which decoding stops, whatever the token budget
+    /// still allows.
+    ///
+    /// A token budget is a poor proxy for how long a request occupies a
+    /// scheduler slot: the same 4096 tokens are ~100 s on a GPU and a quarter
+    /// of an hour on a CPU, and throughput varies as much between two models on
+    /// one device as it does between devices. A deadline bounds the thing that
+    /// actually matters and needs no per-hardware table to do it.
+    deadline: Instant,
 }
 
 impl CandleLlmRuntime {
@@ -1652,16 +2022,39 @@ impl CandleLlmRuntime {
         // request setting one of those flags would pass this gate and then
         // silently dispatch to `load_parallel`, which ignores the flag
         // entirely — accepted but not actually wired.
+        // Metal is tracked separately rather than folded into one "GPU" flag:
+        // `paged_attention`, `cuda_graph_decode` and `flashinfer_attention` all
+        // key off the CUDA flag, and a shared one would let a Metal binding
+        // accept a CUDA-only optimization.
+        let requests_metal = requested_device == "metal";
+        let single_device_metal_supported = cfg!(feature = "candle-metal")
+            && requests_metal
+            && strategy.distribution_mode == GpuDistribution::Single
+            // Only `load_gguf` resolves a Metal device; the safetensors loaders
+            // are still built against `Device::Cpu`.
+            && format == ModelFormat::Gguf;
         let single_device_cuda_supported = cfg!(feature = "candle-cuda")
-            && architecture == ModelArchitecture::Llama
-            && strategy.distribution_mode == GpuDistribution::Single;
+            && !requests_metal
+            && strategy.distribution_mode == GpuDistribution::Single
+            && match format {
+                // Safetensors: `load_safetensors` only resolves a non-CPU
+                // device for a Llama checkpoint; every other family is still
+                // built against `Device::Cpu` unconditionally.
+                ModelFormat::Safetensors => architecture == ModelArchitecture::Llama,
+                // GGUF: `load_gguf` uploads to whatever device it is handed,
+                // and every wired family's `from_gguf` takes that device, so
+                // the family does not restrict the choice.
+                ModelFormat::Gguf => true,
+            };
 
         // paged_attention needs that same Llama+CUDA baseline — the paged
         // flash-attn kernel is CUDA-only — plus a Safetensors checkpoint and
         // an actual non-`cpu` request. `load_safetensors` is the only loader
-        // that wires `cache.set_paged_kv`; GGUF uses its quantized CPU loader.
-        // Every other architecture/format/build/device combination therefore
-        // fails closed here instead of silently running the contiguous path.
+        // that wires `cache.set_paged_kv`: GGUF now runs on CUDA too, but
+        // `QuantizedLlama` owns its own KV cache internally and exposes no
+        // block-table seam. Every other architecture/format/build/device
+        // combination therefore fails closed here instead of silently running
+        // the contiguous path.
         let paged_attention_supported = single_device_cuda_supported
             && format == ModelFormat::Safetensors
             && requested_device != "cpu";
@@ -1684,8 +2077,16 @@ impl CandleLlmRuntime {
         // build lacking `candle-flashinfer` would report this as supported and
         // then panic at decode time (`unimplemented!("compile with
         // '--features flashinfer-kernels'")`).
+        //
+        // The Safetensors requirement is the same one paged_attention carries:
+        // only `load_safetensors` builds the decode path FlashInfer hooks into.
+        // GGUF now also runs on CUDA, so without this the loader would accept
+        // `flashinfer_attention: true` on a GGUF binding and then run ordinary
+        // quantized attention — `QuantizedLlama` owns its own decode path and
+        // never sees `strategy` at all.
         let flashinfer_attention_supported = single_device_cuda_supported
             && cfg!(feature = "candle-flashinfer")
+            && format == ModelFormat::Safetensors
             && requested_device != "cpu";
         if strategy.flashinfer_attention {
             if !flashinfer_attention_supported {
@@ -1693,7 +2094,7 @@ impl CandleLlmRuntime {
                     alias: alias.to_owned(),
                     path: root.to_path_buf(),
                     detail:
-                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Llama checkpoint on a CUDA device with the candle-flashinfer feature compiled in"
+                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Safetensors Llama checkpoint on a CUDA device with the candle-flashinfer feature compiled in"
                             .to_owned(),
                 });
             }
@@ -1748,6 +2149,7 @@ impl CandleLlmRuntime {
         if strategy.distribution_mode == GpuDistribution::Single
             && requested_device != "cpu"
             && !single_device_cuda_supported
+            && !single_device_metal_supported
         {
             return Err(CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
@@ -1786,7 +2188,7 @@ impl CandleLlmRuntime {
                 ModelFormat::Safetensors => {
                     Self::load_safetensors(alias, root, requested_device, strategy)?
                 }
-                ModelFormat::Gguf => Self::load_gguf(alias, root)?,
+                ModelFormat::Gguf => Self::load_gguf(alias, root, requested_device)?,
             }
         } else {
             Self::load_parallel(alias, root, format, strategy, topology)?
@@ -2217,12 +2619,23 @@ impl CandleLlmRuntime {
     /// from GGUF metadata (there is no `config.json`); the quantised tensors are
     /// read from the file. The same reader feeds the header parse and the tensor
     /// reads (candle seeks via `tensor_data_offset`).
+    /// Load a quantized GGUF Llama checkpoint.
+    ///
+    /// `requested_device` selects a real CUDA device on a `candle-cuda` build:
+    /// the pinned fork carries quantized CUDA kernels
+    /// (`candle-core/src/quantized/cuda.rs`), and
+    /// `QuantizedLlama::from_gguf` uploads every block-quantized tensor to the
+    /// device it is handed. `try_load_with_topology`'s single-device gate has
+    /// already rejected a non-`cpu` request on a build or architecture that
+    /// cannot honour it, so reaching here with `requested_device != "cpu"`
+    /// guarantees a `candle-cuda` build, a Llama checkpoint, and `single`
+    /// distribution.
     fn load_gguf(
         alias: &str,
         root: &Path,
+        requested_device: &str,
     ) -> Result<(LoadedModel, GenerationLimits), CandleLlmError> {
         let gguf_path = gguf_file_path(alias, root)?;
-        let device = Device::Cpu;
         let mut reader =
             fs::File::open(&gguf_path).map_err(|error| CandleLlmError::InvalidComponent {
                 alias: alias.to_owned(),
@@ -2239,30 +2652,26 @@ impl CandleLlmRuntime {
             }
         })?;
 
-        // Validate the architecture up front so a non-Llama GGUF fails with a
-        // clear message rather than a missing-key error inside the loader.
-        let architecture = content
-            .metadata
-            .get("general.architecture")
-            .and_then(|value| value.to_string().ok())
-            .map(|value| value.to_owned())
-            .unwrap_or_default();
-        if architecture != GGUF_LLAMA_ARCHITECTURE {
-            return Err(CandleLlmError::UnsupportedModel {
+        // Resolve the architecture up front even though `from_gguf_with` does it
+        // again internally: an unrecognized family is a property of the
+        // *checkpoint*, so it has to surface as `UnsupportedModel` rather than
+        // the `InvalidComponent` every other load failure maps to. It also
+        // names the backend in the load error below. `Architecture::from_content`
+        // is candle's own registry, so this cannot drift from the set of
+        // backends it can actually build.
+        let architecture = GgufArchitecture::from_content(&content).map_err(|error| {
+            CandleLlmError::UnsupportedModel {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
-                detail: format!(
-                    "expected a Llama-family GGUF (`general.architecture` = `{GGUF_LLAMA_ARCHITECTURE}`), got `{architecture}`"
-                ),
-            });
-        }
+                detail: error.to_string(),
+            }
+        })?;
 
-        let context_length = content
-            .metadata
-            .get("llama.context_length")
-            .and_then(|value| value.to_u32().ok())
-            .map(|value| value as usize)
-            .unwrap_or(DEFAULT_MAX_PROMPT_TOKENS);
+        // Read the context window from the file's *own* architecture namespace
+        // rather than a hardcoded `llama.` prefix, which would silently fall
+        // back to the default window for every other family.
+        let context_length =
+            quantized_lm::context_length(&content).unwrap_or(DEFAULT_MAX_PROMPT_TOKENS);
         let eos_tokens = content
             .metadata
             .get("tokenizer.ggml.eos_token_id")
@@ -2271,19 +2680,36 @@ impl CandleLlmRuntime {
             .unwrap_or_default();
         let limits = GenerationLimits::with_context(context_length);
 
-        let model = QuantizedLlama::from_gguf(content, &mut reader, &device).map_err(|error| {
-            CandleLlmError::InvalidComponent {
+        // Resolve the device *before* uploading weights: an unsupported block
+        // type must fail closed here rather than at the first decode step,
+        // when the model already occupies VRAM.
+        let device = resolve_gguf_device(alias, root, &content, requested_device)?;
+
+        // `from_gguf_with` re-reads the architecture and runs the
+        // (architecture, device, dtype) admission check before touching a
+        // tensor. That check is what makes the CUDA-only, F16/BF16-only
+        // `qwen3moe` backend fail at load instead of at its first expert layer,
+        // and it is why that family can stay wired in the capability table
+        // rather than being blanket-refused.
+        //
+        // `use_flash_attn` stays at its default: flash attention is gated
+        // separately by `hardware_strategy`, which this loader never receives,
+        // so `check_flash_attn_support` has nothing to reject.
+        let options = quantized_lm::Options::default();
+        let model = quantized_lm::from_gguf_with(content, &mut reader, &device, &options).map_err(
+            |error| CandleLlmError::InvalidComponent {
                 alias: alias.to_owned(),
                 path: root.to_path_buf(),
                 component: GGUF_COMPONENT,
-                detail: error.to_string(),
-            }
-        })?;
+                detail: format!("`{}` backend: {error}", architecture.name()),
+            },
+        )?;
 
         Ok((
             LoadedModel::Gguf {
                 model: Mutex::new(model),
                 eos_tokens,
+                device,
             },
             limits,
         ))
@@ -2540,10 +2966,18 @@ impl CandleLlmRuntime {
     /// Buffered generation: run the decode and return the full UTF-8 output. A
     /// thin accumulator over [`generate_streaming`], so the two paths always
     /// agree byte-for-byte.
-    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>, CandleLlmError> {
+    pub(crate) fn generate(
+        &self,
+        prompts: &[&[u8]],
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut out = String::new();
-        self.generate_streaming(prompts, &mut |delta| out.push_str(delta))?;
-        Ok(out.into_bytes())
+        // A buffered caller never goes away mid-generation: it is holding the
+        // call. `Continue` is the only honest answer here.
+        let (usage, finish_reason) = self.generate_streaming(prompts, &mut |delta| {
+            out.push_str(delta);
+            StreamControl::Continue
+        })?;
+        Ok((out.into_bytes(), usage, finish_reason))
     }
 
     pub(crate) fn generate_with_adapter(
@@ -2551,19 +2985,25 @@ impl CandleLlmRuntime {
         prompts: &[&[u8]],
         adapter_id: &str,
         adapter_path: &Path,
-    ) -> Result<Vec<u8>, CandleLlmError> {
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut out = String::new();
-        self.generate_with_adapter_streaming(prompts, adapter_id, adapter_path, &mut |delta| {
-            out.push_str(delta)
-        })?;
-        Ok(out.into_bytes())
+        let (usage, finish_reason) = self.generate_with_adapter_streaming(
+            prompts,
+            adapter_id,
+            adapter_path,
+            &mut |delta| {
+                out.push_str(delta);
+                StreamControl::Continue
+            },
+        )?;
+        Ok((out.into_bytes(), usage, finish_reason))
     }
 
     pub(crate) fn try_generate_batch_with_adapters(
         &self,
         prompts: &[&[u8]],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Option<Vec<Vec<u8>>>, CandleLlmError> {
+    ) -> Result<Option<Vec<BatchRowOutput>>, CandleLlmError> {
         if prompts.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -2610,7 +3050,13 @@ impl CandleLlmRuntime {
             return Ok(None);
         }
         if prompt_len > self.limits.max_position_embeddings {
-            return Ok(Some(vec![Vec::new(); prompts.len()]));
+            let refused = TokenUsage {
+                prompt_tokens: prompt_len as u32,
+                completion_tokens: 0,
+            };
+            // Refused before decoding: no tokens were produced, so there is no
+            // budget to have exhausted and no reason to report.
+            return Ok(Some(vec![(Vec::new(), refused, None); prompts.len()]));
         }
 
         let LoadedModel::Safetensors {
@@ -2700,12 +3146,12 @@ impl CandleLlmRuntime {
         .map(Some)
     }
 
-    fn generate_with_adapter_streaming(
+    fn stream_with_adapter_into(
         &self,
         prompts: &[&[u8]],
         adapter_id: &str,
         adapter_path: &Path,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         if prompts.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
@@ -2740,6 +3186,7 @@ impl CandleLlmRuntime {
                 detail: "prompt produced no tokens to condition on".to_owned(),
             });
         }
+        sink.record_prompt_tokens(prompt_ids.len());
 
         let LoadedModel::Safetensors {
             backend,
@@ -2815,7 +3262,7 @@ impl CandleLlmRuntime {
             request,
             eos_tokens,
             device,
-            on_token,
+            sink,
             |input, index_pos| model.forward(input, index_pos, &mut cache),
         );
         let reset =
@@ -2835,23 +3282,67 @@ impl CandleLlmRuntime {
         prompts: &[&[u8]],
         draft: &Self,
         draft_tokens: usize,
-    ) -> Result<Vec<u8>, CandleLlmError> {
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>), CandleLlmError> {
         let mut out = String::new();
-        self.generate_speculative_streaming(prompts, draft, draft_tokens, &mut |delta| {
-            out.push_str(delta)
-        })?;
-        Ok(out.into_bytes())
+        let (usage, finish_reason) =
+            self.generate_speculative_streaming(prompts, draft, draft_tokens, &mut |delta| {
+                out.push_str(delta);
+                StreamControl::Continue
+            })?;
+        Ok((out.into_bytes(), usage, finish_reason))
     }
 
     /// Streaming generation: identical decoding to [`generate`], but each newly
-    /// decoded, stop-trimmed text fragment is handed to `on_token` as it is
-    /// produced. The concatenation of every `on_token` fragment equals the
+    /// decoded, stop-trimmed text fragment is handed to `sink` as it is
+    /// produced. The concatenation of every `sink` fragment equals the
     /// buffered `generate` output. Used by the streaming accelerator path so a
     /// caller can forward tokens to the client as they arrive.
+    /// Stream a prompt's decoded output, invoking `on_token` for each text
+    /// fragment, and report what the generation cost in tokens.
+    ///
+    /// The counts are exact: `prompt_tokens` is the tokenizer's own encoding of
+    /// the prompt and `completion_tokens` is what the decode loop actually
+    /// appended — not a re-tokenization of the output text, which would differ
+    /// from the sequence the model produced and would be wrong to publish as
+    /// `usage`.
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
-        on_token: &mut dyn FnMut(&str),
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
+    ) -> Result<(TokenUsage, Option<&'static str>), CandleLlmError> {
+        let mut sink = TokenSink::new(on_token);
+        self.stream_into(prompts, &mut sink)?;
+        Ok((sink.usage(), sink.finish_reason()))
+    }
+
+    pub(crate) fn generate_speculative_streaming(
+        &self,
+        prompts: &[&[u8]],
+        draft: &Self,
+        draft_tokens: usize,
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
+    ) -> Result<(TokenUsage, Option<&'static str>), CandleLlmError> {
+        let mut sink = TokenSink::new(on_token);
+        self.stream_speculative_into(prompts, draft, draft_tokens, &mut sink)?;
+        Ok((sink.usage(), sink.finish_reason()))
+    }
+
+    pub(crate) fn generate_with_adapter_streaming(
+        &self,
+        prompts: &[&[u8]],
+        adapter_id: &str,
+        adapter_path: &Path,
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
+    ) -> Result<(TokenUsage, Option<&'static str>), CandleLlmError> {
+        let mut sink = TokenSink::new(on_token);
+        self.stream_with_adapter_into(prompts, adapter_id, adapter_path, &mut sink)?;
+        Ok((sink.usage(), sink.finish_reason()))
+    }
+
+    fn stream_into(
+        &self,
+        prompts: &[&[u8]],
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         if prompts.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
@@ -2888,19 +3379,20 @@ impl CandleLlmRuntime {
                 detail: "prompt produced no tokens to condition on".to_owned(),
             });
         }
+        sink.record_prompt_tokens(prompt_ids.len());
 
-        self.decode(&prompt_ids, request, on_token)
+        self.decode(&prompt_ids, request, sink)
     }
 
-    pub(crate) fn generate_speculative_streaming(
+    fn stream_speculative_into(
         &self,
         prompts: &[&[u8]],
         draft: &Self,
         draft_tokens: usize,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
         if prompts.len() != 1 || !self.has_compatible_tokenizer(draft) {
-            return self.generate_streaming(prompts, on_token);
+            return self.stream_into(prompts, sink);
         }
         // Verification (`greedy_next_token_id`/`last_logits`) always builds a
         // fresh contiguous `Cache` from `self`'s already-loaded model, which
@@ -2910,11 +3402,11 @@ impl CandleLlmRuntime {
         // yet, so fall back to plain generation for either side — the same
         // pattern this function already uses for an incompatible tokenizer.
         if self.is_paged_attention_enabled() || draft.is_paged_attention_enabled() {
-            return self.generate_streaming(prompts, on_token);
+            return self.stream_into(prompts, sink);
         }
         let request = self.parse_request(prompts[0])?;
         if !request.sampling.is_greedy() || request.fsm.is_some() {
-            return self.generate_streaming(prompts, on_token);
+            return self.stream_into(prompts, sink);
         }
         let prompt_ids = self.encode_ids(&request.prompt)?;
         if prompt_ids.is_empty() {
@@ -2923,6 +3415,7 @@ impl CandleLlmRuntime {
                 detail: "prompt produced no tokens to condition on".to_owned(),
             });
         }
+        sink.record_prompt_tokens(prompt_ids.len());
 
         let draft_tokens = draft_tokens.max(1);
         let mut context_ids = prompt_ids.clone();
@@ -2935,9 +3428,16 @@ impl CandleLlmRuntime {
             .unwrap_or(0)
             .saturating_sub(1);
         let mut emitted = 0usize;
+        let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
 
         while generated.len() < request.max_new_tokens
             && context_ids.len() < self.limits.max_position_embeddings
+            && Instant::now() < request.deadline
+            // Same reasoning as the deadline, and the same check the ordinary
+            // decode loop makes: a speculative round runs a draft *and* a
+            // target forward pass, so continuing after the consumer left is
+            // the most expensive way to produce nothing.
+            && !sink.stopped()
         {
             let remaining = request.max_new_tokens - generated.len();
             let proposed = draft.greedy_token_ids_from_context(
@@ -2955,31 +3455,45 @@ impl CandleLlmRuntime {
                 };
                 context_ids.push(target_token);
                 generated.push(target_token);
+                sink.record_token();
 
-                let text = self.decode_generated(&generated)?;
-                if let Some(stop_at) = find_earliest_stop(&text, &request.stop) {
-                    emit_delta(on_token, &text, &mut emitted, stop_at);
+                decoder.push(target_token).map_err(|error| {
+                    self.execution_error(format!("failed to decode token: {error}"))
+                })?;
+                let text = decoder.text();
+                if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
+                    emit_delta(sink, text, &mut emitted, stop_at);
                     return Ok(());
                 }
                 if self.is_eos_token(target_token) {
-                    emit_delta(on_token, &text, &mut emitted, text.len());
+                    emit_delta(sink, text, &mut emitted, text.len());
                     return Ok(());
                 }
-                let safe = floor_char_boundary(&text, text.len().saturating_sub(hold));
-                emit_delta(on_token, &text, &mut emitted, safe);
+                let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
+                emit_delta(sink, text, &mut emitted, safe);
 
                 if target_token != proposed_token
                     || generated.len() == request.max_new_tokens
                     || context_ids.len() >= self.limits.max_position_embeddings
+                    // Both cancellation signals are checked inside the
+                    // acceptance loop, not only at the top of the round: one
+                    // round verifies up to `draft_tokens` proposals, each a
+                    // target forward pass, so testing once per round would let
+                    // an expired or abandoned request run all of them.
+                    || Instant::now() >= request.deadline
+                    || sink.stopped()
                 {
                     break;
                 }
             }
         }
 
-        let text = self.decode_generated(&generated)?;
-        let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
-        emit_delta(on_token, &text, &mut emitted, end);
+        let text = decoder.text();
+        if generated.len() >= request.max_new_tokens {
+            sink.mark_budget_exhausted();
+        }
+        let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+        emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
 
@@ -3028,6 +3542,14 @@ impl CandleLlmRuntime {
         let mut context = context_ids.to_vec();
         let mut tokens = Vec::with_capacity(max_tokens);
         for _ in 0..max_tokens {
+            // Each proposal is a full forward, and `draft_tokens` is an
+            // operator-supplied count with no small ceiling — so a round
+            // entered just before expiry could otherwise hold the lane for many
+            // of them. Whatever has been proposed so far is still usable: the
+            // caller verifies the prefix it got.
+            if Instant::now() >= request.deadline {
+                break;
+            }
             let Some(next) = self.greedy_next_token_id(&context, request)? else {
                 break;
             };
@@ -3074,7 +3596,14 @@ impl CandleLlmRuntime {
                 })?;
                 Ok(backend.last_logits(&input, &backend_device))
             }
-            LoadedModel::Gguf { model, .. } => {
+            LoadedModel::Gguf {
+                model,
+                device: model_device,
+                ..
+            } => {
+                let input = input.to_device(model_device).map_err(|error| {
+                    self.execution_error(format!("failed to move input to device: {error}"))
+                })?;
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
                 })?;
@@ -3150,18 +3679,24 @@ impl CandleLlmRuntime {
         &self,
         prompt_ids: &[u32],
         request: &ParsedGenerationRequest,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
     ) -> Result<(), CandleLlmError> {
-        let device = Device::Cpu;
+        // Every arm resolves its own device from the loaded weights: there is
+        // no longer a CPU default to fall back on now that GGUF can live on a
+        // CUDA device too.
         match &*self.inner {
             LoadedModel::Safetensors {
                 backend,
                 eos_tokens,
             } => {
                 let device = backend.device();
-                backend.decode(self, prompt_ids, request, eos_tokens, &device, on_token)
+                backend.decode(self, prompt_ids, request, eos_tokens, &device, sink)
             }
-            LoadedModel::Gguf { model, eos_tokens } => {
+            LoadedModel::Gguf {
+                model,
+                eos_tokens,
+                device,
+            } => {
                 let mut guard = model.lock().map_err(|_| {
                     self.execution_error("GGUF model mutex was poisoned".to_owned())
                 })?;
@@ -3169,8 +3704,8 @@ impl CandleLlmRuntime {
                     prompt_ids,
                     request,
                     eos_tokens,
-                    &device,
-                    on_token,
+                    device,
+                    sink,
                     |input, index_pos| guard.forward(input, index_pos),
                 )
             }
@@ -3195,7 +3730,7 @@ impl CandleLlmRuntime {
                         request,
                         eos_tokens,
                         primary,
-                        on_token,
+                        sink,
                         |input, index_pos| model.forward(input, index_pos, &mut cache),
                     )
                 }
@@ -3220,7 +3755,7 @@ impl CandleLlmRuntime {
                         request,
                         eos_tokens,
                         primary,
-                        on_token,
+                        sink,
                         |input, index_pos| {
                             model.forward_at(index_pos, input, &transports, &mut caches)
                         },
@@ -3247,7 +3782,7 @@ impl CandleLlmRuntime {
                         request,
                         eos_tokens,
                         primary,
-                        on_token,
+                        sink,
                         |input, index_pos| model.forward(input, index_pos, &mut cache),
                     )
                 }
@@ -3261,7 +3796,7 @@ impl CandleLlmRuntime {
     /// token is drawn by the request's `LogitsProcessor`; decoding halts on EOS,
     /// the token budget, the context window, or a matched stop sequence.
     ///
-    /// Decoded text is streamed through `on_token` as it is produced. To honour
+    /// Decoded text is streamed through `sink` as it is produced. To honour
     /// stop sequences without leaking a partial match, the tail of the decoded
     /// text within one stop-length of the end is held back until a further token
     /// confirms it is safe to emit (or the decode ends).
@@ -3271,14 +3806,15 @@ impl CandleLlmRuntime {
         request: &ParsedGenerationRequest,
         eos_tokens: &[u32],
         input_device: &Device,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TokenSink<'_>,
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(), CandleLlmError> {
         let device = input_device;
         if prompt_ids.len() > self.limits.max_position_embeddings {
             return Ok(());
         }
-        let (logits, index_pos) = self.run_prefill_chunks(prompt_ids, device, &mut forward)?;
+        let (logits, index_pos) =
+            self.run_prefill_chunks(prompt_ids, device, request.deadline, &mut forward)?;
         self.decode_loop_from_logits(
             logits,
             index_pos,
@@ -3287,21 +3823,39 @@ impl CandleLlmRuntime {
                 request,
                 eos_tokens,
                 input_device,
-                on_token,
+                sink,
             },
             forward,
         )
     }
 
+    /// `deadline` bounds prefill as well as decode. Prefilling a long prompt on
+    /// a slow model can outlast the whole budget on its own, and it holds the
+    /// same scheduler lane while it does — checking only in the decode loop
+    /// would let a request blow through its stated wall-clock budget before
+    /// producing a single token.
     fn run_prefill_chunks(
         &self,
         prompt_ids: &[u32],
         device: &Device,
+        deadline: Instant,
         forward: &mut impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(Tensor, usize), CandleLlmError> {
         let mut index_pos = 0usize;
         let mut logits = None;
         while index_pos < prompt_ids.len() {
+            // Between chunks, not mid-chunk: a chunk is one forward pass and
+            // cannot be interrupted. `prefill_chunk_tokens` is what bounds how
+            // long the check can be delayed.
+            if logits.is_some() && Instant::now() >= deadline {
+                return Err(CandleLlmError::Execution {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "generation deadline elapsed after prefilling {index_pos} of {} prompt tokens",
+                        prompt_ids.len()
+                    ),
+                });
+            }
             let remaining = prompt_ids.len() - index_pos;
             let chunk_len = self.limits.next_prefill_chunk_len(remaining);
             let chunk = &prompt_ids[index_pos..index_pos + chunk_len];
@@ -3332,7 +3886,7 @@ impl CandleLlmRuntime {
         eos_tokens: &[u32],
         device: &Device,
         adapter_assignments: &[Option<&str>],
-    ) -> Result<Vec<Vec<u8>>, CandleLlmError> {
+    ) -> Result<Vec<BatchRowOutput>, CandleLlmError> {
         let batch = prompt_ids.len();
         let prompt_len = prompt_ids
             .first()
@@ -3360,6 +3914,18 @@ impl CandleLlmRuntime {
                 })?;
             index_pos += chunk_len;
             logits = Some(next_logits);
+            // Between chunks, exactly as the single-sequence and prefix-cache
+            // prefills do. A batch shares one forward pass, so it can only be
+            // abandoned when *every* row is out of time — but without this
+            // check a batch whose rows all expired still ran the whole prompt
+            // forward pass for each of them before the per-row decode check
+            // could retire a single one.
+            let now = Instant::now();
+            if index_pos < prompt_len && requests.iter().all(|request| now >= request.deadline) {
+                return Err(self.execution_error(format!(
+                    "generation deadline elapsed after prefilling {index_pos} of {prompt_len} prompt tokens"
+                )));
+            }
         }
         let mut logits = logits.ok_or_else(|| {
             self.execution_error("batch-native LoRA prompt produced no prefill logits".to_owned())
@@ -3382,6 +3948,16 @@ impl CandleLlmRuntime {
             .iter()
             .map(|request| Vec::with_capacity(request.max_new_tokens))
             .collect::<Vec<_>>();
+        // One incremental detokenizer per row, for the same reason the
+        // single-sequence loops carry one: the stop check needs the decoded
+        // text on every step, and re-decoding each row in full would be O(n²)
+        // per row.
+        //
+        // Built once and cloned per row: `from_tokenizer` holds the tokenizer
+        // by reference rather than cloning the vocabulary, and cloning a
+        // decoder carries over its resolved decoder context, so neither the
+        // vocabulary copy nor the context resolution is paid `batch` times.
+        let mut decoders = vec![IncrementalDecoder::from_tokenizer(&self.tokenizer); batch];
         let mut done = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
         let max_new_tokens = requests
@@ -3389,10 +3965,18 @@ impl CandleLlmRuntime {
             .map(|request| request.max_new_tokens)
             .max()
             .unwrap_or(0);
-
         for step in 0..max_new_tokens {
             for row in 0..batch {
                 if done[row] || generated[row].len() >= requests[row].max_new_tokens {
+                    done[row] = true;
+                    continue;
+                }
+                // Each row against its own budget. Taking the batch minimum
+                // let a 1 ms request truncate a 300 s one co-batched with it —
+                // and retiring a row early is already a solved problem here:
+                // `done` stops sampling it and feeds a placeholder token so the
+                // remaining rows keep their shared forward pass.
+                if Instant::now() >= requests[row].deadline {
                     done[row] = true;
                     continue;
                 }
@@ -3420,14 +4004,18 @@ impl CandleLlmRuntime {
                 }
                 generated[row].push(next);
                 next_tokens[row] = next;
-                let text = self.decode_generated(&generated[row])?;
+                decoders[row].push(next).map_err(|error| {
+                    self.execution_error(format!("failed to decode token for row {row}: {error}"))
+                })?;
                 if eos_tokens.contains(&next)
-                    || find_earliest_stop(&text, &requests[row].stop).is_some()
+                    || find_earliest_stop(decoders[row].text(), &requests[row].stop).is_some()
                 {
                     done[row] = true;
                 }
             }
 
+            // The batch ends when every row has retired — on its own budget,
+            // its own stop sequence, or its own token limit.
             if done.iter().all(|done| *done) || step + 1 == max_new_tokens {
                 break;
             }
@@ -3456,13 +4044,27 @@ impl CandleLlmRuntime {
                 })?;
         }
 
-        generated
+        decoders
             .iter()
             .zip(requests)
-            .map(|(tokens, request)| {
-                let text = self.decode_generated(tokens)?;
-                let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
-                Ok(text.as_bytes()[..end].to_vec())
+            .map(|(decoder, request)| {
+                let text = decoder.text();
+                let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+                let completion_tokens = decoder.tokens().len();
+                let usage = TokenUsage {
+                    // Every row in a native batch shares one prompt length —
+                    // rows of unequal length are refused before this point.
+                    prompt_tokens: prompt_len as u32,
+                    // The decoder holds exactly the tokens it was pushed, which
+                    // is the row's generated sequence.
+                    completion_tokens: completion_tokens as u32,
+                };
+                // Per row, not per batch: rows share a step count but not a
+                // budget, so one row can be truncated while its neighbours
+                // finished cleanly.
+                let finish_reason =
+                    (completion_tokens >= request.max_new_tokens).then_some("length");
+                Ok((text.as_bytes()[..end].to_vec(), usage, finish_reason))
             })
             .collect()
     }
@@ -3473,14 +4075,14 @@ impl CandleLlmRuntime {
         mut logits: Tensor,
         mut index_pos: usize,
         _prompt_ids: &[u32],
-        context: DecodeLoopContext<'_>,
+        context: DecodeLoopContext<'_, '_>,
         mut forward: impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
     ) -> Result<(), CandleLlmError> {
         let DecodeLoopContext {
             request,
             eos_tokens,
             input_device: device,
-            on_token,
+            sink,
         } = context;
         let mut processor = request.sampling.processor();
         let mut fsm_processor = request
@@ -3499,6 +4101,10 @@ impl CandleLlmRuntime {
             .unwrap_or(0)
             .saturating_sub(1);
         let mut emitted = 0usize;
+        // Detokenize incrementally: re-decoding `generated` in full on every
+        // step is O(n²) in the generated length, which only became worth fixing
+        // once generation budgets moved past a few hundred tokens.
+        let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
         for step in 0..request.max_new_tokens {
             let row = logits.squeeze(0).map_err(|error| {
                 self.execution_error(format!("failed to reshape logits: {error}"))
@@ -3519,25 +4125,41 @@ impl CandleLlmRuntime {
                 }
             }
             generated.push(next);
+            sink.record_token();
 
-            let text = self.decode_generated(&generated)?;
+            decoder.push(next).map_err(|error| {
+                self.execution_error(format!("failed to decode token: {error}"))
+            })?;
+            let text = decoder.text();
             // A matched stop ends the decode: emit up to (not including) it.
-            if let Some(stop_at) = find_earliest_stop(&text, &request.stop) {
-                emit_delta(on_token, &text, &mut emitted, stop_at);
+            if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
+                emit_delta(sink, text, &mut emitted, stop_at);
                 return Ok(());
             }
             if eos_tokens.contains(&next) {
-                emit_delta(on_token, &text, &mut emitted, text.len());
+                emit_delta(sink, text, &mut emitted, text.len());
                 return Ok(());
             }
             // No stop yet: emit everything except the held-back tail.
-            let safe = floor_char_boundary(&text, text.len().saturating_sub(hold));
-            emit_delta(on_token, &text, &mut emitted, safe);
+            let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
+            emit_delta(sink, text, &mut emitted, safe);
 
             if step + 1 == request.max_new_tokens {
                 break;
             }
             if index_pos + 1 > self.limits.max_position_embeddings {
+                break;
+            }
+            // Out of time. Stop like an exhausted token budget does — flushing
+            // what was generated — rather than erroring: a partial answer is
+            // worth more to the caller than a failure, and the point is to free
+            // the scheduler slot.
+            if Instant::now() >= request.deadline {
+                break;
+            }
+            // Nobody left to read it. Same reasoning as the deadline: the slot
+            // is worth more than the remainder of an abandoned answer.
+            if sink.stopped() {
                 break;
             }
             let input = Tensor::new(&[next], device)
@@ -3551,9 +4173,12 @@ impl CandleLlmRuntime {
             index_pos += 1;
         }
         // Token budget exhausted: flush the held-back tail, trimming any stop.
-        let text = self.decode_generated(&generated)?;
-        let end = find_earliest_stop(&text, &request.stop).unwrap_or(text.len());
-        emit_delta(on_token, &text, &mut emitted, end);
+        if sink.completion_tokens >= request.max_new_tokens {
+            sink.mark_budget_exhausted();
+        }
+        let text = decoder.text();
+        let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+        emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
 
@@ -3563,6 +4188,7 @@ impl CandleLlmRuntime {
         prompt_ids: &[u32],
         cache: &mut Cache,
         device: &Device,
+        deadline: Instant,
     ) -> Result<(Tensor, usize), CandleLlmError> {
         let mut index_pos = 0usize;
         let mut logits = None;
@@ -3578,6 +4204,21 @@ impl CandleLlmRuntime {
         }
 
         while index_pos < prompt_ids.len() {
+            // Same rule as `run_prefill_chunks`: between chunks, and never
+            // before the first one has produced logits, so a request always
+            // makes progress before it can be refused. This is the common
+            // safetensors Llama path — without the check here a long CPU prompt
+            // held its scheduler lane well past `max_generation_ms`, since the
+            // decode loop's check is only reached once prefill finishes.
+            if logits.is_some() && Instant::now() >= deadline {
+                return Err(CandleLlmError::Execution {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "generation deadline elapsed after prefilling {index_pos} of {} prompt tokens",
+                        prompt_ids.len()
+                    ),
+                });
+            }
             let remaining = prompt_ids.len() - index_pos;
             let chunk_len = self.limits.next_prefill_chunk_len(remaining);
             if index_pos + chunk_len > self.limits.max_position_embeddings {
@@ -3639,6 +4280,31 @@ impl CandleLlmRuntime {
     /// Decode the full generated token sequence to UTF-8 text (special tokens
     /// skipped). Always valid UTF-8, so byte offsets into it land on codepoint
     /// boundaries that grow monotonically as tokens are appended.
+    /// Turn a request's optional `max_generation_ms` into an absolute deadline.
+    ///
+    /// Anchored at parse time rather than at the first decode step, so time
+    /// spent tokenizing and prefilling a long prompt counts against the budget
+    /// — that work occupies the same scheduler slot.
+    fn resolve_deadline(&self, max_generation_ms: Option<u64>) -> Result<Instant, CandleLlmError> {
+        let budget = match max_generation_ms {
+            None => self.limits.default_generation_deadline,
+            Some(millis) => {
+                let requested = Duration::from_millis(millis);
+                if requested.is_zero() || requested > HOST_MAX_GENERATION_DEADLINE {
+                    return Err(CandleLlmError::InvalidRequest {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "max_generation_ms {millis} must be between 1 and {}",
+                            HOST_MAX_GENERATION_DEADLINE.as_millis()
+                        ),
+                    });
+                }
+                requested
+            }
+        };
+        Ok(Instant::now() + budget)
+    }
+
     fn decode_generated(&self, generated: &[u32]) -> Result<String, CandleLlmError> {
         self.tokenizer
             .decode(generated, true)
@@ -3693,6 +4359,7 @@ impl CandleLlmRuntime {
         let ids = self.encode_ids(prompt).expect("prompt should tokenize");
         let device = match &*self.inner {
             LoadedModel::Safetensors { backend, .. } => backend.device(),
+            LoadedModel::Gguf { device, .. } => device.clone(),
             _ => Device::Cpu,
         };
         let input = Tensor::new(ids.as_slice(), &device)
@@ -3797,7 +4464,7 @@ impl CandleLlmRuntime {
             detail: format!("prompt tensor must be valid UTF-8: {error}"),
         })?;
 
-        let request = if raw.trim_start().starts_with('{') {
+        let mut request = if raw.trim_start().starts_with('{') {
             let request = serde_json::from_str::<GenerationRequest>(raw).map_err(|error| {
                 CandleLlmError::InvalidRequest {
                     alias: self.alias.clone(),
@@ -3827,20 +4494,28 @@ impl CandleLlmRuntime {
             };
             ParsedGenerationRequest {
                 prompt,
+                // `None` is recorded, not resolved: the default is clamped to
+                // the context window once the prompt length is known, while an
+                // explicitly requested budget that cannot fit is an error the
+                // caller should hear about rather than a silent truncation.
+                requested_max_new_tokens: request.max_new_tokens,
                 max_new_tokens: request
                     .max_new_tokens
                     .unwrap_or(self.limits.default_max_new_tokens),
                 sampling: resolve_sampling(request.temperature, request.top_p, request.seed),
                 stop: sanitize_stop(request.stop),
                 fsm,
+                deadline: self.resolve_deadline(request.max_generation_ms)?,
             }
         } else {
             ParsedGenerationRequest {
                 prompt: raw.to_owned(),
+                requested_max_new_tokens: None,
                 max_new_tokens: self.limits.default_max_new_tokens,
                 sampling: resolve_sampling(None, None, None),
                 stop: Vec::new(),
                 fsm: None,
+                deadline: self.resolve_deadline(None)?,
             }
         };
 
@@ -3872,6 +4547,35 @@ impl CandleLlmRuntime {
                     self.limits.max_position_embeddings
                 ),
             });
+        }
+        // The prompt budget reserves generation headroom proportionally (see
+        // `prompt_limits_for`), which is the right default but is not the same
+        // as *this* request's budget: an 8k-context checkpoint reserves 2k and
+        // still admits a 6k prompt, so a request asking for the 4k maximum
+        // reaches the context boundary about halfway through and returns a
+        // silently truncated answer.
+        //
+        // The two cases differ. A caller that named a budget has an
+        // expectation to violate, so an impossible one is a request error. A
+        // caller that named none has no expectation, so the default is clamped
+        // to what the window can actually deliver.
+        let headroom = self
+            .limits
+            .max_position_embeddings
+            .saturating_sub(encoded.len());
+        match request.requested_max_new_tokens {
+            Some(requested) if requested > headroom => {
+                return Err(CandleLlmError::InvalidRequest {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "prompt tokens {} plus max_new_tokens {requested} exceed the {}-token context window; lower max_new_tokens to at most {headroom}",
+                        encoded.len(),
+                        self.limits.max_position_embeddings,
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => request.max_new_tokens = request.max_new_tokens.min(headroom.max(1)),
         }
 
         Ok(request)
@@ -3918,11 +4622,11 @@ fn find_earliest_stop(text: &str, stop: &[String]) -> Option<usize> {
         .min()
 }
 
-/// Emit `text[*emitted..end]` through `on_token` (when non-empty) and advance
+/// Emit `text[*emitted..end]` through `sink` (when non-empty) and advance
 /// `*emitted`. `end` and `*emitted` must be codepoint boundaries.
-fn emit_delta(on_token: &mut dyn FnMut(&str), text: &str, emitted: &mut usize, end: usize) {
+fn emit_delta(sink: &mut TokenSink<'_>, text: &str, emitted: &mut usize, end: usize) {
     if *emitted < end && end <= text.len() {
-        on_token(&text[*emitted..end]);
+        sink.emit(&text[*emitted..end]);
         *emitted = end;
     }
 }
@@ -4023,6 +4727,20 @@ impl ChatTemplateField {
 }
 
 impl ChatTemplate {
+    /// The raw Jinja source of the model's chat template, or `None` when the
+    /// file, its `chat_template` field, or either one's parse is missing.
+    ///
+    /// Unlike [`ChatTemplate::load`] this never errors: its callers are
+    /// classifying a model, not preparing to run it, so an unreadable
+    /// `tokenizer_config.json` means "cannot tell" rather than "refuse".
+    fn read_source(root: &Path) -> Option<String> {
+        let raw = fs::read(root.join(TOKENIZER_CONFIG_JSON)).ok()?;
+        let config: TokenizerConfig = serde_json::from_slice(&raw).ok()?;
+        config
+            .chat_template
+            .and_then(ChatTemplateField::into_source)
+    }
+
     /// Load the model's chat template from `tokenizer_config.json`, or `None`
     /// when the file or the `chat_template` field is absent.
     pub(crate) fn load(alias: &str, root: &Path) -> Result<Option<Self>, CandleLlmError> {
@@ -4336,6 +5054,156 @@ fn gguf_file_path(alias: &str, root: &Path) -> Result<PathBuf, CandleLlmError> {
         });
     }
     Ok(path)
+}
+
+/// The first tensor in a checkpoint the target device cannot multiply, plus how
+/// widespread the problem is.
+struct UnsupportedGgufDtypes {
+    tensor: String,
+    dtype: GgmlDType,
+    affected: usize,
+    total: usize,
+}
+
+/// Scan a GGUF checkpoint for block types the target device has no
+/// quantized-matmul kernel for.
+///
+/// The per-dtype rule lives in candle (`Device::supports_qmatmul`), not here:
+/// an earlier revision of this loader carried a hand-copied table of the CUDA
+/// kernel coverage, which is exactly the kind of thing that rots silently when
+/// the backend gains or loses a kernel. Today the only gap on an accelerator is
+/// `Q8_1`/`Q8K` — both parse and both have dequantize kernels, but neither has a
+/// CUDA or Metal matmul kernel, so a checkpoint carrying them would upload to
+/// the GPU and then fail at the first decode step.
+fn unsupported_gguf_matmul_dtypes(
+    content: &gguf_file::Content,
+    device: &Device,
+) -> Option<UnsupportedGgufDtypes> {
+    // Sorted so a mixed-quant checkpoint always reports the same offending
+    // tensor: `tensor_infos` is a hash map, and an arbitrary pick would make
+    // the error message differ run to run for the same file.
+    let mut unsupported = content
+        .tensor_infos
+        .iter()
+        .filter(|(_, info)| !device.supports_qmatmul(info.ggml_dtype))
+        .map(|(name, info)| (name.as_str(), info.ggml_dtype))
+        .collect::<Vec<_>>();
+    unsupported.sort_unstable_by_key(|(name, _)| *name);
+    let (tensor, dtype) = unsupported.first()?;
+    Some(UnsupportedGgufDtypes {
+        tensor: (*tensor).to_owned(),
+        dtype: *dtype,
+        affected: unsupported.len(),
+        total: content.tensor_infos.len(),
+    })
+}
+
+/// Open Metal device 0 for a GGUF binding.
+///
+/// Unlike `Device::cuda_if_available`, this does *not* fall back to the host:
+/// an operator asking for `metal` on a machine without one has a configuration
+/// error, and silently running on CPU would hide it behind a mysterious
+/// slowdown. The CUDA path keeps its fallback because that convention predates
+/// this loader and the parallel engines rely on it.
+#[cfg(feature = "candle-metal")]
+fn new_metal_device(alias: &str, root: &Path) -> Result<Device, CandleLlmError> {
+    Device::new_metal(0).map_err(|error| CandleLlmError::InvalidComponent {
+        alias: alias.to_owned(),
+        path: root.to_path_buf(),
+        component: GGUF_COMPONENT,
+        detail: format!("failed to open Metal device 0: {error}"),
+    })
+}
+
+#[cfg(not(feature = "candle-metal"))]
+fn new_metal_device(alias: &str, root: &Path) -> Result<Device, CandleLlmError> {
+    Err(CandleLlmError::UnsupportedModel {
+        alias: alias.to_owned(),
+        path: root.to_path_buf(),
+        detail: "this host was not built with the `candle-metal` feature".to_owned(),
+    })
+}
+
+/// Pick the device a GGUF checkpoint's weights are uploaded to.
+///
+/// `cpu` (the default) keeps the historical host-side quantized path. Any other
+/// request resolves a device first and only *then* checks block types, because
+/// matmul coverage is a property of the resolved backend, not of the checkpoint:
+/// `Device::cuda_if_available` follows the runtime's existing convention of
+/// falling back to `Device::Cpu` when no physical GPU is present, and the CPU
+/// backend implements `vec_dot` for every block type. Scanning before resolving
+/// would reject a perfectly runnable model on a `candle-cuda` build that happens
+/// to have no GPU attached.
+///
+/// The scan still runs before any weights are uploaded, so a checkpoint the
+/// device cannot execute fails at load rather than at the first decode step with
+/// VRAM already claimed.
+fn resolve_gguf_device(
+    alias: &str,
+    root: &Path,
+    content: &gguf_file::Content,
+    requested_device: &str,
+) -> Result<Device, CandleLlmError> {
+    if requested_device == "cpu" {
+        return Ok(Device::Cpu);
+    }
+
+    let device = match requested_device {
+        "metal" => {
+            if !cfg!(feature = "candle-metal") {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail:
+                        "GGUF execution on `metal` requires a host built with the `candle-metal` feature; rebuild with it or bind this model to `cpu`"
+                            .to_owned(),
+                });
+            }
+            new_metal_device(alias, root)?
+        }
+        "cuda" | "gpu" => {
+            if !cfg!(feature = "candle-cuda") {
+                return Err(CandleLlmError::UnsupportedModel {
+                    alias: alias.to_owned(),
+                    path: root.to_path_buf(),
+                    detail: format!(
+                        "GGUF execution on `{requested_device}` requires a host built with the `candle-cuda` feature; rebuild with it or bind this model to `cpu`"
+                    ),
+                });
+            }
+            Device::cuda_if_available(0).map_err(|error| CandleLlmError::InvalidComponent {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                component: GGUF_COMPONENT,
+                detail: error.to_string(),
+            })?
+        }
+        // Anything else is not a device this loader knows how to reach. Falling
+        // through would upload the weights to CUDA device 0 regardless of what
+        // the operator asked for.
+        other => {
+            return Err(CandleLlmError::UnsupportedModel {
+                alias: alias.to_owned(),
+                path: root.to_path_buf(),
+                detail: format!(
+                    "GGUF execution on `{other}` is not wired; bind this model to `cpu`, `cuda` or `metal`"
+                ),
+            });
+        }
+    };
+
+    if let Some(report) = unsupported_gguf_matmul_dtypes(content, &device) {
+        return Err(CandleLlmError::UnsupportedModel {
+            alias: alias.to_owned(),
+            path: root.to_path_buf(),
+            detail: format!(
+                "GGUF tensor `{}` uses block type `{:?}`, which has no quantized-matmul kernel on `{requested_device}` ({} of {} tensors affected); requantize to a K-quant or legacy Q4/Q5/Q8 type, or bind this model to `cpu`",
+                report.tensor, report.dtype, report.affected, report.total
+            ),
+        });
+    }
+
+    Ok(device)
 }
 
 /// Collect the model's end-of-sequence token id(s), if any, into a flat list.
@@ -5621,6 +6489,37 @@ pub(crate) fn write_tachyon_tiny_gguf_fixture(root: &Path) -> anyhow::Result<()>
 mod tests {
     use super::*;
 
+    /// A local generation that spends its whole budget is truncated, and the
+    /// caller resolves an absent reason to `stop` — so without this the client
+    /// is told a half-written function completed normally.
+    #[test]
+    fn a_local_generation_that_spends_its_budget_reports_length() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        sink.completion_tokens = 3;
+        assert_eq!(
+            sink.finish_reason(),
+            None,
+            "a generation that stopped short of its budget ended for some other \
+             reason, which the caller infers as it always did"
+        );
+
+        sink.completion_tokens = 4;
+        sink.mark_budget_exhausted();
+        assert_eq!(sink.finish_reason(), Some("length"));
+    }
+
+    /// Only the budget is named. EOS, a stop sequence and the deadline all
+    /// leave the reason absent, because guessing between them would be exactly
+    /// the misreport this exists to prevent.
+    #[test]
+    fn a_sink_with_no_recorded_budget_reports_nothing() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        sink.completion_tokens = 99;
+        assert_eq!(sink.finish_reason(), None);
+    }
+
     #[test]
     fn architecture_registry_normalizes_supported_hf_aliases() {
         assert_eq!(
@@ -5666,8 +6565,240 @@ mod tests {
         assert!(ModelArchitecture::Qwen3.supports_format(ModelFormat::Safetensors));
         assert!(ModelArchitecture::Qwen35Moe.supports_format(ModelFormat::Safetensors));
         assert!(!ModelArchitecture::DeepSeekV3.supports_format(ModelFormat::Safetensors));
-        assert!(!ModelArchitecture::Gemma3.supports_format(ModelFormat::Gguf));
         assert!(ModelArchitecture::Gemma3.supports_format(ModelFormat::Safetensors));
+
+        // GGUF support tracks the fork's `quantized_*` modules, one per family.
+        for architecture in [
+            ModelArchitecture::Qwen2,
+            ModelArchitecture::Qwen3,
+            ModelArchitecture::Gemma3,
+            ModelArchitecture::Phi3,
+        ] {
+            assert!(
+                architecture.supports_format(ModelFormat::Gguf),
+                "{architecture:?} has a quantized loader and must accept GGUF"
+            );
+        }
+        // No `quantized_gemma2` or `quantized_phi4` in the fork, so claiming
+        // GGUF here would fail at load instead of at validation.
+        for architecture in [
+            ModelArchitecture::Gemma2,
+            ModelArchitecture::Phi4,
+            ModelArchitecture::DeepSeekV2,
+            ModelArchitecture::Mixtral,
+        ] {
+            assert!(
+                !architecture.supports_format(ModelFormat::Gguf),
+                "{architecture:?} has no quantized loader and must reject GGUF"
+            );
+        }
+    }
+
+    /// Build a bare model directory carrying just the files the parser
+    /// detector reads.
+    fn tool_parser_fixture(
+        tag: &str,
+        tokenizer_config: Option<&str>,
+        sidecar: Option<&str>,
+    ) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-parser-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("fixture dir");
+        if let Some(config) = tokenizer_config {
+            fs::write(dir.join(TOKENIZER_CONFIG_JSON), config).expect("tokenizer config");
+        }
+        if let Some(meta) = sidecar {
+            fs::write(dir.join(MODEL_META_JSON), meta).expect("sidecar");
+        }
+        dir
+    }
+
+    #[test]
+    fn the_tool_call_parser_is_read_from_the_chat_template() {
+        // Each dialect is identified by the marker its own template renders
+        // around a call — not by anything in the model's name.
+        for (tag, template, expected) in [
+            (
+                "qwen",
+                r#"{"chat_template": "{% for m in messages %}<tool_call>{{ m }}</tool_call>{% endfor %}"}"#,
+                Some("qwen"),
+            ),
+            (
+                "mistral",
+                r#"{"chat_template": "{% if tools %}[TOOL_CALLS]{% endif %}"}"#,
+                Some("mistral"),
+            ),
+            // Tool-aware with no tag convention: the call is a bare JSON
+            // object, which is what the `json` parser reads.
+            (
+                "json",
+                r#"{"chat_template": "{% for tool in tools %}{{ tool.name }}{% endfor %}"}"#,
+                Some("json"),
+            ),
+            // Not tool-aware at all: claiming a parser here would be a guess,
+            // and the point of this seam is to stop guessing.
+            (
+                "plain",
+                r#"{"chat_template": "{% for m in messages %}{{ m.content }}{% endfor %}"}"#,
+                None,
+            ),
+        ] {
+            let dir = tool_parser_fixture(tag, Some(template), None);
+            assert_eq!(
+                detect_tool_call_parser(&dir),
+                expected,
+                "{tag} template classified wrongly"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_declared_tool_call_parser_overrides_the_chat_template() {
+        // The escape hatch: a checkpoint fine-tuned to emit a dialect its
+        // stock template does not describe.
+        let dir = tool_parser_fixture(
+            "override",
+            Some(r#"{"chat_template": "<tool_call>{{ x }}</tool_call>"}"#),
+            Some(r#"{"format": "gguf", "tool_call_parser": "json"}"#),
+        );
+        assert_eq!(detect_tool_call_parser(&dir), Some("json"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unreadable_model_directory_yields_no_parser_rather_than_an_error() {
+        // Classification, not loading: a missing or malformed file means
+        // "cannot tell", which leaves the guest's own fallback in charge.
+        let empty = tool_parser_fixture("empty", None, None);
+        assert_eq!(detect_tool_call_parser(&empty), None);
+        let _ = fs::remove_dir_all(empty);
+
+        let malformed = tool_parser_fixture("malformed", Some("{not json"), Some("{also not"));
+        assert_eq!(detect_tool_call_parser(&malformed), None);
+        let _ = fs::remove_dir_all(malformed);
+
+        assert_eq!(
+            detect_tool_call_parser(Path::new("/nonexistent/tachyon/model")),
+            None
+        );
+    }
+
+    /// An unrecognized declared dialect must not propagate: publishing it would
+    /// make `guest-openai` see a value it cannot map, and the row it rides on
+    /// carries the model's existence in `GET /ai/v1/models`.
+    #[test]
+    fn an_unknown_declared_parser_is_dropped() {
+        let dir = tool_parser_fixture(
+            "unknown-declared",
+            None,
+            Some(r#"{"format": "gguf", "tool_call_parser": "some-future-dialect"}"#),
+        );
+        assert_eq!(detect_tool_call_parser(&dir), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The gate that runs *before* `load_gguf`. A family the quantized loader
+    /// can build but this map refuses never reaches it — which is how `glm4`,
+    /// `lfm2`, `phi2` and `qwen3moe` came to be advertised and unloadable.
+    #[test]
+    fn every_loadable_gguf_family_passes_the_architecture_gate() {
+        for name in quantized_lm::SUPPORTED_ARCHITECTURES {
+            let architecture = ModelArchitecture::from_gguf_architecture(name)
+                .unwrap_or_else(|| panic!("`{name}` is loadable but the gate rejects it"));
+            assert!(
+                architecture.supports_format(ModelFormat::Gguf),
+                "`{name}` passes the gate as {architecture:?}, which refuses GGUF"
+            );
+        }
+        // The converse is not required — the host knows safetensors-only
+        // architectures candle has no quantized backend for — but an
+        // unrecognized value must still be refused rather than guessed.
+        assert_eq!(ModelArchitecture::from_gguf_architecture("mamba"), None);
+    }
+
+    #[test]
+    fn gguf_capability_table_matches_candles_architecture_registry() {
+        // Every architecture this host advertises as GGUF-loadable must resolve
+        // to a backend in candle's registry. The `general.architecture` string
+        // is the join key between the two tables, and it is not always the
+        // host's display name (`qwen3-moe` vs `qwen3moe`), so it is spelled out.
+        for (architecture, gguf_name) in [
+            (ModelArchitecture::Llama, "llama"),
+            (ModelArchitecture::Qwen2, "qwen2"),
+            (ModelArchitecture::Qwen3, "qwen3"),
+            (ModelArchitecture::Qwen35Moe, "qwen3moe"),
+            (ModelArchitecture::Gemma3, "gemma3"),
+            (ModelArchitecture::Phi3, "phi3"),
+        ] {
+            assert!(
+                architecture.supports_format(ModelFormat::Gguf),
+                "{architecture:?} maps to the `{gguf_name}` quantized backend and must accept GGUF"
+            );
+            assert!(
+                GgufArchitecture::from_name(gguf_name).is_some(),
+                "candle no longer registers `{gguf_name}`; {architecture:?} must drop `gguf: true`"
+            );
+        }
+
+        // Architectures the host knows but candle has no quantized backend for.
+        // Claiming GGUF here would defer the failure to load time.
+        for (architecture, gguf_name) in [
+            (ModelArchitecture::Gemma2, "gemma2"),
+            (ModelArchitecture::Phi4, "phi4"),
+            (ModelArchitecture::DeepSeekV2, "deepseek2"),
+            (ModelArchitecture::Mixtral, "mixtral"),
+        ] {
+            if GgufArchitecture::from_name(gguf_name).is_some() {
+                // `gemma2` aliases onto the gemma3 backend upstream; the host
+                // still declines it because its safetensors config is what
+                // selects the architecture, and it has no quantized loader of
+                // its own here. Nothing to assert beyond "not advertised".
+                continue;
+            }
+            assert!(
+                !architecture.supports_format(ModelFormat::Gguf),
+                "candle has no quantized `{gguf_name}` backend; {architecture:?} must reject GGUF"
+            );
+        }
+
+        // A checkpoint whose `general.architecture` is in neither table.
+        assert!(GgufArchitecture::from_name("mamba").is_none());
+    }
+
+    #[test]
+    fn qwen3_moe_gguf_is_rejected_on_devices_without_a_fused_expert_kernel() {
+        // The host advertises `qwen3moe` for GGUF (see `capabilities`) and
+        // relies on candle's load-time admission check to refuse the bindings
+        // that cannot run it, rather than refusing the format outright and
+        // losing the CUDA binding too.
+        let options = quantized_lm::Options::default();
+        let cpu = Device::Cpu;
+        assert!(
+            GgufArchitecture::Qwen3Moe
+                .check_device_support(&cpu, options.dtype_for(&cpu))
+                .is_err(),
+            "qwen3moe has no CPU expert kernel and must fail at load"
+        );
+        // Families without a fused expert path stay loadable on the host.
+        for architecture in [
+            GgufArchitecture::Llama,
+            GgufArchitecture::Qwen3,
+            GgufArchitecture::Gemma3,
+            GgufArchitecture::Phi3,
+        ] {
+            assert!(
+                architecture
+                    .check_device_support(&cpu, options.dtype_for(&cpu))
+                    .is_ok(),
+                "{architecture:?} must stay loadable on cpu"
+            );
+        }
     }
 
     #[test]
@@ -5717,8 +6848,8 @@ mod tests {
         ] {
             let (runtime, dir) = load_qwen_fixture("generation", architecture);
             let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
-            let first = runtime.generate(&[request]).expect("first generation");
-            let second = runtime.generate(&[request]).expect("second generation");
+            let first = runtime.generate(&[request]).expect("first generation").0;
+            let second = runtime.generate(&[request]).expect("second generation").0;
             assert_eq!(
                 first,
                 second,
@@ -5739,11 +6870,14 @@ mod tests {
         ] {
             let (runtime, dir) = load_qwen_fixture("streaming", architecture);
             let request: &[u8] = br#"{"prompt":"hello","max_new_tokens":4}"#;
-            let buffered =
-                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let buffered = String::from_utf8(runtime.generate(&[request]).expect("buffered").0)
+                .expect("utf-8");
             let mut streamed = String::new();
             runtime
-                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .generate_streaming(&[request], &mut |delta| {
+                    streamed.push_str(delta);
+                    StreamControl::Continue
+                })
                 .expect("streamed");
             assert_eq!(streamed, buffered);
             let _ = fs::remove_dir_all(dir);
@@ -5850,14 +6984,17 @@ mod tests {
         for architecture in [ModelArchitecture::Gemma2, ModelArchitecture::Gemma3] {
             let (runtime, dir) = load_gemma_fixture("generation", architecture);
             let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
-            let first =
-                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let first = String::from_utf8(runtime.generate(&[request]).expect("buffered").0)
+                .expect("utf-8");
             let second =
-                String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+                String::from_utf8(runtime.generate(&[request]).expect("repeat").0).expect("utf-8");
             assert_eq!(first, second, "internal KV cache must reset");
             let mut streamed = String::new();
             runtime
-                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .generate_streaming(&[request], &mut |delta| {
+                    streamed.push_str(delta);
+                    StreamControl::Continue
+                })
                 .expect("streamed");
             assert_eq!(streamed, first);
             assert_ne!(first.as_bytes(), b"MOCK_LLM_RESPONSE");
@@ -6017,14 +7154,17 @@ mod tests {
             let (runtime, dir) =
                 load_family_fixture("generation", architecture, write_tachyon_tiny_phi_fixture);
             let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
-            let buffered =
-                String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            let buffered = String::from_utf8(runtime.generate(&[request]).expect("buffered").0)
+                .expect("utf-8");
             let repeat =
-                String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+                String::from_utf8(runtime.generate(&[request]).expect("repeat").0).expect("utf-8");
             assert_eq!(buffered, repeat);
             let mut streamed = String::new();
             runtime
-                .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+                .generate_streaming(&[request], &mut |delta| {
+                    streamed.push_str(delta);
+                    StreamControl::Continue
+                })
                 .expect("streamed");
             assert_eq!(streamed, buffered);
             assert_ne!(buffered.as_bytes(), b"MOCK_LLM_RESPONSE");
@@ -6041,13 +7181,16 @@ mod tests {
         );
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
         let buffered =
-            String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            String::from_utf8(runtime.generate(&[request]).expect("buffered").0).expect("utf-8");
         let repeat =
-            String::from_utf8(runtime.generate(&[request]).expect("repeat")).expect("utf-8");
+            String::from_utf8(runtime.generate(&[request]).expect("repeat").0).expect("utf-8");
         assert_eq!(buffered, repeat);
         let mut streamed = String::new();
         runtime
-            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("streamed");
         assert_eq!(streamed, buffered);
         assert_ne!(buffered.as_bytes(), b"MOCK_LLM_RESPONSE");
@@ -6088,6 +7231,370 @@ mod tests {
 
     fn load_fixture(tag: &str) -> (CandleLlmRuntime, PathBuf) {
         load_fixture_with_strategy(tag, &HardwareStrategy::default())
+    }
+
+    /// Drive an [`IncrementalDecoder`] over `tokens`, asserting after every step
+    /// that it agrees with decoding the whole prefix in one go. Returns the
+    /// finished decoder so a caller can inspect its window state.
+    ///
+    /// The decoder itself lives in `candle-transformers` and is tested there;
+    /// what this pins down is the seam — that this runtime's tokenizer and its
+    /// `decode_generated` (which skips special tokens, as the decoder does by
+    /// default) stay interchangeable with the incremental path the generation
+    /// loops actually stream from.
+    fn assert_incremental_matches_whole<'a>(
+        runtime: &'a CandleLlmRuntime,
+        tokens: &[u32],
+    ) -> IncrementalDecoder<&'a Tokenizer> {
+        let mut decoder = IncrementalDecoder::from_tokenizer(&runtime.tokenizer);
+        let mut generated = Vec::new();
+        for token in tokens {
+            generated.push(*token);
+            decoder
+                .push(*token)
+                .expect("incremental push should succeed");
+            let whole = runtime
+                .decode_generated(&generated)
+                .expect("whole-sequence decode should succeed");
+            assert_eq!(
+                decoder.text(),
+                whole,
+                "incremental text diverged from the whole-sequence decode at {} token(s)",
+                generated.len()
+            );
+        }
+        decoder
+    }
+
+    #[test]
+    fn a_zero_deadline_stops_generation_without_erroring() {
+        let (runtime, dir) = load_fixture("deadline-expired");
+        // Already elapsed by the time the loop runs: generation must stop the
+        // way an exhausted token budget does, not fail. Freeing the scheduler
+        // slot is the point; a partial answer still beats an error.
+        let bytes = runtime
+            .generate(&[br#"{"prompt":"hello","max_new_tokens":16,"max_generation_ms":1}"#])
+            .expect("an expired deadline is not a request error")
+            .0;
+        assert!(
+            String::from_utf8(bytes).expect("utf-8").len() < 1024,
+            "an expired deadline must cut generation short"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The prefix-cached prefill is the common safetensors Llama path, and it
+    /// used to be the one prefill that never consulted the deadline — so a long
+    /// CPU prompt held its scheduler lane past `max_generation_ms` before the
+    /// decode loop's check was ever reached.
+    #[test]
+    fn an_expired_deadline_stops_prefix_cached_prefill() {
+        // A two-token chunk makes the fixture's short prompt span several
+        // prefill passes, so the between-chunk check is actually reached.
+        // At the default 8192-token chunk the fixture always prefills in one
+        // pass and this path could never be exercised.
+        let strategy = HardwareStrategy {
+            prefill_chunk_tokens: Some(2),
+            ..HardwareStrategy::default()
+        };
+        let (runtime, dir) = load_fixture_with_strategy("deadline-prefill", &strategy);
+        let request =
+            br#"{"prompt":"hello mesh from tachyon","max_new_tokens":4,"max_generation_ms":1}"#;
+        let error = runtime
+            .generate(&[&request[..]])
+            .expect_err("an elapsed budget must stop prefill rather than run to completion");
+        assert!(
+            error.to_string().contains("deadline elapsed"),
+            "prefill should name the elapsed deadline, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("prompt tokens"),
+            "the error should say how far prefill got, got: {error}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_generous_deadline_does_not_truncate() {
+        let (runtime, dir) = load_fixture("deadline-generous");
+        let deadlined = runtime
+            .generate(&[br#"{"prompt":"hello","max_new_tokens":4,"max_generation_ms":600000}"#])
+            .expect("generation should run")
+            .0;
+        let plain = runtime
+            .generate(&[br#"{"prompt":"hello","max_new_tokens":4}"#])
+            .expect("generation should run")
+            .0;
+        // A deadline far beyond the work must not change the output at all.
+        assert_eq!(deadlined, plain);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_out_of_range_deadline_is_rejected() {
+        let (runtime, dir) = load_fixture("deadline-range");
+        for millis in [0u64, HOST_MAX_GENERATION_DEADLINE.as_millis() as u64 + 1] {
+            let request = format!(r#"{{"prompt":"hello","max_generation_ms":{millis}}}"#);
+            let error = runtime
+                .generate(&[request.as_bytes()])
+                .expect_err("an out-of-range deadline must be rejected");
+            assert!(
+                error.to_string().contains("max_generation_ms"),
+                "the error should name the field, got: {error}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_default_deadline_matches_the_upstream_request_timeout() {
+        // A local and a remote binding should look the same to a caller.
+        assert_eq!(
+            DEFAULT_GENERATION_DEADLINE,
+            Duration::from_secs(300),
+            "keep this in step with the upstream backend's DEFAULT_TIMEOUT"
+        );
+        assert!(HOST_MAX_GENERATION_DEADLINE > DEFAULT_GENERATION_DEADLINE);
+    }
+
+    #[test]
+    fn prompt_limits_scale_with_a_real_context_window() {
+        // A 32k-context model: the budget is the window minus generation
+        // headroom, not the old flat 4096 tokens / 16 KiB.
+        let (tokens, bytes) = prompt_limits_for(32_768);
+        assert_eq!(tokens, 32_768 - HOST_MAX_NEW_TOKENS);
+        assert_eq!(
+            bytes,
+            tokens
+                .saturating_mul(PROMPT_BYTES_PER_TOKEN)
+                .min(MAX_PROMPT_BYTES_CEILING)
+        );
+        assert!(
+            bytes > 16_384,
+            "an agentic prompt must no longer be capped at the old 16 KiB"
+        );
+    }
+
+    #[test]
+    fn a_generation_budget_that_cannot_fit_the_window_is_refused() {
+        // The prompt budget reserves headroom proportionally, so a prompt can
+        // pass the byte/token caps and still leave less room than *this*
+        // request asked for. Before, the decode loop hit the context boundary
+        // partway through and returned a truncated answer with no signal.
+        let (runtime, dir) = load_fixture("budget-overrun");
+        let prompt = std::iter::repeat_n("hello", 8)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let request = serde_json::json!({
+            "prompt": prompt,
+            "max_new_tokens": FIXTURE_MAX_POSITION_EMBEDDINGS,
+        })
+        .to_string();
+        let error = runtime
+            .generate(&[request.as_bytes()])
+            .expect_err("an unsatisfiable budget must be refused, not truncated");
+        let error = error.to_string();
+        assert!(
+            error.contains("exceed the") && error.contains("context window"),
+            "the error should name the window, got: {error}"
+        );
+        assert!(
+            error.contains("lower max_new_tokens to at most"),
+            "the error should say what would fit, got: {error}"
+        );
+
+        // A caller that named no budget has no expectation to violate, so the
+        // default is clamped to what the window can deliver rather than
+        // refused — otherwise every short-context checkpoint would reject
+        // every default request.
+        let defaulted = serde_json::json!({ "prompt": "hello" }).to_string();
+        let (_bytes, usage, _finish) = runtime
+            .generate(&[defaulted.as_bytes()])
+            .expect("an unstated budget must be clamped, not refused");
+        assert!(
+            usage.completion_tokens as usize <= FIXTURE_MAX_POSITION_EMBEDDINGS,
+            "clamped generation overran the window: {usage:?}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prompt_limits_reserve_room_for_generation() {
+        // A prompt that passes validation must never consume the whole window:
+        // the decode loop would then have zero positions left and return empty
+        // output instead of an error.
+        for window in [4_096usize, 32_768, 262_144] {
+            let (tokens, _) = prompt_limits_for(window);
+            assert!(
+                tokens < window,
+                "window {window} left no generation headroom (prompt budget {tokens})"
+            );
+            // Headroom is proportional: at least a quarter of the window, or the
+            // host maximum once the window is large enough to afford it.
+            let headroom = window - tokens;
+            assert!(
+                headroom >= HOST_MAX_NEW_TOKENS.min(window / 4),
+                "window {window} reserved only {headroom} tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_limits_never_exceed_a_tiny_context_window() {
+        // Fixture-sized checkpoints cannot afford the reservation or the floor;
+        // exceeding the window here would make the decode loop return empty.
+        let (tokens, bytes) = prompt_limits_for(FIXTURE_MAX_POSITION_EMBEDDINGS);
+        assert_eq!(tokens, FIXTURE_MAX_POSITION_EMBEDDINGS);
+        // The byte floor still applies: a token estimate is a lower bound, and
+        // a tokenizer with long tokens fits far more text into one token.
+        assert_eq!(bytes, MIN_PROMPT_BYTES);
+
+        let (tokens, _) = prompt_limits_for(1);
+        assert_eq!(tokens, 1);
+    }
+
+    #[test]
+    fn the_byte_budget_never_tightens_below_the_flat_cap_it_replaced() {
+        // Deriving the budget must only ever widen what a checkpoint accepts;
+        // a short-context model must not start rejecting prompts it used to
+        // take.
+        for window in [1usize, 32, 512, 4_096] {
+            let (_, bytes) = prompt_limits_for(window);
+            assert!(
+                bytes >= MIN_PROMPT_BYTES,
+                "window {window} tightened the byte budget to {bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_byte_budget_is_capped_for_very_long_contexts() {
+        // A multi-million-token context would otherwise justify a byte budget
+        // large enough to be its own denial-of-service.
+        let (_, bytes) = prompt_limits_for(2_000_000);
+        assert_eq!(bytes, MAX_PROMPT_BYTES_CEILING);
+    }
+
+    #[test]
+    fn generation_reports_the_tokens_it_actually_used() {
+        let (runtime, dir) = load_fixture("usage-counts");
+        let prompt = "hello mesh";
+        let request = format!(r#"{{"prompt":"{prompt}","max_new_tokens":6}}"#);
+        let mut streamed = String::new();
+        let (usage, _finish) = runtime
+            .generate_streaming(&[request.as_bytes()], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
+            .expect("generation should run");
+
+        // `prompt_tokens` is the tokenizer's own encoding, not an estimate.
+        let expected_prompt = runtime
+            .encode_ids(prompt)
+            .expect("fixture prompt should tokenize")
+            .len();
+        assert_eq!(usage.prompt_tokens as usize, expected_prompt);
+        assert!(usage.prompt_tokens > 0);
+
+        // `completion_tokens` is what the decode loop appended — bounded by the
+        // request's budget, and not a re-tokenization of the emitted text,
+        // which can differ from the sequence the model produced.
+        assert!(
+            usage.completion_tokens > 0,
+            "a generation that produced text must report tokens"
+        );
+        assert!(
+            usage.completion_tokens <= 6,
+            "reported {} tokens for a 6-token budget",
+            usage.completion_tokens
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn buffered_and_streaming_generation_agree_on_usage() {
+        // The buffered wrapper is an accumulator over the streaming core, so
+        // the two must agree on what the generation cost as well as on the text
+        // it produced — the property that makes it safe for the guest's two
+        // paths to report the same numbers.
+        let (runtime, dir) = load_fixture("usage-parity");
+        let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":5}"#;
+        let (buffered, buffered_usage, buffered_finish) =
+            runtime.generate(&[request]).expect("buffered");
+        let mut streamed = String::new();
+        let (streamed_usage, streamed_finish) = runtime
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
+            .expect("streaming");
+
+        assert_eq!(String::from_utf8(buffered).expect("utf-8"), streamed);
+        assert_eq!(buffered_usage, streamed_usage);
+        // The buffered path is an accumulator over the streaming one, so they
+        // must also agree on *why* generation ended — not just on its text and
+        // its cost.
+        assert_eq!(buffered_finish, streamed_finish);
+        assert!(buffered_usage.completion_tokens > 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A budget of one token must report exactly one, which is the assertion
+    /// that fails if the counter is wired to the wrong place — an off-by-one in
+    /// the decode loop hides inside a larger budget.
+    #[test]
+    fn a_single_token_generation_reports_one_completion_token() {
+        let (runtime, dir) = load_fixture("usage-single");
+        let (usage, _finish) = runtime
+            .generate_streaming(
+                &[br#"{"prompt":"hello","max_new_tokens":1}"#],
+                &mut |_delta| StreamControl::Continue,
+            )
+            .expect("generation should run");
+        assert_eq!(usage.completion_tokens, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_fixture_tokenizer_permits_windowing() {
+        // Whole-sequence re-decoding is quadratic in the generated length, and
+        // at a 4096-token budget that is the difference between a linear and a
+        // visibly stalling stream. The decoder falls back to it silently when it
+        // cannot prove the tokenizer's decoder has bounded context, so the
+        // fast path is worth asserting rather than assuming.
+        let (runtime, dir) = load_fixture("decoder-bounded");
+        assert!(
+            IncrementalDecoder::from_tokenizer(&runtime.tokenizer).is_windowed(),
+            "the fixture tokenizer should take the windowed path"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn incremental_detokenization_matches_the_model_tokenizer() {
+        let (runtime, dir) = load_fixture("incremental-detok");
+        // Long enough that the window has to re-anchor several times: the
+        // decoder only attempts one once the window reaches its own threshold,
+        // so a short prompt would pass this test without ever exercising the
+        // step that can lose text.
+        let prompt = "hello mesh ".repeat(96);
+        let ids = runtime
+            .encode_ids(&prompt)
+            .expect("fixture prompt should tokenize");
+        let decoder = assert_incremental_matches_whole(&runtime, &ids);
+        assert!(
+            decoder.window_len() < ids.len(),
+            "the re-decoded window should stay bounded instead of growing with the sequence, \
+             got {} of {} tokens",
+            decoder.window_len(),
+            ids.len()
+        );
+        assert_eq!(
+            decoder.retracted(),
+            0,
+            "text must only ever be emitted once it is settled"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn load_fixture_with_strategy(
@@ -6155,7 +7662,8 @@ mod tests {
         let (runtime, dir) = load_fixture("real-forward");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
-            .expect("generation should run the Llama forward");
+            .expect("generation should run the Llama forward")
+            .0;
         let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
         assert!(
             !text.is_empty(),
@@ -6172,7 +7680,11 @@ mod tests {
             ..HardwareStrategy::default()
         };
         let (runtime, dir) = load_fixture_with_strategy("prefix-cache-fill", &strategy);
-        let prompt = std::iter::repeat_n("hello", PREFIX_CACHE_BLOCK_TOKENS * 2)
+        // One token short of two full blocks: the cache is still exercised
+        // across a block boundary, but the prompt leaves the room the
+        // requested single token needs. A window-filling prompt is now
+        // refused, because there is nowhere for the generation to go.
+        let prompt = std::iter::repeat_n("hello", PREFIX_CACHE_BLOCK_TOKENS * 2 - 1)
             .collect::<Vec<_>>()
             .join(" ");
         let request = serde_json::json!({
@@ -6187,7 +7699,7 @@ mod tests {
 
         assert_eq!(
             runtime.debug_prefix_cache_token_lengths(),
-            vec![PREFIX_CACHE_BLOCK_TOKENS, PREFIX_CACHE_BLOCK_TOKENS * 2]
+            vec![PREFIX_CACHE_BLOCK_TOKENS]
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -6210,11 +7722,13 @@ mod tests {
 
         let first = runtime
             .generate(&[request.as_bytes()])
-            .expect("first generation should run");
+            .expect("first generation should run")
+            .0;
         let hits_before = runtime.debug_prefix_cache_hits();
         let second = runtime
             .generate(&[request.as_bytes()])
-            .expect("second generation should reuse prefix cache");
+            .expect("second generation should reuse prefix cache")
+            .0;
 
         assert_eq!(first, second);
         assert!(
@@ -6261,7 +7775,8 @@ mod tests {
         .to_string();
         let bytes = runtime
             .generate(&[request.as_bytes()])
-            .expect("constrained generation should run");
+            .expect("constrained generation should run")
+            .0;
         let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
         assert_eq!(text, r#"{"ok":true}"#);
 
@@ -6464,7 +7979,8 @@ mod tests {
 
         let generated = nvfp4_runtime
             .generate(&[&b"hello"[..]])
-            .expect("nvfp4 checkpoint should run a real decode loop");
+            .expect("nvfp4 checkpoint should run a real decode loop")
+            .0;
         assert!(!generated.is_empty(), "decode output must not be empty");
 
         let _ = fs::remove_dir_all(dense_dir);
@@ -6475,8 +7991,8 @@ mod tests {
     fn greedy_decode_is_deterministic() {
         let (runtime, dir) = load_fixture("deterministic");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
-        let first = runtime.generate(&[request]).expect("first generation");
-        let second = runtime.generate(&[request]).expect("second generation");
+        let first = runtime.generate(&[request]).expect("first generation").0;
+        let second = runtime.generate(&[request]).expect("second generation").0;
         assert_eq!(
             first, second,
             "greedy decoding the same prompt must be reproducible"
@@ -6493,10 +8009,12 @@ mod tests {
             br#"{"prompt":"hello mesh","max_new_tokens":6,"temperature":0.9,"seed":42}"#;
         let first = runtime
             .generate(&[request])
-            .expect("first sampled generation");
+            .expect("first sampled generation")
+            .0;
         let second = runtime
             .generate(&[request])
-            .expect("second sampled generation");
+            .expect("second sampled generation")
+            .0;
         assert_eq!(
             first, second,
             "sampling with a pinned seed must be reproducible"
@@ -6509,7 +8027,7 @@ mod tests {
         let (runtime, dir) = load_fixture("stop-seq");
         // First, the un-stopped greedy output (deterministic on this fixture).
         let plain: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":8}"#;
-        let full = String::from_utf8(runtime.generate(&[plain]).expect("plain generation"))
+        let full = String::from_utf8(runtime.generate(&[plain]).expect("plain generation").0)
             .expect("utf-8 output");
 
         // Pick an interior character of that output as a stop sequence and assert
@@ -6524,7 +8042,7 @@ mod tests {
             })
             .to_string();
             let stopped =
-                String::from_utf8(runtime.generate(&[request.as_bytes()]).expect("stopped"))
+                String::from_utf8(runtime.generate(&[request.as_bytes()]).expect("stopped").0)
                     .expect("utf-8 output");
             assert!(
                 full.starts_with(&stopped),
@@ -6553,7 +8071,8 @@ mod tests {
         .to_string();
         let bytes = runtime
             .generate(&[request.as_bytes()])
-            .expect("a messages request must run on a checkpoint without a template");
+            .expect("a messages request must run on a checkpoint without a template")
+            .0;
         assert!(!bytes.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
@@ -6656,10 +8175,13 @@ mod tests {
         let (runtime, dir) = load_fixture("stream-concat");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
         let buffered =
-            String::from_utf8(runtime.generate(&[request]).expect("buffered")).expect("utf-8");
+            String::from_utf8(runtime.generate(&[request]).expect("buffered").0).expect("utf-8");
         let mut streamed = String::new();
         runtime
-            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("streamed");
         assert_eq!(
             streamed, buffered,
@@ -6673,10 +8195,11 @@ mod tests {
         let (target, target_dir) = load_fixture("spec-target");
         let (draft, draft_dir) = load_fixture("spec-draft");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
-        let greedy = target.generate(&[request]).expect("greedy generation");
+        let greedy = target.generate(&[request]).expect("greedy generation").0;
         let speculative = target
             .generate_speculative(&[request], &draft, 3)
-            .expect("speculative generation");
+            .expect("speculative generation")
+            .0;
         assert_eq!(
             speculative, greedy,
             "draft/verify must preserve target greedy output"
@@ -6685,7 +8208,8 @@ mod tests {
         let mut streamed = String::new();
         target
             .generate_speculative_streaming(&[request], &draft, 3, &mut |delta| {
-                streamed.push_str(delta)
+                streamed.push_str(delta);
+                StreamControl::Continue
             })
             .expect("speculative streaming");
         assert_eq!(streamed.into_bytes(), greedy);
@@ -6752,12 +8276,202 @@ mod tests {
         (runtime, dir)
     }
 
+    /// Build an in-memory GGUF header carrying the given tensor block types.
+    /// No file is written: only `tensor_infos` matters to the CUDA dtype scan.
+    fn gguf_header_with_dtypes(tensors: &[(&str, GgmlDType)]) -> gguf_file::Content {
+        gguf_file::Content {
+            magic: gguf_file::VersionedMagic::GgufV3,
+            metadata: std::collections::HashMap::new(),
+            tensor_infos: tensors
+                .iter()
+                .map(|(name, dtype)| {
+                    (
+                        (*name).to_owned(),
+                        gguf_file::TensorInfo {
+                            ggml_dtype: *dtype,
+                            shape: candle_core::Shape::from_dims(&[256]),
+                            offset: 0,
+                        },
+                    )
+                })
+                .collect(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn gguf_matmul_scan_never_gates_the_host_path() {
+        // The CPU backend implements `vec_dot` generically for every block
+        // type, so no checkpoint is unrunnable on it — including the two dtypes
+        // an accelerator rejects. This is what lets `resolve_gguf_device` run
+        // one scan against whichever device it resolved, including the silent
+        // `cuda_if_available` fallback to `Device::Cpu`.
+        let content = gguf_header_with_dtypes(&[
+            ("blk.0.attn_q.weight", GgmlDType::Q8K),
+            ("blk.0.attn_k.weight", GgmlDType::Q8_1),
+            ("output_norm.weight", GgmlDType::F32),
+        ]);
+        assert!(
+            unsupported_gguf_matmul_dtypes(&content, &Device::Cpu).is_none(),
+            "the cpu backend multiplies every block type and must never be gated"
+        );
+    }
+
+    /// The rejection path needs a real accelerator, so it only runs where one
+    /// exists. The per-dtype rule itself is candle's
+    /// (`GgmlDType::supports_matmul`) rather than a table copied into this
+    /// crate, which is what makes the untested half safe: it cannot drift.
+    #[test]
+    #[cfg(any(feature = "candle-cuda", feature = "candle-metal"))]
+    fn gguf_matmul_scan_reports_the_first_offending_tensor_on_an_accelerator() {
+        let Some(device) = test_accelerator_device() else {
+            return;
+        };
+        let content = gguf_header_with_dtypes(&[
+            ("blk.1.ffn_down.weight", GgmlDType::Q8K),
+            ("blk.0.attn_q.weight", GgmlDType::Q4K),
+            ("blk.0.attn_k.weight", GgmlDType::Q8K),
+        ]);
+        let report = unsupported_gguf_matmul_dtypes(&content, &device)
+            .expect("a Q8K tensor must be reported as unsupported");
+        // Name-sorted, so the same file always names the same tensor.
+        assert_eq!(report.tensor, "blk.0.attn_k.weight");
+        assert_eq!(report.dtype, GgmlDType::Q8K);
+        assert_eq!(report.affected, 2);
+        assert_eq!(report.total, 3);
+
+        let k_quant = gguf_header_with_dtypes(&[
+            ("token_embd.weight", GgmlDType::Q6K),
+            ("blk.0.attn_q.weight", GgmlDType::Q4K),
+            ("output_norm.weight", GgmlDType::F32),
+        ]);
+        assert!(
+            unsupported_gguf_matmul_dtypes(&k_quant, &device).is_none(),
+            "a Q4_K_M-style checkpoint must be accepted on an accelerator"
+        );
+    }
+
+    #[cfg(any(feature = "candle-cuda", feature = "candle-metal"))]
+    fn test_accelerator_device() -> Option<Device> {
+        #[cfg(feature = "candle-cuda")]
+        if let Ok(device) = Device::new_cuda(0) {
+            return Some(device);
+        }
+        #[cfg(feature = "candle-metal")]
+        if let Ok(device) = Device::new_metal(0) {
+            return Some(device);
+        }
+        None
+    }
+
+    #[test]
+    fn gguf_cpu_bindings_stay_on_the_host() {
+        // Even a checkpoint CUDA could never run stays loadable on `cpu`: the
+        // dtype scan must not gate the host path.
+        let content = gguf_header_with_dtypes(&[("blk.0.attn_q.weight", GgmlDType::Q8K)]);
+        let device = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "cpu")
+            .expect("a cpu binding must always resolve");
+        assert!(device.is_cpu());
+    }
+
+    #[cfg(not(feature = "candle-metal"))]
+    #[test]
+    fn gguf_rejects_a_metal_binding_without_the_metal_feature() {
+        let content = gguf_header_with_dtypes(&[("blk.0.attn_q.weight", GgmlDType::Q4K)]);
+        let error = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "metal")
+            .expect_err("a Metal-less build must refuse a metal binding");
+        assert!(
+            error.to_string().contains("candle-metal"),
+            "the error must name the missing build feature, got: {error}"
+        );
+    }
+
+    #[test]
+    fn gguf_rejects_devices_it_cannot_reach() {
+        // `npu`/`tpu` are valid `ModelDevice` values, so without an explicit
+        // rejection they would fall through to the CUDA branch.
+        let content = gguf_header_with_dtypes(&[("blk.0.attn_q.weight", GgmlDType::Q4K)]);
+        for device in ["npu", "tpu", "vulkan"] {
+            let error =
+                resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, device)
+                    .expect_err("an unreachable device must be refused");
+            assert!(
+                error.to_string().contains("not wired"),
+                "unexpected error for `{device}`: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "candle-metal")]
+    #[test]
+    fn metal_rejects_block_types_it_cannot_multiply() {
+        // The scan is per device, not CUDA-only. Metal has mat-vec kernels for
+        // `Q8_1`/`Q8K` but no mat-mat and no `get_rows`, so prefill and the
+        // embedding lookup fail — which is why `supports_qmatmul` answers `true`
+        // for these two only on the host. Loading anyway would claim VRAM and
+        // then fail on the first forward pass.
+        let content = gguf_header_with_dtypes(&[("blk.0.ffn_down.weight", GgmlDType::Q8K)]);
+        let error = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "metal")
+            .expect_err("a Q8K tensor must be refused before any VRAM is claimed");
+        let message = error.to_string();
+        assert!(
+            message.contains("blk.0.ffn_down.weight") && message.contains("Q8K"),
+            "the error must name the tensor and its block type, got: {message}"
+        );
+    }
+
+    #[cfg(feature = "candle-metal")]
+    #[test]
+    fn metal_accepts_the_k_quants_it_can_multiply() {
+        // The counterpart: the rejection is specific to the two block types
+        // Metal genuinely cannot run, not a blanket refusal of the lane.
+        let content = gguf_header_with_dtypes(&[("blk.0.ffn_down.weight", GgmlDType::Q4K)]);
+        assert!(
+            resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "metal").is_ok()
+        );
+    }
+
+    #[cfg(not(feature = "candle-cuda"))]
+    #[test]
+    fn gguf_rejects_a_gpu_binding_without_the_cuda_feature() {
+        let content = gguf_header_with_dtypes(&[("blk.0.attn_q.weight", GgmlDType::Q4K)]);
+        let error = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "cuda")
+            .expect_err("a CUDA-less build must refuse a gpu binding");
+        assert!(
+            error.to_string().contains("candle-cuda"),
+            "the error must name the missing build feature, got: {error}"
+        );
+    }
+
+    #[cfg(feature = "candle-cuda")]
+    #[test]
+    fn gguf_rejects_a_gpu_binding_whose_blocks_have_no_cuda_kernel() {
+        // The block-type rule only applies once a real CUDA device is resolved:
+        // on a `candle-cuda` build with no GPU attached the loader falls back to
+        // the host, where every block type runs.
+        if !Device::cuda_if_available(0).is_ok_and(|device| device.is_cuda()) {
+            return;
+        }
+        let content = gguf_header_with_dtypes(&[
+            ("blk.0.attn_q.weight", GgmlDType::Q4K),
+            ("blk.0.ffn_down.weight", GgmlDType::Q8K),
+        ]);
+        let error = resolve_gguf_device("tiny-gguf", Path::new("/models/tiny"), &content, "cuda")
+            .expect_err("a Q8K tensor must be refused before any VRAM is claimed");
+        let message = error.to_string();
+        assert!(
+            message.contains("blk.0.ffn_down.weight") && message.contains("Q8K"),
+            "the error must name the tensor and its block type, got: {message}"
+        );
+    }
+
     #[test]
     fn gguf_generate_runs_a_real_quantized_llama_forward() {
         let (runtime, dir) = load_gguf_fixture("real-forward");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
-            .expect("generation should run the quantized Llama forward");
+            .expect("generation should run the quantized Llama forward")
+            .0;
         let text = String::from_utf8(bytes).expect("decoded output should be UTF-8");
         assert!(
             !text.is_empty(),
@@ -6784,8 +8498,8 @@ mod tests {
     fn gguf_greedy_decode_is_deterministic() {
         let (runtime, dir) = load_gguf_fixture("deterministic");
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":6}"#;
-        let first = runtime.generate(&[request]).expect("first generation");
-        let second = runtime.generate(&[request]).expect("second generation");
+        let first = runtime.generate(&[request]).expect("first generation").0;
+        let second = runtime.generate(&[request]).expect("second generation").0;
         assert_eq!(
             first, second,
             "greedy decoding the same GGUF prompt must be reproducible"
@@ -6805,7 +8519,8 @@ mod tests {
                 .expect("a directory with a .gguf file is a GGUF model");
         let bytes = runtime
             .generate(&[&b"hello"[..]])
-            .expect("inferred GGUF model should still run");
+            .expect("inferred GGUF model should still run")
+            .0;
         assert!(!bytes.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
@@ -6916,7 +8631,8 @@ mod tests {
         // Tensor parallelism carries a KV cache, so full generation works.
         let generated = tp
             .generate(&[&b"hello"[..]])
-            .expect("tensor-parallel generation should run the decode loop");
+            .expect("tensor-parallel generation should run the decode loop")
+            .0;
         assert!(!generated.is_empty());
 
         let _ = fs::remove_dir_all(dir);
@@ -6965,7 +8681,8 @@ mod tests {
         // and dense paths.
         let generated = pipeline
             .generate(&[&b"hello"[..]])
-            .expect("pipeline-parallel generation should run the decode loop");
+            .expect("pipeline-parallel generation should run the decode loop")
+            .0;
         assert!(!generated.is_empty());
 
         let _ = fs::remove_dir_all(dir);
@@ -7028,7 +8745,8 @@ mod tests {
         // exactly like the tensor- and pipeline-parallel paths.
         let generated = expert
             .generate(&[&b"hello"[..]])
-            .expect("expert-parallel generation should run the decode loop");
+            .expect("expert-parallel generation should run the decode loop")
+            .0;
         assert!(!generated.is_empty());
 
         let _ = fs::remove_dir_all(dir);
@@ -7181,10 +8899,32 @@ mod tests {
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4}"#;
         let output = runtime
             .generate(&[request])
-            .expect("generation must run a real decode on the cuda device");
+            .expect("generation must run a real decode on the cuda device")
+            .0;
         assert!(
             !output.is_empty(),
             "cuda-resident Llama generation must not be empty/mocked"
+        );
+
+        // Token counts come from the decode loop, so they are only exercised
+        // on whichever device actually ran it. The CPU tests cover the same
+        // counters; this proves the CUDA-gated dispatch arms forward the sink
+        // rather than dropping it — they are compiled only in this build.
+        let mut streamed = String::new();
+        let (usage, _finish) = runtime
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
+            .expect("streaming generation must run on the cuda device");
+        assert_eq!(
+            usage.prompt_tokens as usize,
+            runtime.encode_ids("hello mesh").expect("tokenize").len()
+        );
+        assert!(
+            usage.completion_tokens > 0 && usage.completion_tokens <= 4,
+            "cuda decode reported {} tokens for a 4-token budget",
+            usage.completion_tokens
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -7349,14 +9089,16 @@ mod tests {
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4,"temperature":0.0}"#;
         let first = runtime
             .generate(&[request])
-            .expect("paged-attention generation must run a real decode on the cuda device");
+            .expect("paged-attention generation must run a real decode on the cuda device")
+            .0;
         assert!(
             !first.is_empty(),
             "paged-attention generation must not be empty/mocked"
         );
         let second = runtime
             .generate(&[request])
-            .expect("a second paged-attention request must reuse the block pool correctly");
+            .expect("a second paged-attention request must reuse the block pool correctly")
+            .0;
         assert_eq!(
             first, second,
             "greedy paged-attention generation must be deterministic across requests reusing the same shared block pool"
@@ -7461,7 +9203,8 @@ mod tests {
             .expect("tiny fixture should select the native Candle runtime");
         let captured_output = captured_runtime
             .generate(&[request])
-            .expect("cuda_graph_decode generation must run a real captured/replayed decode");
+            .expect("cuda_graph_decode generation must run a real captured/replayed decode")
+            .0;
         assert!(
             !captured_output.is_empty(),
             "cuda_graph_decode generation must not be empty/mocked"
@@ -7469,7 +9212,8 @@ mod tests {
 
         let captured_second_output = captured_runtime
             .generate(&[request])
-            .expect("cuda_graph_decode must support a second independent request");
+            .expect("cuda_graph_decode must support a second independent request")
+            .0;
         assert_eq!(
             captured_second_output, captured_output,
             "cuda_graph_decode's second request must match the first captured request's greedy output"
@@ -7486,7 +9230,8 @@ mod tests {
                 .expect("tiny fixture should select the native Candle runtime");
         let paged_only_output = paged_only_runtime
             .generate(&[request])
-            .expect("paged-attention generation must run a real decode on the cuda device");
+            .expect("paged-attention generation must run a real decode on the cuda device")
+            .0;
         assert_eq!(
             captured_output, paged_only_output,
             "cuda_graph_decode's captured/replayed decode must match the non-captured paged-attention path's greedy output for the same prompt"
@@ -7654,7 +9399,8 @@ mod tests {
         let request: &[u8] = br#"{"prompt":"hello mesh","max_new_tokens":4,"temperature":0.0}"#;
         let flashinfer_output = runtime
             .generate(&[request])
-            .expect("flashinfer-attention generation must run a real decode on the cuda device");
+            .expect("flashinfer-attention generation must run a real decode on the cuda device")
+            .0;
         assert!(
             !flashinfer_output.is_empty(),
             "flashinfer-attention generation must not be empty/mocked"
@@ -7671,7 +9417,8 @@ mod tests {
                 .expect("tiny fixture should select the native Candle runtime");
         let dense_output = dense_runtime
             .generate(&[request])
-            .expect("dense generation must run a real decode on the cuda device");
+            .expect("dense generation must run a real decode on the cuda device")
+            .0;
         assert_eq!(
             flashinfer_output, dense_output,
             "flashinfer-attention decode must match the dense path's greedy output for the same prompt"

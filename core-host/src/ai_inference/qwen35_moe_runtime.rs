@@ -2,24 +2,29 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{Device, Tensor};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::generation::{IncrementalDecoder, LogitsProcessor, Sampling};
 use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use super::{
     architecture_registry::{ArchitectureDescriptor, ArchitectureKind, ArchitectureMatch},
-    candle_llm_runtime::{ChatTemplate, ChatTurn, HOST_MAX_NEW_TOKENS},
+    candle_llm_runtime::{
+        ChatTemplate, ChatTurn, TokenUsage, DEFAULT_GENERATION_DEADLINE,
+        HOST_MAX_GENERATION_DEADLINE, HOST_MAX_NEW_TOKENS,
+    },
     modelopt_nvfp4::{
         ModelOptLinearTensors, ModelOptNvfp4Directory, Nvfp4AcceleratorCapabilities,
         Nvfp4ExecutionPlan, Nvfp4FallbackMemoryLimits, Nvfp4FallbackScope,
         Nvfp4KernelSelectionMode, Nvfp4OutputDType, PreparedLinear, SafetensorsDType,
         NVFP4_BLOCK_SIZE,
     },
+    StreamControl,
 };
 use primitives::{
     full_attention_step, gated_delta_step, rms_norm_qwen, sparse_moe_forward, HybridDecodeState,
@@ -454,6 +459,12 @@ struct GenerationRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Vec<String>,
+    /// Wall-clock budget, in milliseconds. This runtime parses its own request
+    /// shape rather than reusing `candle_llm_runtime`'s, so the field has to be
+    /// declared here too — omitting it silently ignored the caller's budget and
+    /// let a slow CPU generation hold its scheduler lane indefinitely.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,8 +473,16 @@ struct IncomingChatTurn {
     content: Value,
 }
 
+/// The budget a request that omits `max_new_tokens` gets.
+///
+/// Shared with the generic Candle runtime rather than held separately. It was
+/// 64 here, so once `guest-openai` stopped sending its own default the same
+/// bare request answered in 1024 tokens on one local backend and 64 on this
+/// one — truncating mid-function on exactly the agentic workloads the raised
+/// default exists for. Which runtime happens to serve an alias is not
+/// something a caller chooses, so it must not change the answer's length.
 fn default_max_new_tokens() -> usize {
-    64
+    super::candle_llm_runtime::DEFAULT_MAX_NEW_TOKENS
 }
 
 impl Qwen35MoeRuntime {
@@ -556,17 +575,24 @@ impl Qwen35MoeRuntime {
         self.executed_on
     }
 
-    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<u8>> {
+    pub(crate) fn generate(
+        &self,
+        prompts: &[&[u8]],
+    ) -> Result<(Vec<u8>, TokenUsage, Option<&'static str>)> {
         let mut output = String::new();
-        self.generate_streaming(prompts, &mut |delta| output.push_str(delta))?;
-        Ok(output.into_bytes())
+        // A buffered caller is holding the call and cannot go away mid-decode.
+        let (usage, finish_reason) = self.generate_streaming(prompts, &mut |delta| {
+            output.push_str(delta);
+            StreamControl::Continue
+        })?;
+        Ok((output.into_bytes(), usage, finish_reason))
     }
 
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
-        on_token: &mut dyn FnMut(&str),
-    ) -> Result<()> {
+        on_token: &mut dyn FnMut(&str) -> StreamControl,
+    ) -> Result<(TokenUsage, Option<&'static str>)> {
         if prompts.len() != 1 {
             bail!("Qwen 3.5 MoE runtime currently accepts exactly one prompt per decode");
         }
@@ -588,6 +614,16 @@ impl Qwen35MoeRuntime {
         let mut state = HybridDecodeState::new(&self.config.layer_types);
         let mut logits = Vec::new();
         for (position, token) in encoded.get_ids().iter().copied().enumerate() {
+            // Prefill is per token here, so the budget is checked before each
+            // one rather than between chunks. A long prompt on this CPU-bound
+            // runtime is exactly the case that used to outlast the budget
+            // before a single token was produced.
+            if position > 0 && Instant::now() >= request.deadline {
+                bail!(
+                    "generation deadline elapsed after prefilling {position} of {} prompt tokens",
+                    encoded.len()
+                );
+            }
             logits = self.forward_token(token, position, &mut state)?;
         }
         let sampling = resolve_sampling(
@@ -599,17 +635,37 @@ impl Qwen35MoeRuntime {
             LogitsProcessor::from_sampling(request.seed.unwrap_or(299_792_458), sampling);
         let mut generated = Vec::<u32>::new();
         let mut emitted = 0usize;
+        let mut abandoned = false;
+        let mut budget_exhausted = false;
+        // Incremental, like every other production decode loop. Re-decoding the
+        // whole sequence after each token is quadratic in the generation
+        // length, and the stop check needs the decoded text on every step — so
+        // at the shared multi-thousand-token ceiling a long answer spent a
+        // large share of its wall-clock budget re-rendering text it had already
+        // rendered, while holding the lane.
+        let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
         for step in 0..request.max_new_tokens {
+            // Elapsed budget stops generation the way an exhausted token budget
+            // does, rather than failing: freeing the scheduler slot is the
+            // point, and a partial answer beats an error.
+            if Instant::now() >= request.deadline {
+                break;
+            }
+            // Same reasoning for a consumer that went away: finishing an
+            // answer nobody will read only occupies the slot.
+            if abandoned {
+                break;
+            }
             let tensor = Tensor::from_vec(logits, self.config.vocab_size, &Device::Cpu)?;
             let token = processor.sample(&tensor)?;
             if token == self.config.eos_token_id {
                 break;
             }
             generated.push(token);
-            let text = self
-                .tokenizer
-                .decode(&generated, true)
+            decoder
+                .push(token)
                 .map_err(|error| anyhow!("failed to decode Qwen tokens: {error}"))?;
+            let text = decoder.text();
             let stop = request
                 .stop
                 .iter()
@@ -617,15 +673,26 @@ impl Qwen35MoeRuntime {
                 .min();
             let safe_end = stop.unwrap_or(text.len());
             if emitted < safe_end {
-                on_token(&text[emitted..safe_end]);
+                abandoned = on_token(&text[emitted..safe_end]).is_stop();
                 emitted = safe_end;
             }
             if stop.is_some() {
                 break;
             }
+            if step + 1 == request.max_new_tokens {
+                budget_exhausted = true;
+            }
             logits = self.forward_token(token, encoded.len() + step, &mut state)?;
         }
-        Ok(())
+        let usage = TokenUsage {
+            prompt_tokens: encoded.len() as u32,
+            completion_tokens: generated.len() as u32,
+        };
+        // Same rule as the generic Candle runtime: only budget exhaustion is
+        // named, because that is the case an absent reason would misreport as
+        // a clean `stop` — and this backend serves the same `/ai/v1` clients.
+        let finish_reason = budget_exhausted.then_some("length");
+        Ok((usage, finish_reason))
     }
 
     fn parse_request(&self, bytes: &[u8]) -> Result<ParsedRequest> {
@@ -645,11 +712,28 @@ impl Qwen35MoeRuntime {
                 top_p: None,
                 seed: None,
                 stop: Vec::new(),
+                max_generation_ms: None,
             }
         };
         if request.max_new_tokens == 0 || request.max_new_tokens > HOST_MAX_NEW_TOKENS {
             bail!("max_new_tokens must be between 1 and {HOST_MAX_NEW_TOKENS}");
         }
+        // Same bounds and same default as the Candle runtime, so a caller sees
+        // one wall-clock contract whichever backend serves its alias.
+        let budget = match request.max_generation_ms {
+            None => DEFAULT_GENERATION_DEADLINE,
+            Some(millis) => {
+                let requested = Duration::from_millis(millis);
+                if requested.is_zero() || requested > HOST_MAX_GENERATION_DEADLINE {
+                    bail!(
+                        "max_generation_ms {millis} must be between 1 and {}",
+                        HOST_MAX_GENERATION_DEADLINE.as_millis()
+                    );
+                }
+                requested
+            }
+        };
+        let deadline = Instant::now() + budget;
         let prompt = match (request.messages, request.prompt) {
             (Some(messages), _) if messages.is_empty() => {
                 bail!("chat request must contain at least one message")
@@ -701,6 +785,7 @@ impl Qwen35MoeRuntime {
                 .filter(|stop| !stop.is_empty() && stop.len() <= 256)
                 .take(8)
                 .collect(),
+            deadline,
         })
     }
 
@@ -879,6 +964,9 @@ struct ParsedRequest {
     top_p: Option<f32>,
     seed: Option<u64>,
     stop: Vec<String>,
+    /// Absolute, anchored at parse time so tokenizing and prefilling count
+    /// against the budget — that work holds the same scheduler slot.
+    deadline: Instant,
 }
 
 fn resolve_sampling(temperature: Option<f32>, top_p: Option<f32>, _seed: u64) -> Sampling {
@@ -1155,6 +1243,33 @@ mod tests {
         assert!(cache.stats.evictions >= 1);
     }
 
+    /// This runtime parses its own request shape instead of reusing
+    /// `candle_llm_runtime`'s, so a field missing from *this* struct is
+    /// silently dropped by serde rather than rejected. That is how
+    /// `max_generation_ms` came to be accepted by the API, documented as a
+    /// wall-clock budget, and ignored by this backend entirely.
+    #[test]
+    fn the_request_shape_carries_the_wall_clock_budget() {
+        let request: GenerationRequest =
+            serde_json::from_str(r#"{"prompt":"hi","max_new_tokens":4,"max_generation_ms":1500}"#)
+                .expect("request should parse");
+        assert_eq!(request.max_generation_ms, Some(1500));
+
+        // Omitting it is still valid; the default applies at parse time.
+        let defaulted: GenerationRequest =
+            serde_json::from_str(r#"{"prompt":"hi"}"#).expect("request should parse");
+        assert_eq!(defaulted.max_generation_ms, None);
+    }
+
+    /// One wall-clock contract across backends: a caller must not have to know
+    /// which runtime serves its alias to know what budget it gets.
+    #[test]
+    fn the_deadline_bounds_match_the_candle_runtime() {
+        assert_eq!(DEFAULT_GENERATION_DEADLINE, Duration::from_secs(300));
+        assert_eq!(HOST_MAX_GENERATION_DEADLINE, Duration::from_secs(3_600));
+        assert!(HOST_MAX_GENERATION_DEADLINE > DEFAULT_GENERATION_DEADLINE);
+    }
+
     #[test]
     fn gated_installed_checkpoint_generates_buffered_and_streaming_text() {
         if std::env::var("TACHYON_QWEN35_RUN_SLOW_PROBE").as_deref() != Ok("1") {
@@ -1170,18 +1285,27 @@ mod tests {
         let host_memory_before = current_process_memory_bytes();
         let gpu_memory_before = nvidia_memory_used_mib();
         let started = std::time::Instant::now();
-        let buffered = runtime.generate(&[request]).expect("buffered generation");
+        let (buffered, buffered_usage, buffered_finish) =
+            runtime.generate(&[request]).expect("buffered generation");
         let first_token_ms = started.elapsed().as_millis();
         let mut streamed = String::new();
         let decode_started = std::time::Instant::now();
-        runtime
-            .generate_streaming(&[request], &mut |delta| streamed.push_str(delta))
+        let (streamed_usage, streamed_finish) = runtime
+            .generate_streaming(&[request], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
             .expect("streaming generation");
         let decode_ms = decode_started.elapsed().as_millis();
 
         assert!(!buffered.is_empty());
-        assert_ne!(buffered, b"MOCK_LLM_RESPONSE");
+        assert_ne!(buffered.as_slice(), b"MOCK_LLM_RESPONSE");
         assert_eq!(String::from_utf8(buffered).expect("UTF-8"), streamed);
+        // The buffered wrapper is an accumulator over the streaming core, so
+        // the two must agree on what the generation cost as well as on its text.
+        assert_eq!(buffered_usage, streamed_usage);
+        assert_eq!(buffered_finish, streamed_finish);
+        assert!(buffered_usage.completion_tokens > 0);
         let working_set = runtime.working_set.lock().expect("working set");
         eprintln!(
             "{}",

@@ -52,6 +52,22 @@ candle-cuda = [
     "dep:cudarc",
     "dep:nvml-wrapper",
 ]
+# Apple GPU execution for quantized GGUF checkpoints. Deliberately narrower than
+# `candle-cuda`: it activates candle's Metal backend and nothing else, because
+# the CUDA-only extras that feature pulls in (flash-attn, paged attention,
+# cudarc, NVML) have no Metal counterpart here. Only the GGUF loader resolves a
+# Metal device — safetensors families still build against `Device::Cpu`, so
+# enabling this does not silently move them.
+#
+# Mutually exclusive with `candle-cuda` in practice: candle can compile both
+# backends, but a host would then have two GPU paths competing for the same
+# non-`cpu` binding, and `resolve_gguf_device` deliberately picks CUDA first.
+candle-metal = [
+    "ai-inference",
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+]
 # `nvfp4-cuda` stays CPU-buildable (no `candle-core/cuda`) so it remains in the
 # standard non-CUDA feature matrix. The candle CUDA backend is activated by the
 # separate `candle-cuda` feature (which enables `candle-core/cuda` et al.) and is
@@ -77,15 +93,15 @@ arc-swap = "1.7"
 axum = "0.8"
 blake3 = "1.5"
 bytes = "1.5"
-candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true, default-features = false }
-candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
+candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-15", version = "0.11.0", optional = true }
+candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-15", version = "0.11.0", optional = true }
+candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-15", version = "0.11.0", optional = true, default-features = false }
+candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-15", version = "0.11.0", optional = true }
+candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-15", version = "0.11.0", optional = true }
 # Standard transformer architectures (Llama family) for running real, uploaded
 # checkpoints. Weights are mmapped from the model directory at runtime — never
 # compiled into the Tachyon artifact.
-candle-transformers = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true, default-features = false }
+candle-transformers = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-15", version = "0.11.0", optional = true, default-features = false }
 parallel-topology = { path = "../crates/parallel-topology", optional = true }
 # Same cudarc version `candle-core`'s CUDA backend already vendors (see
 # Cargo.lock), so this reuses one NCCL binding instead of introducing a
@@ -138,7 +154,13 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 tokio-stream = { version = "0.1", optional = true }
-tokenizers = { version = "0.23.0", optional = true, default-features = false, features = ["fancy-regex"] }
+# Pinned to the same major line the candle fork's workspace uses (0.22). Sharing
+# one `tokenizers` crate version is a hard requirement, not a preference:
+# `candle_transformers::generation::IncrementalDecoder::new` takes a
+# `&tokenizers::Tokenizer`, and a 0.23 copy of that type is a *different* type to
+# the compiler. Bumping this ahead of the fork silently splits the dependency
+# graph in two and breaks the detokenizer seam.
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["fancy-regex"] }
 tower = { version = "0.5", optional = true, features = ["retry", "timeout", "util"] }
 tracing = "0.1"
 utoipa = { version = "5", features = ["axum_extras"] }

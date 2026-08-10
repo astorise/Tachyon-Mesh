@@ -564,6 +564,29 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         .expect("buffered reference must have content")
         .to_owned();
 
+    // Unlike a stream, a buffered response has no extra frame to break a naive
+    // client with, so usage is unconditional here — OpenAI reports it the same
+    // way. The counts come back beside the text through `compute-detailed`.
+    let buffered_usage = &ref_json["usage"];
+    assert!(
+        !buffered_usage.is_null(),
+        "a buffered response must report usage: {ref_json}"
+    );
+    let buffered_prompt_tokens = buffered_usage["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+    let buffered_completion_tokens = buffered_usage["completion_tokens"]
+        .as_u64()
+        .expect("completion_tokens");
+    assert!(
+        buffered_prompt_tokens > 0 && buffered_completion_tokens > 0,
+        "buffered usage must be measured, not defaulted: {buffered_usage}"
+    );
+    assert_eq!(
+        buffered_usage["total_tokens"].as_u64(),
+        Some(buffered_prompt_tokens + buffered_completion_tokens)
+    );
+
     // ── Streaming call: stream: true → SSE path ──────────────────────────
     let (hrx_s, mut crx_s) = run_streaming(
         serde_json::json!({"model": "llama3", "messages": messages, "stream": true}),
@@ -606,4 +629,115 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         delta_content, buffered_content,
         "concatenated SSE deltas must equal the buffered response content"
     );
+
+    // ── Usage is opt-in, exactly as it is on OpenAI ──────────────────────
+    // Without `stream_options.include_usage`, no chunk may carry a `usage`
+    // object: an extra trailing chunk with an empty `choices` array breaks
+    // clients that index `choices[0]` unconditionally, which is why OpenAI
+    // gates it too.
+    for frame in sse_data_frames(&sse_body) {
+        assert!(
+            frame.get("usage").is_none_or(Value::is_null),
+            "an unrequested stream must not carry usage: {frame}"
+        );
+    }
+
+    // ── With it: one trailing chunk, no choices, real counts ─────────────
+    let (hrx_u, mut crx_u) = run_streaming(
+        serde_json::json!({
+            "model": "llama3",
+            "messages": messages,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        }),
+        93,
+    );
+    let (usage_status, _) = hrx_u.await.expect("usage stream headers should arrive");
+    assert_eq!(usage_status, StatusCode::OK);
+    let mut usage_body = String::new();
+    while let Some(chunk) = crx_u.recv().await {
+        usage_body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+
+    let frames = sse_data_frames(&usage_body);
+    let carrying_usage: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame.get("usage").is_some_and(|usage| !usage.is_null()))
+        .collect();
+    assert_eq!(
+        carrying_usage.len(),
+        1,
+        "exactly one chunk carries usage\n{usage_body}"
+    );
+
+    let usage_frame = carrying_usage[0];
+    assert!(
+        usage_frame["choices"]
+            .as_array()
+            .is_some_and(|choices| choices.is_empty()),
+        "the usage chunk must carry no choices: {usage_frame}"
+    );
+    // It must also be the last chunk before `[DONE]`, or a client that stops
+    // reading at `finish_reason` never sees it.
+    assert!(
+        std::ptr::eq(usage_frame, frames.last().expect("at least one frame")),
+        "usage must be the final chunk before [DONE]\n{usage_body}"
+    );
+
+    // Counts crossed the whole boundary: decode loop → host channel → WIT
+    // resource → guest → SSE. The mock backend reports word counts, so these
+    // are synthetic but non-zero and internally consistent.
+    let usage = &usage_frame["usage"];
+    assert_eq!(
+        usage, buffered_usage,
+        "the same prompt must cost the same whether streamed or buffered"
+    );
+    let prompt_tokens = usage["prompt_tokens"].as_u64().expect("prompt_tokens");
+    let completion_tokens = usage["completion_tokens"]
+        .as_u64()
+        .expect("completion_tokens");
+    assert!(
+        prompt_tokens > 0,
+        "prompt_tokens must be measured, not defaulted: {usage}"
+    );
+    assert!(
+        completion_tokens > 0,
+        "completion_tokens must be measured, not defaulted: {usage}"
+    );
+    assert_eq!(
+        usage["total_tokens"].as_u64(),
+        Some(prompt_tokens + completion_tokens),
+        "total_tokens must be the sum: {usage}"
+    );
+
+    // Every id in one stream must agree — the usage chunk included, since it is
+    // built after the loop and could easily have picked up a fresh one.
+    let ids: Vec<&str> = frames
+        .iter()
+        .filter_map(|frame| frame["id"].as_str())
+        .collect();
+    assert!(!ids.is_empty());
+    assert!(
+        ids.windows(2).all(|pair| pair[0] == pair[1]),
+        "all chunks of one response must share an id, got {ids:?}"
+    );
+    assert!(
+        ids[0].starts_with("chatcmpl-") && ids[0] != "chatcmpl-tachyon",
+        "the completion id must be per-response, got {}",
+        ids[0]
+    );
+}
+
+/// Parse every `data:` frame of an SSE body except the `[DONE]` sentinel.
+#[cfg(feature = "ai-inference")]
+fn sse_data_frames(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .map(|payload| {
+            serde_json::from_str(payload).unwrap_or_else(|error| {
+                panic!("SSE frame must be JSON ({error}): {payload}");
+            })
+        })
+        .collect()
 }

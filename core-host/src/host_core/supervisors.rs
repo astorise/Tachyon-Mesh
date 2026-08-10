@@ -688,6 +688,8 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         Arc::clone(&state.storage_broker),
     )?;
     let previous_runtime = state.runtime.load_full();
+    #[cfg(feature = "ai-inference")]
+    let previous_runtime_config = previous_runtime.config.clone();
     let draining_since = Instant::now();
     previous_runtime.mark_draining(draining_since);
     state
@@ -698,6 +700,25 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
             runtime: previous_runtime,
             draining_since,
         });
+
+    // Before the swap, withdraw every configured row the incoming runtime will
+    // not serve identically. Publication has to happen *after* the swap (see
+    // below), which leaves a window where the registry still describes the old
+    // runtime while the new one is answering — and an alias whose engine
+    // changed would be advertised as `gguf/<alias>` while requests executed an
+    // `openai:` upstream, the same "the listing lies about where a prompt goes"
+    // failure the ownership rule exists to prevent.
+    //
+    // Withdrawing first turns that into a transient *absence* instead: the
+    // alias 404s for the length of the swap and comes back correctly labelled.
+    // A missing row is a client's retry; a wrong one is a prompt sent somewhere
+    // it did not choose.
+    #[cfg(feature = "ai-inference")]
+    crate::system_storage::withdraw_changed_model_bindings(
+        &state.core_store,
+        &previous_runtime_config,
+        &runtime.config,
+    );
 
     state
         .background_workers
@@ -714,6 +735,17 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         .await;
     let runtime = Arc::new(runtime);
     state.runtime.store(Arc::clone(&runtime));
+    // After the swap, not before. `replace_with` above waits for every old
+    // worker to stop, and throughout that interval the still-active runtime is
+    // the previous one — so publishing first advertised aliases it could not
+    // load, and withdrew engine-qualified ids it was still serving. A client
+    // choosing from `GET /ai/v1/models` in that window got transient 404s from
+    // an otherwise successful reload.
+    //
+    // Best-effort, like the boot-time publication: the reload itself must not
+    // fail on a registry write.
+    #[cfg(feature = "ai-inference")]
+    crate::system_storage::publish_configured_model_bindings(&state.core_store, &runtime.config);
     state
         .host_identity
         .clear_route_token_cache()
