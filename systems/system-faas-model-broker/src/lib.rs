@@ -393,11 +393,15 @@ fn commit_upload(uri: &str) -> Result<String, String> {
         })?;
     }
     if let Err(error) = fs::rename(&incoming_dir, &model_dir) {
-        if replaced {
-            let _ = fs::rename(&backup_dir, &model_dir);
-        }
+        let restore = replaced.then(|| fs::rename(&backup_dir, &model_dir));
         let _ = fs::remove_dir_all(&incoming_dir);
         cleanup_staging(&upload_id);
+        if let Some(Err(restore_error)) = restore {
+            return Err(format!(
+                "failed to install the uploaded model at `{}`: {error}; restoring the previous checkpoint failed: {restore_error}",
+                model_dir.display()
+            ));
+        }
         return Err(format!(
             "failed to install the uploaded model at `{}`: {error}",
             model_dir.display()
@@ -673,12 +677,23 @@ fn file_starts_with_gguf_magic(path: &Path) -> bool {
 
 /// Write the host dispatch sidecar declaring the detected format.
 fn write_meta_sidecar(dir: &Path, format: &str, alias: &str) -> Result<(), String> {
-    let body = serde_json::to_vec(&serde_json::json!({
-        "format": format,
-        "alias": alias,
-    }))
-    .map_err(|error| format!("failed to encode model metadata sidecar: {error}"))?;
-    fs::write(dir.join(MODEL_META_JSON), body)
+    let path = dir.join(MODEL_META_JSON);
+    let tool_call_parser = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("tool_call_parser")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let mut metadata = serde_json::json!({ "format": format, "alias": alias });
+    if let Some(parser) = tool_call_parser {
+        metadata["tool_call_parser"] = serde_json::Value::String(parser);
+    }
+    let body = serde_json::to_vec(&metadata)
+        .map_err(|error| format!("failed to encode model metadata sidecar: {error}"))?;
+    fs::write(path, body)
         .map_err(|error| format!("failed to write model metadata sidecar: {error}"))
 }
 

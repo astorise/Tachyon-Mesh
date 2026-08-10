@@ -770,6 +770,14 @@ impl UpstreamOpenAiRuntime {
             });
         }
 
+        if content.is_none() && finish_reason.as_deref() == Some("content_filter") {
+            return Ok(UpstreamGeneration {
+                bytes: Vec::new(),
+                usage,
+                finish_reason,
+                tool_calls: Vec::new(),
+            });
+        }
         let text = content.ok_or_else(|| UpstreamError::MalformedResponse {
             alias: self.alias.clone(),
             detail: "response has no `choices[0].message.content` string and no `tool_calls`"
@@ -846,7 +854,7 @@ impl UpstreamOpenAiRuntime {
             // The interval is not a deadline. Exceeding it is the normal case
             // for a model still thinking, and only the binding's timeout ends
             // the request.
-            let line = match reader.next_line(&mut response).await {
+            let payload = match reader.next_event(&mut response).await {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(SseReadError::Idle) => {
@@ -885,10 +893,6 @@ impl UpstreamOpenAiRuntime {
                         detail,
                     });
                 }
-            };
-            let Some(payload) = line.trim().strip_prefix("data:") else {
-                // Blank separator lines and SSE comments carry no delta.
-                continue;
             };
             let payload = payload.trim();
             if payload == "[DONE]" {
@@ -1011,6 +1015,13 @@ impl UpstreamOpenAiRuntime {
             }
         }
 
+        if !saw_done && !abandoned {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
+            });
+        }
+
         if !abandoned {
             for call in
                 streamed_tool_calls
@@ -1021,7 +1032,6 @@ impl UpstreamOpenAiRuntime {
                     })?
             {
                 if sink.emit(StreamEvent::ToolCall(call)).is_stop() {
-                    abandoned = true;
                     break;
                 }
             }
@@ -1035,12 +1045,6 @@ impl UpstreamOpenAiRuntime {
         // An abandoned stream is exempt: nobody is left to receive the answer,
         // so stopping short is the intended outcome rather than a truncation to
         // report.
-        if !saw_done && !abandoned {
-            return Err(UpstreamError::MalformedResponse {
-                alias: self.alias.clone(),
-                detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
-            });
-        }
         // Absence stays absence: an upstream that volunteers no usage frame
         // has told us nothing, and zeros would read to the client as a
         // generation that cost nothing.
@@ -1421,9 +1425,38 @@ struct SseReader {
     /// Set once the body is exhausted, so a trailing line with no newline is
     /// still delivered exactly once.
     eof: bool,
+    /// `data:` fields collected for the current SSE event. SSE joins multiple
+    /// fields with a newline and dispatches only at the blank separator.
+    event_data: String,
 }
 
 impl SseReader {
+    async fn next_event(
+        &mut self,
+        response: &mut reqwest::Response,
+    ) -> Result<Option<String>, SseReadError> {
+        loop {
+            match self.next_line(response).await? {
+                Some(line) if line.is_empty() || line == "\r" => {
+                    if !self.event_data.is_empty() {
+                        return Ok(Some(std::mem::take(&mut self.event_data)));
+                    }
+                }
+                Some(line) => {
+                    if let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") {
+                        if !self.event_data.is_empty() {
+                            self.event_data.push('\n');
+                        }
+                        self.event_data
+                            .push_str(data.strip_prefix(' ').unwrap_or(data));
+                    }
+                }
+                None if self.event_data.is_empty() => return Ok(None),
+                None => return Ok(Some(std::mem::take(&mut self.event_data))),
+            }
+        }
+    }
+
     /// The next complete line, or `Ok(None)` at end of stream.
     ///
     /// `Err(Idle)` means only that nothing arrived within the poll interval.

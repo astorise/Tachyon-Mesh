@@ -1239,6 +1239,41 @@ impl CoreStore {
         Ok(changed)
     }
 
+    pub(crate) fn kv_partition_compare_and_delete(
+        &self,
+        table_name: &str,
+        key: &str,
+        expected: &[u8],
+    ) -> Result<bool> {
+        let table_key = kv_partition_table_key(table_name);
+        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("kv_partition_compare_and_delete: begin")?;
+        let changed = {
+            let mut table = write_txn
+                .open_table(table_def)
+                .context("kv_partition_compare_and_delete: open")?;
+            let current = table
+                .get(key)
+                .context("kv_partition_compare_and_delete: get")?
+                .map(|entry| entry.value().to_vec());
+            if current.as_deref() == Some(expected) {
+                table
+                    .remove(key)
+                    .context("kv_partition_compare_and_delete: remove")?;
+                true
+            } else {
+                false
+            }
+        };
+        write_txn
+            .commit()
+            .context("kv_partition_compare_and_delete: commit")?;
+        Ok(changed)
+    }
+
     /// Insert `value` only if `key` is absent, in a single write transaction.
     /// Returns whether the insert happened.
     ///

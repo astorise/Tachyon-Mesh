@@ -586,6 +586,7 @@ pub(crate) struct GenerationError {
     /// a decode error, an unknown alias, a rejected request — because inventing
     /// a status for those would misreport a local fault as a remote one.
     pub(crate) upstream_status: Option<u16>,
+    pub(crate) class: Option<String>,
 }
 
 impl GenerationError {
@@ -593,6 +594,7 @@ impl GenerationError {
         Self {
             message: message.into(),
             upstream_status: None,
+            class: None,
         }
     }
 
@@ -601,12 +603,29 @@ impl GenerationError {
     /// unmodified, so the typed cause survives the trip through the scheduler
     /// and the backend trait and can be read back here.
     fn from_anyhow(error: &anyhow::Error) -> Self {
+        let upstream = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>());
         Self {
             message: error.to_string(),
-            upstream_status: error
-                .chain()
-                .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>())
-                .and_then(upstream_openai::UpstreamError::http_status),
+            upstream_status: upstream.and_then(upstream_openai::UpstreamError::http_status),
+            class: upstream
+                .and_then(|error| match error {
+                    upstream_openai::UpstreamError::InvalidRequest { .. } => {
+                        Some("invalid-request")
+                    }
+                    upstream_openai::UpstreamError::Transport { detail, .. }
+                        if detail.contains("timed out") || detail.contains("timeout") =>
+                    {
+                        Some("timeout")
+                    }
+                    upstream_openai::UpstreamError::Transport { .. } => Some("transport"),
+                    upstream_openai::UpstreamError::MalformedResponse { .. } => {
+                        Some("malformed-response")
+                    }
+                    _ => None,
+                })
+                .map(str::to_owned),
         }
     }
 }

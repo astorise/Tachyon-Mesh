@@ -1810,6 +1810,24 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
             .map_err(|e| format!("{e:#}"))
     }
 
+    fn compare_and_delete(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::kv_partition::Table,
+        >,
+        key: String,
+        expected: Vec<u8>,
+    ) -> std::result::Result<bool, String> {
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
+        res.core_store
+            .kv_partition_compare_and_delete(&res.table_name, &key, &expected)
+            .map_err(|e| format!("{e:#}"))
+    }
+
     fn delete(
         &mut self,
         self_: wasmtime::component::Resource<
@@ -1965,6 +1983,24 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
             .map_err(|e| format!("{e:#}"))
     }
 
+    fn compare_and_delete(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            control_plane_component_bindings::tachyon::mesh::kv_partition::Table,
+        >,
+        key: String,
+        expected: Vec<u8>,
+    ) -> std::result::Result<bool, String> {
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
+        res.core_store
+            .kv_partition_compare_and_delete(&res.table_name, &key, &expected)
+            .map_err(|e| format!("{e:#}"))
+    }
+
     fn delete(
         &mut self,
         self_: wasmtime::component::Resource<
@@ -2051,6 +2087,7 @@ fn wit_generation_error(error: ai_inference::GenerationError) -> WitGenerationEr
     WitGenerationError {
         message: error.message,
         upstream_status: error.upstream_status,
+        class: error.class,
     }
 }
 

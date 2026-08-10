@@ -33,6 +33,9 @@ interface cpu {
     record generation-error {
         message: string,
         upstream-status: option<u16>,
+        /// Stable host classification: `invalid-request`, `transport`, or
+        /// `malformed-response`; absent for ordinary local failures.
+        class: option<string>,
     }
 
     /// One tool call a backend recognised as *structured* data rather than as

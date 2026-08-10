@@ -395,14 +395,6 @@ impl ModelInfo {
 /// A missing or unparseable row is *not* config-owned: the guard exists to
 /// protect a marker that is present, and treating an unreadable row as owned
 /// would make a corrupt entry permanently unfixable through this route.
-fn alias_is_config_owned(alias: &str) -> bool {
-    models_table()
-        .get(alias)
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<ModelInfo>(&raw).ok())
-        .is_some_and(|info| info.is_config_owned())
-}
-
 #[derive(Debug, Serialize)]
 struct OpenAiModel {
     id: String,
@@ -494,19 +486,27 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         // runtime serving the alias — it only removes it from
         // `GET /ai/v1/models`, leaving a model that answers but cannot be
         // discovered, and which no reload short of a config change restores.
-        if alias_is_config_owned(alias) {
-            return Ok(openai_error_payload(
-                409,
-                format!(
-                    "model alias `{alias}` is claimed by a configured binding in the sealed \
-                     manifest; it is removed by editing the manifest, not by deregistering"
-                ),
-                "invalid_request_error",
-            ));
+        let table = models_table();
+        loop {
+            let previous = match table.get(alias) {
+                Ok(row) => row,
+                Err(_) => break,
+            };
+            if serde_json::from_slice::<ModelInfo>(&previous)
+                .ok()
+                .is_some_and(|row| row.is_config_owned())
+            {
+                return Ok(openai_error_payload(409, format!(
+                    "model alias `{alias}` is claimed by a configured binding in the sealed manifest; it is removed by editing the manifest, not by deregistering"
+                ), "invalid_request_error"));
+            }
+            if table
+                .compare_and_delete(alias, &previous)
+                .map_err(|e| format!("model registry delete failed: {e}"))?
+            {
+                break;
+            }
         }
-        models_table()
-            .delete(alias)
-            .map_err(|e| format!("model registry delete failed: {e}"))?;
         return Ok((204, Vec::new()));
     }
 
@@ -834,7 +834,14 @@ fn handle_chat_completions_streaming(
     let mut tool_calls = adopt_host_tool_calls(host_tool_calls);
     if let Some(gate) = gate {
         let (whole, streamed) = gate.finish();
-        let parsed = parse_assistant_output(&request, &whole);
+        let parsed = if tool_calls.is_empty() {
+            parse_assistant_output(&request, &whole)
+        } else {
+            ParsedAssistantOutput {
+                content: whole.clone(),
+                tool_calls: Vec::new(),
+            }
+        };
 
         // Content the gate held back that turned out not to be part of a tool
         // call — text the model emitted *after* the call, typically.
@@ -1057,7 +1064,7 @@ impl StreamingContentGate {
             // accounted for, not pending, so the caller's tail reconciliation
             // does not hand it back afterwards.
             let content = self.seen[self.emitted..at].trim_end().to_owned();
-            self.emitted = at;
+            self.emitted += content.len();
             return (!content.is_empty()).then_some(content);
         }
         let ceiling = floor_char_boundary(&self.seen, self.seen.len().saturating_sub(self.hold));
@@ -1522,15 +1529,18 @@ fn generation_error_payload(
     error: bindings::tachyon::accelerator::cpu::GenerationError,
 ) -> (u16, Vec<u8>) {
     let message = format!("inference failed for model `{model}`: {}", error.message);
-    let (status, kind) = match error.upstream_status {
-        Some(429) => (429, "rate_limit_error"),
+    let (status, kind) = match (error.upstream_status, error.class.as_deref()) {
+        (None, Some("invalid-request")) => (400, "invalid_request_error"),
+        (None, Some("transport" | "malformed-response")) => (502, "server_error"),
+        (None, Some("timeout")) => (504, "server_error"),
+        (Some(429), _) => (429, "rate_limit_error"),
         // The provider rejected the request we forwarded, which almost always
         // reflects the caller's own parameters — an unknown model, a tool
         // schema it will not accept, a context overflow.
-        Some(400 | 404 | 405 | 409 | 413 | 422) => (400, "invalid_request_error"),
-        Some(status @ 502..=504) => (status, "server_error"),
-        Some(_) => (502, "server_error"),
-        None => (500, "server_error"),
+        (Some(400 | 404 | 405 | 409 | 413 | 422), _) => (400, "invalid_request_error"),
+        (Some(status @ 502..=504), _) => (status, "server_error"),
+        (Some(_), _) => (502, "server_error"),
+        (None, _) => (500, "server_error"),
     };
     openai_error_payload(status, message, kind)
 }
@@ -2076,6 +2086,7 @@ mod tests {
         let rate_limited = bindings::tachyon::accelerator::cpu::GenerationError {
             message: "upstream returned HTTP 429".to_owned(),
             upstream_status: Some(429),
+            class: None,
         };
         let (status, body) = generation_error_payload("coder", rate_limited);
         assert_eq!(status, 429, "a client's backoff depends on seeing the 429");
@@ -2088,6 +2099,7 @@ mod tests {
             bindings::tachyon::accelerator::cpu::GenerationError {
                 message: "upstream returned HTTP 400".to_owned(),
                 upstream_status: Some(400),
+                class: None,
             },
         );
         assert_eq!(status, 400);
@@ -2099,6 +2111,7 @@ mod tests {
             bindings::tachyon::accelerator::cpu::GenerationError {
                 message: "upstream returned HTTP 401".to_owned(),
                 upstream_status: Some(401),
+                class: None,
             },
         );
         assert_eq!(status, 502);
@@ -2109,6 +2122,7 @@ mod tests {
             bindings::tachyon::accelerator::cpu::GenerationError {
                 message: "model alias `coder` is not loaded".to_owned(),
                 upstream_status: None,
+                class: None,
             },
         );
         assert_eq!(status, 500);
@@ -2132,9 +2146,9 @@ mod tests {
         // chunk cannot be un-sent, so it is withheld until the gate knows
         // whether a call follows.
         assert_eq!(streamed, "Let me check.");
-        // `emitted` still advances past the withheld newline to the opener, so
-        // the handler's tail reconciliation does not hand it back.
-        assert_eq!(emitted, streamed.len() + 1);
+        // The reconciliation offset counts only bytes actually emitted; the
+        // withheld separator must remain available when prose follows a call.
+        assert_eq!(emitted, streamed.len());
         // The tag itself never leaks into the content stream.
         assert!(!streamed.contains("<tool_call>"));
         assert!(whole.contains("<tool_call>"));

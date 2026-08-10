@@ -3959,6 +3959,7 @@ impl CandleLlmRuntime {
         // vocabulary copy nor the context resolution is paid `batch` times.
         let mut decoders = vec![IncrementalDecoder::from_tokenizer(&self.tokenizer); batch];
         let mut done = vec![false; batch];
+        let mut naturally_stopped = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
         let max_new_tokens = requests
             .iter()
@@ -4011,6 +4012,7 @@ impl CandleLlmRuntime {
                     || find_earliest_stop(decoders[row].text(), &requests[row].stop).is_some()
                 {
                     done[row] = true;
+                    naturally_stopped[row] = true;
                 }
             }
 
@@ -4047,7 +4049,8 @@ impl CandleLlmRuntime {
         decoders
             .iter()
             .zip(requests)
-            .map(|(decoder, request)| {
+            .enumerate()
+            .map(|(row, (decoder, request))| {
                 let text = decoder.text();
                 let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
                 let completion_tokens = decoder.tokens().len();
@@ -4062,8 +4065,9 @@ impl CandleLlmRuntime {
                 // Per row, not per batch: rows share a step count but not a
                 // budget, so one row can be truncated while its neighbours
                 // finished cleanly.
-                let finish_reason =
-                    (completion_tokens >= request.max_new_tokens).then_some("length");
+                let finish_reason = (!naturally_stopped[row]
+                    && completion_tokens >= request.max_new_tokens)
+                    .then_some("length");
                 Ok((text.as_bytes()[..end].to_vec(), usage, finish_reason))
             })
             .collect()
