@@ -1743,14 +1743,16 @@ impl FakeUpstream {
             let _ = stream.flush();
             // Hold the connection open without sending a single chunk.
             std::thread::sleep(hold);
-            // Then close the stream the way a real upstream does: a `[DONE]`
-            // sentinel, then the terminating chunk. Both matter — a truncated
-            // body surfaces as a transport error and a missing sentinel as a
-            // malformed one, and either would mask what the test measures,
-            // which is *when* the reader gave up rather than how it failed.
-            let sentinel = "data: [DONE]\n\n";
-            let _ = stream
-                .write_all(format!("{:x}\r\n{sentinel}\r\n0\r\n\r\n", sentinel.len()).as_bytes());
+            // Then finish with a valid terminal choice followed by `[DONE]`.
+            // The silent period is what these tests measure; a malformed empty
+            // completion would instead exercise stream validation.
+            let completion = concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let _ = stream.write_all(
+                format!("{:x}\r\n{completion}\r\n0\r\n\r\n", completion.len()).as_bytes(),
+            );
             let _ = stream.flush();
         });
 
