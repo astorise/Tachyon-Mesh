@@ -538,9 +538,18 @@ impl Qwen35MoeRuntime {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
+                // The same rule the generic Candle runtime applies, from the
+                // same helper: `none` renders the template's no-tools branch,
+                // and a choice this backend cannot force is refused rather
+                // than quietly downgraded to `auto`.
+                let tools = super::candle_llm_runtime::CandleLlmRuntime::tools_for_choice(
+                    &self.alias,
+                    request.tools.as_deref(),
+                    request.tool_choice.as_ref(),
+                )?;
                 match &self.chat_template {
                     Some(template) => template
-                        .render(&messages, request.tools.as_deref())
+                        .render(&messages, tools)
                         .map_err(|error| anyhow!("failed to render Qwen chat template: {error}"))?,
                     None => {
                         let mut prompt = String::new();
@@ -596,6 +605,13 @@ struct GenerationRequest {
     /// never told the functions exist.
     #[serde(default)]
     tools: Option<Vec<Value>>,
+    /// What the caller wants done with those schemas. Unnamed, serde dropped
+    /// it, so `tool_choice: "none"` still advertised the functions the client
+    /// had just forbidden — and the guest, which does honour the field, had
+    /// already withdrawn its parser, so the model's call markup came back as
+    /// assistant prose.
+    #[serde(default)]
+    tool_choice: Option<Value>,
     /// Absent when the caller named no budget, which is what lets the default
     /// be clamped to the context window while an explicit request that cannot
     /// fit is refused.

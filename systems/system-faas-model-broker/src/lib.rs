@@ -801,14 +801,24 @@ fn write_meta_sidecar(
     // declaration away, and the loss is silent: tool calls simply come back as
     // prose, which reads like the model choosing not to call anything.
     //
-    // Relayed unvalidated. The host already checks the value against the
+    // The *value* is relayed unvalidated — the host checks it against the
     // dialects the guest implements and warns on anything else, and a second
-    // allowlist here would be one more place to forget a new one.
+    // allowlist here would be one more place to forget a new one. Its *type* is
+    // not: the host reads this file into `ModelMeta { tool_call_parser:
+    // Option<String> }`, so a non-string fails that deserialization and takes
+    // the whole sidecar with it — `format` and `alias` included. The upload
+    // would commit, publish, and then be unloadable, which is a worse outcome
+    // than losing one optional hint.
+    //
+    // Dropped rather than refused: the sidecar is an escape hatch, and failing
+    // an otherwise valid checkpoint over a malformed optional field would trade
+    // a silent loss for a loud one nobody asked for. The host's own warning
+    // still fires for a string naming an unknown dialect.
     let declared_parser = fs::read(dir.join(MODEL_META_JSON))
         .ok()
         .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
         .and_then(|meta| meta.get("tool_call_parser").cloned())
-        .filter(|parser| !parser.is_null());
+        .filter(|parser| parser.is_string());
     let mut body = serde_json::json!({
         "format": format,
         "alias": alias,
@@ -1062,6 +1072,26 @@ mod tests {
         // actually landed.
         assert_eq!(meta["alias"], "coder");
         assert_eq!(meta["upload_id"], "up-1");
+
+        // A non-string declaration is dropped rather than relayed. The host
+        // reads this file into `ModelMeta { tool_call_parser: Option<String> }`,
+        // so relaying an object failed that deserialization and took the whole
+        // sidecar with it — `format` and `alias` included — leaving an upload
+        // that committed, published, and could not load.
+        fs::write(
+            dir.join(MODEL_META_JSON),
+            br#"{"format":"gguf","tool_call_parser":{"dialect":"qwen"}}"#,
+        )
+        .expect("uploaded sidecar");
+        write_meta_sidecar(&dir, "gguf", "coder", "up-3").expect("sidecar rewrite");
+        let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
+        let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        assert!(
+            meta.get("tool_call_parser").is_none(),
+            "an unusable hint is worth less than a loadable checkpoint: {meta}"
+        );
+        assert_eq!(meta["format"], "gguf");
+        assert_eq!(meta["alias"], "coder");
 
         // An archive with no declaration gets no key invented for it, so the
         // host falls back to reading the chat template as it always did.

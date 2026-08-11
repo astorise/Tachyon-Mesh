@@ -1614,17 +1614,21 @@ fn tool_calls_from_value(alias: &str, tool_calls: &Value) -> Result<Vec<ToolCall
             }
             // The guest hardcodes `"function"` back onto whatever it echoes, so
             // an upstream naming a different kind here would have that kind
-            // silently relabelled and dispatched as a function call. Absent is
-            // fine — the field is optional and `function` is its only defined
-            // value — but a present, different one is a call this backend does
-            // not know how to carry.
-            if let Some(kind) = call.get("type").and_then(Value::as_str) {
-                if kind != "function" {
-                    return Err(malformed(format!(
-                        "`choices[0].message.tool_calls[{index}].type` is `{kind}`, and only \
-                         `function` calls can be carried"
-                    )));
-                }
+            // silently relabelled and dispatched as a function call. Absent and
+            // null are fine — the field is optional and `function` is its only
+            // defined value — but anything else present is a call this backend
+            // does not know how to carry.
+            //
+            // Read structurally rather than through `as_str`: that answers
+            // `None` for `"type": 42` exactly as it does for a missing key, so
+            // a non-string slipped past the check it was written for. The
+            // streamed assembler carried the same bypass.
+            if !tool_call_type_is_function(call.get("type")) {
+                return Err(malformed(format!(
+                    "`choices[0].message.tool_calls[{index}].type` is {}, and only the string \
+                     `function` can be carried",
+                    describe_tool_call_type(call.get("type"))
+                )));
             }
             let arguments = tool_call_arguments(function.and_then(|f| f.get("arguments")))
                 .ok_or_else(|| {
@@ -1696,6 +1700,34 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Array(_) => "an array",
         Value::Object(_) => "an object",
+    }
+}
+
+/// Whether a tool call's `type` is one this backend can carry.
+///
+/// Absent and null both mean "unstated", which the OpenAI schema allows and
+/// which `function` is the only defined value for. Everything else present has
+/// to be the exact string: `and_then(Value::as_str)` answered `None` for
+/// `"type": 42` just as it does for a missing key, so a non-string was read as
+/// unstated and the guest relabelled the call as a dispatchable `function`.
+fn tool_call_type_is_function(kind: Option<&Value>) -> bool {
+    match kind {
+        None | Some(Value::Null) => true,
+        Some(Value::String(kind)) => kind == "function",
+        Some(_) => false,
+    }
+}
+
+/// How to name a rejected `type` in an error.
+///
+/// The offending *value* for a string — `custom` is what an operator greps for
+/// — and the type name for anything else, where the value is rarely the useful
+/// half and may be arbitrarily large.
+fn describe_tool_call_type(kind: Option<&Value>) -> String {
+    match kind {
+        Some(Value::String(kind)) => format!("`{kind}`"),
+        Some(other) => json_type_name(other).to_owned(),
+        None => "absent".to_owned(),
     }
 }
 
@@ -1783,13 +1815,12 @@ impl StreamedToolCalls {
         // relabelled and dispatched as a function call. The buffered parser
         // already refuses this; checked before the slot is created so a refused
         // fragment leaves nothing half-absorbed behind it.
-        if let Some(kind) = fragment.get("type").and_then(Value::as_str) {
-            if kind != "function" {
-                return Err(format!(
-                    "streamed tool call at index {index} has type `{kind}`, and only `function` \
-                     calls can be carried"
-                ));
-            }
+        if !tool_call_type_is_function(fragment.get("type")) {
+            return Err(format!(
+                "streamed tool call at index {index} has a type of {}, and only the string \
+                 `function` can be carried",
+                describe_tool_call_type(fragment.get("type"))
+            ));
         }
         let slot = match self.by_index.get(&index).copied() {
             Some(at) => &mut self.calls[at],
@@ -2746,7 +2777,12 @@ mod tests {
         let Err(error) = backend.generate(&[b"go"]) else {
             panic!("a non-function call type must not be silently relabelled");
         };
-        assert!(error.to_string().contains("only `function`"), "{error}");
+        let error = error.to_string();
+        assert!(
+            error.contains("`custom`"),
+            "the value is what to grep for: {error}"
+        );
+        assert!(error.contains("only the string `function`"), "{error}");
     }
 
     /// The map and the order have to agree.
@@ -3315,6 +3351,49 @@ mod tests {
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn a_non_string_tool_call_type_is_refused_on_both_routes() {
+        // `and_then(Value::as_str)` answers `None` for `"type": 42` exactly as
+        // it does for a missing key, so the check added for a *different*
+        // string slipped past on a number — and the guest relabels whatever it
+        // echoes as a dispatchable `function`.
+        assert!(tool_call_type_is_function(None));
+        assert!(tool_call_type_is_function(Some(&Value::Null)));
+        assert!(tool_call_type_is_function(Some(&json!("function"))));
+        assert!(!tool_call_type_is_function(Some(&json!(42))));
+        assert!(!tool_call_type_is_function(Some(&json!("custom"))));
+        assert!(!tool_call_type_is_function(Some(
+            &json!({"kind": "function"})
+        )));
+
+        let buffered = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"c1","type":42,"function":{"name":"f","arguments":"{}"}}]}}]}"#,
+        );
+        let error = runtime("coder", &buffered.binding())
+            .generate(&[b"go"])
+            .expect_err("a numeric type is not an unstated one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+
+        let streamed = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":42,"function":{"name":"f","arguments":"{}"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        let error = runtime("coder", &streamed.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("the assembler carried the same bypass");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(captured.tool_calls.is_empty());
     }
 
     #[test]

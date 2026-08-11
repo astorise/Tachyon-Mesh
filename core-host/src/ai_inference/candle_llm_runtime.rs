@@ -2044,6 +2044,16 @@ struct GenerationRequest {
     /// would mean guessing that shape on the model's behalf.
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
+    /// What the caller wants done with those schemas.
+    ///
+    /// Dropped for the same reason `tools` was, and with a worse consequence
+    /// than rendering the wrong template branch: `tool_choice: "none"` means
+    /// the client forbade calls, so the template advertised functions the
+    /// client had ruled out, and if the model then emitted its dialect the
+    /// guest — which *does* honour the field — had already withdrawn intent
+    /// and returned the raw call markup as assistant prose.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
     max_new_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -4664,6 +4674,46 @@ impl CandleLlmRuntime {
     /// `chat_template` (from `tokenizer_config.json`) when present so the result
     /// matches the checkpoint's expected control tokens; otherwise falls back to
     /// a generic, deterministic rendering that ends on an open assistant turn.
+    /// The tool schemas a local template should actually be given.
+    ///
+    /// `Err` names a choice this backend cannot honour. A local runtime has no
+    /// way to *force* a call — there is no constrained decoding for tool
+    /// dialects here — so accepting `required` or a named function would
+    /// promise something only the upstream backends can deliver, and the
+    /// caller would read ordinary prose as a refusal to call.
+    ///
+    /// `Ok(None)` for `"none"`: the template's no-tools branch is exactly what
+    /// "you may not call anything" renders to, and it keeps this side agreeing
+    /// with the guest, which withdraws its parser for the same request.
+    pub(crate) fn tools_for_choice<'a>(
+        alias: &str,
+        tools: Option<&'a [serde_json::Value]>,
+        choice: Option<&serde_json::Value>,
+    ) -> Result<Option<&'a [serde_json::Value]>, CandleLlmError> {
+        let refuse = |detail: String| CandleLlmError::InvalidRequest {
+            alias: alias.to_owned(),
+            detail,
+        };
+        match choice {
+            None | Some(serde_json::Value::Null) => Ok(tools),
+            Some(serde_json::Value::String(choice)) => match choice.as_str() {
+                "auto" => Ok(tools),
+                "none" => Ok(None),
+                other => Err(refuse(format!(
+                    "`tool_choice` `{other}` cannot be honoured by a local backend, which has no \
+                     way to force a call; use `auto` or `none`, or bind this alias to an \
+                     `openai:` upstream"
+                ))),
+            },
+            Some(_) => Err(refuse(
+                "`tool_choice` naming a specific function cannot be honoured by a local backend, \
+                 which has no way to force a call; use `auto` or `none`, or bind this alias to an \
+                 `openai:` upstream"
+                    .to_owned(),
+            )),
+        }
+    }
+
     fn render_chat(
         &self,
         messages: &[ChatTurn],
@@ -4822,7 +4872,14 @@ impl CandleLlmRuntime {
             // Prefer structured `messages` (chat-templated); otherwise a raw
             // `prompt`. Exactly one source of prompt text must be present.
             let prompt = match (request.messages, request.prompt) {
-                (Some(messages), _) => self.render_chat(&messages, request.tools.as_deref())?,
+                (Some(messages), _) => {
+                    let tools = Self::tools_for_choice(
+                        &self.alias,
+                        request.tools.as_deref(),
+                        request.tool_choice.as_ref(),
+                    )?;
+                    self.render_chat(&messages, tools)?
+                }
                 (None, Some(prompt)) => prompt,
                 (None, None) => {
                     return Err(CandleLlmError::InvalidRequest {
@@ -7116,6 +7173,46 @@ mod tests {
             Some("length"),
             "the clock cutting an answer short has to reach the client"
         );
+    }
+
+    /// `tool_choice` reaches the template, or is refused.
+    ///
+    /// The field was unnamed, so serde dropped it and `"none"` still rendered
+    /// the tools branch — advertising functions the client had just forbidden.
+    /// The guest *does* honour the field, so it had already withdrawn its
+    /// parser: if the model then emitted its dialect, the raw call markup came
+    /// back as assistant prose.
+    #[test]
+    fn tool_choice_decides_what_a_local_template_is_told() {
+        let tools = vec![serde_json::json!({"function": {"name": "read_file"}})];
+        let resolve = |choice: Option<serde_json::Value>| {
+            CandleLlmRuntime::tools_for_choice("coder", Some(tools.as_slice()), choice.as_ref())
+                .map(|tools| tools.map(<[serde_json::Value]>::len))
+        };
+
+        assert_eq!(resolve(None).expect("absent is allowed"), Some(1));
+        assert_eq!(
+            resolve(Some(serde_json::json!("auto"))).expect("auto is allowed"),
+            Some(1)
+        );
+        assert_eq!(
+            resolve(Some(serde_json::json!("none"))).expect("none is allowed"),
+            None,
+            "`none` renders the template's no-tools branch, agreeing with the guest"
+        );
+
+        // A local backend cannot *force* a call, so promising one would have
+        // the caller read ordinary prose as a refusal to call.
+        for forced in [
+            serde_json::json!("required"),
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+        ] {
+            let error = resolve(Some(forced.clone())).expect_err("cannot be honoured locally");
+            assert!(
+                matches!(error, CandleLlmError::InvalidRequest { .. }),
+                "{forced} must be the caller's error, not a host fault: {error}"
+            );
+        }
     }
 
     /// A deadline that expires *before* any token is produced.

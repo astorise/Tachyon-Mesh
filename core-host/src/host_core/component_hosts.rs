@@ -2203,6 +2203,15 @@ struct StreamQueueBudget {
 struct StreamQueueState {
     queued: usize,
     consumer_gone: bool,
+    /// Set when the consumer was declared gone by the *stall timeout* rather
+    /// than by actually going away.
+    ///
+    /// The producer's unwind is the same either way, which is why one flag used
+    /// to serve both. The client's outcome is not: a consumer that dropped is
+    /// nobody to report to, while one that merely stopped draining is still
+    /// connected, still reading, and — with no distinction here — was handed a
+    /// truncated answer under a clean `stop`.
+    stalled: bool,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2242,10 +2251,11 @@ impl StreamQueueBudget {
             };
             state = next;
             if timed_out {
-                // Report it the way a departed consumer is reported: the caller
-                // already knows how to unwind that, and from a producer's side
-                // the two are the same situation.
+                // Unwound like a departed consumer — the producer's job is the
+                // same — but recorded as what it was, so the caller can tell a
+                // client that is still there why its answer stopped.
                 state.consumer_gone = true;
+                state.stalled = true;
                 self.drained.notify_all();
                 return false;
             }
@@ -2259,6 +2269,11 @@ impl StreamQueueBudget {
             state.queued = state.queued.saturating_sub(len);
         }
         self.drained.notify_all();
+    }
+
+    /// Whether the consumer was declared gone by the stall timeout.
+    fn stalled(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.stalled)
     }
 
     /// Wake a producer blocked on a budget nobody will drain again.
@@ -2296,6 +2311,21 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
         // the number of them.
         let charged = payload.queued_bytes();
         if !self.budget.reserve(charged) {
+            // A stall is not a departure. The receiver is still there, so it
+            // will see this error and the guest turns it into an SSE error
+            // frame; without it the channel simply closed and a client that had
+            // merely paused was handed a truncated answer under a clean `stop`,
+            // with nothing to distinguish it from a complete one.
+            //
+            // Best effort: if the consumer has since gone too, the send fails
+            // and there is nobody left to tell, which is the other case
+            // already handled below.
+            if self.budget.stalled() {
+                let _ = self.sender.send(Err(ai_inference::GenerationError::local(
+                    "the client stopped reading this stream for longer than the backpressure \
+                     limit allows, so generation was cancelled",
+                )));
+            }
             return ai_inference::StreamControl::Stop;
         }
         match self.sender.send(Ok(payload)) {
@@ -3952,6 +3982,26 @@ mod stream_budget_tests {
             !budget.reserve(1),
             "once the stall is called, later events take the same answer rather than \
              re-waiting the whole limit each time"
+        );
+        // The producer unwinds the same way either time, but the *client*'s
+        // outcome differs: a receiver that dropped is nobody to report to,
+        // while one that merely paused is still connected and was being handed
+        // a truncated answer under a clean `stop`. The sink reads this flag to
+        // send an error down the channel instead.
+        assert!(
+            budget.stalled(),
+            "a timeout must be distinguishable from a departure"
+        );
+
+        let departed = StreamQueueBudget::default();
+        departed.consumer_gone();
+        assert!(
+            !departed.reserve(1),
+            "a departed consumer still refuses the reservation"
+        );
+        assert!(
+            !departed.stalled(),
+            "but it is not a stall, and must not be reported to a caller that has gone"
         );
     }
 
