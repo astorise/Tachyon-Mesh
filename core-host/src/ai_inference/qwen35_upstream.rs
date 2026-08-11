@@ -463,6 +463,7 @@ impl Qwen35MoeRuntime {
                 format!("max_new_tokens must be between 1 and {HOST_MAX_NEW_TOKENS}"),
             ));
         }
+        reject_unsupported_options(&self.alias, &request)?;
         // Same bounds and same default as the Candle runtime, so a caller sees
         // one wall-clock contract whichever backend serves its alias.
         let budget = match request.max_generation_ms {
@@ -593,6 +594,36 @@ struct GenerationRequest {
     /// the caller's budget and let a slow generation hold its scheduler lane.
     #[serde(default)]
     max_generation_ms: Option<u64>,
+    /// Named only to be refused.
+    ///
+    /// `guest-openai` forwards a `response_format` as `json_schema`, and this
+    /// runtime has no constrained decoder to apply it with. Left unnamed, serde
+    /// dropped the field and the request answered 200 with unconstrained prose
+    /// — to a caller that asked for schema-valid data and will parse it as
+    /// such. Refusing is the fail-closed half of the same rule the route
+    /// applies to a `json_schema` block with no schema; applying the constraint
+    /// here, as the generic Candle runtime does through `FsmLogitProcessor`,
+    /// is the better answer and a larger one.
+    #[serde(default)]
+    json_schema: Option<String>,
+}
+
+/// Refuse the options this backend names but cannot honour.
+///
+/// Naming a field and dropping it is the same silence as not naming it. The
+/// route already refuses a `json_schema` block that carries no schema, for the
+/// reason that applies here too: a caller asking for schema-valid output and
+/// receiving prose with a 200 has no way to tell, because it parses the answer
+/// as data.
+fn reject_unsupported_options(alias: &str, request: &GenerationRequest) -> Result<()> {
+    if request.json_schema.is_some() {
+        return Err(invalid_request(
+            alias,
+            "this Qwen 3.5 backend cannot constrain decoding, so a `response_format` carrying a \
+             schema is refused rather than ignored",
+        ));
+    }
+    Ok(())
 }
 
 /// A chat turn as it arrives on the wire.
@@ -736,6 +767,32 @@ mod tests {
             "mtp_num_hidden_layers": 0
         }))
         .expect("fixture config should deserialize")
+    }
+
+    /// A constraint this backend cannot apply is refused, not dropped.
+    ///
+    /// `guest-openai` forwards a `response_format` as `json_schema`. Leaving
+    /// the field unnamed here let serde discard it, so the request answered 200
+    /// with unconstrained prose to a caller that had asked for schema-valid
+    /// data and would parse it as such.
+    #[test]
+    fn a_schema_this_backend_cannot_apply_is_refused() {
+        let parse = |body: &str| {
+            serde_json::from_str::<GenerationRequest>(body).expect("valid request json")
+        };
+
+        // Named, so serde keeps it — the half that made the silence possible.
+        let request = parse(r#"{"prompt":"hi","json_schema":"{\"type\":\"object\"}"}"#);
+        assert!(request.json_schema.is_some());
+
+        let error = reject_unsupported_options("coder", &request)
+            .expect_err("a schema this runtime cannot honour must not be ignored");
+        let error = error.to_string();
+        assert!(error.contains("constrain decoding"), "{error}");
+
+        // A request that asks for no constraint is untouched.
+        reject_unsupported_options("coder", &parse(r#"{"prompt":"hi"}"#))
+            .expect("an unconstrained request is ordinary");
     }
 
     #[test]

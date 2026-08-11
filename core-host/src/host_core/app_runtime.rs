@@ -1145,6 +1145,12 @@ mod requested_model_alias_tests {
         local.device = ModelDevice::Cuda;
         let mut upstream = model_binding("qwen3-coder");
         upstream.path = "openai:http://127.0.0.1:8080/v1".to_owned();
+        // Non-dynamic, because that is what makes the path a destination: the
+        // broker overwrites a `dynamic` binding's path with the directory its
+        // upload landed in, so one written `openai:…` still runs locally. The
+        // shared fixture above is dynamic for the alias-resolution test, which
+        // needs no paths at all.
+        upstream.dynamic = false;
         route.models = vec![local, upstream];
 
         let requested =
@@ -1219,11 +1225,12 @@ pub(crate) fn route_mesh_qos_profile(
     // scheduled on `Network`; reading its declared `cpu`/`cuda` here made mesh
     // admission watch an idle local queue while the network queue filled, so a
     // saturated upstream never redirected a request to a healthier peer.
-    let accelerator = if binding
-        .path
-        .trim()
-        .starts_with(ai_inference::UPSTREAM_SCHEME)
-    {
+    //
+    // `binding_runs_upstream` rather than the prefix: a `dynamic` binding's
+    // path is a placeholder the broker overwrites, so one written
+    // `openai:…` still runs its uploaded checkpoint locally, and calling that
+    // `Network` hid a real GPU queue from admission.
+    let accelerator = if ai_inference::binding_runs_upstream(binding) {
         ai_inference::AcceleratorKind::Network
     } else {
         ai_inference::AcceleratorKind::from_model_device(&binding.device)
@@ -2269,17 +2276,47 @@ mod vram_admission_scope_tests {
         // upstream about, and the ordinary path already ignores it.
         assert!(!route_is_entirely_upstream(&route_with(&[])));
     }
+
+    /// A `dynamic` binding's path is a placeholder, not a destination.
+    ///
+    /// The broker overwrites it: `ensure_model_loaded` swaps it for the
+    /// directory the upload landed in, so the checkpoint runs locally on the
+    /// device the binding seals. Reading the `openai:` prefix alone therefore
+    /// exempted a route holding real VRAM from the refusal that protects it,
+    /// and pointed mesh QoS at an idle network lane while a GPU queue filled.
+    #[test]
+    fn a_dynamic_binding_is_local_however_its_path_reads() {
+        let mut route = route_with(&["openai:http://a.invalid/v1"]);
+        route.models[0].dynamic = true;
+        route.models[0].device = ModelDevice::Cuda;
+
+        assert!(
+            !route_is_entirely_upstream(&route),
+            "a dynamic binding runs its uploaded checkpoint locally, so the VRAM refusal applies"
+        );
+        assert_eq!(
+            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
+            Some(ai_inference::AcceleratorKind::Gpu),
+            "and it queues on the device it sealed, not on the network lane"
+        );
+
+        // The non-dynamic case is unchanged: that path *is* where requests go.
+        route.models[0].dynamic = false;
+        assert!(route_is_entirely_upstream(&route));
+        assert_eq!(
+            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
+            Some(ai_inference::AcceleratorKind::Network)
+        );
+    }
 }
 
 #[cfg(feature = "ai-inference")]
 fn route_is_entirely_upstream(route: &IntegrityRoute) -> bool {
-    !route.models.is_empty()
-        && route.models.iter().all(|binding| {
-            binding
-                .path
-                .trim()
-                .starts_with(ai_inference::UPSTREAM_SCHEME)
-        })
+    // Not the `openai:` prefix: a `dynamic` binding carrying one still runs an
+    // uploaded checkpoint on a local device, so a route made entirely of those
+    // would have skipped the critical-VRAM refusal while holding the very VRAM
+    // the refusal exists to protect.
+    !route.models.is_empty() && route.models.iter().all(ai_inference::binding_runs_upstream)
 }
 
 /// Returns a rejection `RouteExecutionResult` when VRAM pressure is critical

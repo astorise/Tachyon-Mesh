@@ -268,6 +268,23 @@ fn record_execution(alias: impl Into<String>, executed_on: impl Into<String>, su
     }
 }
 
+/// Whether requests for this binding actually leave the node.
+///
+/// The `openai:` prefix alone does not decide it. A `dynamic` binding's path is
+/// a placeholder the broker overwrites: `ensure_model_loaded` swaps it for the
+/// directory the upload landed in, so the checkpoint runs *locally*, on the
+/// device the binding seals, whatever the manifest wrote there.
+///
+/// This module already drew that line for credential collisions. Mesh QoS and
+/// VRAM admission each re-derived it from the path alone, and so classified
+/// such a binding as `Network`: its real CPU or GPU queue became invisible to
+/// admission, and a route made entirely of them skipped the critical-VRAM
+/// refusal while running local checkpoints on a saturated device. One predicate
+/// now, so the three answers cannot drift again.
+pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
+    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
+}
+
 pub(crate) fn inference_execution_telemetry() -> Vec<InferenceExecutionTelemetry> {
     INFERENCE_TELEMETRY
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -1037,9 +1054,7 @@ impl AiInferenceRuntime {
                 .routes
                 .iter()
                 .flat_map(|route| route.models.iter())
-                .filter(|binding| {
-                    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
-                })
+                .filter(|binding| binding_runs_upstream(binding))
                 .map(|binding| binding.alias.as_str()),
         )
         .map_err(|detail| anyhow!("Integrity Validation Failed: {detail}"))?;
@@ -6236,9 +6251,7 @@ mod tests {
                 .routes
                 .iter()
                 .flat_map(|route| route.models.iter())
-                .filter(|binding| {
-                    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
-                })
+                .filter(|binding| binding_runs_upstream(binding))
                 .map(|binding| binding.alias.clone())
                 .collect::<Vec<_>>()
         };
