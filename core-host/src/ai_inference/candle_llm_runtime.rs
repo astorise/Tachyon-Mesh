@@ -3489,9 +3489,9 @@ impl CandleLlmRuntime {
         }
 
         let text = decoder.text();
-        if generated.len() >= request.max_new_tokens {
-            sink.mark_length_truncated();
-        } else if Instant::now() >= request.deadline && !sink.stopped() {
+        if generated.len() >= request.max_new_tokens
+            || (Instant::now() >= request.deadline && !sink.stopped())
+        {
             sink.mark_length_truncated();
         }
         let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
