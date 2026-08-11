@@ -2138,12 +2138,23 @@ impl CandleLlmRuntime {
     /// showed load that could not exist, and the CPU lane, which was doing the
     /// work, looked idle to mesh admission.
     ///
-    /// Only the GGUF path resolves a non-CPU device today; every other loader
-    /// builds against `Device::Cpu` regardless, and those bindings are already
-    /// declared `cpu`.
+    /// Two loaders resolve a non-CPU device, not one. `load_safetensors` calls
+    /// `Device::cuda_if_available(0)` for a CUDA-bound Llama and falls back the
+    /// same way, so this used to answer `false` for a safetensors model running
+    /// every forward on the CPU — the case an earlier version of this comment
+    /// said could not happen. Each variant that can hold a device is asked
+    /// about it; the rest build against `Device::Cpu` regardless, and those
+    /// bindings are already declared `cpu`.
     pub(crate) fn executes_on_host(&self) -> bool {
         match self.inner.as_ref() {
             LoadedModel::Gguf { device, .. } => device.is_cpu(),
+            LoadedModel::Safetensors {
+                backend: SingleDeviceBackend::Llama { device, .. },
+                ..
+            } => device.is_cpu(),
+            // Every other safetensors family is built against `Device::Cpu` —
+            // not a fallback there, so not a discrepancy to report — and the
+            // parallel engines carry their own device plan.
             _ => false,
         }
     }
@@ -4068,9 +4079,16 @@ impl CandleLlmRuntime {
         }
         // Nothing was generated, and that is the answer: an expired deadline
         // returns what was produced rather than failing.
+        //
+        // It still has to say *why* it produced nothing. Zero tokens is below
+        // any requested budget, so the result assembly cannot infer truncation
+        // from the count, and an absent reason reaches `guest-openai` as a
+        // clean `stop` — a request whose clock ran out during prefill reported
+        // as a model that chose to answer with silence.
         let Prefill::Ready { logits, index_pos } =
             self.run_prefill_chunks(prompt_ids, device, request.deadline, &mut forward)?
         else {
+            sink.record_finish(Some(FinishReason::Length));
             return Ok(());
         };
         self.decode_loop_from_logits(
@@ -7097,6 +7115,33 @@ mod tests {
             sink.finish_reason(),
             Some("length"),
             "the clock cutting an answer short has to reach the client"
+        );
+    }
+
+    /// A deadline that expires *before* any token is produced.
+    ///
+    /// The count cannot carry this one at all: zero is below every budget, so
+    /// the result assembly reads it as a generation that simply had more room —
+    /// and `guest-openai` renders an absent reason as a clean `stop`. A request
+    /// whose clock ran out during prefill was therefore reported as a model
+    /// that chose to answer with silence.
+    #[test]
+    fn a_deadline_that_expires_during_prefill_still_reports_length() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        sink.record_token_budget(4_096);
+        assert_eq!(sink.completion_tokens, 0);
+        assert_eq!(
+            sink.finish_reason(),
+            None,
+            "zero tokens under the budget reads as an ordinary short answer"
+        );
+
+        sink.record_finish(Some(FinishReason::Length));
+        assert_eq!(
+            sink.finish_reason(),
+            Some("length"),
+            "which is why the prefill path has to record the verdict itself"
         );
     }
 

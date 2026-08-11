@@ -311,12 +311,19 @@ impl Qwen35MoeRuntime {
                 // Not an error: the deadline's contract is that it stops
                 // generation and returns what was produced, and a prompt that
                 // outlasts prefill produced nothing.
+                //
+                // `Length` rather than no verdict, matching the decode loop
+                // below. An empty answer with no reason reaches `guest-openai`
+                // as a clean `stop`, so a request whose budget ran out during
+                // tokenization or prefill was reported as a model that chose
+                // to say nothing — the same omission the decode path carried
+                // until it was fixed, one branch earlier.
                 return Ok((
                     TokenUsage {
                         prompt_tokens: encoded.len() as u32,
                         completion_tokens: 0,
                     },
-                    None,
+                    Some("length"),
                 ));
             }
             let input = Tensor::new(chunk, &device)?.unsqueeze(0)?;
@@ -446,10 +453,22 @@ impl Qwen35MoeRuntime {
                 ),
             ));
         }
-        let raw = std::str::from_utf8(bytes).context("Qwen prompt must be UTF-8")?;
+        // Typed, not `context`: both of these are the *caller's* input, and an
+        // untyped `anyhow` reaches `GenerationError::from_anyhow` with
+        // `invalid_request` false — which the gateway renders as a retryable
+        // 500. An agent then retries a request that can never parse, against a
+        // node that is working fine. The generic Candle and upstream backends
+        // both classify the same two inputs as invalid requests.
+        let raw = std::str::from_utf8(bytes).map_err(|error| {
+            invalid_request(&self.alias, format!("prompt must be UTF-8: {error}"))
+        })?;
         let request = if raw.trim_start().starts_with('{') {
-            serde_json::from_str::<GenerationRequest>(raw)
-                .context("invalid Qwen JSON generation request")?
+            serde_json::from_str::<GenerationRequest>(raw).map_err(|error| {
+                invalid_request(
+                    &self.alias,
+                    format!("invalid JSON generation request: {error}"),
+                )
+            })?
         } else {
             GenerationRequest {
                 prompt: Some(raw.to_owned()),
@@ -767,6 +786,34 @@ mod tests {
             "mtp_num_hidden_layers": 0
         }))
         .expect("fixture config should deserialize")
+    }
+
+    /// A request the caller malformed is the caller's to fix.
+    ///
+    /// `context` produces an untyped `anyhow`, which `from_anyhow` classifies
+    /// with `invalid_request` false — rendered as a retryable 500. An agent
+    /// then retries a body that can never parse, against a node that is working
+    /// fine. The generic Candle and upstream backends both answer 400 for the
+    /// same input.
+    #[test]
+    fn a_malformed_request_body_is_classified_as_the_callers_fault() {
+        let typed = invalid_request("coder", "invalid JSON generation request: expected value");
+        let classified = super::super::GenerationError::from_anyhow(&typed);
+        assert!(
+            classified.invalid_request,
+            "a malformed body must not read as a host fault: {}",
+            classified.message
+        );
+        assert!(
+            classified.message.contains("invalid JSON"),
+            "{}",
+            classified.message
+        );
+
+        // The shape the `context` wrapper produced, for contrast: no typed
+        // cause in the chain, so nothing marks it as the caller's.
+        let untyped = anyhow!("invalid Qwen JSON generation request");
+        assert!(!super::super::GenerationError::from_anyhow(&untyped).invalid_request);
     }
 
     /// A constraint this backend cannot apply is refused, not dropped.
