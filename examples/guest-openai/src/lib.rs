@@ -244,6 +244,15 @@ struct ChatMessage {
     /// still speaks this dialect is the one that knows its shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     function_call: Option<serde_json::Value>,
+    /// A provider's structured safety refusal, carried through from the host.
+    ///
+    /// OpenAI puts this on its own field precisely so a caller can tell a
+    /// refusal from an answer. Without it a refusal reached the client as
+    /// `content: null` with `finish_reason: "stop"` — indistinguishable from a
+    /// model that returned nothing, so an agent read the empty string as the
+    /// reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<String>,
 }
 
 #[cfg(test)]
@@ -256,6 +265,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             function_call: None,
+            refusal: None,
         }
     }
 }
@@ -926,6 +936,10 @@ fn handle_chat_completions_buffered(
                 tool_call_id: None,
                 name: None,
                 function_call: None,
+                // Carried through untouched. A refusal is the provider's, and
+                // folding it into `content` would be an agent parsing "I can't
+                // help with that" as data.
+                refusal: completed.refusal,
             },
             finish_reason,
         }],

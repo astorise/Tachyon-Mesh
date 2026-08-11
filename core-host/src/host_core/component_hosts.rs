@@ -2458,6 +2458,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
                         completion_tokens: usage.completion_tokens,
                     }
                 }),
+                refusal: generation.refusal,
                 tool_calls: generation
                     .tool_calls
                     .into_iter()

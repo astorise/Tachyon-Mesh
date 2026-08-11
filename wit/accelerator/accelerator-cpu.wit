@@ -111,6 +111,14 @@ interface cpu {
         /// backend that cannot distinguish them, in which case `text` is the
         /// whole answer and any calls in it are the caller's to parse.
         tool-calls: list<tool-call>,
+        /// A provider's structured safety refusal, when it sent one.
+        ///
+        /// Separate from `text` because that is the distinction it exists to
+        /// make: a refusal folded into the answer is an agent parsing "I can't
+        /// help with that" as data, and a refusal dropped entirely is
+        /// indistinguishable from a model that returned nothing. Always absent
+        /// for a local backend, which has no such concept.
+        refusal: option<string>,
     }
 
     load-model: func(name: string) -> result<u32, string>;

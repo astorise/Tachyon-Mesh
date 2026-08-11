@@ -479,6 +479,13 @@ pub(crate) struct InferenceOutput {
     /// because recognising it is a property of the model's chat template, which
     /// the caller resolves and the backend does not.
     pub(crate) tool_calls: Vec<ToolCall>,
+    /// A provider's structured safety refusal, when it sent one.
+    ///
+    /// Its own field rather than folded into `bytes`, because that is exactly
+    /// the distinction it exists to make: a refusal read as content is an
+    /// agent parsing "I can't help with that" as data. Always `None` for a
+    /// local backend, which has no such concept.
+    pub(crate) refusal: Option<String>,
 }
 
 impl InferenceOutput {
@@ -497,6 +504,7 @@ impl InferenceOutput {
             usage: Some(usage),
             finish_reason: finish_reason.map(str::to_owned),
             tool_calls: Vec::new(),
+            refusal: None,
         }
     }
 }
@@ -511,6 +519,7 @@ impl From<Vec<u8>> for InferenceOutput {
             usage: None,
             finish_reason: None,
             tool_calls: Vec::new(),
+            refusal: None,
         }
     }
 }
@@ -786,6 +795,7 @@ pub(crate) struct ComponentGeneration {
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) refusal: Option<String>,
 }
 
 trait BackendModel: Send + Sync {
@@ -1396,6 +1406,7 @@ impl AiInferenceRuntime {
             usage: output.usage,
             finish_reason: output.finish_reason,
             tool_calls: output.tool_calls,
+            refusal: output.refusal,
         })
     }
 
@@ -2848,6 +2859,7 @@ impl BackendModel for CandleBackendModel {
                                 usage: generation.usage,
                                 finish_reason: generation.finish_reason,
                                 tool_calls: generation.tool_calls,
+                                refusal: generation.refusal,
                             })
                             // `anyhow::Error::from` rather than a stringified
                             // message: `GenerationError::from_anyhow` downcasts

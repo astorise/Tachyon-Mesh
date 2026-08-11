@@ -448,6 +448,13 @@ pub(crate) struct UpstreamGeneration {
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
+    /// The provider's structured safety refusal, when it sent one.
+    ///
+    /// OpenAI puts a refusal on its own field precisely so a caller can tell
+    /// one from an answer. Dropping it made a refusal indistinguishable from a
+    /// model that returned nothing: `content: null`, `finish_reason: "stop"`,
+    /// and an agent treating the empty string as the reply.
+    pub(crate) refusal: Option<String>,
 }
 
 /// An OpenAI-compatible upstream bound to one mesh alias.
@@ -995,6 +1002,25 @@ impl UpstreamOpenAiRuntime {
             }
         };
 
+        // Read alongside `content`, not instead of it: the two are separate
+        // fields and a provider may send both. A non-string present value is
+        // refused for the same reason `content` is — reading it with `as_str`
+        // alone would report a corrupted field as absent.
+        let refusal = match message.get("refusal") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) if text.trim().is_empty() => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(other) => {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "response has a non-string `choices[0].message.refusal` of type {}",
+                        json_type_name(other)
+                    ),
+                })
+            }
+        };
+
         // A tool call carries `content: null`, so requiring a content string
         // would turn every successful tool call into a malformed-response
         // error. The calls travel on `tool_calls`, structured, rather than
@@ -1010,6 +1036,7 @@ impl UpstreamOpenAiRuntime {
                 usage,
                 finish_reason,
                 tool_calls: tool_calls_from_value(&self.alias, tool_calls)?,
+                refusal,
             });
         }
 
@@ -1034,6 +1061,7 @@ impl UpstreamOpenAiRuntime {
                 usage,
                 finish_reason,
                 tool_calls: calls,
+                refusal,
             });
         }
 
@@ -1044,20 +1072,23 @@ impl UpstreamOpenAiRuntime {
         // Only a response with no content, no calls and no reason is shapeless
         // enough to have nothing to report.
         let Some(text) = content else {
-            if finish_reason.is_some() {
+            // A refusal counts too: it is the message's substance, and a
+            // provider that sends one without a finish reason has still said
+            // what happened.
+            if finish_reason.is_some() || refusal.is_some() {
                 return Ok(UpstreamGeneration {
                     bytes: Vec::new(),
                     usage,
                     finish_reason,
                     tool_calls: Vec::new(),
+                    refusal,
                 });
             }
             return Err(UpstreamError::MalformedResponse {
                 alias: self.alias.clone(),
-                detail:
-                    "response has no `choices[0].message.content` string, no `tool_calls` and no \
-                     `finish_reason`"
-                        .to_owned(),
+                detail: "response has no `choices[0].message.content` string, no `tool_calls`, no \
+                     `refusal` and no `finish_reason`"
+                    .to_owned(),
             });
         };
         Ok(UpstreamGeneration {
@@ -1065,6 +1096,7 @@ impl UpstreamOpenAiRuntime {
             usage,
             finish_reason,
             tool_calls: Vec::new(),
+            refusal,
         })
     }
 
@@ -3351,6 +3383,62 @@ mod tests {
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             }]
         );
+    }
+
+    /// A safety refusal is a result, and a distinguishable one.
+    ///
+    /// The structured shape is `content: null`, a non-empty `refusal`, and an
+    /// ordinary finish reason. Dropping the field made that indistinguishable
+    /// from a model that returned nothing: the guest emitted `content: null`
+    /// with `finish_reason: "stop"`, and an agent read the empty string as the
+    /// reply.
+    #[test]
+    fn an_upstream_refusal_survives_instead_of_reading_as_an_empty_answer() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"refusal":"I can't help with that."},
+                "finish_reason":"stop"}]}"#,
+        );
+        let generation = runtime("coder", &upstream.binding())
+            .generate(&[b"go"])
+            .expect("a refusal is a result, not a malformed response");
+        assert_eq!(
+            generation.refusal.as_deref(),
+            Some("I can't help with that.")
+        );
+        assert!(
+            generation.bytes.is_empty(),
+            "and it is not folded into the answer, which is the whole point of the field"
+        );
+        assert_eq!(generation.finish_reason.as_deref(), Some("stop"));
+
+        // A refusal with no finish reason is still a message that said what
+        // happened, so it is an answer rather than a shapeless response.
+        let bare = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"refusal":"no"}}]}"#,
+        );
+        assert_eq!(
+            runtime("coder", &bare.binding())
+                .generate(&[b"go"])
+                .expect("a refusal alone is still a report")
+                .refusal
+                .as_deref(),
+            Some("no")
+        );
+
+        // A present non-string is corruption, refused like a bad `content`.
+        let broken = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"refusal":{"text":"no"}},"finish_reason":"stop"}]}"#,
+        );
+        let error = runtime("coder", &broken.binding())
+            .generate(&[b"go"])
+            .expect_err("a structured refusal field is not a refusal string");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
     }
 
     #[test]
