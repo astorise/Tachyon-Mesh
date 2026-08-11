@@ -1279,7 +1279,7 @@ mod configured_binding_registry_tests {
     }
 
     #[test]
-    fn a_reload_withdraws_only_the_bindings_that_change() {
+    fn a_reload_withdraws_only_the_bindings_that_leave_configured_ownership() {
         let (store, dir) = temp_store();
         let previous = config_with(vec![
             binding("unchanged", "openai:http://127.0.0.1:8080/v1", false),
@@ -1290,8 +1290,8 @@ mod configured_binding_registry_tests {
 
         let incoming = config_with(vec![
             binding("unchanged", "openai:http://127.0.0.1:8080/v1", false),
-            // Same alias, different backend: advertising the old engine while
-            // the new one answers is the failure this withdrawal prevents.
+            // Same alias, different backend: it must retain its configured
+            // ownership marker until the publisher refreshes its registry row.
             binding("re-pointed", "/models/re-pointed", false),
         ]);
         withdraw_changed_model_bindings(&store, &previous, &incoming);
@@ -1306,7 +1306,10 @@ mod configured_binding_registry_tests {
             present("unchanged"),
             "an identical binding keeps its row, so an unrelated reload costs no availability"
         );
-        assert!(!present("re-pointed"), "a changed binding is withdrawn");
+        assert!(
+            present("re-pointed"),
+            "a re-pointed binding keeps ownership until its replacement row is published"
+        );
         assert!(!present("removed"), "a removed binding is withdrawn");
         let _ = fs::remove_dir_all(dir);
     }
