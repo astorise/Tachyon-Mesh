@@ -483,6 +483,14 @@ fn execute_guest_persists_volume_data_for_component_guest() {
 #[cfg(feature = "ai-inference")]
 #[tokio::test]
 async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
+    // Every host-side way this can fail — a linker mismatch, a component that
+    // will not instantiate, a trap — answers 500 with no headers and no body,
+    // and says why only through `tracing`. Without a subscriber the assertion
+    // below reports the bare status and nothing that explains it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .try_init();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.models = vec![IntegrityModelBinding {
         alias: "llama3".to_owned(),
@@ -512,7 +520,16 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
 
     let messages = serde_json::json!([{"role": "user", "content": "ping"}]);
 
-    // Helper: run execute_streaming_guest, return (status, headers, body_string).
+    // Helper: run execute_streaming_guest, return (worker, headers, body chunks).
+    //
+    // The worker handle is returned rather than detached, and every call site
+    // joins it once its stream is drained. Draining to EOF only proves the
+    // sender was dropped — the worker is still inside `execute_streaming_guest`
+    // for a moment after that, tearing down a wasmtime store. A detached worker
+    // therefore outlives the test, and under a one-process-per-test runner the
+    // process starts exiting while a guest instance is still being torn down on
+    // another thread. That is the standing explanation for this test reporting
+    // itself as passed and then killing its run process with SIGABRT.
     let run_streaming = |body_json: serde_json::Value, seed: u8| {
         let route_c = route.clone();
         let engine_c = engine.clone();
@@ -524,7 +541,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         );
         let (htx, hrx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();
         let (ctx, crx) = tokio::sync::mpsc::channel::<Bytes>(64);
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             execute_streaming_guest(
                 &engine_c,
                 &route_c,
@@ -535,14 +552,14 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
                 &test_guest_execution_context(config_c, seed),
             );
         });
-        (hrx, crx)
+        (worker, hrx, crx)
     };
 
     // ── Buffered reference: no `stream` field → fallback path sends JSON body ──
     // The streaming execution path is used for both calls; the buffered case
     // uses the channel-based fallback (guest returns normally without calling
     // get-streaming-response).
-    let (hrx_ref, mut crx_ref) = run_streaming(
+    let (ref_worker, hrx_ref, mut crx_ref) = run_streaming(
         serde_json::json!({"model": "llama3", "messages": messages}),
         91,
     );
@@ -551,6 +568,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     while let Some(chunk) = crx_ref.recv().await {
         ref_body_bytes.extend_from_slice(&chunk);
     }
+    ref_worker
+        .join()
+        .expect("the buffered worker should finish");
     assert_eq!(
         ref_status,
         StatusCode::OK,
@@ -588,7 +608,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     );
 
     // ── Streaming call: stream: true → SSE path ──────────────────────────
-    let (hrx_s, mut crx_s) = run_streaming(
+    let (stream_worker, hrx_s, mut crx_s) = run_streaming(
         serde_json::json!({"model": "llama3", "messages": messages, "stream": true}),
         92,
     );
@@ -607,6 +627,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     while let Some(chunk) = crx_s.recv().await {
         sse_body.push_str(&String::from_utf8_lossy(&chunk));
     }
+    stream_worker
+        .join()
+        .expect("the streaming worker should finish");
 
     assert!(
         sse_body.contains("data: [DONE]"),
@@ -643,7 +666,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     }
 
     // ── With it: one trailing chunk, no choices, real counts ─────────────
-    let (hrx_u, mut crx_u) = run_streaming(
+    let (usage_worker, hrx_u, mut crx_u) = run_streaming(
         serde_json::json!({
             "model": "llama3",
             "messages": messages,
@@ -658,6 +681,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     while let Some(chunk) = crx_u.recv().await {
         usage_body.push_str(&String::from_utf8_lossy(&chunk));
     }
+    usage_worker
+        .join()
+        .expect("the usage-stream worker should finish");
 
     let frames = sse_data_frames(&usage_body);
     let carrying_usage: Vec<&Value> = frames
