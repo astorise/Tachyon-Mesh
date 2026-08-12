@@ -1902,7 +1902,13 @@ pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
     // dialect outright, so those are checked before the generic JSON case.
     let detected = if source.contains("[TOOL_CALLS]") {
         Some("mistral")
-    } else if source.contains("<tool_call>") {
+    } else if source.contains("<tool_call>") || source.contains("<tool_calls>") {
+        // Both spellings, because the dialect is one convention with two tag
+        // renderings: `tool_call_openers` already treats `<tool_call>` and
+        // `<tool_calls>` as the same Qwen family, and a template that only ever
+        // emits the plural form used to fall through to the generic `json`
+        // branch below — which cannot parse a tagged call, so every call from
+        // such a model reached the client as prose.
         Some("qwen")
     } else if source.contains("tools") {
         // Tool-aware, but with no tag convention: the call is rendered as a
@@ -7458,6 +7464,14 @@ mod tests {
                 "mistral",
                 r#"{"chat_template": "{% if tools %}[TOOL_CALLS]{% endif %}"}"#,
                 Some("mistral"),
+            ),
+            // The plural spelling is the same dialect. A template that only
+            // renders `<tool_calls>` used to fall through to `json`, which
+            // cannot read a tagged call, so every call arrived as prose.
+            (
+                "qwen-plural",
+                r#"{"chat_template": "{% if tools %}<tool_calls>{{ tools }}</tool_calls>{% endif %}"}"#,
+                Some("qwen"),
             ),
             // Tool-aware with no tag convention: the call is a bare JSON
             // object, which is what the `json` parser reads.

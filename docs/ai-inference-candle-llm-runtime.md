@@ -536,11 +536,33 @@ something to send. A sink also answers `is_live()` — backed by a flag the
 per SSE frame, so a stream of role-only openings, usage frames or keep-alives
 cannot run to completion for a client that has already left.
 
-One window stays open: the read that waits for the upstream's *first* frame is
-uninterruptible, so a client that leaves before any frame arrives is noticed
-only when one does. Closing it needs a cancellable read, which the blocking HTTP
-client does not expose; until then the exposure is bounded by the binding's
-`timeout_ms` (and by a caller's `max_generation_ms`, which tightens it).
+A frame-by-frame probe still cannot help before the *first* frame, and that is
+the window `SseLineReader` closes. `BufRead::read_line` is uninterruptible and
+`reqwest::blocking` exposes no per-read deadline, so a client leaving while the
+upstream was still thinking went unnoticed until a frame arrived — for up to the
+binding's whole `timeout_ms`, holding one of the node's few admission permits
+throughout. The blocking read therefore moves to a dedicated
+`tachyon-upstream-sse` thread, which hands lines back over a depth-one channel,
+and the request thread polls that channel with a `SSE_LIVENESS_POLL` (250 ms)
+timeout. When the poll elapses it asks the sink whether anyone is still
+listening and goes back to waiting if so.
+
+The interval is emphatically **not** a deadline. Exceeding it is the normal case
+for a model still generating its first token, and only the binding's `timeout_ms`
+ends a request — a test asserts that a live consumer keeps waiting across
+several intervals, because getting this wrong would cut off every slow
+generation. What the interval buys is that an *abandoned* request releases its
+permit within a poll or two instead of holding it for the timeout.
+
+The reader thread normally ends when the request thread drops the receiver: its
+next send fails, the response is dropped, the socket closes. Normally, and not
+always — that send only happens once a line has been *read*, so a reader parked
+on a silent upstream cannot observe the closed channel at all, and wakes only
+when the upstream finally speaks or the request timeout fires. `SseReaderSlot`
+is what keeps those parked readers accounted for: a ceiling of twice the
+admitted upstream concurrency, so a client connecting and disconnecting in a
+loop against a silent upstream meets a refusal rather than growing a thread and
+a socket per attempt.
 
 One consequence is worth stating because it is easy to get wrong: with nothing
 enqueued on the `Network` lane, its scheduler queue depth would be permanently

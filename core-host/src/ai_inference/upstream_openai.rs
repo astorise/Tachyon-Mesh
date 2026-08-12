@@ -2253,6 +2253,74 @@ impl FakeUpstream {
         Self { base_url, requests }
     }
 
+    /// A server that answers the request headers and then says nothing.
+    ///
+    /// Chunked, with no chunk ever sent, so the client is committed to a
+    /// successful response and then left waiting. This is the case a blocking
+    /// `read_line` on this thread could not escape: the socket is open, the
+    /// upstream is alive, and no byte of body will arrive for `hold`.
+    pub(crate) fn start_silent(hold: Duration) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (tx, requests) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Read, Write};
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(stream);
+            let mut target = String::new();
+            let mut content_length = 0usize;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                if target.is_empty() {
+                    target = line.trim().to_owned();
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+                line.clear();
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let _ = tx.send((target, String::from_utf8_lossy(&body).into_owned()));
+
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            let _ = stream.flush();
+            // Hold the connection open without sending a single chunk.
+            std::thread::sleep(hold);
+            // Then finish the way a real upstream does: a terminal choice, the
+            // `[DONE]` sentinel, then the terminating chunk. All three matter —
+            // a truncated body surfaces as a transport error, a missing
+            // sentinel as a malformed one, and a stream with no choice at all
+            // trips the "said nothing usable" guard. Any of those would mask
+            // what these tests measure, which is *when* the reader gave up
+            // rather than how it failed.
+            let completion = concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let _ = stream.write_all(
+                format!("{:x}\r\n{completion}\r\n0\r\n\r\n", completion.len()).as_bytes(),
+            );
+            let _ = stream.flush();
+        });
+
+        Self { base_url, requests }
+    }
+
     pub(crate) fn binding(&self) -> String {
         format!("{UPSTREAM_SCHEME}{}", self.base_url)
     }
@@ -4167,6 +4235,62 @@ mod tests {
         fn is_live(&mut self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn a_silent_upstream_still_notices_a_client_that_already_left() {
+        // The window the per-frame liveness probe could not close: the client
+        // leaves *before* the upstream's first frame, so there is no frame to
+        // probe on. A `read_line` on this thread parked here until the
+        // binding's whole `timeout_ms` — up to an hour — holding an admission
+        // permit the node only has a few dozen of.
+        let upstream = FakeUpstream::start_silent(Duration::from_secs(30));
+        // A 30s binding timeout, so "returned because it was cancelled" and
+        // "returned because the request timed out" cannot be confused.
+        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+
+        let started = std::time::Instant::now();
+        let mut sink = DepartedSink::default();
+        let outcome = backend.generate_streaming(&[b"go"], &mut sink);
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_ok(),
+            "an abandoned stream is not a failure, it is a stream nobody wanted: {outcome:?}"
+        );
+        assert_eq!(
+            sink.emitted, 0,
+            "a silent upstream produced nothing, so nothing should have been emitted"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the read must give up on a departed client within a poll interval or two, \
+             not hold the permit for the binding timeout; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_silent_upstream_is_not_abandoned_while_the_client_is_still_there() {
+        // The other half of the contract: the poll interval is not a deadline.
+        // A model that thinks for longer than one interval must not be treated
+        // as an abandoned request, or every slow generation would be cut off.
+        let upstream = FakeUpstream::start_silent(SSE_LIVENESS_POLL * 4);
+        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+
+        let started = std::time::Instant::now();
+        let mut captured = CapturedStream::default();
+        let outcome = backend.generate_streaming(&[b"go"], &mut captured.sink());
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_ok(),
+            "a quiet socket is not an error: {outcome:?}"
+        );
+        assert!(
+            elapsed >= SSE_LIVENESS_POLL * 3,
+            "a live consumer must keep waiting across poll intervals, not be cut off at the \
+             first one; took {elapsed:?}"
+        );
     }
 
     #[test]
