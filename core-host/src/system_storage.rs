@@ -590,7 +590,16 @@ pub(crate) fn publish_configured_model_bindings(
     // Drop configured rows whose binding is gone, or a removed alias would stay
     // listed in `GET /ai/v1/models` forever. Upload-owned rows are never swept:
     // their model is still on disk and reachable.
-    for alias in config_owned_aliases(core_store) {
+    let owned_aliases = match config_owned_aliases(core_store) {
+        Ok(aliases) => aliases,
+        Err(error) => {
+            tracing::warn!(
+                "failed to scan configured model bindings before registry sweep: {error:#}"
+            );
+            return;
+        }
+    };
+    for alias in owned_aliases {
         if configured.contains(alias.as_str()) {
             continue;
         }
@@ -733,7 +742,7 @@ pub(crate) fn withdraw_changed_model_bindings(
 
 /// Every alias in the registry whose row this publisher owns.
 #[cfg(feature = "ai-inference")]
-fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
+fn config_owned_aliases(core_store: &crate::store::CoreStore) -> anyhow::Result<Vec<String>> {
     /// Rows per read. The page size is a transaction-size bound, not a limit
     /// on how much of the table this sweep covers.
     const PAGE: u32 = 10_000;
@@ -744,9 +753,13 @@ fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
         // A single page used to be the whole sweep, so once the table grew
         // past it — uploaded rows count too — any configured alias beyond that
         // page stayed advertised forever after leaving the manifest.
-        let page = core_store
-            .kv_partition_get_range(AI_MODELS_REGISTRY_TABLE, "", "\u{10ffff}", PAGE, offset)
-            .unwrap_or_default();
+        let page = core_store.kv_partition_get_range(
+            AI_MODELS_REGISTRY_TABLE,
+            "",
+            "\u{10ffff}",
+            PAGE,
+            offset,
+        )?;
         let read = page.len() as u32;
         owned.extend(page.into_iter().filter_map(|(alias, raw)| {
             let row = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
@@ -754,7 +767,7 @@ fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
                 .then_some(alias)
         }));
         if read < PAGE {
-            return owned;
+            return Ok(owned);
         }
         offset = offset.saturating_add(read);
     }

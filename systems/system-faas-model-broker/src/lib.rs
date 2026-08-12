@@ -448,9 +448,15 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     }
 
     if replaced {
-        fs::remove_dir_all(&backup_dir).map_err(|error| format!(
-            "model was published but the replaced checkpoint at `{}` could not be removed: {error}", backup_dir.display()
-        ))?;
+        if let Err(error) = fs::remove_dir_all(&backup_dir) {
+            // Publication is already durable. The upload must no longer stay
+            // retryable merely because GC of its obsolete backup failed.
+            cleanup_staging(&upload_id);
+            return Err(format!(
+                "model was published but the replaced checkpoint at `{}` could not be removed: {error}",
+                backup_dir.display()
+            ));
+        }
     }
     cleanup_staging(&upload_id);
 
