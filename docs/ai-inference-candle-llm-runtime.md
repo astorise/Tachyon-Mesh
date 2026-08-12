@@ -677,10 +677,17 @@ streams unconditionally.
 
 ### Versioning the accelerator interface
 
-The interface is `tachyon:accelerator@2.0.0`. The bump is **major** rather than
-minor because `compute`, `embed`, `compute-stream` and `token-stream.next` all
-changed shape — their error type became `generation-error`, and `next` yields a
-`stream-event` instead of a string.
+The interface is `tachyon:accelerator@3.0.0`. 3.0.0 adds a `refusal` case to
+`stream-event`, and a new variant case is breaking in the host→guest direction:
+a component built against the smaller variant has no arm to decode it into. The
+gap it closes is that `generation.refusal` had no streaming counterpart, so a
+provider's safety refusal on a `stream: true` request was dropped and the stream
+completed as an empty assistant message with an ordinary finish.
+
+2.0.0 was likewise **major** rather than minor, because `compute`, `embed`,
+`compute-stream` and `token-stream.next` all changed shape — their error type
+became `generation-error`, and `next` yields a `stream-event` instead of a
+string.
 
 That distinction is load-bearing, not bookkeeping. Wasmtime resolves a component
 import by semver-*compatible* name, so a component built against 1.1.0 would

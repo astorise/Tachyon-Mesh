@@ -419,6 +419,11 @@ struct ChunkDelta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// A provider safety refusal, on its own field exactly as OpenAI puts it —
+    /// a client that can tell a refusal from an answer only can because the two
+    /// never share a field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<StreamToolCall>>,
 }
@@ -428,6 +433,7 @@ impl ChunkDelta {
         Self {
             role: Some(role),
             content: None,
+            refusal: None,
             tool_calls: None,
         }
     }
@@ -436,6 +442,7 @@ impl ChunkDelta {
         Self {
             role: None,
             content: Some(content),
+            refusal: None,
             tool_calls: None,
         }
     }
@@ -444,6 +451,7 @@ impl ChunkDelta {
         Self {
             role: None,
             content: None,
+            refusal: None,
             tool_calls: Some(tool_calls),
         }
     }
@@ -452,6 +460,16 @@ impl ChunkDelta {
         Self {
             role: None,
             content: None,
+            refusal: None,
+            tool_calls: None,
+        }
+    }
+
+    fn refusal(refusal: String) -> Self {
+        Self {
+            role: None,
+            content: None,
+            refusal: Some(refusal),
             tool_calls: None,
         }
     }
@@ -1078,6 +1096,24 @@ fn handle_chat_completions_streaming(
                     choices: vec![ChunkChoice {
                         index: 0,
                         delta: ChunkDelta::content(content),
+                        finish_reason: None,
+                    }],
+                };
+                write_sse_chunk(&writer, &chunk)?;
+            }
+            // A refusal is not content and never goes through the tool-call
+            // gate: it cannot contain a call, and holding it back would delay
+            // the one part of the answer the client most needs promptly.
+            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::Refusal(refusal))) => {
+                let chunk = ChatCompletionChunk {
+                    usage: None,
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: request.model.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta::refusal(refusal),
                         finish_reason: None,
                     }],
                 };

@@ -1457,6 +1457,34 @@ impl UpstreamOpenAiRuntime {
                     })
                 }
             }
+            // A streamed safety refusal, on its own field for the same reason
+            // the buffered path reads one there: it is the message's substance,
+            // not its content. Dropped, a `content_filter` stream reached the
+            // client as an empty assistant message with an ordinary finish —
+            // the exact failure the buffered path already refuses. Validated
+            // like `content`, so a non-string is a malformed frame rather than
+            // a silently missing refusal.
+            match delta.get("refusal") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(refusal)) => {
+                    if !refusal.is_empty() {
+                        saw_result = true;
+                        if sink.emit(StreamEvent::Refusal(refusal)).is_stop() {
+                            abandoned = true;
+                            break;
+                        }
+                    }
+                }
+                Some(other) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed `choices[0].delta.refusal` is {}, expected a string",
+                            json_type_name(other)
+                        ),
+                    })
+                }
+            }
             // A streamed tool call arrives as `delta.tool_calls` fragments with
             // no content at all. Dropping them would make the whole request
             // look like a model that answered with silence, so accumulate them
@@ -2347,6 +2375,7 @@ mod tests {
     #[derive(Default)]
     struct CapturedStream {
         content: Vec<String>,
+        refusals: Vec<String>,
         tool_calls: Vec<ToolCall>,
     }
 
@@ -2355,6 +2384,7 @@ mod tests {
             move |event| {
                 match event {
                     StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::Refusal(text) => self.refusals.push(text.to_owned()),
                     StreamEvent::ToolCall(call) => self.tool_calls.push(call),
                 }
                 StreamControl::Continue
@@ -2370,6 +2400,7 @@ mod tests {
             move |event| {
                 match event {
                     StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::Refusal(text) => self.refusals.push(text.to_owned()),
                     StreamEvent::ToolCall(call) => self.tool_calls.push(call),
                 }
                 if self.content.len() >= after {
@@ -3543,6 +3574,68 @@ mod tests {
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn a_streamed_refusal_reaches_the_sink_instead_of_vanishing() {
+        // The streaming counterpart of the buffered case below. `delta.refusal`
+        // was not read at all, so a `content_filter` stream carried no content,
+        // no tool call and no refusal — and because `finish_reason` alone
+        // counts as substance, it completed *successfully* as an empty
+        // assistant message. Exactly the silent-empty-answer failure the
+        // buffered path refuses.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"refusal":"I can't help with that."}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a refusal is a result, not a malformed response");
+
+        assert_eq!(
+            captured.refusals,
+            vec!["I can't help with that.".to_owned()],
+            "the refusal must reach the sink on its own arm"
+        );
+        assert!(
+            captured.content.is_empty(),
+            "a refusal is not assistant content and must not be folded into it"
+        );
+        assert_eq!(outcome.finish_reason.as_deref(), Some("content_filter"));
+    }
+
+    #[test]
+    fn a_streamed_non_string_refusal_is_a_malformed_frame() {
+        // Same rule as `delta.content`: reading it with `as_str` alone would
+        // report a structured refusal as absent, dropping it and completing the
+        // stream successfully.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"refusal":{"text":"no"}}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+            .expect_err("a structured refusal field is not a refusal string");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
     }
 
     /// A safety refusal is a result, and a distinguishable one.

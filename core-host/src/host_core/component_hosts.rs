@@ -2386,6 +2386,7 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
     fn emit(&mut self, event: ai_inference::StreamEvent<'_>) -> ai_inference::StreamControl {
         let payload = match event {
             ai_inference::StreamEvent::Content(text) => StreamPayload::Content(text.to_owned()),
+            ai_inference::StreamEvent::Refusal(text) => StreamPayload::Refusal(text.to_owned()),
             ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
         };
         // Charged before the send and refunded when the guest takes the event,
@@ -2516,6 +2517,7 @@ enum SlotSend {
 #[cfg(feature = "ai-inference")]
 enum StreamPayload {
     Content(String),
+    Refusal(String),
     ToolCall(ai_inference::ToolCall),
 }
 
@@ -2526,7 +2528,7 @@ impl StreamPayload {
     /// scales with the model's output and the only part worth bounding.
     fn queued_bytes(&self) -> usize {
         match self {
-            Self::Content(text) => text.len(),
+            Self::Content(text) | Self::Refusal(text) => text.len(),
             Self::ToolCall(call) => {
                 call.name.len() + call.arguments.len() + call.id.as_ref().map_or(0, String::len)
             }
@@ -2721,6 +2723,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         match received {
             Ok(Ok(StreamPayload::Content(text))) => Ok(Some(
                 accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Content(
+                    text,
+                ),
+            )),
+            Ok(Ok(StreamPayload::Refusal(text))) => Ok(Some(
+                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Refusal(
                     text,
                 ),
             )),
